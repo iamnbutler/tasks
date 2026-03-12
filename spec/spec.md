@@ -105,7 +105,7 @@ A project maps to a single repository (initially, for simplicity).
 
 - GitHub API (Issues, PRs, webhooks) for issue tracking.
 - Local filesystem for workspaces, event logs, and session state.
-- Sandbox provider (macOS sandbox, Docker, or equivalent) for workspace isolation.
+- Container runtime for session environments (see session-runtime.md).
 - Git CLI for branch and repository operations.
 - Coding agent executable (Claude Code initially) that supports chat-style interaction over stdio.
 - Host environment authentication for GitHub and the coding agent's AI provider.
@@ -477,22 +477,28 @@ other.
 ## 9. Sessions and Agent Runner
 
 A session is the unit of execution. When the server dispatches a task for implementation, it
-creates a session. The session owns everything needed to work on that task: a sandboxed copy of
-the repo, a git branch, an agent process, a chat history, and an event emitter.
+creates a session. The session owns everything needed to work on that task: an isolated runtime
+environment with its own copy of the repo, a git branch, an agent process, a chat history, and
+an event emitter.
+
+The session runtime is a multi-process environment — not just an agent process. It hosts the
+agent, a supervisor that manages the agent's lifecycle, and any processes the agent spawns
+(test runners, build tools, git operations). See session-runtime.md for the runtime
+architecture.
 
 ### 9.1 Session Lifecycle
 
 1. **Creation.** Dispatch logic determines a task needs work (implementation, comment, sub-issue
    creation, etc.). A new session is created for that task.
-2. **Sandbox setup.** The session provisions an isolated workspace (see Section 10) with its
-   own copy of the repo checked out to a dedicated git branch.
-3. **Agent launch.** An agent process is started inside the sandbox. The session sends a custom
+2. **Runtime setup.** The session provisions an isolated runtime environment and workspace
+   (see Section 10) with its own copy of the repo checked out to a dedicated git branch.
+3. **Agent launch.** An agent process is started inside the runtime. The session sends a custom
    prompt to the agent based on the task's details (issue description, context, relevant project
    information).
 4. **Agentic flow.** The agent works autonomously. The session wrapper monitors the agent's
    output, interprets what's happening, and emits events to the bus.
 5. **Completion.** The agent finishes (task done, error, or killed). The session emits final
-   state events. The sandbox and git branch persist for review or re-use.
+   state events. The runtime environment and git branch persist for review or re-use.
 
 ### 9.2 Session as Chat
 
@@ -556,11 +562,12 @@ Previous session chat history remains accessible for context and audit.
 
 When a session is created, it provisions an isolated workspace:
 
-- The workspace is created using a configurable sandbox provider (macOS sandbox, Docker,
-  devcontainers, or other isolation mechanism). The choice of provider is an implementation
-  detail.
-- The workspace gets its own copy of the repository. The copy method (shallow clone, fast copy,
-  worktree, etc.) depends on the sandbox provider.
+- The workspace is created inside an isolated runtime environment provisioned by a configurable
+  container provider. The runtime provides process isolation, filesystem isolation, and a
+  multi-process environment for the agent and its subprocesses. See session-runtime.md for
+  provider details.
+- The workspace gets its own copy of the repository, cloned inside the runtime environment. The
+  copy method (shallow clone, full clone, etc.) is configurable.
 - A new git branch is created off of `main` (or the project's default branch) unless the task
   is explicitly stacking on another in-progress branch.
 - The branch is initially named with a generated ID (UUID or similar). It may be renamed once
