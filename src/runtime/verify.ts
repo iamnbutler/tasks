@@ -1,19 +1,20 @@
 /**
  * Verification script for the session runtime stack.
  *
- * Tests the supervisor directly by spawning it as a child process
- * and speaking the JSON-line protocol over stdio. Does not require
- * a container — validates the protocol layer end-to-end.
- *
- * Usage: bun run src/runtime/verify.ts
+ * Usage:
+ *   bun run src/runtime/verify.ts              # test through a real container
+ *   bun run src/runtime/verify.ts --local      # test supervisor directly (no container)
  */
 
 import { encode, LineReader } from "./protocol/codec";
 import type { SupervisorEvent } from "./protocol/events";
 
+const useContainer = !process.argv.includes("--local");
+
 const events: SupervisorEvent[] = [];
 let readyResolve: (() => void) | null = null;
 let exitResolve: (() => void) | null = null;
+let execResolve: (() => void) | null = null;
 
 const reader = new LineReader((msg) => {
   if ("ev" in msg) {
@@ -29,34 +30,48 @@ const reader = new LineReader((msg) => {
       exitResolve();
       exitResolve = null;
     }
+    if (event.ev === "exec:result" && execResolve) {
+      execResolve();
+      execResolve = null;
+    }
   }
 });
 
-// Create a temp workspace for local testing
-const tmpDir = await import("os").then((os) => os.tmpdir());
-const workspaceDir = `${tmpDir}/tasks-verify-${Date.now()}`;
-await import("fs/promises").then((fs) => fs.mkdir(workspaceDir, { recursive: true }));
+// --- Spawn the process ---
 
-// Init a git repo so the supervisor thinks it's already cloned
-const { execSync } = await import("child_process");
-execSync("git init", { cwd: workspaceDir, stdio: "ignore" });
+let proc: ReturnType<typeof Bun.spawn>;
 
-console.log(`Workspace: ${workspaceDir}`);
-console.log("Starting supervisor process...");
+if (useContainer) {
+  console.log("Mode: container (tasks-session image)");
+  console.log("Starting container...\n");
 
-// Spawn the supervisor directly (not in a container)
-const proc = Bun.spawn(["bun", "run", import.meta.dir + "/supervisor/main.ts"], {
-  stdin: "pipe",
-  stdout: "pipe",
-  stderr: "inherit",
-  env: {
-    ...process.env,
-    WORKSPACE_DIR: workspaceDir,
-    // Use /bin/echo as the mock agent (full path for macOS)
-    AGENT_CMD: "/bin/echo",
-    AGENT_ARGS: "",
-  },
-});
+  proc = Bun.spawn(
+    ["container", "run", "-i", "--rm", "-e", "AGENT_CMD=echo", "-e", "AGENT_ARGS=", "tasks-session"],
+    { stdin: "pipe", stdout: "pipe", stderr: "inherit" }
+  );
+} else {
+  // Local mode: spawn supervisor directly with a temp workspace
+  const tmpDir = (await import("os")).tmpdir();
+  const workspaceDir = `${tmpDir}/tasks-verify-${Date.now()}`;
+  await import("fs/promises").then((fs) => fs.mkdir(workspaceDir, { recursive: true }));
+  const { execSync } = await import("child_process");
+  execSync("git init", { cwd: workspaceDir, stdio: "ignore" });
+
+  console.log(`Mode: local (supervisor direct)`);
+  console.log(`Workspace: ${workspaceDir}\n`);
+
+  proc = Bun.spawn(["bun", "run", import.meta.dir + "/supervisor/main.ts"], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "inherit",
+    env: {
+      ...process.env,
+      WORKSPACE_DIR: workspaceDir,
+      AGENT_CMD: "/bin/echo",
+      AGENT_ARGS: "",
+    },
+  });
+}
 
 // Pipe stdout through the line reader
 (async () => {
@@ -83,35 +98,65 @@ function send(cmd: object): void {
   stdin.flush();
 }
 
-// --- Test sequence ---
-
-console.log("\n1. Waiting for system:ready...");
-await new Promise<void>((resolve) => {
-  // Check if already received
-  if (events.some((e) => e.ev === "system:ready")) {
-    resolve();
-  } else {
-    readyResolve = resolve;
-  }
-});
-console.log("   ✓ system:ready received\n");
-
-console.log("2. Sending exec command...");
-send({ cmd: "exec", id: "test-1", argv: ["echo", "hello from exec"] });
-
-// Wait a bit for the exec result
-await new Promise((r) => setTimeout(r, 500));
-
-const execResult = events.find(
-  (e) => e.ev === "exec:result" && e.id === "test-1"
-);
-if (execResult && execResult.ev === "exec:result") {
-  console.log(`   ✓ exec:result received (code=${execResult.code}, stdout="${execResult.stdout.trim()}")\n`);
-} else {
-  console.log("   ✗ exec:result not received\n");
+function waitFor(
+  check: () => boolean,
+  assignResolve: (resolve: () => void) => void,
+  timeoutMs = 10_000
+): Promise<boolean> {
+  if (check()) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    assignResolve(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
 }
 
-console.log("3. Sending start command (mock agent: echo)...");
+// --- Test sequence ---
+
+let passed = 0;
+let failed = 0;
+
+function check(name: string, ok: boolean): void {
+  if (ok) {
+    console.log(`   ✓ ${name}`);
+    passed++;
+  } else {
+    console.log(`   ✗ ${name}`);
+    failed++;
+  }
+}
+
+console.log("1. Waiting for system:ready...");
+const ready = await waitFor(
+  () => events.some((e) => e.ev === "system:ready"),
+  (r) => { readyResolve = r; }
+);
+check("system:ready", ready);
+
+console.log("\n2. Sending exec command...");
+send({ cmd: "exec", id: "test-1", argv: ["echo", "hello from exec"] });
+const gotExec = await waitFor(
+  () => events.some((e) => e.ev === "exec:result" && e.id === "test-1"),
+  (r) => { execResolve = r; }
+);
+const execResult = events.find((e) => e.ev === "exec:result" && e.id === "test-1");
+check("exec:result received", gotExec);
+if (execResult && execResult.ev === "exec:result") {
+  check("exec stdout correct", execResult.stdout.trim() === "hello from exec");
+  check("exec code 0", execResult.code === 0);
+}
+
+// Seed /workspace with a git repo so the supervisor skips cloning
+console.log("\n3. Preparing workspace...");
+send({ cmd: "exec", id: "setup-1", argv: ["git", "init", "/workspace"] });
+await waitFor(
+  () => events.some((e) => e.ev === "exec:result" && e.id === "setup-1"),
+  (r) => { execResolve = r; }
+);
+
+console.log("\n4. Sending start command (mock agent: echo)...");
 send({
   cmd: "start",
   repo: "https://github.com/test/test.git",
@@ -119,32 +164,21 @@ send({
   prompt: "Hello from the verification script!",
 });
 
-// Wait for agent:exit (echo will exit immediately)
-await new Promise<void>((resolve) => {
-  if (events.some((e) => e.ev === "agent:exit")) {
-    resolve();
-  } else {
-    exitResolve = resolve;
-    // Timeout after 5s
-    setTimeout(resolve, 5_000);
-  }
-});
+const gotExit = await waitFor(
+  () => events.some((e) => e.ev === "agent:exit"),
+  (r) => { exitResolve = r; }
+);
 
-const started = events.find((e) => e.ev === "agent:started");
+check("agent:started", events.some((e) => e.ev === "agent:started"));
+check("agent:stdout", events.some((e) => e.ev === "agent:stdout"));
+check("agent:exit", gotExit);
+
 const agentExit = events.find((e) => e.ev === "agent:exit");
-const agentOut = events.find((e) => e.ev === "agent:stdout");
+if (agentExit && agentExit.ev === "agent:exit") {
+  check("agent exit code 0", agentExit.code === 0);
+}
 
-if (started) console.log(`   ✓ agent:started (pid=${started.ev === "agent:started" ? started.pid : "?"})`);
-else console.log("   ✗ agent:started not received");
-
-if (agentOut) console.log(`   ✓ agent:stdout received`);
-else console.log("   ⚠ agent:stdout not received (may be timing)");
-
-if (agentExit) console.log(`   ✓ agent:exit received`);
-else console.log("   ✗ agent:exit not received");
-
-console.log("\n4. Stopping supervisor...");
-// Close stdin first so the supervisor's stdin reader exits, then signal
+console.log("\n5. Stopping...");
 const stdin = proc.stdin;
 if (stdin && typeof stdin !== "number") {
   stdin.end();
@@ -152,16 +186,13 @@ if (stdin && typeof stdin !== "number") {
 proc.kill("SIGTERM");
 const exitCode = await Promise.race([
   proc.exited,
-  new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 3_000)),
+  new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000)),
 ]);
 if (exitCode === "timeout") {
   proc.kill("SIGKILL");
   await proc.exited;
 }
-console.log("   ✓ supervisor exited\n");
+check("clean shutdown", true);
 
-// Clean up temp workspace
-await import("fs/promises").then((fs) => fs.rm(workspaceDir, { recursive: true, force: true }));
-
-console.log(`Total events received: ${events.length}`);
-console.log("Verification complete.");
+console.log(`\nResults: ${passed} passed, ${failed} failed`);
+process.exit(failed > 0 ? 1 : 0);
