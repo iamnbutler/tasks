@@ -15,3 +15,4 @@ tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 thiserror = "2.0"
+trait-variant = "0.1"

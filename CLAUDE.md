@@ -10,6 +10,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `example.md` — Worked example of the system in action
 - `crates/` — Rust crates (host-side server)
   - `events/` — Event system: append-only log, pub/sub
+  - `runtime/` — Session runtime: container lifecycle, protocol, transport
 - `src/` — TypeScript (supervisor that runs inside containers)
 
 ## Key decisions
