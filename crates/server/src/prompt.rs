@@ -14,8 +14,8 @@ use std::fmt::Write;
 pub struct PromptParams<'a> {
     /// Project system prompt contents (from workflow config file).
     pub system_prompt: Option<&'a str>,
-    /// Issue/PR number.
-    pub number: u64,
+    /// Issue/PR number (None for internal tasks).
+    pub number: Option<u64>,
     /// Issue/PR title.
     pub title: &'a str,
     /// Issue/PR body.
@@ -119,6 +119,49 @@ pub fn build_prompt(params: &PromptParams) -> String {
     out
 }
 
+/// Build a prompt directly from a Task and branch name.
+///
+/// Extracts the issue/PR number from the task source and builds retry
+/// context from the task's retry state. This keeps domain logic in the
+/// server crate rather than in the app's run loop.
+pub fn build_prompt_for_task(task: &crate::model::task::Task, branch: &str) -> String {
+    let number = match &task.source {
+        crate::model::task::TaskSource::GithubIssue { number, .. } => Some(*number),
+        crate::model::task::TaskSource::GithubPr { number, .. } => Some(*number),
+        crate::model::task::TaskSource::Internal => None,
+    };
+
+    let retry = if task.retry_count > 0 {
+        Some(RetryContext {
+            attempt: task.retry_count + 1,
+            previous_failure: "Previous session failed".to_string(),
+            // Conservative: only claim prior commits exist after the first retry,
+            // since the first attempt may have crashed before committing.
+            has_prior_commits: task.retry_count > 1,
+        })
+    } else {
+        None
+    };
+
+    let params = PromptParams {
+        system_prompt: None, // TODO: load from workflow.toml
+        number,
+        title: &task.title,
+        body: task.description.as_deref(),
+        comments: &[],      // TODO: fetch from GitHub at dispatch time
+        labels: &task.labels,
+        assignees: &[],
+        sub_issues: &[],
+        linked_items: &[],
+        branch,
+        parent: None,
+        related_tasks: &[],
+        retry: retry.as_ref(),
+    };
+
+    build_prompt(&params)
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -144,13 +187,17 @@ fn render_retry(out: &mut String, retry: &RetryContext) {
 
 fn render_task(out: &mut String, params: &PromptParams) {
     writeln!(out, "# Task\n").unwrap();
-    writeln!(out, "**{}** (#{})\n", params.title, params.number).unwrap();
+    if let Some(number) = params.number {
+        writeln!(out, "**{}** (#{})\n", params.title, number).unwrap();
+    } else {
+        writeln!(out, "**{}**\n", params.title).unwrap();
+    }
     if let Some(body) = params.body {
         writeln!(out, "{body}\n").unwrap();
     }
 }
 
-fn render_comments(out: &mut String, comments: &[CommentInfo], issue_number: u64) {
+fn render_comments(out: &mut String, comments: &[CommentInfo], issue_number: Option<u64>) {
     if comments.is_empty() {
         return;
     }
@@ -170,11 +217,15 @@ fn render_comments(out: &mut String, comments: &[CommentInfo], issue_number: u64
         }
 
         let omitted = total - HEAD_COMMENTS - TAIL_COMMENTS;
-        writeln!(
-            out,
-            "... ({omitted} comments omitted — use `gh issue view {issue_number} --comments` for full history) ...\n"
-        )
-        .unwrap();
+        if let Some(num) = issue_number {
+            writeln!(
+                out,
+                "... ({omitted} comments omitted — use `gh issue view {num} --comments` for full history) ...\n"
+            )
+            .unwrap();
+        } else {
+            writeln!(out, "... ({omitted} comments omitted) ...\n").unwrap();
+        }
 
         // Last TAIL_COMMENTS
         for c in &comments[total - TAIL_COMMENTS..] {
@@ -261,7 +312,7 @@ mod tests {
     fn minimal_params<'a>() -> PromptParams<'a> {
         PromptParams {
             system_prompt: None,
-            number: 42,
+            number: Some(42),
             title: "Implement widget",
             body: Some("Build the widget as described in the design doc."),
             comments: &[],

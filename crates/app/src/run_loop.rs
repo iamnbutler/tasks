@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
-use models::task::TaskSource;
+use server::model::task::TaskSource;
 use server::Server;
 use tasks_github::client::GitHubClient;
 use tasks_github::poller::RepoPoller;
@@ -220,40 +220,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .unwrap_or_default();
                             let branch = format!("tasks/{}", task.id);
 
-                            // Extract issue/PR number from source
-                            let number = match &task.source {
-                                models::task::TaskSource::GithubIssue { number, .. } => *number,
-                                models::task::TaskSource::GithubPr { number, .. } => *number,
-                                models::task::TaskSource::Internal => 0,
-                            };
-
-                            // Build the full prompt (spec §15)
-                            let retry = if task.retry_count > 0 {
-                                Some(server::prompt::RetryContext {
-                                    attempt: task.retry_count + 1,
-                                    previous_failure: "Previous session failed".to_string(),
-                                    has_prior_commits: true,
-                                })
-                            } else {
-                                None
-                            };
-
-                            let prompt_params = server::prompt::PromptParams {
-                                system_prompt: None, // TODO: load from workflow.toml
-                                number,
-                                title: &task.title,
-                                body: task.description.as_deref(),
-                                comments: &[], // TODO: fetch from GitHub on dispatch
-                                labels: &task.labels,
-                                assignees: &[],
-                                sub_issues: &[],
-                                linked_items: &[],
-                                branch: &branch,
-                                parent: None,
-                                related_tasks: &[],
-                                retry: retry.as_ref(),
-                            };
-                            let prompt = server::prompt::build_prompt(&prompt_params);
+                            let prompt = server::prompt::build_prompt_for_task(&task, &branch);
 
                             if let Err(e) = dispatch_session_mgr
                                 .start_session(
