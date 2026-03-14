@@ -10,6 +10,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `github.md` — GitHub integration: normalized model, GraphQL queries, polling
   - `example.md` — Worked example of the system in action
 - `crates/` — Rust crates (host-side server)
+  - `app/` — Binary entry point: startup, run loops, component wiring
   - `events/` — Event system: append-only log, pub/sub
   - `github/` — GitHub integration: GraphQL client, normalized model, polling
   - `runtime/` — Session runtime: container lifecycle, protocol, transport
