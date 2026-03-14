@@ -4,6 +4,8 @@ use std::time::Duration;
 
 /// Top-level app configuration.
 pub struct AppConfig {
+    /// Data directory (default: `~/.tasks`).
+    pub data_dir: String,
     /// GitHub personal access token.
     pub github_token: String,
     /// Global max concurrent sessions (default: 5).
@@ -23,6 +25,11 @@ pub struct AppConfig {
 impl AppConfig {
     /// Read configuration from environment variables.
     pub fn from_env() -> Result<Self, String> {
+        let data_dir = std::env::var("TASKS_DATA_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.tasks")
+        });
+
         let github_token = std::env::var("GITHUB_TOKEN")
             .map_err(|_| "GITHUB_TOKEN environment variable not set".to_string())?;
 
@@ -45,6 +52,7 @@ impl AppConfig {
             .unwrap_or(30u64);
 
         Ok(Self {
+            data_dir,
             github_token,
             max_sessions,
             poll_interval: Duration::from_secs(poll_interval_secs),

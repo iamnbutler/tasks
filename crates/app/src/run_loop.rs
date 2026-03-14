@@ -8,7 +8,6 @@ use tokio::sync::RwLock;
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
-use server::model::project::Project;
 use server::model::task::TaskSource;
 use server::Server;
 use tasks_github::client::GitHubClient;
@@ -22,6 +21,7 @@ use crate::config::AppConfig;
 /// dispatch tick loop, and session management.
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Tasks platform starting...");
+    eprintln!("  data_dir: {}", config.data_dir);
     eprintln!("  max_sessions: {}", config.max_sessions);
     eprintln!("  poll_interval: {:?}", config.poll_interval);
     eprintln!("  dispatch_interval: {:?}", config.dispatch_interval);
@@ -29,18 +29,23 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 1. Create infrastructure ---
 
-    // Event store — use a temp directory for now. Persistence is future work.
-    let event_dir = std::env::var("TASKS_EVENT_DIR").unwrap_or_else(|_| {
-        let dir = std::env::temp_dir().join("tasks-events");
-        std::fs::create_dir_all(&dir).ok();
-        dir.to_string_lossy().to_string()
-    });
-    let store = EventStore::new(&event_dir);
-    let bus = EventBus::new(store, 256);
+    std::fs::create_dir_all(&config.data_dir)?;
+
+    let db_path = format!("{}/db.sqlite", config.data_dir);
+    let store = tasks_store::Store::open(&db_path)?;
+
+    let event_dir = format!("{}/events", config.data_dir);
+    std::fs::create_dir_all(&event_dir)?;
+    let event_store = EventStore::new(&event_dir);
+    let bus = EventBus::new(event_store, 256);
 
     // --- 2. Create server ---
 
-    let server = Arc::new(Server::new(bus));
+    let server = Arc::new(Server::with_store(bus, store));
+    server
+        .load_from_store()
+        .await
+        .map_err(|e| format!("Failed to load state: {e}"))?;
 
     // --- 3. Create session manager ---
 
@@ -61,31 +66,19 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_hard_time_limit(config.session_hard_limit),
     );
 
-    // --- 4. Register projects and create pollers ---
-
-    let projects_str = std::env::var("TASKS_PROJECTS").unwrap_or_default();
+    // --- 4. Load projects from store and create pollers ---
 
     let mut pollers: Vec<(String, RepoPoller)> = Vec::new();
-
-    for repo_ref in projects_str
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
     {
-        let parts: Vec<&str> = repo_ref.split('/').collect();
-        if parts.len() != 2 {
-            eprintln!("Warning: invalid project reference: {repo_ref}");
-            continue;
+        let state = server.state.read().await;
+        for (project_id, project) in &state.projects {
+            let parts: Vec<&str> = project.repo.split('/').collect();
+            if parts.len() == 2 {
+                let client = GitHubClient::new(&config.github_token);
+                let poller = RepoPoller::new(client, parts[0], parts[1]);
+                pollers.push((project_id.clone(), poller));
+            }
         }
-        let (owner, repo) = (parts[0], parts[1]);
-        let project_id = repo_ref.to_string();
-
-        let project = Project::new(&project_id, repo_ref);
-        server.add_project(project).await;
-
-        let client = GitHubClient::new(&config.github_token);
-        let poller = RepoPoller::new(client, owner, repo);
-        pollers.push((project_id, poller));
     }
 
     // --- 5. Emit system:started ---
