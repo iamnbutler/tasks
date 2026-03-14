@@ -28,7 +28,7 @@
 # - Can decompose large issues into sub-issues
 # - Commits WIP and resumes across runs
 #
-# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"2b481ea49f4135b07f68240bb76a1bc57d4c6041ab0c85cc53d9c8e6d7816711","compiler_version":"v0.56.1","strict":true}
+# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"06be59592ff33360bd264f9432110fd8b022e1ef1ce5504756379b1a59742801","compiler_version":"v0.56.1","strict":true}
 
 name: "PR / Implement"
 "on":
@@ -336,7 +336,6 @@ jobs:
   agent:
     needs: activation
     runs-on: ubuntu-latest
-    environment: ci
     permissions: read-all
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

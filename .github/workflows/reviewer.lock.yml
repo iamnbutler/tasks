@@ -32,7 +32,7 @@
 #     - shared/formatting.md
 #     - shared/reporting.md
 #
-# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"615e3ae79d4f180c665897d9315962dadd05b3bb6849a9e2b8b9bf5575179850","compiler_version":"v0.56.1","strict":true}
+# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"91032ecfa54c2eb752ae9650bb36f90cafeb340227e550a82dd9f04aca53274f","compiler_version":"v0.56.1","strict":true}
 
 name: "PR / Review"
 "on":
@@ -276,7 +276,6 @@ jobs:
   agent:
     needs: activation
     runs-on: ubuntu-latest
-    environment: ci
     permissions:
       actions: read
       contents: read
