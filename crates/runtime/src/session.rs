@@ -75,13 +75,10 @@ impl<R: ContainerRuntime> Session<R> {
         let container_id = self.runtime.create(&self.config).await?;
         self.container_id = Some(container_id.clone());
 
-        // Start container
-        self.runtime.start(&container_id).await?;
-        self.state = SessionState::Starting;
-
-        // Attach transport
-        let transport = self.runtime.attach(&container_id)?;
+        // Start container and attach stdio
+        let transport = self.runtime.start(&container_id).await?;
         self.transport = Some(transport);
+        self.state = SessionState::Starting;
 
         // Wait for system:ready
         self.wait_ready(ready_timeout)?;
