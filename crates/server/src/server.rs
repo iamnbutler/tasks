@@ -65,9 +65,12 @@ impl ServerState {
 /// - Merge queue
 /// - Operating mode
 /// - Human presence tracking
+/// - Scheduler (Section 12: GitHub sync, issue/PR → task import)
+/// - Dispatcher (Section 12.6: priority-based dispatch with concurrency limits)
+/// - Workflow configuration (Section 10: project/label/prompt config)
+/// - Prompt construction (Section 11: system prompt + task context assembly)
 ///
 /// Not yet implemented (spec TODOs):
-/// - Scheduler (Section 12: dispatch logic TODO)
 /// - Web GUI serving (Section 3.1)
 /// - Websocket connections (Section 3.1)
 /// - Orchestrator integration (Section 4.2)
