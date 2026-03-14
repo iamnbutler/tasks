@@ -104,11 +104,37 @@ A project maps to a single repository (initially, for simplicity).
 ### 3.4 External Dependencies
 
 - GitHub API (Issues, PRs, webhooks) for issue tracking.
-- Local filesystem for workspaces, event logs, and session state.
+- Local filesystem and embedded database for persistent state (see §3.5).
 - Container runtime for session environments (see session-runtime.md).
 - Git CLI for branch and repository operations.
 - Coding agent executable (Claude Code initially) that supports chat-style interaction over stdio.
 - Host environment authentication for GitHub and the coding agent's AI provider.
+
+### 3.5 Data Storage
+
+The platform stores two categories of data with different access patterns:
+
+**Structured state.** Projects, tasks, merge queue entries, and configuration. This data is
+read-write, queried by various fields (e.g., "all tasks in waiting state for project X"), and
+must survive server restarts. Stored in a local embedded database (SQLite). The database is
+the source of truth for current state.
+
+**Event log.** The append-only record of everything that happened (spec §8). Events are written
+sequentially and read sequentially (replay, live subscriptions). Stored as per-task JSONL files
+on the local filesystem. The event log is the audit trail — it can reconstruct state, but the
+database is the primary read path for current state.
+
+The separation is intentional. The database is optimized for point queries and state mutations.
+The event log is optimized for append and sequential scan. Both live on the local filesystem —
+there is no external database server.
+
+**Data directory.** All persistent data lives under a single configurable root directory:
+
+- `{data_dir}/db.sqlite` — structured state
+- `{data_dir}/events/{task-id}/events.jsonl` — per-task event logs
+- `{data_dir}/workspaces/` — container workspace state (managed by the container runtime)
+
+The data directory defaults to `~/.tasks/` and is configurable at startup.
 
 ## 4. Actors and Roles
 
@@ -1369,6 +1395,7 @@ A conforming implementation must satisfy all of the following:
 
 - [ ] Server starts, tracks mode (Stop/Pause/Play), and enforces transition rules
 - [ ] Event system: append-only log with per-task storage, pub/sub with pattern matching
+- [ ] Persistent storage: embedded database for structured state, JSONL for event log (§3.5)
 - [ ] Human presence tracking based on active GUI connections
 - [ ] Multi-project support with per-project configuration
 
