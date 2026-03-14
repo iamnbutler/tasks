@@ -220,12 +220,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .unwrap_or_default();
                             let branch = format!("tasks/{}", task.id);
 
-                            // Build a basic prompt (full prompt construction is in server::prompt)
-                            let prompt = format!(
-                                "Implement: {} — {}",
-                                task.title,
-                                task.description.as_deref().unwrap_or("No description")
-                            );
+                            let prompt = server::prompt::build_prompt_for_task(&task, &branch);
 
                             if let Err(e) = dispatch_session_mgr
                                 .start_session(
