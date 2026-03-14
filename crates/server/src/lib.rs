@@ -9,6 +9,7 @@ pub mod merge_queue;
 pub mod presence;
 pub mod prompt;
 pub mod workflow;
+pub mod dispatcher;
 mod server;
 
 pub use mode::Mode;
