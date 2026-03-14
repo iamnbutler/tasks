@@ -85,6 +85,10 @@ pub struct Task {
     pub session_id: Option<String>,
     /// Workspace ID, if provisioned.
     pub workspace_id: Option<String>,
+    /// Number of times this task has been retried (spec §13.2).
+    pub retry_count: u32,
+    /// When the most recent failure occurred (spec §13.2).
+    pub last_failure_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -111,6 +115,8 @@ impl Task {
             priority: None,
             session_id: None,
             workspace_id: None,
+            retry_count: 0,
+            last_failure_at: None,
             created_at: now,
             updated_at: now,
         }
