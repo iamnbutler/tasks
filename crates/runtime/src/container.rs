@@ -64,6 +64,7 @@ pub trait ContainerRuntime {
 }
 
 /// Container runtime using the apple/container CLI.
+#[derive(Clone)]
 pub struct AppleContainerRuntime;
 
 impl AppleContainerRuntime {
