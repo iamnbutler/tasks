@@ -8,8 +8,11 @@ mod schema;
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use server::model::merge_queue::{MergeQueueEntry, MergeStatus};
 use server::model::project::Project;
+use server::model::task::{Task, TaskSource, TaskState};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -117,6 +120,99 @@ impl Store {
             .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
+
+    // ── Merge queue ──────────────────────────────────────────────
+
+    /// Insert or replace a merge queue entry.
+    pub fn save_merge_entry(&self, entry: &MergeQueueEntry) -> Result<(), StoreError> {
+        let status = serde_json::to_value(&entry.status)?
+            .as_str()
+            .unwrap()
+            .to_string();
+        let queued_at = entry.queued_at.to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
+        )?;
+        Ok(())
+    }
+
+    /// Get a merge queue entry by ID.
+    pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(row) => {
+                let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+                let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
+                let queued_at: DateTime<Utc> = queued_at_str
+                    .parse()
+                    .map_err(|e: chrono::ParseError| {
+                        serde_json::from_str::<()>(&e.to_string()).unwrap_err()
+                    })?;
+                Ok(Some(MergeQueueEntry {
+                    id,
+                    task_id,
+                    pr_url,
+                    status,
+                    queued_at,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all merge queue entries.
+    pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+            let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
+            let queued_at: DateTime<Utc> = queued_at_str
+                .parse()
+                .map_err(|e: chrono::ParseError| {
+                    serde_json::from_str::<()>(&e.to_string()).unwrap_err()
+                })?;
+            entries.push(MergeQueueEntry {
+                id,
+                task_id,
+                pr_url,
+                status,
+                queued_at,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Delete a merge queue entry by ID. Returns true if a row was deleted.
+    pub fn delete_merge_entry(&self, id: &str) -> Result<bool, StoreError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM merge_queue WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +289,78 @@ mod tests {
 
         let loaded = store.get_project("p1").unwrap().unwrap();
         assert_eq!(loaded.default_branch, "develop");
+    }
+
+    // ── Merge queue tests ────────────────────────────────────────
+
+    #[test]
+    fn save_and_get_merge_entry() {
+        let store = Store::open_memory().unwrap();
+        let entry = MergeQueueEntry::new("m1", "t1");
+        store.save_merge_entry(&entry).unwrap();
+
+        let loaded = store.get_merge_entry("m1").unwrap().unwrap();
+        assert_eq!(loaded.id, "m1");
+        assert_eq!(loaded.task_id, "t1");
+        assert_eq!(loaded.status, MergeStatus::Pending);
+        assert!(loaded.pr_url.is_none());
+    }
+
+    #[test]
+    fn list_merge_entries() {
+        let store = Store::open_memory().unwrap();
+        store
+            .save_merge_entry(&MergeQueueEntry::new("m1", "t1"))
+            .unwrap();
+        store
+            .save_merge_entry(&MergeQueueEntry::new("m2", "t2"))
+            .unwrap();
+
+        let entries = store.list_merge_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn delete_merge_entry() {
+        let store = Store::open_memory().unwrap();
+        store
+            .save_merge_entry(&MergeQueueEntry::new("m1", "t1"))
+            .unwrap();
+        assert!(store.delete_merge_entry("m1").unwrap());
+        assert!(store.get_merge_entry("m1").unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_status_roundtrip() {
+        let store = Store::open_memory().unwrap();
+
+        for (id, status) in [
+            ("m1", MergeStatus::Pending),
+            ("m2", MergeStatus::Approved),
+            ("m3", MergeStatus::Rejected),
+            ("m4", MergeStatus::Merged),
+            ("m5", MergeStatus::Conflict),
+        ] {
+            let mut entry = MergeQueueEntry::new(id, "t1");
+            entry.status = status;
+            store.save_merge_entry(&entry).unwrap();
+
+            let loaded = store.get_merge_entry(id).unwrap().unwrap();
+            assert_eq!(loaded.status, status, "failed for {id}");
+        }
+    }
+
+    #[test]
+    fn merge_entry_with_pr_url() {
+        let store = Store::open_memory().unwrap();
+        let mut entry = MergeQueueEntry::new("m1", "t1");
+        entry.pr_url = Some("https://github.com/owner/repo/pull/1".to_string());
+        store.save_merge_entry(&entry).unwrap();
+
+        let loaded = store.get_merge_entry("m1").unwrap().unwrap();
+        assert_eq!(
+            loaded.pr_url.as_deref(),
+            Some("https://github.com/owner/repo/pull/1")
+        );
     }
 }
