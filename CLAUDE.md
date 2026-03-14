@@ -16,6 +16,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `runtime/` — Session runtime: container lifecycle, protocol, transport
   - `server/` — Server: domain models, operating modes, merge queue, presence
   - `session/` — Session management: lifecycle, monitoring, event bridging
+  - `store/` — Persistent storage: SQLite for projects, tasks, merge queue
 - `src/` — TypeScript (supervisor that runs inside containers)
 
 ## Key decisions
