@@ -7,6 +7,7 @@ pub mod model;
 pub mod mode;
 pub mod merge_queue;
 pub mod presence;
+pub mod prompt;
 pub mod workflow;
 mod server;
 
