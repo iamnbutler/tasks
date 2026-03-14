@@ -20,7 +20,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-# Bun
+# Node.js (required for Claude Code)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Claude Code
+RUN npm install -g @anthropic-ai/claude-code
+
+# Bun (runs the supervisor)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
