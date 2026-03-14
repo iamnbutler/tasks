@@ -16,6 +16,8 @@ permissions:
   issues: read
   actions: read
 
+environment: ci
+
 engine: claude
 
 tools:
