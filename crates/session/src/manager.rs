@@ -364,3 +364,125 @@ async fn handle_exit(
     let event = events::Event::new(event_type, task_id, events::Actor::System, data);
     let _ = event_bus.publish(event).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    /// Create a test EventBus backed by a temp directory.
+    async fn test_event_bus() -> (Arc<EventBus>, broadcast::Receiver<Arc<events::Event>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = events::EventStore::new(dir.path());
+        let bus = Arc::new(events::EventBus::new(store, 64));
+        let rx = bus.subscribe();
+        (bus, rx)
+    }
+
+    #[tokio::test]
+    async fn agent_started_maps_to_running() {
+        let (bus, mut rx) = test_event_bus().await;
+        let event = runtime::protocol::Event::AgentStarted(
+            runtime::protocol::AgentStartedEvent { pid: 42 },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateRunning);
+        assert_eq!(received.task, "task-1");
+        assert_eq!(received.data["pid"], 42);
+    }
+
+    #[tokio::test]
+    async fn agent_stdout_maps_to_message() {
+        let (bus, mut rx) = test_event_bus().await;
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "hello world".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::AgentMessage);
+        assert_eq!(received.data["text"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn agent_stderr_maps_to_message() {
+        let (bus, mut rx) = test_event_bus().await;
+        let event = runtime::protocol::Event::AgentStderr(
+            runtime::protocol::AgentStderrEvent {
+                data: "error output".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::AgentMessage);
+        assert_eq!(received.data["text"], "error output");
+        assert_eq!(received.data["stream"], "stderr");
+    }
+
+    #[tokio::test]
+    async fn system_ready_not_mapped() {
+        let (bus, mut rx) = test_event_bus().await;
+        let event = runtime::protocol::Event::SystemReady(
+            runtime::protocol::SystemReadyEvent {},
+        );
+
+        handle_supervisor_event("task-1", &event, &bus).await;
+
+        // No event should have been published — try_recv should fail
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn exit_zero_maps_to_awaiting_merge() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(0),
+            signal: None,
+        };
+
+        handle_exit("task-1", &exit, false, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateAwaitingMerge);
+        assert_eq!(received.data["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn exit_nonzero_maps_to_failed() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+
+        handle_exit("task-1", &exit, false, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        assert_eq!(received.data["exit_code"], 1);
+    }
+
+    #[tokio::test]
+    async fn exit_includes_progress_flag() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+
+        handle_exit("task-1", &exit, true, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        assert_eq!(received.data["made_progress"], true);
+    }
+}
