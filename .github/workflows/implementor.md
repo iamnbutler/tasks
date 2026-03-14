@@ -55,8 +55,6 @@ tools:
     toolsets: [all]
   repo-memory: true
 
-environment: ci
-
 engine: claude
 
 steps:
