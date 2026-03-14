@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 events = { path = "../events" }
 runtime = { path = "../runtime" }
+tasks-github = { path = "../github" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

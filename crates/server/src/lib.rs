@@ -10,6 +10,7 @@ pub mod presence;
 pub mod prompt;
 pub mod workflow;
 pub mod dispatcher;
+pub mod scheduler;
 mod server;
 
 pub use mode::Mode;
