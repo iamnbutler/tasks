@@ -641,42 +641,791 @@ The scheduler discovers new and changed work through:
 The scheduler normalizes GitHub payloads into a stable internal model before emitting events.
 This keeps the rest of the system decoupled from GitHub-specific API shapes.
 
-_TODO: Define the normalized issue/PR model._
+See github.md for the full normalized model, GraphQL query design, client API, polling interface,
+and testing strategy.
 
 ## 12. Scheduling and Dispatch
 
-_TODO: Candidate selection, priority sorting, concurrency limits, dispatch logic._
+The dispatch system determines which tasks get worked on and when. The scheduler discovers work
+(§3.2, §11); the dispatcher decides what to run.
+
+### 12.1 Dispatch Loop
+
+The dispatcher is triggered in two ways:
+
+**Event-driven dispatch.** The dispatcher evaluates immediately when any of these events fire:
+
+- `task:created` — new task is available
+- `task:state:completed`, `task:state:failed`, `task:state:cancelled` — a slot freed up
+- `task:state:waiting` — a blocked task became unblocked
+- A `question`-state task receives an answer (human or orchestrator message)
+- `system:mode:pause`, `system:mode:play` — mode changed to one that allows dispatch
+
+**Reconciliation tick.** A periodic sweep (configurable, default 30 seconds) runs the same dispatch
+logic. This catches missed events, stuck states after restarts, and race conditions in event
+processing.
+
+Both triggers invoke the same dispatch evaluation function. The function is idempotent — running it
+multiple times in quick succession is harmless.
+
+**Mode gate.** Dispatch is only active in Pause and Play modes. In Stop mode, the dispatch function
+returns immediately. When transitioning from Stop to Pause or Play, the reconciliation tick
+triggers a full evaluation.
+
+### 12.2 Candidate Selection
+
+The dispatcher divides actionable tasks into two pools:
+
+**Resume candidates.** Tasks with existing sessions that need re-engagement:
+
+- Tasks in `question` state that have received an answer. These already hold a session slot —
+  resuming them is free from a concurrency perspective. The dispatcher sends the message to the
+  existing session immediately.
+- Tasks in `blocked` state that have become unblocked (all `blocked_by` tasks are in terminal
+  states). These transition to `waiting` and are dispatched with their existing workspace and
+  branch.
+
+Resume candidates are always processed before new work candidates. They represent in-progress work
+closer to completion and are cheaper to start.
+
+**New work candidates.** Tasks in `waiting` state with no active session. These require a new
+session, container, and workspace.
+
+### 12.3 Prioritization
+
+Within each pool, candidates are sorted by:
+
+1. **Explicit priority.** Lower `priority` number first. Tasks with null priority sort after all
+   explicitly prioritized tasks.
+2. **Unblocking value.** Tasks that appear in other tasks' `blocked_by` lists sort before tasks
+   that don't. This favors completing work that unblocks downstream tasks.
+3. **Recency.** Among otherwise equal tasks, newer tasks (`created_at` descending) go first.
+   In practice, older tasks in a backlog tend to be lower-priority or complex items; active work
+   is recent.
+
+The orchestrator influences dispatch indirectly by setting task priorities and creating or
+cancelling tasks, not by participating in the dispatch loop itself. This keeps dispatch fast and
+deterministic.
+
+### 12.4 Concurrency Limits
+
+Two limits control how many tasks can run simultaneously:
+
+- **Global limit** (`max_sessions`, required). Total active sessions across all projects. This is
+  the primary resource constraint — each session is a container consuming host CPU and memory.
+  Default: 5.
+- **Per-project limit** (`max_sessions` on project config, optional). Prevents one project from
+  consuming all available slots. Defaults to the global limit if unset.
+
+### 12.5 Slot Accounting
+
+A task holds a slot from when its session is created until the session ends:
+
+- `running` — holds a slot (agent actively working)
+- `question` — holds a slot (session is live, container running, agent waiting)
+- `testing` — holds a slot (CI may be running inside the container)
+- `waiting`, `blocked` — does not hold a slot
+- `awaiting_merge`, `conflict` — does not hold a slot (session has ended, work is complete)
+- Terminal states (`completed`, `failed`, `cancelled`) — does not hold a slot
+
+The dispatcher counts slots by counting tasks in slot-holding states, not by tracking session
+objects. This keeps the accounting simple and derivable from task state.
+
+### 12.6 Dispatch Evaluation
+
+On each evaluation, the dispatcher:
+
+1. Checks mode. If Stop, return immediately.
+2. Processes all resume candidates (free — no slot cost for `question` answers).
+3. Counts active slots globally and per-project.
+4. Collects new work candidates, sorted by priority rules (§12.3).
+5. For each candidate in order: if both global and project slot limits have room, create a session
+   and start the task. Otherwise, the task remains in `waiting`.
 
 ## 13. Retry and Recovery
 
-_TODO: Exponential backoff, continuation retries, restart recovery, failure classes._
+### 13.1 Failure Classes
+
+The system categorizes failures to determine the appropriate response:
+
+**Transient failures.** Temporary problems likely to resolve on their own:
+- Network errors (GitHub API timeouts, DNS failures)
+- Container startup failures (resource pressure, daemon hiccups)
+- Agent process crashes (non-deterministic, may succeed on retry)
+
+Response: Retry with exponential backoff.
+
+**Deterministic failures.** Problems that will recur if retried with the same inputs:
+- Agent repeatedly fails on the same task (same error multiple times)
+- Invalid task configuration (missing repo, bad branch)
+- Authentication failures (expired token, revoked access)
+
+Response: Mark the task as `failed`, emit an event, surface to the orchestrator or human. Do not
+retry automatically.
+
+**Infrastructure failures.** The host or server itself has a problem:
+- Server crash and restart
+- Container runtime unavailable
+- Disk full
+
+Response: Recover on restart via reconciliation (§13.3).
+
+The system distinguishes transient from deterministic failures using a **retry counter per task**.
+If a task fails and is retried N times (configurable, default: 3) without making progress, it is
+reclassified as deterministic and marked `failed`.
+
+"Making progress" means the agent produced commits, changed task state, or ran for longer than a
+minimum duration (configurable, default: 60 seconds). A task that crashes immediately on start 3
+times in a row is deterministic. A task that runs for 10 minutes and then hits an edge case is
+still worth retrying.
+
+### 13.2 Retry Behavior
+
+**Exponential backoff.** When a transient failure occurs, the system retries with increasing
+delays:
+
+- Base delay: 5 seconds
+- Multiplier: 2x per attempt
+- Maximum delay: 5 minutes
+- Jitter: ±25% (prevents thundering herd when multiple tasks fail simultaneously)
+
+Sequence: ~5s, ~10s, ~20s, ~40s, ~80s, capped at ~300s.
+
+**Retry scope.** Retries apply at two levels:
+
+- **API retries.** GitHub API calls, container runtime commands, and other infrastructure
+  operations retry transparently within the client code. The caller does not see transient failures
+  unless retries are exhausted. Max attempts: 3.
+- **Task retries.** When an agent session fails (agent crashes, container dies), the dispatcher
+  can restart the session for the same task. The workspace and branch persist, so the new session
+  picks up from the repo state. Max attempts: 3 (configurable per project).
+
+**Retry state.** Each task tracks:
+
+- `retry_count` (integer) — number of times this task has been retried
+- `last_failure_at` (timestamp or null) — when the most recent failure occurred
+
+These fields are used by the dispatcher to calculate backoff delay. A task whose
+`last_failure_at` plus its current backoff interval is still in the future is not eligible for
+dispatch.
+
+**Retry vs. new session.** A retry creates a new session in the existing workspace. The agent
+starts fresh but the repo state (commits, branch) reflects prior work. This is the same behavior
+as restarting after Stop mode (§9.5).
+
+### 13.3 Restart Recovery
+
+When the server restarts, it reconciles its in-memory state with persistent state:
+
+1. **Reload task state.** Tasks are persisted (event log is the source of truth). Replay each
+   task's event stream to reconstruct current state.
+2. **Detect orphaned sessions.** Tasks in `running` or `question` state may have had their
+   agent process killed by the restart. The server checks whether each session's container is
+   still alive.
+3. **Recover or fail.** For tasks with dead sessions:
+   - If `retry_count` < max retries, transition to `waiting` with an incremented retry count.
+     The dispatcher picks them up on the next evaluation.
+   - If retries exhausted, transition to `failed`.
+4. **Resume the dispatch loop.** The reconciliation tick fires, evaluating all `waiting` tasks.
+
+Container state may persist across server restarts (the containers are independent processes).
+If a container is still running, the server re-attaches to its stdio and resumes the session
+without restarting the agent.
+
+### 13.4 Failure Surfacing
+
+When a task fails (retries exhausted or deterministic failure):
+
+- A `task:state:failed` event is emitted with failure details in the event data.
+- If the human is present, the orchestrator surfaces the failure in conversation.
+- If the human is absent, the failure is logged and visible in the UI on return.
+- The orchestrator may attempt to diagnose the failure and suggest a course of action (retry with
+  different parameters, break the task into smaller pieces, escalate to the human).
 
 ## 14. Workflow Configuration
 
-_TODO: WORKFLOW.md format, front matter schema, prompt templates, dynamic reload._
+Each project can customize how tasks are handled through a workflow configuration file in the
+repository.
+
+### 14.1 Configuration File
+
+The workflow configuration lives at `workflow.toml` in the project's repository root. This
+file is read when the project is added to the server and can be reloaded dynamically.
+
+```toml
+[project]
+max_sessions = 3                # Per-project concurrency limit (§12.4)
+default_branch = "main"         # Override project default branch
+
+[dispatch]
+max_retries = 3                 # Task retry limit (§13.2)
+retry_base_delay = 5            # Base backoff delay in seconds
+progress_threshold = 60         # Minimum runtime (seconds) to count as "progress" (§13.1)
+
+[labels]
+# Map GitHub labels to task behavior.
+# Tasks with "blocked" label start in blocked state.
+# Tasks with "ignore" label are not imported.
+ignore = ["wontfix", "duplicate", "ignore"]
+blocked = ["blocked", "waiting-on-external"]
+
+[prompt]
+# Path to a system prompt file included in every agent session for this project.
+# Relative to repo root.
+system_prompt = "system-prompt.md"
+```
+
+### 14.2 Label Mapping
+
+The `[labels]` section controls how GitHub labels affect task behavior:
+
+- **ignore:** Issues with any of these labels are skipped during import. The scheduler does not
+  create tasks for them.
+- **blocked:** Issues with any of these labels start in `blocked` state instead of `waiting`.
+
+Labels not listed in the configuration have no special meaning to the dispatch system. The
+orchestrator and human can still use them for their own organizational purposes.
+
+### 14.3 Dynamic Reload
+
+The server watches for configuration changes:
+
+- When the configuration file changes (detected via polling the repo or webhook), the server
+  reloads it and emits a `system:config:reloaded` event.
+- Active sessions are not affected — configuration changes apply to newly created sessions and
+  future dispatch decisions.
+- Invalid configuration is rejected with a warning. The previous valid configuration remains in
+  effect.
 
 ## 15. Prompt Construction
 
-_TODO: How task details are assembled into agent prompts, template rendering, retry/continuation
-context._
+When a session starts, the server constructs a prompt for the agent based on the task's details
+and project context. The prompt is the agent's entire understanding of what it needs to do.
+
+### 15.1 Prompt Structure
+
+The prompt is assembled from several layers, concatenated in order:
+
+1. **System prompt (project-level).** The contents of the file referenced by
+   `[prompt].system_prompt` in the workflow configuration (§14.1). This typically contains
+   project conventions, coding standards, and repository-specific context. If not configured,
+   this layer is omitted.
+
+2. **Task description.** The core of the prompt — what the agent needs to do:
+   - Issue/PR title and body
+   - Comments: the first 10 and last 10 comments, chronologically ordered. If there are more
+     than 20 comments, a note is inserted between the two groups indicating how many were omitted
+     and that the agent can use `gh` CLI to fetch the full history.
+   - Labels and assignees
+   - Sub-issues (titles and states, for context)
+   - Linked PRs or issues (titles and states)
+
+3. **Task context.** Additional context the server provides:
+   - Parent task details (if this is a sub-task)
+   - Related task summaries (tasks in the same project that are in progress or recently completed,
+     to help the agent avoid conflicts)
+   - The git branch name and whether prior work exists on it
+
+4. **Behavioral instructions.** Instructions that control how the agent operates:
+   - Commit and push work to the branch when done
+   - Do not merge — the merge queue handles that
+   - If stuck, describe the problem clearly so the orchestrator or human can help
+   - If the task is ambiguous, ask for clarification rather than guessing
+
+### 15.2 Retry and Continuation Context
+
+When a task is being retried (§13.2), additional context is prepended:
+
+- A note that this is a retry, not a first attempt
+- The previous session's failure mode (crash, error message, timeout)
+- What progress was made (commits on the branch, if any)
+- Guidance to try a different approach if the previous one failed
+
+When a task receives a human or orchestrator message while in `question` state, the message is
+delivered via the session's chat interface (§9.2), not by reconstructing the prompt.
+
+### 15.3 Prompt Rendering
+
+The prompt is rendered as plain Markdown. No template engine — the server concatenates the
+sections with clear headings. This keeps the system simple and the prompts inspectable.
+
+```markdown
+# Project Context
+
+{contents of system-prompt.md}
+
+# Task
+
+**{title}** (#{number})
+
+{body}
+
+## Comments
+
+**{author}** ({timestamp}):
+{comment body}
+
+... (showing first 10 and last 10 of {total} comments — use `gh issue view {number} --comments` for full history)
+
+**{author}** ({timestamp}):
+{comment body}
+
+## Context
+
+- Branch: `tasks/{task-id}`
+- Parent task: #{parent_number} — {parent_title}
+- Related in-progress tasks: #{n1} — {title1}, #{n2} — {title2}
+
+## Instructions
+
+- Work on the branch `tasks/{task-id}`. Commit and push your changes when done.
+- Do not merge into main. The merge queue handles merging.
+- If you are stuck or the task is ambiguous, describe the problem clearly.
+```
 
 ## 16. Observability
 
-_TODO: Structured logging, GUI dashboard, runtime snapshots, token/cost accounting._
+### 16.1 Structured Logging
+
+All server components emit structured log entries (JSON) with consistent fields:
+
+- `ts` — timestamp
+- `level` — trace, debug, info, warn, error
+- `component` — which subsystem (scheduler, dispatcher, session, merge_queue, orchestrator)
+- `task_id` — if the log relates to a specific task
+- `session_id` — if the log relates to a specific session
+- `message` — human-readable description
+- `data` — additional structured data
+
+Logs are written to stdout and optionally to a file. The log level is configurable at startup
+and can be changed at runtime.
+
+### 16.2 GUI Dashboard
+
+The web GUI (§3.1) provides a real-time view of system state:
+
+- **System status.** Current operating mode, active session count, slot utilization.
+- **Task list.** All tasks with current state, priority, and session status. Filterable by
+  project, state, and label.
+- **Session view.** For each active session: agent output stream (live), chat history, task
+  details, git branch status.
+- **Merge queue.** Pending, approved, and recently merged items. Review and approve/reject
+  from the UI.
+- **Event stream.** Live feed of events across all tasks, filterable by type and task.
+- **Orchestrator chat.** Persistent conversation with the orchestrator.
+
+### 16.3 Runtime Snapshots
+
+The server exposes a snapshot endpoint (HTTP GET) that returns the full system state as JSON:
+
+- All tasks and their current states
+- All active sessions and their statuses
+- Merge queue contents
+- Current operating mode
+- Rate limit state for each project's GitHub connection
+- Slot utilization (active / max, global and per-project)
+
+This is useful for debugging, monitoring integrations, and the GUI's initial page load.
+
+### 16.4 Token and Cost Accounting
+
+The server tracks resource consumption per task and per project:
+
+- **Agent tokens.** Input and output token counts per session, sourced from agent output parsing
+  (agent-provider-specific). Accumulated per task and per project.
+- **API calls.** GitHub API calls and rate limit point consumption per project per polling cycle.
+- **Session duration.** Wall-clock time per session, from creation to termination.
+- **Container resources.** CPU and memory utilization per session (if available from the container
+  runtime).
+
+Accounting data is stored as events (`system:accounting:*`) and surfaced in the GUI dashboard.
+Cost estimation (mapping tokens to dollars) is not built in — the accounting provides the raw
+numbers, and the human can interpret them with their provider's pricing.
 
 ## 17. Security and Safety
 
-_TODO: Workspace isolation, secret handling, trust boundaries, agent sandboxing._
+### 17.1 Workspace Isolation
+
+Session isolation is provided by the container runtime (session-runtime.md §2):
+
+- Each session runs in its own lightweight VM (apple/container).
+- Processes in one session cannot see or affect processes in another.
+- Each session has its own filesystem. No shared mounts between sessions.
+- The host filesystem is not accessible from inside containers.
+
+### 17.2 Secret Handling
+
+Secrets are injected into containers as environment variables at creation time
+(session-runtime.md §3.1):
+
+- `GITHUB_TOKEN` — for git operations and `gh` CLI.
+- Agent-provider API keys (e.g., `ANTHROPIC_API_KEY`).
+
+Security properties:
+
+- Secrets are never written to disk inside the container (environment variables only).
+- Secrets are not included in event logs, task state, or any persisted data.
+- Secrets are not passed through the supervisor protocol — they are set at container creation
+  and available to all processes inside the container.
+- Each project can use a different GitHub token with scoped permissions (e.g., repo-level
+  fine-grained PAT).
+
+Secrets are configured on the server side (environment variables, config file, or secret
+manager). The server reads them and passes them to the container runtime at session creation.
+The mechanism for configuring secrets on the server is an operational concern, not specified here.
+
+### 17.3 Trust Boundaries
+
+The system has three trust boundaries:
+
+1. **Host ↔ Container.** The container is untrusted from the host's perspective. The agent can
+   execute arbitrary code inside the container, but cannot affect the host. Communication is
+   limited to the supervisor protocol over stdio.
+
+2. **Server ↔ GitHub.** The server reads from GitHub using authenticated API calls. GitHub is
+   trusted as the source of truth for issues and PRs. The server does not write to GitHub
+   directly — all mutations happen through agents inside containers.
+
+3. **Server ↔ Agent provider.** API keys for the agent's AI provider are passed into containers.
+   The server trusts the agent provider's API but limits exposure by scoping keys to the minimum
+   required permissions where possible.
+
+### 17.4 Agent Sandboxing
+
+Agents run inside containers with the following constraints:
+
+- **Network access.** Agents have unrestricted network access. They need it for git operations,
+  package installation (npm, cargo, pip), AI provider APIs, and potentially browsing
+  documentation. Network restriction is not enforced at the container level.
+- **Filesystem.** Agents can read and write anywhere inside their container. The container's
+  filesystem is ephemeral and isolated — nothing persists beyond the container's lifetime except
+  git pushes.
+- **Process execution.** Agents can spawn arbitrary processes inside their container (build tools,
+  test runners, language servers). This is required for them to do their job.
+- **Resource limits.** CPU and memory limits are set at container creation (session-runtime.md
+  §2.1). Default limits are configurable per project.
+- **Time limits.** Sessions have a soft limit and a hard limit on wall-clock duration:
+  - **Soft limit** (configurable, default: 1 hour). When reached, the server nudges the
+    orchestrator or human that the session is running long. The orchestrator may intervene
+    (provide guidance, break the task into smaller pieces) or the human may extend or steer.
+  - **Hard limit** (soft limit + 15 minutes). If no intervention occurs after the nudge, the
+    session is terminated and the task is retried or failed per §13.
+
+The sandboxing model is: give agents everything they need to do their work, but contain the blast
+radius to a single disposable VM.
 
 ## 18. Reference Algorithms
 
-_TODO: Pseudocode for key flows (dispatch tick, session lifecycle, merge queue processing,
-event routing)._
+### 18.1 Dispatch Tick
+
+```
+function dispatch_tick(server):
+    if server.mode == Stop:
+        return
+
+    # Phase 1: Resume candidates (free — no slot cost).
+    for task in server.tasks where task.state == Question:
+        if task has pending message:
+            send message to task.session
+            set task.state = Running
+
+    # Phase 2: Unblock tasks whose dependencies completed.
+    for task in server.tasks where task.state == Blocked:
+        if all tasks in task.blocked_by are terminal:
+            set task.state = Waiting
+
+    # Phase 3: Dispatch new work.
+    candidates = server.tasks
+        where state == Waiting
+        and retry_backoff_elapsed(task)
+        sorted by priority_sort(task)
+
+    for task in candidates:
+        global_slots = count(server.tasks where state in {Running, Question, Testing})
+        project_slots = count(server.tasks
+            where project == task.project
+            and state in {Running, Question, Testing})
+
+        if global_slots >= server.max_sessions:
+            break
+        if project_slots >= task.project.max_sessions:
+            continue
+
+        session = create_session(task)
+        prompt = build_prompt(task)
+        session.start(prompt)
+        set task.state = Running
+        emit task:state:running
+```
+
+### 18.2 Session Lifecycle
+
+```
+function create_session(task):
+    container = runtime.create(task.project.image, task.project.env)
+    runtime.start(container)
+    transport = runtime.attach(container)
+
+    wait for system:ready event on transport
+
+    session = Session {
+        id: new_uuid(),
+        task_id: task.id,
+        container: container,
+        transport: transport,
+        status: Ready,
+    }
+
+    task.session_id = session.id
+    return session
+
+function start_session(session, prompt):
+    send start command {
+        repo: session.task.project.repo_url,
+        branch: session.task.branch,
+        prompt: prompt,
+    } over session.transport
+
+    # Monitor agent output.
+    loop:
+        event = session.transport.recv()
+        match event:
+            agent:started -> emit task:state:running
+            agent:stdout  -> emit agent:message, check for question patterns
+            agent:stderr  -> log warning
+            agent:exit(0) -> emit task:state:testing or task:state:awaiting_merge
+            agent:exit(n) -> handle_failure(session, exit_code=n)
+
+function handle_failure(session, exit_code):
+    task = session.task
+    task.retry_count += 1
+    task.last_failure_at = now()
+
+    if task.retry_count >= max_retries:
+        set task.state = Failed
+        emit task:state:failed
+    else:
+        set task.state = Waiting
+        emit task:state:waiting
+        # Dispatcher will pick it up after backoff.
+```
+
+### 18.3 Merge Queue Processing
+
+```
+function process_merge_queue(server):
+    if server.mode == Stop:
+        return
+    if server.mode == Pause:
+        return  # Queue is held. Only Flush triggers processing.
+
+    # Play mode: orchestrator has merge authority.
+    for entry in server.merge_queue where status == Pending:
+        evaluation = orchestrator.evaluate(entry.task)
+
+        if evaluation.approved:
+            entry.status = Approved
+            emit merge:approved
+
+            conflict = check_merge_conflicts(entry)
+            if conflict:
+                entry.status = Conflict
+                entry.task.state = Conflict
+                emit merge:conflict
+                continue
+
+            perform_merge(entry)
+            entry.status = Merged
+            entry.task.state = Completed
+            emit merge:completed
+            emit task:state:completed
+        else:
+            entry.status = Rejected
+            emit merge:rejected
+            # Send task back to implementor with feedback.
+            restart_with_feedback(entry.task, evaluation.feedback)
+
+function flush_merge_queue(server):
+    # Only callable in Pause mode.
+    for entry in server.merge_queue where status == Approved:
+        conflict = check_merge_conflicts(entry)
+        if conflict:
+            entry.status = Conflict
+            entry.task.state = Conflict
+            emit merge:conflict
+            continue
+
+        perform_merge(entry)
+        entry.status = Merged
+        entry.task.state = Completed
+        emit merge:completed
+        emit task:state:completed
+
+    emit system:flush
+```
+
+### 18.4 Event Routing
+
+```
+function publish(bus, event):
+    # Persist to task-specific log.
+    bus.store.append(event.task, event)
+
+    # Broadcast to live subscribers.
+    for subscriber in bus.subscribers:
+        if matches(subscriber.pattern, event.type)
+           and matches(subscriber.task_filter, event.task):
+            subscriber.send(event)
+
+function matches(pattern, event_type):
+    # Colon-delimited pattern matching with wildcard support.
+    pattern_parts = pattern.split(":")
+    type_parts = event_type.split(":")
+
+    for i in 0..pattern_parts.len():
+        if pattern_parts[i] == "*":
+            return true  # Wildcard matches all remaining segments.
+        if i >= type_parts.len():
+            return false
+        if pattern_parts[i] != type_parts[i]:
+            return false
+
+    return pattern_parts.len() == type_parts.len()
+```
 
 ## 19. Test and Validation Matrix
 
-_TODO: Core conformance tests, extension tests, integration test profile._
+### 19.1 Unit Tests
+
+Each crate has unit tests covering its core logic in isolation:
+
+| Crate | Coverage |
+|-------|----------|
+| events | Event serialization, pattern matching, wildcards, store append/read, bus publish/subscribe/replay |
+| github | Response normalization, GraphQL response deserialization, rate limit parsing, pagination cursor handling, filter construction |
+| runtime | Protocol codec (encode/decode/partial lines), command/event serialization |
+| server | Mode transitions (all actor/direction combinations), task state transitions, merge queue operations (enqueue/approve/reject/flush/conflict/cleanup), presence tracking, slot accounting |
+
+### 19.2 Mock Integration Tests
+
+Tests that use mock servers or in-process fakes to test cross-component behavior:
+
+| Component | Coverage |
+|-----------|----------|
+| GitHub client | List/get issues and PRs, pagination, nested comment/review fetching, error handling (auth, not found, GraphQL errors, rate limiting), since-based filtering |
+| Poller | High-water mark advancement, failure recovery (mark not advanced), empty poll stability |
+| Dispatcher | Candidate selection (resume vs new), priority sorting, concurrency enforcement (global and per-project), mode gating, backoff eligibility |
+| Merge queue | Mode-dependent behavior (Stop/Pause/Play), flush in Pause, conflict detection, rejection with feedback |
+
+### 19.3 Container Integration Tests
+
+Tests that exercise the full session lifecycle with real containers. These are slower and require
+the container runtime to be available.
+
+| Test | What it validates |
+|------|-------------------|
+| Session start | Container creation, supervisor ready, agent launch |
+| Agent execution | Send prompt, receive output, agent exits cleanly |
+| Chat injection | Send message to running agent, receive response |
+| Exec command | Run command inside container, receive result |
+| Session restart | Stop agent, restart in same workspace, verify repo state persists |
+| Session cleanup | Destroy container, verify resources released |
+
+These tests use a mock agent (simple echo process) to avoid depending on a real AI provider.
+The existing `verify.ts` script (§session-runtime.md) is the foundation for these tests.
+
+### 19.4 End-to-End Tests
+
+Full system tests that exercise the platform from issue discovery to merge:
+
+| Test | What it validates |
+|------|-------------------|
+| Happy path | Issue created → task dispatched → agent completes → merge queue → merged |
+| Question flow | Agent asks question → human answers → agent resumes → completes |
+| Retry on failure | Agent crashes → task retried → succeeds on second attempt |
+| Concurrency | Multiple tasks dispatched up to limit, excess tasks wait |
+| Mode transitions | Stop halts agents, Pause holds merges, Play resumes everything |
+| Conflict resolution | Two tasks complete, second has conflict, gets re-engaged |
+| Priority ordering | Higher-priority task dispatched before lower-priority |
+
+End-to-end tests use a fixture GitHub repository (or mock server) and a mock agent. They
+exercise the full dispatch → session → merge pipeline.
+
+### 19.5 Test Environment
+
+- **Unit and mock tests:** Run with `cargo test` and require no external dependencies.
+- **Container tests:** Require the container runtime (`container` CLI) and a pre-built base image.
+  Gated behind a `--features container` flag.
+- **End-to-end tests:** Require container runtime and optionally a GitHub token for live API
+  tests. Gated behind `--features e2e`.
+- **GitHub integration tests:** Require a `GITHUB_TOKEN` and a fixture repository. Gated behind
+  `--features integration`.
 
 ## 20. Implementation Checklist
 
-_TODO: Definition of done for a conforming implementation._
+A conforming implementation must satisfy all of the following:
+
+### 20.1 Core Platform
+
+- [ ] Server starts, tracks mode (Stop/Pause/Play), and enforces transition rules
+- [ ] Event system: append-only log with per-task storage, pub/sub with pattern matching
+- [ ] Human presence tracking based on active GUI connections
+- [ ] Multi-project support with per-project configuration
+
+### 20.2 GitHub Integration
+
+- [ ] GraphQL client fetches issues and PRs with full metadata
+- [ ] Normalized model decoupled from GitHub API shapes
+- [ ] Polling with high-water mark for incremental discovery
+- [ ] Rate limit tracking and backoff
+
+### 20.3 Scheduling and Dispatch
+
+- [ ] Event-driven dispatch with reconciliation tick
+- [ ] Candidate selection: resume candidates before new work
+- [ ] Priority sorting: explicit priority → unblocking value → recency
+- [ ] Global and per-project concurrency limits with slot accounting
+- [ ] Mode-gated dispatch (no dispatch in Stop)
+
+### 20.4 Sessions and Agent Runner
+
+- [ ] Container lifecycle: create, start, attach, stop, destroy
+- [ ] Supervisor protocol: start, chat, stop, exec commands; all event types
+- [ ] Session lifecycle: creation → ready → running → ended
+- [ ] Chat injection from human and orchestrator
+- [ ] Workspace persistence across session restarts
+- [ ] Session soft/hard time limits with escalation nudge
+
+### 20.5 Merge Queue
+
+- [ ] Queue entry lifecycle: pending → approved/rejected → merged/conflict
+- [ ] Mode-dependent merge authority (Stop: held, Pause: held with flush, Play: orchestrator)
+- [ ] Conflict detection and re-engagement
+- [ ] Quality evaluation by orchestrator before queuing
+
+### 20.6 Retry and Recovery
+
+- [ ] Failure classification (transient vs deterministic)
+- [ ] Exponential backoff with jitter
+- [ ] Progress detection to distinguish transient from deterministic failures
+- [ ] Server restart recovery: state reconstruction from event log, orphaned session detection
+- [ ] Failure surfacing to orchestrator and human
+
+### 20.7 Prompt Construction
+
+- [ ] Layered prompt assembly: system prompt, task description, context, instructions
+- [ ] Retry context for failed tasks
+- [ ] Project-level system prompt from workflow configuration
+
+### 20.8 Observability
+
+- [ ] Structured JSON logging with consistent fields
+- [ ] Runtime snapshot endpoint (full system state as JSON)
+- [ ] Token and cost accounting per task and per project
+- [ ] GUI dashboard with live task list, session view, merge queue, event stream
+
+### 20.9 Security
+
+- [ ] Session isolation via container runtime
+- [ ] Secret injection via environment variables (not persisted in logs or state)
+- [ ] Session time limits
