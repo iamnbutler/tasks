@@ -1,0 +1,699 @@
+//! GitHub GraphQL client — spec github.md §4.
+
+use std::sync::RwLock;
+
+use chrono::{DateTime, Utc};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
+use serde_json::json;
+
+use crate::error::GitHubError;
+use crate::model::{
+    Issue, IssueFilters, IssueState, PullRequest, PullRequestFilters, PullRequestState, RateLimit,
+};
+use crate::queries;
+use crate::response::*;
+
+/// Maximum items per page (GitHub's limit).
+const DEFAULT_PAGE_SIZE: u32 = 100;
+
+/// Default maximum pages to fetch before stopping.
+const DEFAULT_MAX_PAGES: u32 = 10;
+
+/// Default rate limit floor — pause requests below this threshold.
+const DEFAULT_RATE_LIMIT_FLOOR: u32 = 200;
+
+/// GitHub GraphQL API client (spec github.md §4).
+pub struct GitHubClient {
+    http: reqwest::Client,
+    base_url: String,
+    max_pages: u32,
+    rate_limit_floor: u32,
+    rate_limit: RwLock<Option<RateLimit>>,
+}
+
+/// Builder for constructing a [`GitHubClient`] with custom settings.
+pub struct GitHubClientBuilder {
+    token: String,
+    base_url: String,
+    max_pages: u32,
+    rate_limit_floor: u32,
+}
+
+impl GitHubClientBuilder {
+    /// Override the GitHub API base URL (for GitHub Enterprise or testing).
+    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    /// Maximum number of pages to fetch per query (default: 10).
+    pub fn max_pages(mut self, max: u32) -> Self {
+        self.max_pages = max;
+        self
+    }
+
+    /// Minimum remaining rate limit points before pausing (default: 200).
+    pub fn rate_limit_floor(mut self, floor: u32) -> Self {
+        self.rate_limit_floor = floor;
+        self
+    }
+
+    /// Build the client.
+    pub fn build(self) -> GitHubClient {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .expect("invalid token characters"),
+        );
+        headers.insert(USER_AGENT, HeaderValue::from_static("tasks-github"));
+
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("failed to build HTTP client");
+
+        GitHubClient {
+            http,
+            base_url: self.base_url,
+            max_pages: self.max_pages,
+            rate_limit_floor: self.rate_limit_floor,
+            rate_limit: RwLock::new(None),
+        }
+    }
+}
+
+impl GitHubClient {
+    /// Create a new client with a personal access token.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self::builder(token).build()
+    }
+
+    /// Create a builder for customizing the client.
+    pub fn builder(token: impl Into<String>) -> GitHubClientBuilder {
+        GitHubClientBuilder {
+            token: token.into(),
+            base_url: "https://api.github.com".to_string(),
+            max_pages: DEFAULT_MAX_PAGES,
+            rate_limit_floor: DEFAULT_RATE_LIMIT_FLOOR,
+        }
+    }
+
+    /// Current rate limit state (if known from a prior request).
+    pub fn rate_limit(&self) -> Option<RateLimit> {
+        *self.rate_limit.read().unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Issues (spec github.md §4.2)
+    // -----------------------------------------------------------------------
+
+    /// List issues for a repository with optional filters.
+    /// Paginates automatically up to `max_pages`.
+    pub async fn list_issues(
+        &self,
+        owner: &str,
+        repo: &str,
+        filters: &IssueFilters,
+    ) -> Result<Vec<Issue>, GitHubError> {
+        let query = queries::list_issues_query();
+        let states = filters
+            .states
+            .as_ref()
+            .map(|s| s.iter().map(|st| issue_state_gql(*st)).collect::<Vec<_>>());
+        let since = filters.since.map(|dt| dt.to_rfc3339());
+
+        let mut all_issues = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..self.max_pages {
+            let variables = json!({
+                "owner": owner,
+                "name": repo,
+                "first": DEFAULT_PAGE_SIZE,
+                "after": cursor,
+                "states": states,
+                "labels": filters.labels,
+                "since": since,
+            });
+
+            let resp: GraphQLResponse<ListIssuesData> =
+                self.execute(&query, variables).await?;
+            let data = self.unwrap_data(resp)?;
+            let repo_data = data
+                .repository
+                .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))?;
+
+            let page = repo_data.issues;
+            let has_next = page.page_info.has_next_page;
+            cursor = page.page_info.end_cursor;
+
+            for gql_issue in page.nodes {
+                let needs_more_comments = gql_issue.has_more_comments();
+                let comment_cursor = gql_issue.comments_cursor().map(String::from);
+                let number = gql_issue.number;
+                let mut issue = gql_issue.into_model(owner, repo);
+
+                if needs_more_comments {
+                    if let Some(c) = comment_cursor {
+                        self.fetch_remaining_issue_comments(
+                            owner,
+                            repo,
+                            number,
+                            c,
+                            &mut issue.comments,
+                        )
+                        .await?;
+                    }
+                }
+
+                all_issues.push(issue);
+            }
+
+            if !has_next || cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all_issues)
+    }
+
+    /// Fetch a single issue by number with full detail.
+    pub async fn get_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Issue, GitHubError> {
+        let query = queries::get_issue_query();
+        let variables = json!({
+            "owner": owner,
+            "name": repo,
+            "number": number as i64,
+        });
+
+        let resp: GraphQLResponse<GetIssueData> = self.execute(&query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+        let repo_data = data
+            .repository
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))?;
+        let gql_issue = repo_data
+            .issue
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}#{number}")))?;
+
+        let needs_more_comments = gql_issue.has_more_comments();
+        let comment_cursor = gql_issue.comments_cursor().map(String::from);
+        let mut issue = gql_issue.into_model(owner, repo);
+
+        if needs_more_comments {
+            if let Some(c) = comment_cursor {
+                self.fetch_remaining_issue_comments(owner, repo, number, c, &mut issue.comments)
+                    .await?;
+            }
+        }
+
+        Ok(issue)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pull Requests (spec github.md §4.2)
+    // -----------------------------------------------------------------------
+
+    /// List pull requests for a repository with optional filters.
+    /// Paginates automatically up to `max_pages`.
+    pub async fn list_pull_requests(
+        &self,
+        owner: &str,
+        repo: &str,
+        filters: &PullRequestFilters,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        let query = queries::list_pull_requests_query();
+        let states = filters.states.as_ref().map(|s| {
+            s.iter()
+                .map(|st| pr_state_gql(*st))
+                .collect::<Vec<_>>()
+        });
+
+        let mut all_prs = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..self.max_pages {
+            let variables = json!({
+                "owner": owner,
+                "name": repo,
+                "first": DEFAULT_PAGE_SIZE,
+                "after": cursor,
+                "states": states,
+            });
+
+            let resp: GraphQLResponse<ListPullRequestsData> =
+                self.execute(&query, variables).await?;
+            let data = self.unwrap_data(resp)?;
+            let repo_data = data
+                .repository
+                .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))?;
+
+            let page = repo_data.pull_requests;
+            let has_next = page.page_info.has_next_page;
+            cursor = page.page_info.end_cursor;
+
+            // For PRs we don't have a `since` filter in GraphQL, so we stop
+            // paginating when we hit PRs older than our `since` threshold.
+            let mut hit_cutoff = false;
+
+            for gql_pr in page.nodes {
+                if let Some(since) = filters.since {
+                    if gql_pr.updated_at < since {
+                        hit_cutoff = true;
+                        break;
+                    }
+                }
+
+                let needs_more_comments = gql_pr.has_more_comments();
+                let comment_cursor = gql_pr.comments_cursor().map(String::from);
+                let needs_more_reviews = gql_pr.has_more_reviews();
+                let review_cursor = gql_pr.reviews_cursor().map(String::from);
+                let number = gql_pr.number;
+                let mut pr = gql_pr.into_model(owner, repo);
+
+                if needs_more_comments {
+                    if let Some(c) = comment_cursor {
+                        self.fetch_remaining_pr_comments(
+                            owner,
+                            repo,
+                            number,
+                            c,
+                            &mut pr.comments,
+                        )
+                        .await?;
+                    }
+                }
+
+                if needs_more_reviews {
+                    if let Some(c) = review_cursor {
+                        self.fetch_remaining_pr_reviews(
+                            owner,
+                            repo,
+                            number,
+                            c,
+                            &mut pr.reviews,
+                        )
+                        .await?;
+                    }
+                }
+
+                all_prs.push(pr);
+            }
+
+            if hit_cutoff || !has_next || cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all_prs)
+    }
+
+    /// Fetch a single pull request by number with full detail.
+    pub async fn get_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PullRequest, GitHubError> {
+        let query = queries::get_pull_request_query();
+        let variables = json!({
+            "owner": owner,
+            "name": repo,
+            "number": number as i64,
+        });
+
+        let resp: GraphQLResponse<GetPullRequestData> =
+            self.execute(&query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+        let repo_data = data
+            .repository
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))?;
+        let gql_pr = repo_data
+            .pull_request
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}#{number}")))?;
+
+        let needs_more_comments = gql_pr.has_more_comments();
+        let comment_cursor = gql_pr.comments_cursor().map(String::from);
+        let needs_more_reviews = gql_pr.has_more_reviews();
+        let review_cursor = gql_pr.reviews_cursor().map(String::from);
+        let mut pr = gql_pr.into_model(owner, repo);
+
+        if needs_more_comments {
+            if let Some(c) = comment_cursor {
+                self.fetch_remaining_pr_comments(owner, repo, number, c, &mut pr.comments)
+                    .await?;
+            }
+        }
+
+        if needs_more_reviews {
+            if let Some(c) = review_cursor {
+                self.fetch_remaining_pr_reviews(owner, repo, number, c, &mut pr.reviews)
+                    .await?;
+            }
+        }
+
+        Ok(pr)
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested pagination helpers
+    // -----------------------------------------------------------------------
+
+    async fn fetch_remaining_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        mut cursor: String,
+        comments: &mut Vec<crate::model::Comment>,
+    ) -> Result<(), GitHubError> {
+        let query = queries::issue_comments_query();
+
+        for _ in 0..self.max_pages {
+            let variables = json!({
+                "owner": owner,
+                "name": repo,
+                "number": number as i64,
+                "first": DEFAULT_PAGE_SIZE,
+                "after": cursor,
+            });
+
+            let resp: GraphQLResponse<IssueCommentsData> =
+                self.execute(query, variables).await?;
+            let data = self.unwrap_data(resp)?;
+            let page = data
+                .repository
+                .and_then(|r| r.issue)
+                .map(|i| i.comments)
+                .ok_or_else(|| {
+                    GitHubError::Decode("missing comment page data".to_string())
+                })?;
+
+            comments.extend(page.nodes.into_iter().map(GqlComment::into_model));
+
+            if !page.page_info.has_next_page {
+                break;
+            }
+            match page.page_info.end_cursor {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_remaining_pr_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        mut cursor: String,
+        comments: &mut Vec<crate::model::Comment>,
+    ) -> Result<(), GitHubError> {
+        let query = queries::pr_comments_query();
+
+        for _ in 0..self.max_pages {
+            let variables = json!({
+                "owner": owner,
+                "name": repo,
+                "number": number as i64,
+                "first": DEFAULT_PAGE_SIZE,
+                "after": cursor,
+            });
+
+            let resp: GraphQLResponse<PrCommentsData> =
+                self.execute(query, variables).await?;
+            let data = self.unwrap_data(resp)?;
+            let page = data
+                .repository
+                .and_then(|r| r.pull_request)
+                .map(|p| p.comments)
+                .ok_or_else(|| {
+                    GitHubError::Decode("missing comment page data".to_string())
+                })?;
+
+            comments.extend(page.nodes.into_iter().map(GqlComment::into_model));
+
+            if !page.page_info.has_next_page {
+                break;
+            }
+            match page.page_info.end_cursor {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_remaining_pr_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        mut cursor: String,
+        reviews: &mut Vec<crate::model::Review>,
+    ) -> Result<(), GitHubError> {
+        let query = queries::pr_reviews_query();
+
+        for _ in 0..self.max_pages {
+            let variables = json!({
+                "owner": owner,
+                "name": repo,
+                "number": number as i64,
+                "first": DEFAULT_PAGE_SIZE,
+                "after": cursor,
+            });
+
+            let resp: GraphQLResponse<PrReviewsData> =
+                self.execute(query, variables).await?;
+            let data = self.unwrap_data(resp)?;
+            let page = data
+                .repository
+                .and_then(|r| r.pull_request)
+                .map(|p| p.reviews)
+                .ok_or_else(|| {
+                    GitHubError::Decode("missing review page data".to_string())
+                })?;
+
+            for r in page.nodes {
+                let state = match r.state.as_str() {
+                    "APPROVED" => crate::model::ReviewState::Approved,
+                    "CHANGES_REQUESTED" => crate::model::ReviewState::ChangesRequested,
+                    "DISMISSED" => crate::model::ReviewState::Dismissed,
+                    _ => crate::model::ReviewState::Commented,
+                };
+                reviews.push(crate::model::Review {
+                    id: r.id,
+                    author: r
+                        .author
+                        .map(GqlUser::into_model)
+                        .unwrap_or_else(|| crate::model::User {
+                            login: "ghost".to_string(),
+                            node_id: String::new(),
+                        }),
+                    state,
+                    body: r.body,
+                    submitted_at: r.submitted_at,
+                });
+            }
+
+            if !page.page_info.has_next_page {
+                break;
+            }
+            match page.page_info.end_cursor {
+                Some(c) => cursor = c,
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // GraphQL execution
+    // -----------------------------------------------------------------------
+
+    /// Execute a GraphQL query and deserialize the response.
+    async fn execute<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<GraphQLResponse<T>, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!("{}/graphql", self.base_url);
+        let body = json!({
+            "query": query,
+            "variables": variables,
+        });
+
+        let response = self.http.post(&url).json(&body).send().await?;
+
+        // Update rate limit state from headers.
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            // Could be rate limiting.
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    // Wait and retry once.
+                    self.sleep_until(rl.reset_at).await;
+                    return self.execute_once(query, variables).await;
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "unexpected status {status}: {text}"
+            )));
+        }
+
+        let gql_response: GraphQLResponse<T> = response.json().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to parse response: {e}"))
+        })?;
+
+        Ok(gql_response)
+    }
+
+    /// Execute without rate-limit retry (used for the retry attempt itself).
+    async fn execute_once<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<GraphQLResponse<T>, GitHubError> {
+        let url = format!("{}/graphql", self.base_url);
+        let body = json!({
+            "query": query,
+            "variables": variables,
+        });
+
+        let response = self.http.post(&url).json(&body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "unexpected status {status}: {text}"
+            )));
+        }
+
+        let gql_response: GraphQLResponse<T> = response.json().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to parse response: {e}"))
+        })?;
+
+        Ok(gql_response)
+    }
+
+    /// Unwrap a GraphQL response, surfacing any GraphQL-level errors.
+    fn unwrap_data<T>(&self, resp: GraphQLResponse<T>) -> Result<T, GitHubError> {
+        if let Some(errors) = resp.errors {
+            if !errors.is_empty() {
+                // Check for NOT_FOUND type errors.
+                if errors
+                    .iter()
+                    .any(|e| e.error_type.as_deref() == Some("NOT_FOUND"))
+                {
+                    return Err(GitHubError::NotFound(errors[0].message.clone()));
+                }
+                return Err(GitHubError::GraphQL(errors));
+            }
+        }
+        resp.data
+            .ok_or_else(|| GitHubError::Decode("response contained no data".to_string()))
+    }
+
+    /// Parse rate limit headers from a response.
+    fn update_rate_limit(&self, response: &reqwest::Response) {
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+
+        let reset = response
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|ts| DateTime::from_timestamp(ts, 0));
+
+        if let (Some(remaining), Some(reset_at)) = (remaining, reset) {
+            *self.rate_limit.write().unwrap() = Some(RateLimit {
+                remaining,
+                reset_at,
+            });
+        }
+    }
+
+    /// If we're below the rate limit floor, wait until the reset window.
+    async fn wait_for_rate_limit(&self) {
+        let rl = *self.rate_limit.read().unwrap();
+        if let Some(rl) = rl {
+            if rl.remaining < self.rate_limit_floor {
+                self.sleep_until(rl.reset_at).await;
+            }
+        }
+    }
+
+    /// Sleep until the given timestamp (or return immediately if it's in the past).
+    async fn sleep_until(&self, until: DateTime<Utc>) {
+        let now = Utc::now();
+        if until > now {
+            let duration = (until - now).to_std().unwrap_or_default();
+            tokio::time::sleep(duration).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn issue_state_gql(state: IssueState) -> &'static str {
+    match state {
+        IssueState::Open => "OPEN",
+        IssueState::Closed => "CLOSED",
+    }
+}
+
+fn pr_state_gql(state: PullRequestState) -> &'static str {
+    match state {
+        PullRequestState::Open => "OPEN",
+        PullRequestState::Closed => "CLOSED",
+        PullRequestState::Merged => "MERGED",
+    }
+}
