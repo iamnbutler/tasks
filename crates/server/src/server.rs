@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -28,6 +29,8 @@ pub enum ServerError {
     ProjectNotFound(String),
     #[error("task not found: {0}")]
     TaskNotFound(String),
+    #[error("store error: {0}")]
+    StoreError(String),
 }
 
 /// Shared server state.
@@ -78,6 +81,7 @@ pub struct Server {
     pub state: Arc<RwLock<ServerState>>,
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
+    pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
 }
 
 impl Server {
@@ -86,12 +90,66 @@ impl Server {
             state: Arc::new(RwLock::new(ServerState::new())),
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
+            store: None,
         }
+    }
+
+    /// Create a server with persistent storage (spec Section 3.5).
+    pub fn with_store(event_bus: EventBus, store: tasks_store::Store) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(ServerState::new())),
+            event_bus: Arc::new(event_bus),
+            presence: Arc::new(PresenceTracker::new()),
+            store: Some(Arc::new(StdMutex::new(store))),
+        }
+    }
+
+    /// Load projects, tasks, and merge queue entries from the store into memory.
+    /// Called once at startup.
+    pub async fn load_from_store(&self) -> Result<(), ServerError> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let store = store.lock().unwrap();
+        let mut state = self.state.write().await;
+
+        // Load projects
+        let projects = store
+            .list_projects()
+            .map_err(|e| ServerError::StoreError(e.to_string()))?;
+        for project in projects {
+            state.projects.insert(project.id.clone(), project);
+        }
+
+        // Load tasks
+        let tasks = store
+            .list_tasks()
+            .map_err(|e| ServerError::StoreError(e.to_string()))?;
+        for task in tasks {
+            state.tasks.insert(task.id.clone(), task);
+        }
+
+        // Load merge queue entries
+        let entries = store
+            .list_merge_entries()
+            .map_err(|e| ServerError::StoreError(e.to_string()))?;
+        for entry in entries {
+            state.merge_queue.enqueue(entry);
+        }
+
+        Ok(())
     }
 
     // --- Project management (spec Section 3.3) ---
 
     pub async fn add_project(&self, project: Project) {
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                let _ = store.save_project(&project);
+            }
+        }
         let mut state = self.state.write().await;
         state.projects.insert(project.id.clone(), project);
     }
@@ -167,6 +225,13 @@ impl Server {
             }),
         );
 
+        // Write-through to store before inserting into HashMap
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                let _ = store.save_task(&task);
+            }
+        }
+
         {
             let mut state = self.state.write().await;
             state.tasks.insert(task_id, task);
@@ -195,6 +260,13 @@ impl Server {
                 .get_mut(task_id)
                 .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
             task.set_state(new_state);
+
+            // Write-through to store
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    let _ = store.save_task(task);
+                }
+            }
         }
 
         let event_type = match new_state {
@@ -584,5 +656,78 @@ mod tests {
 
         let task = server.get_task("t1").await.unwrap();
         assert_eq!(task.state, TaskState::Running);
+    }
+
+    #[tokio::test]
+    async fn store_persists_projects_and_tasks() {
+        let store = tasks_store::Store::open_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let event_store = EventStore::new(dir.path());
+        let bus = EventBus::new(event_store, 64);
+        let server = Server::with_store(bus, store);
+
+        // Add project and task
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        server.add_task(task).await.unwrap();
+
+        // Verify data is in the store
+        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        assert!(store_ref.get_project("p1").unwrap().is_some());
+        assert!(store_ref.get_task("t1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn store_persists_state_changes() {
+        let store = tasks_store::Store::open_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let event_store = EventStore::new(dir.path());
+        let bus = EventBus::new(event_store, 64);
+        let server = Server::with_store(bus, store);
+
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        server.add_task(task).await.unwrap();
+
+        server
+            .set_task_state("t1", TaskState::Running, Actor::System)
+            .await
+            .unwrap();
+
+        // Verify the store has the updated state
+        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let stored_task = store_ref.get_task("t1").unwrap().unwrap();
+        assert_eq!(stored_task.state, TaskState::Running);
+    }
+
+    #[tokio::test]
+    async fn load_from_store_populates_state() {
+        // Create a store with pre-existing data
+        let store = tasks_store::Store::open_memory().unwrap();
+        store
+            .save_project(&Project::new("p1", "owner/repo"))
+            .unwrap();
+        store
+            .save_task(&Task::new("t1", TaskSource::Internal, "Test", "p1"))
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let event_store = EventStore::new(dir.path());
+        let bus = EventBus::new(event_store, 64);
+        let server = Server::with_store(bus, store);
+
+        // State should be empty before load
+        assert!(server.get_project("p1").await.is_none());
+
+        // Load from store
+        server.load_from_store().await.unwrap();
+
+        // Now state should be populated
+        assert!(server.get_project("p1").await.is_some());
+        assert!(server.get_task("t1").await.is_some());
     }
 }

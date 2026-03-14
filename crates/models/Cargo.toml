@@ -1,14 +1,11 @@
 [package]
-name = "tasks-store"
+name = "models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-models = { path = "../models" }
-rusqlite = { version = "0.35", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-thiserror.workspace = true

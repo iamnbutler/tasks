@@ -10,9 +10,9 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
-use server::model::merge_queue::{MergeQueueEntry, MergeStatus};
-use server::model::project::Project;
-use server::model::task::{Task, TaskSource, TaskState};
+use models::merge_queue::{MergeQueueEntry, MergeStatus};
+use models::project::Project;
+use models::task::{Task, TaskSource, TaskState};
 use thiserror::Error;
 
 #[derive(Debug, Error)]

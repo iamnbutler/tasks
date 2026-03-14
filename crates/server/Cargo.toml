@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 events = { path = "../events" }
 runtime = { path = "../runtime" }
+models = { path = "../models" }
+tasks-store = { path = "../store" }
 tasks-github = { path = "../github" }
 serde.workspace = true
 serde_json.workspace = true
