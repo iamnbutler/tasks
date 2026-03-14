@@ -13,6 +13,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `app/` — Binary entry point: startup, run loops, component wiring
   - `events/` — Event system: append-only log, pub/sub
   - `github/` — GitHub integration: GraphQL client, normalized model, polling
+  - `models/` — Shared domain types: project, task, merge entry, task state
   - `runtime/` — Session runtime: container lifecycle, protocol, transport
   - `server/` — Server: domain models, operating modes, merge queue, presence
   - `session/` — Session management: lifecycle, monitoring, event bridging
