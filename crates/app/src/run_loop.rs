@@ -273,7 +273,42 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 8. Wait for shutdown (TUI or headless) ---
+    // --- 8. Optionally spawn web server ---
+
+    let web_handle = if config.web {
+        let api_state = crate::web::ApiState {
+            server: server.clone(),
+            max_sessions: config.max_sessions,
+        };
+        let web_port = config.web_port;
+
+        // Serve the built frontend from web/build if it exists,
+        // otherwise just serve the API.
+        let app = {
+            let api_router = crate::web::router(api_state);
+            let web_dir = std::env::current_dir()
+                .unwrap_or_default()
+                .join("web")
+                .join("build");
+            if web_dir.exists() {
+                let serve = tower_http::services::ServeDir::new(&web_dir)
+                    .fallback(tower_http::services::ServeFile::new(web_dir.join("index.html")));
+                api_router.fallback_service(serve)
+            } else {
+                api_router
+            }
+        };
+
+        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{web_port}")).await?;
+        info!(port = web_port, "web server started");
+        Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        }))
+    } else {
+        None
+    };
+
+    // --- 9. Wait for shutdown (TUI or headless) ---
 
     if config.tui {
         crate::tui::run_tui(server.clone(), server.event_bus.clone(), config.max_sessions).await?;
@@ -288,6 +323,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Cancel the loops
     poll_handle.abort();
     dispatch_handle.abort();
+    if let Some(h) = web_handle {
+        h.abort();
+    }
 
     info!("shutdown complete");
     Ok(())
