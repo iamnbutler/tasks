@@ -34,7 +34,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
 ## Building the container image
 
 ```sh
-container build -f src/runtime/Dockerfile -t tasks-agent:latest .
+container build --dns 8.8.8.8 -f src/runtime/Dockerfile -t tasks-agent:latest .
 ```
 
 The Dockerfile uses a multi-stage build: Rust compilation in `rust:1.85-slim`, runtime on `ubuntu:24.04`. The supervisor binary (`crates/supervisor/`) is compiled in the builder stage and copied into the final image.
