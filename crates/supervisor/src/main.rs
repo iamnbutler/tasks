@@ -7,7 +7,7 @@
 use std::io::{self, BufRead, Write};
 use std::process::Stdio;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
@@ -171,40 +171,24 @@ async fn start_agent(
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn agent: {e}"))?;
     let pid = child.id().unwrap_or(0);
 
-    // Spawn stdout reader.
+    // Spawn stdout reader (line-oriented to avoid splitting UTF-8 sequences).
     if let Some(stdout) = child.stdout.take() {
         let tx = event_tx.clone();
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut buf = vec![0u8; 8192];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = tx.send(Ev::AgentStdout { data });
-                    }
-                    Err(_) => break,
-                }
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(Ev::AgentStdout { data: line + "\n" });
             }
         });
     }
 
-    // Spawn stderr reader.
+    // Spawn stderr reader (line-oriented).
     if let Some(stderr) = child.stderr.take() {
         let tx = event_tx.clone();
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = vec![0u8; 8192];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = tx.send(Ev::AgentStderr { data });
-                    }
-                    Err(_) => break,
-                }
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(Ev::AgentStderr { data: line + "\n" });
             }
         });
     }
@@ -215,22 +199,35 @@ async fn start_agent(
 
 /// Stop the agent: SIGTERM → timeout → SIGKILL (spec §4.1 stop command).
 async fn stop_agent(handle: &mut AgentHandle) {
-    // Send SIGTERM.
-    if let Err(e) = handle.child.start_kill() {
-        log!("failed to send kill signal: {e}");
-        return;
+    let pid = match handle.child.id() {
+        Some(pid) => pid,
+        None => return, // already exited
+    };
+
+    // Send SIGTERM (not SIGKILL — the agent gets a grace period).
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+            log!("failed to send SIGTERM: {e}");
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = handle.child.start_kill();
     }
 
-    // Wait with timeout.
+    // Wait with timeout, then SIGKILL if still alive.
     match tokio::time::timeout(
         std::time::Duration::from_secs(KILL_TIMEOUT_SECS),
         handle.child.wait(),
     )
     .await
     {
-        Ok(_) => {} // exited
+        Ok(_) => {} // exited gracefully
         Err(_) => {
-            // Timeout — force kill.
             log!("agent did not exit in {KILL_TIMEOUT_SECS}s, sending SIGKILL");
             let _ = handle.child.kill().await;
         }
@@ -353,6 +350,10 @@ async fn main() {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     Cmd::Start { repo, branch, prompt } => {
+                        if agent.is_some() {
+                            log!("start received while agent already running — ignoring");
+                            continue;
+                        }
                         // Clone repo if needed (§3).
                         if !repo_exists() {
                             if let Err(e) = clone_repo(&repo, &branch) {
@@ -425,8 +426,18 @@ async fn main() {
             }
             // SIGTERM — graceful shutdown.
             _ = sigterm.recv() => {
-                if let Some(ref mut handle) = agent {
-                    stop_agent(handle).await;
+                if let Some(mut handle) = agent.take() {
+                    stop_agent(&mut handle).await;
+                    let status = handle.child.try_wait().ok().flatten();
+                    let code = status.and_then(|s| s.code());
+                    #[cfg(unix)]
+                    let signal = {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.and_then(|s| s.signal()).map(|s| format!("{s}"))
+                    };
+                    #[cfg(not(unix))]
+                    let signal: Option<String> = None;
+                    emit(&Ev::AgentExit { code, signal });
                 }
                 break;
             }
