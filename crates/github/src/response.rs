@@ -55,14 +55,16 @@ pub(crate) struct Nodes<T> {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct GqlUser {
     pub login: String,
-    pub id: String,
+    /// Node ID — comes from inline fragment (... on User { id }), so may be absent.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 impl GqlUser {
     pub fn into_model(self) -> model::User {
         model::User {
             login: self.login,
-            node_id: self.id,
+            node_id: self.id.unwrap_or_default(),
         }
     }
 }
