@@ -25,7 +25,7 @@ Server (host)
         ├── receives chat messages from server, forwards to supervisor
         │
         └── container (lightweight Linux VM)
-              └── Supervisor (PID 1, Bun/TS)
+              └── Supervisor (PID 1, Rust)
                     ├── manages agent process lifecycle
                     ├── frames agent output as protocol events
                     ├── routes incoming commands to agent stdin
@@ -62,7 +62,7 @@ The base image is a pre-built OCI image containing the tools an agent needs to w
 Contents:
 
 - **Git and GitHub CLI** (`git`, `gh`) — for repository operations and PR management.
-- **Bun** — JavaScript/TypeScript runtime. Also runs the supervisor process.
+- **Supervisor binary** — built from `crates/supervisor/`, manages agent lifecycle.
 - **Rust and Cargo** — for Rust-based projects.
 - **Agent CLI** — the coding agent executable (Claude Code initially).
 - **Standard utilities** — coreutils, curl, ssh, etc.
@@ -128,9 +128,10 @@ This is the provisional approach. Future iterations may support:
 
 ## 4. Supervisor Protocol
 
-The supervisor is a Bun/TypeScript process that runs as PID 1 inside the container. It
-communicates with the host-side session wrapper over the container's stdio using a JSON-lines
-protocol (one JSON object per line, newline-delimited).
+The supervisor is a Rust binary that runs as PID 1 inside the container. It communicates with
+the host-side session wrapper over the container's stdio using a JSON-lines protocol (one JSON
+object per line, newline-delimited). The supervisor binary is built from `crates/supervisor/`
+in the same workspace as the host-side code.
 
 ### 4.1 Commands (Host → Container)
 

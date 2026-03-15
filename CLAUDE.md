@@ -18,12 +18,12 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `server/` — Server: domain models, operating modes, merge queue, presence
   - `session/` — Session management: lifecycle, monitoring, event bridging
   - `store/` — Persistent storage: SQLite for projects, tasks, merge queue
-- `src/` — TypeScript (supervisor that runs inside containers)
+  - `supervisor/` — Container supervisor binary (PID 1 inside containers)
 
 ## Key decisions
 
 - Host runtime: Rust
-- Container supervisor: Bun/TypeScript (PID 1 inside containers)
+- Container supervisor: Rust (PID 1 inside containers, built from same workspace)
 - Session isolation: apple/container (one lightweight Linux VM per session)
 - Host ↔ container communication: JSON-line protocol over stdio
 - Agent provider: Claude Code (initial), pluggable
