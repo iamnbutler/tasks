@@ -6,16 +6,21 @@ export async function cloneRepo(
   branch: string,
   workDir: string
 ): Promise<void> {
-  // Configure git credentials from env if available
+  // Configure git identity
+  await $`git config --global user.email "tasks@localhost"`.quiet();
+  await $`git config --global user.name "Tasks Agent"`.quiet();
+
+  // Embed token in URL for HTTPS auth if available
   const token = process.env.GITHUB_TOKEN;
-  if (token) {
-    // Use token-based auth for HTTPS URLs
-    await $`git config --global credential.helper '!f() { echo "password=${token}"; }; f'`.quiet();
-    await $`git config --global user.email "tasks@localhost"`.quiet();
-    await $`git config --global user.name "Tasks Agent"`.quiet();
+  let cloneUrl = url;
+  if (token && url.startsWith("https://github.com/")) {
+    cloneUrl = url.replace(
+      "https://github.com/",
+      `https://x-access-token:${token}@github.com/`
+    );
   }
 
-  await $`git clone ${url} ${workDir}`.quiet();
+  await $`git clone ${cloneUrl} ${workDir}`.quiet();
   await $`git -C ${workDir} checkout -B ${branch}`.quiet();
 }
 

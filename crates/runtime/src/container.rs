@@ -23,6 +23,7 @@ pub struct ContainerConfig {
     pub env: HashMap<String, String>,
     pub cpus: Option<f32>,
     pub memory: Option<String>,
+    pub dns: Option<String>,
 }
 
 impl ContainerConfig {
@@ -32,6 +33,7 @@ impl ContainerConfig {
             env: HashMap::new(),
             cpus: None,
             memory: None,
+            dns: Some("8.8.8.8".to_string()),
         }
     }
 
@@ -99,6 +101,10 @@ impl ContainerRuntime for AppleContainerRuntime {
 
         if let Some(ref memory) = config.memory {
             cmd.arg("-m").arg(memory);
+        }
+
+        if let Some(ref dns) = config.dns {
+            cmd.arg("--dns").arg(dns);
         }
 
         // Image is a positional argument (must come last, before any container arguments).

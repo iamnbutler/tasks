@@ -220,7 +220,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .await
                             {
-                                // Session failed — already transitioned back to Waiting below.
+                                let _ = &e; // TODO: structured logging
                                 // Transition back to Waiting so dispatcher can retry.
                                 let _ = dispatch_server
                                     .set_task_state(
