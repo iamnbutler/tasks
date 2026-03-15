@@ -18,12 +18,33 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `server/` — Server: domain models, operating modes, merge queue, presence
   - `session/` — Session management: lifecycle, monitoring, event bridging
   - `store/` — Persistent storage: SQLite for projects, tasks, merge queue
-- `src/` — TypeScript (supervisor that runs inside containers)
+  - `supervisor/` — Container supervisor binary (PID 1 inside containers)
 
 ## Key decisions
 
 - Host runtime: Rust
-- Container supervisor: Bun/TypeScript (PID 1 inside containers)
+- Container supervisor: Rust (PID 1 inside containers, built from same workspace)
 - Session isolation: apple/container (one lightweight Linux VM per session)
 - Host ↔ container communication: JSON-line protocol over stdio
 - Agent provider: Claude Code (initial), pluggable
+- Container images: built with `container build` (apple/container CLI), NOT Docker
+- Data directory: `~/.tasks/` (SQLite + event logs), configurable via `TASKS_DATA_DIR`
+- Config: `.env` file at project root, loaded automatically via dotenvy
+
+## Building the container image
+
+```sh
+container build --dns 8.8.8.8 -f src/runtime/Dockerfile -t tasks-agent:latest .
+```
+
+The Dockerfile uses a multi-stage build: Rust compilation in `rust:1.85-slim`, runtime on `ubuntu:24.04`. The supervisor binary (`crates/supervisor/`) is compiled in the builder stage and copied into the final image.
+
+## Running
+
+```sh
+cargo run -- add-project owner/repo   # add a project (stored in SQLite)
+cargo run -- run                      # headless mode
+cargo run -- run --tui                # terminal UI
+```
+
+Requires `.env` with `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
