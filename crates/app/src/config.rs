@@ -25,8 +25,10 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Read configuration from environment variables.
+    /// Read configuration from `.env` file (if present) and environment variables.
     pub fn from_env() -> Result<Self, String> {
+        // Load .env file if it exists — doesn't error if missing.
+        dotenvy::dotenv().ok();
         let data_dir = std::env::var("TASKS_DATA_DIR").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             format!("{home}/.tasks")

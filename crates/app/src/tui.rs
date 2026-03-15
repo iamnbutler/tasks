@@ -19,7 +19,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
-use tokio::sync::RwLock;
 
 use events::{Event as PlatformEvent, EventBus, EventType};
 use models::merge_queue::MergeStatus;
