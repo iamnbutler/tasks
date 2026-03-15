@@ -23,3 +23,7 @@ dotenvy = "0.15"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower = "0.5"
+tokio-stream = { version = "0.1", features = ["sync"] }

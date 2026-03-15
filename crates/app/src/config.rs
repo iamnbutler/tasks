@@ -22,6 +22,10 @@ pub struct AppConfig {
     pub session_hard_limit: Duration,
     /// Whether to run the TUI.
     pub tui: bool,
+    /// Whether to run the web UI.
+    pub web: bool,
+    /// Web server port (default: 4800).
+    pub web_port: u16,
 }
 
 impl AppConfig {
@@ -65,6 +69,11 @@ impl AppConfig {
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
             tui: false, // set by CLI flag
+            web: false, // set by CLI flag
+            web_port: std::env::var("TASKS_WEB_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4800),
         })
     }
 }

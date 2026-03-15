@@ -1,0 +1,12 @@
+@import 'tailwindcss';
+@plugin 'daisyui';
+
+@layer base {
+	:root {
+		font-family: 'Inter', system-ui, -apple-system, sans-serif;
+	}
+
+	body {
+		@apply bg-base-100 text-base-content min-h-screen;
+	}
+}
