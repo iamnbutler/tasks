@@ -8,7 +8,7 @@ const ISSUE_FIELDS: &str = r#"
     body
     state
     stateReason
-    author { login ... on User { id } ... on Bot { id } }
+    author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
     labels(first: 100) {
         nodes { name color }
     }
@@ -24,7 +24,7 @@ const ISSUE_FIELDS: &str = r#"
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             body
             createdAt
             updatedAt
@@ -69,7 +69,7 @@ const PR_FIELDS: &str = r#"
     baseRefName
     isDraft
     mergeable
-    author { login ... on User { id } ... on Bot { id } }
+    author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
     labels(first: 100) {
         nodes { name color }
     }
@@ -81,7 +81,7 @@ const PR_FIELDS: &str = r#"
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             state
             body
             submittedAt
@@ -91,7 +91,7 @@ const PR_FIELDS: &str = r#"
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             body
             createdAt
             updatedAt
@@ -156,7 +156,7 @@ pub fn issue_comments_query() -> &'static str {
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             body
             createdAt
             updatedAt
@@ -210,7 +210,7 @@ pub fn pr_comments_query() -> &'static str {
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             body
             createdAt
             updatedAt
@@ -230,7 +230,7 @@ pub fn pr_reviews_query() -> &'static str {
         pageInfo { hasNextPage endCursor }
         nodes {
             id
-            author { login ... on User { id } ... on Bot { id } }
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
             state
             body
             submittedAt
