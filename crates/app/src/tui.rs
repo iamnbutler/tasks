@@ -201,7 +201,7 @@ async fn handle_key(tui: &mut TuiState, key: KeyEvent, server: &Server) {
 }
 
 /// Draw the TUI.
-fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, tui: &TuiState) -> io::Result<()> {
+fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, tui: &mut TuiState) -> io::Result<()> {
     terminal.draw(|f| {
         let size = f.area();
 
@@ -263,7 +263,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_task_list(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
+fn draw_task_list(f: &mut ratatui::Frame, area: Rect, tui: &mut TuiState) {
     let items: Vec<ListItem> = tui
         .tasks
         .iter()
@@ -305,7 +305,7 @@ fn draw_task_list(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
         .block(Block::default().borders(Borders::ALL).title(" Tasks "))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    f.render_stateful_widget(list, area, &mut tui.task_list_state.clone());
+    f.render_stateful_widget(list, area, &mut tui.task_list_state);
 }
 
 fn draw_merge_queue(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
@@ -423,7 +423,7 @@ pub async fn run_tui(
 
     loop {
         // Draw.
-        draw(&mut terminal, &tui)?;
+        draw(&mut terminal, &mut tui)?;
 
         tokio::select! {
             // Platform events from the event bus.

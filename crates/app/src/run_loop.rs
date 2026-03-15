@@ -241,13 +241,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 error!(task_id = %task_id, error = %e, "failed to start session");
                                 // Transition back to Waiting so dispatcher can retry.
-                                let _ = dispatch_server
+                                if let Err(e2) = dispatch_server
                                     .set_task_state(
                                         task_id,
                                         models::task::TaskState::Waiting,
                                         events::Actor::System,
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    warn!(task_id = %task_id, error = %e2, "failed to revert task to waiting — task may be stuck");
+                                }
                             }
                         }
                     }
