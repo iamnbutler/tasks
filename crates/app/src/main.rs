@@ -80,6 +80,14 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing subscriber (controlled by RUST_LOG env var, default: info)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("run");
 

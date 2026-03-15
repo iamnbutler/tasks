@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
@@ -20,12 +21,14 @@ use crate::config::AppConfig;
 /// Constructs all components and starts the GitHub poll loop,
 /// dispatch tick loop, and session management.
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Tasks platform starting...");
-    eprintln!("  data_dir: {}", config.data_dir);
-    eprintln!("  max_sessions: {}", config.max_sessions);
-    eprintln!("  poll_interval: {:?}", config.poll_interval);
-    eprintln!("  dispatch_interval: {:?}", config.dispatch_interval);
-    eprintln!("  container_image: {}", config.container_image);
+    info!(
+        data_dir = %config.data_dir,
+        max_sessions = config.max_sessions,
+        poll_interval = ?config.poll_interval,
+        dispatch_interval = ?config.dispatch_interval,
+        container_image = %config.container_image,
+        "starting tasks platform"
+    );
 
     // --- 1. Create infrastructure ---
 
@@ -84,7 +87,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 5. Emit system:started ---
 
     server.emit_started().await?;
-    eprintln!("Tasks platform started ({} projects)", pollers.len());
+    info!(projects = pollers.len(), "tasks platform started");
 
     // --- 6. Spawn GitHub poll loop ---
 
@@ -118,9 +121,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     &label_config,
                                 ) {
                                     if let Err(e) = poll_server.add_task(task).await {
-                                        eprintln!(
-                                            "Failed to add task for issue #{}: {e}",
-                                            issue.number
+                                        warn!(
+                                            project = %project_id,
+                                            issue = issue.number,
+                                            error = %e,
+                                            "failed to add task for issue"
                                         );
                                     }
                                 }
@@ -140,9 +145,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     &label_config,
                                 ) {
                                     if let Err(e) = poll_server.add_task(task).await {
-                                        eprintln!(
-                                            "Failed to add task for PR #{}: {e}",
-                                            pr.number
+                                        warn!(
+                                            project = %project_id,
+                                            pr = pr.number,
+                                            error = %e,
+                                            "failed to add task for PR"
                                         );
                                     }
                                 }
@@ -150,7 +157,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Poll error for {project_id}: {e}");
+                        error!(project = %project_id, error = %e, "poll failed");
                     }
                 }
             }
@@ -232,7 +239,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .await
                             {
-                                eprintln!("Failed to start session for {task_id}: {e}");
+                                error!(task_id = %task_id, error = %e, "failed to start session");
                             }
                         }
                     }
@@ -244,12 +251,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             .send_chat(task_id, "Resuming — please continue.".to_string())
                             .await
                         {
-                            eprintln!("Failed to resume session for {task_id}: {e}");
+                            error!(task_id = %task_id, error = %e, "failed to resume session");
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Dispatch error: {e}");
+                    error!(error = %e, "dispatch failed");
                 }
             }
         }
@@ -258,7 +265,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 8. Wait for shutdown ---
 
     tokio::signal::ctrl_c().await?;
-    eprintln!("\nShutting down...");
+    info!("shutting down");
 
     // Stop all sessions
     session_manager.stop_all().await;
@@ -267,6 +274,6 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     poll_handle.abort();
     dispatch_handle.abort();
 
-    eprintln!("Shutdown complete.");
+    info!("shutdown complete");
     Ok(())
 }
