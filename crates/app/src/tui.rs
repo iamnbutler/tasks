@@ -47,6 +47,10 @@ pub struct TuiState {
     pub max_sessions: u32,
     /// Number of projects.
     pub project_count: usize,
+    /// Manual scroll offset for the session output pane.
+    pub session_scroll: u16,
+    /// Whether to auto-scroll session output to bottom.
+    pub session_auto_scroll: bool,
     /// Whether the app should quit.
     pub should_quit: bool,
 }
@@ -64,6 +68,8 @@ impl TuiState {
             active_sessions: 0,
             max_sessions,
             project_count: 0,
+            session_scroll: 0,
+            session_auto_scroll: true,
             should_quit: false,
         }
     }
@@ -83,6 +89,8 @@ impl TuiState {
             .map(|i| (i + 1).min(self.tasks.len() - 1))
             .unwrap_or(0);
         self.task_list_state.select(Some(i));
+        self.session_scroll = 0;
+        self.session_auto_scroll = true;
     }
 
     fn select_prev(&mut self) {
@@ -95,6 +103,8 @@ impl TuiState {
             .map(|i| i.saturating_sub(1))
             .unwrap_or(0);
         self.task_list_state.select(Some(i));
+        self.session_scroll = 0;
+        self.session_auto_scroll = true;
     }
 
     fn append_session_log(&mut self, task_id: &str, line: String) {
@@ -179,8 +189,19 @@ async fn handle_key(tui: &mut TuiState, key: KeyEvent, server: &Server) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             tui.should_quit = true
         }
-        KeyCode::Down | KeyCode::Char('j') => tui.select_next(),
-        KeyCode::Up | KeyCode::Char('k') => tui.select_prev(),
+        KeyCode::Down | KeyCode::Char('j') => {
+            tui.session_scroll = tui.session_scroll.saturating_add(1);
+            tui.session_auto_scroll = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            tui.session_scroll = tui.session_scroll.saturating_sub(1);
+            tui.session_auto_scroll = false;
+        }
+        KeyCode::Tab => tui.select_next(),
+        KeyCode::BackTab => tui.select_prev(),
+        KeyCode::End => {
+            tui.session_auto_scroll = true;
+        }
         KeyCode::Char('p') => {
             let _ = server
                 .set_mode(server::Mode::Pause, &events::Actor::Human)
@@ -349,20 +370,23 @@ fn draw_session_output(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
         .map(|log| log.iter().map(|l| Line::raw(l.as_str())).collect())
         .unwrap_or_else(|| vec![Line::raw("No session output.")]);
 
+    let scroll_y = if tui.session_auto_scroll {
+        // Auto-scroll to bottom.
+        selected_id
+            .and_then(|id| tui.session_logs.get(id))
+            .map(|log| {
+                let visible_height = area.height.saturating_sub(2) as usize;
+                log.len().saturating_sub(visible_height) as u16
+            })
+            .unwrap_or(0)
+    } else {
+        tui.session_scroll
+    };
+
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
-        .scroll((
-            // Auto-scroll to bottom.
-            selected_id
-                .and_then(|id| tui.session_logs.get(id))
-                .map(|log| {
-                    let visible_height = area.height.saturating_sub(2) as usize;
-                    log.len().saturating_sub(visible_height) as u16
-                })
-                .unwrap_or(0),
-            0,
-        ));
+        .scroll((scroll_y, 0));
 
     f.render_widget(paragraph, area);
 }
@@ -378,7 +402,11 @@ fn draw_keybindings(f: &mut ratatui::Frame, area: Rect) {
         Span::styled("g ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("play  "),
         Span::styled("↑↓ ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("select"),
+        Span::raw("scroll  "),
+        Span::styled("tab ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("next task  "),
+        Span::styled("end ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("autoscroll"),
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
