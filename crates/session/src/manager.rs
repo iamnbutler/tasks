@@ -179,10 +179,10 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
 
         session.start(self.ready_timeout).await?;
         let container_id = session.container_id().unwrap().to_string();
-        eprintln!("[session] {task_id}: container {container_id} ready");
+        tracing::info!(task_id = %task_id, container_id = %container_id, "container ready");
 
         session.start_agent(&repo_url, &branch, &prompt)?;
-        eprintln!("[session] {task_id}: agent started");
+        tracing::info!(task_id = %task_id, "agent started");
 
         // Create command channel
         let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(32);
