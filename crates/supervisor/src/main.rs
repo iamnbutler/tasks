@@ -293,6 +293,24 @@ async fn main() {
     // the main loop emits them to the host.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Ev>();
 
+    // Set up Claude Code auth from ANTHROPIC_API_KEY if present.
+    // Claude Code uses ~/.claude/anthropic_key.sh as a credential helper.
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        let claude_dir = format!(
+            "{}/.claude",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+        );
+        let _ = std::fs::create_dir_all(&claude_dir);
+        let script = format!("#!/bin/bash\necho \"{api_key}\"\n");
+        let script_path = format!("{claude_dir}/anthropic_key.sh");
+        let _ = std::fs::write(&script_path, &script);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     // Emit system:ready (§4.2).
     emit(&Ev::SystemReady {});
 
