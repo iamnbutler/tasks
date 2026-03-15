@@ -155,6 +155,7 @@ async fn start_agent(
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_else(|_| vec![
             "--print".to_string(),
+            "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
         ]);
@@ -359,7 +360,7 @@ async fn main() {
                     }
                     Cmd::Chat { text } => {
                         if let Some(ref mut handle) = agent {
-                            send_chat(handle, &text);
+                            send_chat(handle, &text).await;
                         } else {
                             // Buffer if agent not running (§4.1).
                             pending_chat.push(text);
