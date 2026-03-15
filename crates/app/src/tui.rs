@@ -281,11 +281,10 @@ fn draw_task_list(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
                 TaskState::Conflict => ("!", Color::Red),
             };
 
-            // Truncate title to fit.
-            let display_title = if title.len() > 30 {
-                format!("{}…", &title[..29])
-            } else {
-                title.clone()
+            // Truncate title to fit (UTF-8 safe).
+            let display_title = match title.char_indices().nth(29) {
+                Some((i, _)) if title.len() > i => format!("{}…", &title[..i]),
+                _ => title.clone(),
             };
 
             // Extract issue number from task ID if possible.
