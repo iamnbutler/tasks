@@ -233,6 +233,14 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .await
                             {
                                 eprintln!("Failed to start session for {task_id}: {e}");
+                                // Transition back to Waiting so dispatcher can retry.
+                                let _ = dispatch_server
+                                    .set_task_state(
+                                        task_id,
+                                        models::task::TaskState::Waiting,
+                                        events::Actor::System,
+                                    )
+                                    .await;
                             }
                         }
                     }
