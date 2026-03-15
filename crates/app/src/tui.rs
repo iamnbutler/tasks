@@ -8,11 +8,12 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self as ct_event, Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -159,11 +160,10 @@ fn handle_platform_event(tui: &mut TuiState, event: &PlatformEvent) {
     match &event.event_type {
         EventType::AgentMessage => {
             if let Some(text) = event.data.get("text").and_then(|v| v.as_str()) {
-                // Trim long lines for display.
-                let line = if text.len() > 200 {
-                    format!("{}...", &text[..200])
-                } else {
-                    text.to_string()
+                // Trim long lines for display (UTF-8 safe).
+                let line = match text.char_indices().nth(200) {
+                    Some((i, _)) => format!("{}...", &text[..i]),
+                    None => text.to_string(),
                 };
                 tui.append_session_log(&event.task, line);
             }
@@ -387,6 +387,16 @@ fn draw_keybindings(f: &mut ratatui::Frame, area: Rect) {
     );
 }
 
+/// RAII guard to restore terminal state on drop.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 /// Run the TUI event loop. Takes ownership of the terminal.
 ///
 /// This is called from the run loop after all components are started.
@@ -395,8 +405,9 @@ pub async fn run_tui(
     event_bus: Arc<EventBus>,
     max_sessions: u32,
 ) -> io::Result<()> {
-    // Setup terminal.
+    // Setup terminal. The guard ensures cleanup even on early return/panic.
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -404,6 +415,7 @@ pub async fn run_tui(
 
     let mut tui = TuiState::new(max_sessions);
     let mut event_rx = event_bus.subscribe();
+    let mut term_events = EventStream::new();
 
     // Initial state load.
     refresh_from_server(&mut tui, &server).await;
@@ -414,8 +426,6 @@ pub async fn run_tui(
         // Draw.
         draw(&mut terminal, &tui)?;
 
-        // Handle events with timeout.
-        let timeout = tick_rate;
         tokio::select! {
             // Platform events from the event bus.
             result = event_rx.recv() => {
@@ -430,18 +440,14 @@ pub async fn run_tui(
                     }
                 }
             }
-            // Terminal input events.
-            _ = async {
-                loop {
-                    if ct_event::poll(timeout).unwrap_or(false) {
-                        if let Ok(CtEvent::Key(key)) = ct_event::read() {
-                            handle_key(&mut tui, key, &server).await;
-                        }
-                        break;
-                    }
-                    break;
+            // Terminal input events (async, non-blocking).
+            maybe_event = term_events.next() => {
+                if let Some(Ok(CtEvent::Key(key))) = maybe_event {
+                    handle_key(&mut tui, key, &server).await;
                 }
-            } => {}
+            }
+            // Periodic redraw tick.
+            _ = tokio::time::sleep(tick_rate) => {}
         }
 
         if tui.should_quit {
@@ -449,10 +455,6 @@ pub async fn run_tui(
         }
     }
 
-    // Restore terminal.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
+    // Guard handles cleanup via Drop.
     Ok(())
 }
