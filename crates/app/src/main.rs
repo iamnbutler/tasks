@@ -5,6 +5,7 @@
 
 mod config;
 mod run_loop;
+mod tui;
 
 use models::project::Project;
 use tasks_store::Store;
@@ -72,7 +73,7 @@ fn print_usage() {
     eprintln!("Usage: tasks-app <command>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  run                     Start the platform (default)");
+    eprintln!("  run [--tui]             Start the platform (default)");
     eprintln!("  add-project <owner/repo>  Add a project to track");
     eprintln!("  remove-project <id>       Remove a project");
     eprintln!("  list-projects             List configured projects");
@@ -114,13 +115,16 @@ async fn main() {
         }
         "list-projects" => cmd_list_projects(),
         "run" => {
-            let config = match AppConfig::from_env() {
+            let mut config = match AppConfig::from_env() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Configuration error: {e}");
                     std::process::exit(1);
                 }
             };
+            if args.iter().any(|a| a == "--tui") {
+                config.tui = true;
+            }
             run_loop::run(config).await.map_err(|e| e.to_string())
         }
         "--help" | "-h" | "help" => {

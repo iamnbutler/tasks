@@ -240,6 +240,17 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .await
                             {
                                 error!(task_id = %task_id, error = %e, "failed to start session");
+                                // Transition back to Waiting so dispatcher can retry.
+                                if let Err(e2) = dispatch_server
+                                    .set_task_state(
+                                        task_id,
+                                        models::task::TaskState::Waiting,
+                                        events::Actor::System,
+                                    )
+                                    .await
+                                {
+                                    warn!(task_id = %task_id, error = %e2, "failed to revert task to waiting — task may be stuck");
+                                }
                             }
                         }
                     }
@@ -262,9 +273,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 8. Wait for shutdown ---
+    // --- 8. Wait for shutdown (TUI or headless) ---
 
-    tokio::signal::ctrl_c().await?;
+    if config.tui {
+        crate::tui::run_tui(server.clone(), server.event_bus.clone(), config.max_sessions).await?;
+    } else {
+        tokio::signal::ctrl_c().await?;
+    }
     info!("shutting down");
 
     // Stop all sessions

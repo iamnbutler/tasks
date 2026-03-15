@@ -20,11 +20,15 @@ pub struct AppConfig {
     pub session_soft_limit: Duration,
     /// Session hard time limit (default: 1h15m).
     pub session_hard_limit: Duration,
+    /// Whether to run the TUI.
+    pub tui: bool,
 }
 
 impl AppConfig {
-    /// Read configuration from environment variables.
+    /// Read configuration from `.env` file (if present) and environment variables.
     pub fn from_env() -> Result<Self, String> {
+        // Load .env file if it exists — doesn't error if missing.
+        dotenvy::dotenv().ok();
         let data_dir = std::env::var("TASKS_DATA_DIR").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             format!("{home}/.tasks")
@@ -60,6 +64,7 @@ impl AppConfig {
             container_image,
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
+            tui: false, // set by CLI flag
         })
     }
 }
