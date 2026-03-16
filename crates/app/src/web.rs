@@ -32,6 +32,7 @@ use server::Server;
 pub struct ApiState {
     pub server: Arc<Server>,
     pub max_sessions: u32,
+    pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
 }
 
 /// Build the API router.
@@ -41,6 +42,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/events", get(get_task_events))
+        .route("/tasks/{id}/chat", post(send_chat))
         .route("/projects", get(list_projects))
         .route("/merge-queue", get(list_merge_queue))
         .route("/merge-queue/flush", post(flush_merge_queue))
@@ -82,6 +84,11 @@ struct ModeResponse {
 #[derive(Deserialize)]
 struct SetModeRequest {
     mode: Mode,
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +238,22 @@ async fn set_mode(
     Ok(Json(ModeResponse { mode }))
 }
 
+/// POST /api/tasks/:id/chat — Send a chat message to a running session (spec §9.2).
+async fn send_chat(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ChatRequest>,
+) -> Result<StatusCode, ApiError> {
+    let sm = state
+        .session_manager
+        .as_ref()
+        .ok_or_else(|| ApiError::SessionManager("session manager not available".into()))?;
+    sm.send_chat(&id, req.message)
+        .await
+        .map_err(|e| ApiError::SessionManager(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
 /// GET /api/events — SSE stream of live events.
 ///
 /// Supports optional query params: `pattern` and `task_id` for filtering.
@@ -271,6 +294,7 @@ async fn event_stream(
 enum ApiError {
     Server(server::ServerError),
     MergeQueue(String),
+    SessionManager(String),
 }
 
 impl IntoResponse for ApiError {
@@ -278,6 +302,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::Server(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

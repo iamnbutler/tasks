@@ -1,97 +1,91 @@
-import type { Snapshot, Task, Project, MergeQueueEntry, Mode, Event } from './types';
+import type {
+  Event,
+  MergeQueueEntry,
+  Mode,
+  Project,
+  Snapshot,
+  Task,
+} from "./types";
 
-const BASE = '/api';
-
-async function get<T>(path: string): Promise<T> {
-	const res = await fetch(`${BASE}${path}`);
-	if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-	return res.json();
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, init);
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText}: ${path}`);
+  }
+  return res.json();
 }
 
-async function post<T>(path: string, body?: unknown): Promise<T> {
-	const res = await fetch(`${BASE}${path}`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: body ? JSON.stringify(body) : undefined
-	});
-	if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-	return res.json();
+async function requestVoid(path: string, init?: RequestInit): Promise<void> {
+  const res = await fetch(path, init);
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText}: ${path}`);
+  }
 }
 
-/** GET /api/snapshot - Full system state (spec 16.3). */
-export function getSnapshot(): Promise<Snapshot> {
-	return get('/snapshot');
+export function fetchSnapshot(): Promise<Snapshot> {
+  return request<Snapshot>("/api/snapshot");
 }
 
-/** GET /api/tasks */
-export function getTasks(): Promise<Task[]> {
-	return get('/tasks');
+export function fetchTasks(): Promise<Task[]> {
+  return request<Task[]>("/api/tasks");
 }
 
-/** GET /api/tasks/:id */
-export function getTask(id: string): Promise<Task> {
-	return get(`/tasks/${id}`);
+export function fetchTask(id: string): Promise<Task> {
+  return request<Task>(`/api/tasks/${id}`);
 }
 
-/** GET /api/tasks/:id/events */
-export function getTaskEvents(id: string): Promise<Event[]> {
-	return get(`/tasks/${id}/events`);
+export function fetchTaskEvents(id: string): Promise<Event[]> {
+  return request<Event[]>(`/api/tasks/${id}/events`);
 }
 
-/** GET /api/projects */
-export function getProjects(): Promise<Project[]> {
-	return get('/projects');
+export function fetchProjects(): Promise<Project[]> {
+  return request<Project[]>("/api/projects");
 }
 
-/** GET /api/merge-queue */
-export function getMergeQueue(): Promise<MergeQueueEntry[]> {
-	return get('/merge-queue');
+export function fetchMergeQueue(): Promise<MergeQueueEntry[]> {
+  return request<MergeQueueEntry[]>("/api/merge-queue");
 }
 
-/** GET /api/mode */
-export function getMode(): Promise<{ mode: Mode }> {
-	return get('/mode');
+export function fetchMode(): Promise<{ mode: Mode }> {
+  return request<{ mode: Mode }>("/api/mode");
 }
 
-/** POST /api/mode */
 export function setMode(mode: Mode): Promise<{ mode: Mode }> {
-	return post('/mode', { mode });
+  return request<{ mode: Mode }>("/api/mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
 }
 
-/** POST /api/merge-queue/:id/approve */
-export async function approveMerge(id: string): Promise<void> {
-	await fetch(`${BASE}/merge-queue/${id}/approve`, { method: 'POST' });
+export function approveMerge(id: string): Promise<void> {
+  return requestVoid(`/api/merge-queue/${id}/approve`, { method: "POST" });
 }
 
-/** POST /api/merge-queue/:id/reject */
-export async function rejectMerge(id: string): Promise<void> {
-	await fetch(`${BASE}/merge-queue/${id}/reject`, { method: 'POST' });
+export function rejectMerge(id: string): Promise<void> {
+  return requestVoid(`/api/merge-queue/${id}/reject`, { method: "POST" });
 }
 
-/** POST /api/merge-queue/flush */
-export async function flushMergeQueue(): Promise<string[]> {
-	return post('/merge-queue/flush');
+export function flushMergeQueue(): Promise<string[]> {
+  return request<string[]>("/api/merge-queue/flush", { method: "POST" });
 }
 
-/** Subscribe to the live SSE event stream. */
-export function subscribeEvents(
-	onEvent: (event: Event) => void,
-	opts?: { pattern?: string; taskId?: string }
-): () => void {
-	const params = new URLSearchParams();
-	if (opts?.pattern) params.set('pattern', opts.pattern);
-	if (opts?.taskId) params.set('task_id', opts.taskId);
+export function sendChat(taskId: string, message: string): Promise<void> {
+  return requestVoid(`/api/tasks/${taskId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+}
 
-	const url = `${BASE}/events${params.toString() ? '?' + params : ''}`;
-	const source = new EventSource(url);
-
-	source.onmessage = (e) => {
-		try {
-			onEvent(JSON.parse(e.data));
-		} catch {
-			// ignore parse errors
-		}
-	};
-
-	return () => source.close();
+export function subscribeEvents(opts?: {
+  pattern?: string;
+  task_id?: string;
+}): EventSource {
+  const params = new URLSearchParams();
+  if (opts?.pattern) params.set("pattern", opts.pattern);
+  if (opts?.task_id) params.set("task_id", opts.task_id);
+  const query = params.toString();
+  const url = query ? `/api/events?${query}` : "/api/events";
+  return new EventSource(url);
 }

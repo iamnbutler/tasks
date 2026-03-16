@@ -279,6 +279,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         let api_state = crate::web::ApiState {
             server: server.clone(),
             max_sessions: config.max_sessions,
+            session_manager: Some(session_manager.clone()),
         };
         let web_port = config.web_port;
 
