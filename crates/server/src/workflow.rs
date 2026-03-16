@@ -85,7 +85,7 @@ impl Default for DispatchConfig {
 impl Default for LabelConfig {
     fn default() -> Self {
         Self {
-            ignore: Vec::new(),
+            ignore: vec!["agentic-workflows".to_string()],
             blocked: Vec::new(),
         }
     }
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(cfg.dispatch.max_retries, 3);
         assert_eq!(cfg.dispatch.retry_base_delay, 5);
         assert_eq!(cfg.dispatch.progress_threshold, 60);
-        assert!(cfg.labels.ignore.is_empty());
+        assert_eq!(cfg.labels.ignore, vec!["agentic-workflows"]);
         assert!(cfg.labels.blocked.is_empty());
         assert!(cfg.prompt.system_prompt.is_none());
     }
