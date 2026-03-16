@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { ModeControl } from "@/components/mode-control";
+import { ProjectSwitcher } from "@/components/project-switcher";
 import { cn } from "@/lib/utils";
 
 const navItems = [
@@ -38,6 +39,11 @@ export function Layout() {
         {/* App title */}
         <div className="border-b border-border px-4 py-4">
           <h1 className="text-lg font-bold tracking-tight">Tasks</h1>
+        </div>
+
+        {/* Project switcher */}
+        <div className="border-b border-border px-3 py-3">
+          <ProjectSwitcher />
         </div>
 
         {/* Mode control */}

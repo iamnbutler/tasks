@@ -70,6 +70,18 @@ export function flushMergeQueue(): Promise<string[]> {
   return request<string[]>("/api/merge-queue/flush", { method: "POST" });
 }
 
+export function addProject(repo: string): Promise<Project> {
+  return request<Project>("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo }),
+  });
+}
+
+export function deleteProject(id: string): Promise<void> {
+  return requestVoid(`/api/projects/${id}`, { method: "DELETE" });
+}
+
 export function sendChat(taskId: string, message: string): Promise<void> {
   return requestVoid(`/api/tasks/${taskId}/chat`, {
     method: "POST",

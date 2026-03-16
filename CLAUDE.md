@@ -70,6 +70,8 @@ cd web && bun run dev                    # dev mode (proxies /api to localhost:4
 - `GET /api/tasks/:id` — Get single task
 - `GET /api/tasks/:id/events` — Task event history
 - `GET /api/projects` — List projects
+- `POST /api/projects` — Add project `{ repo: "owner/repo" }`
+- `DELETE /api/projects/:id` — Remove a project
 - `GET /api/merge-queue` — Merge queue entries
 - `GET /api/mode` — Current operating mode
 - `POST /api/mode` — Set operating mode `{ mode: "play"|"pause"|"stop" }`
