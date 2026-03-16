@@ -8,7 +8,6 @@ import {
   ChevronRight,
   FileText,
   Terminal,
-  MessageSquare,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -90,167 +89,170 @@ function sourceDisplay(task: Task) {
 }
 
 // ---------------------------------------------------------------------------
-// Session view — live agent output + chat
+// Parse Claude Code protocol messages from agent:message events.
+//
+// Event data shape: { text: "<raw JSON line from agent stdout>" }
+// The JSON line is a Claude Code protocol message with structure:
+//   { type: "system"|"assistant"|"user"|"result", message?: { content: [...] }, ... }
+// Content blocks: { type: "text", text }, { type: "tool_use", name, input },
+//   { type: "tool_result", content }, { type: "thinking", thinking }
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Extract displayable content from an agent event
-// ---------------------------------------------------------------------------
-
-interface ParsedMessage {
-  kind: "text" | "tool_use" | "tool_result" | "error" | "question";
+interface ParsedBlock {
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system";
   content: string;
   toolName?: string;
   filePath?: string;
 }
 
-function parseAgentEvent(event: Event): ParsedMessage {
-  const data = event.data;
+function parseAgentEvents(events: Event[]): ParsedBlock[] {
+  const blocks: ParsedBlock[] = [];
 
-  if (event.type === "agent:error") {
-    const text =
-      typeof data?.message === "string"
-        ? data.message
-        : typeof data?.text === "string"
-          ? data.text
-          : JSON.stringify(data, null, 2);
-    return { kind: "error", content: text };
-  }
-
-  if (event.type === "agent:question") {
-    const text =
-      typeof data?.message === "string"
-        ? data.message
-        : typeof data?.text === "string"
-          ? data.text
-          : JSON.stringify(data, null, 2);
-    return { kind: "question", content: text };
-  }
-
-  // agent:message — try to extract structured content
-  // Tool use events
-  if (data?.tool_use_id || data?.type === "tool_use") {
-    const name =
-      typeof data?.name === "string" ? data.name : (data?.tool as string) ?? "tool";
-    const input = data?.input ?? data?.arguments ?? {};
-    const filePath =
-      typeof input === "object" && input !== null
-        ? (input as Record<string, unknown>).file_path ??
-          (input as Record<string, unknown>).filePath ??
-          (input as Record<string, unknown>).path
-        : undefined;
-    return {
-      kind: "tool_use",
-      content: typeof input === "string" ? input : JSON.stringify(input, null, 2),
-      toolName: String(name),
-      filePath: filePath ? String(filePath) : undefined,
-    };
-  }
-
-  // Tool result events
-  if (data?.tool_use_result || data?.type === "tool_result") {
-    const result = (data?.tool_use_result ?? data) as Record<string, unknown>;
-    const content =
-      typeof result.content === "string"
-        ? result.content
-        : typeof result.output === "string"
-          ? result.output
-          : "";
-    // For file reads, show a truncated preview
-    if (content.length > 500) {
-      const lines = content.split("\n");
-      const preview = lines.slice(0, 20).join("\n");
-      return {
-        kind: "tool_result",
-        content: preview + (lines.length > 20 ? `\n... (${lines.length} lines)` : ""),
-      };
+  for (const event of events) {
+    if (event.type === "agent:error") {
+      blocks.push({
+        kind: "error",
+        content: typeof event.data?.text === "string" ? event.data.text : JSON.stringify(event.data),
+      });
+      continue;
     }
-    return { kind: "tool_result", content: content || "(empty result)" };
+
+    // event.data.text is a raw JSON line from Claude Code stdout
+    const raw = event.data?.text;
+    if (typeof raw !== "string") continue;
+
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      // Not JSON — show as plain text
+      if (raw.trim()) blocks.push({ kind: "text", content: raw });
+      continue;
+    }
+
+    // Skip system init messages
+    if (msg.type === "system") continue;
+
+    // result messages (final summary)
+    if (msg.type === "result") {
+      const result = msg.result as Record<string, unknown> | undefined;
+      if (typeof result?.text === "string" && result.text) {
+        blocks.push({ kind: "text", content: result.text });
+      }
+      continue;
+    }
+
+    // assistant and user messages — extract content blocks
+    const message = msg.message as Record<string, unknown> | undefined;
+    const contentBlocks = (message?.content ?? msg.content) as unknown[] | undefined;
+    if (!Array.isArray(contentBlocks)) continue;
+
+    for (const block of contentBlocks) {
+      if (typeof block !== "object" || block === null) continue;
+      const b = block as Record<string, unknown>;
+
+      if (b.type === "thinking" && typeof b.thinking === "string") {
+        // Skip thinking blocks — they're internal reasoning
+        continue;
+      }
+
+      if (b.type === "text" && typeof b.text === "string") {
+        if (b.text.trim()) {
+          blocks.push({ kind: "text", content: b.text });
+        }
+        continue;
+      }
+
+      if (b.type === "tool_use") {
+        const name = typeof b.name === "string" ? b.name : "tool";
+        const input = (b.input ?? {}) as Record<string, unknown>;
+        const filePath = input.file_path ?? input.filePath ?? input.path ?? input.pattern;
+        const command = input.command;
+        const description = input.description;
+        // Show the most useful piece of context
+        const detail = filePath ?? command ?? description;
+        blocks.push({
+          kind: "tool_use",
+          content: detail ? String(detail) : "",
+          toolName: name,
+          filePath: filePath ? String(filePath) : undefined,
+        });
+        continue;
+      }
+
+      if (b.type === "tool_result") {
+        const content = typeof b.content === "string" ? b.content : "";
+        if (!content) continue;
+        // Truncate large results
+        const lines = content.split("\n");
+        const preview =
+          lines.length > 30
+            ? lines.slice(0, 25).join("\n") + `\n... (${lines.length} total lines)`
+            : content;
+        blocks.push({ kind: "tool_result", content: preview });
+        continue;
+      }
+    }
   }
 
-  // Plain text message
-  const text =
-    typeof data?.message === "string"
-      ? data.message
-      : typeof data?.text === "string"
-        ? data.text
-        : typeof data?.content === "string"
-          ? data.content
-          : null;
-
-  if (text) {
-    return { kind: "text", content: text };
-  }
-
-  // Fallback — skip empty data objects
-  if (!data || Object.keys(data).length === 0) {
-    return { kind: "text", content: "" };
-  }
-
-  return { kind: "text", content: JSON.stringify(data, null, 2) };
+  return blocks;
 }
 
 // ---------------------------------------------------------------------------
-// Message bubble
+// Rendered block components
 // ---------------------------------------------------------------------------
 
-function MessageBubble({ msg }: { msg: ParsedMessage }) {
-  if (!msg.content && msg.kind === "text") return null;
-
-  if (msg.kind === "tool_use") {
+function BlockView({ block }: { block: ParsedBlock }) {
+  if (block.kind === "tool_use") {
     return (
-      <div className="rounded-md border border-border bg-muted/50 text-sm">
-        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border text-muted-foreground text-xs">
-          <Terminal className="h-3 w-3" />
-          <span className="font-medium">{msg.toolName}</span>
-          {msg.filePath && (
-            <span className="font-mono truncate">{msg.filePath}</span>
+      <div className="flex items-center gap-2 py-1 text-muted-foreground text-xs">
+        <Terminal className="h-3 w-3 shrink-0" />
+        <span className="font-medium">{block.toolName}</span>
+        {block.content && (
+          <span className="font-mono truncate">{block.content}</span>
+        )}
+      </div>
+    );
+  }
+
+  if (block.kind === "tool_result") {
+    const [open, setOpen] = useState(false);
+    const isLong = block.content.split("\n").length > 5;
+    return (
+      <div className="rounded-md border border-border bg-muted/50 text-sm overflow-hidden">
+        <button
+          onClick={() => setOpen(!open)}
+          className="flex items-center gap-2 px-3 py-1.5 w-full text-left text-muted-foreground text-xs hover:bg-muted/80"
+        >
+          <FileText className="h-3 w-3 shrink-0" />
+          <span>Output</span>
+          {isLong && (
+            open
+              ? <ChevronDown className="h-3 w-3 ml-auto" />
+              : <ChevronRight className="h-3 w-3 ml-auto" />
           )}
-        </div>
+        </button>
+        {(open || !isLong) && (
+          <pre className="px-3 py-2 text-xs font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-muted-foreground border-t border-border">
+            {block.content}
+          </pre>
+        )}
       </div>
     );
   }
 
-  if (msg.kind === "tool_result") {
-    return (
-      <div className="rounded-md border border-border bg-muted/50 text-sm">
-        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border text-muted-foreground text-xs">
-          <FileText className="h-3 w-3" />
-          <span>Result</span>
-        </div>
-        <pre className="px-3 py-2 text-xs font-mono overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto text-muted-foreground">
-          {msg.content}
-        </pre>
-      </div>
-    );
-  }
-
-  if (msg.kind === "error") {
+  if (block.kind === "error") {
     return (
       <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
-        {msg.content}
+        {block.content}
       </div>
     );
   }
 
-  if (msg.kind === "question") {
-    return (
-      <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm">
-        <div className="flex items-center gap-2 mb-1 text-yellow-400 text-xs font-medium">
-          <MessageSquare className="h-3 w-3" />
-          Question
-        </div>
-        <div className="prose prose-sm prose-invert max-w-none">
-          <Markdown remarkPlugins={[remarkGfm]}>{msg.content}</Markdown>
-        </div>
-      </div>
-    );
-  }
-
-  // Regular text — render as markdown
+  // text — render as markdown
   return (
-    <div className="prose prose-sm prose-invert max-w-none text-sm">
-      <Markdown remarkPlugins={[remarkGfm]}>{msg.content}</Markdown>
+    <div className="prose prose-sm prose-invert max-w-none">
+      <Markdown remarkPlugins={[remarkGfm]}>{block.content}</Markdown>
     </div>
   );
 }
@@ -260,12 +262,11 @@ function MessageBubble({ msg }: { msg: ParsedMessage }) {
 // ---------------------------------------------------------------------------
 
 function SessionView({ taskId }: { taskId: string }) {
-  const [messages, setMessages] = useState<Event[]>([]);
+  const [rawEvents, setRawEvents] = useState<Event[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Subscribe to live events for this task
   useEffect(() => {
     fetchTaskEvents(taskId).then((events) => {
       const agentEvents = events.filter(
@@ -274,7 +275,7 @@ function SessionView({ taskId }: { taskId: string }) {
           e.type === "agent:question" ||
           e.type === "agent:error"
       );
-      setMessages(agentEvents.sort((a, b) => a.ts.localeCompare(b.ts)));
+      setRawEvents(agentEvents.sort((a, b) => a.ts.localeCompare(b.ts)));
     });
 
     const source = subscribeEvents({ task_id: taskId });
@@ -286,7 +287,7 @@ function SessionView({ taskId }: { taskId: string }) {
           event.type === "agent:question" ||
           event.type === "agent:error"
         ) {
-          setMessages((prev) => [...prev, event]);
+          setRawEvents((prev) => [...prev, event]);
         }
       } catch {
         // ignore
@@ -295,10 +296,12 @@ function SessionView({ taskId }: { taskId: string }) {
     return () => source.close();
   }, [taskId]);
 
+  const blocks = parseAgentEvents(rawEvents);
+
   // Auto-scroll to bottom
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [blocks.length]);
 
   const handleSend = useCallback(async () => {
     const text = chatInput.trim();
@@ -314,8 +317,6 @@ function SessionView({ taskId }: { taskId: string }) {
     }
   }, [chatInput, sending, taskId]);
 
-  const parsed = messages.map(parseAgentEvent);
-
   return (
     <Card className="flex flex-col flex-1 min-h-0">
       <CardHeader className="pb-2">
@@ -326,13 +327,13 @@ function SessionView({ taskId }: { taskId: string }) {
       <CardContent className="flex flex-col flex-1 min-h-0 gap-3">
         {/* Message stream */}
         <div className="flex-1 min-h-0 overflow-y-auto rounded-md border border-border bg-background p-4 space-y-3">
-          {parsed.length === 0 && (
+          {blocks.length === 0 && (
             <p className="text-muted-foreground text-center py-8">
               No agent output yet.
             </p>
           )}
-          {parsed.map((msg, i) => (
-            <MessageBubble key={i} msg={msg} />
+          {blocks.map((block, i) => (
+            <BlockView key={i} block={block} />
           ))}
           <div ref={bottomRef} />
         </div>
