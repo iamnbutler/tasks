@@ -158,6 +158,7 @@ async fn start_agent(
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
+            "--dangerously-skip-permissions".to_string(),
         ]);
 
     let mut cmd = Command::new(&agent_cmd);
