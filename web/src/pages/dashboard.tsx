@@ -168,7 +168,7 @@ export function DashboardPage() {
             {activeTasks.map((task) => (
               <Link
                 key={task.id}
-                to="/tasks"
+                to={`/tasks/${task.id}`}
                 className="block rounded-lg border bg-card p-3 hover:bg-accent/50 transition-colors"
               >
                 <div className="flex items-center gap-3">
