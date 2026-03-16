@@ -23,6 +23,11 @@ pub fn issue_to_task(
     project_id: &str,
     label_config: &LabelConfig,
 ) -> Option<Task> {
+    // Skip closed issues.
+    if issue.state != tasks_github::model::IssueState::Open {
+        return None;
+    }
+
     let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
 
     // Check if any issue label matches an ignore label — if so, skip.
@@ -58,6 +63,11 @@ pub fn pr_to_task(
     project_id: &str,
     label_config: &LabelConfig,
 ) -> Option<Task> {
+    // Skip closed/merged PRs.
+    if pr.state != tasks_github::model::PullRequestState::Open {
+        return None;
+    }
+
     let pr_label_names: Vec<&str> = pr.labels.iter().map(|l| l.name.as_str()).collect();
 
     // Check if any PR label matches an ignore label — if so, skip.
@@ -283,16 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn closed_issue_still_imported() {
+    fn closed_issue_not_imported() {
         let issue = make_issue(55, vec![make_label("bug")], GhIssueState::Closed);
         let cfg = default_label_config();
 
         let task = issue_to_task(&issue, "proj-1", &cfg);
-        assert!(task.is_some(), "closed issues should still be imported");
-
-        let task = task.unwrap();
-        assert_eq!(task.id, "gh-acme-widgets-issue-55");
-        // State is Waiting (not derived from GitHub's closed state).
-        assert_eq!(task.state, TaskState::Waiting);
+        assert!(task.is_none(), "closed issues should be skipped");
     }
 }
