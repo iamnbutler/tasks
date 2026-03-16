@@ -44,6 +44,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/events", get(get_task_events))
         .route("/tasks/{id}/chat", post(send_chat))
         .route("/projects", get(list_projects))
+        .route("/projects", post(add_project))
+        .route("/projects/{id}", axum::routing::delete(delete_project))
         .route("/merge-queue", get(list_merge_queue))
         .route("/merge-queue/flush", post(flush_merge_queue))
         .route("/merge-queue/{id}/approve", post(approve_merge))
@@ -84,6 +86,11 @@ struct ModeResponse {
 #[derive(Deserialize)]
 struct SetModeRequest {
     mode: Mode,
+}
+
+#[derive(Deserialize)]
+struct AddProjectRequest {
+    repo: String,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +179,36 @@ async fn list_projects(
 ) -> Json<Vec<models::project::Project>> {
     let server_state = state.server.state.read().await;
     Json(server_state.projects.values().cloned().collect())
+}
+
+/// POST /api/projects — Add a new project.
+async fn add_project(
+    State(state): State<ApiState>,
+    Json(req): Json<AddProjectRequest>,
+) -> Result<Json<models::project::Project>, ApiError> {
+    let parts: Vec<&str> = req.repo.split('/').collect();
+    if parts.len() != 2 {
+        return Err(ApiError::MergeQueue(format!(
+            "Invalid repo format: {} (expected owner/repo)",
+            req.repo
+        )));
+    }
+    let project = models::project::Project::new(&req.repo, &req.repo);
+    state.server.add_project(project.clone()).await;
+    Ok(Json(project))
+}
+
+/// DELETE /api/projects/:id — Remove a project.
+async fn delete_project(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state.server.remove_project(&id).await;
+    if removed {
+        Ok(StatusCode::OK)
+    } else {
+        Err(ApiError::MergeQueue(format!("Project not found: {id}")))
+    }
 }
 
 /// GET /api/merge-queue — List merge queue entries.

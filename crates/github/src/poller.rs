@@ -120,7 +120,7 @@ impl RepoPoller {
 
     async fn poll_issues_inner(&self) -> Result<Vec<Issue>, GitHubError> {
         let filters = IssueFilters {
-            states: None, // all states on first poll, filtered by `since` on subsequent
+            states: Some(vec![crate::model::IssueState::Open]),
             since: self.since,
             ..Default::default()
         };
@@ -131,7 +131,7 @@ impl RepoPoller {
 
     async fn poll_pull_requests_inner(&self) -> Result<Vec<PullRequest>, GitHubError> {
         let filters = PullRequestFilters {
-            states: None,
+            states: Some(vec![crate::model::PullRequestState::Open]),
             since: self.since,
         };
         self.client

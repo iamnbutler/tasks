@@ -154,6 +154,19 @@ impl Server {
         state.projects.insert(project.id.clone(), project);
     }
 
+    pub async fn remove_project(&self, id: &str) -> bool {
+        let mut state = self.state.write().await;
+        let removed = state.projects.remove(id).is_some();
+        if removed {
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    let _ = store.delete_project(id);
+                }
+            }
+        }
+        removed
+    }
+
     pub async fn get_project(&self, id: &str) -> Option<Project> {
         let state = self.state.read().await;
         state.projects.get(id).cloned()
