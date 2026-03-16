@@ -70,6 +70,14 @@ export function flushMergeQueue(): Promise<string[]> {
   return request<string[]>("/api/merge-queue/flush", { method: "POST" });
 }
 
+export function sendChat(taskId: string, message: string): Promise<void> {
+  return requestVoid(`/api/tasks/${taskId}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;

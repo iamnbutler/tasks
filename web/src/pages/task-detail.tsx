@@ -1,12 +1,20 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import {
+  ArrowLeft,
+  ExternalLink,
+  Send,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { fetchTaskEvents } from "@/lib/api";
-import { formatRelativeTime } from "@/lib/utils";
+import { fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
+import { cn, formatRelativeTime } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
@@ -21,31 +29,22 @@ import type { Event, Task, TaskState } from "@/lib/types";
 // State badge
 // ---------------------------------------------------------------------------
 
+const stateStyles: Record<TaskState, string> = {
+  waiting: "bg-muted text-muted-foreground",
+  blocked: "bg-muted text-muted-foreground",
+  running: "bg-blue-600 text-white",
+  question: "bg-yellow-600 text-white",
+  testing: "bg-purple-600 text-white",
+  awaiting_merge: "bg-orange-500 text-white",
+  conflict: "bg-red-600 text-white",
+  completed: "bg-green-600 text-white",
+  failed: "bg-red-600 text-white",
+  cancelled: "bg-muted text-muted-foreground",
+};
+
 function stateBadge(state: TaskState) {
-  switch (state) {
-    case "running":
-      return <Badge className="bg-blue-600 text-white">{state}</Badge>;
-    case "question":
-      return (
-        <Badge variant="secondary" className="text-yellow-600">
-          {state}
-        </Badge>
-      );
-    case "testing":
-      return <Badge variant="outline">{state}</Badge>;
-    case "awaiting_merge":
-      return <Badge variant="secondary">awaiting merge</Badge>;
-    case "completed":
-      return <Badge className="bg-green-600 text-white">{state}</Badge>;
-    case "failed":
-      return <Badge variant="destructive">{state}</Badge>;
-    case "conflict":
-      return <Badge className="bg-orange-600 text-white">{state}</Badge>;
-    case "cancelled":
-      return <Badge variant="secondary">{state}</Badge>;
-    default:
-      return <Badge variant="outline">{state}</Badge>;
-  }
+  const label = state === "awaiting_merge" ? "awaiting merge" : state;
+  return <Badge className={stateStyles[state]}>{label}</Badge>;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +60,7 @@ function sourceDisplay(task: Task) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-blue-600 hover:underline"
+        className="inline-flex items-center gap-1 text-blue-400 hover:underline"
       >
         {source.owner}/{source.repo}#{source.number}
         <ExternalLink className="h-3 w-3" />
@@ -75,7 +74,7 @@ function sourceDisplay(task: Task) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-blue-600 hover:underline"
+        className="inline-flex items-center gap-1 text-blue-400 hover:underline"
       >
         {source.owner}/{source.repo}#{source.number} (PR)
         <ExternalLink className="h-3 w-3" />
@@ -83,6 +82,129 @@ function sourceDisplay(task: Task) {
     );
   }
   return <span className="text-muted-foreground">Internal</span>;
+}
+
+// ---------------------------------------------------------------------------
+// Session view — live agent output + chat
+// ---------------------------------------------------------------------------
+
+function SessionView({ taskId }: { taskId: string }) {
+  const [messages, setMessages] = useState<Event[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Subscribe to live events for this task
+  useEffect(() => {
+    // Load historical events first
+    fetchTaskEvents(taskId).then((events) => {
+      const agentEvents = events.filter(
+        (e) =>
+          e.type === "agent:message" ||
+          e.type === "agent:question" ||
+          e.type === "agent:error"
+      );
+      setMessages(agentEvents.sort((a, b) => a.ts.localeCompare(b.ts)));
+    });
+
+    // Subscribe to live events
+    const source = subscribeEvents({ task_id: taskId });
+    source.onmessage = (msg) => {
+      try {
+        const event: Event = JSON.parse(msg.data);
+        if (
+          event.type === "agent:message" ||
+          event.type === "agent:question" ||
+          event.type === "agent:error"
+        ) {
+          setMessages((prev) => [...prev, event]);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    return () => source.close();
+  }, [taskId]);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSend = useCallback(async () => {
+    const text = chatInput.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setChatInput("");
+    try {
+      await sendChat(taskId, text);
+    } catch {
+      // Message will show via SSE if it worked
+    } finally {
+      setSending(false);
+    }
+  }, [chatInput, sending, taskId]);
+
+  return (
+    <Card className="flex flex-col flex-1 min-h-0">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium text-muted-foreground">
+          Session
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col flex-1 min-h-0 gap-3">
+        {/* Message stream */}
+        <div className="flex-1 min-h-0 overflow-y-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-sm space-y-1">
+          {messages.length === 0 && (
+            <p className="text-muted-foreground text-center py-8">
+              No agent output yet.
+            </p>
+          )}
+          {messages.map((event) => {
+            const content =
+              typeof event.data?.message === "string"
+                ? event.data.message
+                : typeof event.data?.text === "string"
+                  ? event.data.text
+                  : JSON.stringify(event.data);
+            return (
+              <div
+                key={event.id}
+                className={cn(
+                  "whitespace-pre-wrap break-words",
+                  event.type === "agent:error" && "text-red-400",
+                  event.type === "agent:question" && "text-yellow-400"
+                )}
+              >
+                {content}
+              </div>
+            );
+          })}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Chat input */}
+        <form
+          className="flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSend();
+          }}
+        >
+          <Input
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="Send a message to the agent..."
+            className="flex-1"
+            disabled={sending}
+          />
+          <Button type="submit" size="icon" disabled={sending || !chatInput.trim()}>
+            <Send className="h-4 w-4" />
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -103,27 +225,29 @@ export function TaskDetailPage() {
   const { snapshot } = useAppState();
   const [events, setEvents] = useState<Event[]>([]);
   const [eventsLoading, setEventsLoading] = useState(true);
+  const [showDetails, setShowDetails] = useState(false);
 
   const task = snapshot?.tasks.find((t) => t.id === id);
+
+  const isSessionActive =
+    task?.state === "running" ||
+    task?.state === "question" ||
+    task?.state === "testing";
 
   useEffect(() => {
     if (!id) return;
     setEventsLoading(true);
     fetchTaskEvents(id)
       .then((data) => {
-        setEvents(data.sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()));
+        setEvents(
+          data.sort(
+            (a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()
+          )
+        );
       })
-      .catch(() => {
-        setEvents([]);
-      })
-      .finally(() => {
-        setEventsLoading(false);
-      });
+      .catch(() => setEvents([]))
+      .finally(() => setEventsLoading(false));
   }, [id]);
-
-  // -------------------------------------------------------------------------
-  // Not found
-  // -------------------------------------------------------------------------
 
   if (!snapshot) {
     return (
@@ -147,183 +271,199 @@ export function TaskDetailPage() {
     );
   }
 
-  // -------------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------------
-
   return (
-    <div className="space-y-6 p-6">
-      {/* Back link */}
-      <Link to="/tasks">
-        <Button variant="ghost" size="sm" className="gap-1">
-          <ArrowLeft className="h-4 w-4" />
-          Back to Tasks
-        </Button>
-      </Link>
-
-      {/* Title + state */}
-      <div className="flex items-start gap-3">
-        <div className="space-y-1 flex-1">
-          <h1 className="text-2xl font-bold">{task.title}</h1>
-          <p className="text-sm text-muted-foreground font-mono">{task.id}</p>
+    <div className="flex flex-col h-full p-6 gap-4">
+      {/* Header */}
+      <div className="flex items-start gap-3 shrink-0">
+        <Link to="/tasks">
+          <Button variant="ghost" size="icon" className="shrink-0">
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+        </Link>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <h1 className="text-xl font-bold truncate">{task.title}</h1>
+            {stateBadge(task.state)}
+          </div>
+          <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground">
+            <span className="font-mono text-xs">{task.id.slice(0, 8)}</span>
+            <Separator orientation="vertical" className="h-4" />
+            {sourceDisplay(task)}
+            <Separator orientation="vertical" className="h-4" />
+            <span>{task.project}</span>
+            {task.labels.length > 0 && (
+              <>
+                <Separator orientation="vertical" className="h-4" />
+                <span className="flex gap-1">
+                  {task.labels.map((l) => (
+                    <Badge key={l} variant="outline" className="text-xs">
+                      {l}
+                    </Badge>
+                  ))}
+                </span>
+              </>
+            )}
+          </div>
         </div>
-        {stateBadge(task.state)}
       </div>
 
-      {/* Metadata grid */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Details
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3 text-sm">
-            <div>
-              <dt className="text-muted-foreground">Source</dt>
-              <dd className="mt-0.5 font-medium">{sourceDisplay(task)}</dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Project</dt>
-              <dd className="mt-0.5 font-medium">{task.project}</dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Priority</dt>
-              <dd className="mt-0.5 font-medium">
-                {task.priority !== null ? task.priority : "None"}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Created</dt>
-              <dd className="mt-0.5 font-medium">
-                {formatRelativeTime(task.created_at)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Updated</dt>
-              <dd className="mt-0.5 font-medium">
-                {formatRelativeTime(task.updated_at)}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Retry Count</dt>
-              <dd className="mt-0.5 font-medium">{task.retry_count}</dd>
-            </div>
-            {task.session_id && (
-              <div>
-                <dt className="text-muted-foreground">Session ID</dt>
-                <dd className="mt-0.5 font-mono text-xs">{task.session_id}</dd>
-              </div>
-            )}
-            {task.parent_id && (
-              <div>
-                <dt className="text-muted-foreground">Parent Task</dt>
-                <dd className="mt-0.5">
-                  <Link
-                    to={`/tasks/${task.parent_id}`}
-                    className="text-blue-600 hover:underline font-mono text-xs"
-                  >
-                    {task.parent_id.slice(0, 8)}...
-                  </Link>
-                </dd>
-              </div>
-            )}
-            {task.blocked_by.length > 0 && (
-              <div>
-                <dt className="text-muted-foreground">Blocked By</dt>
-                <dd className="mt-0.5 space-x-1">
-                  {task.blocked_by.map((bid) => (
-                    <Link
-                      key={bid}
-                      to={`/tasks/${bid}`}
-                      className="text-blue-600 hover:underline font-mono text-xs"
-                    >
-                      {bid.slice(0, 8)}
-                    </Link>
-                  ))}
-                </dd>
-              </div>
-            )}
-          </dl>
-        </CardContent>
-      </Card>
-
-      {/* Labels */}
-      {task.labels.length > 0 && (
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm text-muted-foreground">Labels:</span>
-          {task.labels.map((label) => (
-            <Badge key={label} variant="outline">
-              {label}
-            </Badge>
-          ))}
-        </div>
+      {/* Session view — the main content when active */}
+      {isSessionActive && id && (
+        <SessionView taskId={id} />
       )}
 
-      {/* Description */}
-      {task.description && (
-        <Card>
-          <CardHeader>
+      {/* Collapsible details */}
+      <div className="shrink-0">
+        <button
+          onClick={() => setShowDetails(!showDetails)}
+          className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
+        >
+          {showDetails ? (
+            <ChevronDown className="h-4 w-4" />
+          ) : (
+            <ChevronRight className="h-4 w-4" />
+          )}
+          Details
+        </button>
+
+        {showDetails && (
+          <div className="mt-3 space-y-4">
+            {/* Metadata */}
+            <Card>
+              <CardContent className="pt-4">
+                <dl className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-3 text-sm">
+                  <div>
+                    <dt className="text-muted-foreground">Priority</dt>
+                    <dd className="font-medium">
+                      {task.priority !== null ? task.priority : "None"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Created</dt>
+                    <dd className="font-medium">
+                      {formatRelativeTime(task.created_at)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Updated</dt>
+                    <dd className="font-medium">
+                      {formatRelativeTime(task.updated_at)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-muted-foreground">Retries</dt>
+                    <dd className="font-medium">{task.retry_count}</dd>
+                  </div>
+                  {task.session_id && (
+                    <div>
+                      <dt className="text-muted-foreground">Session</dt>
+                      <dd className="font-mono text-xs">
+                        {task.session_id.slice(0, 12)}
+                      </dd>
+                    </div>
+                  )}
+                  {task.parent_id && (
+                    <div>
+                      <dt className="text-muted-foreground">Parent</dt>
+                      <dd>
+                        <Link
+                          to={`/tasks/${task.parent_id}`}
+                          className="text-blue-400 hover:underline font-mono text-xs"
+                        >
+                          {task.parent_id.slice(0, 8)}
+                        </Link>
+                      </dd>
+                    </div>
+                  )}
+                  {task.blocked_by.length > 0 && (
+                    <div>
+                      <dt className="text-muted-foreground">Blocked by</dt>
+                      <dd className="space-x-1">
+                        {task.blocked_by.map((bid) => (
+                          <Link
+                            key={bid}
+                            to={`/tasks/${bid}`}
+                            className="text-blue-400 hover:underline font-mono text-xs"
+                          >
+                            {bid.slice(0, 8)}
+                          </Link>
+                        ))}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+              </CardContent>
+            </Card>
+
+            {/* Description */}
+            {task.description && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium text-muted-foreground">
+                    Description
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <pre className="whitespace-pre-wrap text-sm font-mono bg-muted/50 rounded-md p-4 overflow-x-auto">
+                    {task.description}
+                  </pre>
+                </CardContent>
+              </Card>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Event timeline — always visible when no active session, or below details */}
+      {(!isSessionActive || showDetails) && (
+        <Card className="shrink-0">
+          <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
-              Description
+              Event Timeline
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <pre className="whitespace-pre-wrap text-sm font-mono bg-muted/50 rounded-md p-4 overflow-x-auto">
-              {task.description}
-            </pre>
+            {eventsLoading ? (
+              <p className="text-sm text-muted-foreground">Loading events...</p>
+            ) : events.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No events found.</p>
+            ) : (
+              <div className="overflow-x-auto max-h-96 overflow-y-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[100px]">Time</TableHead>
+                      <TableHead className="w-[160px]">Type</TableHead>
+                      <TableHead className="w-[100px]">Actor</TableHead>
+                      <TableHead>Data</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {events.map((event) => (
+                      <TableRow key={event.id}>
+                        <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                          {formatRelativeTime(event.ts)}
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant="outline" className="text-xs">
+                            {event.type}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {event.actor}
+                        </TableCell>
+                        <TableCell className="text-xs font-mono text-muted-foreground max-w-md truncate">
+                          {eventDataPreview(event.data)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
-
-      {/* Event timeline */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm font-medium text-muted-foreground">
-            Event Timeline
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {eventsLoading ? (
-            <p className="text-sm text-muted-foreground">Loading events...</p>
-          ) : events.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No events found.</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="w-[100px]">Time</TableHead>
-                    <TableHead className="w-[160px]">Type</TableHead>
-                    <TableHead className="w-[100px]">Actor</TableHead>
-                    <TableHead>Data</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {events.map((event) => (
-                    <TableRow key={event.id}>
-                      <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-                        {formatRelativeTime(event.ts)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline" className="text-xs">
-                          {event.type}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {event.actor}
-                      </TableCell>
-                      <TableCell className="text-xs font-mono text-muted-foreground max-w-md truncate">
-                        {eventDataPreview(event.data)}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
     </div>
   );
 }

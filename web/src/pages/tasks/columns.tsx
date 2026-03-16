@@ -166,9 +166,12 @@ export const columns: ColumnDef<Task>[] = [
       const labels = row.original.labels;
       return (
         <div className="flex items-center gap-2">
-          <span className="max-w-[500px] truncate font-medium">
+          <a
+            href={`/tasks/${row.original.id}`}
+            className="max-w-[500px] truncate font-medium hover:underline"
+          >
             {row.getValue<string>("title")}
-          </span>
+          </a>
           {labels.map((label) => (
             <Badge key={label} variant="outline" className="text-xs">
               {label}
@@ -286,9 +289,9 @@ export const columns: ColumnDef<Task>[] = [
             >
               Copy task ID
             </DropdownMenuItem>
-            <DropdownMenuItem>View details</DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem>View events</DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <a href={`/tasks/${task.id}`}>View details</a>
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       );

@@ -76,4 +76,5 @@ cd web && bun run dev                    # dev mode (proxies /api to localhost:4
 - `POST /api/merge-queue/:id/approve` — Approve merge entry
 - `POST /api/merge-queue/:id/reject` — Reject merge entry
 - `POST /api/merge-queue/flush` — Flush approved entries (Pause mode only)
+- `POST /api/tasks/:id/chat` — Send chat message to agent session `{ message: string }`
 - `GET /api/events` — SSE live event stream (optional `?pattern=&task_id=` filters)
