@@ -50,9 +50,36 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("Failed to load state: {e}"))?;
 
-    // --- 3. Create session manager ---
+    // --- 3. Create container runtime ---
 
     let container_runtime = AppleContainerRuntime::new();
+
+    // --- 4. Restart recovery (spec §13.3) ---
+    //
+    // Detect orphaned sessions from previous run and recover them.
+    // This must happen after load_from_store and before starting the dispatch loop.
+    {
+        let state = server.state.read().await;
+        let recovery_result = server::recovery::detect_orphaned_sessions(
+            &state.tasks,
+            &container_runtime,
+            config.max_retries,
+        )
+        .await;
+        drop(state);
+
+        if !recovery_result.retried.is_empty() || !recovery_result.failed.is_empty() {
+            info!(
+                retried = recovery_result.retried.len(),
+                failed = recovery_result.failed.len(),
+                alive = recovery_result.alive.len(),
+                "recovering orphaned sessions from previous run"
+            );
+            server.apply_recovery_result(&recovery_result).await?;
+        }
+    }
+
+    // --- 5. Create session manager ---
     let mut default_container_config =
         ContainerConfig::new(&config.container_image).env("GITHUB_TOKEN", &config.github_token);
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -69,13 +96,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_hard_time_limit(config.session_hard_limit),
     );
 
-    // --- 4. Emit system:started ---
+    // --- 6. Emit system:started ---
 
     let project_count = server.state.read().await.projects.len();
     server.emit_started().await?;
     info!(projects = project_count, "tasks platform started");
 
-    // --- 5. Spawn GitHub poll loop ---
+    // --- 7. Spawn GitHub poll loop ---
     //
     // Pollers are rebuilt from the live project list each tick so that
     // projects added/removed via the web UI take effect immediately.
@@ -209,7 +236,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 6b. Spawn event handler loop ---
+    // --- 7b. Spawn event handler loop ---
     //
     // Listens for session lifecycle events and feeds state changes back
     // into the server. The session monitor publishes events (e.g.
@@ -261,7 +288,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 7. Spawn dispatch tick loop ---
+    // --- 8. Spawn dispatch tick loop ---
 
     let dispatch_server = server.clone();
     let dispatch_session_mgr = session_manager.clone();
@@ -361,7 +388,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 8. Optionally spawn web server ---
+    // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
         let api_state = crate::web::ApiState {
@@ -397,7 +424,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- 9. Wait for shutdown (TUI or headless) ---
+    // --- 10. Wait for shutdown (TUI or headless) ---
 
     if config.tui {
         crate::tui::run_tui(server.clone(), server.event_bus.clone(), config.max_sessions).await?;

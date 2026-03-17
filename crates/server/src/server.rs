@@ -518,6 +518,104 @@ impl Server {
         self.event_bus.publish(event).await?;
         Ok(())
     }
+
+    // --- Restart recovery (spec §13.3) ---
+
+    /// Apply the results of orphan detection to task state.
+    ///
+    /// For tasks that should retry:
+    /// - Increment retry_count
+    /// - Set last_failure_at to now
+    /// - Clear session_id
+    /// - Transition to Waiting
+    /// - Emit task:state:waiting event
+    ///
+    /// For tasks that have exhausted retries:
+    /// - Transition to Failed
+    /// - Emit task:state:failed event
+    pub async fn apply_recovery_result(
+        &self,
+        result: &crate::recovery::RecoveryResult,
+    ) -> Result<(), ServerError> {
+        let now = chrono::Utc::now();
+
+        // Handle tasks that should retry
+        for task_id in &result.retried {
+            {
+                let mut state = self.state.write().await;
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.retry_count += 1;
+                    task.last_failure_at = Some(now);
+                    task.session_id = None;
+                    task.set_state(TaskState::Waiting);
+
+                    // Write-through to store
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Err(e) = store.save_task(task) {
+                                tracing::error!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "failed to persist task recovery to store"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit event
+            let event = Event::new(
+                EventType::TaskStateWaiting,
+                task_id,
+                Actor::System,
+                serde_json::json!({
+                    "reason": "orphan_recovery",
+                    "retry": true,
+                }),
+            );
+            self.event_bus.publish(event).await?;
+        }
+
+        // Handle tasks that have exhausted retries
+        for task_id in &result.failed {
+            {
+                let mut state = self.state.write().await;
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.last_failure_at = Some(now);
+                    task.session_id = None;
+                    task.set_state(TaskState::Failed);
+
+                    // Write-through to store
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Err(e) = store.save_task(task) {
+                                tracing::error!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "failed to persist task failure to store"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit event
+            let event = Event::new(
+                EventType::TaskStateFailed,
+                task_id,
+                Actor::System,
+                serde_json::json!({
+                    "reason": "orphan_recovery",
+                    "retries_exhausted": true,
+                }),
+            );
+            self.event_bus.publish(event).await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
