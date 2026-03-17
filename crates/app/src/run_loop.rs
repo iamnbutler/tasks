@@ -143,54 +143,17 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        // Create tasks for new PRs
-                        for pr in &result.pull_requests {
-                            let source = TaskSource::GithubPr {
-                                owner: pr.owner.clone(),
-                                repo: pr.repo.clone(),
-                                number: pr.number,
-                            };
-                            if !poll_server.has_task_for_source(&source).await {
-                                if let Some(task) = server::scheduler::pr_to_task(
-                                    pr,
-                                    project_id,
-                                    &label_config,
-                                ) {
-                                    if let Err(e) = poll_server.add_task(task).await {
-                                        warn!(
-                                            project = %project_id,
-                                            pr = pr.number,
-                                            error = %e,
-                                            "failed to add task for PR"
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Add open PRs to the merge queue if not already tracked.
-                            let pr_url = format!(
-                                "https://github.com/{}/{}/pull/{}",
-                                pr.owner, pr.repo, pr.number
-                            );
-                            let already_queued = {
-                                let state = poll_server.state.read().await;
-                                state.merge_queue.entries().iter().any(|e| e.pr_url == pr_url)
-                            };
-                            if !already_queued {
-                                let entry_id = uuid::Uuid::new_v4().to_string();
-                                // task_id is informational — link to the task that
-                                // may have produced this PR, if one exists.
-                                let task_id = poll_server.task_id_for_source(&source).await
-                                    .unwrap_or_default();
-                                let entry = models::merge_queue::MergeQueueEntry::new(
-                                    &entry_id, &task_id, &pr_url,
-                                );
-                                info!(pr = pr.number, pr_url = %pr_url, "adding PR to merge queue");
-                                if let Err(e) = poll_server.add_to_merge_queue(entry).await {
-                                    error!(pr = pr.number, error = %e, "failed to add PR to merge queue");
-                                }
-                            }
-                        }
+                        // TODO: Re-enable PR task creation and merge queue population
+                        // once the core spec is more complete. Currently causes loops
+                        // where agent-created PRs get picked up as new tasks, which
+                        // then create more PRs, etc.
+                        //
+                        // for pr in &result.pull_requests {
+                        //     let source = TaskSource::GithubPr { ... };
+                        //     // Create tasks for new PRs
+                        //     // Add open PRs to the merge queue
+                        // }
+                        let _ = &result.pull_requests; // suppress unused warning
                     }
                     Err(e) => {
                         error!(project = %project_id, error = %e, "poll failed");
