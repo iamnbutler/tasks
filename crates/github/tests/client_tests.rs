@@ -647,3 +647,89 @@ async fn pr_since_filter_stops_at_cutoff() {
     assert_eq!(prs.len(), 1);
     assert_eq!(prs[0].number, 10);
 }
+
+// ---------------------------------------------------------------------------
+// File content tests (spec §14 — workflow config loading)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_file_content_returns_raw_content() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/contents/workflow.toml"))
+        .and(header("accept", "application/vnd.github.raw+json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("[prompt]\nsystem_prompt = \"prompt.md\""),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let content = client
+        .get_file_content("owner", "repo", "workflow.toml")
+        .await
+        .unwrap();
+
+    assert!(content.is_some());
+    assert!(content.as_ref().unwrap().contains("system_prompt"));
+}
+
+#[tokio::test]
+async fn get_file_content_returns_none_for_404() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/contents/nonexistent.toml"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not found"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let content = client
+        .get_file_content("owner", "repo", "nonexistent.toml")
+        .await
+        .unwrap();
+
+    assert!(content.is_none());
+}
+
+#[tokio::test]
+async fn get_file_content_auth_error_on_401() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/contents/workflow.toml"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .get_file_content("owner", "repo", "workflow.toml")
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn get_file_content_fetches_nested_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/contents/.tasks/prompt.md"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("# System Prompt\n\nUse conventional commits."),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let content = client
+        .get_file_content("owner", "repo", ".tasks/prompt.md")
+        .await
+        .unwrap();
+
+    assert!(content.is_some());
+    assert!(content.as_ref().unwrap().contains("conventional commits"));
+}

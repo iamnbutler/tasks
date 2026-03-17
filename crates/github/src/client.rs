@@ -361,6 +361,78 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // File content (spec §14 — workflow config loading)
+    // -----------------------------------------------------------------------
+
+    /// Fetch file content from a repository at a given path.
+    ///
+    /// Uses the GitHub REST API contents endpoint. Returns the file's decoded
+    /// content as a string. The path should be relative to the repo root
+    /// (e.g., "workflow.toml" or ".tasks/prompt.md").
+    ///
+    /// Returns `Ok(None)` if the file doesn't exist (404). Returns an error
+    /// for other failures (network, auth, etc.).
+    pub async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Option<String>, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            self.base_url, owner, repo, path
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Accept", "application/vnd.github.raw+json")
+            .send()
+            .await?;
+
+        // Update rate limit state from headers.
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "unexpected status {status}: {text}"
+            )));
+        }
+
+        let content = response.text().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to read response body: {e}"))
+        })?;
+
+        Ok(Some(content))
+    }
+
+    // -----------------------------------------------------------------------
     // PR discovery
     // -----------------------------------------------------------------------
 
