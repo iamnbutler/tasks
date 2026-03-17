@@ -497,6 +497,60 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // Branch cleanup (issue #143)
+    // -----------------------------------------------------------------------
+
+    /// Delete a remote branch via the GitHub REST API.
+    ///
+    /// This is used for cleanup when tasks are rejected or discarded. Unlike
+    /// most GitHub mutations (which happen via agents using `gh` CLI), branch
+    /// cleanup is a platform-level operation that occurs after the agent session
+    /// ends. Returns `Ok(true)` if the branch was deleted, `Ok(false)` if it
+    /// didn't exist (already deleted or never pushed).
+    pub async fn delete_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        // GitHub REST API: DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}
+        let url = format!(
+            "{}/repos/{}/{}/git/refs/heads/{}",
+            self.base_url, owner, repo, branch
+        );
+
+        let response = self.http.delete(&url).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        // 204 No Content = successfully deleted
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(true);
+        }
+
+        // 422 Unprocessable Entity = branch doesn't exist (already deleted or never created)
+        // 404 Not Found = branch doesn't exist
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            || status == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(false);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected delete_branch status {status}: {text}"
+        )))
+    }
+
+    // -----------------------------------------------------------------------
     // PR discovery
     // -----------------------------------------------------------------------
 

@@ -131,8 +131,8 @@ impl Store {
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
         self.conn.execute(
-            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
+            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, branch, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![entry.id, entry.task_id, entry.pr_url, entry.branch, status, queued_at],
         )?;
         Ok(())
     }
@@ -140,20 +140,21 @@ impl Store {
     /// Get a merge queue entry by ID.
     pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
+            "SELECT id, task_id, pr_url, branch, status, queued_at FROM merge_queue WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         match rows.next() {
             Some(row) => {
-                let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+                let (id, task_id, pr_url, branch, status_str, queued_at_str) = row?;
                 let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
                 let queued_at: DateTime<Utc> = queued_at_str
                     .parse()
@@ -164,6 +165,7 @@ impl Store {
                     id,
                     task_id,
                     pr_url,
+                    branch,
                     status,
                     queued_at,
                 }))
@@ -176,19 +178,20 @@ impl Store {
     pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
+            .prepare("SELECT id, task_id, pr_url, branch, status, queued_at FROM merge_queue")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+            let (id, task_id, pr_url, branch, status_str, queued_at_str) = row?;
             let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
             let queued_at: DateTime<Utc> = queued_at_str
                 .parse()
@@ -199,6 +202,7 @@ impl Store {
                 id,
                 task_id,
                 pr_url,
+                branch,
                 status,
                 queued_at,
             });

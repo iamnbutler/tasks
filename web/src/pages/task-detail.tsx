@@ -471,6 +471,11 @@ export function TaskDetailPage() {
 
   const task = snapshot?.tasks.find((t) => t.id === id);
 
+  // Map project ID to display name (issue #147)
+  const projectDisplayName = task
+    ? snapshot?.projects.find((p) => p.id === task.project)?.repo ?? task.project
+    : "";
+
   const isSessionActive =
     task?.state === "running" ||
     task?.state === "question" ||
@@ -556,7 +561,7 @@ export function TaskDetailPage() {
             <Separator orientation="vertical" className="h-4" />
             {sourceDisplay(task)}
             <Separator orientation="vertical" className="h-4" />
-            <span>{task.project}</span>
+            <span>{projectDisplayName}</span>
             {task.labels.length > 0 && (
               <>
                 <Separator orientation="vertical" className="h-4" />

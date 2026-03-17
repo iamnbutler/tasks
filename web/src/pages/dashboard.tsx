@@ -56,6 +56,15 @@ const ACTIVE_STATES: TaskState[] = [
 export function DashboardPage() {
   const { snapshot, events, filteredTasks, filteredMergeQueue, selectedProject } = useAppState();
 
+  // Map project ID to display name (issue #147)
+  const projectIdToRepo = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const p of snapshot?.projects ?? []) {
+      map[p.id] = p.repo;
+    }
+    return map;
+  }, [snapshot?.projects]);
+
   const runningCount = useMemo(
     () => filteredTasks.filter((t) => t.state === "running").length,
     [filteredTasks],
@@ -179,7 +188,7 @@ export function DashboardPage() {
                   {/* Only show project when viewing all projects */}
                   {!selectedProject && (
                     <span className="text-muted-foreground text-sm shrink-0">
-                      {task.project}
+                      {projectIdToRepo[task.project] ?? task.project}
                     </span>
                   )}
                   <span className="text-muted-foreground text-sm shrink-0">

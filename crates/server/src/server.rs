@@ -387,11 +387,14 @@ impl Server {
 
     /// Find a task ID by its branch name.
     ///
-    /// Tasks use branches named `tasks/{task_id}`, so we extract the task ID
-    /// from the branch name and look it up.
+    /// Tasks use branches named `tasks/{task_id}/{session_suffix}`, so we extract
+    /// the task ID from the branch name and look it up. The session suffix is an
+    /// 8-character UUID prefix for uniqueness on retry (issue #144).
     pub async fn find_task_by_branch(&self, branch: &str) -> Option<String> {
-        // Tasks use branches like "tasks/gh-owner-repo-issue-123"
-        let task_id = branch.strip_prefix("tasks/")?;
+        // Tasks use branches like "tasks/gh-owner-repo-issue-123/a1b2c3d4"
+        let after_prefix = branch.strip_prefix("tasks/")?;
+        // Extract task_id by removing the session suffix (last path component)
+        let task_id = after_prefix.rsplit_once('/').map(|(id, _)| id).unwrap_or(after_prefix);
         let state = self.state.read().await;
         if state.tasks.contains_key(task_id) {
             Some(task_id.to_string())

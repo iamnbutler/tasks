@@ -27,6 +27,12 @@ pub struct MergeQueueEntry {
     pub task_id: String,
     /// GitHub PR URL.
     pub pr_url: String,
+    /// The branch name for this entry (issue #143, #144).
+    ///
+    /// Stored so we can clean up the remote branch when the entry is rejected.
+    /// Branch names include a session suffix for uniqueness on retry.
+    #[serde(default)]
+    pub branch: Option<String>,
     pub status: MergeStatus,
     pub queued_at: DateTime<Utc>,
 }
@@ -37,6 +43,24 @@ impl MergeQueueEntry {
             id: id.into(),
             task_id: task_id.into(),
             pr_url: pr_url.into(),
+            branch: None,
+            status: MergeStatus::Pending,
+            queued_at: Utc::now(),
+        }
+    }
+
+    /// Create a new entry with a branch name for cleanup (issue #143, #144).
+    pub fn new_with_branch(
+        id: impl Into<String>,
+        task_id: impl Into<String>,
+        pr_url: impl Into<String>,
+        branch: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_id: task_id.into(),
+            pr_url: pr_url.into(),
+            branch: Some(branch.into()),
             status: MergeStatus::Pending,
             queued_at: Utc::now(),
         }

@@ -37,6 +37,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
             pr_url TEXT,
+            branch TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             queued_at TEXT NOT NULL
         );

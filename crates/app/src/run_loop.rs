@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
@@ -332,12 +333,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .await
                                 .unwrap_or_default();
 
-                            // Create merge queue entry
+                            // Create merge queue entry with branch for cleanup (issue #143)
                             let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
-                            let entry = MergeQueueEntry::new(
+                            let entry = MergeQueueEntry::new_with_branch(
                                 entry_id.clone(),
                                 task_id.clone(),
                                 &pr_url,
+                                &pr.head_ref,
                             );
 
                             if let Err(e) = poll_server.add_to_merge_queue(entry).await {
@@ -598,7 +600,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .as_ref()
                                 .map(|p| format!("https://github.com/{}.git", p.repo))
                                 .unwrap_or_default();
-                            let branch = format!("tasks/{}", task.id);
+                            // Use unique branch names to prevent collisions on retry (issue #144)
+                            let session_suffix = &Uuid::new_v4().to_string()[..8];
+                            let branch = format!("tasks/{}/{}", task.id, session_suffix);
 
                             // Load workflow settings (spec §14, §15)
                             let workflow_settings = load_workflow_settings_for_project(
@@ -939,6 +943,17 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 error!(entry_id = %entry_id, error = %e, "failed to reject merge entry for closed issue");
                             }
+
+                            // Clean up the remote branch (issue #143)
+                            if let Some(branch) = &context.entry.branch {
+                                if let Some((owner, repo, _)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                                    match merge_github.delete_branch(&owner, &repo, branch).await {
+                                        Ok(true) => info!(branch = %branch, "deleted remote branch after rejection"),
+                                        Ok(false) => info!(branch = %branch, "remote branch already deleted or never existed"),
+                                        Err(e) => warn!(branch = %branch, error = %e, "failed to delete remote branch"),
+                                    }
+                                }
+                            }
                         } else {
                             // Issue is still open — normal rejection with re-dispatch.
                             if let Err(e) = orch_server
@@ -951,6 +966,19 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
                             }
+
+                            // Clean up the remote branch (issue #143)
+                            // This prevents agents from re-discovering the old branch on retry.
+                            if let Some(branch) = &context.entry.branch {
+                                if let Some((owner, repo, _)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                                    match merge_github.delete_branch(&owner, &repo, branch).await {
+                                        Ok(true) => info!(branch = %branch, "deleted remote branch after rejection"),
+                                        Ok(false) => info!(branch = %branch, "remote branch already deleted or never existed"),
+                                        Err(e) => warn!(branch = %branch, error = %e, "failed to delete remote branch"),
+                                    }
+                                }
+                            }
+
                             // Emit orchestrator:feedback event when feedback is provided
                             if let Some(feedback) = &evaluation.feedback {
                                 if let Err(e) = orch_server.emit_orchestrator_feedback(
