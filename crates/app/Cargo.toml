@@ -30,3 +30,4 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid.workspace = true
+sysinfo.workspace = true

@@ -4,6 +4,7 @@
 //! This binary is intentionally thin — logic lives in the library crates.
 
 mod config;
+mod memory;
 mod run_loop;
 mod tui;
 mod web;

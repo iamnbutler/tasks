@@ -17,6 +17,7 @@ use tasks_github::poller::RepoPoller;
 use tasks_orchestrator::Orchestrator;
 
 use crate::config::AppConfig;
+use crate::memory::{MemoryGate, MemoryThresholds};
 
 /// Enum wrapper for orchestrator implementations.
 ///
@@ -51,6 +52,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         dispatch_interval = ?config.dispatch_interval,
         container_image = %config.container_image,
         container_memory = %config.container_memory,
+        memory_warn_pct = config.memory_warn_pct,
+        memory_soft_limit_pct = config.memory_soft_limit_pct,
+        memory_hard_limit_pct = config.memory_hard_limit_pct,
         "starting tasks platform"
     );
 
@@ -134,6 +138,43 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 "orchestrator not configured",
             ))
         }
+    });
+
+    // --- 5c. Create memory watchdog ---
+
+    let memory_thresholds = MemoryThresholds {
+        warn_pct: config.memory_warn_pct,
+        soft_limit_pct: config.memory_soft_limit_pct,
+        hard_limit_pct: config.memory_hard_limit_pct,
+    };
+    let memory_gate = Arc::new(MemoryGate::new());
+
+    // Log initial memory state
+    {
+        let snapshot = crate::memory::sample_memory(&memory_thresholds);
+        info!(
+            total_gb = snapshot.total_bytes / (1024 * 1024 * 1024),
+            used_pct = snapshot.used_pct,
+            warn_pct = config.memory_warn_pct,
+            soft_limit_pct = config.memory_soft_limit_pct,
+            hard_limit_pct = config.memory_hard_limit_pct,
+            "memory watchdog configured"
+        );
+    }
+
+    let watchdog_gate = memory_gate.clone();
+    let watchdog_bus = server.event_bus.clone();
+    let watchdog_sessions = session_manager.clone();
+
+    let watchdog_handle = tokio::spawn(async move {
+        crate::memory::watchdog_loop(
+            watchdog_gate,
+            memory_thresholds,
+            watchdog_bus,
+            watchdog_sessions,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
     });
 
     // --- 6. Emit system:started ---
@@ -330,6 +371,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_interval = config.dispatch_interval;
     let max_sessions = config.max_sessions;
     let dispatch_event_bus = server.event_bus.clone();
+    let dispatch_memory_gate = memory_gate.clone();
 
     let dispatch_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(dispatch_interval);
@@ -360,6 +402,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            // Check memory pressure before dispatching new work.
+            // When the memory gate is paused, we still allow resume (no new containers)
+            // but skip starting new sessions.
+            let memory_paused = dispatch_memory_gate.is_dispatch_paused();
+            if memory_paused {
+                let pct = dispatch_memory_gate.current_pct.load(std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    used_pct = pct,
+                    "dispatch skipped: host memory pressure too high"
+                );
+            }
+
             // Run dispatch
             let pending_answers: Vec<String> = Vec::new(); // TODO: track pending answers
             match dispatch_server
@@ -367,8 +421,23 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 .await
             {
                 Ok(plan) => {
-                    // Start new sessions for dispatched tasks
+                    // Start new sessions for dispatched tasks (skip if memory-paused)
                     for task_id in &plan.new_work {
+                        if memory_paused {
+                            info!(task_id = %task_id, "deferring session start due to memory pressure");
+                            // Revert to Waiting so it gets picked up when pressure resolves
+                            if let Err(e) = dispatch_server
+                                .set_task_state(
+                                    task_id,
+                                    models::task::TaskState::Waiting,
+                                    events::Actor::System,
+                                )
+                                .await
+                            {
+                                warn!(task_id = %task_id, error = %e, "failed to revert task to waiting during memory pause");
+                            }
+                            continue;
+                        }
                         if let Some(task) = dispatch_server.get_task(task_id).await {
                             let project = dispatch_server.get_project(&task.project).await;
                             let repo_url = project
@@ -613,6 +682,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     dispatch_handle.abort();
     event_handler_handle.abort();
     orchestrator_handle.abort();
+    watchdog_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }
