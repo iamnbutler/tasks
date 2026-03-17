@@ -5,11 +5,13 @@
 //!
 //! # Modules
 //!
+//! - [`components`] - Reusable UI primitive components (Button, Badge, Card, Input)
 //! - [`sse`] - Server-Sent Events client for real-time updates
 //! - [`theme`] - Theming and styling system
 
 use gpui::{Context, SharedString, Window, div, prelude::*, rgb};
 
+pub mod components;
 mod sse;
 pub mod theme;
 
