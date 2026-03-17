@@ -236,15 +236,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
-                // The PR URL is discovered by polling GitHub for PRs on the task branch
-                // — agents create PRs themselves (spec §1: platform only reads GitHub).
+                // Enqueue completed task for merge review (spec §7.1).
+                // The merge queue is task-centric — a PR is just one possible
+                // artifact an agent may produce. We do a best-effort lookup
+                // for a PR on the task branch, but the entry is valid without one.
                 // TODO: orchestrator quality gate before enqueuing (spec §7.3)
                 if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
                     let entry_id = uuid::Uuid::new_v4().to_string();
                     let mut entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
 
-                    // Discover PR URL from GitHub if the agent created one
+                    // Best-effort: check if the agent opened a PR for this task's branch
                     if let Some(task) = event_handler_server.get_task(task_id).await {
                         if let Some(project) = event_handler_server.get_project(&task.project).await {
                             let parts: Vec<&str> = project.repo.split('/').collect();
@@ -255,9 +256,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                         info!(task_id = %task_id, pr_url = %url, "found PR for task branch");
                                         entry.pr_url = Some(url);
                                     }
-                                    Ok(None) => {
-                                        info!(task_id = %task_id, "no PR found for task branch");
-                                    }
+                                    Ok(None) => {}
                                     Err(e) => {
                                         warn!(task_id = %task_id, error = %e, "failed to query PRs for task branch");
                                     }
@@ -266,7 +265,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
+                    info!(task_id = %task_id, entry_id = %entry_id, "enqueuing task for merge review");
                     if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
                         error!(task_id = %task_id, error = %e, "failed to add merge queue entry");
                     }
