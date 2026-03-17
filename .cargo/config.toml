@@ -1,0 +1,21 @@
+# Cross-compilation configuration for building the supervisor binary
+#
+# Linux aarch64 target (used for container images):
+# - On Linux aarch64: compiles natively, no special linker needed
+# - On macOS arm64: requires cross-linker (see below)
+# - On Linux x86_64: requires cross-linker (gcc-aarch64-linux-gnu)
+
+[target.aarch64-unknown-linux-gnu]
+# Uncomment the appropriate linker for your platform:
+#
+# macOS with Homebrew cross-toolchain:
+#   brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
+# linker = "aarch64-unknown-linux-gnu-gcc"
+#
+# Linux x86_64 with cross-compiler:
+#   apt install gcc-aarch64-linux-gnu
+# linker = "aarch64-linux-gnu-gcc"
+#
+# Using 'cross' tool (works on any platform):
+#   cargo install cross
+#   cross build -p tasks-supervisor --release --target aarch64-unknown-linux-gnu

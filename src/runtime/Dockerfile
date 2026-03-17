@@ -1,40 +1,10 @@
-# Stage 1: Build the supervisor binary
-FROM rust:1.85-slim AS builder
+# Runtime image for Tasks Agent sessions
+#
+# Prerequisites: Build the supervisor binary before building this image:
+#   make supervisor
+# Or build everything in one step:
+#   make container-image
 
-WORKDIR /build
-
-# Copy workspace manifests.
-COPY Cargo.toml Cargo.lock* ./
-
-# Copy all crate Cargo.toml files (workspace glob requires them to exist).
-COPY crates/app/Cargo.toml crates/app/Cargo.toml
-COPY crates/events/Cargo.toml crates/events/Cargo.toml
-COPY crates/github/Cargo.toml crates/github/Cargo.toml
-COPY crates/models/Cargo.toml crates/models/Cargo.toml
-COPY crates/runtime/Cargo.toml crates/runtime/Cargo.toml
-COPY crates/server/Cargo.toml crates/server/Cargo.toml
-COPY crates/session/Cargo.toml crates/session/Cargo.toml
-COPY crates/store/Cargo.toml crates/store/Cargo.toml
-COPY crates/supervisor/Cargo.toml crates/supervisor/Cargo.toml
-
-# Create dummy lib/main files so cargo can resolve the workspace and cache deps.
-RUN for dir in crates/*/; do \
-      mkdir -p "$dir/src"; \
-      name=$(basename "$dir"); \
-      if [ "$name" = "app" ] || [ "$name" = "supervisor" ]; then \
-        echo 'fn main() {}' > "$dir/src/main.rs"; \
-      else \
-        echo '' > "$dir/src/lib.rs"; \
-      fi; \
-    done
-
-RUN cargo build -p tasks-supervisor --release 2>/dev/null || true
-
-# Copy real supervisor source and rebuild (remove cached dummy binary to force recompile).
-COPY crates/supervisor/src crates/supervisor/src
-RUN touch crates/supervisor/src/main.rs && cargo build -p tasks-supervisor --release
-
-# Stage 2: Runtime image
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -76,8 +46,8 @@ RUN useradd -m -s /bin/bash agent && \
 RUN su agent -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
-# Supervisor binary from build stage (runs as root PID 1, spawns agent as non-root).
-COPY --from=builder /build/target/release/tasks-supervisor /usr/local/bin/supervisor
+# Supervisor binary (pre-built on host, cross-compiled for aarch64-unknown-linux-gnu)
+COPY target/aarch64-unknown-linux-gnu/release/tasks-supervisor /usr/local/bin/supervisor
 
 # Pre-accept Claude Code ToS so it doesn't hang on first run
 RUN mkdir -p /home/agent/.claude && \

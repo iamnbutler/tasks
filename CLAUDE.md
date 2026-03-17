@@ -35,10 +35,17 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
 ## Building the container image
 
 ```sh
-container build --dns 8.8.8.8 -f src/runtime/Dockerfile -t tasks-agent:latest .
+make container-image   # builds supervisor + container image
+make supervisor        # builds only the supervisor binary
 ```
 
-The Dockerfile uses a multi-stage build: Rust compilation in `rust:1.85-slim`, runtime on `ubuntu:24.04`. The supervisor binary (`crates/supervisor/`) is compiled in the builder stage and copied into the final image.
+The supervisor binary is cross-compiled on the host for `aarch64-unknown-linux-gnu` and copied into the container image. This is faster than the previous multi-stage Docker build (~30s vs ~2min) and eliminates the need for Rust toolchain inside the builder.
+
+For cross-compilation from macOS, install the toolchain:
+```sh
+brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
+```
+Then uncomment the linker line in `.cargo/config.toml`.
 
 ## Running
 
