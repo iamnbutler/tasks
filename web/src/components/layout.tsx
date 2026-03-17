@@ -22,13 +22,12 @@ const navItems = [
 ];
 
 export function Layout() {
-  const { snapshot, connected } = useAppState();
+  const { snapshot, connected, filteredTasks, filteredMergeQueue } = useAppState();
 
-  const tasks = snapshot?.tasks ?? [];
-  const runningCount = tasks.filter((t) => t.state === "running").length;
-  const waitingCount = tasks.filter((t) => t.state === "waiting").length;
-  const questionCount = tasks.filter((t) => t.state === "question").length;
-  const mergeQueueCount = snapshot?.merge_queue?.length ?? 0;
+  const runningCount = filteredTasks.filter((t) => t.state === "running").length;
+  const waitingCount = filteredTasks.filter((t) => t.state === "waiting").length;
+  const questionCount = filteredTasks.filter((t) => t.state === "question").length;
+  const mergeQueueCount = filteredMergeQueue.length;
   const slotActive = snapshot?.slot_utilization?.active ?? 0;
   const slotMax = snapshot?.slot_utilization?.max ?? 0;
 

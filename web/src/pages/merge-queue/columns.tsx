@@ -62,6 +62,19 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     },
   },
   {
+    id: "project",
+    header: "Project",
+    cell: ({ row, table }) => {
+      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
+      const task = tasks.find((t) => t.id === row.original.task_id);
+      return (
+        <span className="text-sm text-muted-foreground">
+          {task?.project ?? "—"}
+        </span>
+      );
+    },
+  },
+  {
     accessorKey: "pr_url",
     header: "PR",
     cell: ({ row }) => {

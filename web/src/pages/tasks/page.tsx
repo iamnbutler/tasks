@@ -4,9 +4,13 @@ import { columns } from "./columns";
 import { DataTable } from "./data-table";
 
 export function TasksPage() {
-  const { snapshot } = useAppState();
-  const tasks = snapshot?.tasks ?? [];
+  const { filteredTasks, selectedProject, snapshot } = useAppState();
   const projects = snapshot?.projects ?? [];
+
+  // Find the selected project name for display
+  const selectedProjectName = selectedProject
+    ? snapshot?.projects.find((p) => p.id === selectedProject)?.repo
+    : null;
 
   // Create a map from project ID to repo name for display
   const projectIdToRepo = useMemo(() => {
@@ -22,10 +26,12 @@ export function TasksPage() {
       <div>
         <h2 className="text-2xl font-bold tracking-tight">Tasks</h2>
         <p className="text-muted-foreground">
-          Manage and monitor your coding tasks.
+          {selectedProjectName
+            ? `Tasks for ${selectedProjectName}`
+            : "Manage and monitor your coding tasks."}
         </p>
       </div>
-      <DataTable columns={columns} data={tasks} projectIdToRepo={projectIdToRepo} />
+      <DataTable columns={columns} data={filteredTasks} hideProjectColumn={!!selectedProject} projectIdToRepo={projectIdToRepo} />
     </div>
   );
 }

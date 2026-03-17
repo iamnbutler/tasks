@@ -3,12 +3,13 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import type { ReactNode } from "react";
 import { createElement } from "react";
-import type { Event, Snapshot } from "@/lib/types";
+import type { Event, Snapshot, Task, MergeQueueEntry } from "@/lib/types";
 import { fetchSnapshot, subscribeEvents } from "@/lib/api";
 
 const MAX_EVENTS = 200;
@@ -23,6 +24,13 @@ export interface AppState {
   connected: boolean;
   error: Error | null;
   refreshSnapshot: () => Promise<void>;
+  /** Currently selected project ID (null = all projects) */
+  selectedProject: string | null;
+  setSelectedProject: (id: string | null) => void;
+  /** Tasks filtered by selected project */
+  filteredTasks: Task[];
+  /** Merge queue entries filtered by selected project */
+  filteredMergeQueue: MergeQueueEntry[];
 }
 
 const defaultState: AppState = {
@@ -31,6 +39,10 @@ const defaultState: AppState = {
   connected: false,
   error: null,
   refreshSnapshot: async () => {},
+  selectedProject: null,
+  setSelectedProject: () => {},
+  filteredTasks: [],
+  filteredMergeQueue: [],
 };
 
 export const AppStateContext = createContext<AppState | null>(null);
@@ -44,6 +56,7 @@ function useAppStateCore(): AppState {
   const [events, setEvents] = useState<Event[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [selectedProject, setSelectedProject] = useState<string | null>(null);
 
   // Keep a ref to the latest snapshot-fetch promise so we can avoid races.
   const fetchInFlight = useRef(false);
@@ -61,6 +74,25 @@ function useAppStateCore(): AppState {
       fetchInFlight.current = false;
     }
   }, []);
+
+  // Compute filtered tasks based on selected project
+  const filteredTasks = useMemo(() => {
+    const tasks = snapshot?.tasks ?? [];
+    if (!selectedProject) return tasks;
+    return tasks.filter((t) => t.project === selectedProject);
+  }, [snapshot, selectedProject]);
+
+  // Compute filtered merge queue entries based on selected project
+  const filteredMergeQueue = useMemo(() => {
+    const entries = snapshot?.merge_queue ?? [];
+    if (!selectedProject) return entries;
+    const tasks = snapshot?.tasks ?? [];
+    // Create a set of task IDs that belong to the selected project
+    const projectTaskIds = new Set(
+      tasks.filter((t) => t.project === selectedProject).map((t) => t.id)
+    );
+    return entries.filter((e) => projectTaskIds.has(e.task_id));
+  }, [snapshot, selectedProject]);
 
   // --- Polling -----------------------------------------------------------
   useEffect(() => {
@@ -137,7 +169,17 @@ function useAppStateCore(): AppState {
     };
   }, [refreshSnapshot]);
 
-  return { snapshot, events, connected, error, refreshSnapshot };
+  return {
+    snapshot,
+    events,
+    connected,
+    error,
+    refreshSnapshot,
+    selectedProject,
+    setSelectedProject,
+    filteredTasks,
+    filteredMergeQueue,
+  };
 }
 
 // ---------------------------------------------------------------------------

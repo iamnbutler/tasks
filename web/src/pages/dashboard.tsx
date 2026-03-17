@@ -54,21 +54,21 @@ const ACTIVE_STATES: TaskState[] = [
 ];
 
 export function DashboardPage() {
-  const { snapshot, events } = useAppState();
+  const { snapshot, events, filteredTasks, filteredMergeQueue, selectedProject } = useAppState();
 
   const runningCount = useMemo(
-    () => snapshot?.tasks.filter((t) => t.state === "running").length ?? 0,
-    [snapshot],
+    () => filteredTasks.filter((t) => t.state === "running").length,
+    [filteredTasks],
   );
 
   const waitingCount = useMemo(
-    () => snapshot?.tasks.filter((t) => t.state === "waiting").length ?? 0,
-    [snapshot],
+    () => filteredTasks.filter((t) => t.state === "waiting").length,
+    [filteredTasks],
   );
 
   const activeTasks = useMemo(
     () =>
-      (snapshot?.tasks ?? [])
+      filteredTasks
         .filter((t) => ACTIVE_STATES.includes(t.state))
         .sort(
           (a, b) =>
@@ -76,7 +76,7 @@ export function DashboardPage() {
             new Date(a.updated_at).getTime(),
         )
         .slice(0, 10),
-    [snapshot],
+    [filteredTasks],
   );
 
   const recentEvents: Event[] = useMemo(
@@ -150,7 +150,7 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">{snapshot.merge_queue.length}</p>
+            <p className="text-2xl font-bold">{filteredMergeQueue.length}</p>
           </CardContent>
         </Card>
       </div>
@@ -176,9 +176,12 @@ export function DashboardPage() {
                   <span className="font-medium truncate flex-1">
                     {task.title}
                   </span>
-                  <span className="text-muted-foreground text-xs shrink-0">
-                    {task.project}
-                  </span>
+                  {/* Only show project when viewing all projects */}
+                  {!selectedProject && (
+                    <span className="text-muted-foreground text-xs shrink-0">
+                      {task.project}
+                    </span>
+                  )}
                   <span className="text-muted-foreground text-xs shrink-0">
                     {formatRelativeTime(task.updated_at)}
                   </span>
