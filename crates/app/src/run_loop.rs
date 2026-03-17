@@ -223,25 +223,25 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if let Some(state) = new_state {
-                // Skip if this event was already published by set_task_state (actor = System from scheduler)
-                // Only handle events from agents/sessions (actor = Agent or System from session monitor)
-                // Apply state from session monitor events (agent-originated).
-                // Uses apply_task_state (no re-publish) to avoid infinite loops.
-                if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
-                    // TaskNotFound can happen for events on tasks not yet in state
-                    if !matches!(e, server::ServerError::TaskNotFound(_)) {
-                        error!(task_id = %task_id, error = %e, "failed to update task state from event");
+                // Only process events from agents/sessions — skip events
+                // already published by set_task_state (from scheduler/dispatch)
+                // to avoid double-applying state and bumping updated_at twice.
+                if event.actor != events::Actor::Scheduler {
+                    if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
+                        if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                            error!(task_id = %task_id, error = %e, "failed to update task state from event");
+                        }
                     }
                 }
 
-                // Create merge queue entry when task reaches awaiting_merge
+                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
+                // TODO: orchestrator quality gate before enqueuing (spec §7.3)
                 if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
                     let entry_id = uuid::Uuid::new_v4().to_string();
                     let entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
-                    let mut server_state = event_handler_server.state.write().await;
-                    if server_state.merge_queue.get_by_task(task_id).is_none() {
-                        info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
-                        server_state.merge_queue.enqueue(entry);
+                    info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
+                    if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
+                        error!(task_id = %task_id, error = %e, "failed to add merge queue entry");
                     }
                 }
             }

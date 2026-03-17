@@ -293,10 +293,12 @@ impl Server {
         Ok(())
     }
 
-    /// Update task state and persist to store, without publishing an event.
+    /// Update task state and persist to store, **without publishing an event**.
     ///
-    /// Used by the event handler loop to apply state changes from events
-    /// that were already published by the session monitor, avoiding infinite loops.
+    /// Only call this from the event-handler loop in `app`, where the
+    /// state-change event was already published by the session monitor.
+    /// All other callers should use [`set_task_state`], which publishes
+    /// the corresponding event.
     pub async fn apply_task_state(
         &self,
         task_id: &str,
@@ -317,6 +319,41 @@ impl Server {
                 }
             }
         }
+        Ok(())
+    }
+
+    // --- Merge queue (spec §7) ---
+
+    /// Add an entry to the merge queue, persisting to store and publishing
+    /// a `merge:queued` event (spec §7.1 step 3).
+    pub async fn add_to_merge_queue(
+        &self,
+        entry: crate::model::merge_queue::MergeQueueEntry,
+    ) -> Result<(), ServerError> {
+        let task_id = entry.task_id.clone();
+        let entry_id = entry.id.clone();
+        {
+            let mut state = self.state.write().await;
+            if state.merge_queue.get_by_task(&task_id).is_some() {
+                return Ok(()); // Already queued
+            }
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_merge_entry(&entry) {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist merge queue entry");
+                    }
+                }
+            }
+            state.merge_queue.enqueue(entry);
+        }
+
+        let event = Event::new(
+            EventType::MergeQueued,
+            &task_id,
+            Actor::System,
+            serde_json::json!({ "entry_id": entry_id }),
+        );
+        self.event_bus.publish(event).await?;
         Ok(())
     }
 
