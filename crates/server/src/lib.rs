@@ -8,10 +8,12 @@ pub mod mode;
 pub mod merge_queue;
 pub mod presence;
 pub mod prompt;
+pub mod recovery;
 pub mod workflow;
 pub mod dispatcher;
 pub mod scheduler;
 mod server;
 
 pub use mode::Mode;
+pub use recovery::{RecoveryResult, DEFAULT_MAX_RETRIES};
 pub use server::{Server, ServerError, ServerState};

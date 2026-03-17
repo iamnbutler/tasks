@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub github_token: String,
     /// Global max concurrent sessions (default: 5).
     pub max_sessions: u32,
+    /// Maximum retry attempts for failed tasks (default: 3, spec §13.2/§14.1).
+    pub max_retries: u32,
     /// GitHub poll interval (default: 60s).
     pub poll_interval: Duration,
     /// Dispatch tick interval (default: 30s).
@@ -54,6 +56,11 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
 
+        let max_retries = std::env::var("TASKS_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(server::DEFAULT_MAX_RETRIES);
+
         let poll_interval_secs = std::env::var("TASKS_POLL_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -68,6 +75,7 @@ impl AppConfig {
             data_dir,
             github_token,
             max_sessions,
+            max_retries,
             poll_interval: Duration::from_secs(poll_interval_secs),
             dispatch_interval: Duration::from_secs(dispatch_interval_secs),
             container_image,

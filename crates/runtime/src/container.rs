@@ -66,6 +66,8 @@ pub trait ContainerRuntime {
     async fn stop(&self, container_id: &str) -> Result<(), ContainerError>;
     /// Destroy a container and clean up.
     async fn destroy(&self, container_id: &str) -> Result<(), ContainerError>;
+    /// Check if a container exists (spec §13.3 restart recovery).
+    async fn container_exists(&self, container_id: &str) -> Result<bool, ContainerError>;
 }
 
 /// Container runtime using the apple/container CLI.
@@ -172,5 +174,20 @@ impl ContainerRuntime for AppleContainerRuntime {
         }
 
         Ok(())
+    }
+
+    /// Check if a container exists using `container inspect`.
+    ///
+    /// Returns true if the container exists (regardless of running state),
+    /// false if it doesn't exist.
+    async fn container_exists(&self, container_id: &str) -> Result<bool, ContainerError> {
+        let output = Command::new("container")
+            .arg("inspect")
+            .arg(container_id)
+            .output()
+            .await?;
+
+        // `container inspect` returns success if the container exists
+        Ok(output.status.success())
     }
 }
