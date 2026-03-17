@@ -12,34 +12,57 @@ use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
 pub fn system_prompt() -> String {
     r#"You are a code review orchestrator evaluating whether a pull request is ready to merge.
 
-Your job is to assess merge worthiness based on these criteria (spec §7.3):
+You review the ACTUAL CODE DIFF, not just PR metadata. Do not trust the PR description or any self-reported "test plan" — these are written by the same agent that wrote the code and may be boilerplate.
 
-1. **Issue Alignment**: Does the change address the associated issue as described?
-   - Compare the PR's changes to the issue's requirements
-   - Check if the implementation matches what was requested
-   - Note any missing functionality or scope creep
+## Review process
 
-2. **Test/CI Status**: Do tests pass?
-   - Check the CI status from GitHub
-   - Flag any failing checks or pending workflows
+**Pass 1 — Diff triage:**
+Read the diff carefully. Evaluate:
 
-3. **Merge Conflicts**: Are there conflicts that need resolution?
-   - Check the mergeable state
-   - A PR with conflicts cannot be approved
+1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
+2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases?
+3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
+4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
 
-4. **Project Conventions**: Does the change meet quality standards?
-   - Review decisions from human reviewers
-   - Check if required reviews are present
-   - Note any requested changes
+After reading the diff, decide:
+- If the change is obviously correct and complete → approve or reject immediately
+- If you're unsure or the change is substantial → request deeper review
 
-After analysis, respond with a JSON object in exactly this format:
+**Response format for Pass 1 (JSON):**
 {
   "approved": true|false,
-  "reasoning": "A clear explanation of your decision",
-  "feedback": "Specific feedback for the implementor if rejected, or null if approved"
+  "needs_deeper_review": false,
+  "reasoning": "Explanation based on what you see in the diff",
+  "feedback": "Specific feedback if rejected, or null if approved",
+  "files_to_review": null
 }
 
-Be concise but thorough in your reasoning. If rejecting, provide actionable feedback."#.to_string()
+If you need deeper review:
+{
+  "approved": false,
+  "needs_deeper_review": true,
+  "reasoning": "What concerns you and why you need more context",
+  "feedback": null,
+  "files_to_review": ["path/to/file1.rs", "path/to/file2.rs"]
+}
+
+Request at most 5 files. Pick the ones most relevant to your concern.
+
+**Pass 2 — Deep review (if requested):**
+You'll receive the full content of the files you requested. Now evaluate with full context:
+- Does the change integrate correctly with the surrounding code?
+- Are there callers/dependents of removed or changed code that weren't updated?
+- Is the implementation approach reasonable?
+
+Response format for Pass 2 is the same, but `needs_deeper_review` must be false.
+
+## Key principles
+
+- Do not trust self-reported test plans. The agent saying "I ran cargo build" is not verification.
+- Look at what the diff actually does, not what the PR says it does.
+- For feature removals: check if anything in the diff's context still references the removed feature.
+- For large diffs: if truncated, lean toward requesting deeper review rather than approving blind.
+- Be concise but specific. If rejecting, point to exact lines/hunks in the diff."#.to_string()
 }
 
 /// Build the user prompt with PR and issue context.
@@ -48,6 +71,7 @@ pub fn build_evaluation_prompt(
     issue: Option<&Issue>,
     task_title: &str,
     task_description: Option<&str>,
+    diff: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -80,8 +104,8 @@ pub fn build_evaluation_prompt(
         }
     }
 
-    // PR context
-    prompt.push_str("## Pull Request\n\n");
+    // PR metadata (no body — we don't trust the agent's self-reported description)
+    prompt.push_str("## Pull Request Metadata\n\n");
     prompt.push_str(&format!("**PR #{}: {}**\n\n", pr.number, pr.title));
     prompt.push_str(&format!("- **Branch**: {} -> {}\n", pr.head_ref, pr.base_ref));
     prompt.push_str(&format!("- **Author**: @{}\n", pr.author.login));
@@ -119,14 +143,6 @@ pub fn build_evaluation_prompt(
 
     prompt.push('\n');
 
-    // PR body
-    if let Some(body) = &pr.body {
-        if !body.is_empty() {
-            prompt.push_str("### PR Description\n\n");
-            prompt.push_str(&format!("{}\n\n", truncate_text(body, 2000)));
-        }
-    }
-
     // Reviews
     if !pr.reviews.is_empty() {
         prompt.push_str("### Reviews\n\n");
@@ -145,18 +161,6 @@ pub fn build_evaluation_prompt(
         prompt.push('\n');
     }
 
-    // PR comments
-    if !pr.comments.is_empty() {
-        prompt.push_str("### PR Comments\n\n");
-        for comment in pr.comments.iter().take(5) {
-            prompt.push_str(&format!(
-                "**@{}**: {}\n\n",
-                comment.author.login,
-                truncate_text(&comment.body, 500)
-            ));
-        }
-    }
-
     // Linked issues
     if !pr.linked_issues.is_empty() {
         prompt.push_str("### Linked Issues\n\n");
@@ -169,10 +173,61 @@ pub fn build_evaluation_prompt(
         prompt.push('\n');
     }
 
+    // The diff — this is what the review is actually about
+    if let Some(diff) = diff {
+        prompt.push_str("## Diff\n\n");
+        prompt.push_str("```diff\n");
+        prompt.push_str(diff);
+        if !diff.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str("```\n\n");
+    } else {
+        prompt.push_str("## Diff\n\n");
+        prompt.push_str("**No diff available.** Evaluate based on metadata only, and lean toward requesting deeper review.\n\n");
+    }
+
     prompt.push_str("## Evaluation Request\n\n");
-    prompt.push_str("Based on the above context, evaluate whether this PR is ready to merge. ");
-    prompt.push_str("Consider issue alignment, test status, merge conflicts, and code quality. ");
-    prompt.push_str("Respond with your evaluation in the JSON format specified.");
+    prompt.push_str("Review the diff above against the issue requirements. ");
+    prompt.push_str("Evaluate correctness, completeness, and whether this actually solves the issue. ");
+    prompt.push_str("Respond with your evaluation in the JSON format specified in your instructions.");
+
+    prompt
+}
+
+/// Build the follow-up prompt for pass 2 (deep review).
+///
+/// Includes the original context plus the requested file contents.
+pub fn build_deep_review_prompt(
+    pr: &PullRequest,
+    issue: Option<&Issue>,
+    task_title: &str,
+    task_description: Option<&str>,
+    diff: &str,
+    review_reasoning: &str,
+    files: &[(String, String)],
+) -> String {
+    // Start with the same base prompt
+    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, Some(diff));
+
+    // Add the reviewer's reasoning from pass 1
+    prompt.push_str("\n## Previous Review Notes\n\n");
+    prompt.push_str(review_reasoning);
+    prompt.push_str("\n\n");
+
+    // Add requested file contents
+    prompt.push_str("## Requested Files\n\n");
+    for (path, content) in files {
+        prompt.push_str(&format!("### `{}`\n\n", path));
+        prompt.push_str("```\n");
+        prompt.push_str(&truncate_text(content, 10_000));
+        prompt.push_str("\n```\n\n");
+    }
+
+    prompt.push_str("## Deep Review Request\n\n");
+    prompt.push_str("You now have the file context you requested. ");
+    prompt.push_str("Make your final evaluation — approve or reject. ");
+    prompt.push_str("You cannot request more files. Respond with your evaluation JSON.");
 
     prompt
 }
@@ -329,17 +384,17 @@ mod tests {
     #[test]
     fn test_system_prompt_contains_criteria() {
         let prompt = system_prompt();
-        assert!(prompt.contains("Issue Alignment"));
-        assert!(prompt.contains("Test/CI Status"));
-        assert!(prompt.contains("Merge Conflicts"));
-        assert!(prompt.contains("Project Conventions"));
+        assert!(prompt.contains("Issue alignment"));
+        assert!(prompt.contains("Correctness"));
+        assert!(prompt.contains("Completeness"));
+        assert!(prompt.contains("Conflicts/CI"));
         assert!(prompt.contains("JSON"));
     }
 
     #[test]
     fn test_build_evaluation_prompt_basic() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None);
+        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None, None);
 
         // Should contain task info
         assert!(prompt.contains("Fix auth bug"));
@@ -366,6 +421,7 @@ mod tests {
             Some(&issue),
             "Fix auth bug",
             Some("Fix the timeout issue"),
+            None,
         );
 
         // Should contain issue info
@@ -382,7 +438,7 @@ mod tests {
         let mut pr = test_pr();
         pr.mergeable = Some(MergeableState::Conflicting);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
         assert!(prompt.contains("has conflicts"));
     }
 
@@ -391,17 +447,68 @@ mod tests {
         let mut pr = test_pr();
         pr.review_decision = Some(ReviewDecision::ChangesRequested);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
         assert!(prompt.contains("Changes requested"));
     }
 
     #[test]
     fn test_build_evaluation_prompt_with_reviews() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
 
         // Should contain review info
         assert!(prompt.contains("@testuser"));
         assert!(prompt.contains("LGTM"));
+    }
+
+    #[test]
+    fn test_system_prompt_is_skeptical() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("diff"));
+        assert!(prompt.contains("Do not trust"));
+        assert!(prompt.contains("needs_deeper_review"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_includes_diff() {
+        let pr = test_pr();
+        let prompt = build_evaluation_prompt(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff --git a/src/auth.rs b/src/auth.rs\n-old\n+new"),
+        );
+        assert!(prompt.contains("## Diff"));
+        assert!(prompt.contains("-old"));
+        assert!(prompt.contains("+new"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_no_diff_notes_absence() {
+        let pr = test_pr();
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
+        assert!(prompt.contains("No diff available"));
+    }
+
+    #[test]
+    fn test_build_deep_review_prompt() {
+        let pr = test_pr();
+        let files = vec![
+            ("src/auth.rs".to_string(), "fn login() { todo!() }".to_string()),
+        ];
+        let prompt = build_deep_review_prompt(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            "diff content here",
+            "I need to see src/auth.rs to verify the login flow is complete",
+            &files,
+        );
+        assert!(prompt.contains("## Requested Files"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("fn login()"));
+        assert!(prompt.contains("Previous Review Notes"));
     }
 }

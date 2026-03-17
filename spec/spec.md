@@ -392,15 +392,31 @@ or drop into a task to give feedback. The mode controls the default flow, not th
 
 ### 7.3 Quality Evaluation
 
-Before approving a merge, the orchestrator evaluates the pull request:
+Before approving a merge, the orchestrator reviews the actual code diff:
 
-- Does the change address the associated issue as described?
-- Do tests pass (CI/testing state)?
-- Are there conflicts that need resolution?
-- Does the change meet project conventions and quality standards?
+**Pass 1 — Diff triage.** The orchestrator fetches the unified diff from GitHub and evaluates it
+against the associated issue. It checks:
 
-If the work isn't ready, the orchestrator rejects the entry. If the PR originated from a task,
-that task may be re-engaged with specific feedback rather than queuing a bad merge.
+- Does the diff actually address the issue? (Not "does the PR description say it does.")
+- Are there obvious correctness issues — missing error handling, incomplete removals, broken
+  dependents?
+- Is the change complete relative to the issue scope?
+- Are there merge conflicts or failing CI checks?
+
+Self-reported "test plans" in PR descriptions are ignored — these are written by the same agent
+that wrote the code and are not verification.
+
+If the change is obviously correct and complete, the orchestrator approves or rejects immediately.
+
+**Pass 2 — Deep review (conditional).** If the diff is substantial, ambiguous, or the orchestrator
+isn't confident the change is correct, it requests up to 5 specific files from the PR branch for
+deeper context. With the full file contents, it evaluates whether the change integrates correctly
+with the surrounding code — checking for broken callers, missed dependents, and incomplete
+migrations.
+
+If the work isn't ready, the orchestrator rejects the entry with specific, actionable feedback
+referencing the actual code. If the PR originated from a task, that task may be re-engaged with
+the feedback rather than queuing a bad merge.
 
 ### 7.4 Conflicts
 
