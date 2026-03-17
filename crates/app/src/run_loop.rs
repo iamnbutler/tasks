@@ -981,10 +981,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
+        // Initialize the completions service for fast LLM utilities
+        let completions_service = tasks_agent::CompletionsService::from_env()
+            .ok()
+            .map(|s| std::sync::Arc::new(tokio::sync::RwLock::new(s)));
+
         let api_state = crate::web::ApiState {
             server: server.clone(),
             max_sessions: config.max_sessions,
             session_manager: Some(session_manager.clone()),
+            completions_service,
         };
         let web_port = config.web_port;
 

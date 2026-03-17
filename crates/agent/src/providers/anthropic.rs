@@ -405,6 +405,7 @@ impl Provider for AnthropicProvider {
         &[
             "claude-sonnet-4-20250514",
             "claude-opus-4-0-20250514",
+            "claude-haiku-4-5-20251001",
             "claude-3-5-haiku-20241022",
         ]
     }

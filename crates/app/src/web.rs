@@ -19,6 +19,7 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
@@ -26,6 +27,7 @@ use tower_http::cors::CorsLayer;
 use events::Actor;
 use server::Server;
 use server::mode::Mode;
+use tasks_agent::CompletionsService;
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -33,6 +35,7 @@ pub struct ApiState {
     pub server: Arc<Server>,
     pub max_sessions: u32,
     pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
+    pub completions_service: Option<Arc<RwLock<CompletionsService>>>,
 }
 
 /// Build the API router.
@@ -53,7 +56,13 @@ pub fn router(state: ApiState) -> Router {
         .route("/merge-queue/{id}/reject", post(reject_merge))
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
-        .route("/events", get(event_stream));
+        .route("/events", get(event_stream))
+        // Completions endpoints (fast mode LLM service)
+        .route("/completions", post(completions))
+        .route("/completions/name", post(completions_name))
+        .route("/completions/describe", post(completions_describe))
+        .route("/completions/brainstorm", post(completions_brainstorm))
+        .route("/completions/summarize", post(completions_summarize));
 
     Router::new()
         .nest("/api", api)
@@ -105,6 +114,48 @@ struct EventStreamQuery {
     pattern: Option<String>,
     /// Optional task ID filter.
     task_id: Option<String>,
+}
+
+// --- Completions request/response types ---
+
+#[derive(Deserialize)]
+struct CompletionsRequest {
+    /// The prompt to complete.
+    prompt: String,
+    /// Optional system prompt.
+    system: Option<String>,
+    /// Optional temperature (0.0-1.0).
+    temperature: Option<f32>,
+    /// Optional max tokens override.
+    max_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct CompletionsResponse {
+    /// The generated text.
+    text: String,
+    /// Token usage information.
+    usage: Option<CompletionsUsage>,
+}
+
+#[derive(Serialize)]
+struct CompletionsUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+#[derive(Deserialize)]
+struct ContextRequest {
+    /// The context to use for generation.
+    context: String,
+}
+
+#[derive(Deserialize)]
+struct BrainstormRequest {
+    /// The context to brainstorm about.
+    context: String,
+    /// Number of suggestions to generate (default 5).
+    count: Option<u32>,
 }
 
 // --- Handlers ---
@@ -390,6 +441,130 @@ async fn event_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+// --- Completions handlers ---
+
+/// POST /api/completions — General-purpose text completion.
+///
+/// Uses claude-haiku-4-5 for fast responses. Supports optional system prompt,
+/// temperature, and max_tokens parameters.
+async fn completions(
+    State(state): State<ApiState>,
+    Json(req): Json<CompletionsRequest>,
+) -> Result<Json<CompletionsResponse>, ApiError> {
+    let service_arc = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Completions("completions service not available".into()))?;
+
+    // Clone the service to avoid holding lock across await
+    let service: CompletionsService = service_arc.read().await.clone();
+    let response = service
+        .complete_advanced(
+            req.system.as_deref(),
+            vec![tasks_agent::Message::user(&req.prompt)],
+            req.temperature,
+            req.max_tokens,
+        )
+        .await
+        .map_err(|e: tasks_agent::AgentError| ApiError::Completions(e.to_string()))?;
+
+    Ok(Json(CompletionsResponse {
+        text: response.text(),
+        usage: response.usage.map(|u| CompletionsUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        }),
+    }))
+}
+
+/// POST /api/completions/name — Generate a name.
+///
+/// Utility endpoint that generates a single, concise name based on context.
+async fn completions_name(
+    State(state): State<ApiState>,
+    Json(req): Json<ContextRequest>,
+) -> Result<Json<CompletionsResponse>, ApiError> {
+    let service_arc = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Completions("completions service not available".into()))?;
+
+    // Clone the service to avoid holding lock across await
+    let service: CompletionsService = service_arc.read().await.clone();
+    let text = service
+        .generate_name(&req.context)
+        .await
+        .map_err(|e: tasks_agent::AgentError| ApiError::Completions(e.to_string()))?;
+
+    Ok(Json(CompletionsResponse { text, usage: None }))
+}
+
+/// POST /api/completions/describe — Generate a description.
+///
+/// Utility endpoint that generates a clear, concise description (1-2 sentences).
+async fn completions_describe(
+    State(state): State<ApiState>,
+    Json(req): Json<ContextRequest>,
+) -> Result<Json<CompletionsResponse>, ApiError> {
+    let service_arc = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Completions("completions service not available".into()))?;
+
+    // Clone the service to avoid holding lock across await
+    let service: CompletionsService = service_arc.read().await.clone();
+    let text = service
+        .generate_description(&req.context)
+        .await
+        .map_err(|e: tasks_agent::AgentError| ApiError::Completions(e.to_string()))?;
+
+    Ok(Json(CompletionsResponse { text, usage: None }))
+}
+
+/// POST /api/completions/brainstorm — Brainstorm names or ideas.
+///
+/// Utility endpoint that generates multiple suggestions based on context.
+async fn completions_brainstorm(
+    State(state): State<ApiState>,
+    Json(req): Json<BrainstormRequest>,
+) -> Result<Json<CompletionsResponse>, ApiError> {
+    let service_arc = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Completions("completions service not available".into()))?;
+
+    // Clone the service to avoid holding lock across await
+    let service: CompletionsService = service_arc.read().await.clone();
+    let text = service
+        .brainstorm(&req.context, req.count)
+        .await
+        .map_err(|e: tasks_agent::AgentError| ApiError::Completions(e.to_string()))?;
+
+    Ok(Json(CompletionsResponse { text, usage: None }))
+}
+
+/// POST /api/completions/summarize — Summarize text content.
+///
+/// Utility endpoint that provides a clear, concise summary.
+async fn completions_summarize(
+    State(state): State<ApiState>,
+    Json(req): Json<ContextRequest>,
+) -> Result<Json<CompletionsResponse>, ApiError> {
+    let service_arc = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Completions("completions service not available".into()))?;
+
+    // Clone the service to avoid holding lock across await
+    let service: CompletionsService = service_arc.read().await.clone();
+    let text = service
+        .summarize(&req.context)
+        .await
+        .map_err(|e: tasks_agent::AgentError| ApiError::Completions(e.to_string()))?;
+
+    Ok(Json(CompletionsResponse { text, usage: None }))
+}
+
 // --- Error handling ---
 
 enum ApiError {
@@ -397,6 +572,7 @@ enum ApiError {
     BadRequest(String),
     MergeQueue(String),
     SessionManager(String),
+    Completions(String),
 }
 
 impl IntoResponse for ApiError {
@@ -406,6 +582,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::Completions(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

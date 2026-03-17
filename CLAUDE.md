@@ -86,3 +86,11 @@ bun web dev                    # dev mode (proxies /api to localhost:4800)
 - `POST /api/merge-queue/flush` — Flush approved entries (Pause mode only)
 - `POST /api/tasks/:id/chat` — Send chat message to agent session `{ message: string }`
 - `GET /api/events` — SSE live event stream (optional `?pattern=&task_id=` filters)
+
+#### Completions (fast mode LLM service using claude-haiku-4-5)
+
+- `POST /api/completions` — General-purpose completion `{ prompt, system?, temperature?, max_tokens? }`
+- `POST /api/completions/name` — Generate a name `{ context: string }`
+- `POST /api/completions/describe` — Generate a description `{ context: string }`
+- `POST /api/completions/brainstorm` — Brainstorm ideas `{ context: string, count?: number }`
+- `POST /api/completions/summarize` — Summarize text `{ context: string }`

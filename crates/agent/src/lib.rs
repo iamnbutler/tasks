@@ -4,12 +4,14 @@
 //! Lifted and adapted from agent-foundry.
 
 pub mod chain;
+pub mod completions;
 pub mod error;
 pub mod message;
 pub mod provider;
 pub mod providers;
 pub mod session;
 
+pub use completions::{CompletionsService, FAST_MODEL};
 pub use error::AgentError;
 pub use message::{Content, Message, Response, Role, StopReason, Tool, ToolCall, ToolResult, Usage};
 pub use provider::{
