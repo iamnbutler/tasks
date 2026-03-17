@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
 use crate::types::{EvaluationContext, QualityEvaluation};
 use models::task::{Task, TaskSource};
 use tasks_agent::{AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider};
@@ -59,9 +59,8 @@ impl ClaudeOrchestrator {
         self
     }
 
-    /// Parse the LLM response into a QualityEvaluation.
-    fn parse_evaluation_response(&self, text: &str) -> Result<QualityEvaluation, OrchestratorError> {
-        // Try to extract JSON from the response
+    /// Parse the LLM response into a ParsedEvaluation (includes triage fields).
+    fn parse_evaluation_response(&self, text: &str) -> Result<ParsedEvaluation, OrchestratorError> {
         let json_str = extract_json(text).ok_or_else(|| {
             OrchestratorError::Evaluation(format!(
                 "Could not find JSON in response: {}",
@@ -69,15 +68,16 @@ impl ClaudeOrchestrator {
             ))
         })?;
 
-        // Parse the JSON
         let parsed: EvaluationResponse = serde_json::from_str(json_str).map_err(|e| {
             OrchestratorError::Evaluation(format!("Failed to parse evaluation JSON: {}", e))
         })?;
 
-        Ok(QualityEvaluation {
+        Ok(ParsedEvaluation {
             approved: parsed.approved,
+            needs_deeper_review: parsed.needs_deeper_review,
             reasoning: parsed.reasoning,
             feedback: parsed.feedback,
+            files_to_review: parsed.files_to_review,
         })
     }
 }
@@ -86,8 +86,21 @@ impl ClaudeOrchestrator {
 #[derive(Deserialize)]
 struct EvaluationResponse {
     approved: bool,
+    #[serde(default)]
+    needs_deeper_review: bool,
     reasoning: String,
     feedback: Option<String>,
+    #[serde(default)]
+    files_to_review: Option<Vec<String>>,
+}
+
+/// Internal parsed result from the LLM (includes triage fields not in QualityEvaluation).
+struct ParsedEvaluation {
+    approved: bool,
+    needs_deeper_review: bool,
+    reasoning: String,
+    feedback: Option<String>,
+    files_to_review: Option<Vec<String>>,
 }
 
 impl Orchestrator for ClaudeOrchestrator {
@@ -110,7 +123,7 @@ impl Orchestrator for ClaudeOrchestrator {
             ))
         })?;
 
-        // Fetch the PR from GitHub
+        // Fetch the PR metadata from GitHub
         let pr = self
             .github
             .get_pull_request(&owner, &repo, pr_number)
@@ -125,7 +138,19 @@ impl Orchestrator for ClaudeOrchestrator {
             "Fetched PR details"
         );
 
-        // If the task originated from a GitHub issue, fetch it too
+        // Fetch the actual diff
+        let diff = match self.github.get_pr_diff(&owner, &repo, pr_number).await {
+            Ok(d) => {
+                info!(diff_len = d.len(), "Fetched PR diff");
+                Some(d)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch PR diff, continuing without it");
+                None
+            }
+        };
+
+        // If the task originated from a GitHub issue, fetch it
         let issue = match &context.task.source {
             TaskSource::GithubIssue {
                 owner: issue_owner,
@@ -150,19 +175,87 @@ impl Orchestrator for ClaudeOrchestrator {
             _ => None,
         };
 
-        // Build the prompt
+        // --- Pass 1: Triage with diff ---
         let system = system_prompt();
         let user_prompt = build_evaluation_prompt(
             &pr,
             issue.as_ref(),
             &context.task.title,
             context.task.description.as_deref(),
-            None, // TODO(task-4): pass actual diff for two-pass review
+            diff.as_deref(),
         );
 
-        // Call the LLM
         let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);
         let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system.clone());
+
+        let response = self
+            .provider
+            .complete(request)
+            .await
+            .map_err(OrchestratorError::Agent)?;
+
+        let response_text = response.text();
+        info!(response_len = response_text.len(), "Pass 1 evaluation response");
+
+        let pass1 = self.parse_evaluation_response(&response_text)?;
+
+        // If pass 1 is decisive (no deeper review needed), return immediately
+        if !pass1.needs_deeper_review || pass1.files_to_review.is_none() {
+            info!(
+                approved = pass1.approved,
+                has_feedback = pass1.feedback.is_some(),
+                "Evaluation complete (pass 1 — no deeper review needed)"
+            );
+            return Ok(QualityEvaluation {
+                approved: pass1.approved,
+                reasoning: pass1.reasoning,
+                feedback: pass1.feedback,
+            });
+        }
+
+        // --- Pass 2: Deep review ---
+        let files_requested = pass1.files_to_review.unwrap_or_default();
+        info!(
+            files = ?files_requested,
+            "Pass 1 requested deeper review, fetching files"
+        );
+
+        // Fetch requested files from the PR branch
+        let mut files: Vec<(String, String)> = Vec::new();
+        for file_path in files_requested.iter().take(5) {
+            match self
+                .github
+                .get_file_content_at_ref(&owner, &repo, file_path, &pr.head_ref)
+                .await
+            {
+                Ok(Some(content)) => {
+                    info!(path = %file_path, len = content.len(), "Fetched file for deep review");
+                    files.push((file_path.clone(), content));
+                }
+                Ok(None) => {
+                    info!(path = %file_path, "File not found on PR branch");
+                    files.push((file_path.clone(), "(file not found)".to_string()));
+                }
+                Err(e) => {
+                    warn!(path = %file_path, error = %e, "Failed to fetch file for deep review");
+                    files.push((file_path.clone(), format!("(fetch error: {e})")));
+                }
+            }
+        }
+
+        let deep_prompt = build_deep_review_prompt(
+            &pr,
+            issue.as_ref(),
+            &context.task.title,
+            context.task.description.as_deref(),
+            diff.as_deref().unwrap_or("(no diff available)"),
+            &pass1.reasoning,
+            &files,
+        );
+
+        let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);
+        let request = CompletionRequest::new(config, vec![Message::user(deep_prompt)])
             .with_system(system);
 
         let response = self
@@ -172,21 +265,21 @@ impl Orchestrator for ClaudeOrchestrator {
             .map_err(OrchestratorError::Agent)?;
 
         let response_text = response.text();
-        info!(
-            response_len = response_text.len(),
-            "Received evaluation response from LLM"
-        );
+        info!(response_len = response_text.len(), "Pass 2 evaluation response");
 
-        // Parse the response
-        let evaluation = self.parse_evaluation_response(&response_text)?;
+        let pass2 = self.parse_evaluation_response(&response_text)?;
 
         info!(
-            approved = evaluation.approved,
-            has_feedback = evaluation.feedback.is_some(),
-            "Evaluation complete"
+            approved = pass2.approved,
+            has_feedback = pass2.feedback.is_some(),
+            "Evaluation complete (pass 2 — deep review)"
         );
 
-        Ok(evaluation)
+        Ok(QualityEvaluation {
+            approved: pass2.approved,
+            reasoning: pass2.reasoning,
+            feedback: pass2.feedback,
+        })
     }
 
     async fn feedback(
