@@ -43,13 +43,10 @@ function modeBadge(mode: Mode) {
 // ---------------------------------------------------------------------------
 
 export function MergeQueuePage() {
-  const { snapshot, refreshSnapshot } = useAppState();
+  const { snapshot, refreshSnapshot, filteredMergeQueue, selectedProject } = useAppState();
   const [flushing, setFlushing] = useState(false);
 
-  const entries = useMemo(
-    () => snapshot?.merge_queue ?? [],
-    [snapshot],
-  );
+  const entries = filteredMergeQueue;
 
   const approvedCount = useMemo(
     () => entries.filter((e) => e.status === "approved").length,
@@ -59,11 +56,20 @@ export function MergeQueuePage() {
   const mode = snapshot?.mode;
   const isPaused = mode === "pause";
 
+  // Find the selected project name for display
+  const selectedProjectName = selectedProject
+    ? snapshot?.projects.find((p) => p.id === selectedProject)?.repo
+    : null;
+
   const table = useReactTable({
     data: entries,
     columns,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
+    state: {
+      // Hide project column when a specific project is selected
+      columnVisibility: selectedProject ? { project: false } : {},
+    },
     meta: {
       refreshSnapshot,
       tasks: snapshot?.tasks ?? [],
@@ -100,9 +106,16 @@ export function MergeQueuePage() {
     <div className="space-y-6 p-6">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold">Merge Queue</h1>
-          {mode && modeBadge(mode)}
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold">Merge Queue</h1>
+            {mode && modeBadge(mode)}
+          </div>
+          {selectedProjectName && (
+            <p className="text-sm text-muted-foreground">
+              Showing entries for {selectedProjectName}
+            </p>
+          )}
         </div>
         {isPaused && (
           <div className="flex items-center gap-3">

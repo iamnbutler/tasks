@@ -29,7 +29,7 @@ import {
 import { Input } from "@/components/ui/input";
 
 export function ProjectSwitcher() {
-  const { snapshot, refreshSnapshot } = useAppState();
+  const { snapshot, refreshSnapshot, selectedProject, setSelectedProject } = useAppState();
   const [open, setOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [newRepo, setNewRepo] = useState("");
@@ -39,6 +39,9 @@ export function ProjectSwitcher() {
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; repo: string } | null>(null);
 
   const projects = snapshot?.projects ?? [];
+  const selectedProjectObj = selectedProject
+    ? projects.find((p) => p.id === selectedProject)
+    : null;
 
   const handleAdd = async () => {
     const repo = newRepo.trim();
@@ -65,6 +68,10 @@ export function ProjectSwitcher() {
     setDeleteError(null);
     try {
       await deleteProject(id);
+      // If we deleted the currently selected project, reset to "All Projects"
+      if (selectedProject === id) {
+        setSelectedProject(null);
+      }
       await refreshSnapshot();
       setDeleteConfirm(null);
     } catch (e) {
@@ -86,7 +93,9 @@ export function ProjectSwitcher() {
               <FolderGit2 className="h-4 w-4 shrink-0 text-muted-foreground" />
               {projects.length === 0
                 ? "No projects"
-                : `${projects.length} project${projects.length !== 1 ? "s" : ""}`}
+                : selectedProjectObj
+                  ? selectedProjectObj.repo
+                  : "All Projects"}
             </span>
             <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
           </Button>
@@ -97,15 +106,46 @@ export function ProjectSwitcher() {
             <CommandList>
               <CommandEmpty>No projects found.</CommandEmpty>
               <CommandGroup heading="Projects">
+                {/* All Projects option */}
+                <CommandItem
+                  value="all-projects"
+                  className="flex items-center justify-between"
+                  onSelect={() => {
+                    setSelectedProject(null);
+                    setOpen(false);
+                  }}
+                >
+                  <span className="flex items-center gap-2 truncate">
+                    <Check
+                      className={cn(
+                        "h-3.5 w-3.5",
+                        !selectedProject ? "opacity-100" : "opacity-0"
+                      )}
+                    />
+                    <span className="truncate">All Projects</span>
+                    <span className="text-xs text-muted-foreground">
+                      ({projects.length})
+                    </span>
+                  </span>
+                </CommandItem>
+                {/* Individual project options */}
                 {projects.map((project) => (
                   <CommandItem
                     key={project.id}
                     value={project.repo}
                     className="flex items-center justify-between"
-                    onSelect={() => {}}
+                    onSelect={() => {
+                      setSelectedProject(project.id);
+                      setOpen(false);
+                    }}
                   >
                     <span className="flex items-center gap-2 truncate">
-                      <Check className="h-3.5 w-3.5 text-green-500" />
+                      <Check
+                        className={cn(
+                          "h-3.5 w-3.5",
+                          selectedProject === project.id ? "opacity-100" : "opacity-0"
+                        )}
+                      />
                       <span className="truncate">{project.repo}</span>
                     </span>
                     <Button

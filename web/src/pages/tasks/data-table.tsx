@@ -29,11 +29,14 @@ import { DataTableToolbar } from "./data-table-toolbar";
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
+  /** Hide the project column (e.g., when a specific project is selected) */
+  hideProjectColumn?: boolean;
 }
 
 export function DataTable<TData extends Task, TValue>({
   columns,
   data,
+  hideProjectColumn = false,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = useState<SortingState>([
     { id: "state", desc: false },
@@ -48,9 +51,12 @@ export function DataTable<TData extends Task, TValue>({
 
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
 
+  // Hide project column when explicitly requested or when viewing single project data
+  const shouldHideProject = hideProjectColumn || singleProject;
+
   const mergedVisibility = useMemo<VisibilityState>(
-    () => ({ ...columnVisibility, ...(singleProject ? { project: false } : {}) }),
-    [columnVisibility, singleProject],
+    () => ({ ...columnVisibility, ...(shouldHideProject ? { project: false } : {}) }),
+    [columnVisibility, shouldHideProject],
   );
 
   const table = useReactTable({

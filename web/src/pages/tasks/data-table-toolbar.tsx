@@ -51,7 +51,8 @@ export function DataTableToolbar({ table }: DataTableToolbarProps) {
             options={stateOptions}
           />
         )}
-        {table.getColumn("project") && projectOptions.length > 0 && (
+        {/* Only show project filter when viewing all projects (column visible) */}
+        {table.getColumn("project")?.getIsVisible() && projectOptions.length > 0 && (
           <DataTableFacetedFilter
             column={table.getColumn("project")}
             title="Project"
