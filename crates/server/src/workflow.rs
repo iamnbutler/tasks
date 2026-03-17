@@ -7,6 +7,7 @@ use serde::Deserialize;
 /// Top-level workflow configuration (spec §14.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct WorkflowConfig {
     pub project: ProjectConfig,
     pub dispatch: DispatchConfig,
@@ -16,6 +17,7 @@ pub struct WorkflowConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct ProjectConfig {
     /// Per-project concurrency limit (spec §12.4).
     pub max_sessions: Option<u32>,
@@ -45,6 +47,7 @@ pub struct LabelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct PromptConfig {
     /// Path to system prompt file, relative to repo root (spec §14.1).
     pub system_prompt: Option<String>,
@@ -52,25 +55,7 @@ pub struct PromptConfig {
 
 // --- Default impls ---
 
-impl Default for WorkflowConfig {
-    fn default() -> Self {
-        Self {
-            project: ProjectConfig::default(),
-            dispatch: DispatchConfig::default(),
-            labels: LabelConfig::default(),
-            prompt: PromptConfig::default(),
-        }
-    }
-}
 
-impl Default for ProjectConfig {
-    fn default() -> Self {
-        Self {
-            max_sessions: None,
-            default_branch: None,
-        }
-    }
-}
 
 impl Default for DispatchConfig {
     fn default() -> Self {
@@ -91,13 +76,6 @@ impl Default for LabelConfig {
     }
 }
 
-impl Default for PromptConfig {
-    fn default() -> Self {
-        Self {
-            system_prompt: None,
-        }
-    }
-}
 
 impl WorkflowConfig {
     /// Parse a TOML string into a `WorkflowConfig`.

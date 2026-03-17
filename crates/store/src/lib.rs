@@ -125,7 +125,7 @@ impl Store {
 
     /// Insert or replace a merge queue entry.
     pub fn save_merge_entry(&self, entry: &MergeQueueEntry) -> Result<(), StoreError> {
-        let status = serde_json::to_value(&entry.status)?
+        let status = serde_json::to_value(entry.status)?
             .as_str()
             .unwrap()
             .to_string();

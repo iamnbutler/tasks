@@ -451,7 +451,7 @@ impl Server {
                         state
                             .tasks
                             .get(dep_id)
-                            .map_or(false, |dep| dep.state.is_terminal())
+                            .is_some_and(|dep| dep.state.is_terminal())
                     })
                 })
                 .map(|t| t.id.clone())
@@ -508,7 +508,7 @@ impl Server {
             .merge_queue
             .flush(mode)
             .map_err(|e| ServerError::EventStore(events::StoreError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                std::io::Error::other(e.to_string()),
             )))?;
 
         drop(state);
