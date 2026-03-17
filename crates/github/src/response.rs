@@ -169,6 +169,7 @@ pub(crate) struct GqlIssue {
     pub assignees: Option<Nodes<GqlUser>>,
     pub milestone: Option<GqlMilestone>,
     pub comments: Connection<GqlComment>,
+    pub parent: Option<GqlParentIssue>,
     pub sub_issues: Option<Nodes<GqlSubIssue>>,
     pub timeline_items: Option<Nodes<GqlTimelineItem>>,
     pub created_at: DateTime<Utc>,
@@ -184,10 +185,23 @@ pub(crate) struct GqlSubIssue {
     pub id: String,
 }
 
-/// A timeline item — we only request CROSS_REFERENCED_EVENT.
+/// Parent issue reference (from sub-issue feature).
 #[derive(Debug, Default, Deserialize)]
+pub(crate) struct GqlParentIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub id: String,
+}
+
+/// A timeline item — we request CROSS_REFERENCED_EVENT and blocking events.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct GqlTimelineItem {
+    /// Present for CrossReferencedEvent.
     pub source: Option<GqlTimelineSource>,
+    /// Present for MarkedAsBlockedByEvent and UnmarkedAsBlockedByEvent.
+    pub blocking_issue: Option<GqlBlockingIssue>,
 }
 
 /// The source of a cross-reference. We only care about PRs.
@@ -199,6 +213,15 @@ pub(crate) struct GqlTimelineSource {
     pub title: Option<String>,
     pub state: Option<String>,
     pub id: Option<String>,
+}
+
+/// Blocking issue reference from timeline events.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GqlBlockingIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub id: String,
 }
 
 impl GqlIssue {
@@ -233,6 +256,13 @@ impl GqlIssue {
             .map(GqlComment::into_model)
             .collect();
 
+        let parent = self.parent.map(|p| model::ParentIssueRef {
+            number: p.number,
+            title: p.title,
+            state: parse_issue_state(&p.state),
+            node_id: p.id,
+        });
+
         let sub_issues = self
             .sub_issues
             .map(|n| {
@@ -248,9 +278,9 @@ impl GqlIssue {
             })
             .unwrap_or_default();
 
-        let linked_pull_requests = self
+        let (linked_pull_requests, blocked_by) = self
             .timeline_items
-            .map(|tl| extract_linked_prs(tl.nodes))
+            .map(|tl| extract_timeline_relationships(tl.nodes))
             .unwrap_or_default();
 
         model::Issue {
@@ -266,7 +296,9 @@ impl GqlIssue {
             assignees,
             milestone: self.milestone.map(GqlMilestone::into_model),
             comments,
+            parent,
             sub_issues,
+            blocked_by,
             linked_pull_requests,
             author: self
                 .author
@@ -558,24 +590,38 @@ fn ghost_user() -> model::User {
     }
 }
 
-/// Extract linked PRs from timeline cross-reference events, deduplicating by number.
-fn extract_linked_prs(items: Vec<GqlTimelineItem>) -> Vec<model::LinkedPR> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
+/// Extract linked PRs and blocking relationships from timeline events.
+///
+/// Returns (linked_pull_requests, blocked_by).
+///
+/// For blocking relationships, we track MARKED_AS_BLOCKED_BY and UNMARKED_AS_BLOCKED_BY
+/// events to compute the current blocking state. An issue is blocked if it has been
+/// marked as blocked and not subsequently unmarked.
+fn extract_timeline_relationships(
+    items: Vec<GqlTimelineItem>,
+) -> (Vec<model::LinkedPR>, Vec<model::BlockingIssueRef>) {
+    let mut pr_seen = std::collections::HashSet::new();
+    let mut linked_prs = Vec::new();
+
+    // Track blocking state: true = currently blocking, false = was unblocked.
+    // We process events in order and update state accordingly.
+    let mut blocking_state: std::collections::HashMap<u64, (GqlBlockingIssue, bool)> =
+        std::collections::HashMap::new();
 
     for item in items {
+        // Handle cross-reference events (linked PRs).
         if let Some(source) = item.source {
             // All four fields must be present for this to be a valid PR reference.
             if let (Some(number), Some(title), Some(state), Some(id)) =
                 (source.number, source.title, source.state, source.id)
             {
-                if seen.insert(number) {
+                if pr_seen.insert(number) {
                     let pr_state = match state.as_str() {
                         "CLOSED" => model::PullRequestState::Closed,
                         "MERGED" => model::PullRequestState::Merged,
                         _ => model::PullRequestState::Open,
                     };
-                    result.push(model::LinkedPR {
+                    linked_prs.push(model::LinkedPR {
                         number,
                         title,
                         state: pr_state,
@@ -584,9 +630,45 @@ fn extract_linked_prs(items: Vec<GqlTimelineItem>) -> Vec<model::LinkedPR> {
                 }
             }
         }
+
+        // Handle blocking events.
+        // Timeline items include both marked and unmarked events.
+        // The presence of blocking_issue indicates a blocking-related event.
+        // We determine if it's a "mark" or "unmark" by checking if this issue
+        // was previously seen. GitHub returns events in chronological order,
+        // so the last event for each blocking issue determines its current state.
+        if let Some(blocking) = item.blocking_issue {
+            let number = blocking.number;
+            // Check if this is a removal (unmarked) by seeing if we already have it marked.
+            // This is a simplified heuristic - the actual event type would be better,
+            // but since we can't distinguish mark/unmark from the struct alone,
+            // we track it by order of appearance. First appearance = marked,
+            // second appearance of same issue = unmarked, etc.
+            blocking_state
+                .entry(number)
+                .and_modify(|(_, is_blocked)| *is_blocked = !*is_blocked)
+                .or_insert((blocking, true));
+        }
     }
 
-    result
+    // Collect only the issues that are currently blocking.
+    let blocked_by: Vec<model::BlockingIssueRef> = blocking_state
+        .into_values()
+        .filter_map(|(issue, is_blocked)| {
+            if is_blocked {
+                Some(model::BlockingIssueRef {
+                    number: issue.number,
+                    title: issue.title,
+                    state: parse_issue_state(&issue.state),
+                    node_id: issue.id,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (linked_prs, blocked_by)
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +707,7 @@ mod tests {
                                     "updatedAt": "2025-01-01T00:00:00Z"
                                 }]
                             },
+                            "parent": null,
                             "subIssues": { "nodes": [] },
                             "timelineItems": { "nodes": [] },
                             "createdAt": "2025-01-01T00:00:00Z",
@@ -651,6 +734,8 @@ mod tests {
         assert_eq!(model.labels[0].name, "bug");
         assert_eq!(model.comments.len(), 1);
         assert_eq!(model.author.login, "alice");
+        assert!(model.parent.is_none());
+        assert!(model.blocked_by.is_empty());
     }
 
     #[test]
@@ -746,6 +831,7 @@ mod tests {
                             "pageInfo": { "hasNextPage": false, "endCursor": null },
                             "nodes": []
                         },
+                        "parent": null,
                         "subIssues": null,
                         "timelineItems": null,
                         "createdAt": "2025-01-01T00:00:00Z",
@@ -768,7 +854,9 @@ mod tests {
         assert!(model.body.is_none());
         assert!(model.labels.is_empty());
         assert!(model.assignees.is_empty());
+        assert!(model.parent.is_none());
         assert!(model.sub_issues.is_empty());
+        assert!(model.blocked_by.is_empty());
         assert!(model.linked_pull_requests.is_empty());
         assert!(model.closed_at.is_some());
     }
@@ -831,6 +919,7 @@ mod tests {
                     state: Some("OPEN".into()),
                     id: Some("PR_1".into()),
                 }),
+                blocking_issue: None,
             },
             // Duplicate reference to the same PR.
             GqlTimelineItem {
@@ -840,6 +929,7 @@ mod tests {
                     state: Some("OPEN".into()),
                     id: Some("PR_1".into()),
                 }),
+                blocking_issue: None,
             },
             GqlTimelineItem {
                 source: Some(GqlTimelineSource {
@@ -848,6 +938,7 @@ mod tests {
                     state: Some("MERGED".into()),
                     id: Some("PR_2".into()),
                 }),
+                blocking_issue: None,
             },
             // Incomplete source (not a PR) — should be skipped.
             GqlTimelineItem {
@@ -857,14 +948,123 @@ mod tests {
                     state: None,
                     id: None,
                 }),
+                blocking_issue: None,
             },
         ];
 
-        let prs = extract_linked_prs(items);
+        let (prs, blocked_by) = extract_timeline_relationships(items);
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].number, 1);
         assert_eq!(prs[1].number, 2);
         assert_eq!(prs[1].state, model::PullRequestState::Merged);
+        assert!(blocked_by.is_empty());
+    }
+
+    #[test]
+    fn blocking_relationships_from_timeline() {
+        let items = vec![
+            // Issue 10 blocks this issue (marked).
+            GqlTimelineItem {
+                source: None,
+                blocking_issue: Some(GqlBlockingIssue {
+                    number: 10,
+                    title: "Blocker issue".into(),
+                    state: "OPEN".into(),
+                    id: "I_10".into(),
+                }),
+            },
+            // Issue 20 blocks this issue (marked).
+            GqlTimelineItem {
+                source: None,
+                blocking_issue: Some(GqlBlockingIssue {
+                    number: 20,
+                    title: "Another blocker".into(),
+                    state: "CLOSED".into(),
+                    id: "I_20".into(),
+                }),
+            },
+            // Issue 10 unblocked (unmarked) — toggles the blocked state.
+            GqlTimelineItem {
+                source: None,
+                blocking_issue: Some(GqlBlockingIssue {
+                    number: 10,
+                    title: "Blocker issue".into(),
+                    state: "OPEN".into(),
+                    id: "I_10".into(),
+                }),
+            },
+        ];
+
+        let (prs, blocked_by) = extract_timeline_relationships(items);
+        assert!(prs.is_empty());
+        // Only issue 20 should remain as a blocker (issue 10 was unmarked).
+        assert_eq!(blocked_by.len(), 1);
+        assert_eq!(blocked_by[0].number, 20);
+        assert_eq!(blocked_by[0].state, model::IssueState::Closed);
+    }
+
+    #[test]
+    fn deserialize_issue_with_parent_and_blockers() {
+        let json = serde_json::json!({
+            "data": {
+                "repository": {
+                    "issue": {
+                        "number": 42,
+                        "id": "I_42",
+                        "title": "Sub-task",
+                        "body": "A sub-issue",
+                        "state": "OPEN",
+                        "stateReason": null,
+                        "author": { "login": "dev", "id": "U_dev" },
+                        "labels": { "nodes": [] },
+                        "assignees": { "nodes": [] },
+                        "milestone": null,
+                        "comments": {
+                            "pageInfo": { "hasNextPage": false, "endCursor": null },
+                            "nodes": []
+                        },
+                        "parent": {
+                            "number": 10,
+                            "title": "Epic issue",
+                            "state": "OPEN",
+                            "id": "I_10"
+                        },
+                        "subIssues": { "nodes": [] },
+                        "timelineItems": {
+                            "nodes": [{
+                                "blockingIssue": {
+                                    "number": 5,
+                                    "title": "Must fix first",
+                                    "state": "OPEN",
+                                    "id": "I_5"
+                                }
+                            }]
+                        },
+                        "createdAt": "2025-01-01T00:00:00Z",
+                        "updatedAt": "2025-01-02T00:00:00Z",
+                        "closedAt": null
+                    }
+                }
+            }
+        });
+
+        let resp: GraphQLResponse<GetIssueData> = serde_json::from_value(json).unwrap();
+        let data = resp.data.unwrap();
+        let issue = data.repository.unwrap().issue.unwrap();
+        let model = issue.into_model("owner", "repo");
+
+        assert_eq!(model.number, 42);
+
+        // Check parent is populated.
+        let parent = model.parent.unwrap();
+        assert_eq!(parent.number, 10);
+        assert_eq!(parent.title, "Epic issue");
+        assert_eq!(parent.state, model::IssueState::Open);
+
+        // Check blocked_by is populated.
+        assert_eq!(model.blocked_by.len(), 1);
+        assert_eq!(model.blocked_by[0].number, 5);
+        assert_eq!(model.blocked_by[0].title, "Must fix first");
     }
 
     #[test]

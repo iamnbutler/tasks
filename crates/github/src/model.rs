@@ -27,8 +27,12 @@ pub struct Issue {
     pub milestone: Option<Milestone>,
     /// Full comment history, ordered chronologically.
     pub comments: Vec<Comment>,
+    /// Parent issue if this is a sub-issue.
+    pub parent: Option<ParentIssueRef>,
     /// Issues linked as sub-issues via GitHub's sub-issue feature.
     pub sub_issues: Vec<SubIssueRef>,
+    /// Issues that block this issue (must be resolved before this issue can be worked on).
+    pub blocked_by: Vec<BlockingIssueRef>,
     /// PRs that reference this issue.
     pub linked_pull_requests: Vec<LinkedPR>,
     pub author: User,
@@ -173,6 +177,24 @@ pub struct Review {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubIssueRef {
+    pub number: u64,
+    pub title: String,
+    pub state: IssueState,
+    pub node_id: String,
+}
+
+/// Reference to a parent issue (GitHub's sub-issue feature).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParentIssueRef {
+    pub number: u64,
+    pub title: String,
+    pub state: IssueState,
+    pub node_id: String,
+}
+
+/// Reference to an issue that blocks another issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockingIssueRef {
     pub number: u64,
     pub title: String,
     pub state: IssueState,

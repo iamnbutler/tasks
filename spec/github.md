@@ -52,7 +52,10 @@ works with these types, never with raw GitHub API shapes.
 - `assignees` (list of User)
 - `milestone` (Milestone or null)
 - `comments` (list of Comment) — full comment history, ordered chronologically
+- `parent` (ParentIssueRef or null) — parent issue if this is a sub-issue
 - `sub_issues` (list of SubIssueRef) — issues linked as sub-issues via GitHub's sub-issue feature
+- `blocked_by` (list of BlockingIssueRef) — issues that block this one (must be resolved before
+  this issue can be worked on)
 - `linked_pull_requests` (list of LinkedPR) — PRs that reference this issue (via closing keywords
   or manual links)
 - `author` (User)
@@ -101,7 +104,11 @@ works with these types, never with raw GitHub API shapes.
 **Review:** `id` (string), `author` (User), `state` (Approved | ChangesRequested | Commented |
 Dismissed), `body` (string or null), `submitted_at` (timestamp)
 
+**ParentIssueRef:** `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
+
 **SubIssueRef:** `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
+
+**BlockingIssueRef:** `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
 
 **LinkedPR:** `number` (u64), `title` (string), `state` (Open | Closed | Merged),
 `node_id` (string)

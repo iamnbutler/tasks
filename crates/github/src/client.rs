@@ -67,6 +67,11 @@ impl GitHubClientBuilder {
                 .expect("invalid token characters"),
         );
         headers.insert(USER_AGENT, HeaderValue::from_static("tasks-github"));
+        // Required for sub-issues API access (public preview feature).
+        headers.insert(
+            "GraphQL-Features",
+            HeaderValue::from_static("sub_issues"),
+        );
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
