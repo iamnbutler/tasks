@@ -1,0 +1,21 @@
+[package]
+name = "gpui-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP API client for the Tasks platform GPUI frontend"
+
+[dependencies]
+# Workspace dependencies
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+
+# Internal crates
+models = { path = "../models" }
+events = { path = "../events" }
+server = { path = "../server" }
