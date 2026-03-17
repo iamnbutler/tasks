@@ -332,10 +332,16 @@ impl Server {
     ) -> Result<(), ServerError> {
         let task_id = entry.task_id.clone();
         let entry_id = entry.id.clone();
+        let pr_url = entry.pr_url.clone();
         {
             let mut state = self.state.write().await;
-            if state.merge_queue.get_by_task(&task_id).is_some() {
-                return Ok(()); // Already queued
+            // Dedup by PR URL first (handles unlinked PRs where task_id is empty)
+            if state.merge_queue.get_by_pr_url(&pr_url).is_some() {
+                return Ok(());
+            }
+            // Dedup by task_id for linked PRs
+            if !task_id.is_empty() && state.merge_queue.get_by_task(&task_id).is_some() {
+                return Ok(());
             }
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
