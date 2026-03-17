@@ -5,16 +5,18 @@
 //!
 //! # Modules
 //!
+//! - [`components`] - Reusable UI primitive components (Button, Badge, Card, Input)
 //! - [`sse`] - Server-Sent Events client for real-time updates
 //! - [`theme`] - Theming and styling system
 
 use gpui::{Context, SharedString, Window, div, prelude::*, rgb};
 
+pub mod components;
 mod sse;
 pub mod theme;
 
 pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
-pub use theme::{Theme, colors, radius, spacing, style_helpers, typography};
+pub use theme::{ComponentTheme, Theme, colors, radius, spacing, style_helpers, typography};
 
 /// Root view for the Tasks desktop application.
 pub struct RootView {
