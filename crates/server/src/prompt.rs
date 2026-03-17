@@ -287,6 +287,49 @@ fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>
     writeln!(out, "- If you are stuck or the task is ambiguous, describe the problem clearly.").unwrap();
 
     writeln!(out).unwrap();
+    writeln!(out, "### Valid outputs\n").unwrap();
+    writeln!(
+        out,
+        "Your work can produce any of the following outputs:\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Code changes**: New features, bug fixes, refactoring, tests, or documentation"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Pull requests**: When code changes are ready for review"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Issue comments**: Progress updates, research findings, questions, or analysis"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **New issues**: Bugs found, follow-up work, or tasks discovered during implementation"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Plans or proposals**: Architecture decisions, implementation approaches, or design documents"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Questions**: Ask for clarification when requirements are unclear"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Error reports**: When something is broken or blocked"
+    )
+    .unwrap();
+
+    writeln!(out).unwrap();
     writeln!(out, "### Delivering your work\n").unwrap();
     writeln!(out, "When your task is finished, deliver your output using the GitHub CLI (`gh`).").unwrap();
     writeln!(out, "Choose the approach that fits what you produced:\n").unwrap();
@@ -382,6 +425,16 @@ mod tests {
         assert!(prompt.contains("Do not merge into main"));
         assert!(prompt.contains("describe the problem clearly"));
         assert!(prompt.contains("issue #42"));
+
+        // Valid outputs section.
+        assert!(prompt.contains("### Valid outputs"));
+        assert!(prompt.contains("**Code changes**"));
+        assert!(prompt.contains("**Pull requests**"));
+        assert!(prompt.contains("**Issue comments**"));
+        assert!(prompt.contains("**New issues**"));
+        assert!(prompt.contains("**Plans or proposals**"));
+        assert!(prompt.contains("**Questions**"));
+        assert!(prompt.contains("**Error reports**"));
     }
 
     #[test]
