@@ -53,7 +53,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/merge-queue/{id}/reject", post(reject_merge))
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
-        .route("/events", get(event_stream));
+        .route("/events", get(event_stream))
+        // Accounting endpoints (spec §16.4)
+        .route("/accounting", get(get_global_accounting))
+        .route("/accounting/tasks", get(list_task_accounting))
+        .route("/accounting/tasks/{id}", get(get_task_accounting));
 
     Router::new()
         .nest("/api", api)
@@ -324,6 +328,69 @@ async fn cancel_task(
     Ok(StatusCode::OK)
 }
 
+// --- Accounting endpoints (spec §16.4) ---
+
+/// GET /api/accounting — Global accounting summary.
+async fn get_global_accounting(
+    State(state): State<ApiState>,
+) -> Result<Json<models::accounting::GlobalAccountingSummary>, ApiError> {
+    let store = state
+        .server
+        .store
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("store not available".into()))?;
+
+    let store = store
+        .lock()
+        .map_err(|_| ApiError::BadRequest("failed to lock store".into()))?;
+
+    store
+        .get_global_accounting()
+        .map(Json)
+        .map_err(|e: tasks_store::StoreError| ApiError::Store(e.to_string()))
+}
+
+/// GET /api/accounting/tasks — List all task accounting summaries.
+async fn list_task_accounting(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<models::accounting::TaskAccountingSummary>>, ApiError> {
+    let store = state
+        .server
+        .store
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("store not available".into()))?;
+
+    let store = store
+        .lock()
+        .map_err(|_| ApiError::BadRequest("failed to lock store".into()))?;
+
+    store
+        .list_task_accounting()
+        .map(Json)
+        .map_err(|e: tasks_store::StoreError| ApiError::Store(e.to_string()))
+}
+
+/// GET /api/accounting/tasks/:id — Get accounting for a specific task.
+async fn get_task_accounting(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<models::accounting::TaskAccountingSummary>, ApiError> {
+    let store = state
+        .server
+        .store
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("store not available".into()))?;
+
+    let store = store
+        .lock()
+        .map_err(|_| ApiError::BadRequest("failed to lock store".into()))?;
+
+    store
+        .get_task_accounting(&id)
+        .map(Json)
+        .map_err(|e: tasks_store::StoreError| ApiError::Store(e.to_string()))
+}
+
 /// GET /api/events — SSE stream of live events.
 ///
 /// Supports optional query params: `pattern` and `task_id` for filtering.
@@ -366,6 +433,7 @@ enum ApiError {
     BadRequest(String),
     MergeQueue(String),
     SessionManager(String),
+    Store(String),
 }
 
 impl IntoResponse for ApiError {
@@ -375,6 +443,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

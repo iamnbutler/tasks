@@ -81,7 +81,7 @@ pub struct Server {
     pub state: Arc<RwLock<ServerState>>,
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
-    pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    pub store: Option<Arc<StdMutex<tasks_store::Store>>>,
 }
 
 impl Server {

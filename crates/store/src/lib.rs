@@ -338,6 +338,174 @@ impl Store {
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
+
+    // ── Accounting (spec §16.4) ───────────────────────────────────
+
+    /// Get or create accounting summary for a task.
+    pub fn get_task_accounting(
+        &self,
+        task_id: &str,
+    ) -> Result<models::accounting::TaskAccountingSummary, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, input_tokens, output_tokens, total_duration_seconds, session_count
+             FROM task_accounting WHERE task_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+
+        match rows.next() {
+            Some(row) => {
+                let (task_id, input, output, duration, sessions) = row?;
+                Ok(models::accounting::TaskAccountingSummary {
+                    task_id,
+                    tokens: models::accounting::TokenUsage::new(input, output),
+                    total_duration_seconds: duration,
+                    session_count: sessions,
+                })
+            }
+            None => Ok(models::accounting::TaskAccountingSummary::new(task_id)),
+        }
+    }
+
+    /// Update accounting summary for a task (upsert).
+    pub fn save_task_accounting(
+        &self,
+        summary: &models::accounting::TaskAccountingSummary,
+    ) -> Result<(), StoreError> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO task_accounting (task_id, input_tokens, output_tokens, total_duration_seconds, session_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 input_tokens = excluded.input_tokens,
+                 output_tokens = excluded.output_tokens,
+                 total_duration_seconds = excluded.total_duration_seconds,
+                 session_count = excluded.session_count,
+                 updated_at = excluded.updated_at",
+            params![
+                summary.task_id,
+                summary.tokens.input_tokens,
+                summary.tokens.output_tokens,
+                summary.total_duration_seconds,
+                summary.session_count,
+                updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Add token usage to a task's accounting.
+    pub fn add_task_tokens(
+        &self,
+        task_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), StoreError> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO task_accounting (task_id, input_tokens, output_tokens, total_duration_seconds, session_count, updated_at)
+             VALUES (?1, ?2, ?3, 0, 0, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 input_tokens = input_tokens + excluded.input_tokens,
+                 output_tokens = output_tokens + excluded.output_tokens,
+                 updated_at = excluded.updated_at",
+            params![task_id, input_tokens, output_tokens, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// Add a session to a task's accounting.
+    pub fn add_task_session(
+        &self,
+        task_id: &str,
+        duration_seconds: u64,
+    ) -> Result<(), StoreError> {
+        let updated_at = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO task_accounting (task_id, input_tokens, output_tokens, total_duration_seconds, session_count, updated_at)
+             VALUES (?1, 0, 0, ?2, 1, ?3)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 total_duration_seconds = total_duration_seconds + excluded.total_duration_seconds,
+                 session_count = session_count + 1,
+                 updated_at = excluded.updated_at",
+            params![task_id, duration_seconds, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// Get global accounting summary across all tasks.
+    pub fn get_global_accounting(&self) -> Result<models::accounting::GlobalAccountingSummary, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(total_duration_seconds), 0), COALESCE(SUM(session_count), 0)
+             FROM task_accounting",
+        )?;
+        let mut rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u32>(3)?,
+            ))
+        })?;
+
+        match rows.next() {
+            Some(row) => {
+                let (input, output, duration, sessions) = row?;
+                Ok(models::accounting::GlobalAccountingSummary {
+                    tokens: models::accounting::TokenUsage::new(input, output),
+                    total_duration_seconds: duration,
+                    session_count: sessions,
+                    api_call_count: 0, // API calls tracked via events only
+                })
+            }
+            None => Ok(models::accounting::GlobalAccountingSummary::default()),
+        }
+    }
+
+    /// List all task accounting summaries.
+    pub fn list_task_accounting(&self) -> Result<Vec<models::accounting::TaskAccountingSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, input_tokens, output_tokens, total_duration_seconds, session_count
+             FROM task_accounting",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (task_id, input, output, duration, sessions) = row?;
+            summaries.push(models::accounting::TaskAccountingSummary {
+                task_id,
+                tokens: models::accounting::TokenUsage::new(input, output),
+                total_duration_seconds: duration,
+                session_count: sessions,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Delete accounting data for a task.
+    pub fn delete_task_accounting(&self, task_id: &str) -> Result<bool, StoreError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
+        Ok(affected > 0)
+    }
 }
 
 /// Map a rusqlite Row to a Task.
@@ -708,5 +876,119 @@ mod tests {
         let loaded = store.get_task("t2").unwrap().unwrap();
         assert_eq!(loaded.blocked_by, vec!["t1"]);
         assert_eq!(loaded.state, TaskState::Blocked);
+    }
+
+    // ── Accounting tests ──────────────────────────────────────────
+
+    #[test]
+    fn get_task_accounting_returns_default_for_new() {
+        let store = Store::open_memory().unwrap();
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.task_id, "task-1");
+        assert_eq!(summary.tokens.input_tokens, 0);
+        assert_eq!(summary.tokens.output_tokens, 0);
+        assert_eq!(summary.total_duration_seconds, 0);
+        assert_eq!(summary.session_count, 0);
+    }
+
+    #[test]
+    fn save_and_get_task_accounting() {
+        let store = Store::open_memory().unwrap();
+        let mut summary = models::accounting::TaskAccountingSummary::new("task-1");
+        summary.tokens = models::accounting::TokenUsage::new(1000, 500);
+        summary.total_duration_seconds = 3600;
+        summary.session_count = 1;
+
+        store.save_task_accounting(&summary).unwrap();
+
+        let loaded = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(loaded.tokens.input_tokens, 1000);
+        assert_eq!(loaded.tokens.output_tokens, 500);
+        assert_eq!(loaded.total_duration_seconds, 3600);
+        assert_eq!(loaded.session_count, 1);
+    }
+
+    #[test]
+    fn add_task_tokens_creates_and_increments() {
+        let store = Store::open_memory().unwrap();
+
+        // First addition creates the record
+        store.add_task_tokens("task-1", 1000, 500).unwrap();
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.tokens.input_tokens, 1000);
+        assert_eq!(summary.tokens.output_tokens, 500);
+
+        // Second addition increments
+        store.add_task_tokens("task-1", 500, 250).unwrap();
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.tokens.input_tokens, 1500);
+        assert_eq!(summary.tokens.output_tokens, 750);
+    }
+
+    #[test]
+    fn add_task_session_creates_and_increments() {
+        let store = Store::open_memory().unwrap();
+
+        // First session
+        store.add_task_session("task-1", 3600).unwrap();
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.total_duration_seconds, 3600);
+        assert_eq!(summary.session_count, 1);
+
+        // Second session
+        store.add_task_session("task-1", 1800).unwrap();
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.total_duration_seconds, 5400);
+        assert_eq!(summary.session_count, 2);
+    }
+
+    #[test]
+    fn get_global_accounting() {
+        let store = Store::open_memory().unwrap();
+
+        // Add accounting for multiple tasks
+        store.add_task_tokens("task-1", 1000, 500).unwrap();
+        store.add_task_session("task-1", 3600).unwrap();
+
+        store.add_task_tokens("task-2", 2000, 1000).unwrap();
+        store.add_task_session("task-2", 1800).unwrap();
+
+        let global = store.get_global_accounting().unwrap();
+        assert_eq!(global.tokens.input_tokens, 3000);
+        assert_eq!(global.tokens.output_tokens, 1500);
+        assert_eq!(global.total_duration_seconds, 5400);
+        assert_eq!(global.session_count, 2);
+    }
+
+    #[test]
+    fn list_task_accounting() {
+        let store = Store::open_memory().unwrap();
+
+        store.add_task_tokens("task-1", 1000, 500).unwrap();
+        store.add_task_tokens("task-2", 2000, 1000).unwrap();
+
+        let summaries = store.list_task_accounting().unwrap();
+        assert_eq!(summaries.len(), 2);
+    }
+
+    #[test]
+    fn delete_task_accounting() {
+        let store = Store::open_memory().unwrap();
+
+        store.add_task_tokens("task-1", 1000, 500).unwrap();
+        assert!(store.delete_task_accounting("task-1").unwrap());
+
+        let summary = store.get_task_accounting("task-1").unwrap();
+        assert_eq!(summary.tokens.input_tokens, 0);
+    }
+
+    #[test]
+    fn global_accounting_empty_returns_defaults() {
+        let store = Store::open_memory().unwrap();
+        let global = store.get_global_accounting().unwrap();
+        assert_eq!(global.tokens.input_tokens, 0);
+        assert_eq!(global.tokens.output_tokens, 0);
+        assert_eq!(global.total_duration_seconds, 0);
+        assert_eq!(global.session_count, 0);
     }
 }

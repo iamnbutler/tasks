@@ -7,12 +7,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use events::EventBus;
+use models::accounting::TokenUsage;
 use runtime::{ContainerConfig, ContainerRuntime};
+
+use crate::token_parser;
 
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
@@ -224,6 +228,52 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
     }
 }
 
+/// Tracks accounting state during a session (spec §16.4).
+struct SessionAccountingState {
+    /// Last reported token usage (to compute deltas from cumulative totals).
+    last_token_usage: TokenUsage,
+    /// Total token usage for this session.
+    total_token_usage: TokenUsage,
+    /// When the session started (for duration tracking).
+    started_at_utc: chrono::DateTime<Utc>,
+}
+
+impl SessionAccountingState {
+    fn new() -> Self {
+        Self {
+            last_token_usage: TokenUsage::default(),
+            total_token_usage: TokenUsage::default(),
+            started_at_utc: Utc::now(),
+        }
+    }
+
+    /// Update token usage from a new reading.
+    ///
+    /// Per spec §13.5, we prefer absolute totals. If the new reading is
+    /// cumulative (larger than last), we compute the delta. Otherwise,
+    /// we treat it as an increment.
+    fn update_tokens(&mut self, new_usage: &TokenUsage) -> TokenUsage {
+        // If new totals are >= last totals, this is a cumulative update
+        let is_cumulative = new_usage.input_tokens >= self.last_token_usage.input_tokens
+            && new_usage.output_tokens >= self.last_token_usage.output_tokens;
+
+        let delta = if is_cumulative {
+            // Compute delta from last reported
+            let delta = new_usage.delta(&self.last_token_usage);
+            self.last_token_usage = new_usage.clone();
+            delta
+        } else {
+            // Treat as incremental (delta-style payload)
+            new_usage.clone()
+        };
+
+        // Add to total
+        self.total_token_usage.add(&delta);
+
+        delta
+    }
+}
+
 /// Monitoring task that bridges supervisor events to platform events.
 ///
 /// Runs for the lifetime of a session. Reads events from the blocking
@@ -242,6 +292,7 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     let started_at = Instant::now();
     let mut soft_limit_notified = false;
     let mut hard_limit_triggered = false;
+    let mut accounting = SessionAccountingState::new();
 
     // Wrap session for shared access between blocking recv thread and async command handler
     let session = Arc::new(std::sync::Mutex::new(session));
@@ -275,13 +326,23 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     loop {
         tokio::select! {
             Some(supervisor_event) = event_rx.recv() => {
+                // Parse token usage from agent output and emit accounting events
+                if let Some(token_delta) = handle_token_accounting(&task_id, &supervisor_event, &mut accounting, &event_bus).await {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        input_tokens = token_delta.input_tokens,
+                        output_tokens = token_delta.output_tokens,
+                        "token usage recorded"
+                    );
+                }
+
                 // Map and publish platform events
                 handle_supervisor_event(&task_id, &supervisor_event, &event_bus).await;
 
                 // Check for agent exit
                 if let runtime::protocol::Event::AgentExit(ref exit) = supervisor_event {
                     let ran_long_enough = started_at.elapsed() >= progress_threshold;
-                    handle_exit(&task_id, exit, ran_long_enough, &event_bus).await;
+                    handle_exit(&task_id, exit, ran_long_enough, &accounting, started_at.elapsed(), &event_bus).await;
                     break;
                 }
             }
@@ -386,6 +447,57 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     reader.abort();
 }
 
+/// Parse token usage from agent output and emit accounting events (spec §16.4).
+///
+/// Returns the token delta if new usage was found.
+async fn handle_token_accounting(
+    task_id: &str,
+    event: &runtime::protocol::Event,
+    accounting: &mut SessionAccountingState,
+    event_bus: &EventBus,
+) -> Option<TokenUsage> {
+    // Only process stdout events for token usage
+    let data = match event {
+        runtime::protocol::Event::AgentStdout(e) => &e.data,
+        _ => return None,
+    };
+
+    // Try to parse token usage from the output line
+    let usage = token_parser::parse_token_usage(data)?;
+
+    // Update accounting state and get the delta
+    let delta = accounting.update_tokens(&usage);
+
+    // Only emit event if there's actual token usage
+    if delta.input_tokens == 0 && delta.output_tokens == 0 {
+        return None;
+    }
+
+    // Emit accounting event
+    let event_data = serde_json::json!({
+        "input_tokens": delta.input_tokens,
+        "output_tokens": delta.output_tokens,
+        "model": usage.model,
+        "cumulative": {
+            "input_tokens": accounting.total_token_usage.input_tokens,
+            "output_tokens": accounting.total_token_usage.output_tokens,
+        }
+    });
+
+    let accounting_event = events::Event::new(
+        events::EventType::SystemAccountingTokens,
+        task_id,
+        events::Actor::System,
+        event_data,
+    );
+
+    if let Err(e) = event_bus.publish(accounting_event).await {
+        tracing::error!(task_id = %task_id, error = %e, "failed to publish token accounting event");
+    }
+
+    Some(delta)
+}
+
 /// Map a supervisor event to a platform event and publish it.
 async fn handle_supervisor_event(
     task_id: &str,
@@ -415,15 +527,18 @@ async fn handle_supervisor_event(
     }
 }
 
-/// Handle an agent exit event — publish success or failure.
+/// Handle an agent exit event — publish success or failure and session accounting.
 async fn handle_exit(
     task_id: &str,
     exit: &runtime::protocol::AgentExitEvent,
     made_progress: bool,
+    accounting: &SessionAccountingState,
+    duration: Duration,
     event_bus: &EventBus,
 ) {
     let success = exit.code == Some(0);
 
+    // Emit task state event
     let (event_type, data) = if success {
         (
             events::EventType::TaskStateAwaitingMerge,
@@ -444,6 +559,37 @@ async fn handle_exit(
     if let Err(e) = event_bus.publish(event).await {
         tracing::error!(task_id = %task_id, error = %e, "failed to publish agent exit event");
     }
+
+    // Emit session accounting event (spec §16.4)
+    let session_event = events::Event::new(
+        events::EventType::SystemAccountingSession,
+        task_id,
+        events::Actor::System,
+        serde_json::json!({
+            "duration_seconds": duration.as_secs(),
+            "started_at": accounting.started_at_utc.to_rfc3339(),
+            "ended_at": Utc::now().to_rfc3339(),
+            "tokens": {
+                "input_tokens": accounting.total_token_usage.input_tokens,
+                "output_tokens": accounting.total_token_usage.output_tokens,
+                "total_tokens": accounting.total_token_usage.total_tokens(),
+            },
+            "exit_code": exit.code,
+            "success": success,
+        }),
+    );
+
+    if let Err(e) = event_bus.publish(session_event).await {
+        tracing::error!(task_id = %task_id, error = %e, "failed to publish session accounting event");
+    }
+
+    tracing::info!(
+        task_id = %task_id,
+        duration_secs = duration.as_secs(),
+        input_tokens = accounting.total_token_usage.input_tokens,
+        output_tokens = accounting.total_token_usage.output_tokens,
+        "session ended"
+    );
 }
 
 #[cfg(test)]
@@ -529,8 +675,10 @@ mod tests {
             code: Some(0),
             signal: None,
         };
+        let accounting = SessionAccountingState::new();
+        let duration = Duration::from_secs(60);
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, false, &accounting, duration, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateAwaitingMerge);
@@ -544,8 +692,10 @@ mod tests {
             code: Some(1),
             signal: None,
         };
+        let accounting = SessionAccountingState::new();
+        let duration = Duration::from_secs(60);
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, false, &accounting, duration, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -559,11 +709,136 @@ mod tests {
             code: Some(1),
             signal: None,
         };
+        let accounting = SessionAccountingState::new();
+        let duration = Duration::from_secs(60);
 
-        handle_exit("task-1", &exit, true, &bus).await;
+        handle_exit("task-1", &exit, true, &accounting, duration, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
         assert_eq!(received.data["made_progress"], true);
+    }
+
+    #[tokio::test]
+    async fn exit_emits_session_accounting() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(0),
+            signal: None,
+        };
+        let mut accounting = SessionAccountingState::new();
+        // Simulate some token usage
+        accounting.update_tokens(&TokenUsage::new(1000, 500));
+        let duration = Duration::from_secs(3600);
+
+        handle_exit("task-1", &exit, false, &accounting, duration, &bus).await;
+
+        // First event is task state
+        let task_event = rx.recv().await.unwrap();
+        assert_eq!(task_event.event_type, events::EventType::TaskStateAwaitingMerge);
+
+        // Second event is session accounting
+        let session_event = rx.recv().await.unwrap();
+        assert_eq!(session_event.event_type, events::EventType::SystemAccountingSession);
+        assert_eq!(session_event.data["duration_seconds"], 3600);
+        assert_eq!(session_event.data["tokens"]["input_tokens"], 1000);
+        assert_eq!(session_event.data["tokens"]["output_tokens"], 500);
+        assert_eq!(session_event.data["tokens"]["total_tokens"], 1500);
+        assert_eq!(session_event.data["success"], true);
+    }
+
+    #[tokio::test]
+    async fn token_accounting_parses_and_emits_event() {
+        let (bus, mut rx) = test_event_bus().await;
+        let mut accounting = SessionAccountingState::new();
+
+        // Simulate agent stdout with token usage
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: r#"{"input_tokens": 1500, "output_tokens": 800}"#.to_string(),
+            },
+        );
+
+        let delta = handle_token_accounting("task-1", &event, &mut accounting, &bus).await;
+
+        assert!(delta.is_some());
+        let delta = delta.unwrap();
+        assert_eq!(delta.input_tokens, 1500);
+        assert_eq!(delta.output_tokens, 800);
+
+        // Check accounting event was emitted
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::SystemAccountingTokens);
+        assert_eq!(received.data["input_tokens"], 1500);
+        assert_eq!(received.data["output_tokens"], 800);
+        assert_eq!(received.data["cumulative"]["input_tokens"], 1500);
+        assert_eq!(received.data["cumulative"]["output_tokens"], 800);
+    }
+
+    #[tokio::test]
+    async fn token_accounting_handles_cumulative_updates() {
+        let (bus, mut rx) = test_event_bus().await;
+        let mut accounting = SessionAccountingState::new();
+
+        // First token usage
+        let event1 = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: r#"{"input_tokens": 1000, "output_tokens": 500}"#.to_string(),
+            },
+        );
+        handle_token_accounting("task-1", &event1, &mut accounting, &bus).await;
+        let _ = rx.recv().await.unwrap(); // consume first event
+
+        // Cumulative update (larger than previous)
+        let event2 = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: r#"{"input_tokens": 1500, "output_tokens": 800}"#.to_string(),
+            },
+        );
+        let delta = handle_token_accounting("task-1", &event2, &mut accounting, &bus).await;
+
+        // Should compute delta from cumulative
+        let delta = delta.unwrap();
+        assert_eq!(delta.input_tokens, 500);  // 1500 - 1000
+        assert_eq!(delta.output_tokens, 300); // 800 - 500
+
+        // Total should be cumulative
+        assert_eq!(accounting.total_token_usage.input_tokens, 1500);
+        assert_eq!(accounting.total_token_usage.output_tokens, 800);
+    }
+
+    #[tokio::test]
+    async fn token_accounting_ignores_non_token_output() {
+        let (bus, mut rx) = test_event_bus().await;
+        let mut accounting = SessionAccountingState::new();
+
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "Just some regular output".to_string(),
+            },
+        );
+
+        let delta = handle_token_accounting("task-1", &event, &mut accounting, &bus).await;
+
+        assert!(delta.is_none());
+        // No event should have been published
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn token_accounting_ignores_stderr() {
+        let (bus, mut rx) = test_event_bus().await;
+        let mut accounting = SessionAccountingState::new();
+
+        let event = runtime::protocol::Event::AgentStderr(
+            runtime::protocol::AgentStderrEvent {
+                data: r#"{"input_tokens": 1500, "output_tokens": 800}"#.to_string(),
+            },
+        );
+
+        let delta = handle_token_accounting("task-1", &event, &mut accounting, &bus).await;
+
+        assert!(delta.is_none());
+        assert!(rx.try_recv().is_err());
     }
 }
