@@ -14,6 +14,8 @@ use tokio::task::JoinHandle;
 use events::EventBus;
 use runtime::{ContainerConfig, ContainerRuntime};
 
+use crate::interpreter::{emit_signal_events, OutputInterpreter, OutputSignal};
+
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
     #[error("session error: {0}")]
@@ -261,7 +263,8 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
 ///
 /// Runs for the lifetime of a session. Reads events from the blocking
 /// transport via a dedicated thread, handles commands from the session
-/// manager, and enforces time limits.
+/// manager, and enforces time limits. Includes output interpretation (spec §9.3)
+/// to detect questions, completion signals, and failure patterns.
 async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     task_id: String,
     session: runtime::Session<R>,
@@ -277,6 +280,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     let started_at = Instant::now();
     let mut soft_limit_notified = false;
     let mut hard_limit_triggered = false;
+
+    // Output interpreter for state detection (spec §9.3)
+    let mut interpreter = OutputInterpreter::new();
 
     // Wrap session for shared access between blocking recv thread and async command handler
     let session = Arc::new(std::sync::Mutex::new(session));
@@ -310,8 +316,8 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     loop {
         tokio::select! {
             Some(supervisor_event) = event_rx.recv() => {
-                // Map and publish platform events
-                handle_supervisor_event(&task_id, &supervisor_event, &event_bus).await;
+                // Map and publish platform events, including output interpretation (spec §9.3)
+                handle_supervisor_event(&task_id, &supervisor_event, &event_bus, &mut interpreter).await;
 
                 // Check for agent exit
                 if let runtime::protocol::Event::AgentExit(ref exit) = supervisor_event {
@@ -442,31 +448,66 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
 }
 
 /// Map a supervisor event to a platform event and publish it.
+///
+/// For stdout events, also runs the output interpreter (spec §9.3) to detect
+/// questions, completion signals, and failure patterns.
 async fn handle_supervisor_event(
     task_id: &str,
     event: &runtime::protocol::Event,
     event_bus: &EventBus,
+    interpreter: &mut OutputInterpreter,
 ) {
-    let (event_type, data) = match event {
-        runtime::protocol::Event::AgentStarted(e) => (
-            events::EventType::TaskStateRunning,
-            serde_json::json!({ "pid": e.pid }),
-        ),
-        runtime::protocol::Event::AgentStdout(e) => (
-            events::EventType::AgentMessage,
-            serde_json::json!({ "text": e.data }),
-        ),
-        runtime::protocol::Event::AgentStderr(e) => (
-            events::EventType::AgentMessage,
-            serde_json::json!({ "text": e.data, "stream": "stderr" }),
-        ),
-        // SystemReady and ExecResult are not mapped to platform events
-        _ => return,
-    };
+    match event {
+        runtime::protocol::Event::AgentStarted(e) => {
+            let platform_event = events::Event::new(
+                events::EventType::TaskStateRunning,
+                task_id,
+                events::Actor::Agent,
+                serde_json::json!({ "pid": e.pid }),
+            );
+            if let Err(e) = event_bus.publish(platform_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish agent started event");
+            }
+        }
+        runtime::protocol::Event::AgentStdout(e) => {
+            // Always emit the base agent:message event
+            let message_event = events::Event::new(
+                events::EventType::AgentMessage,
+                task_id,
+                events::Actor::Agent,
+                serde_json::json!({ "text": e.data }),
+            );
+            if let Err(err) = event_bus.publish(message_event).await {
+                tracing::error!(task_id = %task_id, error = %err, "failed to publish agent message event");
+            }
 
-    let platform_event = events::Event::new(event_type, task_id, events::Actor::Agent, data);
-    if let Err(e) = event_bus.publish(platform_event).await {
-        tracing::error!(task_id = %task_id, error = %e, "failed to publish supervisor event");
+            // Interpret the output for state signals (spec §9.3)
+            let signal = interpreter.interpret(&e.data);
+            if !matches!(signal, OutputSignal::Message) {
+                tracing::debug!(
+                    task_id = %task_id,
+                    signal = ?signal,
+                    "output interpreter detected signal"
+                );
+
+                if let Err(err) = emit_signal_events(task_id, &signal, event_bus).await {
+                    tracing::error!(task_id = %task_id, error = %err, "failed to emit signal events");
+                }
+            }
+        }
+        runtime::protocol::Event::AgentStderr(e) => {
+            let platform_event = events::Event::new(
+                events::EventType::AgentMessage,
+                task_id,
+                events::Actor::Agent,
+                serde_json::json!({ "text": e.data, "stream": "stderr" }),
+            );
+            if let Err(e) = event_bus.publish(platform_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish agent stderr event");
+            }
+        }
+        // SystemReady and ExecResult are not mapped to platform events
+        _ => {}
     }
 }
 
@@ -522,11 +563,12 @@ mod tests {
     #[tokio::test]
     async fn agent_started_maps_to_running() {
         let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
         let event = runtime::protocol::Event::AgentStarted(
             runtime::protocol::AgentStartedEvent { pid: 42 },
         );
 
-        handle_supervisor_event("task-1", &event, &bus).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateRunning);
@@ -537,13 +579,14 @@ mod tests {
     #[tokio::test]
     async fn agent_stdout_maps_to_message() {
         let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "hello world".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::AgentMessage);
@@ -553,13 +596,14 @@ mod tests {
     #[tokio::test]
     async fn agent_stderr_maps_to_message() {
         let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
         let event = runtime::protocol::Event::AgentStderr(
             runtime::protocol::AgentStderrEvent {
                 data: "error output".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::AgentMessage);
@@ -570,11 +614,12 @@ mod tests {
     #[tokio::test]
     async fn system_ready_not_mapped() {
         let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
         let event = runtime::protocol::Event::SystemReady(
             runtime::protocol::SystemReadyEvent {},
         );
 
-        handle_supervisor_event("task-1", &event, &bus).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
 
         // No event should have been published — try_recv should fail
         assert!(rx.try_recv().is_err());
@@ -640,5 +685,105 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.actor, events::Actor::Agent);
+    }
+
+    #[tokio::test]
+    async fn stdout_question_emits_question_events() {
+        // When agent output contains a question pattern, we should emit
+        // agent:question and task:state:question events (spec §9.3).
+        let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "Please provide the database connection string.".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+
+        // First event is the base agent:message
+        let msg_event = rx.recv().await.unwrap();
+        assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
+
+        // Second event is agent:question
+        let question_event = rx.recv().await.unwrap();
+        assert_eq!(question_event.event_type, events::EventType::AgentQuestion);
+        assert_eq!(question_event.data["source"], "output_interpretation");
+
+        // Third event is task:state:question
+        let state_event = rx.recv().await.unwrap();
+        assert_eq!(state_event.event_type, events::EventType::TaskStateQuestion);
+        assert_eq!(state_event.data["reason"], "agent_question");
+    }
+
+    #[tokio::test]
+    async fn stdout_failure_emits_error_event() {
+        // When agent output contains failure patterns, we should emit
+        // an agent:error event (spec §9.3).
+        let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "I'm stuck and cannot proceed with this task.".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+
+        // First event is the base agent:message
+        let msg_event = rx.recv().await.unwrap();
+        assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
+
+        // Second event is agent:error
+        let error_event = rx.recv().await.unwrap();
+        assert_eq!(error_event.event_type, events::EventType::AgentError);
+        assert_eq!(error_event.data["source"], "output_interpretation");
+    }
+
+    #[tokio::test]
+    async fn stdout_completion_emits_completion_hint() {
+        // When agent output contains completion patterns, we emit an
+        // agent:message with completion_hint=true (spec §9.3).
+        let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "Task completed successfully.".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+
+        // First event is the base agent:message
+        let msg_event = rx.recv().await.unwrap();
+        assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
+        assert_eq!(msg_event.data["text"], "Task completed successfully.");
+
+        // Second event is agent:message with completion_hint
+        let hint_event = rx.recv().await.unwrap();
+        assert_eq!(hint_event.event_type, events::EventType::AgentMessage);
+        assert_eq!(hint_event.data["completion_hint"], true);
+    }
+
+    #[tokio::test]
+    async fn stdout_normal_message_no_extra_events() {
+        // Normal agent output should only emit the base agent:message,
+        // no additional signal events.
+        let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: "Reading the configuration file...".to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+
+        // Should receive the base agent:message
+        let msg_event = rx.recv().await.unwrap();
+        assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
+
+        // No additional events - try_recv should fail
+        assert!(rx.try_recv().is_err());
     }
 }
