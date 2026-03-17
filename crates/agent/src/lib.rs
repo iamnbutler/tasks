@@ -3,6 +3,7 @@
 //! Provides provider-agnostic types for interacting with LLM APIs.
 //! Lifted and adapted from agent-foundry.
 
+pub mod chain;
 pub mod error;
 pub mod message;
 pub mod provider;
@@ -16,6 +17,7 @@ pub use provider::{
 };
 pub use providers::AnthropicProvider;
 pub use session::{Chain, Session, SessionBuilder, SessionId, SessionState};
+pub use chain::{ChainBuilder, ChainResult, StepOutput, StepResult};
 
 /// Convenience result type.
 pub type Result<T> = std::result::Result<T, AgentError>;
