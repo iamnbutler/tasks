@@ -10,4 +10,4 @@ name = "tasks-desktop"
 path = "src/main.rs"
 
 [dependencies]
-gpui = "0.2"
+gpui.workspace = true

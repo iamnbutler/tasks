@@ -1,6 +1,6 @@
 //! Tasks Desktop - Main entry point for the GPUI desktop application.
 
-use gpui::{px, size, AppContext, Application, Bounds, WindowBounds, WindowOptions};
+use gpui::{px, size, Application, Bounds, WindowBounds, WindowOptions};
 use tasks_desktop::RootView;
 
 fn main() {
