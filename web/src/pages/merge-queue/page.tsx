@@ -73,6 +73,7 @@ export function MergeQueuePage() {
     meta: {
       refreshSnapshot,
       tasks: snapshot?.tasks ?? [],
+      projects: snapshot?.projects ?? [],
     },
   });
 

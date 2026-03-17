@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useAppState } from "@/hooks/use-app-state";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { formatRelativeTime } from "@/lib/utils";
+import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import type { TaskState, Event } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -179,7 +179,7 @@ export function DashboardPage() {
                   {/* Only show project when viewing all projects */}
                   {!selectedProject && (
                     <span className="text-muted-foreground text-sm shrink-0">
-                      {task.project}
+                      {projectLabel(task.project, snapshot.projects)}
                     </span>
                   )}
                   <span className="text-muted-foreground text-sm shrink-0">
