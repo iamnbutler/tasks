@@ -245,9 +245,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // into the server. The session monitor publishes events (e.g.
     // TaskStateAwaitingMerge) but doesn't update server state directly.
     // This loop bridges events → state updates + merge queue entries.
+    //
+    // For TaskStateFailed events from agents, we use progress detection
+    // (spec §13.1, §13.2) to decide whether to retry or mark as failed.
 
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
+    let event_handler_max_retries = config.max_retries;
 
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
@@ -262,6 +266,34 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let task_id = &event.task;
+
+            // Handle TaskStateFailed specially: use progress detection (spec §13.1)
+            // to determine whether to retry or mark as permanently failed.
+            if event.event_type == EventType::TaskStateFailed
+                && event.actor != events::Actor::Scheduler
+                && event.actor != events::Actor::System
+            {
+                // Extract made_progress from event data (defaults to false)
+                let made_progress = event.data.get("made_progress")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if let Err(e) = event_handler_server
+                    .handle_task_failure(task_id, made_progress, event_handler_max_retries)
+                    .await
+                {
+                    if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                        error!(
+                            task_id = %task_id,
+                            made_progress = made_progress,
+                            error = %e,
+                            "failed to handle task failure"
+                        );
+                    }
+                }
+                continue;
+            }
+
             let new_state = match event.event_type {
                 EventType::TaskStateRunning => Some(models::task::TaskState::Running),
                 EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
