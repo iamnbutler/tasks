@@ -5,4 +5,7 @@
 pub mod task;
 pub mod session;
 pub mod merge_queue;
+pub mod mode;
 pub mod project;
+
+pub use mode::Mode;

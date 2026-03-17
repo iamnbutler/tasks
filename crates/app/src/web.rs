@@ -25,7 +25,7 @@ use tower_http::cors::CorsLayer;
 
 use events::Actor;
 use server::Server;
-use server::mode::Mode;
+use models::Mode;
 
 /// Shared state for API handlers.
 #[derive(Clone)]
