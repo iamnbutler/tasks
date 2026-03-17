@@ -237,9 +237,12 @@ export const columns: ColumnDef<Task>[] = [
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title="Project" />
     ),
-    cell: ({ row }) => (
-      <span className="text-sm">{row.getValue<string>("project")}</span>
-    ),
+    cell: ({ row, table }) => {
+      const projectId = row.getValue<string>("project");
+      const meta = table.options.meta as { projectIdToRepo?: Record<string, string> } | undefined;
+      const displayName = meta?.projectIdToRepo?.[projectId] ?? projectId;
+      return <span className="text-sm">{displayName}</span>;
+    },
     filterFn: (row, id, value: string[]) => {
       return value.includes(row.getValue(id));
     },
