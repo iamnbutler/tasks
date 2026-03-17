@@ -29,7 +29,7 @@ impl ClaudeOrchestrator {
     /// Create from environment variables (ANTHROPIC_API_KEY).
     pub fn from_env() -> Result<Self, OrchestratorError> {
         let provider = AnthropicProvider::from_env()
-            .map_err(|e| OrchestratorError::Agent(e))?;
+            .map_err(OrchestratorError::Agent)?;
         Ok(Self::new(provider))
     }
 }
