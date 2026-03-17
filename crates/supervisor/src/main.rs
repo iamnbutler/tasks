@@ -61,20 +61,24 @@ enum Ev {
     },
 }
 
-/// Write a protocol event to stdout (§4.3: single-line JSON, newline-delimited).
-fn emit(ev: &Ev) {
-    let json = serde_json::to_string(ev).expect("event serialization failed");
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    let _ = writeln!(out, "{json}");
-    let _ = out.flush();
-}
-
 /// Log to stderr (supervisor logging must not go to stdout — §4.3).
 macro_rules! log {
     ($($arg:tt)*) => {
         eprintln!("[supervisor] {}", format!($($arg)*));
     };
+}
+
+/// Write a protocol event to stdout (§4.3: single-line JSON, newline-delimited).
+fn emit(ev: &Ev) {
+    let json = serde_json::to_string(ev).expect("event serialization failed");
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Err(e) = writeln!(out, "{json}") {
+        log!("failed to write event to stdout: {e}");
+    }
+    if let Err(e) = out.flush() {
+        log!("failed to flush stdout: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,13 +100,15 @@ fn repo_exists() -> bool {
 /// Clone the repo and check out the branch. Embeds GITHUB_TOKEN in the URL
 /// for HTTPS auth (spec §3.1).
 fn clone_repo(url: &str, branch: &str) -> Result<(), String> {
-    // Configure git identity.
-    let _ = std::process::Command::new("git")
-        .args(["config", "--global", "user.email", "tasks@localhost"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["config", "--global", "user.name", "Tasks Agent"])
-        .status();
+    // Configure git identity and safe.directory for both root and agent user.
+    for user in ["root", "agent"] {
+        let home = if user == "root" { "/root" } else { &format!("/home/{user}") };
+        let gitconfig = format!("{home}/.gitconfig");
+        let config = "[user]\n\temail = tasks@localhost\n\tname = Tasks Agent\n[safe]\n\tdirectory = /workspace\n";
+        if let Err(e) = std::fs::write(&gitconfig, config) {
+            log!("failed to write {gitconfig}: {e}");
+        }
+    }
 
     // Embed token in URL for auth.
     let clone_url = match std::env::var("GITHUB_TOKEN") {
@@ -129,6 +135,15 @@ fn clone_repo(url: &str, branch: &str) -> Result<(), String> {
 
     if !status.success() {
         return Err(format!("git checkout exited with {status}"));
+    }
+
+    // Ensure the agent user owns the workspace (clone runs as root).
+    let agent_user = std::env::var("AGENT_USER").unwrap_or_else(|_| "agent".to_string());
+    let chown = std::process::Command::new("chown")
+        .args(["-R", &format!("{agent_user}:{agent_user}"), WORK_DIR])
+        .status();
+    if let Err(e) = chown {
+        log!("failed to chown workspace: {e}");
     }
 
     Ok(())
@@ -161,9 +176,24 @@ async fn start_agent(
             "--dangerously-skip-permissions".to_string(),
         ]);
 
-    let mut cmd = Command::new(&agent_cmd);
-    cmd.args(&agent_args)
-        .arg(prompt)
+    // Run the agent as the non-root "agent" user (Claude Code refuses
+    // --dangerously-skip-permissions as root). The supervisor stays root (PID 1).
+    // Use sudo --preserve-env to pass through ANTHROPIC_API_KEY, GITHUB_TOKEN, etc.
+    let agent_user = std::env::var("AGENT_USER").unwrap_or_else(|_| "agent".to_string());
+    let agent_home = format!("/home/{agent_user}");
+    let mut full_args = vec![
+        "--preserve-env".to_string(),
+        "-u".to_string(),
+        agent_user,
+        format!("HOME={agent_home}"),
+        "--".to_string(),
+        agent_cmd,
+    ];
+    full_args.extend(agent_args);
+    full_args.push(prompt.to_string());
+
+    let mut cmd = Command::new("sudo");
+    cmd.args(&full_args)
         .current_dir(WORK_DIR)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -178,7 +208,9 @@ async fn start_agent(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(Ev::AgentStdout { data: line + "\n" });
+                if tx.send(Ev::AgentStdout { data: line + "\n" }).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -189,7 +221,9 @@ async fn start_agent(
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(Ev::AgentStderr { data: line + "\n" });
+                if tx.send(Ev::AgentStderr { data: line + "\n" }).is_err() {
+                    break;
+                }
             }
         });
     }
@@ -217,7 +251,10 @@ async fn stop_agent(handle: &mut AgentHandle) {
     }
     #[cfg(not(unix))]
     {
-        let _ = handle.child.start_kill();
+        if let Err(e) = handle.child.start_kill() {
+            log!("failed to start kill of agent: {e}");
+            return;
+        }
     }
 
     // Wait with timeout, then SIGKILL if still alive.
@@ -230,7 +267,9 @@ async fn stop_agent(handle: &mut AgentHandle) {
         Ok(_) => {} // exited gracefully
         Err(_) => {
             log!("agent did not exit in {KILL_TIMEOUT_SECS}s, sending SIGKILL");
-            let _ = handle.child.kill().await;
+            if let Err(e) = handle.child.kill().await {
+                log!("failed to SIGKILL agent: {e}");
+            }
         }
     }
 }
@@ -239,8 +278,12 @@ async fn stop_agent(handle: &mut AgentHandle) {
 async fn send_chat(handle: &mut AgentHandle, text: &str) {
     if let Some(ref mut stdin) = handle.child.stdin {
         let msg = format!("{text}\n");
-        let _ = stdin.write_all(msg.as_bytes()).await;
-        let _ = stdin.flush().await;
+        if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+            log!("failed to write chat to agent stdin: {e}");
+        }
+        if let Err(e) = stdin.flush().await {
+            log!("failed to flush agent stdin: {e}");
+        }
     }
 }
 
@@ -291,21 +334,33 @@ async fn main() {
     // the main loop emits them to the host.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Ev>();
 
-    // Set up Claude Code auth from ANTHROPIC_API_KEY if present.
-    // Claude Code uses ~/.claude/anthropic_key.sh as a credential helper.
+    // Set up Claude Code auth for the agent user.
+    // Write credential helper to the agent user's home directory.
+    let agent_user = std::env::var("AGENT_USER").unwrap_or_else(|_| "agent".to_string());
+    let agent_home = format!("/home/{agent_user}");
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        let claude_dir = format!(
-            "{}/.claude",
-            std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
-        );
-        let _ = std::fs::create_dir_all(&claude_dir);
+        let claude_dir = format!("{agent_home}/.claude");
+        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
+            log!("failed to create claude config dir {claude_dir}: {e}");
+        }
         let script = format!("#!/bin/bash\necho \"{api_key}\"\n");
         let script_path = format!("{claude_dir}/anthropic_key.sh");
-        let _ = std::fs::write(&script_path, &script);
+        if let Err(e) = std::fs::write(&script_path, &script) {
+            log!("failed to write anthropic_key.sh: {e}");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700));
+            if let Err(e) = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)) {
+                log!("failed to set permissions on anthropic_key.sh: {e}");
+            }
+            // Ensure the agent user owns the .claude directory
+            let chown = std::process::Command::new("chown")
+                .args(["-R", &format!("{agent_user}:{agent_user}"), &claude_dir])
+                .status();
+            if let Err(e) = chown {
+                log!("failed to chown {claude_dir}: {e}");
+            }
         }
     }
 

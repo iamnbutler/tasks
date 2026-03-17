@@ -147,7 +147,9 @@ impl Server {
     pub async fn add_project(&self, project: Project) {
         if let Some(ref store) = self.store {
             if let Ok(store) = store.lock() {
-                let _ = store.save_project(&project);
+                if let Err(e) = store.save_project(&project) {
+                    tracing::error!(project_id = %project.id, error = %e, "failed to persist project to store");
+                }
             }
         }
         let mut state = self.state.write().await;
@@ -160,7 +162,9 @@ impl Server {
         if removed {
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
-                    let _ = store.delete_project(id);
+                    if let Err(e) = store.delete_project(id) {
+                        tracing::error!(project_id = %id, error = %e, "failed to delete project from store");
+                    }
                 }
             }
         }
@@ -241,7 +245,9 @@ impl Server {
         // Write-through to store before inserting into HashMap
         if let Some(ref store) = self.store {
             if let Ok(store) = store.lock() {
-                let _ = store.save_task(&task);
+                if let Err(e) = store.save_task(&task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist task to store");
+                }
             }
         }
 
@@ -277,7 +283,9 @@ impl Server {
             // Write-through to store
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
-                    let _ = store.save_task(task);
+                    if let Err(e) = store.save_task(task) {
+                        tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
+                    }
                 }
             }
         }

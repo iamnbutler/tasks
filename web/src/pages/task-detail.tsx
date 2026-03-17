@@ -99,16 +99,40 @@ function sourceDisplay(task: Task) {
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system";
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle";
   content: string;
   toolName?: string;
   filePath?: string;
 }
 
+/** Human-readable labels for task lifecycle events. */
+const lifecycleLabels: Record<string, string> = {
+  "task:created": "Task created",
+  "task:state:running": "Agent started",
+  "task:state:question": "Agent has a question",
+  "task:state:waiting": "Task waiting",
+  "task:state:blocked": "Task blocked",
+  "task:state:testing": "Running tests",
+  "task:state:awaiting_merge": "Awaiting merge",
+  "task:state:conflict": "Merge conflict detected",
+  "task:state:completed": "Task completed",
+  "task:state:failed": "Task failed",
+  "task:state:cancelled": "Task cancelled",
+};
+
 function parseAgentEvents(events: Event[]): ParsedBlock[] {
   const blocks: ParsedBlock[] = [];
 
   for (const event of events) {
+    // Lifecycle events — task state transitions, container pickup, etc.
+    if (event.type.startsWith("task:")) {
+      const label = lifecycleLabels[event.type];
+      if (label) {
+        blocks.push({ kind: "lifecycle", content: label });
+      }
+      continue;
+    }
+
     if (event.type === "agent:error") {
       blocks.push({
         kind: "error",
@@ -241,6 +265,16 @@ function BlockView({ block }: { block: ParsedBlock }) {
     );
   }
 
+  if (block.kind === "lifecycle") {
+    return (
+      <div className="flex items-center gap-2 py-1.5 text-xs text-muted-foreground">
+        <div className="h-px flex-1 bg-border" />
+        <span>{block.content}</span>
+        <div className="h-px flex-1 bg-border" />
+      </div>
+    );
+  }
+
   if (block.kind === "error") {
     return (
       <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
@@ -268,25 +302,23 @@ function SessionView({ taskId }: { taskId: string }) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const isRelevant = (e: Event) =>
+      e.type === "agent:message" ||
+      e.type === "agent:question" ||
+      e.type === "agent:error" ||
+      e.type.startsWith("task:");
+
     fetchTaskEvents(taskId).then((events) => {
-      const agentEvents = events.filter(
-        (e) =>
-          e.type === "agent:message" ||
-          e.type === "agent:question" ||
-          e.type === "agent:error"
+      setRawEvents(
+        events.filter(isRelevant).sort((a, b) => a.ts.localeCompare(b.ts))
       );
-      setRawEvents(agentEvents.sort((a, b) => a.ts.localeCompare(b.ts)));
     });
 
     const source = subscribeEvents({ task_id: taskId });
     source.onmessage = (msg) => {
       try {
         const event: Event = JSON.parse(msg.data);
-        if (
-          event.type === "agent:message" ||
-          event.type === "agent:question" ||
-          event.type === "agent:error"
-        ) {
+        if (isRelevant(event)) {
           setRawEvents((prev) => [...prev, event]);
         }
       } catch {

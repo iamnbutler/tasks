@@ -123,7 +123,9 @@ impl StdioTransport {
         self.wait()?;
 
         if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+            if let Err(_) = handle.join() {
+                tracing::warn!("transport reader thread panicked during close");
+            }
         }
 
         Ok(())

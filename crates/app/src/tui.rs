@@ -203,19 +203,28 @@ async fn handle_key(tui: &mut TuiState, key: KeyEvent, server: &Server) {
             tui.session_auto_scroll = true;
         }
         KeyCode::Char('p') => {
-            let _ = server
+            if let Err(e) = server
                 .set_mode(server::Mode::Pause, &events::Actor::Human)
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to set mode to Pause");
+            }
         }
         KeyCode::Char('s') => {
-            let _ = server
+            if let Err(e) = server
                 .set_mode(server::Mode::Stop, &events::Actor::Human)
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to set mode to Stop");
+            }
         }
         KeyCode::Char('g') => {
-            let _ = server
+            if let Err(e) = server
                 .set_mode(server::Mode::Play, &events::Actor::Human)
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to set mode to Play");
+            }
         }
         _ => {}
     }
@@ -419,8 +428,12 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if let Err(e) = disable_raw_mode() {
+            tracing::warn!(error = %e, "failed to disable raw mode during TUI teardown");
+        }
+        if let Err(e) = execute!(io::stdout(), LeaveAlternateScreen) {
+            tracing::warn!(error = %e, "failed to leave alternate screen during TUI teardown");
+        }
     }
 }
 

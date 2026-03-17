@@ -82,12 +82,43 @@ fn print_usage() {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing subscriber (controlled by RUST_LOG env var, default: info)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // Initialize tracing: stderr + rotating log file at ~/.tasks/server.log
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let log_dir = data_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = format!("{log_dir}/server.log");
+
+    // Truncate log file if it exceeds ~3000 lines
+    if let Ok(contents) = std::fs::read_to_string(&log_path) {
+        let lines: Vec<&str> = contents.lines().collect();
+        if lines.len() > 3000 {
+            let trimmed = lines[lines.len() - 2000..].join("\n");
+            let _ = std::fs::write(&log_path, trimmed + "\n");
+        }
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("failed to open log file");
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
 
     let args: Vec<String> = std::env::args().collect();

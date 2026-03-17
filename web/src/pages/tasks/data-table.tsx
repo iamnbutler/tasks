@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   type ColumnDef,
   type ColumnFiltersState,
@@ -37,8 +37,19 @@ export function DataTable<TData extends Task, TValue>({
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
   const [rowSelection, setRowSelection] = useState({});
+
+  const singleProject = useMemo(() => {
+    const projects = new Set(data.map((t) => t.project));
+    return projects.size <= 1;
+  }, [data]);
+
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+
+  const mergedVisibility = useMemo<VisibilityState>(
+    () => ({ ...columnVisibility, ...(singleProject ? { project: false } : {}) }),
+    [columnVisibility, singleProject],
+  );
 
   const table = useReactTable({
     data,
@@ -46,7 +57,7 @@ export function DataTable<TData extends Task, TValue>({
     state: {
       sorting,
       columnFilters,
-      columnVisibility,
+      columnVisibility: mergedVisibility,
       rowSelection,
     },
     enableRowSelection: true,

@@ -188,12 +188,13 @@ async fn add_project(
 ) -> Result<Json<models::project::Project>, ApiError> {
     let parts: Vec<&str> = req.repo.split('/').collect();
     if parts.len() != 2 {
-        return Err(ApiError::MergeQueue(format!(
+        return Err(ApiError::BadRequest(format!(
             "Invalid repo format: {} (expected owner/repo)",
             req.repo
         )));
     }
-    let project = models::project::Project::new(&req.repo, &req.repo);
+    let id = uuid::Uuid::new_v4().to_string();
+    let project = models::project::Project::new(&id, &req.repo);
     state.server.add_project(project.clone()).await;
     Ok(Json(project))
 }
@@ -205,9 +206,9 @@ async fn delete_project(
 ) -> Result<StatusCode, ApiError> {
     let removed = state.server.remove_project(&id).await;
     if removed {
-        Ok(StatusCode::OK)
+        Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::MergeQueue(format!("Project not found: {id}")))
+        Err(ApiError::BadRequest(format!("Project not found: {id}")))
     }
 }
 
@@ -330,6 +331,7 @@ async fn event_stream(
 
 enum ApiError {
     Server(server::ServerError),
+    BadRequest(String),
     MergeQueue(String),
     SessionManager(String),
 }
@@ -338,6 +340,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::Server(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
         };

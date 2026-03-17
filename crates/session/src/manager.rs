@@ -148,7 +148,9 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
     pub async fn stop_all(&self) {
         let sessions = self.sessions.read().await;
         for handle in sessions.values() {
-            let _ = handle.command_tx.send(SessionCommand::Stop).await;
+            if let Err(e) = handle.command_tx.send(SessionCommand::Stop).await {
+                tracing::warn!(task_id = %handle.task_id, error = %e, "failed to send stop command during shutdown");
+            }
         }
     }
 }
@@ -276,8 +278,16 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
             Some(cmd) = command_rx.recv() => {
                 let mut sess = session_cmd.lock().unwrap();
                 match cmd {
-                    SessionCommand::Chat(text) => { let _ = sess.send_chat(text); }
-                    SessionCommand::Stop => { let _ = sess.stop_agent(); }
+                    SessionCommand::Chat(text) => {
+                        if let Err(e) = sess.send_chat(text) {
+                            tracing::error!(task_id = %task_id, error = %e, "failed to send chat to session");
+                        }
+                    }
+                    SessionCommand::Stop => {
+                        if let Err(e) = sess.stop_agent() {
+                            tracing::error!(task_id = %task_id, error = %e, "failed to stop agent");
+                        }
+                    }
                 }
             }
             else => break, // both channels closed
@@ -287,7 +297,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
         let elapsed = started_at.elapsed();
         if elapsed >= hard_limit {
             let mut sess = session_cmd.lock().unwrap();
-            let _ = sess.stop_agent();
+            if let Err(e) = sess.stop_agent() {
+                tracing::error!(task_id = %task_id, error = %e, "failed to stop agent at hard time limit");
+            }
             // The exit event will come through event_rx
         } else if elapsed >= soft_limit && !soft_limit_notified {
             soft_limit_notified = true;
@@ -301,7 +313,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
                     "soft_limit_seconds": soft_limit.as_secs(),
                 }),
             );
-            let _ = event_bus.publish(event).await;
+            if let Err(e) = event_bus.publish(event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish escalation event");
+            }
         }
     }
 
@@ -335,7 +349,9 @@ async fn handle_supervisor_event(
     };
 
     let platform_event = events::Event::new(event_type, task_id, events::Actor::Agent, data);
-    let _ = event_bus.publish(platform_event).await;
+    if let Err(e) = event_bus.publish(platform_event).await {
+        tracing::error!(task_id = %task_id, error = %e, "failed to publish supervisor event");
+    }
 }
 
 /// Handle an agent exit event — publish success or failure.
@@ -364,7 +380,9 @@ async fn handle_exit(
     };
 
     let event = events::Event::new(event_type, task_id, events::Actor::System, data);
-    let _ = event_bus.publish(event).await;
+    if let Err(e) = event_bus.publish(event).await {
+        tracing::error!(task_id = %task_id, error = %e, "failed to publish agent exit event");
+    }
 }
 
 #[cfg(test)]

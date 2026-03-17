@@ -74,40 +74,65 @@ function useAppStateCore(): AppState {
     return () => clearInterval(interval);
   }, [refreshSnapshot]);
 
-  // --- SSE subscription --------------------------------------------------
+  // --- SSE subscription with reconnection --------------------------------
   useEffect(() => {
-    const source = subscribeEvents();
+    let source: EventSource | null = null;
+    let disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
 
-    source.onopen = () => {
-      setConnected(true);
-      setError(null);
-    };
+    /** Grace period before showing "Disconnected" — EventSource auto-reconnects,
+     *  so brief hiccups shouldn't flash the indicator. */
+    const DISCONNECT_GRACE_MS = 3_000;
 
-    source.onmessage = (msg) => {
-      try {
-        const event: Event = JSON.parse(msg.data);
+    function connect() {
+      if (closed) return;
+      source = subscribeEvents();
 
-        setEvents((prev) => {
-          const next = [event, ...prev];
-          return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
-        });
-
-        // Auto-refresh snapshot when a state-changing event arrives.
-        if (STATE_CHANGING_EVENT.test(event.type)) {
-          refreshSnapshot();
+      source.onopen = () => {
+        if (disconnectTimer) {
+          clearTimeout(disconnectTimer);
+          disconnectTimer = null;
         }
-      } catch {
-        // Ignore unparseable messages.
-      }
-    };
+        setConnected(true);
+        setError(null);
+      };
 
-    source.onerror = () => {
-      setConnected(false);
-      setError(new Error("SSE connection lost"));
-    };
+      source.onmessage = (msg) => {
+        try {
+          const event: Event = JSON.parse(msg.data);
+
+          setEvents((prev) => {
+            const next = [event, ...prev];
+            return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+          });
+
+          if (STATE_CHANGING_EVENT.test(event.type)) {
+            refreshSnapshot();
+          }
+        } catch {
+          // Ignore unparseable messages.
+        }
+      };
+
+      source.onerror = () => {
+        // Don't immediately mark disconnected — EventSource will auto-retry.
+        // Only show disconnected if it stays down past the grace period.
+        if (!disconnectTimer) {
+          disconnectTimer = setTimeout(() => {
+            disconnectTimer = null;
+            setConnected(false);
+            setError(new Error("SSE connection lost"));
+          }, DISCONNECT_GRACE_MS);
+        }
+      };
+    }
+
+    connect();
 
     return () => {
-      source.close();
+      closed = true;
+      if (disconnectTimer) clearTimeout(disconnectTimer);
+      source?.close();
       setConnected(false);
     };
   }, [refreshSnapshot]);

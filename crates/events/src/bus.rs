@@ -29,8 +29,9 @@ impl EventBus {
     /// Publish an event: persist to store and broadcast to subscribers.
     pub async fn publish(&self, event: Event) -> Result<(), StoreError> {
         self.store.append(&event).await?;
-        // Ignore send errors (no subscribers)
-        let _ = self.sender.send(Arc::new(event));
+        if let Err(e) = self.sender.send(Arc::new(event)) {
+            tracing::debug!(event_type = %e.0.event_type.as_str(), "no subscribers for broadcast event");
+        }
         Ok(())
     }
 

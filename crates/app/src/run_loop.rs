@@ -169,7 +169,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 Actor::Scheduler,
                 serde_json::json!({}),
             );
-            let _ = poll_server.event_bus.publish(event).await;
+            if let Err(e) = poll_server.event_bus.publish(event).await {
+                error!(error = %e, "failed to publish scheduler tick event");
+            }
         }
     });
 

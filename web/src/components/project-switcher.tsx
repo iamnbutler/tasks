@@ -35,7 +35,8 @@ export function ProjectSwitcher() {
   const [newRepo, setNewRepo] = useState("");
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; repo: string } | null>(null);
 
   const projects = snapshot?.projects ?? [];
 
@@ -61,13 +62,14 @@ export function ProjectSwitcher() {
   };
 
   const handleDelete = async (id: string) => {
+    setDeleteError(null);
     try {
       await deleteProject(id);
       await refreshSnapshot();
-    } catch {
-      // ignore
+      setDeleteConfirm(null);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : "Failed to delete project");
     }
-    setDeleteConfirm(null);
   };
 
   return (
@@ -112,7 +114,7 @@ export function ProjectSwitcher() {
                       className="h-6 w-6 shrink-0 text-muted-foreground hover:text-red-400"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setDeleteConfirm(project.id);
+                        setDeleteConfirm({ id: project.id, repo: project.repo });
                       }}
                     >
                       <Trash2 className="h-3 w-3" />
@@ -192,17 +194,20 @@ export function ProjectSwitcher() {
           <DialogHeader>
             <DialogTitle>Remove project</DialogTitle>
             <DialogDescription>
-              Remove <span className="font-mono font-medium">{deleteConfirm}</span> from
+              Remove <span className="font-mono font-medium">{deleteConfirm?.repo}</span> from
               tracking? This won't delete the repository.
             </DialogDescription>
           </DialogHeader>
+          {deleteError && (
+            <p className="text-sm text-red-400">{deleteError}</p>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteConfirm(null)}>
+            <Button variant="outline" onClick={() => { setDeleteConfirm(null); setDeleteError(null); }}>
               Cancel
             </Button>
             <Button
               variant="destructive"
-              onClick={() => deleteConfirm && handleDelete(deleteConfirm)}
+              onClick={() => deleteConfirm && handleDelete(deleteConfirm.id)}
             >
               Remove
             </Button>
