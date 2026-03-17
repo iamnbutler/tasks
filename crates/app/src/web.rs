@@ -43,6 +43,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/events", get(get_task_events))
         .route("/tasks/{id}/chat", post(send_chat))
+        .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/projects", get(list_projects))
         .route("/projects", post(add_project))
         .route("/projects/{id}", axum::routing::delete(delete_project))
@@ -287,6 +288,21 @@ async fn send_chat(
         .as_ref()
         .ok_or_else(|| ApiError::SessionManager("session manager not available".into()))?;
     sm.send_chat(&id, req.message)
+        .await
+        .map_err(|e| ApiError::SessionManager(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/tasks/:id/cancel — Stop a running session (spec §9.5).
+async fn cancel_task(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let sm = state
+        .session_manager
+        .as_ref()
+        .ok_or_else(|| ApiError::SessionManager("session manager not available".into()))?;
+    sm.stop_session(&id)
         .await
         .map_err(|e| ApiError::SessionManager(e.to_string()))?;
     Ok(StatusCode::OK)

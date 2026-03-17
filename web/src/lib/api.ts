@@ -90,6 +90,10 @@ export function sendChat(taskId: string, message: string): Promise<void> {
   });
 }
 
+export function cancelTask(taskId: string): Promise<void> {
+  return requestVoid(`/api/tasks/${taskId}/cancel`, { method: "POST" });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;

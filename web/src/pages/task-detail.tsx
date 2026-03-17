@@ -8,11 +8,12 @@ import {
   ChevronRight,
   FileText,
   Terminal,
+  StopCircle,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAppState } from "@/hooks/use-app-state";
-import { fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
+import { cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -415,6 +416,7 @@ export function TaskDetailPage() {
   const [events, setEvents] = useState<Event[]>([]);
   const [eventsLoading, setEventsLoading] = useState(true);
   const [showDetails, setShowDetails] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const task = snapshot?.tasks.find((t) => t.id === id);
 
@@ -422,6 +424,18 @@ export function TaskDetailPage() {
     task?.state === "running" ||
     task?.state === "question" ||
     task?.state === "testing";
+
+  const handleCancel = useCallback(async () => {
+    if (!id || cancelling) return;
+    setCancelling(true);
+    try {
+      await cancelTask(id);
+    } catch {
+      // Error will be reflected in task state change via SSE
+    } finally {
+      setCancelling(false);
+    }
+  }, [id, cancelling]);
 
   useEffect(() => {
     if (!id) return;
@@ -473,6 +487,18 @@ export function TaskDetailPage() {
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-bold truncate">{task.title}</h1>
             {stateBadge(task.state)}
+            {isSessionActive && (
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={handleCancel}
+                disabled={cancelling}
+                className="ml-2 gap-1"
+              >
+                <StopCircle className="h-4 w-4" />
+                {cancelling ? "Cancelling..." : "Cancel"}
+              </Button>
+            )}
           </div>
           <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground">
             <span className="font-mono text-xs">{task.id.slice(0, 8)}</span>
