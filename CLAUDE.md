@@ -65,8 +65,8 @@ Requires `.env` with `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
 - Uses bun as package manager
 
 ```sh
-cd web && bun install && bun run build   # build frontend
-cd web && bun run dev                    # dev mode (proxies /api to localhost:4800)
+bun install && bun web build   # build frontend
+bun web dev                    # dev mode (proxies /api to localhost:4800)
 ```
 
 ### API endpoints
