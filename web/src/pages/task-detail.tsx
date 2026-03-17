@@ -295,7 +295,7 @@ function BlockView({ block }: { block: ParsedBlock }) {
 // Session view — live agent output + chat
 // ---------------------------------------------------------------------------
 
-function SessionView({ taskId }: { taskId: string }) {
+function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boolean }) {
   const [rawEvents, setRawEvents] = useState<Event[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -370,25 +370,27 @@ function SessionView({ taskId }: { taskId: string }) {
           <div ref={bottomRef} />
         </div>
 
-        {/* Chat input */}
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSend();
-          }}
-        >
-          <Input
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            placeholder="Send a message to the agent..."
-            className="flex-1"
-            disabled={sending}
-          />
-          <Button type="submit" size="icon" disabled={sending || !chatInput.trim()}>
-            <Send className="h-4 w-4" />
-          </Button>
-        </form>
+        {/* Chat input — only when session is active */}
+        {chatEnabled && (
+          <form
+            className="flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSend();
+            }}
+          >
+            <Input
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Send a message to the agent..."
+              className="flex-1"
+              disabled={sending}
+            />
+            <Button type="submit" size="icon" disabled={sending || !chatInput.trim()}>
+              <Send className="h-4 w-4" />
+            </Button>
+          </form>
+        )}
       </CardContent>
     </Card>
   );
@@ -494,9 +496,9 @@ export function TaskDetailPage() {
         </div>
       </div>
 
-      {/* Session view — the main content when active */}
-      {isSessionActive && id && (
-        <SessionView taskId={id} />
+      {/* Session view — always shown, chat input only when active */}
+      {id && (
+        <SessionView taskId={id} chatEnabled={isSessionActive} />
       )}
 
       {/* Collapsible details */}
@@ -601,8 +603,8 @@ export function TaskDetailPage() {
         )}
       </div>
 
-      {/* Event timeline — always visible when no active session, or below details */}
-      {(!isSessionActive || showDetails) && (
+      {/* Raw event timeline — only in details view */}
+      {showDetails && (
         <Card className="shrink-0">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
