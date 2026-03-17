@@ -14,9 +14,9 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 trait-variant.workspace = true
-reqwest = { version = "0.12", features = ["json", "stream"] }
-bytes = "1.11"
-futures = "0.3"
+reqwest.workspace = true
+bytes.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

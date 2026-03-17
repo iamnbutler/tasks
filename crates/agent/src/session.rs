@@ -151,19 +151,12 @@ impl Session {
     }
 
     /// Apply tool results and prepare for the next turn.
+    ///
+    /// Stores results in `pending_tool_results` so that `build_request()`
+    /// emits them as proper `Content::ToolResult` blocks (required by the
+    /// Anthropic API), rather than plain text.
     pub fn apply_tool_results(&mut self, results: Vec<ToolResult>) {
-        let result_text = results.iter()
-            .map(|r| {
-                if r.is_error {
-                    format!("Tool {} error: {}", r.tool_call_id, r.content)
-                } else {
-                    format!("Tool {} result: {}", r.tool_call_id, r.content)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        self.messages.push(Message::user(result_text));
+        self.pending_tool_results = results;
         self.pending_tool_calls.clear();
         self.state = SessionState::Ready;
     }
@@ -424,5 +417,39 @@ mod tests {
         let mut session = Session::new(CompletionConfig::new("test-model"));
         session.cancel();
         assert_eq!(session.state, SessionState::Cancelled);
+    }
+
+    #[test]
+    fn test_apply_tool_results_emits_structured_content() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        session.add_user_message("hello");
+
+        // Simulate a response with tool calls
+        let response = Response {
+            content: vec![Content::text("let me check")],
+            tool_calls: vec![ToolCall {
+                id: "tc-1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp"}),
+            }],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Some(Usage { input_tokens: 10, output_tokens: 5 }),
+        };
+        session.apply_response(&response);
+
+        // Apply tool results — should go to pending_tool_results, not as text
+        session.apply_tool_results(vec![
+            ToolResult::success("tc-1", "file contents here"),
+        ]);
+
+        assert_eq!(session.state, SessionState::Ready);
+        assert!(!session.has_pending_tool_calls());
+        assert_eq!(session.pending_tool_results.len(), 1);
+
+        // build_request should emit proper ToolResult content blocks
+        let request = session.build_request();
+        let last_msg = request.messages.last().unwrap();
+        assert_eq!(last_msg.role, Role::User);
+        assert!(matches!(&last_msg.content[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tc-1"));
     }
 }

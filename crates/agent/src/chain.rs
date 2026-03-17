@@ -136,7 +136,10 @@ impl<P: Provider> ChainBuilder<P> {
 
         for (idx, step) in steps.into_iter().enumerate() {
             let step_name = match &step {
-                ChainStep::Prompt { message, .. } => format!("prompt_{}: {}", idx, &message[..message.len().min(30)]),
+                ChainStep::Prompt { message, .. } => {
+                    let truncated: String = message.chars().take(30).collect();
+                    format!("prompt_{}: {}", idx, truncated)
+                }
                 ChainStep::Transform { name, .. } => format!("transform: {}", name),
                 ChainStep::Gate { name, .. } => format!("gate: {}", name),
                 ChainStep::Custom { name, .. } => format!("custom: {}", name),

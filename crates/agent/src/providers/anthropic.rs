@@ -61,23 +61,7 @@ struct AnthropicRequest {
     stop_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnthropicStreamRequest {
-    model: String,
-    max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
-    messages: Vec<AnthropicMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    stop_sequences: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
 }
 
@@ -93,7 +77,7 @@ enum AnthropicContent {
     Text { text: String },
     Image { source: ImageSource },
     ToolUse { id: String, name: String, input: serde_json::Value },
-    ToolResult { tool_use_id: String, content: String },
+    ToolResult { tool_use_id: String, content: String, #[serde(default, skip_serializing_if = "std::ops::Not::not")] is_error: bool },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,24 +201,25 @@ impl From<&crate::message::Message> for AnthropicMessage {
             crate::message::Role::System => "user",
         };
 
-        let content = msg.content.iter().map(|c| match c {
-            Content::Text { text } => AnthropicContent::Text { text: text.clone() },
-            Content::Thinking { thinking } => AnthropicContent::Text {
-                text: format!("[Internal reasoning: {}]", thinking),
-            },
-            Content::Image { media_type, data } => AnthropicContent::Image {
+        let content = msg.content.iter().filter_map(|c| match c {
+            Content::Text { text } => Some(AnthropicContent::Text { text: text.clone() }),
+            // Thinking blocks are internal reasoning from prior turns — filter
+            // them out rather than replaying as plain text, which would confuse
+            // the model.
+            Content::Thinking { .. } => None,
+            Content::Image { media_type, data } => Some(AnthropicContent::Image {
                 source: ImageSource {
                     source_type: "base64".to_string(),
                     media_type: media_type.clone(),
                     data: data.clone(),
                 },
-            },
-            Content::ToolUse { id, name, input } => AnthropicContent::ToolUse {
+            }),
+            Content::ToolUse { id, name, input } => Some(AnthropicContent::ToolUse {
                 id: id.clone(), name: name.clone(), input: input.clone(),
-            },
-            Content::ToolResult { tool_use_id, content, .. } => AnthropicContent::ToolResult {
-                tool_use_id: tool_use_id.clone(), content: content.clone(),
-            },
+            }),
+            Content::ToolResult { tool_use_id, content, is_error } => Some(AnthropicContent::ToolResult {
+                tool_use_id: tool_use_id.clone(), content: content.clone(), is_error: *is_error,
+            }),
         }).collect();
 
         AnthropicMessage { role: role.to_string(), content }
@@ -453,6 +438,7 @@ impl Provider for AnthropicProvider {
             top_p: request.config.top_p,
             stop_sequences: request.config.stop_sequences,
             tools,
+            stream: false,
         };
 
         let response = self.client
@@ -534,7 +520,7 @@ impl Provider for AnthropicProvider {
             })
             .collect();
 
-        let anthropic_request = AnthropicStreamRequest {
+        let anthropic_request = AnthropicRequest {
             model: request.config.model,
             max_tokens: request.config.max_tokens,
             system: request.system,
