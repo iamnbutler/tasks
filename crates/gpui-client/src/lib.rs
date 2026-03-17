@@ -12,7 +12,7 @@ pub use events::Event;
 pub use models::merge_queue::{MergeQueueEntry, MergeStatus};
 pub use models::project::Project;
 pub use models::task::{Task, TaskSource, TaskState};
-pub use server::mode::Mode;
+pub use models::Mode;
 
 /// API client errors.
 #[derive(Debug, Error)]
@@ -99,7 +99,7 @@ impl ApiClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/api{}", self.base_url, path)
+        format!("{}/api{}", self.base_url.trim_end_matches('/'), path)
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
@@ -286,8 +286,8 @@ impl ApiClient {
     /// Returns the IDs of flushed entries.
     ///
     /// POST /api/merge-queue/flush
-    pub async fn flush_merge_queue(&self) -> Result<Vec<String>, ApiError> {
-        self.post("/merge-queue/flush", &()).await
+    pub async fn flush_merge_queue(&self) -> Result<(), ApiError> {
+        self.post_empty("/merge-queue/flush").await
     }
 
     // --- Mode ---
@@ -334,9 +334,9 @@ mod tests {
     }
 
     #[test]
-    fn client_url_no_trailing_slash() {
+    fn client_url_trailing_slash_stripped() {
         let client = ApiClient::new("http://localhost:4800/");
-        // Even with trailing slash in base_url, the URL construction should work
-        assert_eq!(client.url("/snapshot"), "http://localhost:4800//api/snapshot");
+        // Trailing slash in base_url should be stripped to avoid double-slash
+        assert_eq!(client.url("/snapshot"), "http://localhost:4800/api/snapshot");
     }
 }
