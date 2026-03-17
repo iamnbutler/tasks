@@ -424,7 +424,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         }
-                        Err(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(skipped = n, "orchestrator loop lagged");
+                            continue;
+                        }
+                        Err(_) => break, // channel closed, shut down
                     }
                 }
             };
@@ -510,6 +514,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         ).await {
                             error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
                         }
+                        // TODO: Call orch.feedback(&task, feedback) to deliver
+                        // guidance to the re-dispatched session. Currently the
+                        // feedback only lands in the event payload; the fresh
+                        // session started by the dispatch loop doesn't receive it.
+                        // Needs dispatch loop changes to pass feedback as prompt context.
                     }
                 }
 
