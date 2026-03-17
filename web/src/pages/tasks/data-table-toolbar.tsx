@@ -77,4 +77,9 @@ export function DataTableToolbar({ table, projectIdToRepo }: DataTableToolbarPro
       </div>
     </div>
   );
+}ton>
+        )}
+      </div>
+    </div>
+  );
 }
