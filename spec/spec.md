@@ -919,6 +919,19 @@ The `[labels]` section controls how GitHub labels affect task behavior:
 Labels not listed in the configuration have no special meaning to the dispatch system. The
 orchestrator and human can still use them for their own organizational purposes.
 
+#### Canonical Skip Label
+
+The label `tasks/skip` is a canonical label that always causes an issue or PR to be skipped,
+regardless of project configuration. This label is checked in addition to the configurable
+`labels.ignore` list.
+
+Use `tasks/skip` when you want to permanently exclude an issue from the task queue without
+modifying project configuration. This is useful for:
+
+- Meta-issues that track work but should not be dispatched (e.g., tracking issues, epics)
+- Issues that are intentionally kept open but should not receive agent attention
+- PRs that are in a draft or experimental state and should not be processed
+
 ### 14.3 Dynamic Reload
 
 The server watches for configuration changes:
