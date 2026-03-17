@@ -9,8 +9,8 @@ use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
-use server::model::task::TaskSource;
 use server::Server;
+use server::model::task::TaskSource;
 use tasks_github::client::GitHubClient;
 use tasks_github::poller::RepoPoller;
 
@@ -205,11 +205,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             // Sync pollers with live project list
             let projects: Vec<(String, String)> = {
                 let state = poll_server.state.read().await;
-                state.projects.iter().map(|(id, p)| (id.clone(), p.repo.clone())).collect()
+                state
+                    .projects
+                    .iter()
+                    .map(|(id, p)| (id.clone(), p.repo.clone()))
+                    .collect()
             };
 
             // Remove pollers for deleted projects
-            let active_ids: std::collections::HashSet<&str> = projects.iter().map(|(id, _)| id.as_str()).collect();
+            let active_ids: std::collections::HashSet<&str> =
+                projects.iter().map(|(id, _)| id.as_str()).collect();
             pollers.retain(|id, _| active_ids.contains(id.as_str()));
 
             // Add pollers for new projects
@@ -302,7 +307,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             let event = match rx.recv().await {
                 Ok(e) => e,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(skipped = n, "event handler lagged, some events may not update state");
+                    warn!(
+                        skipped = n,
+                        "event handler lagged, some events may not update state"
+                    );
                     continue;
                 }
                 Err(_) => break,
@@ -395,6 +403,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
         // Track pending answers: task IDs that received HumanMessage while in Question state
         let mut pending_answers: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // GitHub client for fetching comments at dispatch time (spec §15.2)
+        let github_client = GitHubClient::new(&dispatch_github_token);
 
         loop {
             // Wait for either the tick or a dispatch-triggering event
@@ -506,20 +517,22 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await;
 
+                            // Fetch comments from GitHub at dispatch time (spec §15.2)
+                            let comments = server::prompt::fetch_comments_for_task(
+                                &github_client,
+                                &task.source,
+                            )
+                            .await;
+
                             let prompt = server::prompt::build_prompt_for_task(
                                 &task,
                                 &branch,
                                 system_prompt.as_deref(),
+                                &comments,
                             );
 
                             if let Err(e) = dispatch_session_mgr
-                                .start_session(
-                                    task_id.clone(),
-                                    repo_url,
-                                    branch,
-                                    prompt,
-                                    None,
-                                )
+                                .start_session(task_id.clone(), repo_url, branch, prompt, None)
                                 .await
                             {
                                 error!(task_id = %task_id, error = %e, "failed to start session");
@@ -606,9 +619,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             // Snapshot pending merge queue entries with their tasks and projects
             let pending: Vec<(String, String, String)> = {
                 let state = orch_server.state.read().await;
-                state.merge_queue.pending().iter().map(|entry| {
-                    (entry.id.clone(), entry.task_id.clone(), entry.pr_url.clone())
-                }).collect()
+                state
+                    .merge_queue
+                    .pending()
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.id.clone(),
+                            entry.task_id.clone(),
+                            entry.pr_url.clone(),
+                        )
+                    })
+                    .collect()
             };
 
             for (entry_id, task_id, _pr_url) in pending {
@@ -655,27 +677,36 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 // Always emit a decision event (audit trail)
-                if let Err(e) = orch_server.emit_orchestrator_decision(
-                    &task_id,
-                    &entry_id,
-                    evaluation.approved,
-                    &evaluation.reasoning,
-                ).await {
+                if let Err(e) = orch_server
+                    .emit_orchestrator_decision(
+                        &task_id,
+                        &entry_id,
+                        evaluation.approved,
+                        &evaluation.reasoning,
+                    )
+                    .await
+                {
                     error!(error = %e, "failed to emit orchestrator decision event");
                 }
 
                 // In Play mode: act on the decision
                 if mode == server::Mode::Play {
                     if evaluation.approved {
-                        if let Err(e) = orch_server.approve_merge_entry(&entry_id, &evaluation.reasoning).await {
+                        if let Err(e) = orch_server
+                            .approve_merge_entry(&entry_id, &evaluation.reasoning)
+                            .await
+                        {
                             error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
                         }
                     } else {
-                        if let Err(e) = orch_server.reject_merge_entry(
-                            &entry_id,
-                            &evaluation.reasoning,
-                            evaluation.feedback.as_deref(),
-                        ).await {
+                        if let Err(e) = orch_server
+                            .reject_merge_entry(
+                                &entry_id,
+                                &evaluation.reasoning,
+                                evaluation.feedback.as_deref(),
+                            )
+                            .await
+                        {
                             error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
                         }
                         // Emit orchestrator:feedback event when feedback is provided
@@ -719,8 +750,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 .join("web")
                 .join("build");
             if web_dir.exists() {
-                let serve = tower_http::services::ServeDir::new(&web_dir)
-                    .fallback(tower_http::services::ServeFile::new(web_dir.join("index.html")));
+                let serve = tower_http::services::ServeDir::new(&web_dir).fallback(
+                    tower_http::services::ServeFile::new(web_dir.join("index.html")),
+                );
                 api_router.fallback_service(serve)
             } else {
                 api_router
@@ -739,7 +771,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 10. Wait for shutdown (TUI or headless) ---
 
     if config.tui {
-        crate::tui::run_tui(server.clone(), server.event_bus.clone(), config.max_sessions).await?;
+        crate::tui::run_tui(
+            server.clone(),
+            server.event_bus.clone(),
+            config.max_sessions,
+        )
+        .await?;
     } else {
         tokio::signal::ctrl_c().await?;
     }
