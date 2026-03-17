@@ -33,6 +33,8 @@ pub struct ApiState {
     pub server: Arc<Server>,
     pub max_sessions: u32,
     pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
+    /// GitHub token for API operations (merging PRs, etc.)
+    pub github_token: Option<String>,
 }
 
 /// Build the API router.
@@ -221,13 +223,26 @@ async fn list_merge_queue(
 }
 
 /// POST /api/merge-queue/flush — Flush approved entries (Pause mode only).
+///
+/// This merges all approved entries via the GitHub API, updating their
+/// status to `merged` on success or `conflict` on failure.
 async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<String>>, ApiError> {
-    state
+    // Get the GitHub token
+    let token = state.github_token.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("GitHub token not configured".to_string())
+    })?;
+
+    // Create a GitHub client
+    let github_client = tasks_github::client::GitHubClient::new(token);
+
+    // Merge all approved entries
+    let merged = state
         .server
-        .flush_merge_queue()
+        .merge_approved_entries(&github_client)
         .await
-        .map(Json)
-        .map_err(ApiError::Server)
+        .map_err(ApiError::Server)?;
+
+    Ok(Json(merged))
 }
 
 /// POST /api/merge-queue/:id/approve — Approve a merge queue entry.

@@ -326,13 +326,48 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- 8. Optionally spawn web server ---
+    // --- 8. Spawn merge processor loop (Play mode) ---
+    //
+    // In Play mode, the orchestrator continuously merges approved entries.
+    // This loop checks for approved entries and merges them via the GitHub API.
+
+    let merge_server = server.clone();
+    let merge_github_token = config.github_token.clone();
+
+    let merge_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let github_client = GitHubClient::new(&merge_github_token);
+
+        loop {
+            interval.tick().await;
+
+            // Only process in Play mode
+            let mode = merge_server.mode().await;
+            if mode != server::Mode::Play {
+                continue;
+            }
+
+            // Merge approved entries
+            match merge_server.merge_approved_entries(&github_client).await {
+                Ok(merged) if !merged.is_empty() => {
+                    info!(count = merged.len(), "merged approved entries in Play mode");
+                }
+                Ok(_) => { /* no approved entries */ }
+                Err(e) => {
+                    error!(error = %e, "failed to merge approved entries");
+                }
+            }
+        }
+    });
+
+    // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
         let api_state = crate::web::ApiState {
             server: server.clone(),
             max_sessions: config.max_sessions,
             session_manager: Some(session_manager.clone()),
+            github_token: Some(config.github_token.clone()),
         };
         let web_port = config.web_port;
 
@@ -362,7 +397,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- 9. Wait for shutdown (TUI or headless) ---
+    // --- 10. Wait for shutdown (TUI or headless) ---
 
     if config.tui {
         crate::tui::run_tui(server.clone(), server.event_bus.clone(), config.max_sessions).await?;
@@ -378,6 +413,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     poll_handle.abort();
     dispatch_handle.abort();
     event_handler_handle.abort();
+    merge_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }

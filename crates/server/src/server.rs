@@ -14,6 +14,7 @@ use events::{Actor, Event, EventBus, EventType};
 
 use crate::merge_queue::MergeQueue;
 use crate::mode::{Mode, ModeTransitionError};
+use crate::model::merge_queue::MergeStatus;
 use crate::model::project::Project;
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
@@ -473,7 +474,9 @@ impl Server {
 
     /// Flush the merge queue (spec Section 6.2).
     ///
-    /// Only valid in Pause mode.
+    /// Only valid in Pause mode. This marks entries as flushed but does not
+    /// actually merge them via GitHub. Use [`merge_approved_entries`] to
+    /// perform actual merges.
     pub async fn flush_merge_queue(&self) -> Result<Vec<String>, ServerError> {
         let mut state = self.state.write().await;
         let mode = state.mode;
@@ -496,6 +499,174 @@ impl Server {
         self.event_bus.publish(event).await?;
 
         Ok(flushed)
+    }
+
+    /// Merge a single approved entry via the GitHub API.
+    ///
+    /// This method:
+    /// 1. Calls the GitHub API to merge the PR
+    /// 2. Updates the entry status to `merged` on success, `conflict` on failure
+    /// 3. Transitions the task state to `completed` on success
+    /// 4. Emits appropriate events
+    ///
+    /// Returns `Ok(true)` if merged successfully, `Ok(false)` if the entry
+    /// could not be merged (e.g., conflicts), or `Err` on other failures.
+    pub async fn merge_entry(
+        &self,
+        entry_id: &str,
+        github_client: &tasks_github::client::GitHubClient,
+    ) -> Result<bool, ServerError> {
+        // Get the entry
+        let (entry, task_id) = {
+            let state = self.state.read().await;
+            let entry = state
+                .merge_queue
+                .get(entry_id)
+                .ok_or_else(|| ServerError::TaskNotFound(format!("merge entry {entry_id}")))?
+                .clone();
+            let task_id = entry.task_id.clone();
+            (entry, task_id)
+        };
+
+        // Parse the PR URL
+        let pr_ref = entry.parse_pr_url().ok_or_else(|| {
+            ServerError::StoreError(format!("invalid PR URL: {}", entry.pr_url))
+        })?;
+
+        // Attempt to merge via GitHub API
+        let merge_result = github_client
+            .merge_pull_request(&pr_ref.owner, &pr_ref.repo, pr_ref.number)
+            .await;
+
+        match merge_result {
+            Ok(()) => {
+                // Mark as merged and update task state
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(e) = state.merge_queue.get_mut(entry_id) {
+                        e.status = MergeStatus::Merged;
+                    }
+                    // Persist the updated entry
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Some(e) = state.merge_queue.get(entry_id) {
+                                if let Err(err) = store.save_merge_entry(e) {
+                                    tracing::error!(entry_id = %entry_id, error = %err, "failed to persist merged entry");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Transition task to Completed
+                self.set_task_state(&task_id, TaskState::Completed, Actor::Orchestrator)
+                    .await?;
+
+                // Emit merge:completed event
+                let event = Event::new(
+                    EventType::MergeCompleted,
+                    &task_id,
+                    Actor::Orchestrator,
+                    serde_json::json!({
+                        "entry_id": entry_id,
+                        "pr_url": entry.pr_url,
+                    }),
+                );
+                self.event_bus.publish(event).await?;
+
+                Ok(true)
+            }
+            Err(tasks_github::error::GitHubError::MergeConflict(msg)) => {
+                // Mark as conflict
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(e) = state.merge_queue.get_mut(entry_id) {
+                        e.status = MergeStatus::Conflict;
+                    }
+                    // Persist the updated entry
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Some(e) = state.merge_queue.get(entry_id) {
+                                if let Err(err) = store.save_merge_entry(e) {
+                                    tracing::error!(entry_id = %entry_id, error = %err, "failed to persist conflict entry");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Transition task to Conflict
+                self.set_task_state(&task_id, TaskState::Conflict, Actor::Orchestrator)
+                    .await?;
+
+                // Emit merge:conflict event
+                let event = Event::new(
+                    EventType::MergeConflict,
+                    &task_id,
+                    Actor::Orchestrator,
+                    serde_json::json!({
+                        "entry_id": entry_id,
+                        "pr_url": entry.pr_url,
+                        "reason": msg,
+                    }),
+                );
+                self.event_bus.publish(event).await?;
+
+                Ok(false)
+            }
+            Err(tasks_github::error::GitHubError::NotMergeable(msg)) => {
+                // Log but don't change status — may be transient (e.g., checks pending)
+                tracing::warn!(
+                    entry_id = %entry_id,
+                    pr_url = %entry.pr_url,
+                    reason = %msg,
+                    "PR is not mergeable"
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                tracing::error!(
+                    entry_id = %entry_id,
+                    pr_url = %entry.pr_url,
+                    error = %e,
+                    "failed to merge PR"
+                );
+                Err(ServerError::StoreError(format!("GitHub API error: {e}")))
+            }
+        }
+    }
+
+    /// Merge all approved entries via the GitHub API.
+    ///
+    /// This method iterates over all entries with `Approved` status and
+    /// attempts to merge each one. Returns the IDs of successfully merged entries.
+    pub async fn merge_approved_entries(
+        &self,
+        github_client: &tasks_github::client::GitHubClient,
+    ) -> Result<Vec<String>, ServerError> {
+        // Get all approved entry IDs
+        let entry_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state
+                .merge_queue
+                .approved()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect()
+        };
+
+        let mut merged = Vec::new();
+        for entry_id in entry_ids {
+            match self.merge_entry(&entry_id, github_client).await {
+                Ok(true) => merged.push(entry_id),
+                Ok(false) => { /* conflict or not mergeable, already handled */ }
+                Err(e) => {
+                    tracing::error!(entry_id = %entry_id, error = %e, "merge_entry failed");
+                }
+            }
+        }
+
+        Ok(merged)
     }
 
     // --- Presence (spec Section 4.1) ---

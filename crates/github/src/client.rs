@@ -11,7 +11,10 @@ use crate::model::{
     Issue, IssueFilters, IssueState, PullRequest, PullRequestFilters, PullRequestState, RateLimit,
 };
 use crate::queries;
-use crate::response::*;
+use crate::response::{
+    GetIssueData, GetPullRequestData, GraphQLResponse, GqlComment, GqlUser, IssueCommentsData,
+    ListIssuesData, ListPullRequestsData, MergePullRequestData, PrCommentsData, PrReviewsData,
+};
 
 /// Maximum items per page (GitHub's limit).
 const DEFAULT_PAGE_SIZE: u32 = 100;
@@ -401,6 +404,109 @@ impl GitHubClient {
             .map(String::from);
 
         Ok(url)
+    }
+
+    // -----------------------------------------------------------------------
+    // PR mutations
+    // -----------------------------------------------------------------------
+
+    /// Merge a pull request by number.
+    ///
+    /// Returns `Ok(())` on successful merge. Returns `Err(MergeConflict(..))` if
+    /// the PR has merge conflicts. Returns `Err(NotMergeable(..))` if the PR
+    /// cannot be merged for other reasons (e.g., checks failed, review required).
+    pub async fn merge_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<(), GitHubError> {
+        // First, fetch the PR to get its node_id and check mergeability.
+        let pr = self.get_pull_request(owner, repo, number).await?;
+
+        // Check if PR is already merged or closed
+        if pr.state == crate::model::PullRequestState::Merged {
+            return Ok(()); // Already merged, nothing to do
+        }
+        if pr.state == crate::model::PullRequestState::Closed {
+            return Err(GitHubError::NotMergeable(format!(
+                "PR #{number} is closed"
+            )));
+        }
+
+        // Check mergeability state
+        match pr.mergeable {
+            Some(crate::model::MergeableState::Conflicting) => {
+                return Err(GitHubError::MergeConflict(format!(
+                    "PR #{number} has merge conflicts"
+                )));
+            }
+            Some(crate::model::MergeableState::Unknown) => {
+                // GitHub might still be computing — this is a transient state.
+                // We'll attempt the merge anyway and let the mutation fail if needed.
+            }
+            Some(crate::model::MergeableState::Mergeable) => {
+                // Good to go
+            }
+            None => {
+                // Shouldn't happen for open PRs, but attempt merge anyway
+            }
+        }
+
+        // Execute the merge mutation
+        let mutation = r#"
+            mutation MergePullRequest($pullRequestId: ID!) {
+                mergePullRequest(input: { pullRequestId: $pullRequestId }) {
+                    pullRequest {
+                        number
+                        merged
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({ "pullRequestId": pr.node_id });
+
+        let resp: GraphQLResponse<MergePullRequestData> =
+            self.execute(mutation, variables).await?;
+
+        // Check for GraphQL errors first
+        if let Some(errors) = &resp.errors {
+            if !errors.is_empty() {
+                // Check for merge-specific errors
+                let error_msg = &errors[0].message;
+                if error_msg.contains("conflict") || error_msg.contains("Conflict") {
+                    return Err(GitHubError::MergeConflict(error_msg.clone()));
+                }
+                if error_msg.contains("not mergeable")
+                    || error_msg.contains("cannot be merged")
+                    || error_msg.contains("Pull request is not mergeable")
+                {
+                    return Err(GitHubError::NotMergeable(error_msg.clone()));
+                }
+                return Err(GitHubError::GraphQL(errors.clone()));
+            }
+        }
+
+        let data = resp
+            .data
+            .ok_or_else(|| GitHubError::Decode("merge response contained no data".to_string()))?;
+
+        let payload = data
+            .merge_pull_request
+            .ok_or_else(|| GitHubError::Decode("merge mutation returned null".to_string()))?;
+
+        let merged_pr = payload
+            .pull_request
+            .ok_or_else(|| GitHubError::Decode("merged PR data is null".to_string()))?;
+
+        if !merged_pr.merged {
+            return Err(GitHubError::NotMergeable(format!(
+                "PR #{number} merge mutation succeeded but merged=false"
+            )));
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

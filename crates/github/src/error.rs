@@ -31,6 +31,14 @@ pub enum GitHubError {
     /// Response did not match expected shape.
     #[error("decode error: {0}")]
     Decode(String),
+
+    /// Merge conflict — PR cannot be merged due to conflicts.
+    #[error("merge conflict: {0}")]
+    MergeConflict(String),
+
+    /// PR is not mergeable (e.g., checks failed, review required).
+    #[error("PR not mergeable: {0}")]
+    NotMergeable(String),
 }
 
 /// A single error from a GraphQL response.

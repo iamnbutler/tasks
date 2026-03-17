@@ -541,6 +541,28 @@ pub(crate) struct PrReviewsNode {
 }
 
 // ---------------------------------------------------------------------------
+// Merge PR mutation response
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MergePullRequestData {
+    pub merge_pull_request: Option<MergePullRequestPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MergePullRequestPayload {
+    pub pull_request: Option<MergedPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct MergedPullRequest {
+    pub number: u64,
+    pub merged: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
