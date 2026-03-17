@@ -164,6 +164,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
+
+                            // Add open PRs to the merge queue if not already tracked.
+                            let pr_url = format!(
+                                "https://github.com/{}/{}/pull/{}",
+                                pr.owner, pr.repo, pr.number
+                            );
+                            let already_queued = {
+                                let state = poll_server.state.read().await;
+                                state.merge_queue.entries().iter().any(|e| e.pr_url == pr_url)
+                            };
+                            if !already_queued {
+                                let entry_id = uuid::Uuid::new_v4().to_string();
+                                // task_id is informational — link to the task that
+                                // may have produced this PR, if one exists.
+                                let task_id = poll_server.task_id_for_source(&source).await
+                                    .unwrap_or_default();
+                                let entry = models::merge_queue::MergeQueueEntry::new(
+                                    &entry_id, &task_id, &pr_url,
+                                );
+                                info!(pr = pr.number, pr_url = %pr_url, "adding PR to merge queue");
+                                if let Err(e) = poll_server.add_to_merge_queue(entry).await {
+                                    error!(pr = pr.number, error = %e, "failed to add PR to merge queue");
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -194,11 +218,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
-    let event_handler_github_token = config.github_token.clone();
 
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
-        let github = GitHubClient::new(&event_handler_github_token);
         loop {
             let event = match rx.recv().await {
                 Ok(e) => e,
@@ -233,41 +255,6 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if !matches!(e, server::ServerError::TaskNotFound(_)) {
                             error!(task_id = %task_id, error = %e, "failed to update task state from event");
                         }
-                    }
-                }
-
-                // Enqueue completed task for merge review (spec §7.1).
-                // The merge queue is task-centric — a PR is just one possible
-                // artifact an agent may produce. We do a best-effort lookup
-                // for a PR on the task branch, but the entry is valid without one.
-                // TODO: orchestrator quality gate before enqueuing (spec §7.3)
-                if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
-                    let entry_id = uuid::Uuid::new_v4().to_string();
-                    let mut entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
-
-                    // Best-effort: check if the agent opened a PR for this task's branch
-                    if let Some(task) = event_handler_server.get_task(task_id).await {
-                        if let Some(project) = event_handler_server.get_project(&task.project).await {
-                            let parts: Vec<&str> = project.repo.split('/').collect();
-                            if parts.len() == 2 {
-                                let head = format!("tasks/{}", task.id);
-                                match github.find_pr_for_branch(parts[0], parts[1], &head).await {
-                                    Ok(Some(url)) => {
-                                        info!(task_id = %task_id, pr_url = %url, "found PR for task branch");
-                                        entry.pr_url = Some(url);
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        warn!(task_id = %task_id, error = %e, "failed to query PRs for task branch");
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    info!(task_id = %task_id, entry_id = %entry_id, "enqueuing task for merge review");
-                    if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
-                        error!(task_id = %task_id, error = %e, "failed to add merge queue entry");
                     }
                 }
             }

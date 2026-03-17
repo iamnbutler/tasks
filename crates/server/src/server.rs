@@ -365,6 +365,14 @@ impl Server {
         crate::scheduler::task_exists_for_source(&state.tasks, source)
     }
 
+    /// Find the task ID for a given source, if one exists.
+    pub async fn task_id_for_source(&self, source: &TaskSource) -> Option<String> {
+        let state = self.state.read().await;
+        state.tasks.values()
+            .find(|t| t.source == *source)
+            .map(|t| t.id.clone())
+    }
+
     /// Get the effective session limit for a project.
     /// Returns the project's configured limit, or the global default.
     pub async fn project_session_limit(&self, project_id: &str, global_max: u32) -> u32 {
