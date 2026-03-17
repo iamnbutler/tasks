@@ -17,6 +17,19 @@ export type TaskSource =
   | { type: "github_pr"; owner: string; repo: string; number: number }
   | { type: "internal"; description: string };
 
+/** Failure classification per spec §13.1 */
+export type FailureType = "transient" | "deterministic";
+
+/** Detailed failure information per spec §13.4 */
+export interface FailureInfo {
+  exit_code: number | null;
+  signal: string | null;
+  duration_secs: number;
+  stderr_tail: string[];
+  failure_type: FailureType;
+  summary: string;
+}
+
 export interface Task {
   id: string;
   source: TaskSource;
@@ -32,6 +45,7 @@ export interface Task {
   workspace_id: string | null;
   retry_count: number;
   last_failure_at: string | null;
+  last_failure: FailureInfo | null;
   created_at: string;
   updated_at: string;
 }

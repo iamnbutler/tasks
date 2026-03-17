@@ -481,8 +481,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                // Extract failure_info from event data for diagnosis (spec §13.4)
+                let failure_info = event.data.get("failure_info")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+
                 if let Err(e) = event_handler_server
-                    .handle_task_failure(task_id, made_progress, event_handler_max_retries)
+                    .handle_task_failure(task_id, made_progress, event_handler_max_retries, failure_info)
                     .await
                 {
                     if !matches!(e, server::ServerError::TaskNotFound(_)) {
@@ -705,7 +709,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 // Treat as a failure with no progress so backoff kicks in.
                                 // This prevents tight retry loops when containers can't start.
                                 if let Err(e2) = dispatch_server
-                                    .handle_task_failure(task_id, false, max_retries)
+                                    .handle_task_failure(task_id, false, max_retries, None)
                                     .await
                                 {
                                     warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");

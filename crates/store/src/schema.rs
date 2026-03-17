@@ -28,6 +28,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             workspace_id TEXT,
             retry_count INTEGER NOT NULL DEFAULT 0,
             last_failure_at TEXT,
+            last_failure_json TEXT,
             source_created_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -41,5 +42,28 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             queued_at TEXT NOT NULL
         );
         ",
-    )
+    )?;
+
+    // Migration: add last_failure_json column if it doesn't exist (spec §13.4)
+    // This handles existing databases that were created before this column was added.
+    match conn.execute(
+        "ALTER TABLE tasks ADD COLUMN last_failure_json TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added last_failure_json column to tasks table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR =>
+        {
+            // Column already exists — this is expected for existing databases
+            tracing::debug!("last_failure_json column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add last_failure_json column");
+            return Err(e);
+        }
+    }
+
+    Ok(())
 }
