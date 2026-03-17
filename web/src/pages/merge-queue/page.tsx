@@ -93,7 +93,7 @@ export function MergeQueuePage() {
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
-        <p className="text-muted-foreground text-lg">Loading...</p>
+        <p className="text-muted-foreground text-sm">Loading...</p>
       </div>
     );
   }
@@ -108,7 +108,7 @@ export function MergeQueuePage() {
       <div className="flex items-center justify-between">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold">Merge Queue</h1>
+            <h1 className="text-base font-bold">Merge Queue</h1>
             {mode && modeBadge(mode)}
           </div>
           {selectedProjectName && (

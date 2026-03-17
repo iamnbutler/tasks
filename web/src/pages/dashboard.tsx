@@ -91,7 +91,7 @@ export function DashboardPage() {
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
-        <p className="text-muted-foreground text-lg">No data yet</p>
+        <p className="text-muted-foreground text-sm">No data yet</p>
       </div>
     );
   }
@@ -111,9 +111,9 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">
+            <p className="text-base font-bold">
               {snapshot.slot_utilization.active}
-              <span className="text-muted-foreground text-base font-normal">
+              <span className="text-muted-foreground font-normal">
                 {" "}
                 / {snapshot.slot_utilization.max}
               </span>
@@ -128,7 +128,7 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">{runningCount}</p>
+            <p className="text-base font-bold">{runningCount}</p>
           </CardContent>
         </Card>
 
@@ -139,7 +139,7 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">{waitingCount}</p>
+            <p className="text-base font-bold">{waitingCount}</p>
           </CardContent>
         </Card>
 
@@ -150,14 +150,14 @@ export function DashboardPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold">{filteredMergeQueue.length}</p>
+            <p className="text-base font-bold">{filteredMergeQueue.length}</p>
           </CardContent>
         </Card>
       </div>
 
       {/* Active Tasks */}
       <section>
-        <h2 className="text-lg font-semibold mb-3">Active Tasks</h2>
+        <h2 className="text-base font-semibold mb-3">Active Tasks</h2>
 
         {activeTasks.length === 0 ? (
           <p className="text-muted-foreground text-sm">
@@ -178,11 +178,11 @@ export function DashboardPage() {
                   </span>
                   {/* Only show project when viewing all projects */}
                   {!selectedProject && (
-                    <span className="text-muted-foreground text-xs shrink-0">
+                    <span className="text-muted-foreground text-sm shrink-0">
                       {task.project}
                     </span>
                   )}
-                  <span className="text-muted-foreground text-xs shrink-0">
+                  <span className="text-muted-foreground text-sm shrink-0">
                     {formatRelativeTime(task.updated_at)}
                   </span>
                 </div>
@@ -194,7 +194,7 @@ export function DashboardPage() {
 
       {/* Recent Events */}
       <section>
-        <h2 className="text-lg font-semibold mb-3">Recent Events</h2>
+        <h2 className="text-base font-semibold mb-3">Recent Events</h2>
 
         {recentEvents.length === 0 ? (
           <p className="text-muted-foreground text-sm">No events yet.</p>
@@ -205,21 +205,21 @@ export function DashboardPage() {
                 key={event.id}
                 className="flex items-start gap-3 rounded-lg border bg-card px-3 py-2 text-sm"
               >
-                <span className="text-muted-foreground text-xs whitespace-nowrap pt-0.5">
+                <span className="text-muted-foreground text-sm whitespace-nowrap pt-0.5">
                   {formatRelativeTime(event.ts)}
                 </span>
-                <Badge variant="outline" className="shrink-0 text-xs">
+                <Badge variant="outline" className="shrink-0">
                   {event.type}
                 </Badge>
-                <span className="text-muted-foreground text-xs shrink-0">
+                <span className="text-muted-foreground text-sm shrink-0">
                   {event.actor}
                 </span>
                 {event.task && (
-                  <span className="font-mono text-xs text-muted-foreground shrink-0">
+                  <span className="font-mono text-sm text-muted-foreground shrink-0">
                     {event.task.slice(0, 8)}
                   </span>
                 )}
-                <span className="text-xs text-muted-foreground truncate flex-1">
+                <span className="text-sm text-muted-foreground truncate flex-1">
                   {eventDataPreview(event.data)}
                 </span>
               </div>

@@ -37,7 +37,7 @@ export function Layout() {
       <aside className="flex w-60 flex-col border-r border-border bg-background">
         {/* App title */}
         <div className="border-b border-border px-4 py-4">
-          <h1 className="text-lg font-bold tracking-tight">Tasks</h1>
+          <h1 className="text-base font-bold tracking-tight">Tasks</h1>
         </div>
 
         {/* Project switcher */}

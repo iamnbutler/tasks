@@ -37,7 +37,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     accessorKey: "id",
     header: "ID",
     cell: ({ row }) => (
-      <span className="font-mono text-xs">{row.original.id.slice(0, 8)}</span>
+      <span className="font-mono text-sm">{row.original.id.slice(0, 8)}</span>
     ),
   },
   {
@@ -54,7 +54,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
       return (
         <Link
           to={`/tasks/${row.original.task_id}`}
-          className="font-mono text-sm text-blue-400 hover:underline"
+          className="font-mono text-blue-400 hover:underline"
         >
           {label}
         </Link>
@@ -68,7 +68,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
       const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
       const task = tasks.find((t) => t.id === row.original.task_id);
       return (
-        <span className="text-sm text-muted-foreground">
+        <span className="text-muted-foreground">
           {task?.project ?? "—"}
         </span>
       );
@@ -87,7 +87,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs"
+          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-sm"
         >
           PR
           <ExternalLink className="h-3 w-3" />
@@ -104,7 +104,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     accessorKey: "queued_at",
     header: "Queued",
     cell: ({ row }) => (
-      <span className="text-xs text-muted-foreground whitespace-nowrap">
+      <span className="text-sm text-muted-foreground whitespace-nowrap">
         {formatRelativeTime(row.original.queued_at)}
       </span>
     ),
