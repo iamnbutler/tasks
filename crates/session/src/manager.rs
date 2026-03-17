@@ -241,6 +241,7 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
 ) {
     let started_at = Instant::now();
     let mut soft_limit_notified = false;
+    let mut hard_limit_triggered = false;
 
     // Wrap session for shared access between blocking recv thread and async command handler
     let session = Arc::new(std::sync::Mutex::new(session));
@@ -302,28 +303,79 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
             else => break, // both channels closed
         }
 
-        // Time limit checks
+        // Time limit checks (spec §17.4)
         let elapsed = started_at.elapsed();
-        if elapsed >= hard_limit {
+        if elapsed >= hard_limit && !hard_limit_triggered {
+            hard_limit_triggered = true;
+            tracing::warn!(task_id = %task_id, elapsed_secs = elapsed.as_secs(), "hard time limit reached, terminating session");
+
+            // Emit system:time_limit:hard event
+            let hard_event = events::Event::new(
+                events::EventType::SystemTimeLimitHard,
+                &task_id,
+                events::Actor::System,
+                serde_json::json!({
+                    "elapsed_seconds": elapsed.as_secs(),
+                    "hard_limit_seconds": hard_limit.as_secs(),
+                }),
+            );
+            if let Err(e) = event_bus.publish(hard_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish hard time limit event");
+            }
+
+            // Emit task:state:failed event
+            let failed_event = events::Event::new(
+                events::EventType::TaskStateFailed,
+                &task_id,
+                events::Actor::System,
+                serde_json::json!({
+                    "reason": "hard_time_limit",
+                    "elapsed_seconds": elapsed.as_secs(),
+                    "made_progress": started_at.elapsed() >= progress_threshold,
+                }),
+            );
+            if let Err(e) = event_bus.publish(failed_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish failed state event");
+            }
+
+            // Stop the agent
             let mut sess = session_cmd.lock().unwrap();
             if let Err(e) = sess.stop_agent() {
                 tracing::error!(task_id = %task_id, error = %e, "failed to stop agent at hard time limit");
             }
-            // The exit event will come through event_rx
         } else if elapsed >= soft_limit && !soft_limit_notified {
             soft_limit_notified = true;
-            let event = events::Event::new(
-                events::EventType::OrchestratorEscalation,
+            tracing::info!(task_id = %task_id, elapsed_secs = elapsed.as_secs(), "soft time limit reached, notifying orchestrator/human");
+
+            // Emit system:time_limit:soft event
+            let soft_event = events::Event::new(
+                events::EventType::SystemTimeLimitSoft,
                 &task_id,
                 events::Actor::System,
                 serde_json::json!({
-                    "reason": "session_time_limit",
                     "elapsed_seconds": elapsed.as_secs(),
                     "soft_limit_seconds": soft_limit.as_secs(),
+                    "hard_limit_seconds": hard_limit.as_secs(),
                 }),
             );
-            if let Err(e) = event_bus.publish(event).await {
-                tracing::error!(task_id = %task_id, error = %e, "failed to publish escalation event");
+            if let Err(e) = event_bus.publish(soft_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish soft time limit event");
+            }
+
+            // Emit task:state:question event to notify human/orchestrator
+            let question_event = events::Event::new(
+                events::EventType::TaskStateQuestion,
+                &task_id,
+                events::Actor::System,
+                serde_json::json!({
+                    "reason": "soft_time_limit",
+                    "message": "Session has reached the soft time limit. The agent will be terminated at the hard limit unless extended or guided.",
+                    "elapsed_seconds": elapsed.as_secs(),
+                    "remaining_seconds": (hard_limit.as_secs().saturating_sub(elapsed.as_secs())),
+                }),
+            );
+            if let Err(e) = event_bus.publish(question_event).await {
+                tracing::error!(task_id = %task_id, error = %e, "failed to publish question state event");
             }
         }
     }

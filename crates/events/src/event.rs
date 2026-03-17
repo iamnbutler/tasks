@@ -65,6 +65,10 @@ pub enum EventType {
     SystemMemoryWarning,
     SystemMemoryPressure,
     SystemMemoryEmergency,
+    /// Session soft time limit reached (spec §17.4).
+    SystemTimeLimitSoft,
+    /// Session hard time limit reached (spec §17.4).
+    SystemTimeLimitHard,
 }
 
 impl EventType {
@@ -103,6 +107,8 @@ impl EventType {
             Self::SystemMemoryWarning => "system:memory:warning",
             Self::SystemMemoryPressure => "system:memory:pressure",
             Self::SystemMemoryEmergency => "system:memory:emergency",
+            Self::SystemTimeLimitSoft => "system:time_limit:soft",
+            Self::SystemTimeLimitHard => "system:time_limit:hard",
         }
     }
 
@@ -170,6 +176,8 @@ impl TryFrom<String> for EventType {
             "system:memory:warning" => Ok(Self::SystemMemoryWarning),
             "system:memory:pressure" => Ok(Self::SystemMemoryPressure),
             "system:memory:emergency" => Ok(Self::SystemMemoryEmergency),
+            "system:time_limit:soft" => Ok(Self::SystemTimeLimitSoft),
+            "system:time_limit:hard" => Ok(Self::SystemTimeLimitHard),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
@@ -250,5 +258,62 @@ mod tests {
         );
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"task:created\""));
+    }
+
+    #[test]
+    fn time_limit_soft_event_serializes() {
+        let e = Event::new(
+            EventType::SystemTimeLimitSoft,
+            "task-123",
+            Actor::System,
+            serde_json::json!({
+                "elapsed_seconds": 3600,
+                "soft_limit_seconds": 3600,
+                "hard_limit_seconds": 4500,
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:time_limit:soft\""));
+        assert!(json.contains("\"elapsed_seconds\":3600"));
+    }
+
+    #[test]
+    fn time_limit_hard_event_serializes() {
+        let e = Event::new(
+            EventType::SystemTimeLimitHard,
+            "task-123",
+            Actor::System,
+            serde_json::json!({
+                "elapsed_seconds": 4500,
+                "hard_limit_seconds": 4500,
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:time_limit:hard\""));
+        assert!(json.contains("\"hard_limit_seconds\":4500"));
+    }
+
+    #[test]
+    fn time_limit_soft_deserializes() {
+        let s = "system:time_limit:soft".to_string();
+        let t = EventType::try_from(s).unwrap();
+        assert_eq!(t, EventType::SystemTimeLimitSoft);
+    }
+
+    #[test]
+    fn time_limit_hard_deserializes() {
+        let s = "system:time_limit:hard".to_string();
+        let t = EventType::try_from(s).unwrap();
+        assert_eq!(t, EventType::SystemTimeLimitHard);
+    }
+
+    #[test]
+    fn time_limit_events_match_system_wildcard() {
+        let soft = EventType::SystemTimeLimitSoft;
+        let hard = EventType::SystemTimeLimitHard;
+        assert!(soft.matches("system:*"));
+        assert!(hard.matches("system:*"));
+        assert!(soft.matches("system:time_limit:*"));
+        assert!(hard.matches("system:time_limit:*"));
     }
 }
