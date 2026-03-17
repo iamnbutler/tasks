@@ -14,7 +14,30 @@ use server::Server;
 use tasks_github::client::GitHubClient;
 use tasks_github::poller::RepoPoller;
 
+use tasks_orchestrator::Orchestrator;
+
 use crate::config::AppConfig;
+
+/// Enum wrapper for orchestrator implementations.
+///
+/// `trait_variant::make(Send)` generates non-dyn-compatible traits, so we
+/// use an enum to dispatch instead of `Arc<dyn Orchestrator>`.
+enum AnyOrchestrator {
+    Claude(tasks_orchestrator::ClaudeOrchestrator),
+    Mock(tasks_orchestrator::MockOrchestrator),
+}
+
+impl AnyOrchestrator {
+    async fn evaluate(
+        &self,
+        context: &tasks_orchestrator::EvaluationContext,
+    ) -> Result<tasks_orchestrator::QualityEvaluation, tasks_orchestrator::OrchestratorError> {
+        match self {
+            Self::Claude(o) => o.evaluate(context).await,
+            Self::Mock(o) => o.evaluate(context).await,
+        }
+    }
+}
 
 /// Run the Tasks platform.
 ///
@@ -97,6 +120,21 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_soft_time_limit(config.session_soft_limit)
         .with_hard_time_limit(config.session_hard_limit),
     );
+
+    // --- 5b. Create orchestrator ---
+
+    let orchestrator = Arc::new(match tasks_orchestrator::ClaudeOrchestrator::from_env() {
+        Ok(o) => {
+            info!("orchestrator initialized (Claude-backed)");
+            AnyOrchestrator::Claude(o)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to initialize Claude orchestrator, using mock (always rejects)");
+            AnyOrchestrator::Mock(tasks_orchestrator::MockOrchestrator::rejecting(
+                "orchestrator not configured",
+            ))
+        }
+    });
 
     // --- 6. Emit system:started ---
 
@@ -353,6 +391,134 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- 8b. Spawn orchestrator loop ---
+    //
+    // The orchestrator is the project foreman. On each tick it observes
+    // project state and acts: evaluates merge queue entries, comments on
+    // PRs, adjusts tasks. Currently only merge queue evaluation is wired.
+    // In Play mode it auto-approves/rejects. In Pause mode it evaluates
+    // but doesn't merge. In Stop mode it's idle.
+
+    let orch_server = server.clone();
+    let orch = orchestrator.clone();
+    let orch_event_bus = server.event_bus.clone();
+    let orchestrator_interval = config.dispatch_interval; // reuse dispatch interval for now
+
+    let orchestrator_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(orchestrator_interval);
+        let mut event_rx = orch_event_bus.subscribe();
+
+        loop {
+            // Tick on interval or on merge-relevant events
+            tokio::select! {
+                _ = interval.tick() => {},
+                result = event_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if !matches!(
+                                event.event_type,
+                                EventType::MergeQueued
+                                | EventType::SystemModePlay
+                                | EventType::SystemModePause
+                            ) {
+                                continue;
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            };
+
+            // Read current mode — idle in Stop
+            let mode = orch_server.mode().await;
+            if mode == server::Mode::Stop {
+                continue;
+            }
+
+            // Snapshot pending merge queue entries with their tasks and projects
+            let pending: Vec<(String, String, String)> = {
+                let state = orch_server.state.read().await;
+                state.merge_queue.pending().iter().map(|entry| {
+                    (entry.id.clone(), entry.task_id.clone(), entry.pr_url.clone())
+                }).collect()
+            };
+
+            for (entry_id, task_id, _pr_url) in pending {
+                // Build evaluation context
+                let (task, project) = {
+                    let state = orch_server.state.read().await;
+                    let task = match state.tasks.get(&task_id) {
+                        Some(t) => t.clone(),
+                        None => continue,
+                    };
+                    let project = match state.projects.get(&task.project) {
+                        Some(p) => p.clone(),
+                        None => continue,
+                    };
+                    (task, project)
+                };
+
+                let entry = {
+                    let state = orch_server.state.read().await;
+                    match state.merge_queue.get(&entry_id) {
+                        Some(e) => e.clone(),
+                        None => continue,
+                    }
+                };
+
+                let context = tasks_orchestrator::EvaluationContext {
+                    entry,
+                    task: task.clone(),
+                    project,
+                };
+
+                // Evaluate
+                let evaluation = match orch.evaluate(&context).await {
+                    Ok(eval) => eval,
+                    Err(e) => {
+                        error!(
+                            entry_id = %entry_id,
+                            task_id = %task_id,
+                            error = %e,
+                            "orchestrator evaluation failed"
+                        );
+                        continue;
+                    }
+                };
+
+                // Always emit a decision event (audit trail)
+                if let Err(e) = orch_server.emit_orchestrator_decision(
+                    &task_id,
+                    &entry_id,
+                    evaluation.approved,
+                    &evaluation.reasoning,
+                ).await {
+                    error!(error = %e, "failed to emit orchestrator decision event");
+                }
+
+                // In Play mode: act on the decision
+                if mode == server::Mode::Play {
+                    if evaluation.approved {
+                        if let Err(e) = orch_server.approve_merge_entry(&entry_id, &evaluation.reasoning).await {
+                            error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
+                        }
+                    } else {
+                        if let Err(e) = orch_server.reject_merge_entry(
+                            &entry_id,
+                            &evaluation.reasoning,
+                            evaluation.feedback.as_deref(),
+                        ).await {
+                            error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
+                        }
+                    }
+                }
+
+                // In Pause mode: evaluation is recorded (decision event above)
+                // but no merge/reject action is taken. The human reviews.
+            }
+        }
+    });
+
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
@@ -405,6 +571,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     poll_handle.abort();
     dispatch_handle.abort();
     event_handler_handle.abort();
+    orchestrator_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }
