@@ -7,7 +7,7 @@
 //! - Spacing scale
 //! - Style helpers for common patterns
 
-use gpui::{Pixels, Rgba, px};
+use gpui::{hsla, px, Hsla, Pixels, Rgba};
 use models::TaskState;
 
 // =============================================================================
@@ -326,9 +326,9 @@ pub mod radius {
 
 /// Style helper traits and extensions for common patterns.
 pub mod style_helpers {
-    use gpui::{Div, Styled, div};
+    use gpui::{div, Div, Styled};
 
-    use super::{Pixels, colors, radius, rgb, spacing, typography};
+    use super::{colors, radius, rgb, spacing, typography, Pixels};
 
     /// Extension trait for applying common styles to elements.
     pub trait StyledExt: Styled + Sized {
@@ -542,6 +542,121 @@ impl Theme {
             TaskState::Completed => self.state_completed,
             TaskState::Failed | TaskState::Conflict => self.state_failed,
             TaskState::Cancelled => self.state_cancelled,
+        }
+    }
+}
+
+// =============================================================================
+// Component Theme (HSLA-based theme for UI primitive components)
+// =============================================================================
+
+/// HSLA-based theme for UI primitive components (Button, Badge, Card, Input).
+///
+/// Components that implement `IntoElement` (not `Render`) don't have access to
+/// a GPUI context, so they accept this theme as a constructor parameter. This
+/// allows theme propagation from parent views that *do* have access to the
+/// global theme.
+///
+/// Colors use HSLA (matching shadcn/ui) so components can do lightness
+/// arithmetic for hover states without converting color spaces.
+#[derive(Clone, Debug)]
+pub struct ComponentTheme {
+    // Background colors
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub card: Hsla,
+    pub card_foreground: Hsla,
+
+    // Primary colors
+    pub primary: Hsla,
+    pub primary_foreground: Hsla,
+
+    // Secondary colors
+    pub secondary: Hsla,
+    pub secondary_foreground: Hsla,
+
+    // Muted colors
+    pub muted: Hsla,
+    pub muted_foreground: Hsla,
+
+    // Accent colors
+    pub accent: Hsla,
+    pub accent_foreground: Hsla,
+
+    // Destructive colors
+    pub destructive: Hsla,
+    pub destructive_foreground: Hsla,
+
+    // Border and input
+    pub border: Hsla,
+    pub input: Hsla,
+    pub ring: Hsla,
+
+    // Border radii
+    pub radius_sm: Pixels,
+    pub radius_md: Pixels,
+    pub radius_lg: Pixels,
+    pub radius_xl: Pixels,
+}
+
+impl Default for ComponentTheme {
+    fn default() -> Self {
+        Self::dark()
+    }
+}
+
+impl ComponentTheme {
+    /// Dark theme matching shadcn/ui defaults and the web frontend.
+    pub fn dark() -> Self {
+        Self {
+            background: hsla(222.2 / 360.0, 0.84, 0.049, 1.0),
+            foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            card: hsla(222.2 / 360.0, 0.84, 0.049, 1.0),
+            card_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            primary: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            primary_foreground: hsla(222.2 / 360.0, 0.473, 0.112, 1.0),
+            secondary: hsla(217.2 / 360.0, 0.327, 0.176, 1.0),
+            secondary_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            muted: hsla(217.2 / 360.0, 0.327, 0.176, 1.0),
+            muted_foreground: hsla(215.0 / 360.0, 0.204, 0.651, 1.0),
+            accent: hsla(217.2 / 360.0, 0.327, 0.176, 1.0),
+            accent_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            destructive: hsla(0.0, 0.625, 0.306, 1.0),
+            destructive_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            border: hsla(217.2 / 360.0, 0.327, 0.176, 1.0),
+            input: hsla(217.2 / 360.0, 0.327, 0.176, 1.0),
+            ring: hsla(212.7 / 360.0, 0.267, 0.839, 1.0),
+            radius_sm: px(6.0),
+            radius_md: px(8.0),
+            radius_lg: px(10.0),
+            radius_xl: px(12.0),
+        }
+    }
+
+    /// Light theme matching shadcn/ui defaults.
+    pub fn light() -> Self {
+        Self {
+            background: hsla(0.0, 0.0, 1.0, 1.0),
+            foreground: hsla(222.2 / 360.0, 0.84, 0.049, 1.0),
+            card: hsla(0.0, 0.0, 1.0, 1.0),
+            card_foreground: hsla(222.2 / 360.0, 0.84, 0.049, 1.0),
+            primary: hsla(222.2 / 360.0, 0.473, 0.112, 1.0),
+            primary_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            secondary: hsla(210.0 / 360.0, 0.40, 0.961, 1.0),
+            secondary_foreground: hsla(222.2 / 360.0, 0.473, 0.112, 1.0),
+            muted: hsla(210.0 / 360.0, 0.40, 0.961, 1.0),
+            muted_foreground: hsla(215.4 / 360.0, 0.163, 0.469, 1.0),
+            accent: hsla(210.0 / 360.0, 0.40, 0.961, 1.0),
+            accent_foreground: hsla(222.2 / 360.0, 0.473, 0.112, 1.0),
+            destructive: hsla(0.0, 0.843, 0.60, 1.0),
+            destructive_foreground: hsla(210.0 / 360.0, 0.40, 0.98, 1.0),
+            border: hsla(214.3 / 360.0, 0.318, 0.912, 1.0),
+            input: hsla(214.3 / 360.0, 0.318, 0.912, 1.0),
+            ring: hsla(222.2 / 360.0, 0.84, 0.049, 1.0),
+            radius_sm: px(6.0),
+            radius_md: px(8.0),
+            radius_lg: px(10.0),
+            radius_xl: px(12.0),
         }
     }
 }

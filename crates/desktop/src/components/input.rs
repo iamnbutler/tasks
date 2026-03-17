@@ -6,13 +6,14 @@
 
 use gpui::{div, px, Div, IntoElement, ParentElement, SharedString, Styled};
 
-use crate::theme::Theme;
+use crate::theme::ComponentTheme;
 
 /// A text input component (visual only for now)
 pub struct Input {
     value: SharedString,
     placeholder: SharedString,
     disabled: bool,
+    theme: ComponentTheme,
 }
 
 impl Input {
@@ -22,7 +23,14 @@ impl Input {
             value: SharedString::default(),
             placeholder: SharedString::default(),
             disabled: false,
+            theme: ComponentTheme::default(),
         }
+    }
+
+    /// Set the theme for this input
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Set the input value
@@ -45,7 +53,7 @@ impl Input {
 
     /// Render the input into a GPUI element
     pub fn render(self) -> Div {
-        let theme = Theme::default();
+        let theme = &self.theme;
 
         let mut base = div()
             .flex()

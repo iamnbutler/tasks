@@ -4,7 +4,7 @@
 
 use gpui::{div, px, Div, Hsla, IntoElement, ParentElement, SharedString, Styled};
 
-use crate::theme::Theme;
+use crate::theme::ComponentTheme;
 
 /// Badge style variants
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -21,6 +21,7 @@ pub enum BadgeVariant {
 pub struct Badge {
     label: SharedString,
     variant: BadgeVariant,
+    theme: ComponentTheme,
 }
 
 impl Badge {
@@ -29,7 +30,14 @@ impl Badge {
         Self {
             label: label.into(),
             variant: BadgeVariant::default(),
+            theme: ComponentTheme::default(),
         }
+    }
+
+    /// Set the theme for this badge
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Set the badge variant
@@ -63,7 +71,7 @@ impl Badge {
         self.variant(BadgeVariant::Ghost)
     }
 
-    fn get_colors(&self, theme: &Theme) -> (Hsla, Hsla, Option<Hsla>) {
+    fn get_colors(&self, theme: &ComponentTheme) -> (Hsla, Hsla, Option<Hsla>) {
         // Returns (background, text_color, border_color)
         match self.variant {
             BadgeVariant::Default => (theme.primary, theme.primary_foreground, None),
@@ -80,8 +88,8 @@ impl Badge {
 
     /// Render the badge into a GPUI element
     pub fn render(self) -> Div {
-        let theme = Theme::default();
-        let (bg_color, text_color, border_color) = self.get_colors(&theme);
+        let theme = &self.theme;
+        let (bg_color, text_color, border_color) = self.get_colors(theme);
 
         let mut base = div()
             .flex()

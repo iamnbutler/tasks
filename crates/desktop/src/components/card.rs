@@ -4,11 +4,12 @@
 
 use gpui::{div, px, AnyElement, Div, IntoElement, ParentElement, SharedString, Styled};
 
-use crate::theme::Theme;
+use crate::theme::ComponentTheme;
 
 /// A card container component
 pub struct Card {
     children: Vec<AnyElement>,
+    theme: ComponentTheme,
 }
 
 impl Card {
@@ -16,7 +17,14 @@ impl Card {
     pub fn new() -> Self {
         Self {
             children: Vec::new(),
+            theme: ComponentTheme::default(),
         }
+    }
+
+    /// Set the theme for this card
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Add a child element to the card
@@ -34,7 +42,7 @@ impl Card {
 
     /// Render the card into a GPUI element
     pub fn render(self) -> Div {
-        let theme = Theme::default();
+        let theme = &self.theme;
 
         div()
             .flex()
@@ -119,17 +127,27 @@ impl IntoElement for CardHeader {
 /// Card title component
 pub struct CardTitle {
     text: SharedString,
+    theme: ComponentTheme,
 }
 
 impl CardTitle {
     /// Create a new card title
     pub fn new(text: impl Into<SharedString>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            theme: ComponentTheme::default(),
+        }
+    }
+
+    /// Set the theme for this card title
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Render the title into a GPUI element
     pub fn render(self) -> Div {
-        let theme = Theme::default();
+        let theme = &self.theme;
 
         div()
             .text_color(theme.foreground)
@@ -150,17 +168,27 @@ impl IntoElement for CardTitle {
 /// Card description component
 pub struct CardDescription {
     text: SharedString,
+    theme: ComponentTheme,
 }
 
 impl CardDescription {
     /// Create a new card description
     pub fn new(text: impl Into<SharedString>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            theme: ComponentTheme::default(),
+        }
+    }
+
+    /// Set the theme for this card description
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Render the description into a GPUI element
     pub fn render(self) -> Div {
-        let theme = Theme::default();
+        let theme = &self.theme;
 
         div()
             .text_size(px(14.0))

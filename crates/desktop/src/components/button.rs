@@ -7,7 +7,7 @@ use gpui::{
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 
-use crate::theme::Theme;
+use crate::theme::ComponentTheme;
 
 /// Button style variants
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -42,6 +42,7 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     disabled: bool,
+    theme: ComponentTheme,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -54,6 +55,7 @@ impl Button {
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             disabled: false,
+            theme: ComponentTheme::default(),
             on_click: None,
         }
     }
@@ -66,8 +68,15 @@ impl Button {
             variant: ButtonVariant::default(),
             size: ButtonSize::Icon,
             disabled: false,
+            theme: ComponentTheme::default(),
             on_click: None,
         }
+    }
+
+    /// Set the theme for this button
+    pub fn theme(mut self, theme: ComponentTheme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Set the button variant
@@ -97,16 +106,18 @@ impl Button {
         self
     }
 
-    fn get_colors(&self, theme: &Theme) -> (Hsla, Hsla, Hsla) {
+    fn get_colors(&self, theme: &ComponentTheme) -> (Hsla, Hsla, Hsla) {
         match self.variant {
             ButtonVariant::Default => (theme.primary, theme.primary_foreground, theme.primary),
             ButtonVariant::Secondary => {
                 (theme.secondary, theme.secondary_foreground, theme.secondary)
             }
             ButtonVariant::Outline => (theme.background, theme.foreground, theme.border),
-            ButtonVariant::Destructive => {
-                (theme.destructive, theme.destructive_foreground, theme.destructive)
-            }
+            ButtonVariant::Destructive => (
+                theme.destructive,
+                theme.destructive_foreground,
+                theme.destructive,
+            ),
             ButtonVariant::Ghost => (
                 gpui::hsla(0.0, 0.0, 0.0, 0.0),
                 theme.foreground,
@@ -120,7 +131,7 @@ impl Button {
         }
     }
 
-    fn get_hover_bg(&self, theme: &Theme) -> Hsla {
+    fn get_hover_bg(&self, theme: &ComponentTheme) -> Hsla {
         match self.variant {
             ButtonVariant::Default => gpui::hsla(
                 theme.primary.h,
@@ -161,10 +172,10 @@ impl Button {
 
     /// Render the button into a GPUI element
     pub fn render(self) -> Stateful<Div> {
-        let theme = Theme::default();
-        let (bg_color, text_color, border_color) = self.get_colors(&theme);
-        let hover_bg = self.get_hover_bg(&theme);
-        let (height, px_padding, _py_padding, font_size) = self.get_size_styles();
+        let theme = &self.theme;
+        let (bg_color, text_color, border_color) = self.get_colors(theme);
+        let hover_bg = self.get_hover_bg(theme);
+        let (height, px_padding, py_padding, font_size) = self.get_size_styles();
 
         let is_icon = matches!(
             self.size,
@@ -199,17 +210,17 @@ impl Button {
         if is_icon {
             base = base.w(px(height));
         } else {
-            base = base.px(px(px_padding));
+            base = base.px(px(px_padding)).py(px(py_padding));
         }
 
-        // Apply hover styles
-        base = base.hover(|style| style.bg(hover_bg));
-
-        // Apply disabled styles
+        // Apply disabled or interactive styles — hover only applies when enabled
         if self.disabled {
             base = base.opacity(0.5).cursor_not_allowed();
-        } else if let Some(on_click) = self.on_click {
-            base = base.on_click(on_click);
+        } else {
+            base = base.hover(|style| style.bg(hover_bg));
+            if let Some(on_click) = self.on_click {
+                base = base.on_click(on_click);
+            }
         }
 
         // Add label if not icon-only

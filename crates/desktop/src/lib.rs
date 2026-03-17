@@ -16,7 +16,7 @@ mod sse;
 pub mod theme;
 
 pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
-pub use theme::{Theme, colors, radius, spacing, style_helpers, typography};
+pub use theme::{ComponentTheme, Theme, colors, radius, spacing, style_helpers, typography};
 
 /// Root view for the Tasks desktop application.
 pub struct RootView {
