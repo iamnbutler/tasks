@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -471,6 +471,13 @@ export function TaskDetailPage() {
 
   const task = snapshot?.tasks.find((t) => t.id === id);
 
+  // Get project name from project ID
+  const projectName = useMemo(() => {
+    if (!task?.project || !snapshot?.projects) return task?.project;
+    const project = snapshot.projects.find((p) => p.id === task.project);
+    return project?.repo ?? task.project;
+  }, [task?.project, snapshot?.projects]);
+
   const isSessionActive =
     task?.state === "running" ||
     task?.state === "question" ||
@@ -556,7 +563,7 @@ export function TaskDetailPage() {
             <Separator orientation="vertical" className="h-4" />
             {sourceDisplay(task)}
             <Separator orientation="vertical" className="h-4" />
-            <span>{task.project}</span>
+            <span>{projectName}</span>
             {task.labels.length > 0 && (
               <>
                 <Separator orientation="vertical" className="h-4" />

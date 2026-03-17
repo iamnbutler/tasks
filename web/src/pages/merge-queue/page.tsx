@@ -61,6 +61,15 @@ export function MergeQueuePage() {
     ? snapshot?.projects.find((p) => p.id === selectedProject)?.repo
     : null;
 
+  // Create a map from project ID to repo name for display
+  const projectIdToRepo = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const p of snapshot?.projects ?? []) {
+      map[p.id] = p.repo;
+    }
+    return map;
+  }, [snapshot?.projects]);
+
   const table = useReactTable({
     data: entries,
     columns,
@@ -73,6 +82,7 @@ export function MergeQueuePage() {
     meta: {
       refreshSnapshot,
       tasks: snapshot?.tasks ?? [],
+      projectIdToRepo,
     },
   });
 

@@ -65,11 +65,15 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     id: "project",
     header: "Project",
     cell: ({ row, table }) => {
-      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
+      const meta = table.options.meta as { tasks?: Task[]; projectIdToRepo?: Record<string, string> };
+      const tasks = meta?.tasks ?? [];
+      const projectIdToRepo = meta?.projectIdToRepo ?? {};
       const task = tasks.find((t) => t.id === row.original.task_id);
+      const projectId = task?.project;
+      const projectName = projectId ? (projectIdToRepo[projectId] ?? projectId) : "—";
       return (
         <span className="text-muted-foreground">
-          {task?.project ?? "—"}
+          {projectName}
         </span>
       );
     },
