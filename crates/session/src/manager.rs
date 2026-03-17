@@ -153,39 +153,38 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
         Ok(())
     }
 
-    /// Stop all active sessions (for shutdown).
-    pub async fn stop_all(&self) {
-        let sessions = self.sessions.read().await;
-        for handle in sessions.values() {
-            if let Err(e) = handle.command_tx.send(SessionCommand::Stop).await {
-                tracing::warn!(task_id = %handle.task_id, error = %e, "failed to send stop command during shutdown");
-            }
-        }
-    }
-
     /// Stop all sessions and destroy their containers (for clean shutdown).
+    ///
+    /// Drains the sessions map under a brief write lock, then aborts monitor
+    /// tasks and destroys containers without holding the lock.
     pub async fn destroy_all(&self) {
-        let mut sessions = self.sessions.write().await;
-        for handle in sessions.values() {
-            // Best-effort stop command to the agent
-            let _ = handle.command_tx.send(SessionCommand::Stop).await;
-            // Destroy the container (stop + rm)
-            if let Err(e) = self.runtime.destroy(&handle.container_id).await {
+        let entries: Vec<(String, String, JoinHandle<()>)> = {
+            let mut sessions = self.sessions.write().await;
+            sessions
+                .drain()
+                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle))
+                .collect()
+        };
+
+        for (task_id, container_id, monitor_handle) in entries {
+            // Abort the monitor task so it doesn't double-destroy
+            monitor_handle.abort();
+
+            if let Err(e) = self.runtime.destroy(&container_id).await {
                 tracing::error!(
-                    task_id = %handle.task_id,
-                    container_id = %handle.container_id,
+                    task_id = %task_id,
+                    container_id = %container_id,
                     error = %e,
                     "failed to destroy container during shutdown"
                 );
             } else {
                 tracing::info!(
-                    task_id = %handle.task_id,
-                    container_id = %handle.container_id,
+                    task_id = %task_id,
+                    container_id = %container_id,
                     "destroyed container during shutdown"
                 );
             }
         }
-        sessions.clear();
     }
 }
 
@@ -414,20 +413,24 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     // Abort the reader thread
     reader.abort();
 
-    // Destroy the container to reclaim disk and memory
-    if let Err(e) = runtime.destroy(&container_id).await {
-        tracing::error!(
-            task_id = %task_id,
-            container_id = %container_id,
-            error = %e,
-            "failed to destroy container after session ended"
-        );
-    } else {
-        tracing::info!(
-            task_id = %task_id,
-            container_id = %container_id,
-            "destroyed container after session ended"
-        );
+    // Destroy the container to reclaim disk and memory.
+    // Log at debug on failure — the container may already be gone if destroy_all ran first.
+    match runtime.destroy(&container_id).await {
+        Ok(()) => {
+            tracing::info!(
+                task_id = %task_id,
+                container_id = %container_id,
+                "destroyed container after session ended"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                task_id = %task_id,
+                container_id = %container_id,
+                error = %e,
+                "container destroy failed (may already be cleaned up)"
+            );
+        }
     }
 }
 
