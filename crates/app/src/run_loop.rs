@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::sync::Mutex as StdMutex;
+
 use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
@@ -18,6 +20,7 @@ use tasks_orchestrator::Orchestrator;
 
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
+use crate::problem_tracker::ProblemTracker;
 
 /// Enum wrapper for orchestrator implementations.
 ///
@@ -38,6 +41,47 @@ impl AnyOrchestrator {
             Self::Mock(o) => o.evaluate(context).await,
         }
     }
+}
+
+/// Lower operating mode from Play to Pause (spec §6.4).
+///
+/// Called by the orchestrator loop when problem patterns are detected.
+/// Logs the reason and emits an escalation event.
+async fn lower_mode(server: &Arc<server::Server>, reason: &crate::problem_tracker::LowerReason) {
+    // Only lower from Play — if already in Pause/Stop, nothing to do
+    let current_mode = server.mode().await;
+    if current_mode != server::Mode::Play {
+        return;
+    }
+
+    warn!(reason = %reason, "orchestrator lowering mode to Pause");
+
+    // Lower mode
+    if let Err(e) = server
+        .set_mode(server::Mode::Pause, &events::Actor::Orchestrator)
+        .await
+    {
+        error!(error = %e, "failed to lower mode");
+        return;
+    }
+
+    // Emit escalation event so human knows why mode was lowered
+    let event = events::Event::new(
+        events::EventType::OrchestratorEscalation,
+        "system",
+        events::Actor::Orchestrator,
+        serde_json::json!({
+            "action": "mode_lowered",
+            "from": "play",
+            "to": "pause",
+            "reason": reason.to_string(),
+        }),
+    );
+    if let Err(e) = server.event_bus.publish(event).await {
+        error!(error = %e, "failed to emit escalation event for mode lowering");
+    }
+
+    info!("mode lowered to Pause by orchestrator");
 }
 
 /// Run the Tasks platform.
@@ -575,32 +619,29 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // PRs, adjusts tasks. Currently only merge queue evaluation is wired.
     // In Play mode it auto-approves/rejects. In Pause mode it evaluates
     // but doesn't merge. In Stop mode it's idle.
+    //
+    // Mode lowering (spec §6.4): The orchestrator tracks problem patterns
+    // and can lower mode from Play to Pause when things go wrong.
 
     let orch_server = server.clone();
     let orch = orchestrator.clone();
     let orch_event_bus = server.event_bus.clone();
     let orchestrator_interval = config.dispatch_interval; // reuse dispatch interval for now
 
+    // Problem tracker for mode lowering (spec §6.4)
+    let problem_tracker = Arc::new(StdMutex::new(ProblemTracker::new()));
+
     let orchestrator_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(orchestrator_interval);
         let mut event_rx = orch_event_bus.subscribe();
 
         loop {
-            // Tick on interval or on merge-relevant events
-            tokio::select! {
-                _ = interval.tick() => {},
+            // Tick on interval or on relevant events
+            let event_opt = tokio::select! {
+                _ = interval.tick() => None,
                 result = event_rx.recv() => {
                     match result {
-                        Ok(event) => {
-                            if !matches!(
-                                event.event_type,
-                                EventType::MergeQueued
-                                | EventType::SystemModePlay
-                                | EventType::SystemModePause
-                            ) {
-                                continue;
-                            }
-                        }
+                        Ok(event) => Some(event),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!(skipped = n, "orchestrator loop lagged");
                             continue;
@@ -609,6 +650,63 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             };
+
+            // Handle specific events for problem tracking and mode lowering
+            if let Some(ref event) = event_opt {
+                match event.event_type {
+                    // Reset problem tracker when human raises mode to Play
+                    EventType::SystemModePlay => {
+                        if let Ok(mut tracker) = problem_tracker.lock() {
+                            tracker.reset();
+                            info!("problem tracker reset (mode raised to Play)");
+                        }
+                    }
+                    // Track agent errors
+                    EventType::AgentError => {
+                        let should_lower = {
+                            let mut tracker = problem_tracker.lock().unwrap();
+                            tracker.record_agent_error();
+                            tracker.should_lower_mode()
+                        };
+                        if let Some(reason) = should_lower {
+                            lower_mode(&orch_server, &reason).await;
+                        }
+                    }
+                    // Track task failures
+                    EventType::TaskStateFailed => {
+                        let should_lower = {
+                            let mut tracker = problem_tracker.lock().unwrap();
+                            tracker.record_task_failure();
+                            tracker.should_lower_mode()
+                        };
+                        if let Some(reason) = should_lower {
+                            lower_mode(&orch_server, &reason).await;
+                        }
+                    }
+                    // Track merge conflicts
+                    EventType::MergeConflict => {
+                        let should_lower = {
+                            let mut tracker = problem_tracker.lock().unwrap();
+                            tracker.record_conflict();
+                            tracker.should_lower_mode()
+                        };
+                        if let Some(reason) = should_lower {
+                            lower_mode(&orch_server, &reason).await;
+                        }
+                    }
+                    // Skip non-relevant events for merge queue processing
+                    _ if !matches!(
+                        event.event_type,
+                        EventType::MergeQueued
+                            | EventType::SystemModePlay
+                            | EventType::SystemModePause
+                    ) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
 
             // Read current mode — idle in Stop
             let mode = orch_server.mode().await;
@@ -664,7 +762,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                 // Evaluate
                 let evaluation = match orch.evaluate(&context).await {
-                    Ok(eval) => eval,
+                    Ok(eval) => {
+                        // Track successful evaluation
+                        if let Ok(mut tracker) = problem_tracker.lock() {
+                            tracker.record_eval_success();
+                        }
+                        eval
+                    }
                     Err(e) => {
                         error!(
                             entry_id = %entry_id,
@@ -672,6 +776,15 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             error = %e,
                             "orchestrator evaluation failed"
                         );
+                        // Track evaluation failure and check for mode lowering
+                        let should_lower = {
+                            let mut tracker = problem_tracker.lock().unwrap();
+                            tracker.record_eval_failure();
+                            tracker.should_lower_mode()
+                        };
+                        if let Some(reason) = should_lower {
+                            lower_mode(&orch_server, &reason).await;
+                        }
                         continue;
                     }
                 };
@@ -692,6 +805,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // In Play mode: act on the decision
                 if mode == server::Mode::Play {
                     if evaluation.approved {
+                        // Track approval (resets rejection counter)
+                        if let Ok(mut tracker) = problem_tracker.lock() {
+                            tracker.record_approval();
+                        }
                         if let Err(e) = orch_server
                             .approve_merge_entry(&entry_id, &evaluation.reasoning)
                             .await
@@ -699,6 +816,15 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
                         }
                     } else {
+                        // Track rejection and check for mode lowering
+                        let should_lower = {
+                            let mut tracker = problem_tracker.lock().unwrap();
+                            tracker.record_rejection();
+                            tracker.should_lower_mode()
+                        };
+                        if let Some(reason) = should_lower {
+                            lower_mode(&orch_server, &reason).await;
+                        }
                         if let Err(e) = orch_server
                             .reject_merge_entry(
                                 &entry_id,

@@ -11,15 +11,15 @@ use std::time::Duration;
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Terminal;
 
 use events::{Event as PlatformEvent, EventBus, EventType};
 use models::merge_queue::MergeStatus;
@@ -143,7 +143,12 @@ async fn refresh_from_server(tui: &mut TuiState, server: &Server) {
     tui.active_sessions = state
         .tasks
         .values()
-        .filter(|t| matches!(t.state, TaskState::Running | TaskState::Question | TaskState::Testing))
+        .filter(|t| {
+            matches!(
+                t.state,
+                TaskState::Running | TaskState::Question | TaskState::Testing
+            )
+        })
         .count();
 
     // Projects
@@ -240,7 +245,7 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, tui: &mut TuiState) -
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // status bar
-                Constraint::Min(5),   // body
+                Constraint::Min(5),    // body
                 Constraint::Length(1), // keybindings
             ])
             .split(size);
@@ -322,10 +327,7 @@ fn draw_task_list(f: &mut ratatui::Frame, area: Rect, tui: &mut TuiState) {
 
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
-                Span::styled(
-                    format!("#{num} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("#{num} "), Style::default().fg(Color::DarkGray)),
                 Span::raw(display_title),
             ]))
         })
@@ -359,8 +361,11 @@ fn draw_merge_queue(f: &mut ratatui::Frame, area: Rect, tui: &TuiState) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Merge Queue "));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Merge Queue "),
+    );
     f.render_widget(list, area);
 }
 
