@@ -185,6 +185,69 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- 6b. Spawn event handler loop ---
+    //
+    // Listens for session lifecycle events and feeds state changes back
+    // into the server. The session monitor publishes events (e.g.
+    // TaskStateAwaitingMerge) but doesn't update server state directly.
+    // This loop bridges events → state updates + merge queue entries.
+
+    let event_handler_server = server.clone();
+    let event_handler_bus = server.event_bus.clone();
+
+    let event_handler_handle = tokio::spawn(async move {
+        let mut rx = event_handler_bus.subscribe();
+        loop {
+            let event = match rx.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "event handler lagged, some events may not update state");
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            let task_id = &event.task;
+            let new_state = match event.event_type {
+                EventType::TaskStateRunning => Some(models::task::TaskState::Running),
+                EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
+                EventType::TaskStateWaiting => Some(models::task::TaskState::Waiting),
+                EventType::TaskStateBlocked => Some(models::task::TaskState::Blocked),
+                EventType::TaskStateTesting => Some(models::task::TaskState::Testing),
+                EventType::TaskStateAwaitingMerge => Some(models::task::TaskState::AwaitingMerge),
+                EventType::TaskStateConflict => Some(models::task::TaskState::Conflict),
+                EventType::TaskStateCompleted => Some(models::task::TaskState::Completed),
+                EventType::TaskStateFailed => Some(models::task::TaskState::Failed),
+                EventType::TaskStateCancelled => Some(models::task::TaskState::Cancelled),
+                _ => None,
+            };
+
+            if let Some(state) = new_state {
+                // Skip if this event was already published by set_task_state (actor = System from scheduler)
+                // Only handle events from agents/sessions (actor = Agent or System from session monitor)
+                // Apply state from session monitor events (agent-originated).
+                // Uses apply_task_state (no re-publish) to avoid infinite loops.
+                if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
+                    // TaskNotFound can happen for events on tasks not yet in state
+                    if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                        error!(task_id = %task_id, error = %e, "failed to update task state from event");
+                    }
+                }
+
+                // Create merge queue entry when task reaches awaiting_merge
+                if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
+                    let entry_id = uuid::Uuid::new_v4().to_string();
+                    let entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
+                    let mut server_state = event_handler_server.state.write().await;
+                    if server_state.merge_queue.get_by_task(task_id).is_none() {
+                        info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
+                        server_state.merge_queue.enqueue(entry);
+                    }
+                }
+            }
+        }
+    });
+
     // --- 7. Spawn dispatch tick loop ---
 
     let dispatch_server = server.clone();
@@ -336,6 +399,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Cancel the loops
     poll_handle.abort();
     dispatch_handle.abort();
+    event_handler_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }

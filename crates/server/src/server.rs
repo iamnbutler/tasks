@@ -266,29 +266,14 @@ impl Server {
     }
 
     /// Transition a task's state and emit the corresponding event.
+    /// Update task state, persist to store, and publish an event.
     pub async fn set_task_state(
         &self,
         task_id: &str,
         new_state: TaskState,
         actor: Actor,
     ) -> Result<(), ServerError> {
-        {
-            let mut state = self.state.write().await;
-            let task = state
-                .tasks
-                .get_mut(task_id)
-                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
-            task.set_state(new_state);
-
-            // Write-through to store
-            if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_task(task) {
-                        tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
-                    }
-                }
-            }
-        }
+        self.apply_task_state(task_id, new_state).await?;
 
         let event_type = match new_state {
             TaskState::Waiting => EventType::TaskStateWaiting,
@@ -305,6 +290,33 @@ impl Server {
 
         let event = Event::new(event_type, task_id, actor, serde_json::json!({}));
         self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Update task state and persist to store, without publishing an event.
+    ///
+    /// Used by the event handler loop to apply state changes from events
+    /// that were already published by the session monitor, avoiding infinite loops.
+    pub async fn apply_task_state(
+        &self,
+        task_id: &str,
+        new_state: TaskState,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+        task.set_state(new_state);
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
+                }
+            }
+        }
         Ok(())
     }
 
