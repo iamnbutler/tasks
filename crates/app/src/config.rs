@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// Top-level app configuration.
 pub struct AppConfig {
-    /// Data directory (default: `~/.tasks`).
+    /// Data directory (default: `~/.local/state/tasks`).
     pub data_dir: String,
     /// GitHub personal access token.
     pub github_token: String,
@@ -47,7 +47,7 @@ impl AppConfig {
         dotenvy::dotenv().ok();
         let data_dir = std::env::var("TASKS_DATA_DIR").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{home}/.tasks")
+            format!("{home}/.local/state/tasks")
         });
 
         let github_token = std::env::var("GITHUB_TOKEN")

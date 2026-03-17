@@ -64,7 +64,7 @@ cargo run -- run --web
 | `TASKS_POLL_INTERVAL` | No | `60` | GitHub polling interval (seconds) |
 | `TASKS_DISPATCH_INTERVAL` | No | `30` | Dispatch loop interval (seconds) |
 | `TASKS_CONTAINER_IMAGE` | No | `tasks-agent:latest` | Container image for sessions |
-| `TASKS_DATA_DIR` | No | `~/.tasks` | Data directory (SQLite + event logs) |
+| `TASKS_DATA_DIR` | No | `~/.local/state/tasks` | Data directory (SQLite + event logs) |
 
 ## License
 

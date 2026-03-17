@@ -31,7 +31,7 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
 - Host ↔ container communication: JSON-line protocol over stdio
 - Agent provider: Claude Code (initial), pluggable
 - Container images: built with `container build` (apple/container CLI), NOT Docker
-- Data directory: `~/.tasks/` (SQLite + event logs), configurable via `TASKS_DATA_DIR`
+- Data directory: `~/.local/state/tasks/` (SQLite + event logs), configurable via `TASKS_DATA_DIR`
 - Config: `.env` file at project root, loaded automatically via dotenvy
 
 ## Working on issues
