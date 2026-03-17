@@ -376,7 +376,7 @@ async fn max_pages_stops_pagination() {
         .await;
 
     let client = GitHubClient::builder("test-token")
-        .base_url(&server.uri())
+        .base_url(server.uri())
         .max_pages(2)
         .rate_limit_floor(0)
         .build();

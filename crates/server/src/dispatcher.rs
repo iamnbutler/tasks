@@ -49,7 +49,7 @@ pub fn evaluate(
         .filter(|id| {
             tasks
                 .get(id.as_str())
-                .map_or(false, |t| t.state == TaskState::Question)
+                .is_some_and(|t| t.state == TaskState::Question)
         })
         .cloned()
         .collect();

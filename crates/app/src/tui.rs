@@ -172,18 +172,15 @@ async fn refresh_from_server(tui: &mut TuiState, server: &Server) {
 
 /// Handle a platform event — update TUI state.
 fn handle_platform_event(tui: &mut TuiState, event: &PlatformEvent) {
-    match &event.event_type {
-        EventType::AgentMessage => {
-            if let Some(text) = event.data.get("text").and_then(|v| v.as_str()) {
-                // Trim long lines for display (UTF-8 safe).
-                let line = match text.char_indices().nth(200) {
-                    Some((i, _)) => format!("{}...", &text[..i]),
-                    None => text.to_string(),
-                };
-                tui.append_session_log(&event.task, line);
-            }
+    if event.event_type == EventType::AgentMessage {
+        if let Some(text) = event.data.get("text").and_then(|v| v.as_str()) {
+            // Trim long lines for display (UTF-8 safe).
+            let line = match text.char_indices().nth(200) {
+                Some((i, _)) => format!("{}...", &text[..i]),
+                None => text.to_string(),
+            };
+            tui.append_session_log(&event.task, line);
         }
-        _ => {}
     }
 }
 
