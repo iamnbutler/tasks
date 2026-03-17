@@ -606,11 +606,19 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         ).await {
                             error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
                         }
-                        // TODO: Call orch.feedback(&task, feedback) to deliver
-                        // guidance to the re-dispatched session. Currently the
-                        // feedback only lands in the event payload; the fresh
-                        // session started by the dispatch loop doesn't receive it.
-                        // Needs dispatch loop changes to pass feedback as prompt context.
+                        // Emit orchestrator:feedback event when feedback is provided
+                        if let Some(feedback) = &evaluation.feedback {
+                            if let Err(e) = orch_server.emit_orchestrator_feedback(
+                                &task_id,
+                                feedback,
+                                Some("merge_rejection"),
+                            ).await {
+                                error!(error = %e, "failed to emit orchestrator feedback event");
+                            }
+                        }
+                        // TODO: The feedback event is now recorded in the audit trail.
+                        // Delivering feedback to the re-dispatched session's prompt
+                        // context still needs dispatch loop changes.
                     }
                 }
 
