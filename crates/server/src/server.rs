@@ -1003,4 +1003,69 @@ mod tests {
         assert!(server.get_project("p1").await.is_some());
         assert!(server.get_task("t1").await.is_some());
     }
+
+    #[tokio::test]
+    async fn approve_merge_entry_transitions_and_emits() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Drain the queued and task-created events
+        while rx.try_recv().is_ok() {}
+
+        server.approve_merge_entry("mq-1", "looks good").await.unwrap();
+
+        // Check the entry is approved
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Approved);
+        drop(state);
+
+        // Check event was emitted
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::MergeApproved);
+        assert_eq!(event.actor, Actor::Orchestrator);
+    }
+
+    #[tokio::test]
+    async fn reject_merge_entry_transitions_task_to_waiting() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        task.set_state(TaskState::AwaitingMerge);
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        server
+            .reject_merge_entry("mq-1", "needs tests", Some("add unit tests for the new endpoint"))
+            .await
+            .unwrap();
+
+        // Entry should be rejected
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Rejected);
+        drop(state);
+
+        // Task should be back to Waiting for re-dispatch
+        let task = server.get_task("task-1").await.unwrap();
+        assert_eq!(task.state, TaskState::Waiting);
+    }
 }
