@@ -373,6 +373,27 @@ impl Server {
             .map(|t| t.id.clone())
     }
 
+    /// Check if a PR URL is already in the merge queue.
+    pub async fn has_merge_entry_for_pr(&self, pr_url: &str) -> bool {
+        let state = self.state.read().await;
+        state.merge_queue.get_by_pr_url(pr_url).is_some()
+    }
+
+    /// Find a task ID by its branch name.
+    ///
+    /// Tasks use branches named `tasks/{task_id}`, so we extract the task ID
+    /// from the branch name and look it up.
+    pub async fn find_task_by_branch(&self, branch: &str) -> Option<String> {
+        // Tasks use branches like "tasks/gh-owner-repo-issue-123"
+        let task_id = branch.strip_prefix("tasks/")?;
+        let state = self.state.read().await;
+        if state.tasks.contains_key(task_id) {
+            Some(task_id.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Get the effective session limit for a project.
     /// Returns the project's configured limit, or the global default.
     pub async fn project_session_limit(&self, project_id: &str, global_max: u32) -> u32 {
