@@ -24,7 +24,7 @@
 # Code reviewer for the Tasks platform. Reviews every PR against the spec
 # and project conventions.
 # - Checks correctness, spec compliance, and code quality
-# - Uses REQUEST_CHANGES for blocking issues, COMMENT for suggestions
+# - Leaves inline comments on issues (no REQUEST_CHANGES to avoid blocking PRs)
 # - Never writes implementation code — review only
 #
 # Resolved workflow manifest:
@@ -32,7 +32,7 @@
 #     - shared/formatting.md
 #     - shared/reporting.md
 #
-# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"91032ecfa54c2eb752ae9650bb36f90cafeb340227e550a82dd9f04aca53274f","compiler_version":"v0.56.1","strict":true}
+# gh-aw-metadata: {"schema_version":"v2","frontmatter_hash":"859e9e278c25d037c815ae061cb8c1e348083f31959554155c3dc26771b041fa","compiler_version":"v0.56.1","strict":true}
 
 name: "PR / Review"
 "on":
@@ -1038,7 +1038,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           WORKFLOW_NAME: "PR / Review"
-          WORKFLOW_DESCRIPTION: "Code reviewer for the Tasks platform. Reviews every PR against the spec\nand project conventions.\n- Checks correctness, spec compliance, and code quality\n- Uses REQUEST_CHANGES for blocking issues, COMMENT for suggestions\n- Never writes implementation code — review only"
+          WORKFLOW_DESCRIPTION: "Code reviewer for the Tasks platform. Reviews every PR against the spec\nand project conventions.\n- Checks correctness, spec compliance, and code quality\n- Leaves inline comments on issues (no REQUEST_CHANGES to avoid blocking PRs)\n- Never writes implementation code — review only"
           HAS_PATCH: ${{ steps.collect_output.outputs.has_patch }}
         with:
           script: |
