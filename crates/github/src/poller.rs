@@ -56,11 +56,15 @@ impl RepoPoller {
     /// On first call, fetches all open items. On subsequent calls, only items
     /// with `updated_at` after the high-water mark.
     ///
+    /// Issues and PRs are fetched concurrently to halve the per-poll latency.
+    ///
     /// If the poll fails, the high-water mark is **not** advanced — the next
     /// poll retries the same window.
     pub async fn poll(&mut self) -> Result<PollResult, GitHubError> {
-        let issues = self.poll_issues_inner().await?;
-        let pull_requests = self.poll_pull_requests_inner().await?;
+        let (issues, pull_requests) = tokio::try_join!(
+            self.poll_issues_inner(),
+            self.poll_pull_requests_inner(),
+        )?;
 
         // Advance high-water mark to the max updated_at across all returned items.
         let max_ts = issues

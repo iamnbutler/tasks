@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tasks_github::client::GitHubClient;
@@ -109,10 +109,11 @@ fn pr_response(prs: serde_json::Value) -> serde_json::Value {
 async fn first_poll_fetches_all_open_items() {
     let server = MockServer::start().await;
 
-    // The poller makes separate requests for issues and PRs.
-    // wiremock will match based on request body content.
+    // The poller fetches issues and PRs concurrently. Use body matchers to
+    // route each request to the correct mock regardless of arrival order.
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([
@@ -120,12 +121,12 @@ async fn first_poll_fetches_all_open_items() {
                     sample_issue(2, "2025-01-11T00:00:00Z"),
                 ]))),
         )
-        .up_to_n_times(1)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([
@@ -153,6 +154,7 @@ async fn poll_advances_high_water_mark() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([
@@ -160,12 +162,12 @@ async fn poll_advances_high_water_mark() {
                     sample_issue(2, "2025-01-15T00:00:00Z"),
                 ]))),
         )
-        .up_to_n_times(1)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([
@@ -190,9 +192,11 @@ async fn poll_advances_high_water_mark() {
 async fn poll_does_not_advance_on_failure() {
     let server = MockServer::start().await;
 
-    // First poll succeeds.
+    // First poll succeeds. up_to_n_times(1) ensures these are consumed so the
+    // 401 mock below takes effect for the second poll.
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([
@@ -205,6 +209,7 @@ async fn poll_does_not_advance_on_failure() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([]))),
@@ -220,7 +225,7 @@ async fn poll_does_not_advance_on_failure() {
     let mark_after_first = poller.since();
     assert!(mark_after_first.is_some());
 
-    // Second poll fails (server returns 401).
+    // Second poll fails (server returns 401 for all requests).
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
@@ -240,6 +245,7 @@ async fn poll_issues_only() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([
@@ -265,6 +271,7 @@ async fn poll_pull_requests_only() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([
@@ -288,9 +295,11 @@ async fn poll_pull_requests_only() {
 async fn empty_poll_does_not_clear_high_water_mark() {
     let server = MockServer::start().await;
 
-    // First poll returns items.
+    // First poll returns items. up_to_n_times(1) ensures these are consumed
+    // before the empty fallback mocks below.
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([
@@ -303,6 +312,7 @@ async fn empty_poll_does_not_clear_high_water_mark() {
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([]))),
@@ -318,19 +328,20 @@ async fn empty_poll_does_not_clear_high_water_mark() {
     let first_mark = poller.since();
     assert!(first_mark.is_some());
 
-    // Second poll returns nothing.
+    // Second poll returns nothing (fallback mocks serve empty responses).
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListIssues"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(issue_response(json!([]))),
         )
-        .up_to_n_times(1)
         .mount(&server)
         .await;
 
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("ListPullRequests"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(pr_response(json!([]))),
