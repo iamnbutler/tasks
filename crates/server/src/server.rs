@@ -498,6 +498,103 @@ impl Server {
         Ok(flushed)
     }
 
+    /// Approve a merge queue entry and emit a `merge:approved` event.
+    ///
+    /// In Play mode, this is called by the orchestrator loop after a
+    /// positive evaluation. The entry transitions from Pending to Approved.
+    pub async fn approve_merge_entry(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .approve(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        let event = Event::new(
+            EventType::MergeApproved,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({ "entry_id": entry_id, "reasoning": reasoning }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Reject a merge queue entry, re-dispatch the task with feedback,
+    /// and emit a `merge:rejected` event.
+    ///
+    /// The task transitions back to Waiting so the dispatch loop picks
+    /// it up and starts a fresh session with the feedback as context.
+    pub async fn reject_merge_entry(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+        feedback: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .reject(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit rejection event
+        let event = Event::new(
+            EventType::MergeRejected,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "reasoning": reasoning,
+                "feedback": feedback,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition task back to Waiting for re-dispatch (scenario 2)
+        self.set_task_state(&task_id, TaskState::Waiting, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Emit an orchestrator:decision event recording an evaluation.
+    ///
+    /// Called for every evaluation regardless of mode — this is the
+    /// audit trail of the orchestrator's judgment.
+    pub async fn emit_orchestrator_decision(
+        &self,
+        task_id: &str,
+        entry_id: &str,
+        approved: bool,
+        reasoning: &str,
+    ) -> Result<(), ServerError> {
+        let event = Event::new(
+            EventType::OrchestratorDecision,
+            task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "approved": approved,
+                "reasoning": reasoning,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     // --- Presence (spec Section 4.1) ---
 
     /// Whether the human is present (has active GUI connections).
@@ -905,5 +1002,70 @@ mod tests {
         // Now state should be populated
         assert!(server.get_project("p1").await.is_some());
         assert!(server.get_task("t1").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn approve_merge_entry_transitions_and_emits() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Drain the queued and task-created events
+        while rx.try_recv().is_ok() {}
+
+        server.approve_merge_entry("mq-1", "looks good").await.unwrap();
+
+        // Check the entry is approved
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Approved);
+        drop(state);
+
+        // Check event was emitted
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::MergeApproved);
+        assert_eq!(event.actor, Actor::Orchestrator);
+    }
+
+    #[tokio::test]
+    async fn reject_merge_entry_transitions_task_to_waiting() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        task.set_state(TaskState::AwaitingMerge);
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        server
+            .reject_merge_entry("mq-1", "needs tests", Some("add unit tests for the new endpoint"))
+            .await
+            .unwrap();
+
+        // Entry should be rejected
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Rejected);
+        drop(state);
+
+        // Task should be back to Waiting for re-dispatch
+        let task = server.get_task("task-1").await.unwrap();
+        assert_eq!(task.state, TaskState::Waiting);
     }
 }
