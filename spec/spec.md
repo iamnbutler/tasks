@@ -294,15 +294,15 @@ Fields:
 
 _See Section 7 for full merge queue specification._
 
-The merge queue tracks PRs, not tasks. Each entry represents a pull request that is a candidate
-for merging. A `task_id` is stored as a back-reference to the task that produced the PR (if any),
-but the queue is PR-centric.
+Each entry represents a pull request that is a candidate for merging. The merge queue is
+PR-centric — it tracks pull requests, not tasks. A task may produce a PR, in which case the
+entry links back to it, but the queue operates on PRs independently.
 
 Fields:
 
 - `id` (string) — queue entry ID
-- `task_id` (string) — the task that produced this PR, if known
-- `pr_url` (string) — GitHub pull request URL
+- `task_id` (string) — the originating task, if any
+- `pr_url` (string) — pull request URL
 - `status` (string) — pending, approved, rejected, merged, conflict
 - `queued_at` (timestamp)
 
@@ -331,7 +331,7 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.2 Pause
 
 - Agents are dispatched and work on tasks normally.
-- PRs discovered by the poller enter the merge queue.
+- Open pull requests enter the merge queue.
 - The merge queue is held: nothing merges automatically.
 - The orchestrator continues to manage agents, answer questions, and evaluate quality — but does
   not approve merges.
@@ -344,8 +344,8 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.3 Play
 
 - Agents are dispatched and work on tasks normally.
-- The merge queue is continuously active: as PRs are discovered, evaluated by the orchestrator,
-  and approved, they merge automatically.
+- The merge queue is continuously active: as pull requests arrive, pass quality evaluation,
+  and are approved by the orchestrator, they merge automatically.
 - The orchestrator owns merge authority. The human can still intervene at any time.
 - Play is the fully autonomous mode. The human delegates merge authority to the orchestrator and
   may step away.
@@ -362,20 +362,20 @@ Mode transitions follow a severity ordering: Stop < Pause < Play.
 
 ## 7. Merge Queue
 
-The merge queue is a list of pull requests and the order in which they should be merged. It is
-decoupled from tasks — tasks may or may not produce PRs, and PRs may or may not originate from
-tasks. The queue is populated by GitHub polling: when the poller discovers an open PR on a tracked
-repository, it is added to the queue.
+The merge queue is an ordered list of pull requests waiting to be merged. It is independent of
+tasks — a task may produce a PR that enters the queue, but the queue itself operates on pull
+requests regardless of how they originated. Open PRs on tracked repositories are automatically
+added to the queue.
 
 ### 7.1 Queue Entry Lifecycle
 
-1. The GitHub poller discovers an open PR on a tracked repository.
+1. An open pull request is discovered on a tracked repository.
 2. A merge queue entry is created with status `pending`.
 3. The merge authority (human or orchestrator, depending on mode) reviews and either
    approves or rejects.
 4. Approved entries are merged (in Play mode, continuously; in Pause mode, via Flush).
-5. If rejected, the entry is removed from the queue. If the PR was produced by a task,
-   the task may be sent back to the implementor with feedback.
+5. If rejected, the entry is removed from the queue. If the PR originated from a task,
+   that task may be re-engaged with feedback.
 
 ### 7.2 Merge Authority
 
@@ -392,21 +392,21 @@ or drop into a task to give feedback. The mode controls the default flow, not th
 
 ### 7.3 Quality Evaluation
 
-In Play mode, the orchestrator evaluates each pending PR before approving it:
+Before approving a merge, the orchestrator evaluates the pull request:
 
-- Does the implementation address the issue as described?
+- Does the change address the associated issue as described?
 - Do tests pass (CI/testing state)?
 - Are there conflicts that need resolution?
 - Does the change meet project conventions and quality standards?
 
-If the orchestrator determines the work isn't ready, it rejects the entry. If the PR was
-produced by a task, the task may be sent back to the implementor with specific feedback.
+If the work isn't ready, the orchestrator rejects the entry. If the PR originated from a task,
+that task may be re-engaged with specific feedback rather than queuing a bad merge.
 
 ### 7.4 Conflicts
 
 When a pending merge has conflicts:
 
-- The task transitions to the `conflict` state.
+- The entry transitions to the `conflict` status.
 - The merge remains in the queue but is not eligible until the conflict is resolved.
 - The orchestrator triages the conflict:
   - In Play mode: the orchestrator resolves the conflict autonomously — typically re-engaging the
