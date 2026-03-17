@@ -478,6 +478,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_session_mgr = session_manager.clone();
     let dispatch_interval = config.dispatch_interval;
     let max_sessions = config.max_sessions;
+    let max_retries = config.max_retries;
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
     let dispatch_github_token = config.github_token.clone();
@@ -631,16 +632,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .await
                             {
                                 error!(task_id = %task_id, error = %e, "failed to start session");
-                                // Transition back to Waiting so dispatcher can retry.
+                                // Treat as a failure with no progress so backoff kicks in.
+                                // This prevents tight retry loops when containers can't start.
                                 if let Err(e2) = dispatch_server
-                                    .set_task_state(
-                                        task_id,
-                                        models::task::TaskState::Waiting,
-                                        events::Actor::System,
-                                    )
+                                    .handle_task_failure(task_id, false, max_retries)
                                     .await
                                 {
-                                    warn!(task_id = %task_id, error = %e2, "failed to revert task to waiting — task may be stuck");
+                                    warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
                                 }
                             }
                         }
