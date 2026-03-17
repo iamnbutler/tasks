@@ -18,6 +18,7 @@ pub mod components;
 pub(crate) mod sse;
 pub mod state;
 pub mod theme;
+pub mod views;
 
 pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
 pub use theme::{ComponentTheme, Theme, colors, radius, spacing, style_helpers, typography};
