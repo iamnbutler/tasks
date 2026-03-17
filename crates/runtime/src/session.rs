@@ -156,7 +156,9 @@ impl<R: ContainerRuntime> Session<R> {
         self.state = SessionState::Ended;
 
         if let Some(transport) = self.transport.take() {
-            let _ = transport.close();
+            if let Err(e) = transport.close() {
+                tracing::warn!(container_id = ?self.container_id, error = %e, "failed to close transport during session destroy");
+            }
         }
 
         if let Some(ref container_id) = self.container_id {

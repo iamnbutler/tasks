@@ -147,11 +147,18 @@ export const columns: ColumnDef<Task>[] = [
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title="ID" />
     ),
-    cell: ({ row }) => (
-      <span className="font-mono text-xs text-muted-foreground">
-        {row.getValue<string>("id").slice(0, 8)}
-      </span>
-    ),
+    cell: ({ row }) => {
+      const source = row.original.source;
+      const label =
+        source.type === "github_issue" || source.type === "github_pr"
+          ? `#${source.number}`
+          : row.original.id.slice(0, 8);
+      return (
+        <span className="font-mono text-xs text-muted-foreground">
+          {label}
+        </span>
+      );
+    },
     enableSorting: false,
     enableHiding: false,
   },

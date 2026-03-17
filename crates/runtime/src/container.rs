@@ -155,8 +155,10 @@ impl ContainerRuntime for AppleContainerRuntime {
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), ContainerError> {
-        // Stop first (ignore errors — may already be stopped)
-        let _ = self.stop(container_id).await;
+        // Stop first — may already be stopped, so warn rather than error
+        if let Err(e) = self.stop(container_id).await {
+            tracing::warn!(container_id = %container_id, error = %e, "failed to stop container before destroy (may already be stopped)");
+        }
 
         let output = Command::new("container")
             .arg("rm")
