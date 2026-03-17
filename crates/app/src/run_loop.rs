@@ -236,30 +236,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Create PR and merge queue entry when task reaches awaiting_merge (spec §7.1)
+                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
+                // The PR URL is discovered by polling GitHub for PRs on the task branch
+                // — agents create PRs themselves (spec §1: platform only reads GitHub).
                 // TODO: orchestrator quality gate before enqueuing (spec §7.3)
                 if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
                     let entry_id = uuid::Uuid::new_v4().to_string();
                     let mut entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
 
-                    // Create a PR from the task branch
+                    // Discover PR URL from GitHub if the agent created one
                     if let Some(task) = event_handler_server.get_task(task_id).await {
                         if let Some(project) = event_handler_server.get_project(&task.project).await {
                             let parts: Vec<&str> = project.repo.split('/').collect();
                             if parts.len() == 2 {
                                 let head = format!("tasks/{}", task.id);
-                                let pr_title = task.title.clone();
-                                let pr_body = format!(
-                                    "Automated PR for task `{}`.\n\nBranch: `{}`",
-                                    task.id, head
-                                );
-                                match github.create_pull_request(parts[0], parts[1], &head, "main", &pr_title, &pr_body).await {
-                                    Ok((_number, url)) => {
-                                        info!(task_id = %task_id, pr_url = %url, "created PR");
+                                match github.find_pr_for_branch(parts[0], parts[1], &head).await {
+                                    Ok(Some(url)) => {
+                                        info!(task_id = %task_id, pr_url = %url, "found PR for task branch");
                                         entry.pr_url = Some(url);
                                     }
+                                    Ok(None) => {
+                                        info!(task_id = %task_id, "no PR found for task branch");
+                                    }
                                     Err(e) => {
-                                        warn!(task_id = %task_id, error = %e, "failed to create PR");
+                                        warn!(task_id = %task_id, error = %e, "failed to query PRs for task branch");
                                     }
                                 }
                             }
