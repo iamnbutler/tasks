@@ -1,6 +1,13 @@
-//! Tasks Desktop - GPUI-based desktop application for the Tasks platform.
+//! Tasks Desktop — GPUI-based desktop application.
+//!
+//! This crate provides a native desktop UI for the Tasks platform,
+//! built with GPUI (Zed's GPU-accelerated UI framework).
 
 use gpui::{div, prelude::*, rgb, Context, SharedString, Window};
+
+mod sse;
+
+pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
 
 /// Root view for the Tasks desktop application.
 pub struct RootView {
