@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
+use rand::Rng;
 
 use crate::model::task::{Task, TaskState};
 
@@ -20,12 +21,34 @@ pub struct DispatchPlan {
     pub new_work: Vec<String>,
 }
 
-/// Calculate backoff duration for a given retry count (spec §13.2).
-/// Base: 5s, multiplier: 2x, max: 300s. No jitter in the check (jitter is for scheduling).
+/// Minimum backoff duration in seconds.
+const MIN_BACKOFF_SECS: i64 = 5;
+/// Maximum backoff duration in seconds.
+const MAX_BACKOFF_SECS: i64 = 300;
+
+/// Calculate base backoff duration for a given retry count (spec §13.2).
+/// Base: 5s, multiplier: 2x, max: 300s.
+/// This returns the deterministic base duration without jitter.
 pub fn backoff_duration(retry_count: u32) -> Duration {
-    let base_secs = 5i64;
-    let secs = base_secs * 2i64.pow(retry_count.min(6));
-    Duration::seconds(secs.min(300))
+    let secs = MIN_BACKOFF_SECS * 2i64.pow(retry_count.min(6));
+    Duration::seconds(secs.min(MAX_BACKOFF_SECS))
+}
+
+/// Calculate backoff duration with ±25% jitter (spec §13.2).
+/// Jitter prevents thundering herd when multiple tasks fail simultaneously.
+/// The result is clamped to [5s, 300s].
+pub fn backoff_duration_with_jitter(retry_count: u32) -> Duration {
+    let base = backoff_duration(retry_count);
+    let base_secs = base.num_seconds() as f64;
+
+    // Apply ±25% jitter
+    let mut rng = rand::rng();
+    let jitter_factor = rng.random_range(0.75..=1.25);
+    let jittered_secs = (base_secs * jitter_factor).round() as i64;
+
+    // Clamp to [MIN_BACKOFF_SECS, MAX_BACKOFF_SECS]
+    let clamped_secs = jittered_secs.clamp(MIN_BACKOFF_SECS, MAX_BACKOFF_SECS);
+    Duration::seconds(clamped_secs)
 }
 
 /// Evaluate which tasks should be dispatched (spec §12.6).
@@ -74,7 +97,7 @@ pub fn evaluate(
             if t.state != TaskState::Waiting {
                 return false;
             }
-            // Check backoff
+            // Check backoff (jitter is applied at scheduling time, not check time)
             if let Some(failure_at) = t.last_failure_at {
                 if failure_at + backoff_duration(t.retry_count) > now {
                     return false;
@@ -367,6 +390,48 @@ mod tests {
         assert_eq!(backoff_duration(6), Duration::seconds(300));
         // retry 10: capped at retry_count.min(6), so 5 * 2^6 = 320 → capped at 300s
         assert_eq!(backoff_duration(10), Duration::seconds(300));
+    }
+
+    #[test]
+    fn backoff_duration_with_jitter_bounds() {
+        // Test that jittered backoff stays within ±25% of base, clamped to [5s, 300s].
+        // Run multiple times to exercise the randomness.
+        for _ in 0..100 {
+            // retry 0: base=5s, jitter range would be 3.75s-6.25s, clamped to 5s-6s
+            let d0 = backoff_duration_with_jitter(0);
+            assert!(d0.num_seconds() >= 5, "retry 0: got {} < 5", d0.num_seconds());
+            assert!(d0.num_seconds() <= 7, "retry 0: got {} > 7", d0.num_seconds());
+
+            // retry 2: base=20s, jitter range is 15s-25s
+            let d2 = backoff_duration_with_jitter(2);
+            assert!(d2.num_seconds() >= 15, "retry 2: got {} < 15", d2.num_seconds());
+            assert!(d2.num_seconds() <= 25, "retry 2: got {} > 25", d2.num_seconds());
+
+            // retry 6: base=300s (capped), jitter range would be 225s-375s, clamped to 225s-300s
+            let d6 = backoff_duration_with_jitter(6);
+            assert!(d6.num_seconds() >= 225, "retry 6: got {} < 225", d6.num_seconds());
+            assert!(d6.num_seconds() <= 300, "retry 6: got {} > 300", d6.num_seconds());
+        }
+    }
+
+    #[test]
+    fn backoff_duration_with_jitter_minimum_enforced() {
+        // Even with minimum jitter factor (0.75), the result should never go below 5s.
+        // retry 0: base=5s, 5 * 0.75 = 3.75s, should clamp to 5s.
+        for _ in 0..100 {
+            let d = backoff_duration_with_jitter(0);
+            assert!(d.num_seconds() >= 5, "minimum not enforced: got {}", d.num_seconds());
+        }
+    }
+
+    #[test]
+    fn backoff_duration_with_jitter_maximum_enforced() {
+        // Even with maximum jitter factor (1.25), the result should never exceed 300s.
+        // retry 6: base=300s, 300 * 1.25 = 375s, should clamp to 300s.
+        for _ in 0..100 {
+            let d = backoff_duration_with_jitter(6);
+            assert!(d.num_seconds() <= 300, "maximum not enforced: got {}", d.num_seconds());
+        }
     }
 
     #[test]
