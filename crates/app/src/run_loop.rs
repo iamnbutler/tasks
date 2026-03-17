@@ -670,6 +670,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let orch_server = server.clone();
     let orch = orchestrator.clone();
     let orch_event_bus = server.event_bus.clone();
+    let orch_github_token = config.github_token.clone();
+
     let orchestrator_interval = config.dispatch_interval; // reuse dispatch interval for now
 
     // Problem tracker for mode lowering (spec §6.4)
@@ -678,7 +680,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let orchestrator_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(orchestrator_interval);
         let mut event_rx = orch_event_bus.subscribe();
-
+        let merge_github = GitHubClient::new(&orch_github_token);
         loop {
             // Tick on interval or on relevant events
             let event_opt = tokio::select! {
@@ -775,7 +777,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     .collect()
             };
 
-            for (entry_id, task_id, _pr_url) in pending {
+            for (entry_id, task_id, pr_url) in pending {
                 // Build evaluation context
                 let (task, project) = {
                     let state = orch_server.state.read().await;
@@ -858,6 +860,29 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             .await
                         {
                             error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
+                        }
+
+                        // Execute the merge on GitHub (Play mode = continuous merge authority)
+                        if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                            match merge_github.merge_pull_request(&owner, &repo, number).await {
+                                Ok(true) => {
+                                    info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged successfully");
+                                    if let Err(e) = orch_server.mark_entry_merged(&entry_id, &pr_url).await {
+                                        error!(entry_id = %entry_id, error = %e, "failed to mark entry as merged");
+                                    }
+                                }
+                                Ok(false) => {
+                                    warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable (conflicts or checks failing)");
+                                    if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url).await {
+                                        error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR on GitHub");
+                                }
+                            }
+                        } else {
+                            warn!(entry_id = %entry_id, pr_url = %pr_url, "could not parse PR URL for merge execution");
                         }
                     } else {
                         // Track rejection and check for mode lowering

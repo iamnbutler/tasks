@@ -220,13 +220,44 @@ async fn list_merge_queue(
 }
 
 /// POST /api/merge-queue/flush — Flush approved entries (Pause mode only).
+///
+/// Flushes approved entries and executes the actual GitHub merges.
 async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<String>>, ApiError> {
-    state
+    let flushed_entries = state
         .server
         .flush_merge_queue()
         .await
-        .map(Json)
-        .map_err(ApiError::Server)
+        .map_err(ApiError::Server)?;
+
+    // Execute GitHub merges for each flushed entry
+    let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+    if !github_token.is_empty() {
+        let client = tasks_github::client::GitHubClient::new(&github_token);
+        for (entry_id, pr_url) in &flushed_entries {
+            if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+                match client.merge_pull_request(&owner, &repo, number).await {
+                    Ok(true) => {
+                        tracing::info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged via flush");
+                        if let Err(e) = state.server.mark_entry_merged(entry_id, pr_url).await {
+                            tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry merged after flush");
+                        }
+                    }
+                    Ok(false) => {
+                        tracing::warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable during flush");
+                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url).await {
+                            tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict after flush");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR during flush");
+                    }
+                }
+            }
+        }
+    }
+
+    let ids: Vec<String> = flushed_entries.into_iter().map(|(id, _)| id).collect();
+    Ok(Json(ids))
 }
 
 /// POST /api/merge-queue/:id/approve — Approve a merge queue entry.

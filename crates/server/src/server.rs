@@ -500,29 +500,40 @@ impl Server {
 
     /// Flush the merge queue (spec Section 6.2).
     ///
-    /// Only valid in Pause mode.
-    pub async fn flush_merge_queue(&self) -> Result<Vec<String>, ServerError> {
-        let mut state = self.state.write().await;
-        let mode = state.mode;
-        let flushed = state
-            .merge_queue
-            .flush(mode)
-            .map_err(|e| ServerError::EventStore(events::StoreError::Io(
-                std::io::Error::other(e.to_string()),
-            )))?;
+    /// Only valid in Pause mode. Returns (entry_id, pr_url) pairs for
+    /// the caller to execute the actual GitHub merges.
+    pub async fn flush_merge_queue(&self) -> Result<Vec<(String, String)>, ServerError> {
+        let flushed_entries = {
+            let mut state = self.state.write().await;
+            let mode = state.mode;
+            // Collect entry details before flushing
+            let entries: Vec<(String, String)> = state
+                .merge_queue
+                .approved()
+                .iter()
+                .map(|e| (e.id.clone(), e.pr_url.clone()))
+                .collect();
+            state
+                .merge_queue
+                .flush(mode)
+                .map_err(|e| ServerError::EventStore(events::StoreError::Io(
+                    std::io::Error::other(e.to_string()),
+                )))?;
+            entries
+        };
 
-        drop(state);
+        let ids: Vec<String> = flushed_entries.iter().map(|(id, _)| id.clone()).collect();
 
         // Emit flush event
         let event = Event::new(
             EventType::SystemFlush,
             "system",
             Actor::Human,
-            serde_json::json!({ "flushed": flushed }),
+            serde_json::json!({ "flushed": ids }),
         );
         self.event_bus.publish(event).await?;
 
-        Ok(flushed)
+        Ok(flushed_entries)
     }
 
     /// Approve a merge queue entry and emit a `merge:approved` event.
@@ -552,6 +563,69 @@ impl Server {
             serde_json::json!({ "entry_id": entry_id, "reasoning": reasoning }),
         );
         self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Mark a merge queue entry as merged and transition the linked task
+    /// to Completed. Emits `merge:completed` and `task:state:completed`.
+    pub async fn mark_entry_merged(
+        &self,
+        entry_id: &str,
+        pr_url: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .mark_merged(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        let event = Event::new(
+            EventType::MergeCompleted,
+            &task_id,
+            Actor::System,
+            serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition linked task to Completed (if task_id is non-empty)
+        if !task_id.is_empty() {
+            self.set_task_state(&task_id, TaskState::Completed, Actor::System)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Mark a merge queue entry as conflicted. Emits `merge:conflict`.
+    pub async fn mark_entry_conflict(
+        &self,
+        entry_id: &str,
+        pr_url: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .mark_conflict(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        let event = Event::new(
+            EventType::MergeConflict,
+            &task_id,
+            Actor::System,
+            serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url }),
+        );
+        self.event_bus.publish(event).await?;
+
         Ok(())
     }
 
