@@ -316,6 +316,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             | EventType::TaskStateFailed
                             | EventType::TaskStateCancelled
                             | EventType::TaskStateWaiting
+                            | EventType::HumanAnswered
                             | EventType::SystemModePause
                             | EventType::SystemModePlay
                         ),
@@ -329,7 +330,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Run dispatch
-            let pending_answers: Vec<String> = Vec::new(); // TODO: track pending answers
+            let pending_answers = dispatch_server.take_pending_answers();
             match dispatch_server
                 .run_dispatch(&pending_answers, max_sessions)
                 .await

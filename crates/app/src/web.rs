@@ -278,6 +278,8 @@ async fn set_mode(
 }
 
 /// POST /api/tasks/:id/chat — Send a chat message to a running session (spec §9.2).
+///
+/// Also marks the task as having a pending answer for dispatch resume (spec §12.6).
 async fn send_chat(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -290,6 +292,14 @@ async fn send_chat(
     sm.send_chat(&id, req.message)
         .await
         .map_err(|e| ApiError::SessionManager(e.to_string()))?;
+
+    // Mark pending answer for dispatch resume (spec §12.1, §12.6)
+    state
+        .server
+        .mark_pending_answer(&id)
+        .await
+        .map_err(ApiError::Server)?;
+
     Ok(StatusCode::OK)
 }
 

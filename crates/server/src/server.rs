@@ -3,7 +3,7 @@
 //! The long-running process that hosts the event log, task state,
 //! merge queue, scheduler, and serves the web GUI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -82,6 +82,9 @@ pub struct Server {
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
     pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    /// Task IDs that have pending answers (messages received while in Question state).
+    /// Used by the dispatcher to identify resume candidates (spec §12.6).
+    pending_answers: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl Server {
@@ -91,6 +94,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: None,
+            pending_answers: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -101,6 +105,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: Some(Arc::new(StdMutex::new(store))),
+            pending_answers: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -602,6 +607,47 @@ impl Server {
         self.presence.is_present()
     }
 
+    // --- Pending answers (spec §12.6) ---
+
+    /// Mark a task as having a pending answer and emit a human:answered event.
+    ///
+    /// Called when a human sends a chat message to a task in Question state.
+    /// The dispatcher will include these tasks in resume candidates.
+    pub async fn mark_pending_answer(&self, task_id: &str) -> Result<(), ServerError> {
+        {
+            let mut pending = self.pending_answers.lock().unwrap();
+            pending.insert(task_id.to_string());
+        }
+
+        // Emit human:answered event (spec §12.1 dispatch trigger)
+        let event = Event::new(
+            EventType::HumanAnswered,
+            task_id,
+            Actor::Human,
+            serde_json::json!({}),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Get and clear all pending answers.
+    ///
+    /// Called by the dispatch loop to get task IDs with pending answers.
+    /// Returns the set and clears it atomically.
+    pub fn take_pending_answers(&self) -> Vec<String> {
+        let mut pending = self.pending_answers.lock().unwrap();
+        let result: Vec<String> = pending.drain().collect();
+        result
+    }
+
+    /// Clear a specific task's pending answer flag.
+    ///
+    /// Called when a task transitions out of Question state.
+    pub fn clear_pending_answer(&self, task_id: &str) {
+        let mut pending = self.pending_answers.lock().unwrap();
+        pending.remove(task_id);
+    }
+
     // --- Lifecycle ---
 
     /// Emit the system:started event (spec Section 8.3).
@@ -1067,5 +1113,81 @@ mod tests {
         // Task should be back to Waiting for re-dispatch
         let task = server.get_task("task-1").await.unwrap();
         assert_eq!(task.state, TaskState::Waiting);
+    }
+
+    #[tokio::test]
+    async fn pending_answers_tracking() {
+        let server = test_server().await;
+
+        // Initially no pending answers
+        assert!(server.take_pending_answers().is_empty());
+
+        // Mark a task as having a pending answer
+        server.mark_pending_answer("task-1").await.unwrap();
+        server.mark_pending_answer("task-2").await.unwrap();
+
+        // Take returns the pending answers and clears them
+        let pending = server.take_pending_answers();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&"task-1".to_string()));
+        assert!(pending.contains(&"task-2".to_string()));
+
+        // Second take returns empty
+        assert!(server.take_pending_answers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_answer_emits_event() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        server.mark_pending_answer("task-1").await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::HumanAnswered);
+        assert_eq!(event.task, "task-1");
+        assert_eq!(event.actor, Actor::Human);
+    }
+
+    #[tokio::test]
+    async fn clear_pending_answer() {
+        let server = test_server().await;
+
+        server.mark_pending_answer("task-1").await.unwrap();
+        server.mark_pending_answer("task-2").await.unwrap();
+
+        // Clear one task
+        server.clear_pending_answer("task-1");
+
+        // Only task-2 should remain
+        let pending = server.take_pending_answers();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&"task-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pending_answer_dispatch_integration() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Create a task in Question state
+        let mut task = Task::new("t1", TaskSource::Internal, "Task", "proj-1");
+        task.set_state(TaskState::Question);
+        server.add_task(task).await.unwrap();
+
+        // Mark pending answer
+        server.mark_pending_answer("t1").await.unwrap();
+
+        // Take pending answers and run dispatch
+        let pending = server.take_pending_answers();
+        let plan = server.run_dispatch(&pending, 5).await.unwrap();
+
+        // Task should be in resume list
+        assert_eq!(plan.resume, vec!["t1"]);
+
+        // Task should now be Running
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.state, TaskState::Running);
     }
 }

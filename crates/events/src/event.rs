@@ -51,6 +51,9 @@ pub enum EventType {
     OrchestratorEscalation,
     OrchestratorDecision,
 
+    // Human events
+    HumanAnswered,
+
     // System events
     SystemStarted,
     SystemModePlay,
@@ -86,6 +89,7 @@ impl EventType {
             Self::OrchestratorFeedback => "orchestrator:feedback",
             Self::OrchestratorEscalation => "orchestrator:escalation",
             Self::OrchestratorDecision => "orchestrator:decision",
+            Self::HumanAnswered => "human:answered",
             Self::SystemStarted => "system:started",
             Self::SystemModePlay => "system:mode:play",
             Self::SystemModePause => "system:mode:pause",
@@ -149,6 +153,7 @@ impl TryFrom<String> for EventType {
             "orchestrator:feedback" => Ok(Self::OrchestratorFeedback),
             "orchestrator:escalation" => Ok(Self::OrchestratorEscalation),
             "orchestrator:decision" => Ok(Self::OrchestratorDecision),
+            "human:answered" => Ok(Self::HumanAnswered),
             "system:started" => Ok(Self::SystemStarted),
             "system:mode:play" => Ok(Self::SystemModePlay),
             "system:mode:pause" => Ok(Self::SystemModePause),
