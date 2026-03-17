@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// A task may originate from a GitHub issue, a GitHub PR, or be created
 /// internally by the orchestrator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskSource {
     GithubIssue {

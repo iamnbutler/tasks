@@ -53,7 +53,7 @@ export type MergeStatus =
 export interface MergeQueueEntry {
   id: string;
   task_id: string;
-  pr_url: string | null;
+  pr_url: string;
   status: MergeStatus;
   queued_at: string;
 }

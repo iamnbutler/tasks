@@ -146,7 +146,7 @@ impl Store {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
             ))
@@ -181,7 +181,7 @@ impl Store {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
             ))
@@ -505,24 +505,24 @@ mod tests {
     #[test]
     fn save_and_get_merge_entry() {
         let store = Store::open_memory().unwrap();
-        let entry = MergeQueueEntry::new("m1", "t1");
+        let entry = MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1");
         store.save_merge_entry(&entry).unwrap();
 
         let loaded = store.get_merge_entry("m1").unwrap().unwrap();
         assert_eq!(loaded.id, "m1");
         assert_eq!(loaded.task_id, "t1");
         assert_eq!(loaded.status, MergeStatus::Pending);
-        assert!(loaded.pr_url.is_none());
+        assert_eq!(loaded.pr_url, "https://github.com/test/repo/pull/1");
     }
 
     #[test]
     fn list_merge_entries() {
         let store = Store::open_memory().unwrap();
         store
-            .save_merge_entry(&MergeQueueEntry::new("m1", "t1"))
+            .save_merge_entry(&MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1"))
             .unwrap();
         store
-            .save_merge_entry(&MergeQueueEntry::new("m2", "t2"))
+            .save_merge_entry(&MergeQueueEntry::new("m2", "t2", "https://github.com/test/repo/pull/2"))
             .unwrap();
 
         let entries = store.list_merge_entries().unwrap();
@@ -533,7 +533,7 @@ mod tests {
     fn delete_merge_entry() {
         let store = Store::open_memory().unwrap();
         store
-            .save_merge_entry(&MergeQueueEntry::new("m1", "t1"))
+            .save_merge_entry(&MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1"))
             .unwrap();
         assert!(store.delete_merge_entry("m1").unwrap());
         assert!(store.get_merge_entry("m1").unwrap().is_none());
@@ -550,7 +550,7 @@ mod tests {
             ("m4", MergeStatus::Merged),
             ("m5", MergeStatus::Conflict),
         ] {
-            let mut entry = MergeQueueEntry::new(id, "t1");
+            let mut entry = MergeQueueEntry::new(id, "t1", "https://github.com/test/repo/pull/1");
             entry.status = status;
             store.save_merge_entry(&entry).unwrap();
 
@@ -562,15 +562,11 @@ mod tests {
     #[test]
     fn merge_entry_with_pr_url() {
         let store = Store::open_memory().unwrap();
-        let mut entry = MergeQueueEntry::new("m1", "t1");
-        entry.pr_url = Some("https://github.com/owner/repo/pull/1".to_string());
+        let entry = MergeQueueEntry::new("m1", "t1", "https://github.com/owner/repo/pull/1");
         store.save_merge_entry(&entry).unwrap();
 
         let loaded = store.get_merge_entry("m1").unwrap().unwrap();
-        assert_eq!(
-            loaded.pr_url.as_deref(),
-            Some("https://github.com/owner/repo/pull/1")
-        );
+        assert_eq!(loaded.pr_url, "https://github.com/owner/repo/pull/1");
     }
 
     // ── Task tests ───────────────────────────────────────────────

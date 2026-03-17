@@ -152,7 +152,7 @@ mod tests {
     use super::*;
 
     fn entry(id: &str, task_id: &str) -> MergeQueueEntry {
-        MergeQueueEntry::new(id, task_id)
+        MergeQueueEntry::new(id, task_id, "https://github.com/test/repo/pull/1")
     }
 
     #[test]

@@ -164,6 +164,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
+
+                            // Add open PRs to the merge queue if not already tracked.
+                            let pr_url = format!(
+                                "https://github.com/{}/{}/pull/{}",
+                                pr.owner, pr.repo, pr.number
+                            );
+                            let already_queued = {
+                                let state = poll_server.state.read().await;
+                                state.merge_queue.entries().iter().any(|e| e.pr_url == pr_url)
+                            };
+                            if !already_queued {
+                                let entry_id = uuid::Uuid::new_v4().to_string();
+                                // task_id is informational — link to the task that
+                                // may have produced this PR, if one exists.
+                                let task_id = poll_server.task_id_for_source(&source).await
+                                    .unwrap_or_default();
+                                let entry = models::merge_queue::MergeQueueEntry::new(
+                                    &entry_id, &task_id, &pr_url,
+                                );
+                                info!(pr = pr.number, pr_url = %pr_url, "adding PR to merge queue");
+                                if let Err(e) = poll_server.add_to_merge_queue(entry).await {
+                                    error!(pr = pr.number, error = %e, "failed to add PR to merge queue");
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -231,17 +255,6 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if !matches!(e, server::ServerError::TaskNotFound(_)) {
                             error!(task_id = %task_id, error = %e, "failed to update task state from event");
                         }
-                    }
-                }
-
-                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
-                // TODO: orchestrator quality gate before enqueuing (spec §7.3)
-                if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
-                    let entry_id = uuid::Uuid::new_v4().to_string();
-                    let entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
-                    info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
-                    if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
-                        error!(task_id = %task_id, error = %e, "failed to add merge queue entry");
                     }
                 }
             }

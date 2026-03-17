@@ -361,6 +361,49 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // PR discovery
+    // -----------------------------------------------------------------------
+
+    /// Find an open PR for a given head branch. Returns the PR URL if found.
+    ///
+    /// The platform does not create PRs — agents do that inside their sessions
+    /// (spec §1). This method discovers PRs the agent created so the merge
+    /// queue can link to them.
+    pub async fn find_pr_for_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        head: &str,
+    ) -> Result<Option<String>, GitHubError> {
+        let query = r#"
+            query($owner: String!, $name: String!, $head: String!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequests(headRefName: $head, states: [OPEN], first: 1) {
+                        nodes { url }
+                    }
+                }
+            }
+        "#;
+        let variables = json!({ "owner": owner, "name": repo, "head": head });
+
+        let resp: GraphQLResponse<serde_json::Value> =
+            self.execute(query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+
+        let url = data
+            .get("repository")
+            .and_then(|r| r.get("pullRequests"))
+            .and_then(|prs| prs.get("nodes"))
+            .and_then(|nodes| nodes.as_array())
+            .and_then(|nodes| nodes.first())
+            .and_then(|pr| pr.get("url"))
+            .and_then(|u| u.as_str())
+            .map(String::from);
+
+        Ok(url)
+    }
+
+    // -----------------------------------------------------------------------
     // Nested pagination helpers
     // -----------------------------------------------------------------------
 
