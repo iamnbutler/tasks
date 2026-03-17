@@ -378,7 +378,8 @@ fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>
     )
     .unwrap();
     writeln!(out, "- **Issue comments**: Progress updates, research findings, questions, or analysis posted to the issue.").unwrap();
-    writeln!(out, "- **New issues**: Create issues for bugs found, follow-up work, or tasks discovered during implementation.").unwrap();
+    writeln!(out, "- **Issue updates**: Update the current issue with refined scope, implementation plans, or findings. Use `gh issue edit` to update the body or add labels.").unwrap();
+    writeln!(out, "- **New issues**: Create issues for sub-tasks, bugs found, or follow-up work. Breaking a large task into smaller, well-scoped issues is a valuable output — sometimes the best way to \"complete\" a task is to decompose it.").unwrap();
     writeln!(out, "- **Plans or proposals**: Architecture decisions, implementation approaches, or design documents.").unwrap();
     writeln!(
         out,
@@ -420,8 +421,17 @@ fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>
     .unwrap();
     writeln!(
         out,
-        "- **New work items discovered**: Create new issues with `gh issue create` for \
-         each item. Comment on the original issue summarizing what you filed, then close it."
+        "- **Breaking down a large task**: Create new issues with `gh issue create` for \
+         each sub-task. Reference the parent issue in each new issue body. Comment on the \
+         original issue summarizing the breakdown, then close it. This is often the right \
+         approach for ambiguous or large-scoped tasks."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Refining scope or adding context**: Update the issue with `gh issue edit` \
+         to add implementation details, acceptance criteria, or scope clarifications. \
+         Comment explaining what you learned and why you updated the issue."
     )
     .unwrap();
 
@@ -429,8 +439,8 @@ fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>
     writeln!(
         out,
         "Every task should end with a visible artifact on GitHub — a PR, an issue comment, \
-         or a new issue. If the task does not result in a PR, close the issue yourself \
-         when the work is complete."
+         a new issue, or an issue update. If the task does not result in a PR, close the \
+         issue yourself when the work is complete (unless leaving it open for discussion)."
     )
     .unwrap();
 
@@ -497,10 +507,14 @@ mod tests {
         assert!(prompt.contains("**Code changes**"));
         assert!(prompt.contains("**Pull requests**"));
         assert!(prompt.contains("**Issue comments**"));
+        assert!(prompt.contains("**Issue updates**"));
         assert!(prompt.contains("**New issues**"));
         assert!(prompt.contains("**Plans or proposals**"));
         assert!(prompt.contains("**Questions**"));
         assert!(prompt.contains("**Error reports**"));
+        // Issue operations are explicitly encouraged
+        assert!(prompt.contains("gh issue edit"));
+        assert!(prompt.contains("Breaking down a large task"));
     }
 
     #[test]
