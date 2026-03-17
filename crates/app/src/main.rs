@@ -7,7 +7,6 @@ mod config;
 mod memory;
 mod problem_tracker;
 mod run_loop;
-mod tui;
 mod web;
 
 use models::project::Project;
@@ -76,7 +75,7 @@ fn print_usage() {
     eprintln!("Usage: tasks-app <command>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  run [--tui] [--web]     Start the platform (default)");
+    eprintln!("  run [--web]               Start the platform (default)");
     eprintln!("  add-project <owner/repo>  Add a project to track");
     eprintln!("  remove-project <id>       Remove a project");
     eprintln!("  list-projects             List configured projects");
@@ -155,9 +154,6 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            if args.iter().any(|a| a == "--tui") {
-                config.tui = true;
-            }
             if args.iter().any(|a| a == "--web") {
                 config.web = true;
             }
