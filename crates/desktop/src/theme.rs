@@ -8,7 +8,7 @@
 //! - Style helpers for common patterns
 
 use gpui::{hsla, px, Hsla, Pixels, Rgba};
-use models::TaskState;
+use models::task::TaskState;
 
 // =============================================================================
 // Color Palette

@@ -201,11 +201,6 @@ impl Button {
             base = base.border_1().border_color(border_color);
         }
 
-        // Apply underline for link variant
-        if matches!(self.variant, ButtonVariant::Link) {
-            base = base.underline();
-        }
-
         // Apply size-specific padding
         if is_icon {
             base = base.w(px(height));

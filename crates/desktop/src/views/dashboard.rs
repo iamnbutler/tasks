@@ -335,7 +335,7 @@ fn event_row(data: &EventRowData) -> gpui::Div {
                 .child(timestamp),
         )
         .child(
-            Badge::new(data.event_type.as_str())
+            Badge::new(data.event_type.clone())
                 .outline()
                 .theme(theme),
         )
