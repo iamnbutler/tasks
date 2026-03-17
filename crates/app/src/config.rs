@@ -32,8 +32,6 @@ pub struct AppConfig {
     pub memory_soft_limit_pct: u8,
     /// Memory usage percentage at which to emergency-stop sessions (default: 92%).
     pub memory_hard_limit_pct: u8,
-    /// Whether to run the TUI.
-    pub tui: bool,
     /// Whether to run the web UI.
     pub web: bool,
     /// Web server port (default: 4800).
@@ -120,7 +118,6 @@ impl AppConfig {
             memory_warn_pct,
             memory_soft_limit_pct,
             memory_hard_limit_pct,
-            tui: false, // set by CLI flag
             web: false, // set by CLI flag
             web_port: std::env::var("TASKS_WEB_PORT")
                 .ok()

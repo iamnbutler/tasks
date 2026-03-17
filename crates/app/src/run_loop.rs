@@ -968,18 +968,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- 10. Wait for shutdown (TUI or headless) ---
+    // --- 10. Wait for shutdown ---
 
-    if config.tui {
-        crate::tui::run_tui(
-            server.clone(),
-            server.event_bus.clone(),
-            config.max_sessions,
-        )
-        .await?;
-    } else {
-        tokio::signal::ctrl_c().await?;
-    }
+    tokio::signal::ctrl_c().await?;
     info!("shutting down");
 
     // Stop all sessions and destroy their containers

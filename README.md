@@ -39,9 +39,8 @@ cargo run -- add-project owner/repo
 # Run with web UI (serves on :4800)
 cargo run -- run --web
 
-# Other modes
-cargo run -- run          # headless
-cargo run -- run --tui    # terminal UI
+# Headless mode
+cargo run -- run
 ```
 
 ## Development

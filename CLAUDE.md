@@ -51,7 +51,6 @@ The Dockerfile uses a multi-stage build: Rust compilation in `rust:1.85-slim`, r
 ```sh
 cargo run -- add-project owner/repo   # add a project (stored in SQLite)
 cargo run -- run                      # headless mode
-cargo run -- run --tui                # terminal UI
 cargo run -- run --web                # web UI (serves on port 4800)
 ```
 
