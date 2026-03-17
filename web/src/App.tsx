@@ -5,6 +5,7 @@ import { DashboardPage } from "@/pages/dashboard";
 import { TasksPage } from "@/pages/tasks/page";
 import { TaskDetailPage } from "@/pages/task-detail";
 import { MergeQueuePage } from "@/pages/merge-queue/page";
+import { OrchestratorPage } from "@/pages/orchestrator/page";
 import { EventsPage } from "@/pages/events/page";
 
 export function App() {
@@ -16,6 +17,7 @@ export function App() {
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:id" element={<TaskDetailPage />} />
           <Route path="/merge-queue" element={<MergeQueuePage />} />
+          <Route path="/orchestrator" element={<OrchestratorPage />} />
           <Route path="/events" element={<EventsPage />} />
         </Route>
       </Routes>

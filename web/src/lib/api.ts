@@ -94,6 +94,14 @@ export function cancelTask(taskId: string): Promise<void> {
   return requestVoid(`/api/tasks/${taskId}/cancel`, { method: "POST" });
 }
 
+export function sendOrchestratorChat(message: string): Promise<void> {
+  return requestVoid("/api/orchestrator/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;
