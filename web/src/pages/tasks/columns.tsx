@@ -168,7 +168,7 @@ export const columns: ColumnDef<Task>[] = [
           ? `#${source.number}`
           : row.original.id.slice(0, 8);
       return (
-        <span className="font-mono text-xs text-muted-foreground">
+        <span className="font-mono text-sm text-muted-foreground">
           {label}
         </span>
       );
@@ -194,7 +194,7 @@ export const columns: ColumnDef<Task>[] = [
             {row.getValue<string>("title")}
           </a>
           {labels.map((label) => (
-            <Badge key={label} variant="outline" className="text-xs">
+            <Badge key={label} variant="outline">
               {label}
             </Badge>
           ))}
@@ -241,7 +241,7 @@ export const columns: ColumnDef<Task>[] = [
       const projectId = row.getValue<string>("project");
       const meta = table.options.meta as { projectIdToRepo?: Record<string, string> } | undefined;
       const displayName = meta?.projectIdToRepo?.[projectId] ?? projectId;
-      return <span className="text-sm">{displayName}</span>;
+      return <span>{displayName}</span>;
     },
     filterFn: (row, id, value: string[]) => {
       return value.includes(row.getValue(id));
@@ -260,19 +260,19 @@ export const columns: ColumnDef<Task>[] = [
         return (
           <span className="flex items-center gap-1 text-gray-500">
             <Minus className="h-4 w-4" />
-            <span className="text-xs">None</span>
+            <span className="text-sm">None</span>
           </span>
         );
       }
       const config = priorityConfig[priority];
       if (!config) {
-        return <span className="text-xs text-muted-foreground">{priority}</span>;
+        return <span className="text-sm text-muted-foreground">{priority}</span>;
       }
       const Icon = config.icon;
       return (
         <span className={cn("flex items-center gap-1", config.className)}>
           <Icon className="h-4 w-4" />
-          <span className="text-xs">{config.label}</span>
+          <span className="text-sm">{config.label}</span>
         </span>
       );
     },
@@ -290,7 +290,7 @@ export const columns: ColumnDef<Task>[] = [
       <DataTableColumnHeader column={column} title="Updated" />
     ),
     cell: ({ row }) => (
-      <span className="text-sm text-muted-foreground">
+      <span className="text-muted-foreground">
         {formatRelativeTime(row.getValue<string>("updated_at"))}
       </span>
     ),

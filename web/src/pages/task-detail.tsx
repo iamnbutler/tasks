@@ -230,7 +230,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
 function BlockView({ block }: { block: ParsedBlock }) {
   if (block.kind === "tool_use") {
     return (
-      <div className="flex items-center gap-2 py-1 text-muted-foreground text-xs">
+      <div className="flex items-center gap-2 py-1 text-muted-foreground text-sm">
         <Terminal className="h-3 w-3 shrink-0" />
         <span className="font-medium">{block.toolName}</span>
         {block.content && (
@@ -247,7 +247,7 @@ function BlockView({ block }: { block: ParsedBlock }) {
       <div className="rounded-md border border-border bg-muted/50 text-sm overflow-hidden">
         <button
           onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 px-3 py-1.5 w-full text-left text-muted-foreground text-xs hover:bg-muted/80"
+          className="flex items-center gap-2 px-3 py-1.5 w-full text-left text-muted-foreground text-sm hover:bg-muted/80"
         >
           <FileText className="h-3 w-3 shrink-0" />
           <span>Output</span>
@@ -258,7 +258,7 @@ function BlockView({ block }: { block: ParsedBlock }) {
           )}
         </button>
         {(open || !isLong) && (
-          <pre className="px-3 py-2 text-xs font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-muted-foreground border-t border-border">
+          <pre className="px-3 py-2 text-sm font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-muted-foreground border-t border-border">
             {block.content}
           </pre>
         )}
@@ -268,7 +268,7 @@ function BlockView({ block }: { block: ParsedBlock }) {
 
   if (block.kind === "lifecycle") {
     return (
-      <div className="flex items-center gap-2 py-1.5 text-xs text-muted-foreground">
+      <div className="flex items-center gap-2 py-1.5 text-sm text-muted-foreground">
         <div className="h-px flex-1 bg-border" />
         <span>{block.content}</span>
         <div className="h-px flex-1 bg-border" />
@@ -455,7 +455,7 @@ export function TaskDetailPage() {
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
-        <p className="text-muted-foreground text-lg">Loading...</p>
+        <p className="text-muted-foreground text-sm">Loading...</p>
       </div>
     );
   }
@@ -485,7 +485,7 @@ export function TaskDetailPage() {
         </Link>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h1 className="text-xl font-bold truncate">{task.title}</h1>
+            <h1 className="text-base font-bold truncate">{task.title}</h1>
             {stateBadge(task.state)}
             {isSessionActive && (
               <Button
@@ -501,7 +501,7 @@ export function TaskDetailPage() {
             )}
           </div>
           <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground">
-            <span className="font-mono text-xs">{task.id.slice(0, 8)}</span>
+            <span className="font-mono text-sm">{task.id.slice(0, 8)}</span>
             <Separator orientation="vertical" className="h-4" />
             {sourceDisplay(task)}
             <Separator orientation="vertical" className="h-4" />
@@ -511,7 +511,7 @@ export function TaskDetailPage() {
                 <Separator orientation="vertical" className="h-4" />
                 <span className="flex gap-1">
                   {task.labels.map((l) => (
-                    <Badge key={l} variant="outline" className="text-xs">
+                    <Badge key={l} variant="outline">
                       {l}
                     </Badge>
                   ))}
@@ -572,7 +572,7 @@ export function TaskDetailPage() {
                   {task.session_id && (
                     <div>
                       <dt className="text-muted-foreground">Session</dt>
-                      <dd className="font-mono text-xs">
+                      <dd className="font-mono text-sm">
                         {task.session_id.slice(0, 12)}
                       </dd>
                     </div>
@@ -583,7 +583,7 @@ export function TaskDetailPage() {
                       <dd>
                         <Link
                           to={`/tasks/${task.parent_id}`}
-                          className="text-blue-400 hover:underline font-mono text-xs"
+                          className="text-blue-400 hover:underline font-mono text-sm"
                         >
                           {task.parent_id.slice(0, 8)}
                         </Link>
@@ -598,7 +598,7 @@ export function TaskDetailPage() {
                           <Link
                             key={bid}
                             to={`/tasks/${bid}`}
-                            className="text-blue-400 hover:underline font-mono text-xs"
+                            className="text-blue-400 hover:underline font-mono text-sm"
                           >
                             {bid.slice(0, 8)}
                           </Link>
@@ -656,18 +656,18 @@ export function TaskDetailPage() {
                   <TableBody>
                     {events.map((event) => (
                       <TableRow key={event.id}>
-                        <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                        <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
                           {formatRelativeTime(event.ts)}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-xs">
+                          <Badge variant="outline">
                             {event.type}
                           </Badge>
                         </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
+                        <TableCell className="text-sm text-muted-foreground">
                           {event.actor}
                         </TableCell>
-                        <TableCell className="text-xs font-mono text-muted-foreground max-w-md truncate">
+                        <TableCell className="text-sm font-mono text-muted-foreground max-w-md truncate">
                           {eventDataPreview(event.data)}
                         </TableCell>
                       </TableRow>

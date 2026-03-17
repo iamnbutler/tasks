@@ -24,7 +24,7 @@ export function TasksPage() {
   return (
     <div className="flex flex-1 flex-col gap-4 p-4 md:p-8">
       <div>
-        <h2 className="text-2xl font-bold tracking-tight">Tasks</h2>
+        <h2 className="text-base font-bold tracking-tight">Tasks</h2>
         <p className="text-muted-foreground">
           {selectedProjectName
             ? `Tasks for ${selectedProjectName}`

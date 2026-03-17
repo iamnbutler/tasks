@@ -95,7 +95,7 @@ export function EventsPage() {
               size="sm"
               variant={activeFilter === key ? "default" : "outline"}
               onClick={() => setActiveFilter(key)}
-              className="h-7 text-xs"
+              className="h-7"
             >
               {label}
             </Button>
@@ -145,22 +145,22 @@ export function EventsPage() {
             <TableBody>
               {filteredEvents.map((event) => (
                 <TableRow key={event.id}>
-                  <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                  <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
                     {formatRelativeTime(event.ts)}
                   </TableCell>
                   <TableCell>
                     <Badge
                       variant="outline"
-                      className={cn("text-xs font-mono", badgeClasses(event.type))}
+                      className={cn("font-mono", badgeClasses(event.type))}
                     >
                       {event.type}
                     </Badge>
                   </TableCell>
-                  <TableCell className="text-sm">{event.actor}</TableCell>
-                  <TableCell className="font-mono text-xs text-muted-foreground">
+                  <TableCell>{event.actor}</TableCell>
+                  <TableCell className="font-mono text-sm text-muted-foreground">
                     {event.task ? event.task.slice(0, 8) : "\u2014"}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[400px] truncate font-mono">
+                  <TableCell className="text-sm text-muted-foreground max-w-[400px] truncate font-mono">
                     {truncateData(event.data)}
                   </TableCell>
                 </TableRow>
