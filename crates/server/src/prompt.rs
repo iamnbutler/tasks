@@ -86,6 +86,68 @@ const TAIL_COMMENTS: usize = 10;
 const TRUNCATION_THRESHOLD: usize = HEAD_COMMENTS + TAIL_COMMENTS;
 
 // ---------------------------------------------------------------------------
+// GitHub comment conversion (spec §15.2)
+// ---------------------------------------------------------------------------
+
+/// Convert a GitHub comment to the prompt's `CommentInfo` format.
+pub fn github_comment_to_info(comment: &tasks_github::model::Comment) -> CommentInfo {
+    CommentInfo {
+        author: comment.author.login.clone(),
+        timestamp: comment.created_at.to_rfc3339(),
+        body: comment.body.clone(),
+    }
+}
+
+/// Fetch comments for a task from GitHub (spec §11, §15.2).
+///
+/// Returns an empty vec for internal tasks or on error (graceful degradation).
+/// Errors are logged but do not prevent prompt construction.
+pub async fn fetch_comments_for_task(
+    client: &tasks_github::client::GitHubClient,
+    source: &crate::model::task::TaskSource,
+) -> Vec<CommentInfo> {
+    use crate::model::task::TaskSource;
+
+    match source {
+        TaskSource::GithubIssue {
+            owner,
+            repo,
+            number,
+        } => match client.get_issue(owner, repo, *number).await {
+            Ok(issue) => issue.comments.iter().map(github_comment_to_info).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    owner = %owner,
+                    repo = %repo,
+                    number = %number,
+                    error = %e,
+                    "failed to fetch issue comments for prompt"
+                );
+                Vec::new()
+            }
+        },
+        TaskSource::GithubPr {
+            owner,
+            repo,
+            number,
+        } => match client.get_pull_request(owner, repo, *number).await {
+            Ok(pr) => pr.comments.iter().map(github_comment_to_info).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    owner = %owner,
+                    repo = %repo,
+                    number = %number,
+                    error = %e,
+                    "failed to fetch PR comments for prompt"
+                );
+                Vec::new()
+            }
+        },
+        TaskSource::Internal => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -119,7 +181,7 @@ pub fn build_prompt(params: &PromptParams) -> String {
     out
 }
 
-/// Build a prompt directly from a Task and branch name.
+/// Build a prompt directly from a Task and branch name, with comments.
 ///
 /// Extracts the issue/PR number from the task source and builds retry
 /// context from the task's retry state. This keeps domain logic in the
@@ -128,10 +190,14 @@ pub fn build_prompt(params: &PromptParams) -> String {
 /// The `system_prompt` parameter should contain the loaded contents of the
 /// project's system prompt file (from workflow.toml `[prompt].system_prompt`).
 /// If the file doesn't exist or couldn't be loaded, pass `None`.
+///
+/// Comments should be fetched from GitHub at dispatch time using
+/// [`fetch_comments_for_task`] and passed here.
 pub fn build_prompt_for_task(
     task: &crate::model::task::Task,
     branch: &str,
     system_prompt: Option<&str>,
+    comments: &[CommentInfo],
 ) -> String {
     let number = match &task.source {
         crate::model::task::TaskSource::GithubIssue { number, .. } => Some(*number),
@@ -156,7 +222,7 @@ pub fn build_prompt_for_task(
         number,
         title: &task.title,
         body: task.description.as_deref(),
-        comments: &[],      // TODO: fetch from GitHub at dispatch time
+        comments,
         labels: &task.labels,
         assignees: &[],
         sub_issues: &[],
@@ -190,7 +256,11 @@ fn render_retry(out: &mut String, retry: &RetryContext) {
         )
         .unwrap();
     }
-    writeln!(out, "Try a different approach if the previous one failed.\n").unwrap();
+    writeln!(
+        out,
+        "Try a different approach if the previous one failed.\n"
+    )
+    .unwrap();
 }
 
 fn render_task(out: &mut String, params: &PromptParams) {
@@ -292,22 +362,42 @@ fn render_context(out: &mut String, params: &PromptParams) {
 fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>) {
     writeln!(out, "## Instructions\n").unwrap();
     writeln!(out, "- Work on the branch `{branch}`.").unwrap();
-    writeln!(out, "- If you are stuck or the task is ambiguous, describe the problem clearly.").unwrap();
+    writeln!(
+        out,
+        "- If you are stuck or the task is ambiguous, describe the problem clearly."
+    )
+    .unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "### Valid outputs\n").unwrap();
     writeln!(out, "Your work can produce any of the following outputs:\n").unwrap();
     writeln!(out, "- **Code changes**: New features, bug fixes, refactoring, tests, or documentation committed to the branch.").unwrap();
-    writeln!(out, "- **Pull requests**: Open a PR when code changes are ready for review.").unwrap();
+    writeln!(
+        out,
+        "- **Pull requests**: Open a PR when code changes are ready for review."
+    )
+    .unwrap();
     writeln!(out, "- **Issue comments**: Progress updates, research findings, questions, or analysis posted to the issue.").unwrap();
     writeln!(out, "- **New issues**: Create issues for bugs found, follow-up work, or tasks discovered during implementation.").unwrap();
     writeln!(out, "- **Plans or proposals**: Architecture decisions, implementation approaches, or design documents.").unwrap();
-    writeln!(out, "- **Questions**: Ask for clarification when requirements are unclear or you need guidance.").unwrap();
-    writeln!(out, "- **Error reports**: If something is broken or blocked, describe what went wrong clearly.").unwrap();
+    writeln!(
+        out,
+        "- **Questions**: Ask for clarification when requirements are unclear or you need guidance."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- **Error reports**: If something is broken or blocked, describe what went wrong clearly."
+    )
+    .unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "### Delivering your work\n").unwrap();
-    writeln!(out, "When your task is finished, deliver your output using the GitHub CLI (`gh`).").unwrap();
+    writeln!(
+        out,
+        "When your task is finished, deliver your output using the GitHub CLI (`gh`)."
+    )
+    .unwrap();
     writeln!(out, "Choose the approach that fits what you produced:\n").unwrap();
     writeln!(
         out,
@@ -566,7 +656,9 @@ mod tests {
         };
         let prompt = build_prompt(&params);
 
-        assert!(prompt.contains("Sub-issues: #100 — Sub-issue A (open), #101 — Sub-issue B (closed)"));
+        assert!(
+            prompt.contains("Sub-issues: #100 — Sub-issue A (open), #101 — Sub-issue B (closed)")
+        );
         assert!(prompt.contains("Linked: #200 — Related PR (merged)"));
     }
 }
