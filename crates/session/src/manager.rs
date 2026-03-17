@@ -194,6 +194,9 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
     ///
     /// Creates a container, starts the agent, and spawns a monitoring task
     /// that bridges supervisor events to the platform event bus.
+    ///
+    /// The optional `progress_threshold` allows per-project customization
+    /// (spec §13.1, §14.2). If not provided, uses the manager's default.
     pub async fn start_session(
         &self,
         task_id: String,
@@ -201,6 +204,7 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         branch: String,
         prompt: String,
         config: Option<ContainerConfig>,
+        progress_threshold: Option<Duration>,
     ) -> Result<(), SessionManagerError> {
         // Check if session already exists
         if self.sessions.read().await.contains_key(&task_id) {
@@ -222,6 +226,9 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         // Create command channel
         let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(32);
 
+        // Use per-project progress threshold if provided, else manager's default (spec §14.2)
+        let effective_progress_threshold = progress_threshold.unwrap_or(self.progress_threshold);
+
         // Spawn the monitoring task
         let monitor = tokio::spawn(monitor_session(
             task_id.clone(),
@@ -233,7 +240,7 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
             container_id.clone(),
             self.soft_time_limit,
             self.hard_time_limit,
-            self.progress_threshold,
+            effective_progress_threshold,
         ));
 
         // Insert handle into sessions map
