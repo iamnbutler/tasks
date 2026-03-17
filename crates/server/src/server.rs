@@ -322,6 +322,94 @@ impl Server {
         Ok(())
     }
 
+    /// Handle an agent failure — apply retry logic per spec §13.2 and §18.2.
+    ///
+    /// Called when `agent:exit` event is received with non-zero exit code.
+    /// Updates retry_count and last_failure_at, then either:
+    /// - If retries exhausted: set state to Failed, emit `task:state:failed`
+    /// - Else: set state to Waiting, emit `task:state:waiting` (dispatcher
+    ///   will pick up after backoff)
+    pub async fn handle_agent_failure(
+        &self,
+        task_id: &str,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        made_progress: bool,
+        max_retries: u32,
+    ) -> Result<(), ServerError> {
+        use chrono::Utc;
+
+        // Update retry_count and last_failure_at
+        let (new_state, retry_count) = {
+            let mut state = self.state.write().await;
+            let task = state
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+            task.retry_count += 1;
+            task.last_failure_at = Some(Utc::now());
+            task.updated_at = Utc::now();
+
+            let retry_count = task.retry_count;
+            let new_state = if retry_count >= max_retries {
+                TaskState::Failed
+            } else {
+                TaskState::Waiting
+            };
+            task.state = new_state;
+
+            // Write-through to store
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_task(task) {
+                        tracing::error!(task_id = %task_id, error = %e, "failed to persist task retry state");
+                    }
+                }
+            }
+
+            (new_state, retry_count)
+        };
+
+        // Emit the appropriate state event
+        let (event_type, data) = match new_state {
+            TaskState::Failed => (
+                EventType::TaskStateFailed,
+                serde_json::json!({
+                    "exit_code": exit_code,
+                    "signal": signal,
+                    "made_progress": made_progress,
+                    "retry_count": retry_count,
+                    "reason": "max_retries_exceeded",
+                }),
+            ),
+            TaskState::Waiting => (
+                EventType::TaskStateWaiting,
+                serde_json::json!({
+                    "exit_code": exit_code,
+                    "signal": signal,
+                    "made_progress": made_progress,
+                    "retry_count": retry_count,
+                    "reason": "retry_scheduled",
+                }),
+            ),
+            _ => unreachable!(),
+        };
+
+        let event = Event::new(event_type, task_id, Actor::System, data);
+        self.event_bus.publish(event).await?;
+
+        tracing::info!(
+            task_id = %task_id,
+            retry_count = retry_count,
+            max_retries = max_retries,
+            new_state = ?new_state,
+            "handled agent failure"
+        );
+
+        Ok(())
+    }
+
     // --- Merge queue (spec §7) ---
 
     /// Add an entry to the merge queue, persisting to store and publishing
@@ -807,5 +895,138 @@ mod tests {
         // Now state should be populated
         assert!(server.get_project("p1").await.is_some());
         assert!(server.get_task("t1").await.is_some());
+    }
+
+    // --- Retry logic tests (spec §13.2, §18.2) ---
+
+    #[tokio::test]
+    async fn agent_failure_increments_retry_count() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        task.state = TaskState::Running;
+        server.add_task(task).await.unwrap();
+
+        // Handle first failure
+        server
+            .handle_agent_failure("t1", Some(1), None, false, 3)
+            .await
+            .unwrap();
+
+        // Retry count should be 1
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.retry_count, 1);
+        assert!(task.last_failure_at.is_some());
+
+        // Drain initial events
+        while rx.try_recv().is_ok() {}
+
+        // Handle second failure
+        server
+            .handle_agent_failure("t1", Some(1), None, false, 3)
+            .await
+            .unwrap();
+
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.retry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn agent_failure_transitions_to_waiting_when_retries_available() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        task.state = TaskState::Running;
+        server.add_task(task).await.unwrap();
+
+        // Drain initial events
+        while rx.try_recv().is_ok() {}
+
+        // Handle failure with max_retries=3 (retry_count will be 1 < 3)
+        server
+            .handle_agent_failure("t1", Some(1), None, true, 3)
+            .await
+            .unwrap();
+
+        // Task should be Waiting
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.state, TaskState::Waiting);
+
+        // TaskStateWaiting event should have been emitted
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::TaskStateWaiting);
+        assert_eq!(event.data["retry_count"], 1);
+        assert_eq!(event.data["reason"], "retry_scheduled");
+    }
+
+    #[tokio::test]
+    async fn agent_failure_transitions_to_failed_when_retries_exhausted() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        task.state = TaskState::Running;
+        task.retry_count = 2; // Already retried twice
+        server.add_task(task).await.unwrap();
+
+        // Drain initial events
+        while rx.try_recv().is_ok() {}
+
+        // Handle failure with max_retries=3 (retry_count will be 3 >= 3)
+        server
+            .handle_agent_failure("t1", Some(1), None, false, 3)
+            .await
+            .unwrap();
+
+        // Task should be Failed
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.retry_count, 3);
+
+        // TaskStateFailed event should have been emitted
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::TaskStateFailed);
+        assert_eq!(event.data["retry_count"], 3);
+        assert_eq!(event.data["reason"], "max_retries_exceeded");
+    }
+
+    #[tokio::test]
+    async fn agent_failure_persists_retry_state_to_store() {
+        let store = tasks_store::Store::open_memory().unwrap();
+        let dir = tempdir().unwrap();
+        let event_store = EventStore::new(dir.path());
+        let bus = EventBus::new(event_store, 64);
+        let server = Server::with_store(bus, store);
+
+        let project = Project::new("p1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("t1", TaskSource::Internal, "Test", "p1");
+        task.state = TaskState::Running;
+        server.add_task(task).await.unwrap();
+
+        // Handle failure
+        server
+            .handle_agent_failure("t1", Some(1), None, true, 3)
+            .await
+            .unwrap();
+
+        // Verify state is persisted to store
+        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let stored_task = store_ref.get_task("t1").unwrap().unwrap();
+        assert_eq!(stored_task.retry_count, 1);
+        assert!(stored_task.last_failure_at.is_some());
+        assert_eq!(stored_task.state, TaskState::Waiting);
     }
 }

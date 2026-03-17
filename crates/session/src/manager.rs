@@ -354,7 +354,13 @@ async fn handle_supervisor_event(
     }
 }
 
-/// Handle an agent exit event — publish success or failure.
+/// Handle an agent exit event — publish success or failure (spec §18.2).
+///
+/// For successful exits (code 0), emits `task:state:awaiting_merge`.
+/// For failed exits, emits `agent:exit` with exit metadata. The event handler
+/// then applies retry logic per spec §13.2: increment retry_count, set
+/// last_failure_at, and emit either `task:state:failed` (max retries exceeded)
+/// or `task:state:waiting` (retry eligible).
 async fn handle_exit(
     task_id: &str,
     exit: &runtime::protocol::AgentExitEvent,
@@ -369,8 +375,10 @@ async fn handle_exit(
             serde_json::json!({ "exit_code": 0 }),
         )
     } else {
+        // Emit agent:exit instead of task:state:failed — the event handler
+        // will apply retry logic and emit the appropriate state event.
         (
-            events::EventType::TaskStateFailed,
+            events::EventType::AgentExit,
             serde_json::json!({
                 "exit_code": exit.code,
                 "signal": exit.signal,
@@ -477,7 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_nonzero_maps_to_failed() {
+    async fn exit_nonzero_maps_to_agent_exit() {
         let (bus, mut rx) = test_event_bus().await;
         let exit = runtime::protocol::AgentExitEvent {
             code: Some(1),
@@ -487,7 +495,9 @@ mod tests {
         handle_exit("task-1", &exit, false, &bus).await;
 
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        // Non-zero exit emits AgentExit, not TaskStateFailed — retry logic
+        // is applied by the event handler per spec §13.2.
+        assert_eq!(received.event_type, events::EventType::AgentExit);
         assert_eq!(received.data["exit_code"], 1);
     }
 
@@ -502,7 +512,7 @@ mod tests {
         handle_exit("task-1", &exit, true, &bus).await;
 
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        assert_eq!(received.event_type, events::EventType::AgentExit);
         assert_eq!(received.data["made_progress"], true);
     }
 }

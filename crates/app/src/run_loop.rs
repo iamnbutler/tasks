@@ -184,6 +184,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
 
+    // Default max_retries from workflow config (spec §14.1).
+    const DEFAULT_MAX_RETRIES: u32 = 3;
+
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
         loop {
@@ -197,6 +200,28 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let task_id = &event.task;
+
+            // Handle agent:exit events — apply retry logic per spec §13.2, §18.2.
+            if event.event_type == EventType::AgentExit {
+                let exit_code = event.data.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let signal = event.data.get("signal").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let made_progress = event.data.get("made_progress").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                // TODO: Get max_retries from project's workflow config.
+                // For now, use the default value.
+                let max_retries = DEFAULT_MAX_RETRIES;
+
+                if let Err(e) = event_handler_server
+                    .handle_agent_failure(task_id, exit_code, signal, made_progress, max_retries)
+                    .await
+                {
+                    if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                        error!(task_id = %task_id, error = %e, "failed to handle agent failure");
+                    }
+                }
+                continue;
+            }
+
             let new_state = match event.event_type {
                 EventType::TaskStateRunning => Some(models::task::TaskState::Running),
                 EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
