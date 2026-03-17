@@ -134,7 +134,7 @@ there is no external database server.
 - `{data_dir}/events/{task-id}/events.jsonl` — per-task event logs
 - `{data_dir}/workspaces/` — container workspace state (managed by the container runtime)
 
-The data directory defaults to `~/.tasks/` and is configurable at startup.
+The data directory defaults to `~/.local/state/tasks/` (following the XDG Base Directory convention) and is configurable at startup via `TASKS_DATA_DIR`.
 
 ## 4. Actors and Roles
 
