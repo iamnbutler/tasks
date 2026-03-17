@@ -8,6 +8,7 @@ import {
   Clock,
   CircleHelp,
   Layers,
+  Brain,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { ModeControl } from "@/components/mode-control";
@@ -18,6 +19,7 @@ const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/tasks", label: "Tasks", icon: ListTodo },
   { to: "/merge-queue", label: "Merge Queue", icon: GitMerge },
+  { to: "/orchestrator", label: "Orchestrator", icon: Brain },
   { to: "/events", label: "Events", icon: Radio },
 ];
 

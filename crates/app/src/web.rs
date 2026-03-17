@@ -53,6 +53,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/merge-queue/{id}/reject", post(reject_merge))
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
+        .route("/orchestrator/chat", post(orchestrator_chat))
         .route("/events", get(event_stream));
 
     Router::new()
@@ -96,6 +97,11 @@ struct AddProjectRequest {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct OrchestratorChatRequest {
     message: String,
 }
 
@@ -352,6 +358,34 @@ async fn cancel_task(
     sm.stop_session(&id)
         .await
         .map_err(|e| ApiError::SessionManager(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/orchestrator/chat — Send a message to the orchestrator.
+///
+/// This emits an orchestrator:message event that can be picked up by the orchestrator
+/// to process user requests or questions.
+async fn orchestrator_chat(
+    State(state): State<ApiState>,
+    Json(req): Json<OrchestratorChatRequest>,
+) -> Result<StatusCode, ApiError> {
+    // Emit OrchestratorMessage event with the human's message.
+    // The orchestrator can pick this up and respond accordingly.
+    let event = events::Event::new(
+        events::EventType::OrchestratorMessage,
+        "", // No specific task - this is a system-wide message
+        Actor::Human,
+        serde_json::json!({
+            "message": req.message,
+        }),
+    );
+    state
+        .server
+        .event_bus
+        .publish(event)
+        .await
+        .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))?;
+
     Ok(StatusCode::OK)
 }
 
