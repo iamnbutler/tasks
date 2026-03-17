@@ -89,6 +89,8 @@ pub struct Task {
     pub retry_count: u32,
     /// When the most recent failure occurred (spec §13.2).
     pub last_failure_at: Option<DateTime<Utc>>,
+    /// When the source (GitHub issue/PR) was created. Used for dispatch ordering.
+    pub source_created_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,6 +119,7 @@ impl Task {
             workspace_id: None,
             retry_count: 0,
             last_failure_at: None,
+            source_created_at: None,
             created_at: now,
             updated_at: now,
         }

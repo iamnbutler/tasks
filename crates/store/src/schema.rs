@@ -28,6 +28,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             workspace_id TEXT,
             retry_count INTEGER NOT NULL DEFAULT 0,
             last_failure_at TEXT,
+            source_created_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );

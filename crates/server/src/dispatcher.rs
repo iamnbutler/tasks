@@ -110,8 +110,12 @@ pub fn evaluate(
             return unblock_cmp;
         }
 
-        // Recency: newer created_at first (descending).
-        b.created_at.cmp(&a.created_at)
+        // Recency: newer source creation date first (descending).
+        // Use source_created_at (GitHub issue/PR date) when available,
+        // fall back to internal created_at for non-GitHub tasks.
+        let time_a = a.source_created_at.unwrap_or(a.created_at);
+        let time_b = b.source_created_at.unwrap_or(b.created_at);
+        time_b.cmp(&time_a)
     });
 
     // 6. Apply concurrency limits.

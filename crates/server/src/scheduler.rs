@@ -47,6 +47,7 @@ pub fn issue_to_task(
     let mut task = Task::new(id, source, issue.title.clone(), project_id);
     task.description = issue.body.clone();
     task.labels = issue.labels.iter().map(|l| l.name.clone()).collect();
+    task.source_created_at = Some(issue.created_at);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| issue_label_names.contains(&b.as_str()));
@@ -87,6 +88,7 @@ pub fn pr_to_task(
     let mut task = Task::new(id, source, pr.title.clone(), project_id);
     task.description = pr.body.clone();
     task.labels = pr.labels.iter().map(|l| l.name.clone()).collect();
+    task.source_created_at = Some(pr.created_at);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| pr_label_names.contains(&b.as_str()));
