@@ -13,6 +13,7 @@ use rusqlite::{params, Connection};
 use models::merge_queue::{MergeQueueEntry, MergeStatus};
 use models::project::Project;
 use models::task::{Task, TaskSource, TaskState};
+use models::workspace::{Workspace, WorkspaceStatus};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -338,6 +339,124 @@ impl Store {
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
+
+    // ── Workspaces ──────────────────────────────────────────────────
+
+    /// Insert or replace a workspace.
+    pub fn save_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
+        let status = serde_json::to_value(&workspace.status)?
+            .as_str()
+            .unwrap()
+            .to_string();
+        let created_at = workspace.created_at.to_rfc3339();
+        let last_activity_at = workspace.last_activity_at.to_rfc3339();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workspaces (
+                id, task_id, container_id, branch, status, created_at, last_activity_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                workspace.id,
+                workspace.task_id,
+                workspace.container_id,
+                workspace.branch,
+                status,
+                created_at,
+                last_activity_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a workspace by ID.
+    pub fn get_workspace(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, container_id, branch, status, created_at, last_activity_at
+             FROM workspaces WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_workspace)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a workspace by task ID.
+    pub fn get_workspace_by_task(&self, task_id: &str) -> Result<Option<Workspace>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, container_id, branch, status, created_at, last_activity_at
+             FROM workspaces WHERE task_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], row_to_workspace)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all workspaces.
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, container_id, branch, status, created_at, last_activity_at
+             FROM workspaces",
+        )?;
+        let rows = stmt.query_map([], row_to_workspace)?;
+        let mut workspaces = Vec::new();
+        for row in rows {
+            workspaces.push(row?);
+        }
+        Ok(workspaces)
+    }
+
+    /// List workspaces by status.
+    pub fn list_workspaces_by_status(&self, status: WorkspaceStatus) -> Result<Vec<Workspace>, StoreError> {
+        let status_json = serde_json::to_value(&status).map_err(StoreError::Json)?;
+        let status_str = status_json.as_str().unwrap();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, container_id, branch, status, created_at, last_activity_at
+             FROM workspaces WHERE status = ?1",
+        )?;
+        let rows = stmt.query_map(params![status_str], row_to_workspace)?;
+        let mut workspaces = Vec::new();
+        for row in rows {
+            workspaces.push(row?);
+        }
+        Ok(workspaces)
+    }
+
+    /// List stale workspaces (last activity older than threshold).
+    ///
+    /// Used for cleanup of idle workspaces (spec §10.3).
+    pub fn list_stale_workspaces(&self, idle_threshold: chrono::Duration) -> Result<Vec<Workspace>, StoreError> {
+        let cutoff = (Utc::now() - idle_threshold).to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, container_id, branch, status, created_at, last_activity_at
+             FROM workspaces
+             WHERE status IN ('active', 'idle') AND last_activity_at < ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff], row_to_workspace)?;
+        let mut workspaces = Vec::new();
+        for row in rows {
+            workspaces.push(row?);
+        }
+        Ok(workspaces)
+    }
+
+    /// Delete a workspace by ID. Returns true if a row was deleted.
+    pub fn delete_workspace(&self, id: &str) -> Result<bool, StoreError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    /// Delete all workspaces with status 'cleaned'.
+    pub fn prune_cleaned_workspaces(&self) -> Result<usize, StoreError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM workspaces WHERE status = 'cleaned'", [])?;
+        Ok(affected)
+    }
 }
 
 /// Map a rusqlite Row to a Task.
@@ -421,6 +540,41 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         last_failure_at,
         created_at,
         updated_at,
+    })
+}
+
+/// Map a rusqlite Row to a Workspace.
+fn row_to_workspace(row: &rusqlite::Row) -> Result<Workspace, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let task_id: String = row.get(1)?;
+    let container_id: Option<String> = row.get(2)?;
+    let branch: Option<String> = row.get(3)?;
+    let status_str: String = row.get(4)?;
+    let created_at_str: String = row.get(5)?;
+    let last_activity_at_str: String = row.get(6)?;
+
+    let status: WorkspaceStatus = serde_json::from_str(&format!("\"{status_str}\"")).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    let last_activity_at = DateTime::parse_from_rfc3339(&last_activity_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+    Ok(Workspace {
+        id,
+        task_id,
+        container_id,
+        branch,
+        status,
+        created_at,
+        last_activity_at,
     })
 }
 
@@ -708,5 +862,132 @@ mod tests {
         let loaded = store.get_task("t2").unwrap().unwrap();
         assert_eq!(loaded.blocked_by, vec!["t1"]);
         assert_eq!(loaded.state, TaskState::Blocked);
+    }
+
+    // ── Workspace tests ─────────────────────────────────────────────
+
+    #[test]
+    fn save_and_get_workspace() {
+        let store = Store::open_memory().unwrap();
+        let ws = Workspace::new("ws-1", "task-1");
+        store.save_workspace(&ws).unwrap();
+
+        let loaded = store.get_workspace("ws-1").unwrap().unwrap();
+        assert_eq!(loaded.id, "ws-1");
+        assert_eq!(loaded.task_id, "task-1");
+        assert_eq!(loaded.status, WorkspaceStatus::Active);
+    }
+
+    #[test]
+    fn get_workspace_by_task() {
+        let store = Store::open_memory().unwrap();
+        let ws = Workspace::new("ws-1", "task-1");
+        store.save_workspace(&ws).unwrap();
+
+        let loaded = store.get_workspace_by_task("task-1").unwrap().unwrap();
+        assert_eq!(loaded.id, "ws-1");
+    }
+
+    #[test]
+    fn workspace_with_container_id() {
+        let store = Store::open_memory().unwrap();
+        let mut ws = Workspace::new("ws-1", "task-1");
+        ws.container_id = Some("container-123".to_string());
+        ws.branch = Some("feature/test".to_string());
+        store.save_workspace(&ws).unwrap();
+
+        let loaded = store.get_workspace("ws-1").unwrap().unwrap();
+        assert_eq!(loaded.container_id.as_deref(), Some("container-123"));
+        assert_eq!(loaded.branch.as_deref(), Some("feature/test"));
+    }
+
+    #[test]
+    fn workspace_status_roundtrip() {
+        let store = Store::open_memory().unwrap();
+
+        for (id, status) in [
+            ("ws1", WorkspaceStatus::Active),
+            ("ws2", WorkspaceStatus::Idle),
+            ("ws3", WorkspaceStatus::PendingCleanup),
+            ("ws4", WorkspaceStatus::Cleaned),
+        ] {
+            let mut ws = Workspace::new(id, "task-1");
+            ws.status = status;
+            store.save_workspace(&ws).unwrap();
+
+            let loaded = store.get_workspace(id).unwrap().unwrap();
+            assert_eq!(loaded.status, status, "failed for {id}");
+        }
+    }
+
+    #[test]
+    fn list_workspaces_by_status() {
+        let store = Store::open_memory().unwrap();
+
+        let ws1 = Workspace::new("ws-1", "task-1");
+        let mut ws2 = Workspace::new("ws-2", "task-2");
+        ws2.mark_idle();
+        let mut ws3 = Workspace::new("ws-3", "task-3");
+        ws3.mark_cleaned();
+
+        store.save_workspace(&ws1).unwrap();
+        store.save_workspace(&ws2).unwrap();
+        store.save_workspace(&ws3).unwrap();
+
+        let active = store.list_workspaces_by_status(WorkspaceStatus::Active).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "ws-1");
+
+        let idle = store.list_workspaces_by_status(WorkspaceStatus::Idle).unwrap();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].id, "ws-2");
+    }
+
+    #[test]
+    fn list_stale_workspaces() {
+        let store = Store::open_memory().unwrap();
+
+        // Create a stale workspace
+        let mut stale = Workspace::new("ws-stale", "task-stale");
+        stale.last_activity_at = Utc::now() - chrono::Duration::days(10);
+        stale.status = WorkspaceStatus::Idle;
+        store.save_workspace(&stale).unwrap();
+
+        // Create a fresh workspace
+        let fresh = Workspace::new("ws-fresh", "task-fresh");
+        store.save_workspace(&fresh).unwrap();
+
+        let stale_list = store.list_stale_workspaces(chrono::Duration::days(7)).unwrap();
+        assert_eq!(stale_list.len(), 1);
+        assert_eq!(stale_list[0].id, "ws-stale");
+    }
+
+    #[test]
+    fn delete_workspace() {
+        let store = Store::open_memory().unwrap();
+        let ws = Workspace::new("ws-1", "task-1");
+        store.save_workspace(&ws).unwrap();
+
+        assert!(store.delete_workspace("ws-1").unwrap());
+        assert!(store.get_workspace("ws-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_cleaned_workspaces() {
+        let store = Store::open_memory().unwrap();
+
+        let mut ws1 = Workspace::new("ws-1", "task-1");
+        ws1.mark_cleaned();
+        let ws2 = Workspace::new("ws-2", "task-2");
+
+        store.save_workspace(&ws1).unwrap();
+        store.save_workspace(&ws2).unwrap();
+
+        let pruned = store.prune_cleaned_workspaces().unwrap();
+        assert_eq!(pruned, 1);
+
+        let all = store.list_workspaces().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "ws-2");
     }
 }

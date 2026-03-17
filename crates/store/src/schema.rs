@@ -39,6 +39,16 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             status TEXT NOT NULL DEFAULT 'pending',
             queued_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            container_id TEXT,
+            branch TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            last_activity_at TEXT NOT NULL
+        );
         ",
     )
 }

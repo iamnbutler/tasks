@@ -13,6 +13,7 @@ use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
 use server::model::task::TaskSource;
+use server::workspace::WorkspaceCleanupManager;
 use tasks_github::client::GitHubClient;
 use tasks_github::poller::RepoPoller;
 
@@ -170,6 +171,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_hard_time_limit(config.session_hard_limit)
         .with_progress_threshold(config.progress_threshold),
     );
+
+    // --- 5a. Create workspace cleanup manager (spec §10.3) ---
+    let cleanup_runtime = Arc::new(AppleContainerRuntime::new());
+    let workspace_cleanup = Arc::new(WorkspaceCleanupManager::new(
+        cleanup_runtime,
+        server.event_bus.clone(),
+    ));
 
     // --- 5b. Create orchestrator ---
 
@@ -340,10 +348,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     //
     // For TaskStateFailed events from agents, we use progress detection
     // (spec §13.1, §13.2) to decide whether to retry or mark as failed.
+    //
+    // Also triggers workspace cleanup on terminal states (spec §10.3).
 
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
     let event_handler_max_retries = config.max_retries;
+    let event_handler_cleanup = workspace_cleanup.clone();
 
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
@@ -387,6 +398,47 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 continue;
+            }
+
+            // Handle workspace cleanup triggers (spec §10.3)
+            match event.event_type {
+                // PR merged → cleanup workspace
+                EventType::MergeCompleted => {
+                    if let Err(e) = server::workspace::trigger_cleanup_on_merge(
+                        &event_handler_cleanup,
+                        task_id,
+                    ).await {
+                        // Log but don't fail — cleanup is best-effort
+                        if !matches!(e, server::WorkspaceCleanupError::NotFound(_)) {
+                            warn!(task_id = %task_id, error = %e, "workspace cleanup failed on merge");
+                        }
+                    }
+                }
+                // Task completed → cleanup workspace
+                EventType::TaskStateCompleted => {
+                    if let Err(e) = server::workspace::trigger_cleanup_on_task_terminal(
+                        &event_handler_cleanup,
+                        task_id,
+                        true, // is_completed
+                    ).await {
+                        if !matches!(e, server::WorkspaceCleanupError::NotFound(_)) {
+                            warn!(task_id = %task_id, error = %e, "workspace cleanup failed on completion");
+                        }
+                    }
+                }
+                // Task cancelled → cleanup workspace
+                EventType::TaskStateCancelled => {
+                    if let Err(e) = server::workspace::trigger_cleanup_on_task_terminal(
+                        &event_handler_cleanup,
+                        task_id,
+                        false, // is_completed
+                    ).await {
+                        if !matches!(e, server::WorkspaceCleanupError::NotFound(_)) {
+                            warn!(task_id = %task_id, error = %e, "workspace cleanup failed on cancellation");
+                        }
+                    }
+                }
+                _ => {}
             }
 
             let new_state = match event.event_type {
@@ -857,6 +909,39 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- 8c. Spawn stale workspace cleanup loop (spec §10.3) ---
+    //
+    // Periodically checks for and cleans up stale/idle workspaces.
+    // Runs once per hour by default.
+
+    let stale_cleanup = workspace_cleanup.clone();
+    let stale_cleanup_handle = tokio::spawn(async move {
+        let cleanup_interval = std::time::Duration::from_secs(3600); // 1 hour
+        let mut interval = tokio::time::interval(cleanup_interval);
+
+        loop {
+            interval.tick().await;
+
+            match stale_cleanup.cleanup_stale().await {
+                Ok(cleaned) => {
+                    if !cleaned.is_empty() {
+                        info!(
+                            count = cleaned.len(),
+                            workspaces = ?cleaned,
+                            "cleaned up stale workspaces"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "stale workspace cleanup failed");
+                }
+            }
+
+            // Prune cleaned workspaces from tracking
+            stale_cleanup.prune_cleaned().await;
+        }
+    });
+
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
@@ -917,6 +1002,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     event_handler_handle.abort();
     orchestrator_handle.abort();
     watchdog_handle.abort();
+    stale_cleanup_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }

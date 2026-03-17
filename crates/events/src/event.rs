@@ -69,6 +69,12 @@ pub enum EventType {
     SystemTimeLimitSoft,
     /// Session hard time limit reached (spec §17.4).
     SystemTimeLimitHard,
+
+    // Workspace events (spec §10)
+    /// Workspace cleanup scheduled.
+    WorkspaceCleanupScheduled,
+    /// Workspace cleanup completed.
+    WorkspaceCleanupCompleted,
 }
 
 impl EventType {
@@ -109,6 +115,8 @@ impl EventType {
             Self::SystemMemoryEmergency => "system:memory:emergency",
             Self::SystemTimeLimitSoft => "system:time_limit:soft",
             Self::SystemTimeLimitHard => "system:time_limit:hard",
+            Self::WorkspaceCleanupScheduled => "workspace:cleanup:scheduled",
+            Self::WorkspaceCleanupCompleted => "workspace:cleanup:completed",
         }
     }
 
@@ -178,6 +186,8 @@ impl TryFrom<String> for EventType {
             "system:memory:emergency" => Ok(Self::SystemMemoryEmergency),
             "system:time_limit:soft" => Ok(Self::SystemTimeLimitSoft),
             "system:time_limit:hard" => Ok(Self::SystemTimeLimitHard),
+            "workspace:cleanup:scheduled" => Ok(Self::WorkspaceCleanupScheduled),
+            "workspace:cleanup:completed" => Ok(Self::WorkspaceCleanupCompleted),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
@@ -315,5 +325,31 @@ mod tests {
         assert!(hard.matches("system:*"));
         assert!(soft.matches("system:time_limit:*"));
         assert!(hard.matches("system:time_limit:*"));
+    }
+
+    #[test]
+    fn workspace_cleanup_scheduled_roundtrips() {
+        let t = EventType::WorkspaceCleanupScheduled;
+        assert_eq!(t.as_str(), "workspace:cleanup:scheduled");
+        let parsed = EventType::try_from("workspace:cleanup:scheduled".to_string()).unwrap();
+        assert_eq!(parsed, EventType::WorkspaceCleanupScheduled);
+    }
+
+    #[test]
+    fn workspace_cleanup_completed_roundtrips() {
+        let t = EventType::WorkspaceCleanupCompleted;
+        assert_eq!(t.as_str(), "workspace:cleanup:completed");
+        let parsed = EventType::try_from("workspace:cleanup:completed".to_string()).unwrap();
+        assert_eq!(parsed, EventType::WorkspaceCleanupCompleted);
+    }
+
+    #[test]
+    fn workspace_events_match_wildcard() {
+        let scheduled = EventType::WorkspaceCleanupScheduled;
+        let completed = EventType::WorkspaceCleanupCompleted;
+        assert!(scheduled.matches("workspace:*"));
+        assert!(completed.matches("workspace:*"));
+        assert!(scheduled.matches("workspace:cleanup:*"));
+        assert!(completed.matches("workspace:cleanup:*"));
     }
 }

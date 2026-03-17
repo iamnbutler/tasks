@@ -6,3 +6,4 @@ pub mod task;
 pub mod session;
 pub mod merge_queue;
 pub mod project;
+pub mod workspace;
