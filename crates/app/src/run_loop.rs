@@ -27,6 +27,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         poll_interval = ?config.poll_interval,
         dispatch_interval = ?config.dispatch_interval,
         container_image = %config.container_image,
+        container_memory = %config.container_memory,
         "starting tasks platform"
     );
 
@@ -53,8 +54,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 3. Create session manager ---
 
     let container_runtime = AppleContainerRuntime::new();
-    let mut default_container_config =
-        ContainerConfig::new(&config.container_image).env("GITHUB_TOKEN", &config.github_token);
+    let mut default_container_config = ContainerConfig::new(&config.container_image)
+        .env("GITHUB_TOKEN", &config.github_token)
+        .memory(&config.container_memory);
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         default_container_config = default_container_config.env("ANTHROPIC_API_KEY", key);
     }
