@@ -3,7 +3,7 @@ description: |
   Code reviewer for the Tasks platform. Reviews every PR against the spec
   and project conventions.
   - Checks correctness, spec compliance, and code quality
-  - Uses REQUEST_CHANGES for blocking issues, COMMENT for suggestions
+  - Leaves inline comments on issues (no REQUEST_CHANGES to avoid blocking PRs)
   - Never writes implementation code — review only
 
 on:
@@ -144,14 +144,14 @@ For every changed file, evaluate the diff:
 
 ### Step 4: Classify Findings
 
-**Blocking** (results in `REQUEST_CHANGES`):
+**Important** (requires attention before merging):
 - Correctness bugs or data races
 - Spec violations
 - Wrong crate boundary (logic in the wrong place)
 - Missing error handling that could cause panics
 - Holding async locks across blocking operations
 
-**Suggestion** (results in `COMMENT`):
+**Suggestion** (nice to have):
 - Naming improvements
 - Test coverage gaps
 - Minor code quality improvements
@@ -159,7 +159,7 @@ For every changed file, evaluate the diff:
 
 For each finding:
 ```
-**[BLOCKING]** or **[SUGGESTION]**
+**[IMPORTANT]** or **[SUGGESTION]**
 
 Priority: Correctness | Spec Compliance | Architecture | Code Quality
 
@@ -176,13 +176,14 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
-If tests fail or clippy has errors, note them as blocking issues.
+If tests fail or clippy has errors, note them as important issues in your review.
 
 ### Step 6: Submit Review
 
-- **If any blocking issues**: `REQUEST_CHANGES`
-- **If only suggestions**: `COMMENT`
-- **If clean**: `COMMENT` with brief acknowledgment
+Always submit as `COMMENT` (never use `REQUEST_CHANGES`):
+- **If important issues found**: Note them clearly in inline comments and review summary
+- **If only suggestions**: Leave inline comments with suggestions
+- **If clean**: Brief acknowledgment that the PR looks good
 
 Follow the imported formatting guidelines for the review body.
 
@@ -195,8 +196,8 @@ After review, update cache memory:
 ## What the Reviewer Does NOT Do
 
 - **Never write implementation code.** Review only.
-- **Never approve out of politeness.** If there are blocking issues, request changes.
-- **Never block on subjective style.** Only block on the 4 priorities above.
+- **Never ignore real issues.** If there are important problems, leave clear comments.
+- **Never flag subjective style as important.** Only flag issues in the 4 priorities above.
 - **Never duplicate existing review comments.** Check before posting.
 
 **Important**: If no action is needed (e.g., PR is draft with no changes), call the `noop` safe-output tool with a brief explanation.
