@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatRelativeTime } from "@/lib/utils";
 import { approveMerge, rejectMerge } from "@/lib/api";
-import type { MergeQueueEntry, MergeStatus } from "@/lib/types";
+import type { MergeQueueEntry, MergeStatus, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Status badge
@@ -43,14 +43,23 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
   {
     accessorKey: "task_id",
     header: "Task",
-    cell: ({ row }) => (
-      <Link
-        to={`/tasks/${row.original.task_id}`}
-        className="font-mono text-xs text-blue-600 hover:underline"
-      >
-        {row.original.task_id.slice(0, 8)}...
-      </Link>
-    ),
+    cell: ({ row, table }) => {
+      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
+      const task = tasks.find((t) => t.id === row.original.task_id);
+      const source = task?.source;
+      const label =
+        source && (source.type === "github_issue" || source.type === "github_pr")
+          ? `#${source.number}`
+          : row.original.task_id.slice(0, 8);
+      return (
+        <Link
+          to={`/tasks/${row.original.task_id}`}
+          className="font-mono text-sm text-blue-400 hover:underline"
+        >
+          {label}
+        </Link>
+      );
+    },
   },
   {
     accessorKey: "pr_url",
@@ -65,7 +74,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-blue-600 hover:underline text-xs"
+          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs"
         >
           PR
           <ExternalLink className="h-3 w-3" />
@@ -108,11 +117,11 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
       }
 
       return (
-        <div className="flex items-center gap-1">
+        <div className="inline-flex items-center rounded-md border border-border">
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 gap-1 text-green-600 hover:text-green-700 hover:bg-green-50"
+            className="h-7 gap-1 rounded-r-none border-r border-border"
             onClick={handleApprove}
           >
             <Check className="h-3.5 w-3.5" />
@@ -121,7 +130,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 gap-1 text-red-600 hover:text-red-700 hover:bg-red-50"
+            className="h-7 gap-1 rounded-l-none"
             onClick={handleReject}
           >
             <X className="h-3.5 w-3.5" />

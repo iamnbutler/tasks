@@ -2,9 +2,9 @@
 //!
 //! This is intentionally thin — the logic lives in the library crates.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
@@ -69,41 +69,51 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_hard_time_limit(config.session_hard_limit),
     );
 
-    // --- 4. Load projects from store and create pollers ---
+    // --- 4. Emit system:started ---
 
-    let mut pollers: Vec<(String, RepoPoller)> = Vec::new();
-    {
-        let state = server.state.read().await;
-        for (project_id, project) in &state.projects {
-            let parts: Vec<&str> = project.repo.split('/').collect();
-            if parts.len() == 2 {
-                let client = GitHubClient::new(&config.github_token);
-                let poller = RepoPoller::new(client, parts[0], parts[1]);
-                pollers.push((project_id.clone(), poller));
-            }
-        }
-    }
-
-    // --- 5. Emit system:started ---
-
+    let project_count = server.state.read().await.projects.len();
     server.emit_started().await?;
-    info!(projects = pollers.len(), "tasks platform started");
+    info!(projects = project_count, "tasks platform started");
 
-    // --- 6. Spawn GitHub poll loop ---
+    // --- 5. Spawn GitHub poll loop ---
+    //
+    // Pollers are rebuilt from the live project list each tick so that
+    // projects added/removed via the web UI take effect immediately.
 
     let poll_server = server.clone();
     let poll_interval = config.poll_interval;
-    let pollers = Arc::new(RwLock::new(pollers));
-    let poll_pollers = pollers.clone();
+    let github_token = config.github_token.clone();
 
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         let label_config = server::workflow::LabelConfig::default();
+        let mut pollers: HashMap<String, RepoPoller> = HashMap::new();
 
         loop {
             interval.tick().await;
 
-            let mut pollers = poll_pollers.write().await;
+            // Sync pollers with live project list
+            let projects: Vec<(String, String)> = {
+                let state = poll_server.state.read().await;
+                state.projects.iter().map(|(id, p)| (id.clone(), p.repo.clone())).collect()
+            };
+
+            // Remove pollers for deleted projects
+            let active_ids: std::collections::HashSet<&str> = projects.iter().map(|(id, _)| id.as_str()).collect();
+            pollers.retain(|id, _| active_ids.contains(id.as_str()));
+
+            // Add pollers for new projects
+            for (project_id, repo) in &projects {
+                if !pollers.contains_key(project_id) {
+                    let parts: Vec<&str> = repo.split('/').collect();
+                    if parts.len() == 2 {
+                        let client = GitHubClient::new(&github_token);
+                        let poller = RepoPoller::new(client, parts[0], parts[1]);
+                        pollers.insert(project_id.clone(), poller);
+                    }
+                }
+            }
+
             for (project_id, poller) in pollers.iter_mut() {
                 match poller.poll().await {
                     Ok(result) => {
@@ -171,6 +181,69 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             );
             if let Err(e) = poll_server.event_bus.publish(event).await {
                 error!(error = %e, "failed to publish scheduler tick event");
+            }
+        }
+    });
+
+    // --- 6b. Spawn event handler loop ---
+    //
+    // Listens for session lifecycle events and feeds state changes back
+    // into the server. The session monitor publishes events (e.g.
+    // TaskStateAwaitingMerge) but doesn't update server state directly.
+    // This loop bridges events → state updates + merge queue entries.
+
+    let event_handler_server = server.clone();
+    let event_handler_bus = server.event_bus.clone();
+
+    let event_handler_handle = tokio::spawn(async move {
+        let mut rx = event_handler_bus.subscribe();
+        loop {
+            let event = match rx.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "event handler lagged, some events may not update state");
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            let task_id = &event.task;
+            let new_state = match event.event_type {
+                EventType::TaskStateRunning => Some(models::task::TaskState::Running),
+                EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
+                EventType::TaskStateWaiting => Some(models::task::TaskState::Waiting),
+                EventType::TaskStateBlocked => Some(models::task::TaskState::Blocked),
+                EventType::TaskStateTesting => Some(models::task::TaskState::Testing),
+                EventType::TaskStateAwaitingMerge => Some(models::task::TaskState::AwaitingMerge),
+                EventType::TaskStateConflict => Some(models::task::TaskState::Conflict),
+                EventType::TaskStateCompleted => Some(models::task::TaskState::Completed),
+                EventType::TaskStateFailed => Some(models::task::TaskState::Failed),
+                EventType::TaskStateCancelled => Some(models::task::TaskState::Cancelled),
+                _ => None,
+            };
+
+            if let Some(state) = new_state {
+                // Only process events from agents/sessions — skip events
+                // already published by set_task_state (from scheduler/dispatch)
+                // to avoid double-applying state and bumping updated_at twice.
+                if event.actor != events::Actor::Scheduler {
+                    if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
+                        if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                            error!(task_id = %task_id, error = %e, "failed to update task state from event");
+                        }
+                    }
+                }
+
+                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
+                // TODO: orchestrator quality gate before enqueuing (spec §7.3)
+                if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
+                    let entry_id = uuid::Uuid::new_v4().to_string();
+                    let entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
+                    info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
+                    if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
+                        error!(task_id = %task_id, error = %e, "failed to add merge queue entry");
+                    }
+                }
             }
         }
     });
@@ -326,6 +399,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Cancel the loops
     poll_handle.abort();
     dispatch_handle.abort();
+    event_handler_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }

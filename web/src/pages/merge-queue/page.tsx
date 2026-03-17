@@ -66,6 +66,7 @@ export function MergeQueuePage() {
     getPaginationRowModel: getPaginationRowModel(),
     meta: {
       refreshSnapshot,
+      tasks: snapshot?.tasks ?? [],
     },
   });
 

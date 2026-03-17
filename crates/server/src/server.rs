@@ -266,29 +266,14 @@ impl Server {
     }
 
     /// Transition a task's state and emit the corresponding event.
+    /// Update task state, persist to store, and publish an event.
     pub async fn set_task_state(
         &self,
         task_id: &str,
         new_state: TaskState,
         actor: Actor,
     ) -> Result<(), ServerError> {
-        {
-            let mut state = self.state.write().await;
-            let task = state
-                .tasks
-                .get_mut(task_id)
-                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
-            task.set_state(new_state);
-
-            // Write-through to store
-            if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_task(task) {
-                        tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
-                    }
-                }
-            }
-        }
+        self.apply_task_state(task_id, new_state).await?;
 
         let event_type = match new_state {
             TaskState::Waiting => EventType::TaskStateWaiting,
@@ -304,6 +289,70 @@ impl Server {
         };
 
         let event = Event::new(event_type, task_id, actor, serde_json::json!({}));
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Update task state and persist to store, **without publishing an event**.
+    ///
+    /// Only call this from the event-handler loop in `app`, where the
+    /// state-change event was already published by the session monitor.
+    /// All other callers should use [`set_task_state`], which publishes
+    /// the corresponding event.
+    pub async fn apply_task_state(
+        &self,
+        task_id: &str,
+        new_state: TaskState,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+        task.set_state(new_state);
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // --- Merge queue (spec §7) ---
+
+    /// Add an entry to the merge queue, persisting to store and publishing
+    /// a `merge:queued` event (spec §7.1 step 3).
+    pub async fn add_to_merge_queue(
+        &self,
+        entry: crate::model::merge_queue::MergeQueueEntry,
+    ) -> Result<(), ServerError> {
+        let task_id = entry.task_id.clone();
+        let entry_id = entry.id.clone();
+        {
+            let mut state = self.state.write().await;
+            if state.merge_queue.get_by_task(&task_id).is_some() {
+                return Ok(()); // Already queued
+            }
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_merge_entry(&entry) {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist merge queue entry");
+                    }
+                }
+            }
+            state.merge_queue.enqueue(entry);
+        }
+
+        let event = Event::new(
+            EventType::MergeQueued,
+            &task_id,
+            Actor::System,
+            serde_json::json!({ "entry_id": entry_id }),
+        );
         self.event_bus.publish(event).await?;
         Ok(())
     }
