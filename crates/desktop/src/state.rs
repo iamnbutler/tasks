@@ -14,10 +14,11 @@ use gpui::{AppContext as _, AsyncApp, Context, Entity, EventEmitter, WeakEntity}
 use tracing::{debug, info, warn};
 
 use crate::api::{
-    ApiClient, ApiError, Event, MergeQueueEntry, Mode, Project, Snapshot, Task, TaskState,
-    DEFAULT_SERVER_URL,
+    task_state_is_active, ApiClient, ApiError, MergeQueueEntry, Mode, Project, Snapshot, Task,
+    TaskState, DEFAULT_SERVER_URL,
 };
-use crate::sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
+use crate::SseClient;
+use crate::sse::{SseClientEvent, SseConnectionState, SseFilters};
 
 /// Maximum number of events to keep in the buffer.
 const MAX_EVENTS: usize = 200;
@@ -25,7 +26,7 @@ const MAX_EVENTS: usize = 200;
 /// Polling interval for snapshot refresh (milliseconds).
 const POLL_INTERVAL_MS: u64 = 5_000;
 
-/// Regex pattern matching event types that should trigger a snapshot refresh.
+/// Check whether an event type string should trigger a snapshot refresh.
 /// Matches: task:*, merge:*, system:mode*
 fn is_state_changing_event(event_type: &str) -> bool {
     event_type.starts_with("task:")
@@ -34,6 +35,9 @@ fn is_state_changing_event(event_type: &str) -> bool {
 }
 
 /// Connection status for the app.
+///
+/// A higher-level abstraction over `SseConnectionState` that could
+/// incorporate HTTP polling status in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     /// Not connected to the server.
@@ -53,8 +57,22 @@ impl ConnectionStatus {
     pub fn is_connected_or_connecting(&self) -> bool {
         matches!(
             self,
-            ConnectionStatus::Connected | ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
+            ConnectionStatus::Connected
+                | ConnectionStatus::Connecting
+                | ConnectionStatus::Reconnecting
         )
+    }
+}
+
+impl From<SseConnectionState> for ConnectionStatus {
+    fn from(state: SseConnectionState) -> Self {
+        match state {
+            SseConnectionState::Disconnected => ConnectionStatus::Disconnected,
+            SseConnectionState::Connecting => ConnectionStatus::Connecting,
+            SseConnectionState::Connected => ConnectionStatus::Connected,
+            SseConnectionState::Reconnecting => ConnectionStatus::Reconnecting,
+            SseConnectionState::Failed => ConnectionStatus::Failed,
+        }
     }
 }
 
@@ -67,8 +85,8 @@ pub enum AppStateEvent {
     ConnectionStatusChanged(ConnectionStatus),
     /// An error occurred.
     Error(String),
-    /// New event received.
-    EventReceived(Arc<Event>),
+    /// New event received from the SSE stream.
+    EventReceived(Arc<events::Event>),
     /// Selected project changed.
     SelectedProjectChanged(Option<String>),
 }
@@ -81,8 +99,10 @@ pub enum AppStateEvent {
 pub struct AppState {
     /// Current system snapshot.
     snapshot: Option<Snapshot>,
-    /// Event buffer (most recent first).
-    events: Vec<Arc<Event>>,
+    /// Event buffer (most recent first). This is the canonical buffer
+    /// that the UI reads from; the SSE client's internal buffer is not
+    /// exposed to consumers.
+    events: Vec<Arc<events::Event>>,
     /// Connection status.
     connection_status: ConnectionStatus,
     /// Last error message.
@@ -115,9 +135,13 @@ impl AppState {
         let sse_client = cx.new(|_cx| SseClient::new(&server_url, SseFilters::new()));
 
         // Subscribe to SSE events
-        cx.subscribe(&sse_client, |this: &mut Self, _entity, event: &SseClientEvent, cx| {
-            this.handle_sse_event(event, cx);
-        }).detach();
+        cx.subscribe(
+            &sse_client,
+            |this: &mut Self, _entity, event: &SseClientEvent, cx| {
+                this.handle_sse_event(event, cx);
+            },
+        )
+        .detach();
 
         // Start SSE connection
         sse_client.update(cx, |client, cx| {
@@ -182,12 +206,12 @@ impl AppState {
     }
 
     /// Get the event buffer.
-    pub fn events(&self) -> &[Arc<Event>] {
+    pub fn events(&self) -> &[Arc<events::Event>] {
         &self.events
     }
 
     /// Get recent events (limited).
-    pub fn recent_events(&self, limit: usize) -> &[Arc<Event>] {
+    pub fn recent_events(&self, limit: usize) -> &[Arc<events::Event>] {
         let len = self.events.len().min(limit);
         &self.events[..len]
     }
@@ -222,7 +246,10 @@ impl AppState {
 
     /// Check if a human is present.
     pub fn human_present(&self) -> bool {
-        self.snapshot.as_ref().map(|s| s.human_present).unwrap_or(false)
+        self.snapshot
+            .as_ref()
+            .map(|s| s.human_present)
+            .unwrap_or(false)
     }
 
     // --- Computed properties ---
@@ -257,11 +284,14 @@ impl AppState {
         }
     }
 
-    /// Get active tasks (running, question, testing, awaiting_merge).
+    /// Get active tasks (Running, Question, Testing).
+    ///
+    /// AwaitingMerge is NOT active — it means the agent has finished and the PR
+    /// is waiting in the merge queue. This matches the server definition.
     pub fn active_tasks(&self) -> Vec<&Task> {
         self.filtered_tasks()
             .into_iter()
-            .filter(|t| t.state.is_active())
+            .filter(|t| task_state_is_active(&t.state))
             .collect()
     }
 
@@ -314,9 +344,11 @@ impl AppState {
             let result = api_client.fetch_snapshot().await;
             fetch_in_flight.store(false, Ordering::SeqCst);
 
-            let _ = this.update(&mut cx, |state, cx| {
+            if let Err(e) = this.update(&mut cx, |state, cx| {
                 state.update_snapshot(result, cx);
-            });
+            }) {
+                warn!(error = %e, "Failed to update snapshot state");
+            }
         })
         .detach();
     }
@@ -332,7 +364,9 @@ impl AppState {
                     || self.connection_status == ConnectionStatus::Failed
                 {
                     self.connection_status = ConnectionStatus::Connected;
-                    cx.emit(AppStateEvent::ConnectionStatusChanged(self.connection_status));
+                    cx.emit(AppStateEvent::ConnectionStatusChanged(
+                        self.connection_status,
+                    ));
                 }
                 cx.emit(AppStateEvent::SnapshotUpdated);
                 cx.notify();
@@ -352,7 +386,7 @@ impl AppState {
     }
 
     /// Add an event to the buffer.
-    fn push_event(&mut self, event: Event, cx: &mut Context<Self>) {
+    fn push_event(&mut self, event: events::Event, cx: &mut Context<Self>) {
         let event = Arc::new(event);
         self.events.insert(0, event.clone());
         if self.events.len() > MAX_EVENTS {
@@ -392,33 +426,31 @@ impl AppState {
     fn handle_sse_event(&mut self, event: &SseClientEvent, cx: &mut Context<Self>) {
         match event {
             SseClientEvent::StateChanged(state) => {
-                self.connection_status = match state {
-                    SseConnectionState::Disconnected => ConnectionStatus::Disconnected,
-                    SseConnectionState::Connecting => ConnectionStatus::Connecting,
-                    SseConnectionState::Connected => ConnectionStatus::Connected,
-                    SseConnectionState::Reconnecting => ConnectionStatus::Reconnecting,
-                    SseConnectionState::Failed => ConnectionStatus::Failed,
-                };
-                cx.emit(AppStateEvent::ConnectionStatusChanged(self.connection_status));
+                self.connection_status = ConnectionStatus::from(*state);
+                cx.emit(AppStateEvent::ConnectionStatusChanged(
+                    self.connection_status,
+                ));
                 cx.notify();
             }
             SseClientEvent::EventReceived(event) => {
-                // Clone the inner event
-                let event_clone = Event {
-                    id: event.id.clone(),
-                    event_type: event.event_type.clone(),
-                    task: event.task.clone(),
-                    actor: event.actor,
-                    ts: event.ts,
-                    data: event.data.clone(),
-                };
-
                 // Check if this is a state-changing event
-                if is_state_changing_event(&event.event_type) {
-                    debug!(event_type = %event.event_type, "State-changing event, refreshing snapshot");
+                let event_type_str = event.event_type.as_str();
+                if is_state_changing_event(event_type_str) {
+                    debug!(event_type = %event_type_str, "State-changing event, refreshing snapshot");
                     self.refresh_snapshot(cx);
                 }
 
+                // Clone and push the event into our buffer.
+                // The SSE client also buffers events internally, but AppState's
+                // buffer is the authoritative source for the UI.
+                let event_clone = events::Event {
+                    id: event.id,
+                    event_type: event.event_type.clone(),
+                    task: event.task.clone(),
+                    actor: event.actor.clone(),
+                    ts: event.ts,
+                    data: event.data.clone(),
+                };
                 self.push_event(event_clone, cx);
             }
             SseClientEvent::Error(error) => {
@@ -437,7 +469,11 @@ impl Drop for AppState {
 }
 
 /// Background polling loop for snapshot refresh.
-async fn run_polling_loop(stop_flag: Arc<AtomicBool>, entity: WeakEntity<AppState>, mut cx: AsyncApp) {
+async fn run_polling_loop(
+    stop_flag: Arc<AtomicBool>,
+    entity: WeakEntity<AppState>,
+    mut cx: AsyncApp,
+) {
     let interval = Duration::from_millis(POLL_INTERVAL_MS);
 
     loop {
@@ -451,9 +487,11 @@ async fn run_polling_loop(stop_flag: Arc<AtomicBool>, entity: WeakEntity<AppStat
         }
 
         // Trigger a snapshot refresh
-        let _ = entity.update(&mut cx, |state, cx| {
+        if let Err(e) = entity.update(&mut cx, |state, cx| {
             state.refresh_snapshot(cx);
-        });
+        }) {
+            warn!(error = %e, "Failed to trigger snapshot refresh from polling loop");
+        }
     }
 }
 
@@ -485,5 +523,17 @@ mod tests {
         assert!(ConnectionStatus::Reconnecting.is_connected_or_connecting());
         assert!(!ConnectionStatus::Disconnected.is_connected_or_connecting());
         assert!(!ConnectionStatus::Failed.is_connected_or_connecting());
+    }
+
+    #[test]
+    fn connection_status_from_sse_state() {
+        assert_eq!(
+            ConnectionStatus::from(SseConnectionState::Connected),
+            ConnectionStatus::Connected
+        );
+        assert_eq!(
+            ConnectionStatus::from(SseConnectionState::Failed),
+            ConnectionStatus::Failed
+        );
     }
 }

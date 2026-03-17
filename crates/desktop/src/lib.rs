@@ -15,7 +15,7 @@ use gpui::{Context, SharedString, Window, div, prelude::*, rgb};
 
 pub mod api;
 pub mod components;
-mod sse;
+pub(crate) mod sse;
 pub mod state;
 pub mod theme;
 

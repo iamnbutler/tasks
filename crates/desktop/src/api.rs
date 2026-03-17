@@ -2,13 +2,110 @@
 //!
 //! This module provides type-safe access to the Tasks REST API endpoints.
 //! It mirrors the TypeScript API client in `web/src/lib/api.ts`.
+//!
+//! Domain types (`Task`, `Project`, `MergeQueueEntry`, etc.) are re-exported
+//! from the canonical `models` and `events` crates rather than duplicated here.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Re-export canonical domain types so consumers can import from one place.
+pub use events::{Actor, Event};
+pub use models::merge_queue::{MergeQueueEntry, MergeStatus};
+pub use models::project::Project;
+pub use models::task::{Task, TaskSource, TaskState};
+pub use models::Mode;
+
 /// Default server URL.
 pub const DEFAULT_SERVER_URL: &str = "http://localhost:4800";
+
+// =============================================================================
+// Display helpers for canonical types (UI-only, not on the model crate)
+// =============================================================================
+
+/// Display-friendly name for a `TaskState`.
+pub fn task_state_display_name(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Waiting => "Waiting",
+        TaskState::Blocked => "Blocked",
+        TaskState::Running => "Running",
+        TaskState::Question => "Question",
+        TaskState::Testing => "Testing",
+        TaskState::AwaitingMerge => "Awaiting Merge",
+        TaskState::Conflict => "Conflict",
+        TaskState::Completed => "Completed",
+        TaskState::Failed => "Failed",
+        TaskState::Cancelled => "Cancelled",
+    }
+}
+
+/// Whether the task is actively consuming an agent slot.
+///
+/// Matches the server definition: Running, Question, Testing.
+/// AwaitingMerge is NOT active — the agent has finished and the PR
+/// is waiting in the merge queue.
+pub fn task_state_is_active(state: &TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Running | TaskState::Question | TaskState::Testing
+    )
+}
+
+/// Display-friendly name for a `Mode`.
+pub fn mode_display_name(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Stop => "Stop",
+        Mode::Pause => "Pause",
+        Mode::Play => "Play",
+    }
+}
+
+/// Display-friendly name for a `MergeStatus`.
+pub fn merge_status_display_name(status: &MergeStatus) -> &'static str {
+    match status {
+        MergeStatus::Pending => "Pending",
+        MergeStatus::Approved => "Approved",
+        MergeStatus::Rejected => "Rejected",
+        MergeStatus::Merged => "Merged",
+        MergeStatus::Conflict => "Conflict",
+    }
+}
+
+/// Display-friendly label for a `TaskSource`.
+pub fn task_source_label(source: &TaskSource) -> String {
+    match source {
+        TaskSource::GithubIssue {
+            owner,
+            repo,
+            number,
+        } => {
+            format!("{}/{}#{}", owner, repo, number)
+        }
+        TaskSource::GithubPr {
+            owner,
+            repo,
+            number,
+        } => {
+            format!("{}/{}#{} (PR)", owner, repo, number)
+        }
+        TaskSource::Internal => "Internal".to_string(),
+    }
+}
+
+/// Display-friendly name for an `Actor`.
+pub fn actor_display_name(actor: &Actor) -> &'static str {
+    match actor {
+        Actor::Human => "Human",
+        Actor::Orchestrator => "Orchestrator",
+        Actor::Scheduler => "Scheduler",
+        Actor::Agent => "Agent",
+        Actor::System => "System",
+    }
+}
+
+// =============================================================================
+// API Client
+// =============================================================================
 
 /// API client for the Tasks server.
 #[derive(Clone)]
@@ -220,205 +317,11 @@ impl ApiClient {
     }
 }
 
-// --- API Types ---
-// These mirror the TypeScript types in web/src/lib/types.ts
+// =============================================================================
+// API-only types (not in canonical model crates)
+// =============================================================================
 
-/// Operating mode (spec Section 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    Stop,
-    Pause,
-    Play,
-}
-
-impl Mode {
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Mode::Stop => "Stop",
-            Mode::Pause => "Pause",
-            Mode::Play => "Play",
-        }
-    }
-}
-
-/// Task state (spec Section 5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskState {
-    Waiting,
-    Blocked,
-    Running,
-    Question,
-    Testing,
-    AwaitingMerge,
-    Conflict,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl TaskState {
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            TaskState::Waiting => "Waiting",
-            TaskState::Blocked => "Blocked",
-            TaskState::Running => "Running",
-            TaskState::Question => "Question",
-            TaskState::Testing => "Testing",
-            TaskState::AwaitingMerge => "Awaiting Merge",
-            TaskState::Conflict => "Conflict",
-            TaskState::Completed => "Completed",
-            TaskState::Failed => "Failed",
-            TaskState::Cancelled => "Cancelled",
-        }
-    }
-
-    /// Whether this is a terminal state.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-
-    /// Whether this is an active state (agent working).
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Self::Running | Self::Question | Self::Testing | Self::AwaitingMerge
-        )
-    }
-}
-
-/// Task source — origin reference (spec Section 5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TaskSource {
-    GithubIssue {
-        owner: String,
-        repo: String,
-        number: u64,
-    },
-    GithubPr {
-        owner: String,
-        repo: String,
-        number: u64,
-    },
-    Internal,
-}
-
-impl TaskSource {
-    /// Get a display-friendly label for the source.
-    pub fn label(&self) -> String {
-        match self {
-            TaskSource::GithubIssue { owner, repo, number } => {
-                format!("{}/{}#{}", owner, repo, number)
-            }
-            TaskSource::GithubPr { owner, repo, number } => {
-                format!("{}/{}#{} (PR)", owner, repo, number)
-            }
-            TaskSource::Internal => "Internal".to_string(),
-        }
-    }
-}
-
-/// A task — the internal representation of a unit of work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub id: String,
-    pub source: TaskSource,
-    pub title: String,
-    pub description: Option<String>,
-    pub state: TaskState,
-    pub parent_id: Option<String>,
-    pub blocked_by: Vec<String>,
-    pub project: String,
-    pub labels: Vec<String>,
-    pub priority: Option<i32>,
-    pub session_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub retry_count: u32,
-    pub last_failure_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// A project — maps to a single repository.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
-    pub id: String,
-    pub repo: String,
-    pub default_branch: String,
-    pub config: serde_json::Value,
-}
-
-/// Merge queue entry status (spec Section 5.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeStatus {
-    Pending,
-    Approved,
-    Rejected,
-    Merged,
-    Conflict,
-}
-
-impl MergeStatus {
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            MergeStatus::Pending => "Pending",
-            MergeStatus::Approved => "Approved",
-            MergeStatus::Rejected => "Rejected",
-            MergeStatus::Merged => "Merged",
-            MergeStatus::Conflict => "Conflict",
-        }
-    }
-}
-
-/// A merge queue entry — a PR waiting to be merged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeQueueEntry {
-    pub id: String,
-    pub task_id: String,
-    pub pr_url: String,
-    pub status: MergeStatus,
-    pub queued_at: DateTime<Utc>,
-}
-
-/// Who produced an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Actor {
-    Human,
-    Orchestrator,
-    Scheduler,
-    Agent,
-    System,
-}
-
-impl Actor {
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Actor::Human => "Human",
-            Actor::Orchestrator => "Orchestrator",
-            Actor::Scheduler => "Scheduler",
-            Actor::Agent => "Agent",
-            Actor::System => "System",
-        }
-    }
-}
-
-/// An event in the system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub task: String,
-    pub actor: Actor,
-    pub ts: DateTime<Utc>,
-    pub data: serde_json::Value,
-}
-
-/// Slot utilization info.
+/// Slot utilization info (only returned in snapshot responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotUtilization {
     pub active: u32,
@@ -436,7 +339,7 @@ pub struct Snapshot {
     pub human_present: bool,
 }
 
-// --- Request/Response types ---
+// --- Request/Response types (internal to API calls) ---
 
 #[derive(Serialize)]
 struct SetModeRequest {
@@ -458,7 +361,9 @@ struct ChatRequest {
     message: String,
 }
 
-// --- Errors ---
+// =============================================================================
+// Errors
+// =============================================================================
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -468,22 +373,34 @@ pub enum ApiError {
     HttpStatus(u16),
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn task_state_display() {
-        assert_eq!(TaskState::Running.display_name(), "Running");
-        assert_eq!(TaskState::AwaitingMerge.display_name(), "Awaiting Merge");
+        assert_eq!(task_state_display_name(&TaskState::Running), "Running");
+        assert_eq!(
+            task_state_display_name(&TaskState::AwaitingMerge),
+            "Awaiting Merge"
+        );
     }
 
     #[test]
-    fn task_state_is_active() {
-        assert!(TaskState::Running.is_active());
-        assert!(TaskState::Question.is_active());
-        assert!(!TaskState::Waiting.is_active());
-        assert!(!TaskState::Completed.is_active());
+    fn task_state_active_excludes_awaiting_merge() {
+        assert!(task_state_is_active(&TaskState::Running));
+        assert!(task_state_is_active(&TaskState::Question));
+        assert!(task_state_is_active(&TaskState::Testing));
+        assert!(
+            !task_state_is_active(&TaskState::AwaitingMerge),
+            "AwaitingMerge should NOT be active"
+        );
+        assert!(!task_state_is_active(&TaskState::Waiting));
+        assert!(!task_state_is_active(&TaskState::Completed));
     }
 
     #[test]
@@ -495,19 +412,19 @@ mod tests {
     }
 
     #[test]
-    fn task_source_label() {
+    fn task_source_label_display() {
         let issue = TaskSource::GithubIssue {
             owner: "foo".to_string(),
             repo: "bar".to_string(),
             number: 123,
         };
-        assert_eq!(issue.label(), "foo/bar#123");
+        assert_eq!(task_source_label(&issue), "foo/bar#123");
 
         let pr = TaskSource::GithubPr {
             owner: "foo".to_string(),
             repo: "bar".to_string(),
             number: 456,
         };
-        assert_eq!(pr.label(), "foo/bar#456 (PR)");
+        assert_eq!(task_source_label(&pr), "foo/bar#456 (PR)");
     }
 }
