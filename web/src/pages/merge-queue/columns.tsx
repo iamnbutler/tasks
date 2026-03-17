@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatRelativeTime } from "@/lib/utils";
 import { approveMerge, rejectMerge } from "@/lib/api";
-import type { MergeQueueEntry, MergeStatus } from "@/lib/types";
+import type { MergeQueueEntry, MergeStatus, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Status badge
@@ -43,14 +43,23 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
   {
     accessorKey: "task_id",
     header: "Task",
-    cell: ({ row }) => (
-      <Link
-        to={`/tasks/${row.original.task_id}`}
-        className="font-mono text-xs text-blue-400 hover:underline"
-      >
-        {row.original.task_id.slice(0, 8)}...
-      </Link>
-    ),
+    cell: ({ row, table }) => {
+      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
+      const task = tasks.find((t) => t.id === row.original.task_id);
+      const source = task?.source;
+      const label =
+        source && (source.type === "github_issue" || source.type === "github_pr")
+          ? `#${source.number}`
+          : row.original.task_id.slice(0, 8);
+      return (
+        <Link
+          to={`/tasks/${row.original.task_id}`}
+          className="font-mono text-sm text-blue-400 hover:underline"
+        >
+          {label}
+        </Link>
+      );
+    },
   },
   {
     accessorKey: "pr_url",
