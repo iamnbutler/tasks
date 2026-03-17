@@ -9,6 +9,9 @@ import {
   FileText,
   Terminal,
   StopCircle,
+  User,
+  Bot,
+  RotateCcw,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -100,10 +103,12 @@ function sourceDisplay(task: Task) {
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle";
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "session_boundary";
   content: string;
   toolName?: string;
   filePath?: string;
+  timestamp?: string;
+  sessionId?: string;
 }
 
 /** Human-readable labels for task lifecycle events. */
@@ -123,13 +128,43 @@ const lifecycleLabels: Record<string, string> = {
 
 function parseAgentEvents(events: Event[]): ParsedBlock[] {
   const blocks: ParsedBlock[] = [];
+  let lastSessionId: string | undefined;
 
   for (const event of events) {
+    // Track session boundaries — when a new session starts (running state after previous session)
+    if (event.type === "task:state:running") {
+      const sessionId = event.data?.session_id as string | undefined;
+      if (lastSessionId && sessionId && lastSessionId !== sessionId) {
+        blocks.push({
+          kind: "session_boundary",
+          content: "New session started (retry)",
+          timestamp: event.ts,
+          sessionId,
+        });
+      }
+      if (sessionId) {
+        lastSessionId = sessionId;
+      }
+    }
+
     // Lifecycle events — task state transitions, container pickup, etc.
     if (event.type.startsWith("task:")) {
       const label = lifecycleLabels[event.type];
       if (label) {
-        blocks.push({ kind: "lifecycle", content: label });
+        blocks.push({ kind: "lifecycle", content: label, timestamp: event.ts });
+      }
+      continue;
+    }
+
+    // Human messages — user chat input
+    if (event.type === "human:message") {
+      const message = event.data?.message as string | undefined;
+      if (message) {
+        blocks.push({
+          kind: "human_message",
+          content: message,
+          timestamp: event.ts,
+        });
       }
       continue;
     }
@@ -138,6 +173,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       blocks.push({
         kind: "error",
         content: typeof event.data?.text === "string" ? event.data.text : JSON.stringify(event.data),
+        timestamp: event.ts,
       });
       continue;
     }
@@ -183,7 +219,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
 
       if (b.type === "text" && typeof b.text === "string") {
         if (b.text.trim()) {
-          blocks.push({ kind: "text", content: b.text });
+          blocks.push({ kind: "text", content: b.text, timestamp: event.ts });
         }
         continue;
       }
@@ -201,6 +237,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
           content: detail ? String(detail) : "",
           toolName: name,
           filePath: filePath ? String(filePath) : undefined,
+          timestamp: event.ts,
         });
         continue;
       }
@@ -214,7 +251,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
           lines.length > 30
             ? lines.slice(0, 25).join("\n") + `\n... (${lines.length} total lines)`
             : content;
-        blocks.push({ kind: "tool_result", content: preview });
+        blocks.push({ kind: "tool_result", content: preview, timestamp: event.ts });
         continue;
       }
     }
@@ -227,7 +264,52 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
 // Rendered block components
 // ---------------------------------------------------------------------------
 
+/** Format timestamp for display in chat */
+function formatMessageTime(ts?: string): string | null {
+  if (!ts) return null;
+  try {
+    const date = new Date(ts);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return null;
+  }
+}
+
 function BlockView({ block }: { block: ParsedBlock }) {
+  const timestamp = formatMessageTime(block.timestamp);
+
+  // Human message — user chat input (right-aligned, distinct style)
+  if (block.kind === "human_message") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] flex flex-col items-end gap-1">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>You</span>
+            <User className="h-3 w-3" />
+          </div>
+          <div className="rounded-lg bg-blue-600 px-3 py-2 text-sm text-white">
+            {block.content}
+          </div>
+          {timestamp && (
+            <span className="text-xs text-muted-foreground">{timestamp}</span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Session boundary — retry indicator
+  if (block.kind === "session_boundary") {
+    return (
+      <div className="flex items-center gap-2 py-3 text-sm text-yellow-500">
+        <div className="h-px flex-1 bg-yellow-500/30" />
+        <RotateCcw className="h-4 w-4" />
+        <span className="font-medium">{block.content}</span>
+        <div className="h-px flex-1 bg-yellow-500/30" />
+      </div>
+    );
+  }
+
   if (block.kind === "tool_use") {
     return (
       <div className="flex items-center gap-2 py-1 text-muted-foreground text-sm">
@@ -284,10 +366,22 @@ function BlockView({ block }: { block: ParsedBlock }) {
     );
   }
 
-  // text — render as markdown
+  // text — render as markdown (agent message)
   return (
-    <div className="prose prose-sm prose-invert max-w-none">
-      <Markdown remarkPlugins={[remarkGfm]}>{block.content}</Markdown>
+    <div className="flex gap-2">
+      <div className="shrink-0 mt-1">
+        <div className="flex items-center justify-center h-6 w-6 rounded-full bg-muted">
+          <Bot className="h-3.5 w-3.5 text-muted-foreground" />
+        </div>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="prose prose-sm prose-invert max-w-none">
+          <Markdown remarkPlugins={[remarkGfm]}>{block.content}</Markdown>
+        </div>
+        {timestamp && (
+          <span className="text-xs text-muted-foreground mt-1 block">{timestamp}</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -310,6 +404,7 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       e.type === "agent:message" ||
       e.type === "agent:question" ||
       e.type === "agent:error" ||
+      e.type === "human:message" ||
       e.type.startsWith("task:");
 
     fetchTaskEvents(taskId).then((events) => {
