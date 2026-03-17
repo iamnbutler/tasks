@@ -10,7 +10,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
-use models::merge_queue::{MergeQueueEntry, MergeStatus};
+use models::merge_queue::{ConflictInfo, MergeQueueEntry, MergeStatus};
 use models::project::Project;
 use models::task::{Task, TaskSource, TaskState};
 use thiserror::Error;
@@ -130,9 +130,14 @@ impl Store {
             .unwrap()
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
+        let conflict_info_json = entry
+            .conflict_info
+            .as_ref()
+            .map(|c| serde_json::to_string(c))
+            .transpose()?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
+            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, status, queued_at, conflict_info_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![entry.id, entry.task_id, entry.pr_url, status, queued_at, conflict_info_json],
         )?;
         Ok(())
     }
@@ -140,7 +145,7 @@ impl Store {
     /// Get a merge queue entry by ID.
     pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
+            "SELECT id, task_id, pr_url, status, queued_at, conflict_info_json FROM merge_queue WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok((
@@ -149,23 +154,28 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         match rows.next() {
             Some(row) => {
-                let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+                let (id, task_id, pr_url, status_str, queued_at_str, conflict_info_json) = row?;
                 let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
                 let queued_at: DateTime<Utc> = queued_at_str
                     .parse()
                     .map_err(|e: chrono::ParseError| {
                         serde_json::from_str::<()>(&e.to_string()).unwrap_err()
                     })?;
+                let conflict_info: Option<ConflictInfo> = conflict_info_json
+                    .map(|s| serde_json::from_str(&s))
+                    .transpose()?;
                 Ok(Some(MergeQueueEntry {
                     id,
                     task_id,
                     pr_url,
                     status,
                     queued_at,
+                    conflict_info,
                 }))
             }
             None => Ok(None),
@@ -176,7 +186,7 @@ impl Store {
     pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
+            .prepare("SELECT id, task_id, pr_url, status, queued_at, conflict_info_json FROM merge_queue")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -184,23 +194,28 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+            let (id, task_id, pr_url, status_str, queued_at_str, conflict_info_json) = row?;
             let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
             let queued_at: DateTime<Utc> = queued_at_str
                 .parse()
                 .map_err(|e: chrono::ParseError| {
                     serde_json::from_str::<()>(&e.to_string()).unwrap_err()
                 })?;
+            let conflict_info: Option<ConflictInfo> = conflict_info_json
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?;
             entries.push(MergeQueueEntry {
                 id,
                 task_id,
                 pr_url,
                 status,
                 queued_at,
+                conflict_info,
             });
         }
         Ok(entries)

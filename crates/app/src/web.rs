@@ -23,9 +23,11 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
+use chrono::Utc;
 use events::Actor;
 use server::Server;
 use server::mode::Mode;
+use server::model::merge_queue::{ConflictInfo, ConflictType};
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -244,7 +246,14 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
                     }
                     Ok(false) => {
                         tracing::warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable during flush");
-                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url).await {
+                        // Create default conflict info for flush failures
+                        let conflict_info = ConflictInfo {
+                            conflict_type: ConflictType::Unknown,
+                            conflicting_files: vec![],
+                            description: "Merge failed during flush - PR not mergeable".to_string(),
+                            detected_at: Utc::now(),
+                        };
+                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url, conflict_info).await {
                             tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict after flush");
                         }
                     }

@@ -4,7 +4,7 @@
 
 use thiserror::Error;
 
-use crate::model::merge_queue::{MergeQueueEntry, MergeStatus};
+use crate::model::merge_queue::{ConflictInfo, MergeQueueEntry, MergeStatus};
 use crate::mode::Mode;
 
 #[derive(Debug, Error)]
@@ -105,13 +105,46 @@ impl MergeQueue {
         Ok(())
     }
 
-    /// Mark an entry as conflicted (spec Section 7.4).
-    pub fn mark_conflict(&mut self, id: &str) -> Result<(), MergeQueueError> {
+    /// Mark an entry as conflicted with detailed info (spec Section 7.4).
+    pub fn mark_conflict(&mut self, id: &str, info: ConflictInfo) -> Result<(), MergeQueueError> {
         let entry = self
             .get_mut(id)
             .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
-        entry.status = MergeStatus::Conflict;
+        entry.set_conflict(info);
         Ok(())
+    }
+
+    /// Clear conflict status and return entry to pending (after resolution).
+    pub fn clear_conflict(&mut self, id: &str) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        entry.clear_conflict();
+        Ok(())
+    }
+
+    /// Get all conflicted entries (spec Section 7.4).
+    pub fn conflicted(&self) -> Vec<&MergeQueueEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == MergeStatus::Conflict)
+            .collect()
+    }
+
+    /// Get conflicted entries that can be resolved mechanically.
+    pub fn mechanical_conflicts(&self) -> Vec<&MergeQueueEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == MergeStatus::Conflict && e.has_mechanical_conflict())
+            .collect()
+    }
+
+    /// Get conflicted entries that need human guidance.
+    pub fn conflicts_needing_human(&self) -> Vec<&MergeQueueEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == MergeStatus::Conflict && e.needs_human_guidance())
+            .collect()
     }
 
     /// Flush: push through all approved entries (spec Section 6.2).
@@ -155,9 +188,20 @@ impl Default for MergeQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::merge_queue::ConflictType;
+    use chrono::Utc;
 
     fn entry(id: &str, task_id: &str) -> MergeQueueEntry {
         MergeQueueEntry::new(id, task_id, "https://github.com/test/repo/pull/1")
+    }
+
+    fn test_conflict_info(conflict_type: ConflictType) -> ConflictInfo {
+        ConflictInfo {
+            conflict_type,
+            conflicting_files: vec!["src/main.rs".to_string()],
+            description: "Test conflict".to_string(),
+            detected_at: Utc::now(),
+        }
     }
 
     #[test]
@@ -200,8 +244,42 @@ mod tests {
     fn conflict_not_eligible() {
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
-        q.mark_conflict("m1").unwrap();
+        q.mark_conflict("m1", test_conflict_info(ConflictType::SourceConflict)).unwrap();
         assert!(q.pending().is_empty());
+        assert_eq!(q.conflicted().len(), 1);
+    }
+
+    #[test]
+    fn mechanical_vs_complex_conflicts() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+        q.enqueue(entry("m3", "t3"));
+
+        // m1: mechanical (needs rebase)
+        q.mark_conflict("m1", test_conflict_info(ConflictType::NeedsRebase)).unwrap();
+        // m2: complex (needs human)
+        q.mark_conflict("m2", test_conflict_info(ConflictType::ComplexConflict)).unwrap();
+        // m3: source conflict (re-engage agent)
+        q.mark_conflict("m3", test_conflict_info(ConflictType::SourceConflict)).unwrap();
+
+        assert_eq!(q.conflicted().len(), 3);
+        assert_eq!(q.mechanical_conflicts().len(), 1);
+        assert_eq!(q.conflicts_needing_human().len(), 1);
+    }
+
+    #[test]
+    fn clear_conflict_returns_to_pending() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.mark_conflict("m1", test_conflict_info(ConflictType::NeedsRebase)).unwrap();
+
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Conflict);
+        assert!(q.get("m1").unwrap().conflict_info.is_some());
+
+        q.clear_conflict("m1").unwrap();
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Pending);
+        assert!(q.get("m1").unwrap().conflict_info.is_none());
     }
 
     #[test]

@@ -8,7 +8,8 @@ use serde_json::json;
 
 use crate::error::GitHubError;
 use crate::model::{
-    Issue, IssueFilters, IssueState, PullRequest, PullRequestFilters, PullRequestState, RateLimit,
+    Issue, IssueFilters, IssueState, MergeableState, PrMergeStatus, PullRequest,
+    PullRequestFilters, PullRequestState, RateLimit,
 };
 use crate::queries;
 use crate::response::*;
@@ -494,6 +495,99 @@ impl GitHubClient {
         Err(GitHubError::Decode(format!(
             "unexpected merge status {status}: {text}"
         )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Conflict detection (spec §7.4)
+    // -----------------------------------------------------------------------
+
+    /// Check a PR's merge status and return conflict details if any.
+    ///
+    /// Returns detailed information about merge conflicts to support
+    /// the orchestrator's conflict triage (spec §7.4). The returned
+    /// `MergeStatus` indicates:
+    /// - `Mergeable`: PR can be merged cleanly
+    /// - `Conflicting`: PR has merge conflicts (files are returned)
+    /// - `Unknown`: GitHub hasn't computed mergeability yet
+    ///
+    /// Also returns the list of files that would be changed by the PR,
+    /// which helps determine conflict type (source vs generated files).
+    pub async fn check_pr_merge_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrMergeStatus, GitHubError> {
+        let query = r#"
+            query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                        mergeable
+                        headRef {
+                            compare(headRef: "HEAD") {
+                                status
+                                behindBy
+                            }
+                        }
+                        files(first: 100) {
+                            nodes {
+                                path
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+        let variables = json!({
+            "owner": owner,
+            "name": repo,
+            "number": number as i64,
+        });
+
+        let resp: GraphQLResponse<serde_json::Value> =
+            self.execute(query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+
+        let pr = data
+            .get("repository")
+            .and_then(|r| r.get("pullRequest"))
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}#{number}")))?;
+
+        let mergeable = pr
+            .get("mergeable")
+            .and_then(|m| m.as_str())
+            .map(|s| match s {
+                "MERGEABLE" => MergeableState::Mergeable,
+                "CONFLICTING" => MergeableState::Conflicting,
+                _ => MergeableState::Unknown,
+            })
+            .unwrap_or(MergeableState::Unknown);
+
+        let behind_by = pr
+            .get("headRef")
+            .and_then(|r| r.get("compare"))
+            .and_then(|c| c.get("behindBy"))
+            .and_then(|b| b.as_u64())
+            .unwrap_or(0) as u32;
+
+        let changed_files: Vec<String> = pr
+            .get("files")
+            .and_then(|f| f.get("nodes"))
+            .and_then(|nodes| nodes.as_array())
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter_map(|n| n.get("path").and_then(|p| p.as_str()))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(PrMergeStatus {
+            mergeable,
+            behind_by,
+            changed_files,
+        })
     }
 
     // -----------------------------------------------------------------------

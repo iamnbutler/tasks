@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::types::{EvaluationContext, QualityEvaluation};
+use crate::types::{default_triage, ConflictTriage, EvaluationContext, QualityEvaluation};
+use models::merge_queue::ConflictInfo;
 use models::task::Task;
 
 /// A mock orchestrator that returns configurable responses.
@@ -18,6 +19,8 @@ pub struct MockOrchestrator {
     pub evaluate_count: Mutex<u32>,
     /// Count of feedback calls (for assertions).
     pub feedback_count: Mutex<u32>,
+    /// Count of triage calls (for assertions).
+    pub triage_count: Mutex<u32>,
 }
 
 impl MockOrchestrator {
@@ -31,6 +34,7 @@ impl MockOrchestrator {
             }),
             evaluate_count: Mutex::new(0),
             feedback_count: Mutex::new(0),
+            triage_count: Mutex::new(0),
         }
     }
 
@@ -45,6 +49,7 @@ impl MockOrchestrator {
             }),
             evaluate_count: Mutex::new(0),
             feedback_count: Mutex::new(0),
+            triage_count: Mutex::new(0),
         }
     }
 
@@ -70,6 +75,18 @@ impl Orchestrator for MockOrchestrator {
     ) -> Result<(), OrchestratorError> {
         *self.feedback_count.lock().unwrap() += 1;
         Ok(())
+    }
+
+    async fn triage_conflict(
+        &self,
+        entry_id: &str,
+        conflict_info: &ConflictInfo,
+        is_play_mode: bool,
+        human_present: bool,
+    ) -> Result<ConflictTriage, OrchestratorError> {
+        *self.triage_count.lock().unwrap() += 1;
+        // Use default triage logic for mock
+        Ok(default_triage(entry_id, conflict_info, is_play_mode, human_present))
     }
 }
 

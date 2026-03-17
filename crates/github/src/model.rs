@@ -218,6 +218,79 @@ pub struct LinkedIssueRef {
 }
 
 // ---------------------------------------------------------------------------
+// Merge status (spec §7.4)
+// ---------------------------------------------------------------------------
+
+/// PR merge status details for conflict detection.
+///
+/// Contains information needed by the orchestrator to triage conflicts.
+#[derive(Debug, Clone)]
+pub struct PrMergeStatus {
+    /// GitHub's computed mergeability state.
+    pub mergeable: MergeableState,
+    /// Number of commits the branch is behind the base branch.
+    pub behind_by: u32,
+    /// Files changed by this PR (helps determine conflict type).
+    pub changed_files: Vec<String>,
+}
+
+impl PrMergeStatus {
+    /// Check if the PR needs a rebase (behind base but no conflicts).
+    pub fn needs_rebase(&self) -> bool {
+        self.mergeable == MergeableState::Mergeable && self.behind_by > 0
+    }
+
+    /// Check if the PR has actual merge conflicts.
+    pub fn has_conflicts(&self) -> bool {
+        self.mergeable == MergeableState::Conflicting
+    }
+
+    /// Check if GitHub hasn't computed mergeability yet.
+    pub fn is_unknown(&self) -> bool {
+        self.mergeable == MergeableState::Unknown
+    }
+
+    /// Check if any changed files are likely auto-generated.
+    ///
+    /// Used to determine if conflicts might be trivially resolvable
+    /// by regenerating generated files.
+    pub fn has_generated_files(&self) -> bool {
+        self.changed_files.iter().any(|f| {
+            f.ends_with(".lock")
+                || f.ends_with("package-lock.json")
+                || f.ends_with("Cargo.lock")
+                || f.ends_with("yarn.lock")
+                || f.ends_with("pnpm-lock.yaml")
+                || f.ends_with(".min.js")
+                || f.ends_with(".min.css")
+                || f.contains("/generated/")
+                || f.contains("/build/")
+                || f.contains("/dist/")
+        })
+    }
+
+    /// Get source files (non-generated) from changed files.
+    pub fn source_files(&self) -> Vec<&str> {
+        self.changed_files
+            .iter()
+            .filter(|f| {
+                !f.ends_with(".lock")
+                    && !f.ends_with("package-lock.json")
+                    && !f.ends_with("Cargo.lock")
+                    && !f.ends_with("yarn.lock")
+                    && !f.ends_with("pnpm-lock.yaml")
+                    && !f.ends_with(".min.js")
+                    && !f.ends_with(".min.css")
+                    && !f.contains("/generated/")
+                    && !f.contains("/build/")
+                    && !f.contains("/dist/")
+            })
+            .map(|s| s.as_str())
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filters (spec github.md §4.3)
 // ---------------------------------------------------------------------------
 

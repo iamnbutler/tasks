@@ -7,18 +7,20 @@ use std::sync::Arc;
 
 use std::sync::Mutex as StdMutex;
 
+use chrono::Utc;
 use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
-use server::model::merge_queue::MergeQueueEntry;
+use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
 use tasks_github::client::GitHubClient;
 use tasks_github::model::IssueState;
 use tasks_github::poller::RepoPoller;
+use tasks_github::PrMergeStatus;
 
-use tasks_orchestrator::Orchestrator;
+use tasks_orchestrator::{ConflictResolution, ConflictTriage, Orchestrator};
 
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
@@ -42,6 +44,71 @@ impl AnyOrchestrator {
             Self::Claude(o) => o.evaluate(context).await,
             Self::Mock(o) => o.evaluate(context).await,
         }
+    }
+
+    async fn triage_conflict(
+        &self,
+        entry_id: &str,
+        conflict_info: &ConflictInfo,
+        is_play_mode: bool,
+        human_present: bool,
+    ) -> Result<ConflictTriage, tasks_orchestrator::OrchestratorError> {
+        match self {
+            Self::Claude(o) => o.triage_conflict(entry_id, conflict_info, is_play_mode, human_present).await,
+            Self::Mock(o) => o.triage_conflict(entry_id, conflict_info, is_play_mode, human_present).await,
+        }
+    }
+}
+
+/// Convert PR merge status from GitHub to ConflictInfo.
+fn pr_merge_status_to_conflict_info(status: &PrMergeStatus) -> ConflictInfo {
+    let conflict_type = if status.is_unknown() {
+        ConflictType::Unknown
+    } else if status.needs_rebase() {
+        ConflictType::NeedsRebase
+    } else if status.has_conflicts() {
+        // Determine if conflicts are trivial or source-level
+        let source_files = status.source_files();
+        if source_files.is_empty() && status.has_generated_files() {
+            ConflictType::TrivialMerge
+        } else if source_files.len() <= 3 {
+            ConflictType::SourceConflict
+        } else {
+            // Many source files conflicting suggests complex changes
+            ConflictType::ComplexConflict
+        }
+    } else {
+        // Shouldn't happen if we only call this when there's a conflict
+        ConflictType::Unknown
+    };
+
+    let description = match conflict_type {
+        ConflictType::NeedsRebase => format!(
+            "Branch is {} commit(s) behind base, needs rebase",
+            status.behind_by
+        ),
+        ConflictType::TrivialMerge => {
+            "Conflicts in generated/lock files that can be auto-resolved".to_string()
+        }
+        ConflictType::SourceConflict => {
+            let files = status.source_files();
+            format!("Source conflicts in {} file(s): {}", files.len(), files.join(", "))
+        }
+        ConflictType::ComplexConflict => {
+            let files = status.source_files();
+            format!(
+                "Complex conflicts across {} source file(s), may require manual resolution",
+                files.len()
+            )
+        }
+        ConflictType::Unknown => "GitHub has not yet computed mergeability".to_string(),
+    };
+
+    ConflictInfo {
+        conflict_type,
+        conflicting_files: status.changed_files.clone(),
+        description,
+        detected_at: Utc::now(),
     }
 }
 
@@ -870,6 +937,85 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                         // Execute the merge on GitHub (Play mode = continuous merge authority)
                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                            // Check PR merge status first (spec §7.4)
+                            let merge_status = match merge_github.check_pr_merge_status(&owner, &repo, number).await {
+                                Ok(status) => status,
+                                Err(e) => {
+                                    error!(entry_id = %entry_id, error = %e, "failed to check PR merge status");
+                                    continue;
+                                }
+                            };
+
+                            // If there are conflicts, triage them (spec §7.4)
+                            if merge_status.has_conflicts() || merge_status.is_unknown() {
+                                let conflict_info = pr_merge_status_to_conflict_info(&merge_status);
+                                let human_present = orch_server.is_human_present();
+
+                                // Triage the conflict
+                                let triage = match orch.triage_conflict(
+                                    &entry_id,
+                                    &conflict_info,
+                                    true, // is_play_mode
+                                    human_present,
+                                ).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        error!(entry_id = %entry_id, error = %e, "failed to triage conflict");
+                                        // Fall back to marking as conflict
+                                        if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                info!(
+                                    entry_id = %entry_id,
+                                    conflict_type = ?conflict_info.conflict_type,
+                                    resolution = ?triage.resolution,
+                                    "Conflict detected, triaging (Play mode)"
+                                );
+
+                                // Execute the triage decision
+                                match triage.resolution {
+                                    ConflictResolution::Rebase => {
+                                        // Mark as conflict for now — rebase execution not yet implemented
+                                        warn!(entry_id = %entry_id, "rebase resolution not yet implemented, marking as conflict");
+                                        if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                        }
+                                    }
+                                    ConflictResolution::ReengageAgent { instructions } => {
+                                        info!(entry_id = %entry_id, "re-engaging agent for conflict resolution");
+                                        if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                        }
+                                        if let Err(e) = orch_server.reengage_for_conflict(&entry_id, &instructions).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to re-engage agent");
+                                        }
+                                    }
+                                    ConflictResolution::SurfaceToHuman { summary } => {
+                                        info!(entry_id = %entry_id, summary = %summary, "surfacing conflict to human");
+                                        if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                        }
+                                    }
+                                    ConflictResolution::AutoResolve { strategy } => {
+                                        // Auto-resolve not yet implemented
+                                        warn!(entry_id = %entry_id, strategy = %strategy, "auto-resolve not yet implemented, marking as conflict");
+                                        if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                            error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                        }
+                                    }
+                                    ConflictResolution::RetryLater => {
+                                        info!(entry_id = %entry_id, "GitHub hasn't computed mergeability, will retry later");
+                                        // Don't mark as conflict — leave pending for next tick
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // No conflicts — proceed with merge
                             match merge_github.merge_pull_request(&owner, &repo, number).await {
                                 Ok(true) => {
                                     info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged successfully");
@@ -878,8 +1024,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 Ok(false) => {
+                                    // Merge failed — likely conflicts emerged after check
                                     warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable (conflicts or checks failing)");
-                                    if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url).await {
+                                    // Re-check status for accurate conflict info
+                                    let conflict_info = pr_merge_status_to_conflict_info(&merge_status);
+                                    if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
                                         error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
                                     }
                                 }
@@ -968,8 +1117,66 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // In Pause mode: evaluation is recorded (decision event above)
-                // but no merge/reject action is taken. The human reviews.
+                // In Pause mode: check for conflicts and surface to human (spec §7.4)
+                if mode == server::Mode::Pause {
+                    if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                        // Check PR merge status
+                        if let Ok(merge_status) = merge_github.check_pr_merge_status(&owner, &repo, number).await {
+                            if merge_status.has_conflicts() {
+                                let conflict_info = pr_merge_status_to_conflict_info(&merge_status);
+                                let human_present = orch_server.is_human_present();
+
+                                // Triage the conflict (Pause mode behavior)
+                                if let Ok(triage) = orch.triage_conflict(
+                                    &entry_id,
+                                    &conflict_info,
+                                    false, // is_play_mode = false for Pause
+                                    human_present,
+                                ).await {
+                                    info!(
+                                        entry_id = %entry_id,
+                                        conflict_type = ?conflict_info.conflict_type,
+                                        resolution = ?triage.resolution,
+                                        "Conflict detected, triaging (Pause mode)"
+                                    );
+
+                                    match triage.resolution {
+                                        ConflictResolution::Rebase | ConflictResolution::AutoResolve { .. } => {
+                                            // Mechanical conflicts can be resolved directly in Pause mode
+                                            warn!(entry_id = %entry_id, "mechanical conflict resolution not yet implemented");
+                                            if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                            }
+                                        }
+                                        ConflictResolution::SurfaceToHuman { summary } => {
+                                            info!(entry_id = %entry_id, summary = %summary, "surfacing conflict to human (Pause mode)");
+                                            if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                            }
+                                        }
+                                        ConflictResolution::ReengageAgent { instructions } => {
+                                            // In Pause mode with human present, surface instead of re-engaging
+                                            if human_present {
+                                                info!(entry_id = %entry_id, "surfacing source conflict to human (Pause mode with human present)");
+                                            } else {
+                                                info!(entry_id = %entry_id, "re-engaging agent for conflict (Pause mode)");
+                                                if let Err(e) = orch_server.reengage_for_conflict(&entry_id, &instructions).await {
+                                                    error!(entry_id = %entry_id, error = %e, "failed to re-engage agent");
+                                                }
+                                            }
+                                            if let Err(e) = orch_server.mark_entry_conflict(&entry_id, &pr_url, conflict_info).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to mark entry as conflict");
+                                            }
+                                        }
+                                        ConflictResolution::RetryLater => {
+                                            // Leave pending, will re-check on next tick
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Cleanup terminal merge queue entries (issue #132).

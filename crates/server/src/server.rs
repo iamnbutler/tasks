@@ -14,6 +14,7 @@ use events::{Actor, Event, EventBus, EventType};
 
 use crate::merge_queue::MergeQueue;
 use crate::mode::{Mode, ModeTransitionError};
+use crate::model::merge_queue::ConflictInfo;
 use crate::model::project::Project;
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
@@ -601,30 +602,102 @@ impl Server {
         Ok(())
     }
 
-    /// Mark a merge queue entry as conflicted. Emits `merge:conflict`.
+    /// Mark a merge queue entry as conflicted with detailed info (spec §7.4).
+    /// Emits `merge:conflict` and transitions task to Conflict state.
     pub async fn mark_entry_conflict(
         &self,
         entry_id: &str,
         pr_url: &str,
+        conflict_info: ConflictInfo,
     ) -> Result<(), ServerError> {
         let task_id = {
             let mut state = self.state.write().await;
             state
                 .merge_queue
-                .mark_conflict(entry_id)
+                .mark_conflict(entry_id, conflict_info.clone())
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             entry.task_id.clone()
         };
 
+        // Emit conflict event with detailed info
         let event = Event::new(
             EventType::MergeConflict,
             &task_id,
             Actor::System,
-            serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url }),
+            serde_json::json!({
+                "entry_id": entry_id,
+                "pr_url": pr_url,
+                "conflict_type": conflict_info.conflict_type,
+                "conflicting_files": conflict_info.conflicting_files,
+                "description": conflict_info.description,
+            }),
         );
         self.event_bus.publish(event).await?;
+
+        // Transition task to Conflict state (spec §7.4)
+        self.set_task_state(&task_id, TaskState::Conflict, Actor::System)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Clear conflict on a merge queue entry after resolution.
+    /// Returns the entry to Pending and task to AwaitingMerge.
+    pub async fn clear_entry_conflict(
+        &self,
+        entry_id: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .clear_conflict(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Transition task back to AwaitingMerge
+        self.set_task_state(&task_id, TaskState::AwaitingMerge, Actor::System)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Prepare a task for agent re-engagement after conflict detection.
+    /// Returns the task to Waiting state so the dispatch loop can pick it up
+    /// with conflict resolution instructions.
+    pub async fn reengage_for_conflict(
+        &self,
+        entry_id: &str,
+        instructions: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let state = self.state.read().await;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit orchestrator feedback event with conflict instructions
+        let event = Event::new(
+            EventType::OrchestratorFeedback,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "feedback": instructions,
+                "context": "conflict_resolution",
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition task back to Waiting for re-dispatch
+        self.set_task_state(&task_id, TaskState::Waiting, Actor::Orchestrator)
+            .await?;
 
         Ok(())
     }

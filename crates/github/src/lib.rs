@@ -16,4 +16,5 @@ mod response;
 
 pub use client::GitHubClient;
 pub use error::GitHubError;
+pub use model::PrMergeStatus;
 pub use poller::{PollResult, RepoPoller};
