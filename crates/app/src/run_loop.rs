@@ -14,6 +14,7 @@ use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
 use server::model::merge_queue::MergeQueueEntry;
 use server::model::task::{TaskSource, TaskState};
+use server::{WorkflowConfigWatcher, RefreshResult};
 use tasks_github::client::GitHubClient;
 use tasks_github::model::IssueState;
 use tasks_github::poller::RepoPoller;
@@ -125,6 +126,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("Failed to load state: {e}"))?;
 
+    // --- 2b. Create workflow config watcher (spec §14.3) ---
+    //
+    // Watches workflow.toml in project repositories and caches configs.
+    // Refreshes are triggered during the GitHub poll loop.
+    let workflow_config_watcher = Arc::new(WorkflowConfigWatcher::with_defaults());
+
     // --- 3. Create container runtime ---
 
     let container_runtime = AppleContainerRuntime::new();
@@ -235,10 +242,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     //
     // Pollers are rebuilt from the live project list each tick so that
     // projects added/removed via the web UI take effect immediately.
+    // Also refreshes workflow configs (spec §14.3) on each tick.
 
     let poll_server = server.clone();
     let poll_interval = config.poll_interval;
     let github_token = config.github_token.clone();
+    let poll_config_watcher = workflow_config_watcher.clone();
 
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -271,6 +280,59 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         let client = GitHubClient::new(&github_token);
                         let poller = RepoPoller::new(client, parts[0], parts[1]);
                         pollers.insert(project_id.clone(), poller);
+                    }
+                }
+            }
+
+            // Refresh workflow configs (spec §14.3)
+            //
+            // Check for workflow.toml changes in each project repository.
+            // On change, emit system:config:reloaded event.
+            for (project_id, repo) in &projects {
+                let parts: Vec<&str> = repo.split('/').collect();
+                if parts.len() != 2 {
+                    continue;
+                }
+                let (owner, repo_name) = (parts[0].to_string(), parts[1].to_string());
+                let token = github_token.clone();
+                let pid = project_id.clone();
+
+                let result = poll_config_watcher
+                    .refresh(&pid, || async {
+                        let client = GitHubClient::new(&token);
+                        client
+                            .get_file_content(&owner, &repo_name, "workflow.toml")
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+
+                // Emit event if config changed
+                if let RefreshResult::Changed(config) = result {
+                    info!(
+                        project_id = %pid,
+                        max_sessions = ?config.project.max_sessions,
+                        max_retries = config.dispatch.max_retries,
+                        "workflow config reloaded"
+                    );
+                    let event = Event::new(
+                        EventType::SystemConfigReloaded,
+                        "system",
+                        Actor::System,
+                        serde_json::json!({
+                            "project_id": pid,
+                            "config": {
+                                "max_sessions": config.project.max_sessions,
+                                "max_retries": config.dispatch.max_retries,
+                                "retry_base_delay": config.dispatch.retry_base_delay,
+                                "progress_threshold": config.dispatch.progress_threshold,
+                                "ignore_labels": config.labels.ignore,
+                                "blocked_labels": config.labels.blocked,
+                            }
+                        }),
+                    );
+                    if let Err(e) = poll_server.event_bus.publish(event).await {
+                        error!(error = %e, "failed to publish config reload event");
                     }
                 }
             }
@@ -483,6 +545,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
     let dispatch_github_token = config.github_token.clone();
+    let dispatch_config_watcher = workflow_config_watcher.clone();
 
     // Debounce interval to coalesce rapid events (100ms)
     let debounce_duration = std::time::Duration::from_millis(100);
@@ -601,9 +664,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             let branch = format!("tasks/{}", task.id);
 
                             // Load workflow settings (spec §14, §15)
+                            // Uses cached config from the workflow watcher (spec §14.3)
                             let workflow_settings = load_workflow_settings_for_project(
                                 project.as_ref(),
                                 &dispatch_github_token,
+                                &dispatch_config_watcher,
                             )
                             .await;
 
@@ -1065,17 +1130,21 @@ impl Default for ProjectWorkflowSettings {
 
 /// Load workflow settings for a project at dispatch time (spec §14, §15).
 ///
-/// 1. Fetches `workflow.toml` from the repository root
-/// 2. Parses the workflow config
-/// 3. Extracts `dispatch.progress_threshold` (spec §13.1, §14.2)
-/// 4. Fetches the system prompt file if configured
-/// 5. Returns the settings, with defaults for any unavailable fields
+/// Uses the cached workflow config from the watcher (spec §14.3) when available,
+/// which is populated by the poll loop. Falls back to fetching from GitHub
+/// if not cached.
+///
+/// 1. Checks the workflow config cache
+/// 2. Extracts `dispatch.progress_threshold` (spec §13.1, §14.2)
+/// 3. Fetches the system prompt file if configured
+/// 4. Returns the settings, with defaults for any unavailable fields
 ///
 /// Errors are logged but don't fail dispatch — the session continues with
 /// defaults for any fields that couldn't be loaded.
 async fn load_workflow_settings_for_project(
     project: Option<&models::project::Project>,
     github_token: &str,
+    config_watcher: &WorkflowConfigWatcher,
 ) -> ProjectWorkflowSettings {
     let project = match project {
         Some(p) => p,
@@ -1090,38 +1159,9 @@ async fn load_workflow_settings_for_project(
     }
     let (owner, repo) = (parts[0], parts[1]);
 
-    // Create GitHub client
-    let client = GitHubClient::new(github_token);
-
-    // Fetch workflow.toml
-    let workflow_content = match client.get_file_content(owner, repo, "workflow.toml").await {
-        Ok(Some(content)) => content,
-        Ok(None) => {
-            // No workflow.toml — that's fine, use defaults
-            return ProjectWorkflowSettings::default();
-        }
-        Err(e) => {
-            warn!(
-                project_id = %project.id,
-                error = %e,
-                "failed to fetch workflow.toml, using defaults"
-            );
-            return ProjectWorkflowSettings::default();
-        }
-    };
-
-    // Parse workflow config
-    let workflow_config = match server::workflow::WorkflowConfig::parse(&workflow_content) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!(
-                project_id = %project.id,
-                error = %e,
-                "failed to parse workflow.toml, using defaults"
-            );
-            return ProjectWorkflowSettings::default();
-        }
-    };
+    // Get cached workflow config (spec §14.3)
+    // The poll loop refreshes this periodically, so it should usually be cached.
+    let workflow_config = config_watcher.get_config(&project.id).await;
 
     // Extract progress_threshold from dispatch config (spec §14.2)
     // The workflow.toml default is 60s, so we only override if it differs
@@ -1135,6 +1175,9 @@ async fn load_workflow_settings_for_project(
     };
 
     // Fetch system prompt if configured
+    // Note: System prompts are still fetched fresh since they may change independently
+    // of workflow.toml. A future optimization could cache these as well.
+    let client = GitHubClient::new(github_token);
     let system_prompt = match &workflow_config.prompt.system_prompt {
         Some(system_prompt_path) => {
             match client
