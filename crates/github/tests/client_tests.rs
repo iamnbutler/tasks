@@ -733,3 +733,86 @@ async fn get_file_content_fetches_nested_path() {
     assert!(content.is_some());
     assert!(content.as_ref().unwrap().contains("conventional commits"));
 }
+
+// ---------------------------------------------------------------------------
+// Branch deletion tests (issue #143 — cleanup on rejection)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delete_branch_returns_true_on_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/owner/repo/git/refs/heads/tasks/test-task-123"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let deleted = client
+        .delete_branch("owner", "repo", "tasks/test-task-123")
+        .await
+        .unwrap();
+
+    assert!(deleted);
+}
+
+#[tokio::test]
+async fn delete_branch_returns_false_on_404() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/owner/repo/git/refs/heads/nonexistent-branch"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Reference does not exist"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let deleted = client
+        .delete_branch("owner", "repo", "nonexistent-branch")
+        .await
+        .unwrap();
+
+    // 404 is not an error — the branch simply doesn't exist
+    assert!(!deleted);
+}
+
+#[tokio::test]
+async fn delete_branch_auth_error_on_401() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/repos/owner/repo/git/refs/heads/tasks/test-task"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .delete_branch("owner", "repo", "tasks/test-task")
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn delete_branch_auth_error_on_protected_branch() {
+    let server = MockServer::start().await;
+
+    // 403 for protected branches (not rate limiting)
+    Mock::given(method("DELETE"))
+        .and(path("/repos/owner/repo/git/refs/heads/main"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string("Cannot delete protected branch")
+                .insert_header("x-ratelimit-remaining", "4999"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client.delete_branch("owner", "repo", "main").await;
+
+    // 403 with remaining rate limit = auth error (protected branch)
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}

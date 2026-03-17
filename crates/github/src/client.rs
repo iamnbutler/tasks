@@ -497,6 +497,69 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // Branch management
+    // -----------------------------------------------------------------------
+
+    /// Delete a branch from the repository.
+    ///
+    /// Uses the GitHub REST API to delete a git ref. Returns `Ok(true)` if
+    /// deleted successfully, `Ok(false)` if the branch doesn't exist (404).
+    ///
+    /// This is used when rejecting and re-dispatching a task to ensure the
+    /// agent starts fresh without finding old work on the branch.
+    pub async fn delete_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        // GitHub REST API: DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}
+        let url = format!(
+            "{}/repos/{}/{}/git/refs/heads/{}",
+            self.base_url, owner, repo, branch
+        );
+
+        let response = self.http.delete(&url).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status.is_success() || status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(true);
+        }
+
+        // 404 = branch doesn't exist (not an error for our use case)
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            // Could be rate limiting or protected branch
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected delete branch status {status}: {text}"
+        )))
+    }
+
+    // -----------------------------------------------------------------------
     // PR discovery
     // -----------------------------------------------------------------------
 

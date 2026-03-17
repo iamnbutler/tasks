@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use std::sync::Mutex as StdMutex;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use uuid::Uuid;
@@ -1020,6 +1020,49 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
                             }
+
+                            // Delete the remote branch so the agent starts fresh (issue #143).
+                            // Without this, the agent would find the old branch and resubmit
+                            // the same work instead of starting over.
+                            let branch = format!("tasks/{}", task_id);
+                            let repo_parts: Vec<&str> = context.project.repo.split('/').collect();
+                            if repo_parts.len() == 2 {
+                                match merge_github.delete_branch(repo_parts[0], repo_parts[1], &branch).await {
+                                    Ok(true) => {
+                                        info!(
+                                            task_id = %task_id,
+                                            branch = %branch,
+                                            "deleted remote branch for re-dispatch"
+                                        );
+                                    }
+                                    Ok(false) => {
+                                        // Branch didn't exist — that's fine
+                                        debug!(
+                                            task_id = %task_id,
+                                            branch = %branch,
+                                            "branch did not exist on remote"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Log but don't fail — the task can still be re-dispatched.
+                                        // The agent may find old work, but that's better than
+                                        // blocking the entire rejection flow.
+                                        warn!(
+                                            task_id = %task_id,
+                                            branch = %branch,
+                                            error = %e,
+                                            "failed to delete remote branch for re-dispatch"
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    task_id = %task_id,
+                                    repo = %context.project.repo,
+                                    "invalid repo format, cannot delete branch"
+                                );
+                            }
+
                             // Emit orchestrator:feedback event when feedback is provided
                             if let Some(feedback) = &evaluation.feedback {
                                 if let Err(e) = orch_server.emit_orchestrator_feedback(
