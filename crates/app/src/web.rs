@@ -287,6 +287,24 @@ async fn send_chat(
         .session_manager
         .as_ref()
         .ok_or_else(|| ApiError::SessionManager("session manager not available".into()))?;
+
+    // Emit HumanMessage event before sending to session.
+    // This event triggers dispatch if the task is in Question state (spec §12.1).
+    let event = events::Event::new(
+        events::EventType::HumanMessage,
+        &id,
+        Actor::Human,
+        serde_json::json!({
+            "message": req.message,
+        }),
+    );
+    state
+        .server
+        .event_bus
+        .publish(event)
+        .await
+        .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))?;
+
     sm.send_chat(&id, req.message)
         .await
         .map_err(|e| ApiError::SessionManager(e.to_string()))?;

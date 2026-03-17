@@ -39,6 +39,9 @@ pub enum EventType {
     AgentQuestion,
     AgentError,
 
+    // Human events
+    HumanMessage,
+
     // Merge events
     MergeQueued,
     MergeApproved,
@@ -81,6 +84,7 @@ impl EventType {
             Self::AgentMessage => "agent:message",
             Self::AgentQuestion => "agent:question",
             Self::AgentError => "agent:error",
+            Self::HumanMessage => "human:message",
             Self::MergeQueued => "merge:queued",
             Self::MergeApproved => "merge:approved",
             Self::MergeRejected => "merge:rejected",
@@ -147,6 +151,7 @@ impl TryFrom<String> for EventType {
             "agent:message" => Ok(Self::AgentMessage),
             "agent:question" => Ok(Self::AgentQuestion),
             "agent:error" => Ok(Self::AgentError),
+            "human:message" => Ok(Self::HumanMessage),
             "merge:queued" => Ok(Self::MergeQueued),
             "merge:approved" => Ok(Self::MergeApproved),
             "merge:rejected" => Ok(Self::MergeRejected),

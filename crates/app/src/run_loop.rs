@@ -367,6 +367,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- 8. Spawn dispatch tick loop ---
+    //
+    // The dispatch loop is triggered by events (spec §12.1):
+    // - task:created — new work available
+    // - task:state:completed/failed/cancelled — slot freed up
+    // - task:state:waiting — task became unblocked
+    // - human:message — answer provided to Question-state task
+    // - system:mode:pause/play — mode changed
+    //
+    // Plus a reconciliation tick to catch missed events (spec §12.1).
+    // Uses debouncing to coalesce rapid events before dispatch.
 
     let dispatch_server = server.clone();
     let dispatch_session_mgr = session_manager.clone();
@@ -375,17 +385,48 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
 
+    // Debounce interval to coalesce rapid events (100ms)
+    let debounce_duration = std::time::Duration::from_millis(100);
+
     let dispatch_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(dispatch_interval);
         let mut event_rx = dispatch_event_bus.subscribe();
 
+        // Track pending answers: task IDs that received HumanMessage while in Question state
+        let mut pending_answers: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         loop {
             // Wait for either the tick or a dispatch-triggering event
-            let should_dispatch = tokio::select! {
-                _ = interval.tick() => true,
+            let trigger_event = tokio::select! {
+                _ = interval.tick() => None,
                 result = event_rx.recv() => {
                     match result {
-                        Ok(event) => matches!(
+                        Ok(event) => Some(event),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(skipped = n, "dispatch loop lagged, some events may not trigger dispatch");
+                            None
+                        }
+                        Err(_) => continue, // channel closed, will be handled by outer loop
+                    }
+                }
+            };
+
+            // Check if this is a dispatch-triggering event
+            let should_dispatch = match &trigger_event {
+                None => true, // reconciliation tick
+                Some(event) => {
+                    // Track HumanMessage for Question-state tasks (spec §12.1)
+                    if event.event_type == EventType::HumanMessage {
+                        // Check if task is in Question state
+                        if let Some(task) = dispatch_server.get_task(&event.task).await {
+                            if task.state == models::task::TaskState::Question {
+                                pending_answers.insert(event.task.clone());
+                                info!(task_id = %event.task, "tracking pending answer for dispatch");
+                            }
+                        }
+                        true // trigger dispatch to process the answer
+                    } else {
+                        matches!(
                             event.event_type,
                             EventType::TaskCreated
                             | EventType::TaskStateCompleted
@@ -394,14 +435,34 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             | EventType::TaskStateWaiting
                             | EventType::SystemModePause
                             | EventType::SystemModePlay
-                        ),
-                        Err(_) => false,
+                        )
                     }
                 }
             };
 
             if !should_dispatch {
                 continue;
+            }
+
+            // Debounce: wait briefly to coalesce rapid events (spec §12.1)
+            // Continue collecting pending answers during debounce window
+            let debounce_deadline = tokio::time::Instant::now() + debounce_duration;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(debounce_deadline) => break,
+                    result = event_rx.recv() => {
+                        if let Ok(event) = result {
+                            // Track additional HumanMessage events during debounce
+                            if event.event_type == EventType::HumanMessage {
+                                if let Some(task) = dispatch_server.get_task(&event.task).await {
+                                    if task.state == models::task::TaskState::Question {
+                                        pending_answers.insert(event.task.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Check memory pressure before dispatching new work.
@@ -420,10 +481,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 max_sessions
             };
 
-            // Run dispatch
-            let pending_answers: Vec<String> = Vec::new(); // TODO: track pending answers
+            // Run dispatch with pending answers
+            let answers_vec: Vec<String> = pending_answers.iter().cloned().collect();
             match dispatch_server
-                .run_dispatch(&pending_answers, effective_max)
+                .run_dispatch(&answers_vec, effective_max)
                 .await
             {
                 Ok(plan) => {
@@ -465,15 +526,14 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Resume sessions with pending answers
+                    // Resume sessions with pending answers — the message was already
+                    // sent to the session when the HumanMessage event was emitted,
+                    // so we just transition the task state here. The session manager
+                    // handles delivering the message to the agent.
                     for task_id in &plan.resume {
-                        // TODO: look up the pending message and send it
-                        if let Err(e) = dispatch_session_mgr
-                            .send_chat(task_id, "Resuming — please continue.".to_string())
-                            .await
-                        {
-                            error!(task_id = %task_id, error = %e, "failed to resume session");
-                        }
+                        info!(task_id = %task_id, "resumed session with pending answer");
+                        // Remove from pending answers set — it's been processed
+                        pending_answers.remove(task_id);
                     }
                 }
                 Err(e) => {
