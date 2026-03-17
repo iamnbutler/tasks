@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub dispatch_interval: Duration,
     /// Container image for sessions.
     pub container_image: String,
+    /// Container memory limit (default: 8G).
+    pub container_memory: String,
     /// Session soft time limit (default: 1h).
     pub session_soft_limit: Duration,
     /// Session hard time limit (default: 1h15m).
@@ -45,6 +47,9 @@ impl AppConfig {
 
         let container_image = std::env::var("TASKS_CONTAINER_IMAGE")
             .unwrap_or_else(|_| "tasks-agent:latest".to_string());
+
+        let container_memory = std::env::var("TASKS_CONTAINER_MEMORY")
+            .unwrap_or_else(|_| "8G".to_string());
 
         let max_sessions = std::env::var("TASKS_MAX_SESSIONS")
             .ok()
@@ -74,6 +79,7 @@ impl AppConfig {
             poll_interval: Duration::from_secs(poll_interval_secs),
             dispatch_interval: Duration::from_secs(dispatch_interval_secs),
             container_image,
+            container_memory,
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
             tui: false, // set by CLI flag

@@ -29,13 +29,17 @@ import { DataTableToolbar } from "./data-table-toolbar";
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
+  projectIdToRepo: Record<string, string>;
 }
 
 export function DataTable<TData extends Task, TValue>({
   columns,
   data,
+  projectIdToRepo,
 }: DataTableProps<TData, TValue>) {
-  const [sorting, setSorting] = useState<SortingState>([]);
+  const [sorting, setSorting] = useState<SortingState>([
+    { id: "state", desc: false },
+  ]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [rowSelection, setRowSelection] = useState({});
 
@@ -71,11 +75,12 @@ export function DataTable<TData extends Task, TValue>({
     getPaginationRowModel: getPaginationRowModel(),
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
+    meta: { projectIdToRepo },
   });
 
   return (
     <div className="space-y-4">
-      <DataTableToolbar table={table as unknown as import("@tanstack/react-table").Table<Task>} />
+      <DataTableToolbar table={table as unknown as import("@tanstack/react-table").Table<Task>} projectIdToRepo={projectIdToRepo} />
       <div className="rounded-md border">
         <Table>
           <TableHeader>

@@ -42,6 +42,20 @@ export interface TaskStateMeta {
   className: string;
 }
 
+// State priority for sorting (lower number = higher priority / shown first)
+export const stateSortOrder: Record<TaskState, number> = {
+  awaiting_merge: 0,
+  running: 1,
+  question: 2,
+  conflict: 3,
+  testing: 4,
+  waiting: 5,
+  blocked: 6,
+  completed: 7,
+  failed: 8,
+  cancelled: 9,
+};
+
 export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
   waiting: {
     label: "Waiting",
@@ -210,6 +224,11 @@ export const columns: ColumnDef<Task>[] = [
     filterFn: (row, id, value: string[]) => {
       return value.includes(row.getValue(id));
     },
+    sortingFn: (rowA, rowB) => {
+      const a = stateSortOrder[rowA.getValue<TaskState>("state")] ?? 999;
+      const b = stateSortOrder[rowB.getValue<TaskState>("state")] ?? 999;
+      return a - b;
+    },
   },
 
   // Project
@@ -218,9 +237,12 @@ export const columns: ColumnDef<Task>[] = [
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title="Project" />
     ),
-    cell: ({ row }) => (
-      <span className="text-sm">{row.getValue<string>("project")}</span>
-    ),
+    cell: ({ row, table }) => {
+      const projectId = row.getValue<string>("project");
+      const meta = table.options.meta as { projectIdToRepo?: Record<string, string> } | undefined;
+      const displayName = meta?.projectIdToRepo?.[projectId] ?? projectId;
+      return <span className="text-sm">{displayName}</span>;
+    },
     filterFn: (row, id, value: string[]) => {
       return value.includes(row.getValue(id));
     },
