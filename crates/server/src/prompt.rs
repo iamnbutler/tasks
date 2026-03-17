@@ -114,7 +114,7 @@ pub fn build_prompt(params: &PromptParams) -> String {
     render_context(&mut out, params);
 
     // 6. Behavioral instructions — spec §15.1 layer 4
-    render_instructions(&mut out, params.branch);
+    render_instructions(&mut out, params.branch, params.number);
 
     out
 }
@@ -281,23 +281,53 @@ fn render_context(out: &mut String, params: &PromptParams) {
     writeln!(out).unwrap();
 }
 
-fn render_instructions(out: &mut String, branch: &str) {
+fn render_instructions(out: &mut String, branch: &str, issue_number: Option<u64>) {
     writeln!(out, "## Instructions\n").unwrap();
+    writeln!(out, "- Work on the branch `{branch}`.").unwrap();
+    writeln!(out, "- If you are stuck or the task is ambiguous, describe the problem clearly.").unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(out, "### Delivering your work\n").unwrap();
+    writeln!(out, "When your task is finished, deliver your output using the GitHub CLI (`gh`).").unwrap();
+    writeln!(out, "Choose the approach that fits what you produced:\n").unwrap();
     writeln!(
         out,
-        "- Work on the branch `{branch}`. Commit and push your changes when done."
+        "- **Code changes**: Commit your work, push the branch, and open a pull request \
+         with `gh pr create`. Do not merge into main — the merge queue handles that. \
+         The PR should reference the issue so it closes automatically when merged."
     )
     .unwrap();
     writeln!(
         out,
-        "- Do not merge into main. The merge queue handles merging."
+        "- **Research, analysis, or a question answer**: Comment your findings on the \
+         issue with `gh issue comment`, then close it with `gh issue close`."
     )
     .unwrap();
     writeln!(
         out,
-        "- If you are stuck or the task is ambiguous, describe the problem clearly."
+        "- **A plan or proposal that needs discussion**: Comment the plan on the issue \
+         with `gh issue comment`. Leave the issue open for review."
     )
     .unwrap();
+    writeln!(
+        out,
+        "- **New work items discovered**: Create new issues with `gh issue create` for \
+         each item. Comment on the original issue summarizing what you filed, then close it."
+    )
+    .unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Every task should end with a visible artifact on GitHub — a PR, an issue comment, \
+         or a new issue. If the task does not result in a PR, close the issue yourself \
+         when the work is complete."
+    )
+    .unwrap();
+
+    if let Some(n) = issue_number {
+        writeln!(out, "This task corresponds to issue #{n}.").unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +376,12 @@ mod tests {
         assert!(prompt.contains("Build the widget as described in the design doc."));
         assert!(prompt.contains("Branch: `tasks/42`"));
         assert!(prompt.contains("Work on the branch `tasks/42`"));
+        assert!(prompt.contains("gh pr create"));
+        assert!(prompt.contains("gh issue comment"));
+        assert!(prompt.contains("gh issue close"));
         assert!(prompt.contains("Do not merge into main"));
         assert!(prompt.contains("describe the problem clearly"));
+        assert!(prompt.contains("issue #42"));
     }
 
     #[test]
