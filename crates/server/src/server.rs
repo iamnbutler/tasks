@@ -595,6 +595,54 @@ impl Server {
         Ok(())
     }
 
+    /// Emit an orchestrator:feedback event when feedback is sent to a task.
+    ///
+    /// Called when the orchestrator sends guidance to a re-engaged task after
+    /// rejection or when providing direction during a task's execution.
+    /// Spec §8.3: "orchestrator:feedback — orchestrator sent feedback to an agent"
+    pub async fn emit_orchestrator_feedback(
+        &self,
+        task_id: &str,
+        feedback: &str,
+        context: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let event = Event::new(
+            EventType::OrchestratorFeedback,
+            task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "feedback": feedback,
+                "context": context,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Emit an orchestrator:escalation event when surfacing issues to the human.
+    ///
+    /// Called when the orchestrator needs human attention for a decision,
+    /// blocker, or important information that requires human review.
+    /// Spec §8.3: "orchestrator:escalation — orchestrator surfaced something to the human"
+    pub async fn emit_orchestrator_escalation(
+        &self,
+        task_id: &str,
+        reason: &str,
+        details: serde_json::Value,
+    ) -> Result<(), ServerError> {
+        let event = Event::new(
+            EventType::OrchestratorEscalation,
+            task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "reason": reason,
+                "details": details,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     // --- Presence (spec Section 4.1) ---
 
     /// Whether the human is present (has active GUI connections).
@@ -1350,5 +1398,68 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ServerError::TaskNotFound(_)));
+    }
+
+    // --- Orchestrator event tests (spec §8.3) ---
+
+    #[tokio::test]
+    async fn emit_orchestrator_feedback_emits_event() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        server
+            .emit_orchestrator_feedback("task-1", "please add more tests", Some("merge_rejection"))
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::OrchestratorFeedback);
+        assert_eq!(event.task, "task-1");
+        assert_eq!(event.actor, Actor::Orchestrator);
+        assert_eq!(event.data["feedback"], "please add more tests");
+        assert_eq!(event.data["context"], "merge_rejection");
+    }
+
+    #[tokio::test]
+    async fn emit_orchestrator_feedback_handles_no_context() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        server
+            .emit_orchestrator_feedback("task-2", "guidance for task", None)
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::OrchestratorFeedback);
+        assert!(event.data["context"].is_null());
+    }
+
+    #[tokio::test]
+    async fn emit_orchestrator_escalation_emits_event() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        server
+            .emit_orchestrator_escalation(
+                "task-1",
+                "needs_human_decision",
+                serde_json::json!({
+                    "question": "Should we merge this despite failing CI?",
+                    "options": ["merge anyway", "wait for fix"],
+                }),
+            )
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::OrchestratorEscalation);
+        assert_eq!(event.task, "task-1");
+        assert_eq!(event.actor, Actor::Orchestrator);
+        assert_eq!(event.data["reason"], "needs_human_decision");
+        assert_eq!(
+            event.data["details"]["question"],
+            "Should we merge this despite failing CI?"
+        );
     }
 }
