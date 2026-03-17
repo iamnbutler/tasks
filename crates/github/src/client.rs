@@ -433,6 +433,65 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // PR merge (spec §7.1)
+    // -----------------------------------------------------------------------
+
+    /// Merge a pull request via the GitHub REST API.
+    ///
+    /// Uses squash merge by default. Returns `Ok(true)` if merged successfully,
+    /// `Ok(false)` if the PR is not mergeable (conflicts, checks failing, etc.).
+    pub async fn merge_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<bool, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/merge",
+            self.base_url, owner, repo, number
+        );
+
+        let body = json!({
+            "merge_method": "squash",
+        });
+
+        let response = self.http.put(&url).json(&body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status.is_success() {
+            return Ok(true);
+        }
+
+        // 405 = not mergeable (conflicts, checks required, etc.)
+        // 409 = merge conflict
+        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            || status == reqwest::StatusCode::CONFLICT
+        {
+            return Ok(false);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected merge status {status}: {text}"
+        )))
+    }
+
+    // -----------------------------------------------------------------------
     // PR discovery
     // -----------------------------------------------------------------------
 
