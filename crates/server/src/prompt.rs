@@ -124,7 +124,15 @@ pub fn build_prompt(params: &PromptParams) -> String {
 /// Extracts the issue/PR number from the task source and builds retry
 /// context from the task's retry state. This keeps domain logic in the
 /// server crate rather than in the app's run loop.
-pub fn build_prompt_for_task(task: &crate::model::task::Task, branch: &str) -> String {
+///
+/// The `system_prompt` parameter should contain the loaded contents of the
+/// project's system prompt file (from workflow.toml `[prompt].system_prompt`).
+/// If the file doesn't exist or couldn't be loaded, pass `None`.
+pub fn build_prompt_for_task(
+    task: &crate::model::task::Task,
+    branch: &str,
+    system_prompt: Option<&str>,
+) -> String {
     let number = match &task.source {
         crate::model::task::TaskSource::GithubIssue { number, .. } => Some(*number),
         crate::model::task::TaskSource::GithubPr { number, .. } => Some(*number),
@@ -144,7 +152,7 @@ pub fn build_prompt_for_task(task: &crate::model::task::Task, branch: &str) -> S
     };
 
     let params = PromptParams {
-        system_prompt: None, // TODO: load from workflow.toml
+        system_prompt,
         number,
         title: &task.title,
         body: task.description.as_deref(),

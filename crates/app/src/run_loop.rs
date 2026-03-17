@@ -384,6 +384,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let max_sessions = config.max_sessions;
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
+    let dispatch_github_token = config.github_token.clone();
 
     // Debounce interval to coalesce rapid events (100ms)
     let debounce_duration = std::time::Duration::from_millis(100);
@@ -498,7 +499,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .unwrap_or_default();
                             let branch = format!("tasks/{}", task.id);
 
-                            let prompt = server::prompt::build_prompt_for_task(&task, &branch);
+                            // Load system prompt from workflow config (spec §14, §15)
+                            let system_prompt = load_system_prompt_for_project(
+                                project.as_ref(),
+                                &dispatch_github_token,
+                            )
+                            .await;
+
+                            let prompt = server::prompt::build_prompt_for_task(
+                                &task,
+                                &branch,
+                                system_prompt.as_deref(),
+                            );
 
                             if let Err(e) = dispatch_session_mgr
                                 .start_session(
@@ -748,4 +760,102 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Load system prompt content for a project at dispatch time (spec §14, §15).
+///
+/// 1. Fetches `workflow.toml` from the repository root
+/// 2. Parses the workflow config to get the system_prompt path
+/// 3. Fetches the system prompt file if configured
+/// 4. Returns the content, or None if not configured or unavailable
+///
+/// Errors are logged but don't fail dispatch — the session continues with
+/// the default prompt (no project-level system prompt).
+async fn load_system_prompt_for_project(
+    project: Option<&models::project::Project>,
+    github_token: &str,
+) -> Option<String> {
+    let project = project?;
+
+    // Parse owner/repo
+    let parts: Vec<&str> = project.repo.split('/').collect();
+    if parts.len() != 2 {
+        warn!(repo = %project.repo, "invalid repo format, cannot load workflow config");
+        return None;
+    }
+    let (owner, repo) = (parts[0], parts[1]);
+
+    // Create GitHub client
+    let client = GitHubClient::new(github_token);
+
+    // Fetch workflow.toml
+    let workflow_content = match client.get_file_content(owner, repo, "workflow.toml").await {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            // No workflow.toml — that's fine, use defaults
+            return None;
+        }
+        Err(e) => {
+            warn!(
+                project_id = %project.id,
+                error = %e,
+                "failed to fetch workflow.toml, using default prompt"
+            );
+            return None;
+        }
+    };
+
+    // Parse workflow config
+    let workflow_config = match server::workflow::WorkflowConfig::parse(&workflow_content) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!(
+                project_id = %project.id,
+                error = %e,
+                "failed to parse workflow.toml, using default prompt"
+            );
+            return None;
+        }
+    };
+
+    // Get system_prompt path from config
+    let system_prompt_path = match &workflow_config.prompt.system_prompt {
+        Some(path) => path,
+        None => {
+            // No system_prompt configured
+            return None;
+        }
+    };
+
+    // Fetch the system prompt file
+    match client
+        .get_file_content(owner, repo, system_prompt_path)
+        .await
+    {
+        Ok(Some(content)) => {
+            info!(
+                project_id = %project.id,
+                path = %system_prompt_path,
+                "loaded system prompt from workflow config"
+            );
+            Some(content)
+        }
+        Ok(None) => {
+            warn!(
+                project_id = %project.id,
+                path = %system_prompt_path,
+                "system_prompt file not found in repository"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                project_id = %project.id,
+                path = %system_prompt_path,
+                error = %e,
+                "failed to fetch system_prompt file"
+            );
+            None
+        }
+    }
 }
