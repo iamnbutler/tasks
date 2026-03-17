@@ -952,8 +952,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("shutting down");
 
-    // Stop all sessions
-    session_manager.stop_all().await;
+    // Stop all sessions and destroy their containers
+    session_manager.destroy_all().await;
 
     // Cancel the loops
     poll_handle.abort();
