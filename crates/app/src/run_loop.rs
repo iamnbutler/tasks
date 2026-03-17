@@ -424,7 +424,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // - task:created — new work available
     // - task:state:completed/failed/cancelled — slot freed up
     // - task:state:waiting — task became unblocked
-    // - human:message — answer provided to Question-state task
+    // - human:message or orchestrator:feedback — answer provided to Question-state task
     // - system:mode:pause/play — mode changed
     //
     // Plus a reconciliation tick to catch missed events (spec §12.1).
@@ -443,9 +443,23 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let dispatch_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(dispatch_interval);
-        let mut event_rx = dispatch_event_bus.subscribe();
 
-        // Track pending answers: task IDs that received HumanMessage while in Question state
+        // Subscribe to dispatch-triggering events only (spec §12.1).
+        // Pattern-based subscription filters out irrelevant events at the receiver level.
+        let mut event_rx = dispatch_event_bus.subscribe_with_patterns(&[
+            "task:created",
+            "task:state:completed",
+            "task:state:failed",
+            "task:state:cancelled",
+            "task:state:waiting",
+            "human:message",
+            "orchestrator:feedback",
+            "system:mode:pause",
+            "system:mode:play",
+        ]);
+
+        // Track pending answers: task IDs that received a message while in Question state.
+        // Per spec §12.1, both human and orchestrator messages can answer agent questions.
         let mut pending_answers: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // GitHub client for fetching comments at dispatch time (spec §15.2)
@@ -467,37 +481,26 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Check if this is a dispatch-triggering event
-            let should_dispatch = match &trigger_event {
-                None => true, // reconciliation tick
-                Some(event) => {
-                    // Track HumanMessage for Question-state tasks (spec §12.1)
-                    if event.event_type == EventType::HumanMessage {
-                        // Check if task is in Question state
-                        if let Some(task) = dispatch_server.get_task(&event.task).await {
-                            if task.state == models::task::TaskState::Question {
-                                pending_answers.insert(event.task.clone());
-                                info!(task_id = %event.task, "tracking pending answer for dispatch");
-                            }
+            // Track answer events for Question-state tasks (spec §12.1).
+            // All events from pattern subscription trigger dispatch; we just need
+            // to track HumanMessage and OrchestratorFeedback for pending answers.
+            if let Some(ref event) = trigger_event {
+                if matches!(
+                    event.event_type,
+                    EventType::HumanMessage | EventType::OrchestratorFeedback
+                ) {
+                    // Check if task is in Question state
+                    if let Some(task) = dispatch_server.get_task(&event.task).await {
+                        if task.state == models::task::TaskState::Question {
+                            pending_answers.insert(event.task.clone());
+                            info!(
+                                task_id = %event.task,
+                                event_type = %event.event_type.as_str(),
+                                "tracking pending answer for dispatch"
+                            );
                         }
-                        true // trigger dispatch to process the answer
-                    } else {
-                        matches!(
-                            event.event_type,
-                            EventType::TaskCreated
-                            | EventType::TaskStateCompleted
-                            | EventType::TaskStateFailed
-                            | EventType::TaskStateCancelled
-                            | EventType::TaskStateWaiting
-                            | EventType::SystemModePause
-                            | EventType::SystemModePlay
-                        )
                     }
                 }
-            };
-
-            if !should_dispatch {
-                continue;
             }
 
             // Debounce: wait briefly to coalesce rapid events (spec §12.1)
@@ -508,8 +511,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     _ = tokio::time::sleep_until(debounce_deadline) => break,
                     result = event_rx.recv() => {
                         if let Ok(event) = result {
-                            // Track additional HumanMessage events during debounce
-                            if event.event_type == EventType::HumanMessage {
+                            // Track additional answer events during debounce
+                            if matches!(
+                                event.event_type,
+                                EventType::HumanMessage | EventType::OrchestratorFeedback
+                            ) {
                                 if let Some(task) = dispatch_server.get_task(&event.task).await {
                                     if task.state == models::task::TaskState::Question {
                                         pending_answers.insert(event.task.clone());

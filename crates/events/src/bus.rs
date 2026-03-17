@@ -8,6 +8,34 @@ use tokio::sync::broadcast;
 
 use crate::{Event, EventStore, store::StoreError};
 
+/// A pattern-filtered event subscriber (spec §12.1).
+///
+/// Wraps a broadcast receiver and filters events based on patterns.
+/// Created via [`EventBus::subscribe_with_patterns`].
+pub struct PatternSubscriber {
+    receiver: broadcast::Receiver<Arc<Event>>,
+    patterns: Vec<String>,
+}
+
+impl PatternSubscriber {
+    /// Receive the next event that matches any of the patterns.
+    ///
+    /// Blocks until a matching event is available or the channel is closed.
+    pub async fn recv(&mut self) -> Result<Arc<Event>, broadcast::error::RecvError> {
+        loop {
+            let event = self.receiver.recv().await?;
+            if self.matches(&event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Check if an event matches any of the configured patterns.
+    fn matches(&self, event: &Event) -> bool {
+        self.patterns.iter().any(|p| event.event_type.matches(p))
+    }
+}
+
 /// Event bus combining storage with live pub/sub.
 ///
 /// Events are persisted to the store and broadcast to subscribers.
@@ -41,6 +69,27 @@ impl EventBus {
     /// Use `subscribe_with_replay` to also get historical events.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Event>> {
         self.sender.subscribe()
+    }
+
+    /// Subscribe to events matching specific patterns (spec §12.1).
+    ///
+    /// Returns a [`PatternSubscriber`] that filters events based on the given patterns.
+    /// Patterns support wildcards: `task:*` matches all task events,
+    /// `task:state:*` matches all state changes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut sub = event_bus.subscribe_with_patterns(&["task:created", "task:state:*"]);
+    /// while let Ok(event) = sub.recv().await {
+    ///     // Only receives task:created and task:state:* events
+    /// }
+    /// ```
+    pub fn subscribe_with_patterns(&self, patterns: &[&str]) -> PatternSubscriber {
+        PatternSubscriber {
+            receiver: self.sender.subscribe(),
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     /// Subscribe to events for a specific task, replaying history first.
@@ -164,5 +213,51 @@ mod tests {
 
         assert!(matches_task(&event, "task-1"));
         assert!(!matches_task(&event, "task-2"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_patterns_filters_events() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+        let bus = EventBus::new(store, 16);
+
+        // Subscribe only to task:created and task:state:* events
+        let mut sub = bus.subscribe_with_patterns(&["task:created", "task:state:*"]);
+
+        // Publish events of different types
+        let task_created = Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let task_created_id = task_created.id;
+
+        let agent_message = Event::new(
+            EventType::AgentMessage,
+            "task-1",
+            Actor::Agent,
+            serde_json::json!({}),
+        );
+
+        let task_running = Event::new(
+            EventType::TaskStateRunning,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let task_running_id = task_running.id;
+
+        bus.publish(task_created).await.unwrap();
+        bus.publish(agent_message).await.unwrap();
+        bus.publish(task_running).await.unwrap();
+
+        // Should receive task:created (matches exact pattern)
+        let received = sub.recv().await.unwrap();
+        assert_eq!(received.id, task_created_id);
+
+        // Should skip agent:message and receive task:state:running (matches task:state:*)
+        let received = sub.recv().await.unwrap();
+        assert_eq!(received.id, task_running_id);
     }
 }

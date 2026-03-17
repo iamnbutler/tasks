@@ -9,4 +9,4 @@ mod bus;
 
 pub use event::{Event, EventType, Actor};
 pub use store::{EventStore, StoreError};
-pub use bus::{EventBus, matches_pattern, matches_task};
+pub use bus::{EventBus, PatternSubscriber, matches_pattern, matches_task};
