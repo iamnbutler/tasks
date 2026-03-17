@@ -5,18 +5,26 @@
 //!
 //! # Modules
 //!
+//! - [`api`] - HTTP API client for the Tasks server
 //! - [`components`] - Reusable UI primitive components (Button, Badge, Card, Input)
 //! - [`sse`] - Server-Sent Events client for real-time updates
+//! - [`state`] - Application state management (GPUI Model-based)
 //! - [`theme`] - Theming and styling system
 
 use gpui::{Context, SharedString, Window, div, prelude::*, rgb};
 
+pub mod api;
 pub mod components;
 mod sse;
+pub mod state;
 pub mod theme;
 
 pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
 pub use theme::{ComponentTheme, Theme, colors, radius, spacing, style_helpers, typography};
+
+// Re-export state management types
+pub use api::{ApiClient, ApiError};
+pub use state::{AppState, AppStateEvent, ConnectionStatus, create_app_state};
 
 /// Root view for the Tasks desktop application.
 pub struct RootView {
