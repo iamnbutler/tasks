@@ -70,7 +70,14 @@ impl ClaudeOrchestrator {
         })?;
 
         // Parse the JSON
-        let parsed: EvaluationResponse = serde_json::from_str(json_str).map_err(|e| {
+        serde_json::from_str::<QualityEvaluation>(json_str).map_err(|e| {
+            OrchestratorError::Evaluation(format!(
+                "Failed to parse evaluation JSON: {}",
+                e
+            ))
+        })
+    }
+}aluationResponse = serde_json::from_str(json_str).map_err(|e| {
             OrchestratorError::Evaluation(format!("Failed to parse evaluation JSON: {}", e))
         })?;
 
