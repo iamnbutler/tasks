@@ -215,6 +215,58 @@ impl GitHubClient {
         Ok(issue)
     }
 
+    /// Create a new issue in a repository.
+    ///
+    /// Returns the created issue with its number, node ID, title, and URL.
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: Option<&str>,
+    ) -> Result<crate::model::CreatedIssue, GitHubError> {
+        // First, get the repository ID (required for mutations).
+        let repo_id = self.get_repository_id(owner, repo).await?;
+
+        let query = queries::create_issue_mutation();
+        let variables = json!({
+            "repositoryId": repo_id,
+            "title": title,
+            "body": body,
+        });
+
+        let resp: GraphQLResponse<CreateIssueData> = self.execute(&query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+
+        let issue = data
+            .create_issue
+            .and_then(|p| p.issue)
+            .ok_or_else(|| GitHubError::Decode("createIssue returned no issue".to_string()))?;
+
+        Ok(crate::model::CreatedIssue {
+            number: issue.number,
+            node_id: issue.id,
+            title: issue.title,
+            url: issue.url,
+        })
+    }
+
+    /// Get the GraphQL node ID for a repository.
+    async fn get_repository_id(&self, owner: &str, repo: &str) -> Result<String, GitHubError> {
+        let query = queries::get_repository_id_query();
+        let variables = json!({
+            "owner": owner,
+            "name": repo,
+        });
+
+        let resp: GraphQLResponse<GetRepositoryIdData> = self.execute(&query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+
+        data.repository
+            .map(|r| r.id)
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))
+    }
+
     // -----------------------------------------------------------------------
     // Pull Requests (spec github.md §4.2)
     // -----------------------------------------------------------------------

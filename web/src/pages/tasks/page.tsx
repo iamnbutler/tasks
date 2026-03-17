@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useAppState } from "@/hooks/use-app-state";
+import { CreateIssueDialog } from "@/components/create-issue-dialog";
 import { columns } from "./columns";
 import { DataTable } from "./data-table";
 
@@ -23,13 +24,16 @@ export function TasksPage() {
 
   return (
     <div className="flex flex-1 flex-col gap-4 p-4 md:p-8">
-      <div>
-        <h2 className="text-base font-bold tracking-tight">Tasks</h2>
-        <p className="text-muted-foreground">
-          {selectedProjectName
-            ? `Tasks for ${selectedProjectName}`
-            : "Manage and monitor your coding tasks."}
-        </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h2 className="text-base font-bold tracking-tight">Tasks</h2>
+          <p className="text-muted-foreground">
+            {selectedProjectName
+              ? `Tasks for ${selectedProjectName}`
+              : "Manage and monitor your coding tasks."}
+          </p>
+        </div>
+        <CreateIssueDialog />
       </div>
       <DataTable columns={columns} data={filteredTasks} hideProjectColumn={!!selectedProject} projectIdToRepo={projectIdToRepo} />
     </div>

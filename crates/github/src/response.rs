@@ -541,6 +541,43 @@ pub(crate) struct PrReviewsNode {
 }
 
 // ---------------------------------------------------------------------------
+// Create issue mutation response
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateIssueData {
+    #[serde(rename = "createIssue")]
+    pub create_issue: Option<CreateIssuePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateIssuePayload {
+    pub issue: Option<CreatedIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreatedIssue {
+    pub number: u64,
+    pub id: String,
+    pub title: String,
+    pub url: String,
+}
+
+// ---------------------------------------------------------------------------
+// Repository ID query response
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct GetRepositoryIdData {
+    pub repository: Option<RepositoryIdNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RepositoryIdNode {
+    pub id: String,
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

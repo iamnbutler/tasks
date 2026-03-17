@@ -240,3 +240,31 @@ pub fn pr_reviews_query() -> &'static str {
   }
 }"#
 }
+
+/// Mutation to create a new issue in a repository.
+pub fn create_issue_mutation() -> &'static str {
+    r#"mutation CreateIssue($repositoryId: ID!, $title: String!, $body: String, $labelIds: [ID!]) {
+  createIssue(input: {
+    repositoryId: $repositoryId
+    title: $title
+    body: $body
+    labelIds: $labelIds
+  }) {
+    issue {
+      number
+      id
+      title
+      url
+    }
+  }
+}"#
+}
+
+/// Query to get a repository's node ID (needed for mutations).
+pub fn get_repository_id_query() -> &'static str {
+    r#"query GetRepositoryId($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    id
+  }
+}"#
+}

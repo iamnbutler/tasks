@@ -196,6 +196,19 @@ pub struct LinkedIssueRef {
 }
 
 // ---------------------------------------------------------------------------
+// Created issue (returned from create mutation)
+// ---------------------------------------------------------------------------
+
+/// A newly created issue, returned from the createIssue mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedIssue {
+    pub number: u64,
+    pub node_id: String,
+    pub title: String,
+    pub url: String,
+}
+
+// ---------------------------------------------------------------------------
 // Filters (spec github.md §4.3)
 // ---------------------------------------------------------------------------
 

@@ -47,6 +47,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/projects", get(list_projects))
         .route("/projects", post(add_project))
         .route("/projects/{id}", axum::routing::delete(delete_project))
+        .route("/issues", post(create_issue))
         .route("/merge-queue", get(list_merge_queue))
         .route("/merge-queue/flush", post(flush_merge_queue))
         .route("/merge-queue/{id}/approve", post(approve_merge))
@@ -97,6 +98,22 @@ struct AddProjectRequest {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
+}
+
+#[derive(Deserialize)]
+struct CreateIssueRequest {
+    /// Repository in "owner/repo" format.
+    repo: String,
+    /// Issue title.
+    title: String,
+    /// Issue body (markdown).
+    body: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateIssueResponse {
+    number: u64,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +226,43 @@ async fn delete_project(
     } else {
         Err(ApiError::BadRequest(format!("Project not found: {id}")))
     }
+}
+
+/// POST /api/issues — Create a GitHub issue.
+///
+/// Creates a new issue in the specified repository via the GitHub API.
+/// The poller will pick up the new issue on its next cycle and create a task.
+async fn create_issue(
+    Json(req): Json<CreateIssueRequest>,
+) -> Result<Json<CreateIssueResponse>, ApiError> {
+    let parts: Vec<&str> = req.repo.split('/').collect();
+    if parts.len() != 2 {
+        return Err(ApiError::BadRequest(format!(
+            "Invalid repo format: {} (expected owner/repo)",
+            req.repo
+        )));
+    }
+    let owner = parts[0];
+    let repo = parts[1];
+
+    if req.title.trim().is_empty() {
+        return Err(ApiError::BadRequest("Issue title cannot be empty".to_string()));
+    }
+
+    let github_token = std::env::var("GITHUB_TOKEN").map_err(|_| {
+        ApiError::BadRequest("GITHUB_TOKEN not configured".to_string())
+    })?;
+
+    let client = tasks_github::GitHubClient::new(&github_token);
+    let created = client
+        .create_issue(owner, repo, &req.title, req.body.as_deref())
+        .await
+        .map_err(|e| ApiError::GitHub(e.to_string()))?;
+
+    Ok(Json(CreateIssueResponse {
+        number: created.number,
+        url: created.url,
+    }))
 }
 
 /// GET /api/merge-queue — List merge queue entries.
@@ -397,6 +451,7 @@ enum ApiError {
     BadRequest(String),
     MergeQueue(String),
     SessionManager(String),
+    GitHub(String),
 }
 
 impl IntoResponse for ApiError {
@@ -406,6 +461,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::GitHub(e) => (StatusCode::BAD_GATEWAY, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

@@ -94,6 +94,25 @@ export function cancelTask(taskId: string): Promise<void> {
   return requestVoid(`/api/tasks/${taskId}/cancel`, { method: "POST" });
 }
 
+export interface CreateIssueRequest {
+  repo: string;
+  title: string;
+  body?: string;
+}
+
+export interface CreateIssueResponse {
+  number: number;
+  url: string;
+}
+
+export function createIssue(req: CreateIssueRequest): Promise<CreateIssueResponse> {
+  return request<CreateIssueResponse>("/api/issues", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;
