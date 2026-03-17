@@ -440,7 +440,10 @@ async fn handle_exit(
         )
     };
 
-    let event = events::Event::new(event_type, task_id, events::Actor::System, data);
+    // Use Actor::Agent since this event represents the agent exiting.
+    // This allows the run_loop event handler to process it through
+    // handle_task_failure() for retry logic (spec §13.1, §13.2, §18.2).
+    let event = events::Event::new(event_type, task_id, events::Actor::Agent, data);
     if let Err(e) = event_bus.publish(event).await {
         tracing::error!(task_id = %task_id, error = %e, "failed to publish agent exit event");
     }
@@ -565,5 +568,22 @@ mod tests {
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
         assert_eq!(received.data["made_progress"], true);
+    }
+
+    #[tokio::test]
+    async fn exit_event_uses_agent_actor() {
+        // The exit event must use Actor::Agent so run_loop's event handler
+        // processes it through handle_task_failure() for retry logic.
+        // See spec §13.1, §13.2, §18.2.
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+
+        handle_exit("task-1", &exit, false, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.actor, events::Actor::Agent);
     }
 }
