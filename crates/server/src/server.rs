@@ -498,6 +498,103 @@ impl Server {
         Ok(flushed)
     }
 
+    /// Approve a merge queue entry and emit a `merge:approved` event.
+    ///
+    /// In Play mode, this is called by the orchestrator loop after a
+    /// positive evaluation. The entry transitions from Pending to Approved.
+    pub async fn approve_merge_entry(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .approve(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        let event = Event::new(
+            EventType::MergeApproved,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({ "entry_id": entry_id, "reasoning": reasoning }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Reject a merge queue entry, re-dispatch the task with feedback,
+    /// and emit a `merge:rejected` event.
+    ///
+    /// The task transitions back to Waiting so the dispatch loop picks
+    /// it up and starts a fresh session with the feedback as context.
+    pub async fn reject_merge_entry(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+        feedback: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .reject(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit rejection event
+        let event = Event::new(
+            EventType::MergeRejected,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "reasoning": reasoning,
+                "feedback": feedback,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition task back to Waiting for re-dispatch (scenario 2)
+        self.set_task_state(&task_id, TaskState::Waiting, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Emit an orchestrator:decision event recording an evaluation.
+    ///
+    /// Called for every evaluation regardless of mode — this is the
+    /// audit trail of the orchestrator's judgment.
+    pub async fn emit_orchestrator_decision(
+        &self,
+        task_id: &str,
+        entry_id: &str,
+        approved: bool,
+        reasoning: &str,
+    ) -> Result<(), ServerError> {
+        let event = Event::new(
+            EventType::OrchestratorDecision,
+            task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "approved": approved,
+                "reasoning": reasoning,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     // --- Presence (spec Section 4.1) ---
 
     /// Whether the human is present (has active GUI connections).
