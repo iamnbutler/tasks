@@ -107,6 +107,21 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
   cancelled: {
     label: "Cancelled",
     icon: MinusCircle,
+    className: "text-muted-foreground border-muted",
+  },
+};
+label: "Completed",
+    icon: CheckCircle2,
+    className: "text-green-500 border-green-500/30 bg-green-500/10",
+  },
+  failed: {
+    label: "Failed",
+    icon: XCircle,
+    className: "text-red-500 border-red-500/30 bg-red-500/10",
+  },
+  cancelled: {
+    label: "Cancelled",
+    icon: MinusCircle,
     className: "text-gray-500 border-gray-500/30 bg-gray-500/10",
   },
 };
