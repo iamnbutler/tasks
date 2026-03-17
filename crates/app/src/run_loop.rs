@@ -194,9 +194,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
+    let event_handler_github_token = config.github_token.clone();
 
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
+        let github = GitHubClient::new(&event_handler_github_token);
         loop {
             let event = match rx.recv().await {
                 Ok(e) => e,
@@ -234,11 +236,36 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Create merge queue entry when task reaches awaiting_merge (spec §7.1)
+                // Create PR and merge queue entry when task reaches awaiting_merge (spec §7.1)
                 // TODO: orchestrator quality gate before enqueuing (spec §7.3)
                 if matches!(event.event_type, EventType::TaskStateAwaitingMerge) {
                     let entry_id = uuid::Uuid::new_v4().to_string();
-                    let entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
+                    let mut entry = models::merge_queue::MergeQueueEntry::new(&entry_id, task_id);
+
+                    // Create a PR from the task branch
+                    if let Some(task) = event_handler_server.get_task(task_id).await {
+                        if let Some(project) = event_handler_server.get_project(&task.project).await {
+                            let parts: Vec<&str> = project.repo.split('/').collect();
+                            if parts.len() == 2 {
+                                let head = format!("tasks/{}", task.id);
+                                let pr_title = task.title.clone();
+                                let pr_body = format!(
+                                    "Automated PR for task `{}`.\n\nBranch: `{}`",
+                                    task.id, head
+                                );
+                                match github.create_pull_request(parts[0], parts[1], &head, "main", &pr_title, &pr_body).await {
+                                    Ok((_number, url)) => {
+                                        info!(task_id = %task_id, pr_url = %url, "created PR");
+                                        entry.pr_url = Some(url);
+                                    }
+                                    Err(e) => {
+                                        warn!(task_id = %task_id, error = %e, "failed to create PR");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     info!(task_id = %task_id, entry_id = %entry_id, "task awaiting merge, adding to queue");
                     if let Err(e) = event_handler_server.add_to_merge_queue(entry).await {
                         error!(task_id = %task_id, error = %e, "failed to add merge queue entry");

@@ -361,6 +361,76 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // Mutations
+    // -----------------------------------------------------------------------
+
+    /// Create a pull request. Returns the PR number and URL.
+    pub async fn create_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(u64, String), GitHubError> {
+        // First, get the repository node ID (required by the GraphQL mutation).
+        let repo_query = "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }";
+        let repo_vars = json!({ "owner": owner, "name": repo });
+
+        let resp: GraphQLResponse<serde_json::Value> =
+            self.execute(repo_query, repo_vars).await?;
+        let data = self.unwrap_data(resp)?;
+        let repo_id = data
+            .get("repository")
+            .and_then(|r| r.get("id"))
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}")))?
+            .to_string();
+
+        // Create the PR.
+        let mutation = r#"
+            mutation($input: CreatePullRequestInput!) {
+                createPullRequest(input: $input) {
+                    pullRequest {
+                        number
+                        url
+                    }
+                }
+            }
+        "#;
+        let variables = json!({
+            "input": {
+                "repositoryId": repo_id,
+                "headRefName": head,
+                "baseRefName": base,
+                "title": title,
+                "body": body,
+            }
+        });
+
+        let resp: GraphQLResponse<serde_json::Value> =
+            self.execute(mutation, variables).await?;
+        let data = self.unwrap_data(resp)?;
+        let pr = data
+            .get("createPullRequest")
+            .and_then(|c| c.get("pullRequest"))
+            .ok_or_else(|| GitHubError::Decode("missing pullRequest in response".to_string()))?;
+
+        let number = pr
+            .get("number")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GitHubError::Decode("missing PR number".to_string()))?;
+        let url = pr
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| GitHubError::Decode("missing PR url".to_string()))?
+            .to_string();
+
+        Ok((number, url))
+    }
+
+    // -----------------------------------------------------------------------
     // Nested pagination helpers
     // -----------------------------------------------------------------------
 
