@@ -332,10 +332,16 @@ impl Server {
     ) -> Result<(), ServerError> {
         let task_id = entry.task_id.clone();
         let entry_id = entry.id.clone();
+        let pr_url = entry.pr_url.clone();
         {
             let mut state = self.state.write().await;
-            if state.merge_queue.get_by_task(&task_id).is_some() {
-                return Ok(()); // Already queued
+            // Dedup by PR URL first (handles unlinked PRs where task_id is empty)
+            if state.merge_queue.get_by_pr_url(&pr_url).is_some() {
+                return Ok(());
+            }
+            // Dedup by task_id for linked PRs
+            if !task_id.is_empty() && state.merge_queue.get_by_task(&task_id).is_some() {
+                return Ok(());
             }
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
@@ -371,6 +377,27 @@ impl Server {
         state.tasks.values()
             .find(|t| t.source == *source)
             .map(|t| t.id.clone())
+    }
+
+    /// Check if a PR URL is already in the merge queue.
+    pub async fn has_merge_entry_for_pr(&self, pr_url: &str) -> bool {
+        let state = self.state.read().await;
+        state.merge_queue.get_by_pr_url(pr_url).is_some()
+    }
+
+    /// Find a task ID by its branch name.
+    ///
+    /// Tasks use branches named `tasks/{task_id}`, so we extract the task ID
+    /// from the branch name and look it up.
+    pub async fn find_task_by_branch(&self, branch: &str) -> Option<String> {
+        // Tasks use branches like "tasks/gh-owner-repo-issue-123"
+        let task_id = branch.strip_prefix("tasks/")?;
+        let state = self.state.read().await;
+        if state.tasks.contains_key(task_id) {
+            Some(task_id.to_string())
+        } else {
+            None
+        }
     }
 
     /// Get the effective session limit for a project.

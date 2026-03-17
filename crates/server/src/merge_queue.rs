@@ -57,6 +57,11 @@ impl MergeQueue {
         self.entries.iter().find(|e| e.task_id == task_id)
     }
 
+    /// Get an entry by PR URL.
+    pub fn get_by_pr_url(&self, pr_url: &str) -> Option<&MergeQueueEntry> {
+        self.entries.iter().find(|e| e.pr_url == pr_url)
+    }
+
     /// Get all pending entries (eligible for merge in Play mode).
     pub fn pending(&self) -> Vec<&MergeQueueEntry> {
         self.entries

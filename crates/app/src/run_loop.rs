@@ -12,6 +12,7 @@ use tracing::{error, info, warn};
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
+use server::model::merge_queue::MergeQueueEntry;
 use server::model::task::TaskSource;
 use tasks_github::client::GitHubClient;
 use tasks_github::poller::RepoPoller;
@@ -300,17 +301,60 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        // TODO: Re-enable PR task creation and merge queue population
-                        // once the core spec is more complete. Currently causes loops
-                        // where agent-created PRs get picked up as new tasks, which
-                        // then create more PRs, etc.
+                        // Add open PRs to the merge queue (spec §7).
                         //
-                        // for pr in &result.pull_requests {
-                        //     let source = TaskSource::GithubPr { ... };
-                        //     // Create tasks for new PRs
-                        //     // Add open PRs to the merge queue
-                        // }
-                        let _ = &result.pull_requests; // suppress unused warning
+                        // We don't create tasks for PRs here — that would cause loops
+                        // where agent-created PRs get picked up as new tasks. Instead,
+                        // we only add PRs to the merge queue, which is PR-centric.
+                        //
+                        // If a PR's branch matches the `tasks/{task_id}` pattern, we
+                        // link it to that task. Otherwise, we use an empty task_id.
+                        for pr in &result.pull_requests {
+                            // Skip draft PRs — they aren't merge-ready
+                            if pr.is_draft {
+                                continue;
+                            }
+
+                            let pr_url = format!(
+                                "https://github.com/{}/{}/pull/{}",
+                                pr.owner, pr.repo, pr.number
+                            );
+
+                            // Skip if already in merge queue
+                            if poll_server.has_merge_entry_for_pr(&pr_url).await {
+                                continue;
+                            }
+
+                            // Try to find a linked task by branch name
+                            let task_id = poll_server
+                                .find_task_by_branch(&pr.head_ref)
+                                .await
+                                .unwrap_or_default();
+
+                            // Create merge queue entry
+                            let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
+                            let entry = MergeQueueEntry::new(
+                                entry_id.clone(),
+                                task_id.clone(),
+                                &pr_url,
+                            );
+
+                            if let Err(e) = poll_server.add_to_merge_queue(entry).await {
+                                warn!(
+                                    project = %project_id,
+                                    pr = pr.number,
+                                    error = %e,
+                                    "failed to add PR to merge queue"
+                                );
+                            } else {
+                                info!(
+                                    project = %project_id,
+                                    pr = pr.number,
+                                    task_id = %task_id,
+                                    "added PR to merge queue"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         error!(project = %project_id, error = %e, "poll failed");
