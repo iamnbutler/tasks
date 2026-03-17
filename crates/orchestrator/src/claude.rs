@@ -157,6 +157,7 @@ impl Orchestrator for ClaudeOrchestrator {
             issue.as_ref(),
             &context.task.title,
             context.task.description.as_deref(),
+            None, // TODO(task-4): pass actual diff for two-pass review
         );
 
         // Call the LLM
