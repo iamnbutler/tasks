@@ -171,6 +171,8 @@ async fn start_agent(
         .unwrap_or_else(|_| vec![
             "--print".to_string(),
             "--verbose".to_string(),
+            "--model".to_string(),
+            "claude-opus-4-5".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--dangerously-skip-permissions".to_string(),

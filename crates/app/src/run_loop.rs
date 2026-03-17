@@ -2,9 +2,9 @@
 //!
 //! This is intentionally thin — the logic lives in the library crates.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
@@ -69,41 +69,51 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         .with_hard_time_limit(config.session_hard_limit),
     );
 
-    // --- 4. Load projects from store and create pollers ---
+    // --- 4. Emit system:started ---
 
-    let mut pollers: Vec<(String, RepoPoller)> = Vec::new();
-    {
-        let state = server.state.read().await;
-        for (project_id, project) in &state.projects {
-            let parts: Vec<&str> = project.repo.split('/').collect();
-            if parts.len() == 2 {
-                let client = GitHubClient::new(&config.github_token);
-                let poller = RepoPoller::new(client, parts[0], parts[1]);
-                pollers.push((project_id.clone(), poller));
-            }
-        }
-    }
-
-    // --- 5. Emit system:started ---
-
+    let project_count = server.state.read().await.projects.len();
     server.emit_started().await?;
-    info!(projects = pollers.len(), "tasks platform started");
+    info!(projects = project_count, "tasks platform started");
 
-    // --- 6. Spawn GitHub poll loop ---
+    // --- 5. Spawn GitHub poll loop ---
+    //
+    // Pollers are rebuilt from the live project list each tick so that
+    // projects added/removed via the web UI take effect immediately.
 
     let poll_server = server.clone();
     let poll_interval = config.poll_interval;
-    let pollers = Arc::new(RwLock::new(pollers));
-    let poll_pollers = pollers.clone();
+    let github_token = config.github_token.clone();
 
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         let label_config = server::workflow::LabelConfig::default();
+        let mut pollers: HashMap<String, RepoPoller> = HashMap::new();
 
         loop {
             interval.tick().await;
 
-            let mut pollers = poll_pollers.write().await;
+            // Sync pollers with live project list
+            let projects: Vec<(String, String)> = {
+                let state = poll_server.state.read().await;
+                state.projects.iter().map(|(id, p)| (id.clone(), p.repo.clone())).collect()
+            };
+
+            // Remove pollers for deleted projects
+            let active_ids: std::collections::HashSet<&str> = projects.iter().map(|(id, _)| id.as_str()).collect();
+            pollers.retain(|id, _| active_ids.contains(id.as_str()));
+
+            // Add pollers for new projects
+            for (project_id, repo) in &projects {
+                if !pollers.contains_key(project_id) {
+                    let parts: Vec<&str> = repo.split('/').collect();
+                    if parts.len() == 2 {
+                        let client = GitHubClient::new(&github_token);
+                        let poller = RepoPoller::new(client, parts[0], parts[1]);
+                        pollers.insert(project_id.clone(), poller);
+                    }
+                }
+            }
+
             for (project_id, poller) in pollers.iter_mut() {
                 match poller.poll().await {
                     Ok(result) => {
