@@ -387,17 +387,28 @@ impl Server {
 
     /// Find a task ID by its branch name.
     ///
-    /// Tasks use branches named `tasks/{task_id}`, so we extract the task ID
-    /// from the branch name and look it up.
+    /// Tasks use branches named `tasks/{task_id}--{unique_suffix}` (new format)
+    /// or `tasks/{task_id}` (legacy format). The `--` delimiter separates the
+    /// task ID from the unique suffix added to prevent branch name clashes.
     pub async fn find_task_by_branch(&self, branch: &str) -> Option<String> {
-        // Tasks use branches like "tasks/gh-owner-repo-issue-123"
-        let task_id = branch.strip_prefix("tasks/")?;
+        // Strip the "tasks/" prefix
+        let branch_suffix = branch.strip_prefix("tasks/")?;
         let state = self.state.read().await;
-        if state.tasks.contains_key(task_id) {
-            Some(task_id.to_string())
-        } else {
-            None
+
+        // New format: "tasks/{task_id}--{unique_suffix}"
+        // Split on "--" and check if the first part is a known task ID.
+        if let Some((task_id, _suffix)) = branch_suffix.split_once("--") {
+            if state.tasks.contains_key(task_id) {
+                return Some(task_id.to_string());
+            }
         }
+
+        // Legacy format: "tasks/{task_id}" (exact match)
+        if state.tasks.contains_key(branch_suffix) {
+            return Some(branch_suffix.to_string());
+        }
+
+        None
     }
 
     /// Get the effective session limit for a project.
@@ -1706,5 +1717,98 @@ mod tests {
         assert!(state.merge_queue.get("mq-3").is_some());
         assert!(state.merge_queue.get("mq-1").is_none());
         assert!(state.merge_queue.get("mq-2").is_none());
+    }
+
+    // --- Branch lookup tests ---
+
+    #[tokio::test]
+    async fn find_task_by_branch_new_format_with_unique_suffix() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new(
+            "gh-owner-repo-issue-123",
+            TaskSource::Internal,
+            "Test task",
+            "proj-1",
+        );
+        server.add_task(task).await.unwrap();
+
+        // New format: tasks/{task_id}--{unique_suffix}
+        let result = server
+            .find_task_by_branch("tasks/gh-owner-repo-issue-123--a1b2c3d4")
+            .await;
+        assert_eq!(result, Some("gh-owner-repo-issue-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_task_by_branch_legacy_format_exact_match() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new(
+            "gh-owner-repo-issue-123",
+            TaskSource::Internal,
+            "Test task",
+            "proj-1",
+        );
+        server.add_task(task).await.unwrap();
+
+        // Legacy format: tasks/{task_id}
+        let result = server
+            .find_task_by_branch("tasks/gh-owner-repo-issue-123")
+            .await;
+        assert_eq!(result, Some("gh-owner-repo-issue-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_task_by_branch_no_prefix_returns_none() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Branch without tasks/ prefix
+        let result = server.find_task_by_branch("feature/something").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn find_task_by_branch_unknown_task_returns_none() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // No tasks added
+        let result = server
+            .find_task_by_branch("tasks/gh-owner-repo-issue-999--abcd1234")
+            .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn find_task_by_branch_does_not_match_partial_task_id() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Add task with ID "gh-owner-repo-issue-1"
+        let task = Task::new(
+            "gh-owner-repo-issue-1",
+            TaskSource::Internal,
+            "Test task",
+            "proj-1",
+        );
+        server.add_task(task).await.unwrap();
+
+        // Branch is for issue-123, should NOT match issue-1
+        let result = server
+            .find_task_by_branch("tasks/gh-owner-repo-issue-123--abcd1234")
+            .await;
+        assert_eq!(result, None);
     }
 }
