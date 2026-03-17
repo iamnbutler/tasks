@@ -226,7 +226,16 @@ async fn run_sse_loop(
 
         info!(url = %url, "SSE connecting...");
 
-        match connect_and_stream(&url, &stop_flag, &entity, &mut cx).await {
+        let (was_connected, result) =
+            connect_and_stream(&url, &stop_flag, &entity, &mut cx).await;
+
+        // Reset failure counter if we had a successful connection
+        if was_connected {
+            consecutive_failures = 0;
+            reconnect_delay = Duration::from_millis(RECONNECT_DELAY_MS);
+        }
+
+        match result {
             Ok(()) => {
                 // Clean disconnect (stop signal received)
                 break;
@@ -241,16 +250,19 @@ async fn run_sse_loop(
                 );
 
                 // Update state based on failure count
-                let _ = entity.update(&mut cx, |client: &mut SseClient, cx| {
+                let error_msg = e.to_string();
+                if let Err(update_err) = entity.update(&mut cx, |client: &mut SseClient, cx| {
                     if consecutive_failures == 1 {
                         // First failure: enter reconnecting state (grace period)
                         client.set_state(SseConnectionState::Reconnecting, cx);
                     } else {
                         // Multiple failures: show as failed
                         client.set_state(SseConnectionState::Failed, cx);
-                        client.set_error(e.to_string(), cx);
+                        client.set_error(error_msg.clone(), cx);
                     }
-                });
+                }) {
+                    warn!(error = %update_err, "Failed to update SSE failure state");
+                }
 
                 // Check stop flag before sleeping
                 if stop_flag.load(Ordering::SeqCst) {
@@ -267,10 +279,12 @@ async fn run_sse_loop(
                 while elapsed < delay {
                     if stop_flag.load(Ordering::SeqCst) {
                         info!(url = %url, "SSE client stopped during reconnect");
-                        let _ = entity.update(&mut cx, |client: &mut SseClient, cx| {
+                        if let Err(e) = entity.update(&mut cx, |client: &mut SseClient, cx| {
                             client.stop_flag = None;
                             client.set_state(SseConnectionState::Disconnected, cx);
-                        });
+                        }) {
+                            warn!(error = %e, "Failed to update SSE disconnect state");
+                        }
                         return;
                     }
                     smol::Timer::after(check_interval).await;
@@ -284,40 +298,54 @@ async fn run_sse_loop(
         }
     }
 
-    let _ = entity.update(&mut cx, |client: &mut SseClient, cx| {
+    if let Err(e) = entity.update(&mut cx, |client: &mut SseClient, cx| {
         client.stop_flag = None;
         client.set_state(SseConnectionState::Disconnected, cx);
-    });
+    }) {
+        warn!(error = %e, "Failed to update SSE final disconnect state");
+    }
 }
 
 /// Connect to the SSE endpoint and stream events.
+/// Returns (was_connected, result) — `was_connected` is true if we established a connection
+/// before any error, so the caller can reset failure counters.
 async fn connect_and_stream(
     url: &str,
     stop_flag: &Arc<AtomicBool>,
     entity: &WeakEntity<SseClient>,
     cx: &mut AsyncApp,
-) -> Result<(), SseError> {
+) -> (bool, Result<(), SseError>) {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(30))
         .build()
-        .map_err(SseError::Request)?;
+        .map_err(SseError::Request);
 
-    let response = client
+    let client = match client {
+        Ok(c) => c,
+        Err(e) => return (false, Err(e)),
+    };
+
+    let response = match client
         .get(url)
         .header("Accept", "text/event-stream")
         .header("Cache-Control", "no-cache")
         .send()
         .await
-        .map_err(SseError::Request)?;
+    {
+        Ok(r) => r,
+        Err(e) => return (false, Err(SseError::Request(e))),
+    };
 
     if !response.status().is_success() {
-        return Err(SseError::HttpStatus(response.status().as_u16()));
+        return (false, Err(SseError::HttpStatus(response.status().as_u16())));
     }
 
     // Update state to connected
-    let _ = entity.update(cx, |client: &mut SseClient, cx| {
+    if let Err(e) = entity.update(cx, |client: &mut SseClient, cx| {
         client.set_state(SseConnectionState::Connected, cx);
-    });
+    }) {
+        warn!(error = %e, "Failed to update SSE connection state");
+    }
 
     info!(url = %url, "SSE connected");
 
@@ -328,7 +356,7 @@ async fn connect_and_stream(
     loop {
         // Check for stop signal
         if stop_flag.load(Ordering::SeqCst) {
-            return Ok(());
+            return (true, Ok(()));
         }
 
         // Poll the stream with a timeout to allow checking stop flag
@@ -343,11 +371,11 @@ async fn connect_and_stream(
                         process_buffer(&mut buffer, entity, cx);
                     }
                     Some(Err(e)) => {
-                        return Err(SseError::Stream(e.to_string()));
+                        return (true, Err(SseError::Stream(e.to_string())));
                     }
                     None => {
                         // Stream ended
-                        return Err(SseError::StreamEnded);
+                        return (true, Err(SseError::StreamEnded));
                     }
                 }
             }
@@ -360,6 +388,11 @@ async fn connect_and_stream(
 
 /// Process the SSE buffer, extracting complete events.
 fn process_buffer(buffer: &mut String, entity: &WeakEntity<SseClient>, cx: &mut AsyncApp) {
+    // Normalize \r\n to \n per SSE spec (WHATWG)
+    if buffer.contains("\r\n") {
+        *buffer = buffer.replace("\r\n", "\n");
+    }
+
     // SSE format: "data: <json>\n\n"
     while let Some(pos) = buffer.find("\n\n") {
         let message = buffer[..pos].to_string();
@@ -371,9 +404,11 @@ fn process_buffer(buffer: &mut String, entity: &WeakEntity<SseClient>, cx: &mut 
                 match serde_json::from_str::<events::Event>(data) {
                     Ok(event) => {
                         debug!(event_type = %event.event_type.as_str(), task = %event.task, "SSE event received");
-                        let _ = entity.update(cx, |client: &mut SseClient, cx| {
+                        if let Err(e) = entity.update(cx, |client: &mut SseClient, cx| {
                             client.push_event(event, cx);
-                        });
+                        }) {
+                            warn!(error = %e, "Failed to push SSE event to client");
+                        }
                     }
                     Err(e) => {
                         warn!(data = %data, error = %e, "Failed to parse SSE event");
