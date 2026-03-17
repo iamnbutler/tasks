@@ -42,6 +42,21 @@ export interface TaskStateMeta {
   className: string;
 }
 
+// Sort priority for task states (lower = higher priority, shown first)
+// Active/actionable states appear at the top, terminal states at the bottom
+export const taskStatePriority: Record<TaskState, number> = {
+  awaiting_merge: 0,
+  running: 1,
+  question: 2,
+  conflict: 3,
+  testing: 4,
+  waiting: 5,
+  blocked: 6,
+  completed: 7,
+  failed: 8,
+  cancelled: 9,
+};
+
 export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
   waiting: {
     label: "Waiting",
@@ -209,6 +224,11 @@ export const columns: ColumnDef<Task>[] = [
     },
     filterFn: (row, id, value: string[]) => {
       return value.includes(row.getValue(id));
+    },
+    sortingFn: (rowA, rowB) => {
+      const a = taskStatePriority[rowA.getValue<TaskState>("state")] ?? 999;
+      const b = taskStatePriority[rowB.getValue<TaskState>("state")] ?? 999;
+      return a - b;
     },
   },
 
