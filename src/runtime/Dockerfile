@@ -69,7 +69,8 @@ RUN npm install -g @anthropic-ai/claude-code
 # Create non-root user (Claude Code refuses --dangerously-skip-permissions as root)
 RUN useradd -m -s /bin/bash agent && \
     echo 'agent ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
-    echo 'Defaults env_keep += "ANTHROPIC_API_KEY GITHUB_TOKEN AGENT_CMD AGENT_ARGS"' >> /etc/sudoers
+    echo 'Defaults env_keep += "ANTHROPIC_API_KEY GITHUB_TOKEN AGENT_CMD AGENT_ARGS"' >> /etc/sudoers && \
+    echo 'Defaults secure_path="/home/agent/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' >> /etc/sudoers
 
 # Rust (minimal profile — for Rust-based projects the agent works on)
 RUN su agent -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
