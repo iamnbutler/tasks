@@ -16,19 +16,24 @@ const stateOptions = Object.entries(taskStateMeta).map(([value, meta]) => ({
 
 interface DataTableToolbarProps {
   table: Table<Task>;
+  projectIdToRepo: Record<string, string>;
 }
 
-export function DataTableToolbar({ table }: DataTableToolbarProps) {
+export function DataTableToolbar({ table, projectIdToRepo }: DataTableToolbarProps) {
   const isFiltered = table.getState().columnFilters.length > 0;
 
-  // Derive unique project names from table data for the project filter.
+  // Derive unique project IDs from table data, display repo names.
   const projectOptions = Array.from(
     new Set(table.getCoreRowModel().rows.map((row) => row.original.project))
   )
-    .sort()
-    .map((project) => ({
-      value: project,
-      label: project,
+    .sort((a, b) => {
+      const repoA = projectIdToRepo[a] ?? a;
+      const repoB = projectIdToRepo[b] ?? b;
+      return repoA.localeCompare(repoB);
+    })
+    .map((projectId) => ({
+      value: projectId,
+      label: projectIdToRepo[projectId] ?? projectId,
     }));
 
   return (
