@@ -294,11 +294,15 @@ Fields:
 
 _See Section 7 for full merge queue specification._
 
+The merge queue tracks PRs, not tasks. Each entry represents a pull request that is a candidate
+for merging. A `task_id` is stored as a back-reference to the task that produced the PR (if any),
+but the queue is PR-centric.
+
 Fields:
 
 - `id` (string) — queue entry ID
-- `task_id` (string)
-- `pr_url` (string or null)
+- `task_id` (string) — the task that produced this PR, if known
+- `pr_url` (string) — GitHub pull request URL
 - `status` (string) — pending, approved, rejected, merged, conflict
 - `queued_at` (timestamp)
 
@@ -327,7 +331,7 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.2 Pause
 
 - Agents are dispatched and work on tasks normally.
-- Completed work enters the merge queue.
+- PRs discovered by the poller enter the merge queue.
 - The merge queue is held: nothing merges automatically.
 - The orchestrator continues to manage agents, answer questions, and evaluate quality — but does
   not approve merges.
@@ -340,8 +344,8 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.3 Play
 
 - Agents are dispatched and work on tasks normally.
-- The merge queue is continuously active: as work completes, passes quality evaluation, and is
-  approved by the orchestrator, it merges automatically.
+- The merge queue is continuously active: as PRs are discovered, evaluated by the orchestrator,
+  and approved, they merge automatically.
 - The orchestrator owns merge authority. The human can still intervene at any time.
 - Play is the fully autonomous mode. The human delegates merge authority to the orchestrator and
   may step away.
@@ -358,17 +362,20 @@ Mode transitions follow a severity ordering: Stop < Pause < Play.
 
 ## 7. Merge Queue
 
-The merge queue is the pipeline between "an agent finished its work" and "that work ships."
+The merge queue is a list of pull requests and the order in which they should be merged. It is
+decoupled from tasks — tasks may or may not produce PRs, and PRs may or may not originate from
+tasks. The queue is populated by GitHub polling: when the poller discovers an open PR on a tracked
+repository, it is added to the queue.
 
 ### 7.1 Queue Entry Lifecycle
 
-1. An implementor agent completes its task and produces a result (typically a PR).
-2. The orchestrator evaluates whether the implementation meets the quality bar and appropriately
-   resolves the issue.
-3. If approved, the work enters the merge queue as a pending merge.
-4. The merge authority (human or orchestrator, depending on mode and presence) reviews and either
-   merges or rejects.
-5. If rejected, the task may be sent back to the implementor with feedback.
+1. The GitHub poller discovers an open PR on a tracked repository.
+2. A merge queue entry is created with status `pending`.
+3. The merge authority (human or orchestrator, depending on mode) reviews and either
+   approves or rejects.
+4. Approved entries are merged (in Play mode, continuously; in Pause mode, via Flush).
+5. If rejected, the entry is removed from the queue. If the PR was produced by a task,
+   the task may be sent back to the implementor with feedback.
 
 ### 7.2 Merge Authority
 
@@ -385,15 +392,15 @@ or drop into a task to give feedback. The mode controls the default flow, not th
 
 ### 7.3 Quality Evaluation
 
-Before a task enters the merge queue, the orchestrator evaluates it:
+In Play mode, the orchestrator evaluates each pending PR before approving it:
 
 - Does the implementation address the issue as described?
 - Do tests pass (CI/testing state)?
 - Are there conflicts that need resolution?
 - Does the change meet project conventions and quality standards?
 
-If the orchestrator determines the work isn't ready, it sends the task back to the implementor
-with specific feedback rather than queuing a bad merge.
+If the orchestrator determines the work isn't ready, it rejects the entry. If the PR was
+produced by a task, the task may be sent back to the implementor with specific feedback.
 
 ### 7.4 Conflicts
 
