@@ -15,7 +15,7 @@ use events::{Actor, Event, EventBus, EventType};
 use crate::merge_queue::MergeQueue;
 use crate::mode::{Mode, ModeTransitionError};
 use crate::model::project::Project;
-use crate::model::task::{Task, TaskSource, TaskState};
+use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
 use crate::presence::PresenceTracker;
 
@@ -320,6 +320,49 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// Update task to failed state with failure info (spec §13.5).
+    ///
+    /// Called by the event handler loop when a TaskStateFailed event is received.
+    /// Updates the task state, increments retry count, and stores failure details.
+    pub async fn apply_task_failure(
+        &self,
+        task_id: &str,
+        failure_info: Option<FailureInfo>,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+        task.set_state(TaskState::Failed);
+        task.last_failure_at = Some(chrono::Utc::now());
+        task.retry_count += 1;
+        task.last_failure = failure_info;
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist task failure to store");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a task has exhausted its retries (spec §13.2).
+    ///
+    /// Default max_retries is 3.
+    pub async fn task_exhausted_retries(&self, task_id: &str, max_retries: u32) -> bool {
+        let state = self.state.read().await;
+        state
+            .tasks
+            .get(task_id)
+            .map(|t| t.retry_count >= max_retries)
+            .unwrap_or(false)
     }
 
     // --- Merge queue (spec §7) ---

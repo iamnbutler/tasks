@@ -1,9 +1,10 @@
-//! Session manager — spec §9, §12.
+//! Session manager — spec §9, §12, §13.
 //!
 //! Manages active container sessions. Spawns containers, monitors agent
-//! output, maps supervisor events to platform events, and enforces time limits.
+//! output, maps supervisor events to platform events, enforces time limits,
+//! and captures failure context for diagnosis (spec §13.5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,9 @@ use tokio::task::JoinHandle;
 
 use events::EventBus;
 use runtime::{ContainerConfig, ContainerRuntime};
+
+/// Maximum number of stderr lines to retain for failure diagnosis.
+const STDERR_BUFFER_LINES: usize = 50;
 
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
@@ -219,7 +223,7 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
 ///
 /// Runs for the lifetime of a session. Reads events from the blocking
 /// transport via a dedicated thread, handles commands from the session
-/// manager, and enforces time limits.
+/// manager, enforces time limits, and captures stderr for failure diagnosis.
 async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     task_id: String,
     session: runtime::Session<R>,
@@ -232,6 +236,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
 ) {
     let started_at = Instant::now();
     let mut soft_limit_notified = false;
+    // Rolling buffer of recent stderr lines for failure diagnosis (spec §13.5)
+    let mut stderr_buffer: VecDeque<String> = VecDeque::with_capacity(STDERR_BUFFER_LINES);
+    let mut hit_hard_limit = false;
 
     // Wrap session for shared access between blocking recv thread and async command handler
     let session = Arc::new(std::sync::Mutex::new(session));
@@ -265,13 +272,29 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     loop {
         tokio::select! {
             Some(supervisor_event) = event_rx.recv() => {
+                // Capture stderr for failure diagnosis (spec §13.5)
+                if let runtime::protocol::Event::AgentStderr(ref stderr) = supervisor_event {
+                    // Split stderr data into lines and add to buffer
+                    for line in stderr.data.lines() {
+                        if stderr_buffer.len() >= STDERR_BUFFER_LINES {
+                            stderr_buffer.pop_front();
+                        }
+                        stderr_buffer.push_back(line.to_string());
+                    }
+                }
+
                 // Map and publish platform events
                 handle_supervisor_event(&task_id, &supervisor_event, &event_bus).await;
 
                 // Check for agent exit
                 if let runtime::protocol::Event::AgentExit(ref exit) = supervisor_event {
                     let ran_long_enough = started_at.elapsed() >= progress_threshold;
-                    handle_exit(&task_id, exit, ran_long_enough, &event_bus).await;
+                    let stderr_tail = if stderr_buffer.is_empty() {
+                        None
+                    } else {
+                        Some(stderr_buffer.iter().cloned().collect::<Vec<_>>().join("\n"))
+                    };
+                    handle_exit(&task_id, exit, ran_long_enough, hit_hard_limit, stderr_tail, &event_bus).await;
                     break;
                 }
             }
@@ -296,6 +319,7 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
         // Time limit checks
         let elapsed = started_at.elapsed();
         if elapsed >= hard_limit {
+            hit_hard_limit = true;
             let mut sess = session_cmd.lock().unwrap();
             if let Err(e) = sess.stop_agent() {
                 tracing::error!(task_id = %task_id, error = %e, "failed to stop agent at hard time limit");
@@ -354,11 +378,83 @@ async fn handle_supervisor_event(
     }
 }
 
-/// Handle an agent exit event — publish success or failure.
+/// Classify a failure based on exit code, signal, and progress (spec §13.1).
+///
+/// Returns (FailureType, reason_string).
+fn classify_failure(
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+    made_progress: bool,
+    hit_timeout: bool,
+) -> (models::task::FailureType, String) {
+    use models::task::FailureType;
+
+    // Timeout is transient on first occurrence (agent might succeed with more time)
+    if hit_timeout {
+        return (
+            FailureType::Transient,
+            "Session exceeded hard time limit".to_string(),
+        );
+    }
+
+    // Signal-based classification
+    if let Some(sig) = signal {
+        return match sig {
+            // OOM killer or resource exhaustion — transient
+            "SIGKILL" => (
+                FailureType::Transient,
+                format!("Agent killed by {sig} (possibly OOM or resource exhaustion)"),
+            ),
+            // Segfault or abort — deterministic code error
+            "SIGSEGV" | "SIGABRT" | "SIGBUS" => (
+                FailureType::Deterministic,
+                format!("Agent crashed with {sig}"),
+            ),
+            // Other signals — treat as transient
+            _ => (
+                FailureType::Transient,
+                format!("Agent terminated by signal {sig}"),
+            ),
+        };
+    }
+
+    // Exit code-based classification
+    if let Some(code) = exit_code {
+        let (failure_type, reason) = match code {
+            // Common transient exit codes
+            137 => (FailureType::Transient, "Agent killed (exit 137, likely OOM)"),
+            143 => (FailureType::Transient, "Agent terminated (exit 143, SIGTERM)"),
+            // Rate limit / network errors often use exit code 1, but with no progress
+            // they're likely transient; with progress they might be deterministic
+            1 if !made_progress => (FailureType::Transient, "Agent failed quickly (exit 1)"),
+            1 => (FailureType::Deterministic, "Agent failed after making progress (exit 1)"),
+            // Other non-zero codes
+            _ if !made_progress => (
+                FailureType::Transient,
+                "Agent failed without making progress",
+            ),
+            _ => (
+                FailureType::Deterministic,
+                "Agent failed after making progress",
+            ),
+        };
+        return (failure_type, format!("{} — exit code {}", reason, code));
+    }
+
+    // No exit code or signal — unknown failure
+    (
+        FailureType::Transient,
+        "Agent exited unexpectedly".to_string(),
+    )
+}
+
+/// Handle an agent exit event — publish success or failure with diagnosis (spec §13.5).
 async fn handle_exit(
     task_id: &str,
     exit: &runtime::protocol::AgentExitEvent,
     made_progress: bool,
+    hit_timeout: bool,
+    stderr_tail: Option<String>,
     event_bus: &EventBus,
 ) {
     let success = exit.code == Some(0);
@@ -369,12 +465,31 @@ async fn handle_exit(
             serde_json::json!({ "exit_code": 0 }),
         )
     } else {
+        // Classify the failure (spec §13.1)
+        let (failure_type, reason) = classify_failure(
+            exit.code,
+            exit.signal.as_deref(),
+            made_progress,
+            hit_timeout,
+        );
+
+        // Build FailureInfo for the event data
+        let failure_info = models::task::FailureInfo {
+            failure_type,
+            reason: reason.clone(),
+            exit_code: exit.code,
+            signal: exit.signal.clone(),
+            made_progress,
+            stderr_tail,
+        };
+
         (
             events::EventType::TaskStateFailed,
             serde_json::json!({
                 "exit_code": exit.code,
                 "signal": exit.signal,
                 "made_progress": made_progress,
+                "failure_info": failure_info,
             }),
         )
     };
@@ -469,7 +584,7 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, false, false, None, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateAwaitingMerge);
@@ -484,11 +599,14 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, false, false, None, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
         assert_eq!(received.data["exit_code"], 1);
+        // Should include failure_info with classification
+        assert!(received.data["failure_info"].is_object());
+        assert_eq!(received.data["failure_info"]["failure_type"], "transient");
     }
 
     #[tokio::test]
@@ -499,10 +617,60 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, true, &bus).await;
+        handle_exit("task-1", &exit, true, false, None, &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
         assert_eq!(received.data["made_progress"], true);
+        // With progress, exit code 1 is classified as deterministic
+        assert_eq!(received.data["failure_info"]["failure_type"], "deterministic");
+    }
+
+    #[tokio::test]
+    async fn exit_timeout_classified_as_transient() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: None,
+            signal: Some("SIGKILL".to_string()),
+        };
+
+        handle_exit("task-1", &exit, true, true, None, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        // Timeout is classified as transient
+        assert_eq!(received.data["failure_info"]["failure_type"], "transient");
+        assert!(received.data["failure_info"]["reason"].as_str().unwrap().contains("time limit"));
+    }
+
+    #[tokio::test]
+    async fn exit_includes_stderr_tail() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+
+        handle_exit("task-1", &exit, false, false, Some("error: file not found".to_string()), &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        assert_eq!(received.data["failure_info"]["stderr_tail"], "error: file not found");
+    }
+
+    #[tokio::test]
+    async fn exit_segfault_classified_as_deterministic() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: None,
+            signal: Some("SIGSEGV".to_string()),
+        };
+
+        handle_exit("task-1", &exit, false, false, None, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+        assert_eq!(received.data["failure_info"]["failure_type"], "deterministic");
+        assert!(received.data["failure_info"]["reason"].as_str().unwrap().contains("SIGSEGV"));
     }
 }

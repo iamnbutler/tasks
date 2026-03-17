@@ -3,6 +3,50 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Failure classification — spec §13.1.
+///
+/// Categorizes failures to determine appropriate response:
+/// - Transient: Retry with backoff
+/// - Deterministic: Mark failed, surface to human
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureType {
+    /// Temporary problems likely to resolve (network, rate limits, resource pressure).
+    Transient,
+    /// Problems that will recur if retried with the same inputs.
+    Deterministic,
+}
+
+impl Default for FailureType {
+    fn default() -> Self {
+        Self::Transient
+    }
+}
+
+/// Detailed failure information — spec §13.5.
+///
+/// Captures context about why a task failed for debugging and retry decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FailureInfo {
+    /// Classification of the failure.
+    #[serde(default)]
+    pub failure_type: FailureType,
+    /// Human-readable description of what went wrong.
+    pub reason: String,
+    /// Exit code if the agent process exited normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Signal name if the agent was killed by a signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Whether the session ran long enough to count as progress (spec §13.1).
+    #[serde(default)]
+    pub made_progress: bool,
+    /// Last lines of stderr output for debugging context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+}
+
 /// Origin reference for a task (spec Section 5.1 `source` field).
 ///
 /// A task may originate from a GitHub issue, a GitHub PR, or be created
@@ -89,6 +133,8 @@ pub struct Task {
     pub retry_count: u32,
     /// When the most recent failure occurred (spec §13.2).
     pub last_failure_at: Option<DateTime<Utc>>,
+    /// Details about the most recent failure (spec §13.5).
+    pub last_failure: Option<FailureInfo>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,6 +163,7 @@ impl Task {
             workspace_id: None,
             retry_count: 0,
             last_failure_at: None,
+            last_failure: None,
             created_at: now,
             updated_at: now,
         }

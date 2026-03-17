@@ -216,7 +216,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // already published by set_task_state (from scheduler/dispatch)
                 // to avoid double-applying state and bumping updated_at twice.
                 if event.actor != events::Actor::Scheduler {
-                    if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
+                    // Special handling for failures to capture failure info (spec §13.5)
+                    if event.event_type == EventType::TaskStateFailed {
+                        let failure_info: Option<models::task::FailureInfo> = event
+                            .data
+                            .get("failure_info")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        if let Err(e) = event_handler_server.apply_task_failure(task_id, failure_info).await {
+                            if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                                error!(task_id = %task_id, error = %e, "failed to apply task failure from event");
+                            }
+                        }
+                    } else if let Err(e) = event_handler_server.apply_task_state(task_id, state).await {
                         if !matches!(e, server::ServerError::TaskNotFound(_)) {
                             error!(task_id = %task_id, error = %e, "failed to update task state from event");
                         }

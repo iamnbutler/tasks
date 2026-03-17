@@ -72,6 +72,20 @@ pub struct RetryContext {
     pub attempt: u32,
     pub previous_failure: String,
     pub has_prior_commits: bool,
+    /// Detailed failure information from the last attempt (spec §13.5).
+    pub failure_details: Option<RetryFailureDetails>,
+}
+
+/// Detailed failure information for retry context.
+pub struct RetryFailureDetails {
+    /// Whether the failure was classified as transient or deterministic.
+    pub failure_type: String,
+    /// Exit code if available.
+    pub exit_code: Option<i32>,
+    /// Signal if the agent was killed.
+    pub signal: Option<String>,
+    /// Last lines of stderr for debugging.
+    pub stderr_tail: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,12 +146,30 @@ pub fn build_prompt_for_task(task: &crate::model::task::Task, branch: &str) -> S
     };
 
     let retry = if task.retry_count > 0 {
+        // Build failure details from last_failure if available (spec §13.5)
+        let failure_details = task.last_failure.as_ref().map(|f| RetryFailureDetails {
+            failure_type: match f.failure_type {
+                crate::model::task::FailureType::Transient => "transient (may succeed on retry)".to_string(),
+                crate::model::task::FailureType::Deterministic => "deterministic (likely needs different approach)".to_string(),
+            },
+            exit_code: f.exit_code,
+            signal: f.signal.clone(),
+            stderr_tail: f.stderr_tail.clone(),
+        });
+
+        let previous_failure = task
+            .last_failure
+            .as_ref()
+            .map(|f| f.reason.clone())
+            .unwrap_or_else(|| "Previous session failed".to_string());
+
         Some(RetryContext {
             attempt: task.retry_count + 1,
-            previous_failure: "Previous session failed".to_string(),
+            previous_failure,
             // Conservative: only claim prior commits exist after the first retry,
             // since the first attempt may have crashed before committing.
             has_prior_commits: task.retry_count > 1,
+            failure_details,
         })
     } else {
         None
@@ -175,14 +207,42 @@ fn render_retry(out: &mut String, retry: &RetryContext) {
     )
     .unwrap();
     writeln!(out, "Previous failure: {}", retry.previous_failure).unwrap();
+
+    // Include detailed failure information if available (spec §13.5)
+    if let Some(ref details) = retry.failure_details {
+        writeln!(out, "\n**Failure details:**").unwrap();
+        writeln!(out, "- Classification: {}", details.failure_type).unwrap();
+        if let Some(code) = details.exit_code {
+            writeln!(out, "- Exit code: {}", code).unwrap();
+        }
+        if let Some(ref signal) = details.signal {
+            writeln!(out, "- Signal: {}", signal).unwrap();
+        }
+        if let Some(ref stderr) = details.stderr_tail {
+            writeln!(out, "- Last stderr output:").unwrap();
+            writeln!(out, "```").unwrap();
+            // Limit stderr to avoid overwhelming the prompt
+            let lines: Vec<&str> = stderr.lines().collect();
+            let display_lines = if lines.len() > 20 {
+                &lines[lines.len() - 20..]
+            } else {
+                &lines[..]
+            };
+            for line in display_lines {
+                writeln!(out, "{}", line).unwrap();
+            }
+            writeln!(out, "```").unwrap();
+        }
+    }
+
     if retry.has_prior_commits {
         writeln!(
             out,
-            "Prior work exists on the branch — review existing commits before starting."
+            "\nPrior work exists on the branch — review existing commits before starting."
         )
         .unwrap();
     }
-    writeln!(out, "Try a different approach if the previous one failed.\n").unwrap();
+    writeln!(out, "\nTry a different approach if the previous one failed.\n").unwrap();
 }
 
 fn render_task(out: &mut String, params: &PromptParams) {
@@ -483,6 +543,7 @@ mod tests {
             attempt: 3,
             previous_failure: "Timeout after 600s".to_string(),
             has_prior_commits: true,
+            failure_details: None,
         };
         let params = PromptParams {
             retry: Some(&retry),
@@ -500,6 +561,33 @@ mod tests {
         let retry_pos = prompt.find("# Retry Information").unwrap();
         let task_pos = prompt.find("# Task").unwrap();
         assert!(retry_pos < task_pos);
+    }
+
+    #[test]
+    fn retry_context_includes_failure_details() {
+        let retry = RetryContext {
+            attempt: 2,
+            previous_failure: "Agent killed by SIGKILL".to_string(),
+            has_prior_commits: false,
+            failure_details: Some(RetryFailureDetails {
+                failure_type: "transient (may succeed on retry)".to_string(),
+                exit_code: Some(137),
+                signal: Some("SIGKILL".to_string()),
+                stderr_tail: Some("error: out of memory\nKilled".to_string()),
+            }),
+        };
+        let params = PromptParams {
+            retry: Some(&retry),
+            ..minimal_params()
+        };
+        let prompt = build_prompt(&params);
+
+        assert!(prompt.contains("**Failure details:**"));
+        assert!(prompt.contains("Classification: transient"));
+        assert!(prompt.contains("Exit code: 137"));
+        assert!(prompt.contains("Signal: SIGKILL"));
+        assert!(prompt.contains("Last stderr output:"));
+        assert!(prompt.contains("out of memory"));
     }
 
     #[test]
