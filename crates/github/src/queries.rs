@@ -30,6 +30,12 @@ const ISSUE_FIELDS: &str = r#"
             updatedAt
         }
     }
+    parent {
+        number
+        title
+        state
+        id
+    }
     subIssues(first: 50) {
         nodes {
             number
@@ -38,7 +44,7 @@ const ISSUE_FIELDS: &str = r#"
             id
         }
     }
-    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, MARKED_AS_BLOCKED_BY_EVENT, UNMARKED_AS_BLOCKED_BY_EVENT]) {
         nodes {
             ... on CrossReferencedEvent {
                 source {
@@ -48,6 +54,22 @@ const ISSUE_FIELDS: &str = r#"
                         state
                         id
                     }
+                }
+            }
+            ... on MarkedAsBlockedByEvent {
+                blockingIssue {
+                    number
+                    title
+                    state
+                    id
+                }
+            }
+            ... on UnmarkedAsBlockedByEvent {
+                blockingIssue {
+                    number
+                    title
+                    state
+                    id
                 }
             }
         }
