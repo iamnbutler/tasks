@@ -27,7 +27,7 @@ cp .env.example .env
 container build --dns 8.8.8.8 -f src/runtime/Dockerfile -t tasks-agent:latest .
 
 # Build the web frontend
-cd web && bun install && bun run build && cd ..
+bun install && bun web build
 ```
 
 ## Running
@@ -48,7 +48,7 @@ cargo run -- run --tui    # terminal UI
 
 ```sh
 # Frontend dev server (proxies /api to localhost:4800)
-cd web && bun run dev
+bun web dev
 
 # Run the backend separately
 cargo run -- run --web
