@@ -7,10 +7,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 
 # Copy all crate Cargo.toml files (workspace glob requires them to exist).
+COPY crates/agent/Cargo.toml crates/agent/Cargo.toml
 COPY crates/app/Cargo.toml crates/app/Cargo.toml
 COPY crates/events/Cargo.toml crates/events/Cargo.toml
 COPY crates/github/Cargo.toml crates/github/Cargo.toml
 COPY crates/models/Cargo.toml crates/models/Cargo.toml
+COPY crates/orchestrator/Cargo.toml crates/orchestrator/Cargo.toml
 COPY crates/runtime/Cargo.toml crates/runtime/Cargo.toml
 COPY crates/server/Cargo.toml crates/server/Cargo.toml
 COPY crates/session/Cargo.toml crates/session/Cargo.toml
