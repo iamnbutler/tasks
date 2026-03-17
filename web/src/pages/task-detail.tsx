@@ -300,6 +300,9 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
   const [rawEvents, setRawEvents] = useState<Event[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -330,11 +333,43 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
   }, [taskId]);
 
   const blocks = parseAgentEvents(rawEvents);
+  const prevBlocksLength = useRef(blocks.length);
 
-  // Auto-scroll to bottom
+  // Check if user is scrolled to bottom (within threshold)
+  const checkIfAtBottom = useCallback(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return true;
+    const threshold = 50;
+    return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+  }, []);
+
+  // Handle scroll events to track position
+  const handleScroll = useCallback(() => {
+    const atBottom = checkIfAtBottom();
+    setIsAtBottom(atBottom);
+    if (atBottom) {
+      setHasNewMessages(false);
+    }
+  }, [checkIfAtBottom]);
+
+  // Auto-scroll to bottom only if user was at bottom, otherwise show indicator
   useEffect(() => {
+    if (blocks.length > prevBlocksLength.current) {
+      if (isAtBottom) {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      } else {
+        setHasNewMessages(true);
+      }
+    }
+    prevBlocksLength.current = blocks.length;
+  }, [blocks.length, isAtBottom]);
+
+  // Scroll to bottom when clicking the new messages indicator
+  const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [blocks.length]);
+    setHasNewMessages(false);
+    setIsAtBottom(true);
+  }, []);
 
   const handleSend = useCallback(async () => {
     const text = chatInput.trim();
@@ -359,16 +394,32 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       </CardHeader>
       <CardContent className="flex flex-col flex-1 min-h-0 gap-3">
         {/* Message stream */}
-        <div className="flex-1 min-h-0 overflow-y-auto rounded-md border border-border bg-background p-4 space-y-3">
-          {blocks.length === 0 && (
-            <p className="text-muted-foreground text-center py-8">
-              No agent output yet.
-            </p>
+        <div className="relative flex-1 min-h-0">
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-4 space-y-3"
+          >
+            {blocks.length === 0 && (
+              <p className="text-muted-foreground text-center py-8">
+                No agent output yet.
+              </p>
+            )}
+            {blocks.map((block, i) => (
+              <BlockView key={i} block={block} />
+            ))}
+            <div ref={bottomRef} />
+          </div>
+          {/* New messages indicator */}
+          {hasNewMessages && (
+            <button
+              onClick={scrollToBottom}
+              className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 text-white text-sm font-medium shadow-lg hover:bg-blue-700 transition-colors"
+            >
+              <ChevronDown className="h-4 w-4" />
+              New messages
+            </button>
           )}
-          {blocks.map((block, i) => (
-            <BlockView key={i} block={block} />
-          ))}
-          <div ref={bottomRef} />
         </div>
 
         {/* Chat input — only when session is active */}
