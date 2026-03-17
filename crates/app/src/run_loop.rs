@@ -45,7 +45,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 2. Create server ---
 
-    let server = Arc::new(Server::with_store(bus, store));
+    let server = Arc::new(
+        Server::with_store(bus, store)
+            .with_github_token(&config.github_token)
+    );
     server
         .load_from_store()
         .await

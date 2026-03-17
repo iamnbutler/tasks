@@ -82,6 +82,8 @@ pub struct Server {
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
     pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    /// GitHub token for API operations (merge queue flush).
+    github_token: Option<String>,
 }
 
 impl Server {
@@ -91,6 +93,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: None,
+            github_token: None,
         }
     }
 
@@ -101,7 +104,14 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: Some(Arc::new(StdMutex::new(store))),
+            github_token: None,
         }
+    }
+
+    /// Set the GitHub token for API operations (merge queue flush).
+    pub fn with_github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(token.into());
+        self
     }
 
     /// Load projects, tasks, and merge queue entries from the store into memory.
@@ -473,29 +483,145 @@ impl Server {
 
     /// Flush the merge queue (spec Section 6.2).
     ///
-    /// Only valid in Pause mode.
+    /// Iterates all approved entries and attempts to merge each PR via the
+    /// GitHub API. Entries are marked as `merged` on success or `conflict`
+    /// on failure. Only valid in Pause mode.
     pub async fn flush_merge_queue(&self) -> Result<Vec<String>, ServerError> {
-        let mut state = self.state.write().await;
-        let mode = state.mode;
-        let flushed = state
-            .merge_queue
-            .flush(mode)
-            .map_err(|e| ServerError::EventStore(events::StoreError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-            )))?;
+        // Check mode first
+        let mode = {
+            let state = self.state.read().await;
+            state.mode
+        };
 
-        drop(state);
+        if !mode.flush_available() {
+            return Err(ServerError::EventStore(events::StoreError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("merge queue is held in {:?} mode", mode),
+                ),
+            )));
+        }
+
+        // Get approved entries
+        let approved_entries: Vec<_> = {
+            let state = self.state.read().await;
+            state
+                .merge_queue
+                .approved()
+                .iter()
+                .map(|e| (*e).clone())
+                .collect()
+        };
+
+        if approved_entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Create GitHub client if we have a token
+        let github_client = self.github_token.as_ref().map(|token| {
+            tasks_github::GitHubClient::new(token)
+        });
+
+        let mut merged_ids = Vec::new();
+        let mut conflict_ids = Vec::new();
+
+        for entry in &approved_entries {
+            let result = if let Some(ref client) = github_client {
+                // Parse PR URL to get owner/repo/number
+                if let Some((owner, repo, number)) = entry.parse_pr_url() {
+                    match client.merge_pull_request(&owner, &repo, number).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                entry_id = %entry.id,
+                                pr_url = %entry.pr_url,
+                                "successfully merged PR"
+                            );
+                            Ok(())
+                        }
+                        Err(tasks_github::GitHubError::MergeConflict(reason)) => {
+                            tracing::warn!(
+                                entry_id = %entry.id,
+                                pr_url = %entry.pr_url,
+                                reason = %reason,
+                                "PR has merge conflict"
+                            );
+                            Err(reason)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                entry_id = %entry.id,
+                                pr_url = %entry.pr_url,
+                                error = %e,
+                                "failed to merge PR"
+                            );
+                            Err(e.to_string())
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        entry_id = %entry.id,
+                        pr_url = %entry.pr_url,
+                        "invalid PR URL format"
+                    );
+                    Err("invalid PR URL format".to_string())
+                }
+            } else {
+                // No GitHub token configured — just mark as merged (legacy behavior)
+                tracing::warn!(
+                    entry_id = %entry.id,
+                    "no GitHub token configured, marking as merged without API call"
+                );
+                Ok(())
+            };
+
+            match result {
+                Ok(()) => merged_ids.push(entry.id.clone()),
+                Err(_) => conflict_ids.push(entry.id.clone()),
+            }
+        }
+
+        // Update entry statuses
+        {
+            let mut state = self.state.write().await;
+            for id in &merged_ids {
+                if let Err(e) = state.merge_queue.mark_merged(id) {
+                    tracing::error!(entry_id = %id, error = %e, "failed to mark entry as merged");
+                }
+            }
+            for id in &conflict_ids {
+                if let Err(e) = state.merge_queue.mark_conflict(id) {
+                    tracing::error!(entry_id = %id, error = %e, "failed to mark entry as conflict");
+                }
+            }
+        }
+
+        // Persist status changes to store
+        if let Some(ref store) = self.store {
+            let state = self.state.read().await;
+            if let Ok(store) = store.lock() {
+                for id in merged_ids.iter().chain(conflict_ids.iter()) {
+                    if let Some(entry) = state.merge_queue.get(id) {
+                        if let Err(e) = store.save_merge_entry(entry) {
+                            tracing::error!(entry_id = %id, error = %e, "failed to persist merge entry status");
+                        }
+                    }
+                }
+            }
+        }
 
         // Emit flush event
         let event = Event::new(
             EventType::SystemFlush,
             "system",
             Actor::Human,
-            serde_json::json!({ "flushed": flushed }),
+            serde_json::json!({
+                "merged": merged_ids,
+                "conflicts": conflict_ids,
+            }),
         );
         self.event_bus.publish(event).await?;
 
-        Ok(flushed)
+        Ok(merged_ids)
     }
 
     // --- Presence (spec Section 4.1) ---

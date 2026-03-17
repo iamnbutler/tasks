@@ -404,6 +404,122 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
+    // PR mutations (spec Section 7 — merge queue)
+    // -----------------------------------------------------------------------
+
+    /// Merge a pull request by number.
+    ///
+    /// Returns `Ok(())` on success, `Err(GitHubError::MergeConflict)` if the
+    /// PR cannot be merged due to conflicts or other merge blockers.
+    pub async fn merge_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<(), GitHubError> {
+        // First, fetch the PR's node ID and check if it's mergeable.
+        let info_query = queries::get_pr_merge_info_query();
+        let info_variables = json!({
+            "owner": owner,
+            "name": repo,
+            "number": number as i64,
+        });
+
+        let info_resp: GraphQLResponse<serde_json::Value> =
+            self.execute(info_query, info_variables).await?;
+        let info_data = self.unwrap_data(info_resp)?;
+
+        let pr_data = info_data
+            .get("repository")
+            .and_then(|r| r.get("pullRequest"))
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}#{number}")))?;
+
+        let pr_id = pr_data
+            .get("id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| GitHubError::Decode("missing PR id".to_string()))?;
+
+        let state = pr_data
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("UNKNOWN");
+
+        // If the PR is already merged or closed, handle appropriately.
+        if state == "MERGED" {
+            // Already merged, nothing to do.
+            return Ok(());
+        }
+        if state == "CLOSED" {
+            return Err(GitHubError::MergeConflict(
+                "PR is closed and cannot be merged".to_string(),
+            ));
+        }
+
+        let mergeable = pr_data
+            .get("mergeable")
+            .and_then(|m| m.as_str())
+            .unwrap_or("UNKNOWN");
+
+        // CONFLICTING means there are merge conflicts.
+        if mergeable == "CONFLICTING" {
+            return Err(GitHubError::MergeConflict(
+                "PR has merge conflicts".to_string(),
+            ));
+        }
+
+        // UNKNOWN means GitHub hasn't computed mergeability yet.
+        // We proceed with the merge attempt and let GitHub reject it if needed.
+
+        // Now perform the actual merge.
+        let merge_query = queries::merge_pull_request_mutation();
+        let merge_variables = json!({
+            "pullRequestId": pr_id,
+            "mergeMethod": "SQUASH",
+        });
+
+        let merge_resp: GraphQLResponse<serde_json::Value> =
+            self.execute(merge_query, merge_variables).await?;
+
+        // Check for GraphQL errors that indicate merge failure.
+        if let Some(errors) = &merge_resp.errors {
+            for error in errors {
+                let msg = error.message.to_lowercase();
+                if msg.contains("conflict")
+                    || msg.contains("not mergeable")
+                    || msg.contains("head branch was modified")
+                    || msg.contains("blocked")
+                {
+                    return Err(GitHubError::MergeConflict(error.message.clone()));
+                }
+            }
+            // If there are other errors, return them as GraphQL errors.
+            if !errors.is_empty() {
+                return Err(GitHubError::GraphQL(errors.clone()));
+            }
+        }
+
+        // Verify the merge succeeded.
+        let data = merge_resp
+            .data
+            .ok_or_else(|| GitHubError::Decode("no data in merge response".to_string()))?;
+
+        let merged = data
+            .get("mergePullRequest")
+            .and_then(|m| m.get("pullRequest"))
+            .and_then(|pr| pr.get("merged"))
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+
+        if !merged {
+            return Err(GitHubError::MergeConflict(
+                "merge request completed but PR was not merged".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Nested pagination helpers
     // -----------------------------------------------------------------------
 

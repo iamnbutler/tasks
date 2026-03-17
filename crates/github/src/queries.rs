@@ -240,3 +240,29 @@ pub fn pr_reviews_query() -> &'static str {
   }
 }"#
 }
+
+/// Merge a pull request (spec Section 7 — merge queue flush).
+pub fn merge_pull_request_mutation() -> &'static str {
+    r#"mutation MergePullRequest($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod) {
+  mergePullRequest(input: { pullRequestId: $pullRequestId, mergeMethod: $mergeMethod }) {
+    pullRequest {
+      merged
+      mergedAt
+      url
+    }
+  }
+}"#
+}
+
+/// Fetch the node ID and mergeable state of a pull request by number.
+pub fn get_pr_merge_info_query() -> &'static str {
+    r#"query GetPrMergeInfo($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      mergeable
+      state
+    }
+  }
+}"#
+}
