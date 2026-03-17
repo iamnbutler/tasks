@@ -1,0 +1,13 @@
+[package]
+name = "tasks-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tasks-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
