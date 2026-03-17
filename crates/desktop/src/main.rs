@@ -3,11 +3,15 @@
 //! A GPUI-based native desktop application for the Tasks platform.
 
 use gpui::{
-    actions, div, px, App, AppContext as _, Application, Context, Entity, IntoElement,
-    ParentElement, Render, Styled, Window, WindowOptions,
+    actions, px, App, AppContext as _, Application, Context, Entity, IntoElement, ParentElement,
+    Render, Styled, Window, WindowOptions,
 };
 use std::sync::Arc;
-use tasks_desktop::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
+use tasks_desktop::{
+    colors, spacing,
+    style_helpers::{container, heading, muted_text, status_dot, StyledExt},
+    typography, SseClient, SseClientEvent, SseConnectionState, SseFilters,
+};
 use tracing_subscriber::EnvFilter;
 
 actions!(desktop, [Quit]);
@@ -115,13 +119,11 @@ impl Render for TasksApp {
         };
 
         let status_color = match self.connection_state {
-            SseConnectionState::Connected => gpui::rgb(0x22c55e), // green
+            SseConnectionState::Connected => colors::STATE_COMPLETED,
             SseConnectionState::Connecting | SseConnectionState::Reconnecting => {
-                gpui::rgb(0xeab308) // yellow
+                colors::STATE_QUESTION
             }
-            SseConnectionState::Disconnected | SseConnectionState::Failed => {
-                gpui::rgb(0xef4444) // red
-            }
+            SseConnectionState::Disconnected | SseConnectionState::Failed => colors::STATE_FAILED,
         };
 
         let last_event_text = self
@@ -130,52 +132,43 @@ impl Render for TasksApp {
             .map(|e| format!("{}: {}", e.event_type.as_str(), e.task))
             .unwrap_or_else(|| "No events yet".to_string());
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(gpui::rgb(0x1a1a1a))
-            .text_color(gpui::rgb(0xffffff))
-            .p_4()
-            .gap_4()
+        container()
+            .p(spacing::SPACE_4)
+            .gap(spacing::SPACE_4)
             .child(
-                div()
+                gpui::div()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(spacing::SPACE_2)
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
+                        heading(typography::TEXT_XL)
+                            .font_weight(typography::WEIGHT_BOLD)
                             .child("Tasks Desktop"),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(gpui::rgb(0x888888))
+                        muted_text()
                             .child("GPUI-based desktop client for the Tasks platform"),
                     ),
             )
             .child(
-                div()
+                gpui::div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(div().w(px(12.)).h(px(12.)).rounded_full().bg(status_color))
-                    .child(div().child(format!("Status: {}", status_text))),
+                    .gap(spacing::SPACE_2)
+                    .child(status_dot(status_color))
+                    .child(gpui::div().text_primary().child(format!("Status: {}", status_text))),
             )
             .child(
-                div()
+                gpui::div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(div().child(format!("Events received: {}", self.event_count)))
+                    .gap(spacing::SPACE_1)
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(gpui::rgb(0x888888))
-                            .child(format!("Last event: {}", last_event_text)),
-                    ),
+                        gpui::div()
+                            .text_primary()
+                            .child(format!("Events received: {}", self.event_count)),
+                    )
+                    .child(muted_text().child(format!("Last event: {}", last_event_text))),
             )
     }
 }
