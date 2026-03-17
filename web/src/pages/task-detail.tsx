@@ -14,7 +14,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAppState } from "@/hooks/use-app-state";
 import { cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
-import { cn, formatRelativeTime } from "@/lib/utils";
+import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -556,7 +556,7 @@ export function TaskDetailPage() {
             <Separator orientation="vertical" className="h-4" />
             {sourceDisplay(task)}
             <Separator orientation="vertical" className="h-4" />
-            <span>{task.project}</span>
+            <span>{projectLabel(task.project, snapshot.projects)}</span>
             {task.labels.length > 0 && (
               <>
                 <Separator orientation="vertical" className="h-4" />

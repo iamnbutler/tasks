@@ -5,7 +5,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatRelativeTime } from "@/lib/utils";
 import { approveMerge, rejectMerge } from "@/lib/api";
-import type { MergeQueueEntry, MergeStatus, Task } from "@/lib/types";
+import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
+import { projectLabel } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Status badge
@@ -65,11 +66,14 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     id: "project",
     header: "Project",
     cell: ({ row, table }) => {
-      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
+      const meta = table.options.meta as { tasks?: Task[]; projects?: Project[] } | undefined;
+      const tasks = meta?.tasks ?? [];
+      const projects = meta?.projects ?? [];
       const task = tasks.find((t) => t.id === row.original.task_id);
+      const displayName = task?.project ? projectLabel(task.project, projects) : "—";
       return (
         <span className="text-muted-foreground">
-          {task?.project ?? "—"}
+          {displayName}
         </span>
       );
     },
