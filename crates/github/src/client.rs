@@ -437,6 +437,154 @@ impl GitHubClient {
         Ok(Some(content))
     }
 
+    /// Fetch raw file content at a specific git ref (branch, tag, or SHA).
+    ///
+    /// Like `get_file_content` but targets a specific ref instead of the
+    /// default branch.
+    pub async fn get_file_content_at_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}?ref={}",
+            self.base_url, owner, repo, path, git_ref
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Accept", "application/vnd.github.raw+json")
+            .send()
+            .await?;
+
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "unexpected status {status}: {text}"
+            )));
+        }
+
+        let content = response.text().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to read response body: {e}"))
+        })?;
+
+        Ok(Some(content))
+    }
+
+    // -----------------------------------------------------------------------
+    // PR diff (REST API)
+    // -----------------------------------------------------------------------
+
+    /// Maximum diff size to return (100KB). Larger diffs are truncated.
+    const MAX_DIFF_SIZE: usize = 100_000;
+
+    /// Fetch the unified diff for a pull request.
+    ///
+    /// Uses the GitHub REST API with `Accept: application/vnd.github.diff`.
+    /// Large diffs (>100KB) are truncated with a notice appended.
+    pub async fn get_pr_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<String, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}",
+            self.base_url, owner, repo, number
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Accept", "application/vnd.github.diff")
+            .send()
+            .await?;
+
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "unexpected status {status}: {text}"
+            )));
+        }
+
+        let content = response.text().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to read response body: {e}"))
+        })?;
+
+        // Truncate large diffs to avoid blowing out LLM context
+        if content.len() > Self::MAX_DIFF_SIZE {
+            let truncated = &content[..Self::MAX_DIFF_SIZE];
+            // Try to cut at a line boundary
+            let cut_at = truncated.rfind('\n').unwrap_or(Self::MAX_DIFF_SIZE);
+            Ok(format!(
+                "{}\n\n[diff truncated — showing {cut_at} of {} bytes]",
+                &content[..cut_at],
+                content.len()
+            ))
+        } else {
+            Ok(content)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // PR merge (spec §7.1)
     // -----------------------------------------------------------------------

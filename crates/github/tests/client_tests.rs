@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use tasks_github::client::GitHubClient;
@@ -815,4 +815,118 @@ async fn delete_branch_auth_error_on_protected_branch() {
 
     // 403 with remaining rate limit = auth error (protected branch)
     assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+// ---------------------------------------------------------------------------
+// File content at ref tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_file_content_at_ref_sends_ref_param() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/contents/src/main.rs"))
+        .and(query_param("ref", "feature-branch"))
+        .and(header("accept", "application/vnd.github.raw+json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("fn main() {}"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let content = client
+        .get_file_content_at_ref("owner", "repo", "src/main.rs", "feature-branch")
+        .await
+        .unwrap();
+
+    assert_eq!(content, Some("fn main() {}".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// PR diff tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_pr_diff_returns_unified_diff() {
+    let server = MockServer::start().await;
+
+    let diff_body = "\
+diff --git a/src/main.rs b/src/main.rs
+index abc1234..def5678 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    println!(\"old\");
++    println!(\"new\");
++    println!(\"added\");
+ }
+";
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/10"))
+        .and(header("accept", "application/vnd.github.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(diff_body))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let diff = client.get_pr_diff("owner", "repo", 10).await.unwrap();
+    assert!(diff.contains("@@"));
+    assert!(diff.contains("+    println!(\"new\")"));
+}
+
+#[tokio::test]
+async fn get_pr_diff_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/999"))
+        .and(header("accept", "application/vnd.github.diff"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client.get_pr_diff("owner", "repo", 999).await;
+    assert!(matches!(result, Err(GitHubError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn get_pr_diff_auth_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/10"))
+        .and(header("accept", "application/vnd.github.diff"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client.get_pr_diff("owner", "repo", 10).await;
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn get_pr_diff_truncates_large_diffs() {
+    let server = MockServer::start().await;
+
+    // Generate a diff larger than 100KB
+    let large_diff = "a".repeat(150_000);
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/10"))
+        .and(header("accept", "application/vnd.github.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(&large_diff))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let diff = client.get_pr_diff("owner", "repo", 10).await.unwrap();
+    // Should be truncated to MAX_DIFF_SIZE + truncation notice
+    assert!(diff.len() < 150_000);
+    assert!(diff.contains("[diff truncated"));
 }
