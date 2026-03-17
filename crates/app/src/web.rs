@@ -4,28 +4,28 @@
 //! The server serves the built frontend as static files and
 //! exposes API endpoints under `/api/`.
 
-use std::sync::Arc;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{
-        sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event as SseEvent, KeepAlive, Sse},
     },
     routing::{get, post},
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
 use events::Actor;
-use server::mode::Mode;
 use server::Server;
+use server::mode::Mode;
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -175,9 +175,7 @@ async fn get_task_events(
 }
 
 /// GET /api/projects — List all projects.
-async fn list_projects(
-    State(state): State<ApiState>,
-) -> Json<Vec<models::project::Project>> {
+async fn list_projects(State(state): State<ApiState>) -> Json<Vec<models::project::Project>> {
     let server_state = state.server.state.read().await;
     Json(server_state.projects.values().cloned().collect())
 }

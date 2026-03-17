@@ -5,6 +5,7 @@
 
 mod config;
 mod memory;
+mod problem_tracker;
 mod run_loop;
 mod tui;
 mod web;
@@ -109,8 +110,7 @@ async fn main() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr);
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(log_file))

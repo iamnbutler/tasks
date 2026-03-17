@@ -56,8 +56,8 @@ impl AppConfig {
         let container_image = std::env::var("TASKS_CONTAINER_IMAGE")
             .unwrap_or_else(|_| "tasks-agent:latest".to_string());
 
-        let container_memory = std::env::var("TASKS_CONTAINER_MEMORY")
-            .unwrap_or_else(|_| "8G".to_string());
+        let container_memory =
+            std::env::var("TASKS_CONTAINER_MEMORY").unwrap_or_else(|_| "8G".to_string());
 
         let max_sessions = std::env::var("TASKS_MAX_SESSIONS")
             .ok()
