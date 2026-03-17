@@ -124,6 +124,15 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
         self.sessions.read().await.keys().cloned().collect()
     }
 
+    /// Get the task ID of the most recently started session (for emergency stop).
+    pub async fn newest_session(&self) -> Option<String> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .max_by_key(|h| h.started_at)
+            .map(|h| h.task_id.clone())
+    }
+
     /// Send a chat message to a running session (spec §9.2).
     pub async fn send_chat(&self, task_id: &str, message: String) -> Result<(), SessionManagerError> {
         let sessions = self.sessions.read().await;

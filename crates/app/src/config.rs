@@ -24,6 +24,12 @@ pub struct AppConfig {
     pub session_soft_limit: Duration,
     /// Session hard time limit (default: 1h15m).
     pub session_hard_limit: Duration,
+    /// Memory usage percentage at which to warn (default: 75%).
+    pub memory_warn_pct: u8,
+    /// Memory usage percentage at which to pause dispatch (default: 85%).
+    pub memory_soft_limit_pct: u8,
+    /// Memory usage percentage at which to emergency-stop sessions (default: 92%).
+    pub memory_hard_limit_pct: u8,
     /// Whether to run the TUI.
     pub tui: bool,
     /// Whether to run the web UI.
@@ -71,6 +77,27 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30u64);
 
+        let memory_warn_pct = std::env::var("TASKS_MEMORY_WARN_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(75u8);
+
+        let memory_soft_limit_pct = std::env::var("TASKS_MEMORY_SOFT_LIMIT_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(85u8);
+
+        let memory_hard_limit_pct = std::env::var("TASKS_MEMORY_HARD_LIMIT_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(92u8);
+
+        if !(memory_warn_pct < memory_soft_limit_pct && memory_soft_limit_pct < memory_hard_limit_pct) {
+            return Err(format!(
+                "Memory thresholds must be ordered: warn ({memory_warn_pct}) < soft ({memory_soft_limit_pct}) < hard ({memory_hard_limit_pct})"
+            ));
+        }
+
         Ok(Self {
             data_dir,
             github_token,
@@ -82,6 +109,9 @@ impl AppConfig {
             container_memory,
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
+            memory_warn_pct,
+            memory_soft_limit_pct,
+            memory_hard_limit_pct,
             tui: false, // set by CLI flag
             web: false, // set by CLI flag
             web_port: std::env::var("TASKS_WEB_PORT")

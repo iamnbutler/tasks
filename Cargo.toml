@@ -22,3 +22,4 @@ trait-variant = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 bytes = "1.11"
 futures = "0.3"
+sysinfo = "0.33"

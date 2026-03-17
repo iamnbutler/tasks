@@ -59,6 +59,9 @@ pub enum EventType {
     SystemFlush,
     SystemConfigReloaded,
     SystemSchedulerTick,
+    SystemMemoryWarning,
+    SystemMemoryPressure,
+    SystemMemoryEmergency,
 }
 
 impl EventType {
@@ -93,6 +96,9 @@ impl EventType {
             Self::SystemFlush => "system:flush",
             Self::SystemConfigReloaded => "system:config:reloaded",
             Self::SystemSchedulerTick => "system:scheduler:tick",
+            Self::SystemMemoryWarning => "system:memory:warning",
+            Self::SystemMemoryPressure => "system:memory:pressure",
+            Self::SystemMemoryEmergency => "system:memory:emergency",
         }
     }
 
@@ -156,6 +162,9 @@ impl TryFrom<String> for EventType {
             "system:flush" => Ok(Self::SystemFlush),
             "system:config:reloaded" => Ok(Self::SystemConfigReloaded),
             "system:scheduler:tick" => Ok(Self::SystemSchedulerTick),
+            "system:memory:warning" => Ok(Self::SystemMemoryWarning),
+            "system:memory:pressure" => Ok(Self::SystemMemoryPressure),
+            "system:memory:emergency" => Ok(Self::SystemMemoryEmergency),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
