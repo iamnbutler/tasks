@@ -426,6 +426,82 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // --- 7a. Check for external closures (spec §11.3) ---
+            //
+            // For each non-terminal task sourced from a GitHub issue/PR, check
+            // if that issue/PR has been closed externally. If so, transition
+            // the task to the appropriate terminal state.
+            //
+            // This runs once per poll cycle, after importing new issues/PRs.
+            let tasks_to_check: Vec<(String, TaskSource)> = {
+                let state = poll_server.state.read().await;
+                server::scheduler::tasks_needing_closure_check(&state.tasks)
+                    .into_iter()
+                    .map(|t| (t.id.clone(), t.source.clone()))
+                    .collect()
+            };
+
+            for (task_id, source) in tasks_to_check {
+                let closure = match &source {
+                    TaskSource::GithubIssue { owner, repo, number } => {
+                        let client = GitHubClient::new(&github_token);
+                        match client.get_issue(owner, repo, *number).await {
+                            Ok(issue) => server::scheduler::check_issue_closure(&issue)
+                                .map(|(state, reason)| (state, reason)),
+                            Err(e) => {
+                                debug!(
+                                    task_id = %task_id,
+                                    owner = %owner,
+                                    repo = %repo,
+                                    number = %number,
+                                    error = %e,
+                                    "failed to fetch issue for closure check"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    TaskSource::GithubPr { owner, repo, number } => {
+                        let client = GitHubClient::new(&github_token);
+                        match client.get_pull_request(owner, repo, *number).await {
+                            Ok(pr) => server::scheduler::check_pr_closure(&pr)
+                                .map(|(state, reason)| (state, reason)),
+                            Err(e) => {
+                                debug!(
+                                    task_id = %task_id,
+                                    owner = %owner,
+                                    repo = %repo,
+                                    number = %number,
+                                    error = %e,
+                                    "failed to fetch PR for closure check"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    TaskSource::Internal => None,
+                };
+
+                if let Some((new_state, reason)) = closure {
+                    info!(
+                        task_id = %task_id,
+                        new_state = ?new_state,
+                        reason = %reason,
+                        "external closure detected, transitioning task"
+                    );
+                    if let Err(e) = poll_server
+                        .set_task_state(&task_id, new_state, Actor::Scheduler)
+                        .await
+                    {
+                        error!(
+                            task_id = %task_id,
+                            error = %e,
+                            "failed to transition task after external closure"
+                        );
+                    }
+                }
+            }
+
             // Emit scheduler tick event
             let event = Event::new(
                 EventType::SystemSchedulerTick,
