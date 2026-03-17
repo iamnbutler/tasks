@@ -403,41 +403,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Check memory pressure before dispatching new work.
-            // When the memory gate is paused, we still allow resume (no new containers)
-            // but skip starting new sessions.
+            // When paused, pass global_max=0 so the dispatcher won't select
+            // new work (which would transition tasks to Running prematurely),
+            // but resumes still go through.
             let memory_paused = dispatch_memory_gate.is_dispatch_paused();
-            if memory_paused {
+            let effective_max = if memory_paused {
                 let pct = dispatch_memory_gate.current_pct.load(std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     used_pct = pct,
-                    "dispatch skipped: host memory pressure too high"
+                    "dispatch: no new sessions due to memory pressure"
                 );
-            }
+                0
+            } else {
+                max_sessions
+            };
 
             // Run dispatch
             let pending_answers: Vec<String> = Vec::new(); // TODO: track pending answers
             match dispatch_server
-                .run_dispatch(&pending_answers, max_sessions)
+                .run_dispatch(&pending_answers, effective_max)
                 .await
             {
                 Ok(plan) => {
-                    // Start new sessions for dispatched tasks (skip if memory-paused)
+                    // Start new sessions for dispatched tasks
                     for task_id in &plan.new_work {
-                        if memory_paused {
-                            info!(task_id = %task_id, "deferring session start due to memory pressure");
-                            // Revert to Waiting so it gets picked up when pressure resolves
-                            if let Err(e) = dispatch_server
-                                .set_task_state(
-                                    task_id,
-                                    models::task::TaskState::Waiting,
-                                    events::Actor::System,
-                                )
-                                .await
-                            {
-                                warn!(task_id = %task_id, error = %e, "failed to revert task to waiting during memory pause");
-                            }
-                            continue;
-                        }
                         if let Some(task) = dispatch_server.get_task(task_id).await {
                             let project = dispatch_server.get_project(&task.project).await;
                             let repo_url = project

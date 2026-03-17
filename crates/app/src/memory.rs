@@ -164,13 +164,15 @@ pub async fn watchdog_loop(
                 gate.dispatch_paused.store(true, Ordering::Relaxed);
             }
             MemoryPressure::Emergency => {
-                error!(
-                    used_pct = snapshot.used_pct,
-                    threshold = thresholds.hard_limit_pct,
-                    "EMERGENCY: memory critical, stopping sessions to prevent OS lockup"
-                );
                 gate.dispatch_paused.store(true, Ordering::Relaxed);
-                emit_memory_event(&event_bus, EventType::SystemMemoryEmergency, &snapshot).await;
+                if last_pressure < MemoryPressure::Emergency {
+                    error!(
+                        used_pct = snapshot.used_pct,
+                        threshold = thresholds.hard_limit_pct,
+                        "EMERGENCY: memory critical, stopping sessions to prevent OS lockup"
+                    );
+                    emit_memory_event(&event_bus, EventType::SystemMemoryEmergency, &snapshot).await;
+                }
 
                 // Stop the most recently started session to free memory.
                 // We stop one at a time — the next tick will re-evaluate.

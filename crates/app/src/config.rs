@@ -92,6 +92,12 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(92u8);
 
+        if !(memory_warn_pct < memory_soft_limit_pct && memory_soft_limit_pct < memory_hard_limit_pct) {
+            return Err(format!(
+                "Memory thresholds must be ordered: warn ({memory_warn_pct}) < soft ({memory_soft_limit_pct}) < hard ({memory_hard_limit_pct})"
+            ));
+        }
+
         Ok(Self {
             data_dir,
             github_token,
