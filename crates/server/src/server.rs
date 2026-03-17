@@ -671,6 +671,60 @@ impl Server {
         Ok(())
     }
 
+    /// Reject a merge queue entry when the underlying issue is already closed.
+    ///
+    /// Unlike `reject_merge_entry`, this does NOT transition the task back to
+    /// Waiting. Instead, it marks the task as Completed (or Cancelled if
+    /// NOT_PLANNED) since there's no reason to re-dispatch.
+    ///
+    /// This prevents the infinite loop described in issue #132 where rejected
+    /// tasks for closed issues would cycle endlessly.
+    pub async fn reject_merge_entry_closed(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+        final_state: TaskState,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .reject(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit rejection event with context that the issue is closed
+        let event = Event::new(
+            EventType::MergeRejected,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "reasoning": reasoning,
+                "issue_closed": true,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition task to terminal state (Completed or Cancelled)
+        self.set_task_state(&task_id, final_state, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Remove terminal entries (merged, rejected) from the merge queue.
+    ///
+    /// Should be called periodically to prevent unbounded queue growth.
+    /// See issue #132.
+    pub async fn cleanup_merge_queue(&self) {
+        let mut state = self.state.write().await;
+        state.merge_queue.cleanup();
+    }
+
     /// Emit an orchestrator:decision event recording an evaluation.
     ///
     /// Called for every evaluation regardless of mode — this is the
@@ -1562,5 +1616,95 @@ mod tests {
             event.data["details"]["question"],
             "Should we merge this despite failing CI?"
         );
+    }
+
+    #[tokio::test]
+    async fn reject_merge_entry_closed_marks_task_completed() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let mut task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        task.set_state(TaskState::AwaitingMerge);
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Drain queued events
+        while rx.try_recv().is_ok() {}
+
+        server
+            .reject_merge_entry_closed("mq-1", "issue already closed", TaskState::Completed)
+            .await
+            .unwrap();
+
+        // Entry should be rejected
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Rejected);
+        drop(state);
+
+        // Task should be Completed (not Waiting)
+        let task = server.get_task("task-1").await.unwrap();
+        assert_eq!(task.state, TaskState::Completed);
+
+        // Check event was emitted with issue_closed flag
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::MergeRejected);
+        assert_eq!(event.data["issue_closed"], true);
+    }
+
+    #[tokio::test]
+    async fn cleanup_merge_queue_removes_terminal_entries() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Add three tasks and queue entries
+        for i in 1..=3 {
+            let task = Task::new(
+                format!("task-{}", i),
+                TaskSource::Internal,
+                format!("Test task {}", i),
+                "proj-1",
+            );
+            server.add_task(task).await.unwrap();
+
+            let entry = crate::model::merge_queue::MergeQueueEntry::new(
+                format!("mq-{}", i),
+                format!("task-{}", i),
+                format!("https://github.com/owner/repo/pull/{}", i),
+            );
+            server.add_to_merge_queue(entry).await.unwrap();
+        }
+
+        // Mark one as merged, one as rejected, leave one pending
+        {
+            let mut state = server.state.write().await;
+            state.merge_queue.mark_merged("mq-1").unwrap();
+            state.merge_queue.reject("mq-2").unwrap();
+        }
+
+        // Before cleanup: 3 entries
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.merge_queue.entries().len(), 3);
+        }
+
+        // Run cleanup
+        server.cleanup_merge_queue().await;
+
+        // After cleanup: only the pending entry remains
+        let state = server.state.read().await;
+        assert_eq!(state.merge_queue.entries().len(), 1);
+        assert!(state.merge_queue.get("mq-3").is_some());
+        assert!(state.merge_queue.get("mq-1").is_none());
+        assert!(state.merge_queue.get("mq-2").is_none());
     }
 }

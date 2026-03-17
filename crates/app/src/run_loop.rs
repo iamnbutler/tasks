@@ -13,8 +13,9 @@ use events::{Actor, Event, EventBus, EventStore, EventType};
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
 use server::model::merge_queue::MergeQueueEntry;
-use server::model::task::TaskSource;
+use server::model::task::{TaskSource, TaskState};
 use tasks_github::client::GitHubClient;
+use tasks_github::model::IssueState;
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::Orchestrator;
@@ -899,35 +900,81 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(reason) = should_lower {
                             lower_mode(&orch_server, &reason).await;
                         }
-                        if let Err(e) = orch_server
-                            .reject_merge_entry(
-                                &entry_id,
-                                &evaluation.reasoning,
-                                evaluation.feedback.as_deref(),
-                            )
-                            .await
-                        {
-                            error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
-                        }
-                        // Emit orchestrator:feedback event when feedback is provided
-                        if let Some(feedback) = &evaluation.feedback {
-                            if let Err(e) = orch_server.emit_orchestrator_feedback(
-                                &task_id,
-                                feedback,
-                                Some("merge_rejection"),
-                            ).await {
-                                error!(error = %e, "failed to emit orchestrator feedback event");
+
+                        // Check if the underlying issue is closed (issue #132).
+                        // If so, mark the task as completed instead of re-dispatching.
+                        let issue_closed = match &task.source {
+                            TaskSource::GithubIssue { owner, repo, number } => {
+                                match merge_github.get_issue(owner, repo, *number).await {
+                                    Ok(issue) => issue.state != IssueState::Open,
+                                    Err(e) => {
+                                        // On error, assume issue is still open to avoid
+                                        // incorrectly marking tasks as complete.
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to check issue state, assuming open"
+                                        );
+                                        false
+                                    }
+                                }
                             }
+                            _ => false,
+                        };
+
+                        if issue_closed {
+                            // Issue is closed — don't re-dispatch. Mark task as completed.
+                            info!(
+                                task_id = %task_id,
+                                entry_id = %entry_id,
+                                "underlying issue is closed, marking task completed instead of re-dispatching"
+                            );
+                            if let Err(e) = orch_server
+                                .reject_merge_entry_closed(
+                                    &entry_id,
+                                    &format!("{} (issue already closed)", &evaluation.reasoning),
+                                    TaskState::Completed,
+                                )
+                                .await
+                            {
+                                error!(entry_id = %entry_id, error = %e, "failed to reject merge entry for closed issue");
+                            }
+                        } else {
+                            // Issue is still open — normal rejection with re-dispatch.
+                            if let Err(e) = orch_server
+                                .reject_merge_entry(
+                                    &entry_id,
+                                    &evaluation.reasoning,
+                                    evaluation.feedback.as_deref(),
+                                )
+                                .await
+                            {
+                                error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
+                            }
+                            // Emit orchestrator:feedback event when feedback is provided
+                            if let Some(feedback) = &evaluation.feedback {
+                                if let Err(e) = orch_server.emit_orchestrator_feedback(
+                                    &task_id,
+                                    feedback,
+                                    Some("merge_rejection"),
+                                ).await {
+                                    error!(error = %e, "failed to emit orchestrator feedback event");
+                                }
+                            }
+                            // TODO: The feedback event is now recorded in the audit trail.
+                            // Delivering feedback to the re-dispatched session's prompt
+                            // context still needs dispatch loop changes.
                         }
-                        // TODO: The feedback event is now recorded in the audit trail.
-                        // Delivering feedback to the re-dispatched session's prompt
-                        // context still needs dispatch loop changes.
                     }
                 }
 
                 // In Pause mode: evaluation is recorded (decision event above)
                 // but no merge/reject action is taken. The human reviews.
             }
+
+            // Cleanup terminal merge queue entries (issue #132).
+            // This removes Merged and Rejected entries to prevent unbounded growth.
+            orch_server.cleanup_merge_queue().await;
         }
     });
 
