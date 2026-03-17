@@ -10,6 +10,7 @@ use std::sync::Mutex as StdMutex;
 use tracing::{error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
+use uuid::Uuid;
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
 use server::model::merge_queue::MergeQueueEntry;
@@ -598,7 +599,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 .as_ref()
                                 .map(|p| format!("https://github.com/{}.git", p.repo))
                                 .unwrap_or_default();
-                            let branch = format!("tasks/{}", task.id);
+                            // Include unique suffix to prevent branch name clashes on task
+                            // retry and to prevent agents from rediscovering past attempts.
+                            let unique_suffix = &Uuid::new_v4().to_string()[..8];
+                            let branch = format!("tasks/{}--{}", task.id, unique_suffix);
 
                             // Load workflow settings (spec §14, §15)
                             let workflow_settings = load_workflow_settings_for_project(
