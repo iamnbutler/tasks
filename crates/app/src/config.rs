@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub session_soft_limit: Duration,
     /// Session hard time limit (default: 1h15m).
     pub session_hard_limit: Duration,
+    /// Minimum session duration to count as "progress" (default: 60s, spec §13.1).
+    pub progress_threshold: Duration,
     /// Memory usage percentage at which to warn (default: 75%).
     pub memory_warn_pct: u8,
     /// Memory usage percentage at which to pause dispatch (default: 85%).
@@ -77,6 +79,11 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30u64);
 
+        let progress_threshold_secs = std::env::var("TASKS_PROGRESS_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60u64);
+
         let memory_warn_pct = std::env::var("TASKS_MEMORY_WARN_PCT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -109,6 +116,7 @@ impl AppConfig {
             container_memory,
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
+            progress_threshold: Duration::from_secs(progress_threshold_secs),
             memory_warn_pct,
             memory_soft_limit_pct,
             memory_hard_limit_pct,

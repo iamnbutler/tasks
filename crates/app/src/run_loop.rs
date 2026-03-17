@@ -52,6 +52,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         dispatch_interval = ?config.dispatch_interval,
         container_image = %config.container_image,
         container_memory = %config.container_memory,
+        progress_threshold = ?config.progress_threshold,
         memory_warn_pct = config.memory_warn_pct,
         memory_soft_limit_pct = config.memory_soft_limit_pct,
         memory_hard_limit_pct = config.memory_hard_limit_pct,
@@ -122,7 +123,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             default_container_config,
         )
         .with_soft_time_limit(config.session_soft_limit)
-        .with_hard_time_limit(config.session_hard_limit),
+        .with_hard_time_limit(config.session_hard_limit)
+        .with_progress_threshold(config.progress_threshold),
     );
 
     // --- 5b. Create orchestrator ---
