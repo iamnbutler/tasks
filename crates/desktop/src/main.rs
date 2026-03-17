@@ -3,14 +3,14 @@
 //! A GPUI-based native desktop application for the Tasks platform.
 
 use gpui::{
-    actions, px, App, AppContext as _, Application, Context, Entity, IntoElement, ParentElement,
-    Render, Styled, Window, WindowOptions,
+    App, AppContext as _, Application, Context, Entity, IntoElement, ParentElement, Render, Styled,
+    Window, WindowOptions, actions, px,
 };
 use std::sync::Arc;
 use tasks_desktop::{
-    colors, spacing,
-    style_helpers::{container, heading, muted_text, status_dot, StyledExt},
-    typography, SseClient, SseClientEvent, SseConnectionState, SseFilters,
+    SseClient, SseClientEvent, SseConnectionState, SseFilters, colors, spacing,
+    style_helpers::{StyledExt, container, heading, muted_text, status_dot},
+    typography,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -145,10 +145,7 @@ impl Render for TasksApp {
                             .font_weight(typography::WEIGHT_BOLD)
                             .child("Tasks Desktop"),
                     )
-                    .child(
-                        muted_text()
-                            .child("GPUI-based desktop client for the Tasks platform"),
-                    ),
+                    .child(muted_text().child("GPUI-based desktop client for the Tasks platform")),
             )
             .child(
                 gpui::div()
@@ -156,7 +153,11 @@ impl Render for TasksApp {
                     .items_center()
                     .gap(spacing::SPACE_2)
                     .child(status_dot(status_color))
-                    .child(gpui::div().text_primary().child(format!("Status: {}", status_text))),
+                    .child(
+                        gpui::div()
+                            .text_primary()
+                            .child(format!("Status: {}", status_text)),
+                    ),
             )
             .child(
                 gpui::div()

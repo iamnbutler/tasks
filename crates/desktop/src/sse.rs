@@ -5,8 +5,8 @@
 //!
 //! Reference: web/src/hooks/use-app-state.ts
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
@@ -359,11 +359,7 @@ async fn connect_and_stream(
 }
 
 /// Process the SSE buffer, extracting complete events.
-fn process_buffer(
-    buffer: &mut String,
-    entity: &WeakEntity<SseClient>,
-    cx: &mut AsyncApp,
-) {
+fn process_buffer(buffer: &mut String, entity: &WeakEntity<SseClient>, cx: &mut AsyncApp) {
     // SSE format: "data: <json>\n\n"
     while let Some(pos) = buffer.find("\n\n") {
         let message = buffer[..pos].to_string();

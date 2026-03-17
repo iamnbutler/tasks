@@ -7,7 +7,8 @@
 //! - Spacing scale
 //! - Style helpers for common patterns
 
-use gpui::{px, Hsla, Pixels, Rgba};
+use gpui::{Pixels, Rgba, px};
+use models::TaskState;
 
 // =============================================================================
 // Color Palette
@@ -100,65 +101,17 @@ pub mod colors {
     /// Pending state - Tailwind gray-500
     pub const STATE_PENDING: u32 = 0x6b7280;
 
-    // -------------------------------------------------------------------------
-    // Sidebar Colors
-    // -------------------------------------------------------------------------
+    /// Merged/awaiting-merge state - Tailwind purple-600
+    pub const STATE_MERGED: u32 = 0x9333ea;
 
-    /// Sidebar background
-    pub const SIDEBAR_BACKGROUND: u32 = 0x1a1a1a;
-
-    /// Sidebar foreground - muted
-    pub const SIDEBAR_FOREGROUND: u32 = 0xa3a3a3;
-
-    /// Sidebar primary
-    pub const SIDEBAR_PRIMARY: u32 = 0xfafafa;
-
-    /// Sidebar accent
-    pub const SIDEBAR_ACCENT: u32 = 0x3f3f3f;
-
-    /// Sidebar border
-    pub const SIDEBAR_BORDER: u32 = 0x3f3f3f;
-
-    // -------------------------------------------------------------------------
-    // Chart/Data Visualization Colors
-    // -------------------------------------------------------------------------
-
-    /// Chart color 1 - blue
-    pub const CHART_1: u32 = 0x3b82f6;
-
-    /// Chart color 2 - green/teal
-    pub const CHART_2: u32 = 0x22c55e;
-
-    /// Chart color 3 - yellow/orange
-    pub const CHART_3: u32 = 0xeab308;
-
-    /// Chart color 4 - purple
-    pub const CHART_4: u32 = 0xa855f7;
-
-    /// Chart color 5 - red/pink
-    pub const CHART_5: u32 = 0xef4444;
-
-    // -------------------------------------------------------------------------
-    // Hover State Variations
-    // -------------------------------------------------------------------------
-
-    /// Accent hover - slightly lighter than accent
-    pub const ACCENT_HOVER: u32 = 0x4a4a4a;
-
-    /// Card hover background
-    pub const CARD_HOVER: u32 = 0x252525;
+    /// Cancelled state - Tailwind gray-400
+    pub const STATE_CANCELLED: u32 = 0x9ca3af;
 }
 
 /// Convert a hex color to GPUI's Rgba format.
 #[inline]
 pub fn rgb(hex: u32) -> Rgba {
     gpui::rgb(hex)
-}
-
-/// Convert a hex color to GPUI's Hsla format with full opacity.
-#[inline]
-pub fn hsla_from_hex(hex: u32) -> Hsla {
-    gpui::rgb(hex).into()
 }
 
 /// Create a color with custom alpha from a hex value.
@@ -373,9 +326,9 @@ pub mod radius {
 
 /// Style helper traits and extensions for common patterns.
 pub mod style_helpers {
-    use gpui::{div, Div, Styled};
+    use gpui::{Div, Styled, div};
 
-    use super::*;
+    use super::{Pixels, colors, radius, rgb, spacing, typography};
 
     /// Extension trait for applying common styles to elements.
     pub trait StyledExt: Styled + Sized {
@@ -447,8 +400,8 @@ pub mod style_helpers {
         }
     }
 
-    /// Implement StyledExt for Div (the most common element type).
-    impl StyledExt for Div {}
+    /// Blanket impl for any GPUI element that implements `Styled`.
+    impl<T: Styled + Sized> StyledExt for T {}
 
     /// Create a themed container div with standard padding and background.
     pub fn container() -> Div {
@@ -540,6 +493,8 @@ pub struct Theme {
     pub state_question: u32,
     pub state_failed: u32,
     pub state_pending: u32,
+    pub state_merged: u32,
+    pub state_cancelled: u32,
 }
 
 impl Default for Theme {
@@ -572,17 +527,21 @@ impl Theme {
             state_question: colors::STATE_QUESTION,
             state_failed: colors::STATE_FAILED,
             state_pending: colors::STATE_PENDING,
+            state_merged: colors::STATE_MERGED,
+            state_cancelled: colors::STATE_CANCELLED,
         }
     }
 
     /// Get the appropriate state color for a task state.
-    pub fn state_color(&self, state: &str) -> u32 {
+    pub fn state_color(&self, state: &TaskState) -> u32 {
         match state {
-            "running" | "in_progress" => self.state_running,
-            "completed" | "done" | "merged" => self.state_completed,
-            "question" | "waiting" | "blocked" => self.state_question,
-            "failed" | "error" | "rejected" => self.state_failed,
-            _ => self.state_pending,
+            TaskState::Waiting | TaskState::Blocked => self.state_pending,
+            TaskState::Running | TaskState::Testing => self.state_running,
+            TaskState::Question => self.state_question,
+            TaskState::AwaitingMerge => self.state_merged,
+            TaskState::Completed => self.state_completed,
+            TaskState::Failed | TaskState::Conflict => self.state_failed,
+            TaskState::Cancelled => self.state_cancelled,
         }
     }
 }
@@ -603,10 +562,42 @@ mod tests {
     #[test]
     fn test_theme_state_colors() {
         let theme = Theme::dark();
-        assert_eq!(theme.state_color("running"), colors::STATE_RUNNING);
-        assert_eq!(theme.state_color("completed"), colors::STATE_COMPLETED);
-        assert_eq!(theme.state_color("question"), colors::STATE_QUESTION);
-        assert_eq!(theme.state_color("failed"), colors::STATE_FAILED);
-        assert_eq!(theme.state_color("unknown"), colors::STATE_PENDING);
+        assert_eq!(
+            theme.state_color(&TaskState::Running),
+            colors::STATE_RUNNING
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Testing),
+            colors::STATE_RUNNING
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Completed),
+            colors::STATE_COMPLETED
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Question),
+            colors::STATE_QUESTION
+        );
+        assert_eq!(theme.state_color(&TaskState::Failed), colors::STATE_FAILED);
+        assert_eq!(
+            theme.state_color(&TaskState::Conflict),
+            colors::STATE_FAILED
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Waiting),
+            colors::STATE_PENDING
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Blocked),
+            colors::STATE_PENDING
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::AwaitingMerge),
+            colors::STATE_MERGED
+        );
+        assert_eq!(
+            theme.state_color(&TaskState::Cancelled),
+            colors::STATE_CANCELLED
+        );
     }
 }

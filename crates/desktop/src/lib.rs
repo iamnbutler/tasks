@@ -8,13 +8,13 @@
 //! - [`sse`] - Server-Sent Events client for real-time updates
 //! - [`theme`] - Theming and styling system
 
-use gpui::{div, prelude::*, rgb, Context, SharedString, Window};
+use gpui::{Context, SharedString, Window, div, prelude::*, rgb};
 
 mod sse;
 pub mod theme;
 
 pub use sse::{SseClient, SseClientEvent, SseConnectionState, SseFilters};
-pub use theme::{colors, radius, spacing, style_helpers, typography, Theme};
+pub use theme::{Theme, colors, radius, spacing, style_helpers, typography};
 
 /// Root view for the Tasks desktop application.
 pub struct RootView {
@@ -50,11 +50,7 @@ impl Render for RootView {
                             .text_color(rgb(0xcdd6f4))
                             .child(self.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_color(rgb(0xa6adc8))
-                            .child("GPUI Desktop Shell"),
-                    ),
+                    .child(div().text_color(rgb(0xa6adc8)).child("GPUI Desktop Shell")),
             )
     }
 }
