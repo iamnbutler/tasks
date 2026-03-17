@@ -162,6 +162,31 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             }
         }
     }
+
+    /// Stop all sessions and destroy their containers (for clean shutdown).
+    pub async fn destroy_all(&self) {
+        let mut sessions = self.sessions.write().await;
+        for handle in sessions.values() {
+            // Best-effort stop command to the agent
+            let _ = handle.command_tx.send(SessionCommand::Stop).await;
+            // Destroy the container (stop + rm)
+            if let Err(e) = self.runtime.destroy(&handle.container_id).await {
+                tracing::error!(
+                    task_id = %handle.task_id,
+                    container_id = %handle.container_id,
+                    error = %e,
+                    "failed to destroy container during shutdown"
+                );
+            } else {
+                tracing::info!(
+                    task_id = %handle.task_id,
+                    container_id = %handle.container_id,
+                    "destroyed container during shutdown"
+                );
+            }
+        }
+        sessions.clear();
+    }
 }
 
 /// Methods that require `Clone` on the runtime (needed to create `runtime::Session`).
@@ -205,6 +230,8 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
             command_rx,
             self.event_bus.clone(),
             self.sessions.clone(),
+            self.runtime.clone(),
+            container_id.clone(),
             self.soft_time_limit,
             self.hard_time_limit,
             self.progress_threshold,
@@ -235,6 +262,8 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     mut command_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
     event_bus: Arc<EventBus>,
     sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
+    runtime: Arc<R>,
+    container_id: String,
     soft_limit: Duration,
     hard_limit: Duration,
     progress_threshold: Duration,
@@ -384,6 +413,22 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     sessions.write().await.remove(&task_id);
     // Abort the reader thread
     reader.abort();
+
+    // Destroy the container to reclaim disk and memory
+    if let Err(e) = runtime.destroy(&container_id).await {
+        tracing::error!(
+            task_id = %task_id,
+            container_id = %container_id,
+            error = %e,
+            "failed to destroy container after session ended"
+        );
+    } else {
+        tracing::info!(
+            task_id = %task_id,
+            container_id = %container_id,
+            "destroyed container after session ended"
+        );
+    }
 }
 
 /// Map a supervisor event to a platform event and publish it.
