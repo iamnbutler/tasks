@@ -916,7 +916,9 @@ The `[labels]` section controls how GitHub labels affect task behavior:
   create tasks for them.
 - **blocked:** Issues with any of these labels start in `blocked` state instead of `waiting`.
 
-**Canonical Skip Label:** The label `tasks/skip` is a reserved, canonical label that always causes
+#### 14.2.1 Canonical Skip Label
+
+The label `tasks/skip` is a reserved, canonical label that always causes
 issues and pull requests to be skipped during import, regardless of project configuration. This
 label is checked before the configurable `ignore` list and provides a consistent, cross-project
 mechanism to prevent specific items from becoming tasks. Use cases include:
@@ -925,7 +927,7 @@ mechanism to prevent specific items from becoming tasks. Use cases include:
 - Issues awaiting external decisions or dependencies not suitable for agent work
 - Items temporarily excluded from agent processing without modifying workflow.toml
 
-Labels not listed in the configuration have no special meaning to the dispatch system. The
+Labels not listed in the configuration (aside from the canonical `tasks/skip` label described above) have no special meaning to the dispatch system. The
 orchestrator and human can still use them for their own organizational purposes.
 
 ### 14.3 Dynamic Reload

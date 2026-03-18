@@ -4,16 +4,16 @@
 
 use std::collections::HashMap;
 
-/// Canonical label that always causes an issue/PR to be skipped, regardless of
-/// project configuration. This label is checked in addition to the configurable
-/// `labels.ignore` list from `workflow.toml`.
-pub const SKIP_LABEL: &str = "tasks/skip";
-
 use thiserror::Error;
 
 use tasks_github::model::{Issue, PullRequest};
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::workflow::LabelConfig;
+
+/// Canonical label that always causes an issue/PR to be skipped, regardless of
+/// project configuration. This label is checked in addition to the configurable
+/// `labels.ignore` list from `workflow.toml`.
+pub const SKIP_LABEL: &str = "tasks/skip";
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
@@ -355,9 +355,4 @@ mod tests {
         assert!(result.is_none(), "PR with tasks/skip label should be skipped");
     }
 
-    #[test]
-    fn canonical_skip_label_constant() {
-        // Verify the canonical label value.
-        assert_eq!(super::SKIP_LABEL, "tasks/skip");
-    }
 }
