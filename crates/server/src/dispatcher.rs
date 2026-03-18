@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
+use rand::Rng;
 
 use crate::model::task::{Task, TaskState};
 
@@ -20,12 +21,28 @@ pub struct DispatchPlan {
     pub new_work: Vec<String>,
 }
 
-/// Calculate backoff duration for a given retry count (spec §13.2).
-/// Base: 5s, multiplier: 2x, max: 300s. No jitter in the check (jitter is for scheduling).
-pub fn backoff_duration(retry_count: u32) -> Duration {
+/// Calculate base backoff duration for a given retry count (spec §13.2).
+/// Base: 5s, multiplier: 2x, max: 300s. No jitter applied.
+pub fn base_backoff_duration(retry_count: u32) -> Duration {
     let base_secs = 5i64;
     let secs = base_secs * 2i64.pow(retry_count.min(6));
     Duration::seconds(secs.min(300))
+}
+
+/// Calculate backoff duration with ±25% jitter (spec §13.2).
+///
+/// Applies random jitter to prevent thundering herd when multiple tasks fail simultaneously.
+/// The jitter is applied to the base duration, then clamped to [5s, 300s].
+pub fn backoff_duration(retry_count: u32) -> Duration {
+    let base = base_backoff_duration(retry_count);
+    let base_secs = base.num_seconds() as f64;
+
+    // Apply ±25% jitter
+    let jitter_factor = rand::rng().random_range(0.75..=1.25);
+    let jittered_secs = (base_secs * jitter_factor).round() as i64;
+
+    // Clamp to [5s, 300s]
+    Duration::seconds(jittered_secs.clamp(5, 300))
 }
 
 /// Evaluate which tasks should be dispatched (spec §12.6).
@@ -349,7 +366,8 @@ mod tests {
         insert(&mut tasks, t);
 
         let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
-        // Backoff for retry_count=1 is 10s, so this task should be excluded.
+        // Backoff for retry_count=1 is ~10s (±25% jitter = 7.5s-12.5s).
+        // A task that just failed (0s ago) should always be excluded.
         assert!(plan.new_work.is_empty());
     }
 
@@ -374,17 +392,67 @@ mod tests {
     }
 
     #[test]
-    fn backoff_duration_values() {
+    fn base_backoff_duration_values() {
         // retry 0: 5 * 2^0 = 5s
-        assert_eq!(backoff_duration(0), Duration::seconds(5));
+        assert_eq!(base_backoff_duration(0), Duration::seconds(5));
         // retry 1: 5 * 2^1 = 10s
-        assert_eq!(backoff_duration(1), Duration::seconds(10));
+        assert_eq!(base_backoff_duration(1), Duration::seconds(10));
         // retry 2: 5 * 2^2 = 20s
-        assert_eq!(backoff_duration(2), Duration::seconds(20));
+        assert_eq!(base_backoff_duration(2), Duration::seconds(20));
         // retry 6: 5 * 2^6 = 320 → capped at 300s
-        assert_eq!(backoff_duration(6), Duration::seconds(300));
+        assert_eq!(base_backoff_duration(6), Duration::seconds(300));
         // retry 10: capped at retry_count.min(6), so 5 * 2^6 = 320 → capped at 300s
-        assert_eq!(backoff_duration(10), Duration::seconds(300));
+        assert_eq!(base_backoff_duration(10), Duration::seconds(300));
+    }
+
+    #[test]
+    fn backoff_duration_with_jitter_in_bounds() {
+        // Test that jittered backoff stays within ±25% of base and respects min/max.
+        for retry_count in 0..=10 {
+            let base = base_backoff_duration(retry_count).num_seconds();
+            // Run multiple times to test randomness
+            for _ in 0..20 {
+                let jittered = backoff_duration(retry_count).num_seconds();
+                // Jitter should be within ±25% of base, clamped to [5, 300]
+                let expected_min = ((base as f64 * 0.75).round() as i64).clamp(5, 300);
+                let expected_max = ((base as f64 * 1.25).round() as i64).clamp(5, 300);
+                assert!(
+                    jittered >= expected_min && jittered <= expected_max,
+                    "retry_count={}, base={}, jittered={}, expected=[{}, {}]",
+                    retry_count,
+                    base,
+                    jittered,
+                    expected_min,
+                    expected_max
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_duration_respects_minimum() {
+        // retry 0: base is 5s, 75% of 5s is 3.75s, but should be clamped to 5s
+        for _ in 0..50 {
+            let jittered = backoff_duration(0).num_seconds();
+            assert!(
+                jittered >= 5,
+                "jittered backoff {} should not go below 5s",
+                jittered
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_duration_respects_maximum() {
+        // retry 6+: base is 300s (capped), 125% would be 375s, but should be clamped to 300s
+        for _ in 0..50 {
+            let jittered = backoff_duration(6).num_seconds();
+            assert!(
+                jittered <= 300,
+                "jittered backoff {} should not exceed 300s",
+                jittered
+            );
+        }
     }
 
     #[test]
@@ -393,7 +461,8 @@ mod tests {
 
         let mut t = make_task("t1", "proj");
         t.retry_count = 1;
-        // Failed 20 seconds ago; backoff for retry_count=1 is 10s, so it should be allowed.
+        // Failed 20 seconds ago; backoff for retry_count=1 is ~10s (max with jitter: 12.5s).
+        // 20s > 12.5s, so it should be allowed.
         t.last_failure_at = Some(Utc::now() - Duration::seconds(20));
         insert(&mut tasks, t);
 
