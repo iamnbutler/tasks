@@ -21,6 +21,8 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `session/` — Session management: lifecycle, monitoring, event bridging
   - `store/` — Persistent storage: SQLite for projects, tasks, merge queue
   - `supervisor/` — Container supervisor binary (PID 1 inside containers)
+  - `desktop/` — GPUI-based native desktop app (macOS/Linux)
+  - `gpui-client/` — HTTP API client library for GPUI frontend
 - `web/` — React + Vite frontend (shadcn/ui + Tailwind CSS v4 + TanStack Table)
 
 ## Key decisions
@@ -94,3 +96,49 @@ bun web dev                    # dev mode (proxies /api to localhost:4800)
 - `POST /api/merge-queue/flush` — Flush approved entries (Pause mode only)
 - `POST /api/tasks/:id/chat` — Send chat message to agent session `{ message: string }`
 - `GET /api/events` — SSE live event stream (optional `?pattern=&task_id=` filters)
+
+## Desktop app (GPUI)
+
+A native desktop application built with [GPUI](https://github.com/zed-industries/zed) (Zed's GPU-accelerated UI framework).
+
+- `crates/desktop/` — Main desktop app crate
+- `crates/gpui-client/` — Shared HTTP API client
+
+### Building
+
+The desktop app requires system libraries for X11/Wayland:
+
+**macOS:**
+```sh
+# No additional dependencies needed
+cargo build --package tasks-desktop
+```
+
+**Linux (Debian/Ubuntu):**
+```sh
+sudo apt install libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+cargo build --package tasks-desktop
+```
+
+### Running
+
+```sh
+# Start the server first
+cargo run -- run --web
+
+# In another terminal, run the desktop app
+cargo run --package tasks-desktop
+```
+
+### Configuration
+
+- `TASKS_SERVER_URL` — Server URL (default: `http://localhost:4800`)
+
+### Architecture
+
+- **api.rs** — HTTP API client (mirrors web frontend's `api.ts`)
+- **sse.rs** — SSE client with auto-reconnection
+- **state.rs** — Reactive app state management (GPUI Model-based)
+- **theme.rs** — Theming system matching web frontend's Tailwind colors
+- **components/** — UI primitives (Badge, Button, Card, Input)
+- **views/** — View components (Dashboard, etc.)
