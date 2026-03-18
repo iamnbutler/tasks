@@ -123,8 +123,13 @@ impl RepoPoller {
     // -----------------------------------------------------------------------
 
     async fn poll_issues_inner(&self) -> Result<Vec<Issue>, GitHubError> {
+        // Include both Open and Closed states so we can detect external closures.
+        // When an issue is closed, its updated_at changes and we'll see it in the poll.
         let filters = IssueFilters {
-            states: Some(vec![crate::model::IssueState::Open]),
+            states: Some(vec![
+                crate::model::IssueState::Open,
+                crate::model::IssueState::Closed,
+            ]),
             since: self.since,
             ..Default::default()
         };
@@ -134,8 +139,14 @@ impl RepoPoller {
     }
 
     async fn poll_pull_requests_inner(&self) -> Result<Vec<PullRequest>, GitHubError> {
+        // Include all states (Open, Closed, Merged) so we can detect external closures.
+        // When a PR is closed or merged, its updated_at changes and we'll see it in the poll.
         let filters = PullRequestFilters {
-            states: Some(vec![crate::model::PullRequestState::Open]),
+            states: Some(vec![
+                crate::model::PullRequestState::Open,
+                crate::model::PullRequestState::Closed,
+                crate::model::PullRequestState::Merged,
+            ]),
             since: self.since,
         };
         self.client
