@@ -1,6 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
 import {
-  LayoutDashboard,
   ListTodo,
   GitMerge,
   Radio,
@@ -16,8 +15,7 @@ import { ProjectSwitcher } from "@/components/project-switcher";
 import { cn } from "@/lib/utils";
 
 const navItems = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/tasks", label: "Tasks", icon: ListTodo },
+  { to: "/", label: "Tasks", icon: ListTodo },
   { to: "/merge-queue", label: "Merge Queue", icon: GitMerge },
   { to: "/orchestrator", label: "Orchestrator", icon: Brain },
   { to: "/events", label: "Events", icon: Radio },
