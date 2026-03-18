@@ -1,11 +1,13 @@
 //! Orchestrator trait — the core abstraction.
 //!
 //! Spec §4.2: The orchestrator evaluates work quality and provides feedback.
+//! Spec §7.4: The orchestrator triages conflicts with mode-aware resolution.
+//!
 //! The trait is intentionally narrow — `evaluate` returns a verdict, and the
 //! caller (server run loop) decides whether to act on it based on mode.
 
 use crate::error::OrchestratorError;
-use crate::types::{EvaluationContext, QualityEvaluation};
+use crate::types::{ConflictContext, ConflictTriage, EvaluationContext, QualityEvaluation};
 use models::task::Task;
 
 /// Trait for orchestrator implementations.
@@ -35,4 +37,17 @@ pub trait Orchestrator: Sync {
         task: &Task,
         feedback: &str,
     ) -> Result<(), OrchestratorError>;
+
+    /// Triage a merge conflict and decide resolution strategy.
+    ///
+    /// Spec §7.4: The orchestrator triages conflicts based on type and mode:
+    /// - Play mode: resolve autonomously (rebase, re-engage agent)
+    /// - Pause mode: surface non-trivial to human, resolve mechanical directly
+    ///
+    /// The default implementation uses `default_triage()` from types.rs.
+    /// Implementations can override for custom triage logic.
+    async fn triage_conflict(
+        &self,
+        context: &ConflictContext,
+    ) -> Result<ConflictTriage, OrchestratorError>;
 }

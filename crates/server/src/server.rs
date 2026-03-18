@@ -613,29 +613,100 @@ impl Server {
     }
 
     /// Mark a merge queue entry as conflicted. Emits `merge:conflict`.
+    ///
+    /// Optionally accepts `ConflictInfo` with details about the conflict type
+    /// and affected files (spec §7.4).
     pub async fn mark_entry_conflict(
         &self,
         entry_id: &str,
         pr_url: &str,
+        conflict_info: Option<crate::model::merge_queue::ConflictInfo>,
     ) -> Result<(), ServerError> {
+        let (task_id, conflict_type) = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .mark_conflict(entry_id, conflict_info.clone())
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            let conflict_type = entry
+                .conflict_info
+                .as_ref()
+                .map(|i| format!("{:?}", i.conflict_type));
+            (entry.task_id.clone(), conflict_type)
+        };
+
+        let mut event_data = serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url });
+        if let Some(ct) = conflict_type {
+            event_data["conflict_type"] = serde_json::Value::String(ct);
+        }
+        if let Some(ref info) = conflict_info {
+            event_data["conflicting_files"] =
+                serde_json::Value::Array(info.conflicting_files.iter().map(|f| serde_json::Value::String(f.clone())).collect());
+        }
+
+        let event = Event::new(EventType::MergeConflict, &task_id, Actor::System, event_data);
+        self.event_bus.publish(event).await?;
+
+        // Also transition the task to Conflict state
+        if !task_id.is_empty() {
+            self.set_task_state(&task_id, TaskState::Conflict, Actor::System)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Re-engage a task to resolve a conflict (spec §7.4).
+    ///
+    /// Transitions the task back to Waiting with conflict feedback so the
+    /// dispatch loop picks it up. The conflict info is preserved in the
+    /// merge queue entry.
+    pub async fn reengage_for_conflict(
+        &self,
+        entry_id: &str,
+        feedback: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let state = self.state.read().await;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit orchestrator feedback event
+        self.emit_orchestrator_feedback(&task_id, feedback, Some("conflict_resolution"))
+            .await?;
+
+        // Transition task back to Waiting for re-dispatch
+        self.set_task_state(&task_id, TaskState::Waiting, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Clear conflict status from a merge queue entry after resolution.
+    ///
+    /// This transitions the entry back to Pending and the task back to
+    /// AwaitingMerge.
+    pub async fn clear_entry_conflict(&self, entry_id: &str) -> Result<(), ServerError> {
         let task_id = {
             let mut state = self.state.write().await;
             state
                 .merge_queue
-                .mark_conflict(entry_id)
+                .clear_conflict(entry_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             entry.task_id.clone()
         };
 
-        let event = Event::new(
-            EventType::MergeConflict,
-            &task_id,
-            Actor::System,
-            serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url }),
-        );
-        self.event_bus.publish(event).await?;
+        // Transition task back to AwaitingMerge
+        if !task_id.is_empty() {
+            self.set_task_state(&task_id, TaskState::AwaitingMerge, Actor::System)
+                .await?;
+        }
 
         Ok(())
     }

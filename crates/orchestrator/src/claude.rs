@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
-use crate::types::{EvaluationContext, QualityEvaluation};
+use crate::types::{default_triage, ConflictContext, ConflictTriage, EvaluationContext, QualityEvaluation};
 use models::task::{Task, TaskSource};
 use tasks_agent::{AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider};
 use tasks_github::GitHubClient;
@@ -303,6 +303,32 @@ impl Orchestrator for ClaudeOrchestrator {
         );
 
         Ok(())
+    }
+
+    async fn triage_conflict(
+        &self,
+        context: &ConflictContext,
+    ) -> Result<ConflictTriage, OrchestratorError> {
+        info!(
+            task_id = %context.task.id,
+            conflict_type = ?context.conflict_info.conflict_type,
+            mode = ?context.mode,
+            human_present = context.human_present,
+            "Triaging merge conflict"
+        );
+
+        // Use the default triage logic. This could be enhanced in the future
+        // to use an LLM for more sophisticated conflict analysis.
+        let triage = default_triage(&context.conflict_info, context.mode, context.human_present);
+
+        info!(
+            task_id = %context.task.id,
+            resolution = ?triage.resolution,
+            reasoning = %triage.reasoning,
+            "Conflict triage complete"
+        );
+
+        Ok(triage)
     }
 }
 
