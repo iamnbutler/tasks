@@ -1,8 +1,5 @@
-import type { ColumnDef } from "@tanstack/react-table";
+import type { ComponentType } from "react";
 import {
-  ArrowDown,
-  ArrowRight,
-  ArrowUp,
   Ban,
   CheckCircle2,
   Circle,
@@ -10,27 +7,12 @@ import {
   GitMerge,
   HelpCircle,
   Loader,
-  Minus,
   MinusCircle,
-  MoreHorizontal,
   XCircle,
   AlertTriangle,
 } from "lucide-react";
-import type { ComponentType } from "react";
-
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { cn, formatRelativeTime } from "@/lib/utils";
-import type { Task, TaskState } from "@/lib/types";
-import { DataTableColumnHeader } from "./data-table-column-header";
+import { cn } from "@/lib/utils";
+import type { TaskState } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Task state metadata
@@ -39,7 +21,10 @@ import { DataTableColumnHeader } from "./data-table-column-header";
 export interface TaskStateMeta {
   label: string;
   icon: ComponentType<{ className?: string }>;
+  /** Full className for badge rendering (color + border + bg) */
   className: string;
+  /** Just the text color class, for inline icon usage */
+  color: string;
 }
 
 // State priority for sorting (lower number = higher priority / shown first)
@@ -61,11 +46,13 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
     label: "Waiting",
     icon: Circle,
     className: "text-muted-foreground border-muted",
+    color: "text-muted-foreground",
   },
   blocked: {
     label: "Blocked",
     icon: Ban,
     className: "text-muted-foreground border-muted",
+    color: "text-muted-foreground",
   },
   running: {
     label: "Running",
@@ -73,257 +60,48 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
       <Loader className={cn("animate-spin", className)} {...props} />
     ),
     className: "text-blue-500 border-blue-500/30 bg-blue-500/10",
+    color: "text-blue-500",
   },
   question: {
     label: "Question",
     icon: HelpCircle,
     className: "text-yellow-500 border-yellow-500/30 bg-yellow-500/10",
+    color: "text-yellow-500",
   },
   testing: {
     label: "Testing",
     icon: FlaskConical,
     className: "text-purple-500 border-purple-500/30 bg-purple-500/10",
+    color: "text-purple-500",
   },
   awaiting_merge: {
     label: "Awaiting Merge",
     icon: GitMerge,
     className: "text-orange-500 border-orange-500/30 bg-orange-500/10",
+    color: "text-orange-500",
   },
   conflict: {
     label: "Conflict",
     icon: AlertTriangle,
     className: "text-red-500 border-red-500/30 bg-red-500/10",
+    color: "text-red-500",
   },
   completed: {
     label: "Completed",
     icon: CheckCircle2,
     className: "text-green-500 border-green-500/30 bg-green-500/10",
+    color: "text-green-500",
   },
   failed: {
     label: "Failed",
     icon: XCircle,
     className: "text-red-500 border-red-500/30 bg-red-500/10",
+    color: "text-red-500",
   },
   cancelled: {
     label: "Cancelled",
     icon: MinusCircle,
     className: "text-gray-500 border-gray-500/30 bg-gray-500/10",
+    color: "text-gray-500",
   },
 };
-
-// ---------------------------------------------------------------------------
-// Priority helpers
-// ---------------------------------------------------------------------------
-
-const priorityConfig: Record<
-  number,
-  { icon: ComponentType<{ className?: string }>; className: string; label: string }
-> = {
-  1: { icon: ArrowUp, className: "text-red-500", label: "High" },
-  2: { icon: ArrowRight, className: "text-yellow-500", label: "Medium" },
-  3: { icon: ArrowDown, className: "text-blue-500", label: "Low" },
-};
-
-// ---------------------------------------------------------------------------
-// Column definitions
-// ---------------------------------------------------------------------------
-
-export const columns: ColumnDef<Task>[] = [
-  // Select
-  {
-    id: "select",
-    header: ({ table }) => (
-      <Checkbox
-        checked={
-          table.getIsAllPageRowsSelected() ||
-          (table.getIsSomePageRowsSelected() && "indeterminate")
-        }
-        onCheckedChange={(value) => table.toggleAllPageRowsSelected(!!value)}
-        aria-label="Select all"
-        className="translate-y-[2px]"
-      />
-    ),
-    cell: ({ row }) => (
-      <Checkbox
-        checked={row.getIsSelected()}
-        onCheckedChange={(value) => row.toggleSelected(!!value)}
-        aria-label="Select row"
-        className="translate-y-[2px]"
-      />
-    ),
-    enableSorting: false,
-    enableHiding: false,
-  },
-
-  // ID
-  {
-    accessorKey: "id",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="ID" />
-    ),
-    cell: ({ row }) => {
-      const source = row.original.source;
-      const label =
-        source.type === "github_issue" || source.type === "github_pr"
-          ? `#${source.number}`
-          : row.original.id.slice(0, 8);
-      return (
-        <span className="font-mono text-sm text-muted-foreground">
-          {label}
-        </span>
-      );
-    },
-    enableSorting: false,
-    enableHiding: false,
-  },
-
-  // Title
-  {
-    accessorKey: "title",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="Title" />
-    ),
-    cell: ({ row }) => {
-      const labels = row.original.labels;
-      return (
-        <div className="flex items-center gap-2">
-          <a
-            href={`/tasks/${row.original.id}`}
-            className="max-w-[500px] truncate font-medium hover:underline"
-          >
-            {row.getValue<string>("title")}
-          </a>
-          {labels.map((label) => (
-            <Badge key={label} variant="outline">
-              {label}
-            </Badge>
-          ))}
-        </div>
-      );
-    },
-  },
-
-  // State
-  {
-    accessorKey: "state",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="State" />
-    ),
-    cell: ({ row }) => {
-      const state = row.getValue<TaskState>("state");
-      const meta = taskStateMeta[state];
-      if (!meta) return null;
-      const Icon = meta.icon;
-      return (
-        <Badge variant="outline" className={cn("gap-1", meta.className)}>
-          <Icon className="h-3.5 w-3.5" />
-          {meta.label}
-        </Badge>
-      );
-    },
-    filterFn: (row, id, value: string[]) => {
-      return value.includes(row.getValue(id));
-    },
-    sortingFn: (rowA, rowB) => {
-      const a = stateSortOrder[rowA.getValue<TaskState>("state")] ?? 999;
-      const b = stateSortOrder[rowB.getValue<TaskState>("state")] ?? 999;
-      return a - b;
-    },
-  },
-
-  // Project
-  {
-    accessorKey: "project",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="Project" />
-    ),
-    cell: ({ row, table }) => {
-      const projectId = row.getValue<string>("project");
-      const meta = table.options.meta as { projectIdToRepo?: Record<string, string> } | undefined;
-      const displayName = meta?.projectIdToRepo?.[projectId] ?? projectId;
-      return <span>{displayName}</span>;
-    },
-    filterFn: (row, id, value: string[]) => {
-      return value.includes(row.getValue(id));
-    },
-  },
-
-  // Priority
-  {
-    accessorKey: "priority",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="Priority" />
-    ),
-    cell: ({ row }) => {
-      const priority = row.getValue<number | null>("priority");
-      if (priority == null) {
-        return (
-          <span className="flex items-center gap-1 text-gray-500">
-            <Minus className="h-4 w-4" />
-            <span className="text-sm">None</span>
-          </span>
-        );
-      }
-      const config = priorityConfig[priority];
-      if (!config) {
-        return <span className="text-sm text-muted-foreground">{priority}</span>;
-      }
-      const Icon = config.icon;
-      return (
-        <span className={cn("flex items-center gap-1", config.className)}>
-          <Icon className="h-4 w-4" />
-          <span className="text-sm">{config.label}</span>
-        </span>
-      );
-    },
-    sortingFn: (rowA, rowB) => {
-      const a = rowA.getValue<number | null>("priority") ?? 999;
-      const b = rowB.getValue<number | null>("priority") ?? 999;
-      return a - b;
-    },
-  },
-
-  // Updated
-  {
-    accessorKey: "updated_at",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} title="Updated" />
-    ),
-    cell: ({ row }) => (
-      <span className="text-muted-foreground">
-        {formatRelativeTime(row.getValue<string>("updated_at"))}
-      </span>
-    ),
-  },
-
-  // Actions
-  {
-    id: "actions",
-    cell: ({ row }) => {
-      const task = row.original;
-      return (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              className="flex h-8 w-8 p-0 data-[state=open]:bg-muted"
-            >
-              <MoreHorizontal className="h-4 w-4" />
-              <span className="sr-only">Open menu</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-[160px]">
-            <DropdownMenuItem
-              onClick={() => navigator.clipboard.writeText(task.id)}
-            >
-              Copy task ID
-            </DropdownMenuItem>
-            <DropdownMenuItem asChild>
-              <a href={`/tasks/${task.id}`}>View details</a>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      );
-    },
-  },
-];

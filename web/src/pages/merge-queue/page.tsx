@@ -17,11 +17,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { columns } from "./columns";
-
-// ---------------------------------------------------------------------------
-// Merge Queue Page
-// ---------------------------------------------------------------------------
 
 export function MergeQueuePage() {
   const { snapshot, refreshSnapshot, filteredMergeQueue, selectedProject } = useAppState();
@@ -47,7 +44,6 @@ export function MergeQueuePage() {
     getPaginationRowModel: getPaginationRowModel(),
     state: {
       pagination,
-      // Hide project column when a specific project is selected
       columnVisibility: selectedProject ? { project: false } : {},
     },
     autoResetPageIndex: false,
@@ -69,10 +65,6 @@ export function MergeQueuePage() {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Loading state
-  // -------------------------------------------------------------------------
-
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
@@ -81,103 +73,92 @@ export function MergeQueuePage() {
     );
   }
 
-  // -------------------------------------------------------------------------
-  // Render
-  // -------------------------------------------------------------------------
-
   return (
-    <div className="p-4">
-      {/* Toolbar */}
-      {isPaused && (
-        <div className="flex items-center justify-end gap-2 mb-3">
-          {approvedCount > 0 && (
-            <span className="text-sm text-muted-foreground">
-              {approvedCount} approved
-            </span>
-          )}
+    <div className="flex flex-col h-full">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+        <div className="flex items-center gap-3">
+          <h1 className="text-sm font-semibold">Merge Queue</h1>
+          <span className="text-xs text-muted-foreground">{entries.length} entries</span>
+        </div>
+
+        {isPaused && approvedCount > 0 && (
           <Button
             size="sm"
             onClick={handleFlush}
-            disabled={flushing || approvedCount === 0}
+            disabled={flushing}
+            className="h-7 text-xs"
           >
-            {flushing ? "Flushing..." : "Flush Queue"}
+            {flushing ? "Flushing..." : `Flush ${approvedCount} approved`}
           </Button>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Table */}
-      <div className="rounded-md border">
-          {entries.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-8 text-center">
-              No entries in the merge queue.
-            </p>
-          ) : (
-            <>
-              <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    {table.getHeaderGroups().map((headerGroup) => (
-                      <TableRow key={headerGroup.id}>
-                        {headerGroup.headers.map((header) => (
-                          <TableHead key={header.id}>
-                            {header.isPlaceholder
-                              ? null
-                              : flexRender(
-                                  header.column.columnDef.header,
-                                  header.getContext(),
-                                )}
-                          </TableHead>
-                        ))}
-                      </TableRow>
+      <ScrollArea className="flex-1">
+        {entries.length === 0 ? (
+          <div className="flex items-center justify-center py-20">
+            <p className="text-sm text-muted-foreground">No entries in the merge queue.</p>
+          </div>
+        ) : (
+          <>
+            <Table>
+              <TableHeader>
+                {table.getHeaderGroups().map((headerGroup) => (
+                  <TableRow key={headerGroup.id}>
+                    {headerGroup.headers.map((header) => (
+                      <TableHead key={header.id}>
+                        {header.isPlaceholder
+                          ? null
+                          : flexRender(header.column.columnDef.header, header.getContext())}
+                      </TableHead>
                     ))}
-                  </TableHeader>
-                  <TableBody>
-                    {table.getRowModel().rows.map((row) => (
-                      <TableRow key={row.id}>
-                        {row.getVisibleCells().map((cell) => (
-                          <TableCell key={cell.id}>
-                            {flexRender(
-                              cell.column.columnDef.cell,
-                              cell.getContext(),
-                            )}
-                          </TableCell>
-                        ))}
-                      </TableRow>
+                  </TableRow>
+                ))}
+              </TableHeader>
+              <TableBody>
+                {table.getRowModel().rows.map((row) => (
+                  <TableRow key={row.id}>
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell key={cell.id}>
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </TableCell>
                     ))}
-                  </TableBody>
-                </Table>
-              </div>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
 
-              {/* Pagination */}
-              {table.getPageCount() > 1 && (
-                <div className="flex items-center justify-between px-3 py-2 border-t">
-                  <span className="text-sm text-muted-foreground">
-                    Page {table.getState().pagination.pageIndex + 1} of{" "}
-                    {table.getPageCount()}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => table.previousPage()}
-                      disabled={!table.getCanPreviousPage()}
-                    >
-                      Previous
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => table.nextPage()}
-                      disabled={!table.getCanNextPage()}
-                    >
-                      Next
-                    </Button>
-                  </div>
+            {table.getPageCount() > 1 && (
+              <div className="flex items-center justify-between px-4 py-2 border-t">
+                <span className="text-xs text-muted-foreground">
+                  Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => table.previousPage()}
+                    disabled={!table.getCanPreviousPage()}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => table.nextPage()}
+                    disabled={!table.getCanNextPage()}
+                  >
+                    Next
+                  </Button>
                 </div>
-              )}
-            </>
-          )}
-      </div>
+              </div>
+            )}
+          </>
+        )}
+      </ScrollArea>
     </div>
   );
 }
