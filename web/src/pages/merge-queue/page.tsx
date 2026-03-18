@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  type PaginationState,
   useReactTable,
   getCoreRowModel,
   getPaginationRowModel,
@@ -45,6 +46,10 @@ function modeBadge(mode: Mode) {
 export function MergeQueuePage() {
   const { snapshot, refreshSnapshot, filteredMergeQueue, selectedProject } = useAppState();
   const [flushing, setFlushing] = useState(false);
+  const [pagination, setPagination] = useState<PaginationState>({
+    pageIndex: 0,
+    pageSize: 10,
+  });
 
   const entries = filteredMergeQueue;
 
@@ -66,10 +71,13 @@ export function MergeQueuePage() {
     columns,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
+    autoResetPageIndex: false,
     state: {
+      pagination,
       // Hide project column when a specific project is selected
       columnVisibility: selectedProject ? { project: false } : {},
     },
+    onPaginationChange: setPagination,
     meta: {
       refreshSnapshot,
       tasks: snapshot?.tasks ?? [],
