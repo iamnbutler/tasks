@@ -21,11 +21,27 @@ pub struct DispatchPlan {
 }
 
 /// Calculate backoff duration for a given retry count (spec §13.2).
-/// Base: 5s, multiplier: 2x, max: 300s. No jitter in the check (jitter is for scheduling).
+/// Base: 5s, multiplier: 2x, max: 300s. Deterministic — no jitter.
 pub fn backoff_duration(retry_count: u32) -> Duration {
     let base_secs = 5i64;
     let secs = base_secs * 2i64.pow(retry_count.min(6));
     Duration::seconds(secs.min(300))
+}
+
+/// Calculate backoff duration with ±25% jitter (spec §13.2).
+/// Wraps `backoff_duration` and applies random jitter derived from the current
+/// sub-second nanoseconds, keeping the result within [5s, 300s].
+pub fn backoff_duration_jittered(retry_count: u32) -> Duration {
+    let base = backoff_duration(retry_count).num_seconds();
+    // Derive jitter from sub-second nanoseconds — cheap, no dependency needed.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as i64;
+    // Map to -25..=25 percent
+    let jitter_pct = (nanos % 51) - 25;
+    let jittered = base + (base * jitter_pct / 100);
+    Duration::seconds(jittered.max(5).min(300))
 }
 
 /// Evaluate which tasks should be dispatched (spec §12.6).
@@ -74,9 +90,9 @@ pub fn evaluate(
             if t.state != TaskState::Waiting {
                 return false;
             }
-            // Check backoff
+            // Check backoff with jitter to prevent thundering herds (spec §13.2).
             if let Some(failure_at) = t.last_failure_at {
-                if failure_at + backoff_duration(t.retry_count) > now {
+                if failure_at + backoff_duration_jittered(t.retry_count) > now {
                     return false;
                 }
             }
@@ -434,5 +450,27 @@ mod tests {
         );
         assert_eq!(plan.resume, vec!["q1"]);
         assert_eq!(plan.new_work, vec!["t1"]);
+    }
+
+    #[test]
+    fn backoff_duration_jittered_within_range() {
+        // Jittered duration must stay within [5s, 300s] for all retry counts.
+        for retry in [0u32, 1, 2, 3, 6, 10] {
+            let base = backoff_duration(retry).num_seconds();
+            let low = (base - base / 4).max(5);
+            let high = (base + base / 4).min(300);
+            // Run a few times to check range stability.
+            for _ in 0..5 {
+                let jittered = backoff_duration_jittered(retry).num_seconds();
+                assert!(
+                    jittered >= 5 && jittered <= 300,
+                    "retry={retry}: jittered={jittered}s must be in [5, 300]"
+                );
+                assert!(
+                    jittered >= low && jittered <= high,
+                    "retry={retry}: jittered={jittered}s out of expected ±25% range [{low}, {high}]"
+                );
+            }
+        }
     }
 }
