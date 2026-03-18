@@ -108,7 +108,6 @@ interface ParsedBlock {
   toolName?: string;
   filePath?: string;
   timestamp?: string;
-  sessionId?: string;
 }
 
 /** Human-readable labels for task lifecycle events. */
@@ -128,22 +127,20 @@ const lifecycleLabels: Record<string, string> = {
 
 function parseAgentEvents(events: Event[]): ParsedBlock[] {
   const blocks: ParsedBlock[] = [];
-  let lastSessionId: string | undefined;
+  let runningCount = 0;
 
   for (const event of events) {
-    // Track session boundaries — when a new session starts (running state after previous session)
+    // Track session boundaries — when a task enters running state again (retry).
+    // Note: session_id is not available in the event data (it lives on the Task
+    // model), so we detect retries by counting running transitions instead.
     if (event.type === "task:state:running") {
-      const sessionId = event.data?.session_id as string | undefined;
-      if (lastSessionId && sessionId && lastSessionId !== sessionId) {
+      runningCount++;
+      if (runningCount > 1) {
         blocks.push({
           kind: "session_boundary",
           content: "New session started (retry)",
           timestamp: event.ts,
-          sessionId,
         });
-      }
-      if (sessionId) {
-        lastSessionId = sessionId;
       }
     }
 
