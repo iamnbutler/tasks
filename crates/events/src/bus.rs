@@ -165,4 +165,305 @@ mod tests {
         assert!(matches_task(&event, "task-1"));
         assert!(!matches_task(&event, "task-2"));
     }
+
+    #[tokio::test]
+    async fn filter_live_events_by_pattern() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+        let bus = EventBus::new(store, 16);
+
+        let mut rx = bus.subscribe();
+
+        // Publish events of different types
+        bus.publish(Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::AgentMessage,
+            "task-1",
+            Actor::Agent,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::TaskStateRunning,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        // Collect and filter for task events only
+        let mut task_events = Vec::new();
+        for _ in 0..3 {
+            let event = rx.recv().await.unwrap();
+            if matches_pattern(&event, "task:*") {
+                task_events.push(event);
+            }
+        }
+
+        assert_eq!(task_events.len(), 2);
+        assert!(matches_pattern(&task_events[0], "task:created"));
+        assert!(matches_pattern(&task_events[1], "task:state:running"));
+    }
+
+    #[tokio::test]
+    async fn filter_live_events_by_task_id() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+        let bus = EventBus::new(store, 16);
+
+        let mut rx = bus.subscribe();
+
+        // Publish events for different tasks
+        bus.publish(Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::TaskCreated,
+            "task-2",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::TaskStateRunning,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        // Collect and filter for task-1 only
+        let mut task1_events = Vec::new();
+        for _ in 0..3 {
+            let event = rx.recv().await.unwrap();
+            if matches_task(&event, "task-1") {
+                task1_events.push(event);
+            }
+        }
+
+        assert_eq!(task1_events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_independent_filtering() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+        let bus = EventBus::new(store, 16);
+
+        let mut rx1 = bus.subscribe();
+        let mut rx2 = bus.subscribe();
+
+        // Publish mixed events
+        bus.publish(Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::AgentMessage,
+            "task-1",
+            Actor::Agent,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        // Subscriber 1 filters for task events
+        let mut task_events = Vec::new();
+        for _ in 0..2 {
+            let event = rx1.recv().await.unwrap();
+            if matches_pattern(&event, "task:*") {
+                task_events.push(event);
+            }
+        }
+
+        // Subscriber 2 filters for agent events
+        let mut agent_events = Vec::new();
+        for _ in 0..2 {
+            let event = rx2.recv().await.unwrap();
+            if matches_pattern(&event, "agent:*") {
+                agent_events.push(event);
+            }
+        }
+
+        assert_eq!(task_events.len(), 1);
+        assert_eq!(agent_events.len(), 1);
+    }
+
+    #[test]
+    fn pattern_matching_negative_cases() {
+        let task_event = Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        );
+
+        // Should not match unrelated patterns
+        assert!(!matches_pattern(&task_event, "agent:*"));
+        assert!(!matches_pattern(&task_event, "merge:*"));
+        assert!(!matches_pattern(&task_event, "system:*"));
+        assert!(!matches_pattern(&task_event, "orchestrator:*"));
+        assert!(!matches_pattern(&task_event, "human:*"));
+
+        // Should not match partial patterns (no wildcard)
+        assert!(!matches_pattern(&task_event, "task"));
+        assert!(!matches_pattern(&task_event, "task:"));
+        assert!(!matches_pattern(&task_event, "task:state:running"));
+
+        // Should not match wrong exact value
+        assert!(!matches_pattern(&task_event, "task:state:completed"));
+    }
+
+    #[test]
+    fn pattern_matching_all_event_families() {
+        let events = vec![
+            (EventType::TaskCreated, "task:*"),
+            (EventType::AgentMessage, "agent:*"),
+            (EventType::MergeQueued, "merge:*"),
+            (EventType::OrchestratorFeedback, "orchestrator:*"),
+            (EventType::SystemStarted, "system:*"),
+            (EventType::HumanMessage, "human:*"),
+        ];
+
+        for (event_type, pattern) in events {
+            let event = Event::new(event_type, "task-1", Actor::System, serde_json::json!({}));
+            assert!(
+                matches_pattern(&event, pattern),
+                "Expected {:?} to match {}",
+                event.event_type,
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn filter_combined_pattern_and_task() {
+        let event1 = Event::new(
+            EventType::TaskStateRunning,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let event2 = Event::new(
+            EventType::TaskStateRunning,
+            "task-2",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let event3 = Event::new(
+            EventType::AgentMessage,
+            "task-1",
+            Actor::Agent,
+            serde_json::json!({}),
+        );
+
+        // Only event1 matches both criteria
+        let matches_both = |e: &Event| matches_pattern(e, "task:state:*") && matches_task(e, "task-1");
+
+        assert!(matches_both(&event1));
+        assert!(!matches_both(&event2)); // wrong task
+        assert!(!matches_both(&event3)); // wrong pattern
+    }
+
+    #[test]
+    fn filter_star_matches_everything() {
+        let events = vec![
+            Event::new(EventType::TaskCreated, "task-1", Actor::System, serde_json::json!({})),
+            Event::new(EventType::AgentMessage, "task-2", Actor::Agent, serde_json::json!({})),
+            Event::new(EventType::MergeCompleted, "task-3", Actor::System, serde_json::json!({})),
+            Event::new(EventType::SystemStarted, "", Actor::System, serde_json::json!({})),
+        ];
+
+        for event in &events {
+            assert!(
+                matches_pattern(event, "*"),
+                "Expected {:?} to match *",
+                event.event_type
+            );
+        }
+    }
+
+    #[test]
+    fn filter_empty_task_id() {
+        let event = Event::new(
+            EventType::SystemStarted,
+            "",
+            Actor::System,
+            serde_json::json!({}),
+        );
+
+        assert!(matches_task(&event, ""));
+        assert!(!matches_task(&event, "task-1"));
+    }
+
+    #[tokio::test]
+    async fn filter_replay_events() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+        let bus = EventBus::new(store, 16);
+
+        // Publish historical events
+        bus.publish(Event::new(
+            EventType::TaskCreated,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::AgentMessage,
+            "task-1",
+            Actor::Agent,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        bus.publish(Event::new(
+            EventType::TaskStateRunning,
+            "task-1",
+            Actor::System,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        // Subscribe with replay and filter historical events
+        let (history, _rx) = bus.subscribe_with_replay("task-1").await.unwrap();
+
+        let task_state_events: Vec<_> = history
+            .iter()
+            .filter(|e| matches_pattern(e, "task:state:*"))
+            .collect();
+
+        assert_eq!(task_state_events.len(), 1);
+        assert!(matches_pattern(task_state_events[0], "task:state:running"));
+    }
 }
