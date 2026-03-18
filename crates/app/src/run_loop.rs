@@ -1440,10 +1440,21 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
+        // Initialize completions service for fast Haiku-based completions.
+        let completions_service = tasks_agent::CompletionsService::from_env()
+            .map(Arc::new)
+            .ok();
+        if completions_service.is_some() {
+            info!("completions service available");
+        } else {
+            warn!("completions service unavailable (ANTHROPIC_API_KEY not set)");
+        }
+
         let api_state = crate::web::ApiState {
             server: server.clone(),
             max_sessions: config.max_sessions,
             session_manager: Some(session_manager.clone()),
+            completions_service,
         };
         let web_port = config.web_port;
 

@@ -14,6 +14,7 @@ tasks-session = { path = "../session" }
 tasks-github = { path = "../github" }
 tasks-store = { path = "../store" }
 tasks-orchestrator = { path = "../orchestrator" }
+tasks-agent = { path = "../agent" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

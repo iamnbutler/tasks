@@ -23,6 +23,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
+use tasks_agent::CompletionsService;
 use events::Actor;
 use server::Server;
 use models::Mode;
@@ -33,6 +34,7 @@ pub struct ApiState {
     pub server: Arc<Server>,
     pub max_sessions: u32,
     pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
+    pub completions_service: Option<Arc<CompletionsService>>,
 }
 
 /// Build the API router.
@@ -57,7 +59,13 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting", get(get_accounting_summary))
         .route("/accounting/tasks", get(list_task_accounting))
         .route("/accounting/tasks/{id}", get(get_task_accounting))
-        .route("/events", get(event_stream));
+        .route("/events", get(event_stream))
+        // Completions endpoints (fast mode with Haiku)
+        .route("/completions", post(completions))
+        .route("/completions/name", post(completions_name))
+        .route("/completions/describe", post(completions_describe))
+        .route("/completions/brainstorm", post(completions_brainstorm))
+        .route("/completions/summarize", post(completions_summarize));
 
     Router::new()
         .nest("/api", api)
@@ -114,6 +122,80 @@ struct EventStreamQuery {
     pattern: Option<String>,
     /// Optional task ID filter.
     task_id: Option<String>,
+}
+
+// --- Completions request/response types ---
+
+#[derive(Deserialize)]
+struct CompletionRequest {
+    /// The prompt to send to the model.
+    prompt: String,
+    /// Optional system prompt.
+    #[serde(default)]
+    system: Option<String>,
+    /// Maximum tokens to generate (default: 1024).
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct CompletionResponse {
+    /// The generated text.
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct NameRequest {
+    /// Context to generate a name from (e.g., task title + summary).
+    context: String,
+}
+
+#[derive(Serialize)]
+struct NameResponse {
+    /// The generated name.
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DescribeRequest {
+    /// Context to describe.
+    context: String,
+}
+
+#[derive(Serialize)]
+struct DescribeResponse {
+    /// The generated description.
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct BrainstormRequest {
+    /// Topic to brainstorm about.
+    topic: String,
+    /// Number of ideas to generate (default: 5).
+    #[serde(default)]
+    count: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct BrainstormResponse {
+    /// The generated ideas.
+    ideas: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SummarizeRequest {
+    /// Text to summarize.
+    text: String,
+    /// Optional maximum word count for summary.
+    #[serde(default)]
+    max_words: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SummarizeResponse {
+    /// The summary.
+    summary: String,
 }
 
 // --- Handlers ---
@@ -458,6 +540,141 @@ async fn event_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+// --- Completions handlers ---
+
+/// Maximum input size for completions endpoints (32 KB).
+const MAX_COMPLETION_INPUT_BYTES: usize = 32_768;
+
+fn validate_input_size(input: &str) -> Result<(), ApiError> {
+    if input.len() > MAX_COMPLETION_INPUT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "input exceeds maximum size of {} bytes",
+            MAX_COMPLETION_INPUT_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// POST /api/completions — General completion endpoint.
+///
+/// Send a prompt and optionally a system prompt for fast LLM completions using Haiku.
+async fn completions(
+    State(state): State<ApiState>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<Json<CompletionResponse>, ApiError> {
+    validate_input_size(&req.prompt)?;
+    if let Some(ref system) = req.system {
+        validate_input_size(system)?;
+    }
+
+    let service = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::CompletionsUnavailable("completions service not configured".into()))?;
+
+    let text = if let Some(system) = req.system {
+        service
+            .complete_with_system(&system, &req.prompt, req.max_tokens)
+            .await
+            .map_err(|e| ApiError::CompletionsError(e.to_string()))?
+    } else {
+        service
+            .complete(&req.prompt, req.max_tokens)
+            .await
+            .map_err(|e| ApiError::CompletionsError(e.to_string()))?
+    };
+
+    Ok(Json(CompletionResponse { text }))
+}
+
+/// POST /api/completions/name — Generate a name.
+///
+/// Given context (e.g., task title + summary), generates a concise name.
+async fn completions_name(
+    State(state): State<ApiState>,
+    Json(req): Json<NameRequest>,
+) -> Result<Json<NameResponse>, ApiError> {
+    validate_input_size(&req.context)?;
+
+    let service = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::CompletionsUnavailable("completions service not configured".into()))?;
+
+    let name = service
+        .generate_name(&req.context)
+        .await
+        .map_err(|e| ApiError::CompletionsError(e.to_string()))?;
+
+    Ok(Json(NameResponse { name }))
+}
+
+/// POST /api/completions/describe — Generate a description.
+///
+/// Given context, generates a brief description (1-2 sentences).
+async fn completions_describe(
+    State(state): State<ApiState>,
+    Json(req): Json<DescribeRequest>,
+) -> Result<Json<DescribeResponse>, ApiError> {
+    validate_input_size(&req.context)?;
+
+    let service = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::CompletionsUnavailable("completions service not configured".into()))?;
+
+    let description = service
+        .generate_description(&req.context)
+        .await
+        .map_err(|e| ApiError::CompletionsError(e.to_string()))?;
+
+    Ok(Json(DescribeResponse { description }))
+}
+
+/// POST /api/completions/brainstorm — Brainstorm ideas.
+///
+/// Given a topic, generates a list of creative ideas.
+async fn completions_brainstorm(
+    State(state): State<ApiState>,
+    Json(req): Json<BrainstormRequest>,
+) -> Result<Json<BrainstormResponse>, ApiError> {
+    validate_input_size(&req.topic)?;
+
+    let service = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::CompletionsUnavailable("completions service not configured".into()))?;
+
+    let ideas = service
+        .brainstorm(&req.topic, req.count)
+        .await
+        .map_err(|e| ApiError::CompletionsError(e.to_string()))?;
+
+    Ok(Json(BrainstormResponse { ideas }))
+}
+
+/// POST /api/completions/summarize — Summarize text.
+///
+/// Given text, generates a condensed summary.
+async fn completions_summarize(
+    State(state): State<ApiState>,
+    Json(req): Json<SummarizeRequest>,
+) -> Result<Json<SummarizeResponse>, ApiError> {
+    validate_input_size(&req.text)?;
+
+    let service = state
+        .completions_service
+        .as_ref()
+        .ok_or_else(|| ApiError::CompletionsUnavailable("completions service not configured".into()))?;
+
+    let summary = service
+        .summarize(&req.text, req.max_words)
+        .await
+        .map_err(|e| ApiError::CompletionsError(e.to_string()))?;
+
+    Ok(Json(SummarizeResponse { summary }))
+}
+
 // --- Error handling ---
 
 enum ApiError {
@@ -466,6 +683,8 @@ enum ApiError {
     MergeQueue(String),
     SessionManager(String),
     NotFound(String),
+    CompletionsUnavailable(String),
+    CompletionsError(String),
 }
 
 impl IntoResponse for ApiError {
@@ -476,6 +695,8 @@ impl IntoResponse for ApiError {
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, e),
+            ApiError::CompletionsUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e),
+            ApiError::CompletionsError(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
