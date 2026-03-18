@@ -10,6 +10,11 @@ use tasks_github::model::{Issue, PullRequest};
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::workflow::LabelConfig;
 
+/// Canonical label that always causes an issue/PR to be skipped, regardless of
+/// project configuration. This label is checked in addition to the configurable
+/// `labels.ignore` list from `workflow.toml`.
+pub const SKIP_LABEL: &str = "tasks/skip";
+
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error("github error: {0}")]
@@ -17,7 +22,7 @@ pub enum SchedulerError {
 }
 
 /// Convert a GitHub issue into a Task, if it should be imported.
-/// Returns None if the issue should be ignored (matches ignore labels).
+/// Returns None if the issue should be ignored (matches ignore labels or canonical skip label).
 pub fn issue_to_task(
     issue: &Issue,
     project_id: &str,
@@ -29,6 +34,11 @@ pub fn issue_to_task(
     }
 
     let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+
+    // Check for the canonical skip label — always skip regardless of config.
+    if issue_label_names.contains(&SKIP_LABEL) {
+        return None;
+    }
 
     // Check if any issue label matches an ignore label — if so, skip.
     for ignore in &label_config.ignore {
@@ -59,6 +69,7 @@ pub fn issue_to_task(
 }
 
 /// Convert a GitHub PR into a Task, if it should be imported.
+/// Returns None if the PR should be ignored (matches ignore labels or canonical skip label).
 pub fn pr_to_task(
     pr: &PullRequest,
     project_id: &str,
@@ -70,6 +81,11 @@ pub fn pr_to_task(
     }
 
     let pr_label_names: Vec<&str> = pr.labels.iter().map(|l| l.name.as_str()).collect();
+
+    // Check for the canonical skip label — always skip regardless of config.
+    if pr_label_names.contains(&SKIP_LABEL) {
+        return None;
+    }
 
     // Check if any PR label matches an ignore label — if so, skip.
     for ignore in &label_config.ignore {
@@ -304,4 +320,41 @@ mod tests {
         let task = issue_to_task(&issue, "proj-1", &cfg);
         assert!(task.is_none(), "closed issues should be skipped");
     }
+
+    #[test]
+    fn issue_with_canonical_skip_label() {
+        // The canonical tasks/skip label should always skip, regardless of config.
+        let issue = make_issue(
+            100,
+            vec![make_label("bug"), make_label(super::SKIP_LABEL)],
+            GhIssueState::Open,
+        );
+        // Use an empty ignore list to prove the canonical label works independently.
+        let cfg = LabelConfig {
+            ignore: vec![],
+            blocked: vec![],
+        };
+
+        let result = issue_to_task(&issue, "proj-1", &cfg);
+        assert!(result.is_none(), "issue with tasks/skip label should be skipped");
+    }
+
+    #[test]
+    fn pr_with_canonical_skip_label() {
+        // The canonical tasks/skip label should always skip PRs too.
+        let pr = make_pr(
+            101,
+            vec![make_label("feature"), make_label(super::SKIP_LABEL)],
+            PullRequestState::Open,
+        );
+        // Use an empty ignore list to prove the canonical label works independently.
+        let cfg = LabelConfig {
+            ignore: vec![],
+            blocked: vec![],
+        };
+
+        let result = pr_to_task(&pr, "proj-2", &cfg);
+        assert!(result.is_none(), "PR with tasks/skip label should be skipped");
+    }
+
 }
