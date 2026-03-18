@@ -1144,6 +1144,62 @@ impl Server {
 
         Ok(())
     }
+
+    // --- Accounting (spec §16.4) ---
+
+    /// Get the global accounting summary.
+    pub fn get_accounting_summary(&self) -> Result<tasks_store::AccountingSummary, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.get_accounting_summary()
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// List all task accounting records.
+    pub fn list_task_accounting(&self) -> Result<Vec<tasks_store::TaskAccounting>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.list_accounting()
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// Get accounting for a specific task.
+    pub fn get_task_accounting(&self, task_id: &str) -> Result<Option<tasks_store::TaskAccounting>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.get_accounting(task_id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// Add token usage to a task's accounting.
+    pub fn add_task_token_usage(
+        &self,
+        task_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<tasks_store::TaskAccounting, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.add_token_usage(task_id, input_tokens, output_tokens)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// Record a session end for a task.
+    pub fn record_task_session_end(
+        &self,
+        task_id: &str,
+        duration_seconds: u64,
+    ) -> Result<tasks_store::TaskAccounting, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.record_session_end(task_id, duration_seconds)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
 }
 
 #[cfg(test)]

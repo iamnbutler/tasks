@@ -70,6 +70,14 @@ pub enum EventType {
     SystemTimeLimitSoft,
     /// Session hard time limit reached (spec §17.4).
     SystemTimeLimitHard,
+
+    // Accounting events (spec §16.4)
+    /// Token usage accounting (input/output tokens per request).
+    SystemAccountingTokens,
+    /// External API call tracking.
+    SystemAccountingApiCall,
+    /// Session duration and total token accounting.
+    SystemAccountingSession,
 }
 
 impl EventType {
@@ -111,6 +119,9 @@ impl EventType {
             Self::SystemMemoryEmergency => "system:memory:emergency",
             Self::SystemTimeLimitSoft => "system:time_limit:soft",
             Self::SystemTimeLimitHard => "system:time_limit:hard",
+            Self::SystemAccountingTokens => "system:accounting:tokens",
+            Self::SystemAccountingApiCall => "system:accounting:api_call",
+            Self::SystemAccountingSession => "system:accounting:session",
         }
     }
 
@@ -181,6 +192,9 @@ impl TryFrom<String> for EventType {
             "system:memory:emergency" => Ok(Self::SystemMemoryEmergency),
             "system:time_limit:soft" => Ok(Self::SystemTimeLimitSoft),
             "system:time_limit:hard" => Ok(Self::SystemTimeLimitHard),
+            "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
+            "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
+            "system:accounting:session" => Ok(Self::SystemAccountingSession),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
@@ -318,5 +332,66 @@ mod tests {
         assert!(hard.matches("system:*"));
         assert!(soft.matches("system:time_limit:*"));
         assert!(hard.matches("system:time_limit:*"));
+    }
+
+    #[test]
+    fn accounting_tokens_event_serializes() {
+        let e = Event::new(
+            EventType::SystemAccountingTokens,
+            "task-123",
+            Actor::System,
+            serde_json::json!({
+                "input_tokens": 1500,
+                "output_tokens": 800,
+                "model": "claude-3-opus",
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:accounting:tokens\""));
+        assert!(json.contains("\"input_tokens\":1500"));
+    }
+
+    #[test]
+    fn accounting_session_event_serializes() {
+        let e = Event::new(
+            EventType::SystemAccountingSession,
+            "task-123",
+            Actor::System,
+            serde_json::json!({
+                "duration_seconds": 3600,
+                "total_input_tokens": 15000,
+                "total_output_tokens": 8000,
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:accounting:session\""));
+        assert!(json.contains("\"duration_seconds\":3600"));
+    }
+
+    #[test]
+    fn accounting_events_deserialize() {
+        let tokens = EventType::try_from("system:accounting:tokens".to_string()).unwrap();
+        assert_eq!(tokens, EventType::SystemAccountingTokens);
+
+        let api_call = EventType::try_from("system:accounting:api_call".to_string()).unwrap();
+        assert_eq!(api_call, EventType::SystemAccountingApiCall);
+
+        let session = EventType::try_from("system:accounting:session".to_string()).unwrap();
+        assert_eq!(session, EventType::SystemAccountingSession);
+    }
+
+    #[test]
+    fn accounting_events_match_system_wildcard() {
+        let tokens = EventType::SystemAccountingTokens;
+        let api_call = EventType::SystemAccountingApiCall;
+        let session = EventType::SystemAccountingSession;
+
+        assert!(tokens.matches("system:*"));
+        assert!(api_call.matches("system:*"));
+        assert!(session.matches("system:*"));
+
+        assert!(tokens.matches("system:accounting:*"));
+        assert!(api_call.matches("system:accounting:*"));
+        assert!(session.matches("system:accounting:*"));
     }
 }

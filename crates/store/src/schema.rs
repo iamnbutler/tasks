@@ -41,6 +41,16 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             status TEXT NOT NULL DEFAULT 'pending',
             queued_at TEXT NOT NULL
         );
+
+        -- Token and cost accounting (spec §16.4)
+        CREATE TABLE IF NOT EXISTS task_accounting (
+            task_id TEXT PRIMARY KEY,
+            total_input_tokens INTEGER NOT NULL DEFAULT 0,
+            total_output_tokens INTEGER NOT NULL DEFAULT 0,
+            session_count INTEGER NOT NULL DEFAULT 0,
+            total_duration_seconds INTEGER NOT NULL DEFAULT 0,
+            last_updated TEXT NOT NULL
+        );
         ",
     )?;
 

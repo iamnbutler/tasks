@@ -4,7 +4,10 @@
 //! leaks into other crates. The implementation can be swapped without
 //! affecting consumers.
 
+mod accounting;
 mod schema;
+
+pub use accounting::{AccountingSummary, TaskAccounting};
 
 use std::path::Path;
 
@@ -348,6 +351,151 @@ impl Store {
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
+
+    // ── Accounting (spec §16.4) ───────────────────────────────────
+
+    /// Get or create accounting data for a task.
+    pub fn get_or_create_accounting(&self, task_id: &str) -> Result<TaskAccounting, StoreError> {
+        if let Some(acc) = self.get_accounting(task_id)? {
+            return Ok(acc);
+        }
+        let acc = TaskAccounting::new(task_id);
+        self.save_accounting(&acc)?;
+        Ok(acc)
+    }
+
+    /// Get accounting data for a task, if it exists.
+    pub fn get_accounting(&self, task_id: &str) -> Result<Option<TaskAccounting>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, total_input_tokens, total_output_tokens, session_count,
+                    total_duration_seconds, last_updated
+             FROM task_accounting WHERE task_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], row_to_accounting)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Save accounting data for a task.
+    pub fn save_accounting(&self, accounting: &TaskAccounting) -> Result<(), StoreError> {
+        let last_updated = accounting.last_updated.to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO task_accounting
+             (task_id, total_input_tokens, total_output_tokens, session_count,
+              total_duration_seconds, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                accounting.task_id,
+                accounting.total_input_tokens as i64,
+                accounting.total_output_tokens as i64,
+                accounting.session_count,
+                accounting.total_duration_seconds as i64,
+                last_updated,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Add token usage to a task's accounting.
+    pub fn add_token_usage(
+        &self,
+        task_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<TaskAccounting, StoreError> {
+        let mut acc = self.get_or_create_accounting(task_id)?;
+        acc.add_tokens(input_tokens, output_tokens);
+        self.save_accounting(&acc)?;
+        Ok(acc)
+    }
+
+    /// Record a session completion for a task.
+    pub fn record_session_end(
+        &self,
+        task_id: &str,
+        duration_seconds: u64,
+    ) -> Result<TaskAccounting, StoreError> {
+        let mut acc = self.get_or_create_accounting(task_id)?;
+        acc.record_session(duration_seconds);
+        self.save_accounting(&acc)?;
+        Ok(acc)
+    }
+
+    /// List all accounting records.
+    pub fn list_accounting(&self) -> Result<Vec<TaskAccounting>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, total_input_tokens, total_output_tokens, session_count,
+                    total_duration_seconds, last_updated
+             FROM task_accounting",
+        )?;
+        let rows = stmt.query_map([], row_to_accounting)?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Get global accounting summary across all tasks.
+    pub fn get_accounting_summary(&self) -> Result<AccountingSummary, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(total_input_tokens), 0),
+                    COALESCE(SUM(total_output_tokens), 0),
+                    COALESCE(SUM(session_count), 0),
+                    COALESCE(SUM(total_duration_seconds), 0),
+                    COUNT(*)
+             FROM task_accounting",
+        )?;
+        let summary = stmt.query_row([], |row| {
+            Ok(AccountingSummary {
+                total_input_tokens: row.get::<_, i64>(0)? as u64,
+                total_output_tokens: row.get::<_, i64>(1)? as u64,
+                total_sessions: row.get::<_, i64>(2)? as u32,
+                total_duration_seconds: row.get::<_, i64>(3)? as u64,
+                task_count: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        Ok(summary)
+    }
+
+    /// Delete accounting data for a task.
+    pub fn delete_accounting(&self, task_id: &str) -> Result<bool, StoreError> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
+        Ok(affected > 0)
+    }
+}
+
+/// Map a rusqlite Row to a TaskAccounting.
+fn row_to_accounting(row: &rusqlite::Row) -> Result<TaskAccounting, rusqlite::Error> {
+    let task_id: String = row.get(0)?;
+    let total_input_tokens: i64 = row.get(1)?;
+    let total_output_tokens: i64 = row.get(2)?;
+    let session_count: u32 = row.get(3)?;
+    let total_duration_seconds: i64 = row.get(4)?;
+    let last_updated_str: String = row.get(5)?;
+
+    let last_updated = DateTime::parse_from_rfc3339(&last_updated_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?;
+
+    Ok(TaskAccounting {
+        task_id,
+        total_input_tokens: total_input_tokens as u64,
+        total_output_tokens: total_output_tokens as u64,
+        session_count,
+        total_duration_seconds: total_duration_seconds as u64,
+        last_updated,
+    })
 }
 
 /// Map a rusqlite Row to a Task.
@@ -746,5 +894,101 @@ mod tests {
         let loaded = store.get_task("t2").unwrap().unwrap();
         assert_eq!(loaded.blocked_by, vec!["t1"]);
         assert_eq!(loaded.state, TaskState::Blocked);
+    }
+
+    // ── Accounting tests ──────────────────────────────────────────
+
+    #[test]
+    fn get_or_create_accounting() {
+        let store = Store::open_memory().unwrap();
+        let acc = store.get_or_create_accounting("task-1").unwrap();
+        assert_eq!(acc.task_id, "task-1");
+        assert_eq!(acc.total_input_tokens, 0);
+        assert_eq!(acc.total_output_tokens, 0);
+        assert_eq!(acc.session_count, 0);
+    }
+
+    #[test]
+    fn add_token_usage() {
+        let store = Store::open_memory().unwrap();
+
+        // Add first batch
+        let acc = store.add_token_usage("task-1", 100, 50).unwrap();
+        assert_eq!(acc.total_input_tokens, 100);
+        assert_eq!(acc.total_output_tokens, 50);
+
+        // Add second batch
+        let acc = store.add_token_usage("task-1", 200, 100).unwrap();
+        assert_eq!(acc.total_input_tokens, 300);
+        assert_eq!(acc.total_output_tokens, 150);
+
+        // Verify persistence
+        let loaded = store.get_accounting("task-1").unwrap().unwrap();
+        assert_eq!(loaded.total_input_tokens, 300);
+        assert_eq!(loaded.total_output_tokens, 150);
+    }
+
+    #[test]
+    fn record_session_end() {
+        let store = Store::open_memory().unwrap();
+
+        let acc = store.record_session_end("task-1", 3600).unwrap();
+        assert_eq!(acc.session_count, 1);
+        assert_eq!(acc.total_duration_seconds, 3600);
+
+        let acc = store.record_session_end("task-1", 1800).unwrap();
+        assert_eq!(acc.session_count, 2);
+        assert_eq!(acc.total_duration_seconds, 5400);
+    }
+
+    #[test]
+    fn list_accounting() {
+        let store = Store::open_memory().unwrap();
+
+        store.add_token_usage("task-1", 100, 50).unwrap();
+        store.add_token_usage("task-2", 200, 100).unwrap();
+
+        let all = store.list_accounting().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn get_accounting_summary() {
+        let store = Store::open_memory().unwrap();
+
+        store.add_token_usage("task-1", 100, 50).unwrap();
+        store.record_session_end("task-1", 3600).unwrap();
+
+        store.add_token_usage("task-2", 200, 100).unwrap();
+        store.record_session_end("task-2", 1800).unwrap();
+
+        let summary = store.get_accounting_summary().unwrap();
+        assert_eq!(summary.total_input_tokens, 300);
+        assert_eq!(summary.total_output_tokens, 150);
+        assert_eq!(summary.total_tokens(), 450);
+        assert_eq!(summary.total_sessions, 2);
+        assert_eq!(summary.total_duration_seconds, 5400);
+        assert_eq!(summary.task_count, 2);
+    }
+
+    #[test]
+    fn delete_accounting() {
+        let store = Store::open_memory().unwrap();
+
+        store.add_token_usage("task-1", 100, 50).unwrap();
+        assert!(store.get_accounting("task-1").unwrap().is_some());
+
+        assert!(store.delete_accounting("task-1").unwrap());
+        assert!(store.get_accounting("task-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn accounting_summary_empty() {
+        let store = Store::open_memory().unwrap();
+        let summary = store.get_accounting_summary().unwrap();
+        assert_eq!(summary.total_input_tokens, 0);
+        assert_eq!(summary.total_output_tokens, 0);
+        assert_eq!(summary.total_sessions, 0);
+        assert_eq!(summary.task_count, 0);
     }
 }
