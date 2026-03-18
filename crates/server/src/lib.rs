@@ -13,9 +13,15 @@ pub mod workflow;
 pub mod workflow_watcher;
 pub mod dispatcher;
 pub mod scheduler;
+pub mod workspace;
 mod server;
 
 pub use mode::Mode;
 pub use recovery::{RecoveryResult, DEFAULT_MAX_RETRIES};
 pub use server::{Server, ServerError, ServerState};
 pub use workflow_watcher::{WorkflowConfigCache, WorkflowConfigWatcher, RefreshResult};
+pub use workspace::{
+    CleanupCandidate, CleanupConfig, CleanupReason,
+    find_cleanup_candidates, is_stale_cleanup, is_terminal_state_cleanup,
+    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_STALE_THRESHOLD_SECS,
+};

@@ -76,5 +76,27 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // Migration: add last_activity_at column if it doesn't exist (spec §10.3)
+    // This is used for stale workspace detection.
+    match conn.execute(
+        "ALTER TABLE tasks ADD COLUMN last_activity_at TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added last_activity_at column to tasks table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            // Column already exists — this is expected for existing databases
+            tracing::debug!("last_activity_at column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add last_activity_at column");
+            return Err(e);
+        }
+    }
+
     Ok(())
 }

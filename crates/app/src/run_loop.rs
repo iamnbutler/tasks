@@ -1238,6 +1238,66 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- 8c. Spawn workspace cleanup loop (spec §10.3) ---
+    //
+    // Periodically scans for workspaces eligible for cleanup:
+    // - Tasks in terminal states (Completed, Failed, Cancelled)
+    // - Stale/idle workspaces (no activity beyond threshold)
+    //
+    // For each candidate, the loop destroys the container (if still running)
+    // and clears the workspace_id from the task. Event logs are retained.
+
+    let cleanup_server = server.clone();
+    let cleanup_session_mgr = session_manager.clone();
+    let cleanup_interval = config.cleanup_interval;
+    let stale_threshold = config.workspace_stale_threshold;
+
+    let cleanup_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+
+        loop {
+            interval.tick().await;
+
+            // Get cleanup candidates
+            let candidates = cleanup_server
+                .get_workspace_cleanup_candidates(stale_threshold)
+                .await;
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            debug!(
+                count = candidates.len(),
+                "workspace cleanup: found candidates"
+            );
+
+            for candidate in candidates {
+                // Check if there's an active session for this task — if so, skip.
+                // The session manager handles its own cleanup when sessions end.
+                if cleanup_session_mgr.has_session(&candidate.task_id).await {
+                    debug!(
+                        task_id = %candidate.task_id,
+                        "workspace cleanup: skipping, session still active"
+                    );
+                    continue;
+                }
+
+                // Clear the workspace_id from the task and emit event
+                if let Err(e) = cleanup_server
+                    .clear_workspace_id(&candidate.task_id, &candidate.reason)
+                    .await
+                {
+                    warn!(
+                        task_id = %candidate.task_id,
+                        error = %e,
+                        "workspace cleanup: failed to clear workspace_id"
+                    );
+                }
+            }
+        }
+    });
+
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
@@ -1289,6 +1349,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     event_handler_handle.abort();
     orchestrator_handle.abort();
     watchdog_handle.abort();
+    cleanup_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }
