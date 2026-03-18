@@ -1,14 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import {
-  ListTodo,
-  GitMerge,
-  Radio,
-  MonitorDot,
-  Clock,
-  CircleHelp,
-  Layers,
-  Brain,
-} from "lucide-react";
+import { ListTodo, GitMerge, Radio, Brain } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { ModeControl } from "@/components/mode-control";
 import { ProjectSwitcher } from "@/components/project-switcher";
@@ -22,45 +13,25 @@ const navItems = [
 ];
 
 export function Layout() {
-  const { snapshot, connected, filteredTasks, filteredMergeQueue } = useAppState();
-
-  const runningCount = filteredTasks.filter((t) => t.state === "running").length;
-  const waitingCount = filteredTasks.filter((t) => t.state === "waiting").length;
-  const questionCount = filteredTasks.filter((t) => t.state === "question").length;
-  const mergeQueueCount = filteredMergeQueue.length;
-  const slotActive = snapshot?.slot_utilization?.active ?? 0;
-  const slotMax = snapshot?.slot_utilization?.max ?? 0;
+  const { connected } = useAppState();
 
   return (
     <div className="flex h-screen bg-background text-foreground">
       {/* Sidebar */}
-      <aside className="flex w-60 flex-col border-r border-border bg-background">
-        {/* App title */}
-        <div className="border-b border-border px-4 py-4">
+      <aside className="flex w-52 flex-col border-r border-border bg-background">
+        {/* Header: title + mode control */}
+        <div className="flex items-center justify-between border-b border-border px-3 py-3">
           <h1 className="text-base font-bold tracking-tight">Tasks</h1>
-        </div>
-
-        {/* Project switcher */}
-        <div className="border-b border-border px-3 py-3">
-          <ProjectSwitcher />
-        </div>
-
-        {/* Mode control */}
-        <div className="border-b border-border px-4 py-3">
           <ModeControl />
         </div>
 
-        {/* Status section */}
-        <div className="border-b border-border px-4 py-3 space-y-1.5 text-sm">
-          <StatusRow icon={MonitorDot} label="Sessions" value={`${slotActive}/${slotMax}`} />
-          <StatusRow icon={Layers} label="Running" value={runningCount} />
-          <StatusRow icon={Clock} label="Waiting" value={waitingCount} />
-          <StatusRow icon={CircleHelp} label="Questions" value={questionCount} />
-          <StatusRow icon={GitMerge} label="Merge Queue" value={mergeQueueCount} />
+        {/* Project switcher */}
+        <div className="border-b border-border px-3 py-2">
+          <ProjectSwitcher />
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 px-2 py-3 space-y-0.5">
+        <nav className="flex-1 px-2 py-2 space-y-0.5">
           {navItems.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
@@ -82,11 +53,11 @@ export function Layout() {
         </nav>
 
         {/* Connection status */}
-        <div className="border-t border-border px-4 py-3 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2">
+        <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
+          <div className="flex items-center gap-1.5">
             <span
               className={cn(
-                "inline-block h-2 w-2 rounded-full",
+                "inline-block h-1.5 w-1.5 rounded-full",
                 connected ? "bg-green-500" : "bg-red-500"
               )}
             />
@@ -103,22 +74,3 @@ export function Layout() {
   );
 }
 
-function StatusRow({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: typeof MonitorDot;
-  label: string;
-  value: string | number;
-}) {
-  return (
-    <div className="flex items-center justify-between text-muted-foreground">
-      <span className="flex items-center gap-2">
-        <Icon className="h-3.5 w-3.5" />
-        {label}
-      </span>
-      <span className="font-mono text-foreground">{value}</span>
-    </div>
-  );
-}

@@ -437,16 +437,7 @@ export function OrchestratorPage() {
   }
 
   return (
-    <div className="flex flex-col h-full p-6 gap-4">
-      {/* Header */}
-      <div className="shrink-0">
-        <h1 className="text-xl font-bold">Orchestrator</h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          View orchestrator activity and send commands
-        </p>
-      </div>
-
-      {/* Orchestrator view */}
+    <div className="flex flex-col h-full p-4">
       <OrchestratorView />
     </div>
   );
