@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import {
   type ColumnDef,
   type ColumnFiltersState,
+  type PaginationState,
   type SortingState,
   type VisibilityState,
   flexRender,
@@ -45,6 +46,10 @@ export function DataTable<TData extends Task, TValue>({
   ]);
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const [rowSelection, setRowSelection] = useState({});
+  const [pagination, setPagination] = useState<PaginationState>({
+    pageIndex: 0,
+    pageSize: 50,
+  });
 
   const singleProject = useMemo(() => {
     const projects = new Set(data.map((t) => t.project));
@@ -64,20 +69,20 @@ export function DataTable<TData extends Task, TValue>({
   const table = useReactTable({
     data,
     columns,
-    initialState: {
-      pagination: { pageSize: 50 },
-    },
     state: {
       sorting,
       columnFilters,
       columnVisibility: mergedVisibility,
       rowSelection,
+      pagination,
     },
     enableRowSelection: true,
+    autoResetPageIndex: false,
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onColumnVisibilityChange: setColumnVisibility,
     onRowSelectionChange: setRowSelection,
+    onPaginationChange: setPagination,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
