@@ -1,7 +1,6 @@
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
 import { useAppState } from "@/hooks/use-app-state";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import type { TaskState, Event } from "@/lib/types";
@@ -54,17 +53,7 @@ const ACTIVE_STATES: TaskState[] = [
 ];
 
 export function DashboardPage() {
-  const { snapshot, events, filteredTasks, filteredMergeQueue, selectedProject } = useAppState();
-
-  const runningCount = useMemo(
-    () => filteredTasks.filter((t) => t.state === "running").length,
-    [filteredTasks],
-  );
-
-  const waitingCount = useMemo(
-    () => filteredTasks.filter((t) => t.state === "waiting").length,
-    [filteredTasks],
-  );
+  const { snapshot, events, filteredTasks, selectedProject } = useAppState();
 
   const activeTasks = useMemo(
     () =>
@@ -101,60 +90,7 @@ export function DashboardPage() {
   // -----------------------------------------------------------------------
 
   return (
-    <div className="space-y-8 p-6">
-      {/* Stats cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Active Sessions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-base font-bold">
-              {snapshot.slot_utilization.active}
-              <span className="text-muted-foreground font-normal">
-                {" "}
-                / {snapshot.slot_utilization.max}
-              </span>
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Running Tasks
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-base font-bold">{runningCount}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Waiting Tasks
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-base font-bold">{waitingCount}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Merge Queue
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-base font-bold">{filteredMergeQueue.length}</p>
-          </CardContent>
-        </Card>
-      </div>
-
+    <div className="space-y-6 p-6">
       {/* Active Tasks */}
       <section>
         <h2 className="text-base font-semibold mb-3">Active Tasks</h2>
