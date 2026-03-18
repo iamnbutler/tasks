@@ -17,7 +17,7 @@ use server::model::merge_queue::MergeQueueEntry;
 use server::model::task::{TaskSource, TaskState};
 use server::{WorkflowConfigWatcher, RefreshResult};
 use tasks_github::client::GitHubClient;
-use tasks_github::model::IssueState;
+use tasks_github::model::{IssueState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::Orchestrator;
@@ -417,6 +417,109 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     task_id = %task_id,
                                     "added PR to merge queue"
                                 );
+                            }
+                        }
+
+                        // --- Detect external closures (spec §11.3) ---
+                        //
+                        // When a GitHub issue or PR is closed externally, transition the
+                        // corresponding task to a terminal state:
+                        // - Closed issue → Cancelled
+                        // - Merged PR → Completed
+                        // - Closed (not merged) PR → Cancelled
+                        //
+                        // Skip if:
+                        // - Task is already in a terminal state
+                        // - Task is Running (agent may have closed PR for rework)
+
+                        // Check closed issues
+                        for issue in &result.issues {
+                            if issue.state != IssueState::Closed {
+                                continue;
+                            }
+
+                            let source = TaskSource::GithubIssue {
+                                owner: issue.owner.clone(),
+                                repo: issue.repo.clone(),
+                                number: issue.number,
+                            };
+
+                            if let Some(task) = poll_server.get_task_for_source(&source).await {
+                                // Skip if already terminal or actively running
+                                if task.state.is_terminal() || task.state == TaskState::Running {
+                                    continue;
+                                }
+
+                                info!(
+                                    project = %project_id,
+                                    issue = issue.number,
+                                    task_id = %task.id,
+                                    "issue closed externally, cancelling task"
+                                );
+
+                                if let Err(e) = poll_server
+                                    .set_task_state(&task.id, TaskState::Cancelled, Actor::Scheduler)
+                                    .await
+                                {
+                                    error!(
+                                        task_id = %task.id,
+                                        error = %e,
+                                        "failed to cancel task for closed issue"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Check closed/merged PRs
+                        for pr in &result.pull_requests {
+                            let new_state = match pr.state {
+                                PullRequestState::Merged => Some(TaskState::Completed),
+                                PullRequestState::Closed => Some(TaskState::Cancelled),
+                                PullRequestState::Open => None,
+                            };
+
+                            let Some(target_state) = new_state else {
+                                continue;
+                            };
+
+                            let source = TaskSource::GithubPr {
+                                owner: pr.owner.clone(),
+                                repo: pr.repo.clone(),
+                                number: pr.number,
+                            };
+
+                            if let Some(task) = poll_server.get_task_for_source(&source).await {
+                                // Skip if already terminal or actively running
+                                if task.state.is_terminal() || task.state == TaskState::Running {
+                                    continue;
+                                }
+
+                                let action = if target_state == TaskState::Completed {
+                                    "merged"
+                                } else {
+                                    "closed"
+                                };
+
+                                info!(
+                                    project = %project_id,
+                                    pr = pr.number,
+                                    task_id = %task.id,
+                                    "PR {} externally, transitioning task to {:?}",
+                                    action,
+                                    target_state
+                                );
+
+                                if let Err(e) = poll_server
+                                    .set_task_state(&task.id, target_state, Actor::Scheduler)
+                                    .await
+                                {
+                                    error!(
+                                        task_id = %task.id,
+                                        error = %e,
+                                        "failed to update task for {} PR",
+                                        action
+                                    );
+                                }
                             }
                         }
                     }

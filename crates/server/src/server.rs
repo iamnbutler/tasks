@@ -379,6 +379,16 @@ impl Server {
             .map(|t| t.id.clone())
     }
 
+    /// Find a task by its GitHub source, if one exists.
+    ///
+    /// Returns the full task object for state inspection.
+    pub async fn get_task_for_source(&self, source: &TaskSource) -> Option<Task> {
+        let state = self.state.read().await;
+        state.tasks.values()
+            .find(|t| t.source == *source)
+            .cloned()
+    }
+
     /// Check if a PR URL is already in the merge queue.
     pub async fn has_merge_entry_for_pr(&self, pr_url: &str) -> bool {
         let state = self.state.read().await;
@@ -1821,5 +1831,81 @@ mod tests {
             .find_task_by_branch("tasks/gh-owner-repo-issue-123--abcd1234")
             .await;
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn get_task_for_source_returns_task_when_exists() {
+        let server = test_server().await;
+
+        // Add project
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Add task with GitHub issue source
+        let source = TaskSource::GithubIssue {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 42,
+        };
+        let task = Task::new("gh-owner-repo-issue-42", source.clone(), "Test issue", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Should find the task
+        let found = server.get_task_for_source(&source).await;
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.id, "gh-owner-repo-issue-42");
+        assert_eq!(found.source, source);
+    }
+
+    #[tokio::test]
+    async fn get_task_for_source_returns_none_when_not_exists() {
+        let server = test_server().await;
+
+        // Add project
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Query for non-existent source
+        let source = TaskSource::GithubIssue {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 999,
+        };
+
+        let found = server.get_task_for_source(&source).await;
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_task_for_source_distinguishes_pr_from_issue() {
+        let server = test_server().await;
+
+        // Add project
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Add task with GitHub issue source
+        let issue_source = TaskSource::GithubIssue {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 42,
+        };
+        let task = Task::new("gh-owner-repo-issue-42", issue_source.clone(), "Issue task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Query for PR with same number should not match
+        let pr_source = TaskSource::GithubPr {
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            number: 42,
+        };
+
+        let found = server.get_task_for_source(&pr_source).await;
+        assert!(found.is_none());
+
+        // Issue source should still match
+        let found = server.get_task_for_source(&issue_source).await;
+        assert!(found.is_some());
     }
 }
