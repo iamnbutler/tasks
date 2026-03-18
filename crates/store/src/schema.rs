@@ -53,8 +53,9 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         Ok(_) => {
             tracing::info!("added last_failure_json column to tasks table");
         }
-        Err(rusqlite::Error::SqliteFailure(e, _))
-            if e.extended_code == rusqlite::ffi::SQLITE_ERROR =>
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
         {
             // Column already exists — this is expected for existing databases
             tracing::debug!("last_failure_json column already exists");
