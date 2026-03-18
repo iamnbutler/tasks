@@ -166,6 +166,7 @@ impl Store {
                     pr_url,
                     status,
                     queued_at,
+                    conflict_info: None, // Not persisted to DB yet
                 }))
             }
             None => Ok(None),
@@ -201,6 +202,7 @@ impl Store {
                 pr_url,
                 status,
                 queued_at,
+                conflict_info: None, // Not persisted to DB yet
             });
         }
         Ok(entries)

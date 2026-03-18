@@ -2,7 +2,7 @@
 //!
 //! The orchestrator is an AI agent that evaluates merge queue entries
 //! for quality and provides feedback to implementor agents.
-//! See spec §4.2.
+//! See spec §4.2 (evaluation) and §7.4 (conflict triage).
 
 pub mod error;
 mod claude;
@@ -16,4 +16,7 @@ pub use error::OrchestratorError;
 pub use mock::MockOrchestrator;
 pub use orchestrator::Orchestrator;
 pub use prompt::parse_pr_url;
-pub use types::{EvaluationContext, QualityEvaluation};
+pub use types::{
+    ConflictContext, ConflictResolution, ConflictTriage, EvaluationContext, OperatingMode,
+    QualityEvaluation,
+};

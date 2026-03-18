@@ -14,6 +14,63 @@ pub enum MergeStatus {
     Conflict,
 }
 
+/// Type of merge conflict — spec Section 7.4.
+///
+/// The orchestrator uses this to decide resolution strategy:
+/// - Mechanical conflicts (NeedsRebase, TrivialMerge) can be resolved automatically
+/// - Source conflicts require agent re-engagement
+/// - Complex conflicts may need human guidance
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictType {
+    /// Branch is behind base branch — needs rebase (mechanical).
+    NeedsRebase,
+    /// Conflicts in generated/lock files only — can auto-resolve (mechanical).
+    TrivialMerge,
+    /// Conflicts in source code — needs agent re-engagement.
+    SourceConflict,
+    /// Extensive conflicts across many files — may need human guidance.
+    ComplexConflict,
+    /// GitHub hasn't computed mergeability yet.
+    Unknown,
+}
+
+impl ConflictType {
+    /// Returns true if this conflict type can be resolved mechanically.
+    pub fn is_mechanical(&self) -> bool {
+        matches!(self, ConflictType::NeedsRebase | ConflictType::TrivialMerge)
+    }
+}
+
+/// Detailed information about a merge conflict — spec Section 7.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    /// The type of conflict detected.
+    pub conflict_type: ConflictType,
+    /// Files involved in the conflict, if known.
+    pub conflicting_files: Vec<String>,
+    /// Human-readable description of the conflict.
+    pub description: String,
+    /// When the conflict was detected.
+    pub detected_at: DateTime<Utc>,
+}
+
+impl ConflictInfo {
+    pub fn new(conflict_type: ConflictType, description: impl Into<String>) -> Self {
+        Self {
+            conflict_type,
+            conflicting_files: Vec::new(),
+            description: description.into(),
+            detected_at: Utc::now(),
+        }
+    }
+
+    pub fn with_files(mut self, files: Vec<String>) -> Self {
+        self.conflicting_files = files;
+        self
+    }
+}
+
 /// A merge queue entry — a PR waiting to be merged.
 ///
 /// The merge queue is a list of PRs, ordered by when they were queued.
@@ -29,6 +86,9 @@ pub struct MergeQueueEntry {
     pub pr_url: String,
     pub status: MergeStatus,
     pub queued_at: DateTime<Utc>,
+    /// Conflict details when status is Conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_info: Option<ConflictInfo>,
 }
 
 impl MergeQueueEntry {
@@ -39,6 +99,62 @@ impl MergeQueueEntry {
             pr_url: pr_url.into(),
             status: MergeStatus::Pending,
             queued_at: Utc::now(),
+            conflict_info: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_type_is_mechanical() {
+        assert!(ConflictType::NeedsRebase.is_mechanical());
+        assert!(ConflictType::TrivialMerge.is_mechanical());
+        assert!(!ConflictType::SourceConflict.is_mechanical());
+        assert!(!ConflictType::ComplexConflict.is_mechanical());
+        assert!(!ConflictType::Unknown.is_mechanical());
+    }
+
+    #[test]
+    fn conflict_info_new() {
+        let info = ConflictInfo::new(ConflictType::SourceConflict, "test description");
+        assert_eq!(info.conflict_type, ConflictType::SourceConflict);
+        assert_eq!(info.description, "test description");
+        assert!(info.conflicting_files.is_empty());
+    }
+
+    #[test]
+    fn conflict_info_with_files() {
+        let info = ConflictInfo::new(ConflictType::SourceConflict, "test")
+            .with_files(vec!["src/main.rs".to_string(), "Cargo.toml".to_string()]);
+        assert_eq!(info.conflicting_files.len(), 2);
+        assert_eq!(info.conflicting_files[0], "src/main.rs");
+    }
+
+    #[test]
+    fn merge_queue_entry_with_conflict_info() {
+        let mut entry = MergeQueueEntry::new("mq-1", "task-1", "https://example.com/pr/1");
+        assert!(entry.conflict_info.is_none());
+
+        entry.conflict_info = Some(ConflictInfo::new(ConflictType::NeedsRebase, "behind base"));
+        assert!(entry.conflict_info.is_some());
+        assert_eq!(
+            entry.conflict_info.as_ref().unwrap().conflict_type,
+            ConflictType::NeedsRebase
+        );
+    }
+
+    #[test]
+    fn conflict_info_serializes() {
+        let info = ConflictInfo::new(ConflictType::SourceConflict, "test")
+            .with_files(vec!["src/lib.rs".to_string()]);
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("source_conflict"));
+        assert!(json.contains("src/lib.rs"));
+
+        let deserialized: ConflictInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.conflict_type, ConflictType::SourceConflict);
     }
 }

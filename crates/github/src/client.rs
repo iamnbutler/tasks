@@ -8,7 +8,8 @@ use serde_json::json;
 
 use crate::error::GitHubError;
 use crate::model::{
-    Issue, IssueFilters, IssueState, PullRequest, PullRequestFilters, PullRequestState, RateLimit,
+    Issue, IssueFilters, IssueState, MergeableState, PrMergeStatus, PullRequest,
+    PullRequestFilters, PullRequestState, RateLimit,
 };
 use crate::queries;
 use crate::response::*;
@@ -642,6 +643,125 @@ impl GitHubClient {
         Err(GitHubError::Decode(format!(
             "unexpected merge status {status}: {text}"
         )))
+    }
+
+    /// Check detailed PR merge status including conflict information.
+    ///
+    /// Returns a `PrMergeStatus` with:
+    /// - Basic mergeable state
+    /// - Whether the branch is behind base
+    /// - Which files are conflicting (if any)
+    ///
+    /// This is used for conflict triage (spec §7.4) to decide whether
+    /// conflicts can be resolved mechanically or need agent re-engagement.
+    pub async fn check_pr_merge_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrMergeStatus, GitHubError> {
+        // Use GraphQL to get detailed merge info including comparison
+        let query = r#"
+            query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                        mergeable
+                        headRef {
+                            name
+                            compare(headRef: "HEAD") {
+                                behindBy
+                            }
+                        }
+                        baseRef {
+                            name
+                        }
+                        files(first: 100) {
+                            nodes {
+                                path
+                            }
+                        }
+                    }
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "owner": owner,
+            "name": repo,
+            "number": number as i64,
+        });
+
+        let resp: crate::response::GraphQLResponse<serde_json::Value> =
+            self.execute(query, variables).await?;
+        let data = self.unwrap_data(resp)?;
+
+        let pr = data
+            .get("repository")
+            .and_then(|r| r.get("pullRequest"))
+            .ok_or_else(|| GitHubError::NotFound(format!("{owner}/{repo}#{number}")))?;
+
+        let mergeable_str = pr
+            .get("mergeable")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+
+        let mergeable = match mergeable_str {
+            "MERGEABLE" => MergeableState::Mergeable,
+            "CONFLICTING" => MergeableState::Conflicting,
+            _ => MergeableState::Unknown,
+        };
+
+        let head_ref = pr
+            .get("headRef")
+            .and_then(|h| h.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let base_ref = pr
+            .get("baseRef")
+            .and_then(|b| b.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("main")
+            .to_string();
+
+        let commits_behind = pr
+            .get("headRef")
+            .and_then(|h| h.get("compare"))
+            .and_then(|c| c.get("behindBy"))
+            .and_then(|b| b.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Get changed files (we'll need to determine conflicts separately)
+        let changed_files: Vec<String> = pr
+            .get("files")
+            .and_then(|f| f.get("nodes"))
+            .and_then(|n| n.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.get("path"))
+                    .filter_map(|p| p.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // For conflicting PRs, the changed files are potentially conflicting
+        // (GitHub doesn't expose exact conflict info via API)
+        let conflicting_files = if mergeable == MergeableState::Conflicting {
+            changed_files
+        } else {
+            Vec::new()
+        };
+
+        Ok(PrMergeStatus {
+            mergeable,
+            behind_base_branch: commits_behind > 0,
+            conflicting_files,
+            head_ref,
+            base_ref,
+            commits_behind,
+        })
     }
 
     // -----------------------------------------------------------------------

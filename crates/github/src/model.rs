@@ -110,6 +110,61 @@ pub enum MergeableState {
     Unknown,
 }
 
+/// Detailed PR merge status with conflict information.
+///
+/// This struct provides more detail than just `MergeableState`:
+/// - Whether the branch is behind base (needs rebase)
+/// - Which files are conflicting
+/// - Whether conflicts are in generated files vs source
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrMergeStatus {
+    /// Basic mergeable state from GitHub.
+    pub mergeable: MergeableState,
+    /// Whether the branch is behind the base branch.
+    pub behind_base_branch: bool,
+    /// Files with conflicts (if mergeable is Conflicting).
+    pub conflicting_files: Vec<String>,
+    /// The head ref name.
+    pub head_ref: String,
+    /// The base ref name.
+    pub base_ref: String,
+    /// Number of commits the branch is behind.
+    pub commits_behind: u32,
+}
+
+impl PrMergeStatus {
+    /// Returns true if this is a trivial conflict (only lock/generated files).
+    pub fn is_trivial_conflict(&self) -> bool {
+        if self.mergeable != MergeableState::Conflicting {
+            return false;
+        }
+        self.conflicting_files.iter().all(Self::is_generated_file)
+    }
+
+    /// Check if a file is generated/lock file that can be auto-resolved.
+    fn is_generated_file(path: &String) -> bool {
+        let path_lower = path.to_lowercase();
+        path_lower.ends_with("package-lock.json")
+            || path_lower.ends_with("yarn.lock")
+            || path_lower.ends_with("pnpm-lock.yaml")
+            || path_lower.ends_with("cargo.lock")
+            || path_lower.ends_with("go.sum")
+            || path_lower.ends_with("poetry.lock")
+            || path_lower.ends_with("composer.lock")
+            || path_lower.ends_with("gemfile.lock")
+            || path_lower.contains(".generated.")
+            || path_lower.contains("/generated/")
+            || path_lower.ends_with(".min.js")
+            || path_lower.ends_with(".min.css")
+    }
+
+    /// Returns true if the conflict is complex (many files or source files).
+    pub fn is_complex_conflict(&self) -> bool {
+        // More than 5 conflicting files is complex
+        self.conflicting_files.len() > 5
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReviewDecision {

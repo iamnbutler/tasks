@@ -4,7 +4,7 @@
 
 use thiserror::Error;
 
-use crate::model::merge_queue::{MergeQueueEntry, MergeStatus};
+use crate::model::merge_queue::{ConflictInfo, MergeQueueEntry, MergeStatus};
 use crate::mode::Mode;
 
 #[derive(Debug, Error)]
@@ -105,13 +105,38 @@ impl MergeQueue {
         Ok(())
     }
 
-    /// Mark an entry as conflicted (spec Section 7.4).
-    pub fn mark_conflict(&mut self, id: &str) -> Result<(), MergeQueueError> {
+    /// Mark an entry as conflicted with optional details (spec Section 7.4).
+    pub fn mark_conflict(
+        &mut self,
+        id: &str,
+        conflict_info: Option<ConflictInfo>,
+    ) -> Result<(), MergeQueueError> {
         let entry = self
             .get_mut(id)
             .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
         entry.status = MergeStatus::Conflict;
+        entry.conflict_info = conflict_info;
         Ok(())
+    }
+
+    /// Clear conflict status and info from an entry (after resolution).
+    pub fn clear_conflict(&mut self, id: &str) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        if entry.status == MergeStatus::Conflict {
+            entry.status = MergeStatus::Pending;
+            entry.conflict_info = None;
+        }
+        Ok(())
+    }
+
+    /// Get all entries with conflicts.
+    pub fn conflicting(&self) -> Vec<&MergeQueueEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == MergeStatus::Conflict)
+            .collect()
     }
 
     /// Flush: push through all approved entries (spec Section 6.2).
@@ -200,8 +225,48 @@ mod tests {
     fn conflict_not_eligible() {
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
-        q.mark_conflict("m1").unwrap();
+        q.mark_conflict("m1", None).unwrap();
         assert!(q.pending().is_empty());
+    }
+
+    #[test]
+    fn conflict_with_info() {
+        use crate::model::merge_queue::{ConflictInfo, ConflictType};
+
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+
+        let info = ConflictInfo::new(ConflictType::SourceConflict, "Files conflict");
+        q.mark_conflict("m1", Some(info)).unwrap();
+
+        let entry = q.get("m1").unwrap();
+        assert_eq!(entry.status, MergeStatus::Conflict);
+        assert!(entry.conflict_info.is_some());
+        assert_eq!(
+            entry.conflict_info.as_ref().unwrap().conflict_type,
+            ConflictType::SourceConflict
+        );
+    }
+
+    #[test]
+    fn clear_conflict() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.mark_conflict("m1", None).unwrap();
+        assert!(q.pending().is_empty());
+
+        q.clear_conflict("m1").unwrap();
+        assert_eq!(q.pending().len(), 1);
+    }
+
+    #[test]
+    fn list_conflicting() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+        q.mark_conflict("m1", None).unwrap();
+        assert_eq!(q.conflicting().len(), 1);
+        assert_eq!(q.conflicting()[0].id, "m1");
     }
 
     #[test]

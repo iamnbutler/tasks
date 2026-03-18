@@ -250,7 +250,7 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
                     }
                     Ok(false) => {
                         tracing::warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable during flush");
-                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url).await {
+                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url, None).await {
                             tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict after flush");
                         }
                     }
