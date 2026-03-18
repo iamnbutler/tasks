@@ -35,9 +35,13 @@ pub fn backoff_duration(retry_count: u32) -> Duration {
 ///
 /// `pending_answers` is the set of task IDs in Question state that have
 /// received a message (human or orchestrator). These are resume candidates.
+///
+/// `tasks_with_active_prs` is the set of task IDs that have an unclosed PR
+/// in the merge queue. These tasks are skipped since work is already in progress.
 pub fn evaluate(
     tasks: &HashMap<String, Task>,
     pending_answers: &[String],
+    tasks_with_active_prs: &std::collections::HashSet<String>,
     project_limits: &HashMap<String, u32>,
     global_max: u32,
 ) -> DispatchPlan {
@@ -67,11 +71,16 @@ pub fn evaluate(
         }
     }
 
-    // 3. Collect new work candidates: Waiting tasks with backoff elapsed.
+    // 3. Collect new work candidates: Waiting tasks with backoff elapsed
+    //    and no active PR in merge queue.
     let mut candidates: Vec<&Task> = tasks
         .values()
         .filter(|t| {
             if t.state != TaskState::Waiting {
+                return false;
+            }
+            // Skip tasks that already have an unclosed PR in the merge queue
+            if tasks_with_active_prs.contains(&t.id) {
                 return false;
             }
             // Check backoff
@@ -156,7 +165,7 @@ mod tests {
     use super::*;
     use crate::model::task::{Task, TaskSource, TaskState};
     use chrono::{Duration, Utc};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     /// Helper to create a minimal task in Waiting state.
     fn make_task(id: &str, project: &str) -> Task {
@@ -168,10 +177,15 @@ mod tests {
         map.insert(task.id.clone(), task);
     }
 
+    /// Helper for an empty active PRs set.
+    fn no_active_prs() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn empty_tasks_returns_empty_plan() {
         let tasks = HashMap::new();
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert!(plan.resume.is_empty());
         assert!(plan.new_work.is_empty());
     }
@@ -183,7 +197,7 @@ mod tests {
         t.state = TaskState::Question;
         insert(&mut tasks, t);
 
-        let plan = evaluate(&tasks, &["t1".to_string()], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &["t1".to_string()], &no_active_prs(), &HashMap::new(), 10);
         assert_eq!(plan.resume, vec!["t1"]);
     }
 
@@ -194,7 +208,7 @@ mod tests {
         t.state = TaskState::Question;
         insert(&mut tasks, t);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert!(plan.resume.is_empty());
     }
 
@@ -204,7 +218,7 @@ mod tests {
         let t = make_task("t1", "proj");
         insert(&mut tasks, t);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert_eq!(plan.new_work, vec!["t1"]);
     }
 
@@ -220,7 +234,7 @@ mod tests {
         t2.priority = Some(1);
         insert(&mut tasks, t2);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert_eq!(plan.new_work, vec!["t2", "t1"]);
     }
 
@@ -236,7 +250,7 @@ mod tests {
         t2.priority = Some(3);
         insert(&mut tasks, t2);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert_eq!(plan.new_work, vec!["t2", "t1"]);
     }
 
@@ -258,7 +272,7 @@ mod tests {
         t3.blocked_by = vec!["t1".to_string()];
         insert(&mut tasks, t3);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         // t1 unblocks t3, so t1 before t2. t3 is Blocked, not in new_work.
         assert_eq!(plan.new_work.len(), 2);
         assert_eq!(plan.new_work[0], "t1");
@@ -281,7 +295,7 @@ mod tests {
         t2.created_at = now;
         insert(&mut tasks, t2);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         // t2 is newer, so it sorts first at same priority.
         assert_eq!(plan.new_work, vec!["t2", "t1"]);
     }
@@ -292,7 +306,7 @@ mod tests {
         insert(&mut tasks, make_task("t1", "proj"));
         insert(&mut tasks, make_task("t2", "proj"));
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 1);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 1);
         assert_eq!(plan.new_work.len(), 1);
     }
 
@@ -305,7 +319,7 @@ mod tests {
         let mut project_limits = HashMap::new();
         project_limits.insert("proj".to_string(), 1);
 
-        let plan = evaluate(&tasks, &[], &project_limits, 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &project_limits, 10);
         assert_eq!(plan.new_work.len(), 1);
     }
 
@@ -320,7 +334,7 @@ mod tests {
         insert(&mut tasks, make_task("t1", "proj"));
         insert(&mut tasks, make_task("t2", "proj"));
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 2);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 2);
         // 1 Running occupies a slot, so only 1 new slot available.
         assert_eq!(plan.new_work.len(), 1);
     }
@@ -334,7 +348,7 @@ mod tests {
         t.last_failure_at = Some(Utc::now()); // just failed
         insert(&mut tasks, t);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         // Backoff for retry_count=1 is 10s, so this task should be excluded.
         assert!(plan.new_work.is_empty());
     }
@@ -355,7 +369,7 @@ mod tests {
         t3.state = TaskState::Cancelled;
         insert(&mut tasks, t3);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert!(plan.new_work.is_empty());
     }
 
@@ -383,7 +397,7 @@ mod tests {
         t.last_failure_at = Some(Utc::now() - Duration::seconds(20));
         insert(&mut tasks, t);
 
-        let plan = evaluate(&tasks, &[], &HashMap::new(), 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
         assert_eq!(plan.new_work, vec!["t1"]);
     }
 
@@ -399,7 +413,7 @@ mod tests {
         let mut project_limits = HashMap::new();
         project_limits.insert("projA".to_string(), 1);
 
-        let plan = evaluate(&tasks, &[], &project_limits, 10);
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &project_limits, 10);
         // projA limited to 1, projB unlimited → 1 from A + 1 from B = 2.
         assert_eq!(plan.new_work.len(), 2);
         // b1 should be in there.
@@ -429,10 +443,58 @@ mod tests {
         let plan = evaluate(
             &tasks,
             &["q1".to_string()],
+            &no_active_prs(),
             &HashMap::new(),
             2,
         );
         assert_eq!(plan.resume, vec!["q1"]);
         assert_eq!(plan.new_work, vec!["t1"]);
+    }
+
+    #[test]
+    fn task_with_active_pr_skipped() {
+        let mut tasks = HashMap::new();
+        insert(&mut tasks, make_task("t1", "proj"));
+        insert(&mut tasks, make_task("t2", "proj"));
+
+        // t1 has an active PR in the merge queue
+        let mut active_prs = HashSet::new();
+        active_prs.insert("t1".to_string());
+
+        let plan = evaluate(&tasks, &[], &active_prs, &HashMap::new(), 10);
+        // Only t2 should be in new_work, t1 is skipped
+        assert_eq!(plan.new_work, vec!["t2"]);
+    }
+
+    #[test]
+    fn multiple_tasks_with_active_prs_skipped() {
+        let mut tasks = HashMap::new();
+        insert(&mut tasks, make_task("t1", "proj"));
+        insert(&mut tasks, make_task("t2", "proj"));
+        insert(&mut tasks, make_task("t3", "proj"));
+
+        // t1 and t2 have active PRs
+        let mut active_prs = HashSet::new();
+        active_prs.insert("t1".to_string());
+        active_prs.insert("t2".to_string());
+
+        let plan = evaluate(&tasks, &[], &active_prs, &HashMap::new(), 10);
+        // Only t3 should be in new_work
+        assert_eq!(plan.new_work, vec!["t3"]);
+    }
+
+    #[test]
+    fn all_tasks_with_active_prs_returns_empty() {
+        let mut tasks = HashMap::new();
+        insert(&mut tasks, make_task("t1", "proj"));
+        insert(&mut tasks, make_task("t2", "proj"));
+
+        // Both tasks have active PRs
+        let mut active_prs = HashSet::new();
+        active_prs.insert("t1".to_string());
+        active_prs.insert("t2".to_string());
+
+        let plan = evaluate(&tasks, &[], &active_prs, &HashMap::new(), 10);
+        assert!(plan.new_work.is_empty());
     }
 }
