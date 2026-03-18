@@ -361,13 +361,13 @@ function OrchestratorView() {
           Orchestrator Activity
         </CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-col flex-1 min-h-0 gap-3">
+      <CardContent className="flex flex-col flex-1 min-h-0 gap-2">
         {/* Message stream */}
         <div className="relative flex-1 min-h-0">
           <div
             ref={scrollContainerRef}
             onScroll={handleScroll}
-            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-4 space-y-3"
+            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-3 space-y-2"
           >
             {blocks.length === 0 && (
               <div className="flex flex-col items-center justify-center h-full py-8 text-center">

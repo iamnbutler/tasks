@@ -89,7 +89,7 @@ export function MergeQueuePage() {
     <div className="p-4">
       {/* Toolbar */}
       {isPaused && (
-        <div className="flex items-center justify-end gap-3 mb-4">
+        <div className="flex items-center justify-end gap-2 mb-3">
           {approvedCount > 0 && (
             <span className="text-sm text-muted-foreground">
               {approvedCount} approved
@@ -150,7 +150,7 @@ export function MergeQueuePage() {
 
               {/* Pagination */}
               {table.getPageCount() > 1 && (
-                <div className="flex items-center justify-between px-4 py-3 border-t">
+                <div className="flex items-center justify-between px-3 py-2 border-t">
                   <span className="text-sm text-muted-foreground">
                     Page {table.getState().pagination.pageIndex + 1} of{" "}
                     {table.getPageCount()}
