@@ -66,6 +66,9 @@ export function MergeQueuePage() {
     columns,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
+    initialState: {
+      pagination: { pageSize: 50 },
+    },
     state: {
       // Hide project column when a specific project is selected
       columnVisibility: selectedProject ? { project: false } : {},
