@@ -3,7 +3,7 @@
 //! The long-running process that hosts the event log, task state,
 //! merge queue, scheduler, and serves the web GUI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use events::{Actor, Event, EventBus, EventType};
 
 use crate::merge_queue::MergeQueue;
+use crate::model::merge_queue::MergeStatus;
 use crate::mode::{Mode, ModeTransitionError};
 use crate::model::project::Project;
 use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
@@ -486,9 +487,26 @@ impl Server {
         };
 
         // 4. Call dispatcher::evaluate() with current tasks.
+        //    Build set of task IDs with unclosed PRs in merge queue (skip these).
         let plan = {
             let state = self.state.read().await;
-            dispatcher::evaluate(&state.tasks, pending_answers, &project_limits, global_max)
+            let tasks_with_active_prs: HashSet<String> = state
+                .merge_queue
+                .entries()
+                .iter()
+                .filter(|e| matches!(
+                    e.status,
+                    MergeStatus::Pending | MergeStatus::Approved | MergeStatus::Conflict
+                ))
+                .map(|e| e.task_id.clone())
+                .collect();
+            dispatcher::evaluate(
+                &state.tasks,
+                pending_answers,
+                &tasks_with_active_prs,
+                &project_limits,
+                global_max,
+            )
         };
 
         // 5. For each task in plan.new_work: transition to Running.
