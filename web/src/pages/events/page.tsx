@@ -86,7 +86,7 @@ export function EventsPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-2">
         {/* Filter buttons */}
         <div className="flex items-center gap-1.5 flex-wrap">
           {FILTERS.map(({ key, label }) => (

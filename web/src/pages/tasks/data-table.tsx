@@ -93,7 +93,7 @@ export function DataTable<TData extends Task, TValue>({
   });
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       <DataTableToolbar table={table as unknown as import("@tanstack/react-table").Table<Task>} projectIdToRepo={projectIdToRepo} />
       <div className="rounded-md border">
         <Table>

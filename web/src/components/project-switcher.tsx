@@ -194,7 +194,7 @@ export function ProjectSwitcher() {
               handleAdd();
             }}
           >
-            <div className="space-y-3 py-4">
+            <div className="space-y-2 py-3">
               <Input
                 placeholder="owner/repo"
                 value={newRepo}

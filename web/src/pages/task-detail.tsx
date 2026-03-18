@@ -484,13 +484,13 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
           Session
         </CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-col flex-1 min-h-0 gap-3">
+      <CardContent className="flex flex-col flex-1 min-h-0 gap-2">
         {/* Message stream */}
         <div className="relative flex-1 min-h-0">
           <div
             ref={scrollContainerRef}
             onScroll={handleScroll}
-            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-4 space-y-3"
+            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-3 space-y-2"
           >
             {blocks.length === 0 && (
               <p className="text-muted-foreground text-center py-8">
@@ -555,7 +555,7 @@ function FailureInfoCard({ failure }: { failure: FailureInfo }) {
           Last Failure
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-2">
         <dl className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-2 text-sm">
           <div>
             <dt className="text-muted-foreground">Type</dt>
@@ -685,7 +685,7 @@ export function TaskDetailPage() {
 
   if (!task) {
     return (
-      <div className="space-y-4 p-6">
+      <div className="space-y-3 p-4">
         <Link to="/tasks">
           <Button variant="ghost" size="sm" className="gap-1">
             <ArrowLeft className="h-4 w-4" />
@@ -698,7 +698,7 @@ export function TaskDetailPage() {
   }
 
   return (
-    <div className="flex flex-col h-full p-6 gap-4">
+    <div className="flex flex-col h-full p-4 gap-3">
       {/* Header */}
       <div className="flex items-start gap-3 shrink-0">
         <Link to="/tasks">
@@ -765,7 +765,7 @@ export function TaskDetailPage() {
         </button>
 
         {showDetails && (
-          <div className="mt-3 space-y-4">
+          <div className="mt-2 space-y-3">
             {/* Metadata */}
             <Card>
               <CardContent className="pt-4">

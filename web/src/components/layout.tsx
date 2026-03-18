@@ -18,9 +18,9 @@ export function Layout() {
   return (
     <div className="flex h-screen bg-background text-foreground">
       {/* Sidebar */}
-      <aside className="flex w-52 flex-col border-r border-border bg-background">
+      <aside className="flex w-48 flex-col border-r border-border bg-background">
         {/* Header: title + mode control */}
-        <div className="flex items-center justify-between border-b border-border px-3 py-3">
+        <div className="flex items-center justify-between border-b border-border px-3 py-2">
           <h1 className="text-base font-bold tracking-tight">Tasks</h1>
           <ModeControl />
         </div>
@@ -53,7 +53,7 @@ export function Layout() {
         </nav>
 
         {/* Connection status */}
-        <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
+        <div className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">
           <div className="flex items-center gap-1.5">
             <span
               className={cn(
