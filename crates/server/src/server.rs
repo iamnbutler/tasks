@@ -15,7 +15,7 @@ use events::{Actor, Event, EventBus, EventType};
 use crate::merge_queue::MergeQueue;
 use crate::mode::{Mode, ModeTransitionError};
 use crate::model::project::Project;
-use crate::model::task::{Task, TaskSource, TaskState};
+use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
 use crate::presence::PresenceTracker;
 
@@ -844,11 +844,16 @@ impl Server {
     ///
     /// Returns `true` if the task will be retried (transitioned to Waiting),
     /// `false` if it transitioned to Failed.
+    ///
+    /// The optional `failure_info` parameter contains detailed diagnosis from
+    /// the session (spec §13.4). When provided, it is stored with the task for
+    /// surfacing in the UI and retry prompt context.
     pub async fn handle_task_failure(
         &self,
         task_id: &str,
         made_progress: bool,
         max_retries: u32,
+        failure_info: Option<FailureInfo>,
     ) -> Result<bool, ServerError> {
         let now = chrono::Utc::now();
 
@@ -858,6 +863,9 @@ impl Server {
                 .tasks
                 .get_mut(task_id)
                 .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+            // Store failure info for UI and retry context (spec §13.4)
+            task.last_failure = failure_info.clone();
 
             if made_progress {
                 // Progress was made — this is a transient failure.
@@ -887,6 +895,7 @@ impl Server {
                         "reason": "session_failure",
                         "made_progress": true,
                         "retry_count_reset": true,
+                        "failure_info": failure_info,
                     }),
                 )
             } else {
@@ -919,6 +928,7 @@ impl Server {
                             "reason": "session_failure",
                             "made_progress": false,
                             "retry_count": task.retry_count,
+                            "failure_info": failure_info,
                         }),
                     )
                 } else {
@@ -946,6 +956,7 @@ impl Server {
                             "made_progress": false,
                             "retries_exhausted": true,
                             "retry_count": task.retry_count,
+                            "failure_info": failure_info,
                         }),
                     )
                 }
@@ -1436,7 +1447,7 @@ mod tests {
 
         // Handle failure with progress made
         let will_retry = server
-            .handle_task_failure("task-1", true, 3)
+            .handle_task_failure("task-1", true, 3, None)
             .await
             .unwrap();
 
@@ -1464,7 +1475,7 @@ mod tests {
 
         // Handle failure without progress
         let will_retry = server
-            .handle_task_failure("task-1", false, 3)
+            .handle_task_failure("task-1", false, 3, None)
             .await
             .unwrap();
 
@@ -1493,7 +1504,7 @@ mod tests {
 
         // Handle failure without progress
         let will_retry = server
-            .handle_task_failure("task-1", false, 3)
+            .handle_task_failure("task-1", false, 3, None)
             .await
             .unwrap();
 
@@ -1523,7 +1534,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Failure with progress → should emit TaskStateWaiting
-        server.handle_task_failure("task-1", true, 3).await.unwrap();
+        server.handle_task_failure("task-1", true, 3, None).await.unwrap();
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event.event_type, EventType::TaskStateWaiting);
@@ -1548,7 +1559,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Failure without progress at max retries → should emit TaskStateFailed
-        server.handle_task_failure("task-1", false, 3).await.unwrap();
+        server.handle_task_failure("task-1", false, 3, None).await.unwrap();
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event.event_type, EventType::TaskStateFailed);
@@ -1560,7 +1571,7 @@ mod tests {
         let server = test_server().await;
 
         // Try to handle failure for a task that doesn't exist
-        let result = server.handle_task_failure("nonexistent", true, 3).await;
+        let result = server.handle_task_failure("nonexistent", true, 3, None).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ServerError::TaskNotFound(_)));

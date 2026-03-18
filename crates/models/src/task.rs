@@ -3,6 +3,39 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Failure classification — spec Section 13.1.
+///
+/// The system categorizes failures to determine the appropriate response:
+/// - Transient: temporary problems likely to resolve on retry
+/// - Deterministic: problems that will recur with the same inputs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureType {
+    /// Temporary problems: rate limits, network issues, resource exhaustion, OOM kills.
+    Transient,
+    /// Persistent problems: code errors, invalid config, missing dependencies.
+    Deterministic,
+}
+
+/// Detailed failure information — spec Section 13.4.
+///
+/// Captured when a session fails to provide context for debugging and retries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureInfo {
+    /// Exit code from the agent process, if available.
+    pub exit_code: Option<i32>,
+    /// Signal that terminated the process, if applicable (e.g., "9" or "SIGKILL").
+    pub signal: Option<String>,
+    /// How long the session ran before failing (seconds).
+    pub duration_secs: u64,
+    /// Last lines of stderr output (rolling buffer, max 50 lines).
+    pub stderr_tail: Vec<String>,
+    /// Classification of the failure.
+    pub failure_type: FailureType,
+    /// Human-readable summary of the failure.
+    pub summary: String,
+}
+
 /// Origin reference for a task (spec Section 5.1 `source` field).
 ///
 /// A task may originate from a GitHub issue, a GitHub PR, or be created
@@ -89,6 +122,8 @@ pub struct Task {
     pub retry_count: u32,
     /// When the most recent failure occurred (spec §13.2).
     pub last_failure_at: Option<DateTime<Utc>>,
+    /// Detailed information about the last failure (spec §13.4).
+    pub last_failure: Option<FailureInfo>,
     /// When the source (GitHub issue/PR) was created. Used for dispatch ordering.
     pub source_created_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -119,6 +154,7 @@ impl Task {
             workspace_id: None,
             retry_count: 0,
             last_failure_at: None,
+            last_failure: None,
             source_created_at: None,
             created_at: now,
             updated_at: now,
@@ -129,5 +165,138 @@ impl Task {
     pub fn set_state(&mut self, state: TaskState) {
         self.state = state;
         self.updated_at = Utc::now();
+    }
+}
+
+impl FailureInfo {
+    /// Classify a session failure based on exit code, signal, and duration.
+    ///
+    /// Per spec §13.1:
+    /// - Transient: rate limits, network issues, resource exhaustion, OOM kills (signal 9)
+    /// - Deterministic: code errors, invalid config, missing dependencies
+    /// - "Making progress" = agent ran >= progress_threshold_secs
+    pub fn classify(
+        exit_code: Option<i32>,
+        signal: Option<String>,
+        duration_secs: u64,
+        progress_threshold_secs: u64,
+        stderr_tail: Vec<String>,
+    ) -> Self {
+        let made_progress = duration_secs >= progress_threshold_secs;
+
+        // Parse signal string to number if possible
+        let signal_num = signal.as_ref().and_then(|s| {
+            s.parse::<i32>().ok().or_else(|| {
+                // Try to parse common signal names
+                match s.to_uppercase().as_str() {
+                    "SIGKILL" | "KILL" => Some(9),
+                    "SIGTERM" | "TERM" => Some(15),
+                    "SIGINT" | "INT" => Some(2),
+                    "SIGSEGV" | "SEGV" => Some(11),
+                    "SIGABRT" | "ABRT" => Some(6),
+                    _ => None,
+                }
+            })
+        });
+
+        // Determine failure type based on exit code, signal, and progress
+        let (failure_type, summary) = match (exit_code, signal_num) {
+            // OOM kill (signal 9) is transient
+            (_, Some(9)) => (
+                FailureType::Transient,
+                "Process killed by OOM killer (signal 9)".to_string(),
+            ),
+            // SIGTERM (15) from timeout is transient
+            (_, Some(15)) => (
+                FailureType::Transient,
+                "Process terminated by signal 15 (SIGTERM)".to_string(),
+            ),
+            // If progress was made, treat as transient (may have hit edge case)
+            _ if made_progress => (
+                FailureType::Transient,
+                format!("Session ran for {duration_secs}s before failing"),
+            ),
+            // Exit code 1 without progress is likely a code error
+            (Some(1), _) => (
+                FailureType::Deterministic,
+                "Process exited with code 1 (error)".to_string(),
+            ),
+            // Exit code 2 is often invalid arguments/config
+            (Some(2), _) => (
+                FailureType::Deterministic,
+                "Process exited with code 2 (invalid arguments)".to_string(),
+            ),
+            // Exit code 127 is command not found
+            (Some(127), _) => (
+                FailureType::Deterministic,
+                "Process exited with code 127 (command not found)".to_string(),
+            ),
+            // Exit code 126 is permission denied
+            (Some(126), _) => (
+                FailureType::Deterministic,
+                "Process exited with code 126 (permission denied)".to_string(),
+            ),
+            // Other non-zero exits without progress are deterministic
+            (Some(code), _) if code != 0 => (
+                FailureType::Deterministic,
+                format!("Process exited with code {code}"),
+            ),
+            // Unknown failure
+            _ => (
+                FailureType::Transient,
+                "Unknown failure (no exit code or signal)".to_string(),
+            ),
+        };
+
+        Self {
+            exit_code,
+            signal,
+            duration_secs,
+            stderr_tail,
+            failure_type,
+            summary,
+        }
+    }
+
+    /// Check for transient patterns in stderr (rate limits, network errors).
+    ///
+    /// Call this after initial classification to potentially upgrade
+    /// a deterministic failure to transient if stderr indicates a
+    /// recoverable issue.
+    pub fn check_stderr_for_transient_patterns(&mut self) {
+        let stderr_text = self.stderr_tail.join("\n").to_lowercase();
+
+        // Patterns that indicate transient failures
+        let transient_patterns = [
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "429",
+            "timeout",
+            "timed out",
+            "connection refused",
+            "connection reset",
+            "network unreachable",
+            "dns",
+            "econnrefused",
+            "econnreset",
+            "etimedout",
+            "resource temporarily unavailable",
+            "out of memory",
+            "oom",
+            "no space left on device",
+            "disk quota exceeded",
+        ];
+
+        for pattern in transient_patterns {
+            if stderr_text.contains(pattern) {
+                self.failure_type = FailureType::Transient;
+                self.summary = format!(
+                    "{} (detected transient pattern: {})",
+                    self.summary, pattern
+                );
+                return;
+            }
+        }
     }
 }

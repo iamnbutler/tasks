@@ -3,7 +3,7 @@
 //! Manages active container sessions. Spawns containers, monitors agent
 //! output, maps supervisor events to platform events, and enforces time limits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,11 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use events::EventBus;
+use models::task::FailureInfo;
 use runtime::{ContainerConfig, ContainerRuntime};
+
+/// Maximum number of stderr lines to keep in the rolling buffer.
+const MAX_STDERR_LINES: usize = 50;
 
 use crate::interpreter::{emit_signal_events, OutputInterpreter, OutputSignal};
 
@@ -284,6 +288,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     // Output interpreter for state detection (spec §9.3)
     let mut interpreter = OutputInterpreter::new();
 
+    // Rolling stderr buffer for failure diagnosis (spec §13.4)
+    let mut stderr_buffer: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_LINES);
+
     // Wrap session for shared access between blocking recv thread and async command handler
     let session = Arc::new(std::sync::Mutex::new(session));
     let session_recv = session.clone();
@@ -316,13 +323,25 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     loop {
         tokio::select! {
             Some(supervisor_event) = event_rx.recv() => {
+                // Capture stderr into rolling buffer for failure diagnosis (spec §13.4)
+                if let runtime::protocol::Event::AgentStderr(ref stderr) = supervisor_event {
+                    for line in stderr.data.lines() {
+                        if stderr_buffer.len() >= MAX_STDERR_LINES {
+                            stderr_buffer.pop_front();
+                        }
+                        stderr_buffer.push_back(line.to_string());
+                    }
+                }
+
                 // Map and publish platform events, including output interpretation (spec §9.3)
                 handle_supervisor_event(&task_id, &supervisor_event, &event_bus, &mut interpreter).await;
 
                 // Check for agent exit
                 if let runtime::protocol::Event::AgentExit(ref exit) = supervisor_event {
-                    let ran_long_enough = started_at.elapsed() >= progress_threshold;
-                    handle_exit(&task_id, exit, ran_long_enough, &event_bus).await;
+                    let duration_secs = started_at.elapsed().as_secs();
+                    let progress_threshold_secs = progress_threshold.as_secs();
+                    let stderr_tail: Vec<String> = stderr_buffer.iter().cloned().collect();
+                    handle_exit(&task_id, exit, duration_secs, progress_threshold_secs, stderr_tail, &event_bus).await;
                     break;
                 }
             }
@@ -511,14 +530,17 @@ async fn handle_supervisor_event(
     }
 }
 
-/// Handle an agent exit event — publish success or failure.
+/// Handle an agent exit event — publish success or failure with diagnosis (spec §13.4).
 async fn handle_exit(
     task_id: &str,
     exit: &runtime::protocol::AgentExitEvent,
-    made_progress: bool,
+    duration_secs: u64,
+    progress_threshold_secs: u64,
+    stderr_tail: Vec<String>,
     event_bus: &EventBus,
 ) {
     let success = exit.code == Some(0);
+    let made_progress = duration_secs >= progress_threshold_secs;
 
     let (event_type, data) = if success {
         (
@@ -526,12 +548,26 @@ async fn handle_exit(
             serde_json::json!({ "exit_code": 0 }),
         )
     } else {
+        // Classify the failure and include diagnosis info (spec §13.1, §13.4)
+        let mut failure_info = FailureInfo::classify(
+            exit.code,
+            exit.signal.clone(),
+            duration_secs,
+            progress_threshold_secs,
+            stderr_tail,
+        );
+
+        // Check stderr for transient patterns (rate limits, network errors)
+        failure_info.check_stderr_for_transient_patterns();
+
         (
             events::EventType::TaskStateFailed,
             serde_json::json!({
                 "exit_code": exit.code,
                 "signal": exit.signal,
                 "made_progress": made_progress,
+                "duration_secs": duration_secs,
+                "failure_info": failure_info,
             }),
         )
     };
@@ -633,7 +669,7 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, 120, 60, vec![], &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateAwaitingMerge);
@@ -648,7 +684,8 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        // Short duration (30s) below progress threshold (60s) -> no progress
+        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -663,7 +700,8 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, true, &bus).await;
+        // Duration (120s) >= progress threshold (60s) -> made progress
+        handle_exit("task-1", &exit, 120, 60, vec![], &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -681,10 +719,65 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, false, &bus).await;
+        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.actor, events::Actor::Agent);
+    }
+
+    #[tokio::test]
+    async fn exit_includes_failure_info() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+        let stderr = vec!["error: something went wrong".to_string()];
+
+        handle_exit("task-1", &exit, 30, 60, stderr, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.event_type, events::EventType::TaskStateFailed);
+
+        // Check failure_info is present
+        let failure_info = &received.data["failure_info"];
+        assert_eq!(failure_info["exit_code"], 1);
+        assert_eq!(failure_info["duration_secs"], 30);
+        assert_eq!(failure_info["failure_type"], "deterministic");
+        assert_eq!(failure_info["stderr_tail"][0], "error: something went wrong");
+    }
+
+    #[tokio::test]
+    async fn exit_detects_transient_rate_limit() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: Some(1),
+            signal: None,
+        };
+        let stderr = vec!["API error: rate limit exceeded (429)".to_string()];
+
+        handle_exit("task-1", &exit, 30, 60, stderr, &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        let failure_info = &received.data["failure_info"];
+        // Should be upgraded to transient due to rate limit pattern in stderr
+        assert_eq!(failure_info["failure_type"], "transient");
+    }
+
+    #[tokio::test]
+    async fn exit_oom_is_transient() {
+        let (bus, mut rx) = test_event_bus().await;
+        let exit = runtime::protocol::AgentExitEvent {
+            code: None,
+            signal: Some("9".to_string()),
+        };
+
+        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
+
+        let received = rx.recv().await.unwrap();
+        let failure_info = &received.data["failure_info"];
+        assert_eq!(failure_info["failure_type"], "transient");
+        assert!(failure_info["summary"].as_str().unwrap().contains("OOM"));
     }
 
     #[tokio::test]

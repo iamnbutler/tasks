@@ -28,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { Event, Task, TaskState } from "@/lib/types";
+import type { Event, FailureInfo, Task, TaskState } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // State badge
@@ -449,6 +449,86 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
 }
 
 // ---------------------------------------------------------------------------
+// Failure info display
+// ---------------------------------------------------------------------------
+
+function FailureInfoCard({ failure }: { failure: FailureInfo }) {
+  const [stderrExpanded, setStderrExpanded] = useState(false);
+  const hasStderr = failure.stderr_tail.length > 0;
+
+  return (
+    <Card className="border-red-500/30">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium text-red-400">
+          Last Failure
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <dl className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-2 text-sm">
+          <div>
+            <dt className="text-muted-foreground">Type</dt>
+            <dd className="font-medium">
+              <Badge
+                variant="outline"
+                className={cn(
+                  failure.failure_type === "transient"
+                    ? "border-yellow-500/50 text-yellow-400"
+                    : "border-red-500/50 text-red-400"
+                )}
+              >
+                {failure.failure_type}
+              </Badge>
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Duration</dt>
+            <dd className="font-medium">{failure.duration_secs}s</dd>
+          </div>
+          {failure.exit_code !== null && (
+            <div>
+              <dt className="text-muted-foreground">Exit Code</dt>
+              <dd className="font-mono">{failure.exit_code}</dd>
+            </div>
+          )}
+          {failure.signal && (
+            <div>
+              <dt className="text-muted-foreground">Signal</dt>
+              <dd className="font-mono">{failure.signal}</dd>
+            </div>
+          )}
+        </dl>
+
+        <div>
+          <p className="text-sm text-muted-foreground">{failure.summary}</p>
+        </div>
+
+        {hasStderr && (
+          <div className="space-y-1">
+            <button
+              onClick={() => setStderrExpanded(!stderrExpanded)}
+              className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {stderrExpanded ? (
+                <ChevronDown className="h-4 w-4" />
+              ) : (
+                <ChevronRight className="h-4 w-4" />
+              )}
+              <Terminal className="h-3 w-3" />
+              Stderr ({failure.stderr_tail.length} lines)
+            </button>
+            {stderrExpanded && (
+              <pre className="text-xs font-mono bg-muted/50 rounded-md p-3 overflow-x-auto max-h-48 overflow-y-auto text-red-300/80">
+                {failure.stderr_tail.join("\n")}
+              </pre>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Event data preview
 // ---------------------------------------------------------------------------
 
@@ -660,6 +740,11 @@ export function TaskDetailPage() {
                 </dl>
               </CardContent>
             </Card>
+
+            {/* Failure info — shown when task has failed or has last_failure */}
+            {task.last_failure && (
+              <FailureInfoCard failure={task.last_failure} />
+            )}
 
             {/* Description */}
             {task.description && (
