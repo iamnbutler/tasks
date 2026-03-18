@@ -167,3 +167,175 @@ pub fn streaming_from_complete(response: Response) -> mpsc::UnboundedReceiver<St
 
     rx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{Content, Role, StopReason, Usage};
+
+    #[test]
+    fn completion_config_default() {
+        let config = CompletionConfig::default();
+        assert!(config.model.is_empty());
+        assert_eq!(config.max_tokens, 4096);
+        assert!(config.temperature.is_none());
+        assert!(config.top_p.is_none());
+        assert!(config.stop_sequences.is_empty());
+    }
+
+    #[test]
+    fn completion_config_new() {
+        let config = CompletionConfig::new("claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.max_tokens, 4096);
+    }
+
+    #[test]
+    fn completion_config_builder_pattern() {
+        let config = CompletionConfig::new("claude-sonnet-4-20250514")
+            .with_max_tokens(8192)
+            .with_temperature(0.7);
+
+        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.max_tokens, 8192);
+        assert_eq!(config.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn completion_config_serialization() {
+        let config = CompletionConfig::new("claude-sonnet-4-20250514")
+            .with_max_tokens(2048)
+            .with_temperature(0.5);
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"model\":\"claude-sonnet-4-20250514\""));
+        assert!(json.contains("\"max_tokens\":2048"));
+        assert!(json.contains("\"temperature\":0.5"));
+    }
+
+    #[test]
+    fn completion_config_deserialization() {
+        let json = r#"{
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "temperature": 0.8
+        }"#;
+
+        let config: CompletionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.max_tokens, 1024);
+        assert_eq!(config.temperature, Some(0.8));
+    }
+
+    #[test]
+    fn completion_config_deserialization_defaults() {
+        let json = r#"{"model": "test-model"}"#;
+
+        let config: CompletionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.model, "test-model");
+        assert_eq!(config.max_tokens, 4096); // default
+        assert!(config.temperature.is_none());
+    }
+
+    #[test]
+    fn completion_request_new() {
+        let config = CompletionConfig::new("test-model");
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![Content::text("Hello")],
+        }];
+
+        let request = CompletionRequest::new(config, messages);
+        assert_eq!(request.config.model, "test-model");
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.system.is_none());
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn completion_request_builder_pattern() {
+        let config = CompletionConfig::new("test-model");
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![Content::text("Hello")],
+        }];
+
+        let request = CompletionRequest::new(config, messages)
+            .with_system("You are a helpful assistant.")
+            .with_tools(vec![]);
+
+        assert_eq!(request.system, Some("You are a helpful assistant.".to_string()));
+    }
+
+    #[test]
+    fn streaming_from_complete_text() {
+        let response = Response {
+            content: vec![Content::text("Hello, world!")],
+            tool_calls: vec![],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Some(Usage::default()),
+        };
+
+        let mut rx = streaming_from_complete(response);
+
+        // Should receive text chunk
+        let chunk = rx.try_recv().unwrap();
+        match chunk {
+            StreamChunk::Text(text) => assert_eq!(text, "Hello, world!"),
+            _ => panic!("Expected Text chunk"),
+        }
+
+        // Should receive complete chunk
+        let chunk = rx.try_recv().unwrap();
+        assert!(matches!(chunk, StreamChunk::Complete(_)));
+    }
+
+    #[test]
+    fn streaming_from_complete_thinking() {
+        let response = Response {
+            content: vec![
+                Content::thinking("Let me think..."),
+                Content::text("The answer is 42."),
+            ],
+            tool_calls: vec![],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Some(Usage::default()),
+        };
+
+        let mut rx = streaming_from_complete(response);
+
+        // Should receive thinking chunk
+        let chunk = rx.try_recv().unwrap();
+        match chunk {
+            StreamChunk::Thinking(text) => assert_eq!(text, "Let me think..."),
+            _ => panic!("Expected Thinking chunk"),
+        }
+
+        // Should receive text chunk
+        let chunk = rx.try_recv().unwrap();
+        match chunk {
+            StreamChunk::Text(text) => assert_eq!(text, "The answer is 42."),
+            _ => panic!("Expected Text chunk"),
+        }
+
+        // Should receive complete chunk
+        let chunk = rx.try_recv().unwrap();
+        assert!(matches!(chunk, StreamChunk::Complete(_)));
+    }
+
+    #[test]
+    fn streaming_from_complete_empty_response() {
+        let response = Response {
+            content: vec![],
+            tool_calls: vec![],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Some(Usage::default()),
+        };
+
+        let mut rx = streaming_from_complete(response);
+
+        // Should only receive complete chunk
+        let chunk = rx.try_recv().unwrap();
+        assert!(matches!(chunk, StreamChunk::Complete(_)));
+    }
+}
