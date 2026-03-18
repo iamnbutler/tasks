@@ -23,8 +23,13 @@ cd tasks
 cp .env.example .env
 # Edit .env — set GITHUB_TOKEN and ANTHROPIC_API_KEY
 
-# Build the container image (required for agent sessions)
-container build --dns 8.8.8.8 -f src/runtime/Dockerfile -t tasks-agent:latest .
+# Install cross-compilation toolchain (one-time setup)
+brew tap messense/macos-cross-toolchains
+brew install aarch64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+
+# Build the container image (cross-compiles supervisor + builds image)
+make container-image
 
 # Build the web frontend
 bun install && bun web build
