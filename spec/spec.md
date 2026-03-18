@@ -119,7 +119,7 @@ read-write, queried by various fields (e.g., "all tasks in waiting state for pro
 must survive server restarts. Stored in a local embedded database (SQLite). The database is
 the source of truth for current state.
 
-**Event log.** The append-only record of everything that happened (spec §8). Events are written
+**Event log.** The append-only record of everything that happened (spec §9). Events are written
 sequentially and read sequentially (replay, live subscriptions). Stored as per-task JSONL files
 on the local filesystem. The event log is the audit trail — it can reconstruct state, but the
 database is the primary read path for current state.
@@ -278,7 +278,7 @@ break a large issue into smaller pieces of work.
 
 ### 5.4 Session
 
-_See Section 9 for full session specification._
+_See Section 10 for full session specification._
 
 Fields:
 
@@ -431,20 +431,145 @@ When a pending merge has conflicts:
   - In Pause mode or when the human is present: the orchestrator surfaces non-trivial conflicts
     to the human for guidance. Mechanical conflicts are resolved by the orchestrator directly.
 
-## 8. Event System
+## 8. Reflections
+
+Reflections are a post-merge review stage. After pull requests are merged, they enter a reflection
+window where the human can review the merged changes asynchronously and provide feedback.
+
+Reflections address a timing gap in the merge queue model: the human may not always be present when
+work is evaluated and merged, especially in Play mode. Reflections provide a second chance to
+review merged changes, flag concerns, and create a feedback loop that improves future work.
+
+### 8.1 Purpose
+
+Reflections serve several purposes:
+
+- **Async review.** Comment on merged changes that slipped through the queue before the human could
+  review them in real-time.
+- **Post-merge analysis.** Raise security, performance, or architectural concerns after seeing the
+  code in context of the merged codebase.
+- **Feedback loop.** Provide input that shapes how the orchestrator evaluates and guides future
+  tasks (e.g., "in past reflections, X approach was flagged as problematic").
+- **Questioning approaches.** Challenge design decisions or implementation choices with the benefit
+  of hindsight.
+
+### 8.2 Reflection Model (Phase 1)
+
+In the initial implementation, reflections are GitHub issues with a special label.
+
+**Implementation:**
+
+- Reflections are issues labeled with `reflection` (or a configurable label).
+- The `reflection` label is added to the workflow configuration's `[labels].ignore` list, so
+  reflection issues are not imported as tasks. They exist for review and discussion only.
+- The UI includes a Reflections tab that displays issues with the reflection label, filtered
+  separately from the task list.
+- Reflections reference the merged PR they pertain to (via link in the issue body or title).
+
+**Creating reflections:**
+
+- The human creates a reflection issue manually, linking it to the merged PR or commit range.
+- The issue body contains the human's observations, questions, or concerns.
+
+**Workflow configuration:**
+
+```toml
+[labels]
+ignore = ["wontfix", "duplicate", "ignore", "reflection"]
+
+[reflections]
+label = "reflection"  # The label that marks an issue as a reflection (default: "reflection")
+```
+
+### 8.3 Reflection Lifecycle
+
+Reflections are simpler than tasks — they do not trigger agent sessions or enter a dispatch queue.
+
+1. **Creation.** A reflection issue is created (manually by the human, or automatically in Phase 2).
+2. **Discussion.** The human and orchestrator discuss the reflection. The orchestrator may provide
+   context about why certain decisions were made, reference the original task, or acknowledge the
+   feedback.
+3. **Resolution.** The human closes the reflection when satisfied. Resolution options:
+   - **Acknowledged** — feedback noted, no action needed.
+   - **Action taken** — a follow-up task was created to address the concern.
+   - **Deferred** — valid concern, but not worth addressing now.
+4. **Archival.** Closed reflections remain in the repository history and can be referenced in
+   future task prompts.
+
+### 8.4 Design Decisions
+
+**Reflections do not block future work.** Reflections are advisory, not blocking. A reflection
+flagging a concern about area X does not prevent new tasks from working on area X. If the concern
+is severe enough to warrant blocking, the human should create a regular issue or mark existing
+tasks as blocked.
+
+Rationale: blocking on reflections would create an approval bottleneck that undermines the
+system's autonomy model. Reflections are a feedback mechanism, not a gate.
+
+**No automatic reflection window.** Reflections can be created at any time after a PR merges.
+There is no automatic "reflection period" during which merges are held or flagged. The human
+reviews merged work at their own pace.
+
+Rationale: a mandatory window would slow down Play mode without clear benefit. The human can
+always review the merge queue history and merged PR list.
+
+**Orchestrator cannot create reflections autonomously (Phase 1).** In the initial implementation,
+only the human creates reflections. The orchestrator can respond to reflections in conversation
+and reference past reflection feedback when evaluating tasks, but it does not initiate the
+reflection process.
+
+Rationale: reflections are a human review mechanism. Having the orchestrator create them would
+defeat the purpose. In future phases, the orchestrator may flag items for human reflection.
+
+### 8.5 Future Extensions
+
+**Phase 2: Auto-populated reflections.** When a PR merges, the system automatically creates a
+reflection issue pre-populated with:
+
+- The PR title and link
+- A summary of the diff (generated by the orchestrator)
+- The merge queue evaluation notes (what the orchestrator checked, what it approved)
+- Links to the original task and issue
+
+The human can then review this pre-populated reflection, add comments, or close it without
+action if the change looks good. This reduces the friction of creating reflections while
+maintaining human control over the review process.
+
+**Phase 3: Feedback integration.** Reflection feedback is incorporated into the orchestrator's
+context for future task evaluation:
+
+- When evaluating a new task or PR, the orchestrator retrieves relevant past reflections
+  (by area of code, author, type of change) and factors them into its assessment.
+- Patterns from reflections (e.g., "security concerns in auth code are frequently flagged")
+  are summarized and included in agent prompts for related tasks.
+- The system tracks whether feedback from reflections was acted upon or acknowledged.
+
+### 8.6 Reflection Events
+
+Reflections integrate with the event system through a small set of events:
+
+- `reflection:created` — a new reflection issue was detected
+- `reflection:comment` — a comment was added to a reflection
+- `reflection:closed` — a reflection was resolved
+
+These events are informational — they trigger no automatic actions in the dispatch system or
+merge queue. They allow the UI to display reflection activity and the orchestrator to
+maintain awareness of ongoing review discussions.
+
+## 9. Event System
 
 Tasks uses an append-only event log as the backbone for all communication between components.
 Agents, the orchestrator, the scheduler, and the human all produce events. The UI, orchestrator,
 and parent tasks consume them.
 
-### 8.1 Design
+### 9.1 Design
 
 - All events are immutable. Once written, an event is never modified or deleted.
 - Events are persisted to an append-only log, stored per-task (one log file per task).
 - A lightweight in-memory pub/sub layer sits in front of the log for live subscriptions.
 - Consumers can subscribe to live events and replay historical events from the log.
 
-### 8.2 Event Shape
+### 9.2 Event Shape
 
 Every event has the same base structure:
 
@@ -456,7 +581,7 @@ Every event has the same base structure:
 - `ts` (timestamp) — when the event occurred
 - `data` (object) — event-type-specific payload
 
-### 8.3 Event Types
+### 9.3 Event Types
 
 Task events:
 
@@ -502,7 +627,7 @@ System events:
 - `system:config:reloaded` — configuration was reloaded
 - `system:scheduler:tick` — scheduler polled for updates
 
-### 8.4 Subscriptions
+### 9.4 Subscriptions
 
 Consumers subscribe to events using colon-delimited patterns with wildcard support:
 
@@ -515,7 +640,7 @@ A parent task can subscribe to events from its child tasks by task ID. Any consu
 to any task's event stream. The bus handles routing — tasks never communicate directly with each
 other.
 
-### 8.5 Storage and Cleanup
+### 9.5 Storage and Cleanup
 
 - Events are stored per-task as append-only files (e.g., `<task-id>/events.jsonl`).
 - A global index or secondary log may be maintained for cross-task queries.
@@ -523,7 +648,7 @@ other.
   - Completed/cancelled task logs can be archived or deleted after a retention period.
   - Active task logs are never pruned.
 
-## 9. Sessions and Agent Runner
+## 10. Sessions and Agent Runner
 
 A session is the unit of execution. When the server dispatches a task for implementation, it
 creates a session. The session owns everything needed to work on that task: an isolated runtime
@@ -535,12 +660,12 @@ agent, a supervisor that manages the agent's lifecycle, and any processes the ag
 (test runners, build tools, git operations). See session-runtime.md for the runtime
 architecture.
 
-### 9.1 Session Lifecycle
+### 10.1 Session Lifecycle
 
 1. **Creation.** Dispatch logic determines a task needs work (implementation, comment, sub-issue
    creation, etc.). A new session is created for that task.
 2. **Runtime setup.** The session provisions an isolated runtime environment and workspace
-   (see Section 10) with its own copy of the repo checked out to a dedicated git branch.
+   (see Section 11) with its own copy of the repo checked out to a dedicated git branch.
 3. **Agent launch.** An agent process is started inside the runtime. The session sends a custom
    prompt to the agent based on the task's details (issue description, context, relevant project
    information).
@@ -549,7 +674,7 @@ architecture.
 5. **Completion.** The agent finishes (task done, error, or killed). The session emits final
    state events. The runtime environment and git branch persist for review or re-use.
 
-### 9.2 Session as Chat
+### 10.2 Session as Chat
 
 Every session is a chat conversation. This is the universal interface.
 
@@ -561,7 +686,7 @@ Every session is a chat conversation. This is the universal interface.
   regardless of whether anyone joins.
 - Chat history is persistent. The human can review what happened in any session after the fact.
 
-### 9.3 Event Emission
+### 10.3 Event Emission
 
 The agent itself does not know about the Tasks event system. The session wrapper is responsible
 for observing the agent's behavior and emitting appropriate events.
@@ -572,7 +697,7 @@ for observing the agent's behavior and emitting appropriate events.
   `agent:question` + `task:state:question`).
 - The session emits all events to the bus on behalf of the agent.
 
-### 9.4 Agent Provider
+### 10.4 Agent Provider
 
 The agent provider is an implementation detail. Claude Code is the initial provider, but the
 session contract is designed to be provider-agnostic.
@@ -584,7 +709,7 @@ The session needs the agent provider to support:
 - Accepting human/orchestrator messages as chat input.
 - Being terminated gracefully.
 
-### 9.5 Pause, Resume, and Interruption
+### 10.5 Pause, Resume, and Interruption
 
 For the initial implementation, the model is simple:
 
@@ -597,7 +722,7 @@ For the initial implementation, the model is simple:
 - **Future improvement:** Resume agent sessions where they left off rather than restarting. This
   depends on agent provider support and is not required for the initial implementation.
 
-### 9.6 One Session Per Task
+### 10.6 One Session Per Task
 
 A task has at most one active session at a time. If a task needs to be re-run (retry, restart
 after Stop, feedback from human), the previous session is ended and a new one is created in the
@@ -605,9 +730,9 @@ same sandbox/branch.
 
 Previous session chat history remains accessible for context and audit.
 
-## 10. Workspace Management
+## 11. Workspace Management
 
-### 10.1 Workspace Creation
+### 11.1 Workspace Creation
 
 When a session is created, it provisions an isolated workspace:
 
@@ -622,7 +747,7 @@ When a session is created, it provisions an isolated workspace:
 - The branch is initially named with a generated ID (UUID or similar). It may be renamed once
   work starts or when a PR is created, to something human-readable based on the task.
 
-### 10.2 Workspace Reuse
+### 11.2 Workspace Reuse
 
 - A workspace persists across session restarts for the same task. If a session is killed (Stop
   mode) and restarted, the new session reuses the existing workspace and branch — the agent
@@ -630,7 +755,7 @@ When a session is created, it provisions an isolated workspace:
 - One workspace per task. If a session happens to address multiple tasks, the workspace belongs
   to the primary task.
 
-### 10.3 Cleanup
+### 11.3 Cleanup
 
 Workspaces are cleaned up when they are no longer needed:
 
@@ -641,15 +766,15 @@ Workspaces are cleaned up when they are no longer needed:
 - Chat history and event logs are retained independently of workspace cleanup — deleting a
   workspace does not delete the session's history.
 
-## 11. Issue Tracker Integration
+## 12. Issue Tracker Integration
 
-### 11.1 GitHub as Source of Truth
+### 12.1 GitHub as Source of Truth
 
 GitHub Issues and PRs are the external source of work. Tasks reads from GitHub to discover and
 track work, but does not write back — all GitHub mutations (comments, labels, state changes,
 PR creation) are performed by agents working inside their sessions.
 
-### 11.2 What Gets Tracked
+### 12.2 What Gets Tracked
 
 The scheduler monitors both issues and pull requests:
 
@@ -666,7 +791,7 @@ For each issue/PR, the scheduler reads all available fields:
 - Open/closed state
 - Timestamps (created, updated)
 
-### 11.3 State Mapping
+### 12.3 State Mapping
 
 Tasks owns its own internal state (Section 5.1) independently of GitHub's open/closed status.
 
@@ -677,7 +802,7 @@ Tasks owns its own internal state (Section 5.1) independently of GitHub's open/c
 - Tasks does not push its internal states back to GitHub labels or issue fields. Progress is
   communicated through agent-authored comments and PR activity.
 
-### 11.4 Discovery
+### 12.4 Discovery
 
 The scheduler discovers new and changed work through:
 
@@ -685,7 +810,7 @@ The scheduler discovers new and changed work through:
 - **Webhooks (optional):** GitHub webhooks can push issue/PR events to the server for faster
   response. Polling remains as a fallback and reconciliation mechanism.
 
-### 11.5 Normalization
+### 12.5 Normalization
 
 The scheduler normalizes GitHub payloads into a stable internal model before emitting events.
 This keeps the rest of the system decoupled from GitHub-specific API shapes.
@@ -693,12 +818,12 @@ This keeps the rest of the system decoupled from GitHub-specific API shapes.
 See github.md for the full normalized model, GraphQL query design, client API, polling interface,
 and testing strategy.
 
-## 12. Scheduling and Dispatch
+## 13. Scheduling and Dispatch
 
 The dispatch system determines which tasks get worked on and when. The scheduler discovers work
-(§3.2, §11); the dispatcher decides what to run.
+(§3.2, §12); the dispatcher decides what to run.
 
-### 12.1 Dispatch Loop
+### 13.1 Dispatch Loop
 
 The dispatcher is triggered in two ways:
 
@@ -721,7 +846,7 @@ multiple times in quick succession is harmless.
 returns immediately. When transitioning from Stop to Pause or Play, the reconciliation tick
 triggers a full evaluation.
 
-### 12.2 Candidate Selection
+### 13.2 Candidate Selection
 
 The dispatcher divides actionable tasks into two pools:
 
@@ -740,7 +865,7 @@ closer to completion and are cheaper to start.
 **New work candidates.** Tasks in `waiting` state with no active session. These require a new
 session, container, and workspace.
 
-### 12.3 Prioritization
+### 13.3 Prioritization
 
 Within each pool, candidates are sorted by:
 
@@ -756,7 +881,7 @@ The orchestrator influences dispatch indirectly by setting task priorities and c
 cancelling tasks, not by participating in the dispatch loop itself. This keeps dispatch fast and
 deterministic.
 
-### 12.4 Concurrency Limits
+### 13.4 Concurrency Limits
 
 Two limits control how many tasks can run simultaneously:
 
@@ -766,7 +891,7 @@ Two limits control how many tasks can run simultaneously:
 - **Per-project limit** (`max_sessions` on project config, optional). Prevents one project from
   consuming all available slots. Defaults to the global limit if unset.
 
-### 12.5 Slot Accounting
+### 13.5 Slot Accounting
 
 A task holds a slot from when its session is created until the session ends:
 
@@ -780,20 +905,20 @@ A task holds a slot from when its session is created until the session ends:
 The dispatcher counts slots by counting tasks in slot-holding states, not by tracking session
 objects. This keeps the accounting simple and derivable from task state.
 
-### 12.6 Dispatch Evaluation
+### 13.6 Dispatch Evaluation
 
 On each evaluation, the dispatcher:
 
 1. Checks mode. If Stop, return immediately.
 2. Processes all resume candidates (free — no slot cost for `question` answers).
 3. Counts active slots globally and per-project.
-4. Collects new work candidates, sorted by priority rules (§12.3).
+4. Collects new work candidates, sorted by priority rules (§13.3).
 5. For each candidate in order: if both global and project slot limits have room, create a session
    and start the task. Otherwise, the task remains in `waiting`.
 
-## 13. Retry and Recovery
+## 14. Retry and Recovery
 
-### 13.1 Failure Classes
+### 14.1 Failure Classes
 
 The system categorizes failures to determine the appropriate response:
 
@@ -817,7 +942,7 @@ retry automatically.
 - Container runtime unavailable
 - Disk full
 
-Response: Recover on restart via reconciliation (§13.3).
+Response: Recover on restart via reconciliation (§14.3).
 
 The system distinguishes transient from deterministic failures using a **retry counter per task**.
 If a task fails and is retried N times (configurable, default: 3) without making progress, it is
@@ -828,7 +953,7 @@ minimum duration (configurable, default: 60 seconds). A task that crashes immedi
 times in a row is deterministic. A task that runs for 10 minutes and then hits an edge case is
 still worth retrying.
 
-### 13.2 Retry Behavior
+### 14.2 Retry Behavior
 
 **Exponential backoff.** When a transient failure occurs, the system retries with increasing
 delays:
@@ -860,9 +985,9 @@ dispatch.
 
 **Retry vs. new session.** A retry creates a new session in the existing workspace. The agent
 starts fresh but the repo state (commits, branch) reflects prior work. This is the same behavior
-as restarting after Stop mode (§9.5).
+as restarting after Stop mode (§10.5).
 
-### 13.3 Restart Recovery
+### 14.3 Restart Recovery
 
 When the server restarts, it reconciles its in-memory state with persistent state:
 
@@ -881,7 +1006,7 @@ Container state may persist across server restarts (the containers are independe
 If a container is still running, the server re-attaches to its stdio and resumes the session
 without restarting the agent.
 
-### 13.4 Failure Surfacing
+### 14.4 Failure Surfacing
 
 When a task fails (retries exhausted or deterministic failure):
 
@@ -891,25 +1016,25 @@ When a task fails (retries exhausted or deterministic failure):
 - The orchestrator may attempt to diagnose the failure and suggest a course of action (retry with
   different parameters, break the task into smaller pieces, escalate to the human).
 
-## 14. Workflow Configuration
+## 15. Workflow Configuration
 
 Each project can customize how tasks are handled through a workflow configuration file in the
 repository.
 
-### 14.1 Configuration File
+### 15.1 Configuration File
 
 The workflow configuration lives at `workflow.toml` in the project's repository root. This
 file is read when the project is added to the server and can be reloaded dynamically.
 
 ```toml
 [project]
-max_sessions = 3                # Per-project concurrency limit (§12.4)
+max_sessions = 3                # Per-project concurrency limit (§13.4)
 default_branch = "main"         # Override project default branch
 
 [dispatch]
-max_retries = 3                 # Task retry limit (§13.2)
+max_retries = 3                 # Task retry limit (§14.2)
 retry_base_delay = 5            # Base backoff delay in seconds
-progress_threshold = 60         # Minimum runtime (seconds) to count as "progress" (§13.1)
+progress_threshold = 60         # Minimum runtime (seconds) to count as "progress" (§14.1)
 
 [labels]
 # Map GitHub labels to task behavior.
@@ -924,7 +1049,7 @@ blocked = ["blocked", "waiting-on-external"]
 system_prompt = "system-prompt.md"
 ```
 
-### 14.2 Label Mapping
+### 15.2 Label Mapping
 
 The `[labels]` section controls how GitHub labels affect task behavior:
 
@@ -932,7 +1057,7 @@ The `[labels]` section controls how GitHub labels affect task behavior:
   create tasks for them.
 - **blocked:** Issues with any of these labels start in `blocked` state instead of `waiting`.
 
-#### 14.2.1 Canonical Skip Label
+#### 15.2.1 Canonical Skip Label
 
 The label `tasks/skip` is a reserved, canonical label that always causes
 issues and pull requests to be skipped during import, regardless of project configuration. This
@@ -946,7 +1071,7 @@ mechanism to prevent specific items from becoming tasks. Use cases include:
 Labels not listed in the configuration (aside from the canonical `tasks/skip` label described above) have no special meaning to the dispatch system. The
 orchestrator and human can still use them for their own organizational purposes.
 
-### 14.3 Dynamic Reload
+### 15.3 Dynamic Reload
 
 The server watches for configuration changes:
 
@@ -957,17 +1082,17 @@ The server watches for configuration changes:
 - Invalid configuration is rejected with a warning. The previous valid configuration remains in
   effect.
 
-## 15. Prompt Construction
+## 16. Prompt Construction
 
 When a session starts, the server constructs a prompt for the agent based on the task's details
 and project context. The prompt is the agent's entire understanding of what it needs to do.
 
-### 15.1 Prompt Structure
+### 16.1 Prompt Structure
 
 The prompt is assembled from several layers, concatenated in order:
 
 1. **System prompt (project-level).** The contents of the file referenced by
-   `[prompt].system_prompt` in the workflow configuration (§14.1). This typically contains
+   `[prompt].system_prompt` in the workflow configuration (§15.1). This typically contains
    project conventions, coding standards, and repository-specific context. If not configured,
    this layer is omitted.
 
@@ -992,9 +1117,9 @@ The prompt is assembled from several layers, concatenated in order:
    - If stuck, describe the problem clearly so the orchestrator or human can help
    - If the task is ambiguous, ask for clarification rather than guessing
 
-### 15.2 Retry and Continuation Context
+### 16.2 Retry and Continuation Context
 
-When a task is being retried (§13.2), additional context is prepended:
+When a task is being retried (§14.2), additional context is prepended:
 
 - A note that this is a retry, not a first attempt
 - The previous session's failure mode (crash, error message, timeout)
@@ -1002,9 +1127,9 @@ When a task is being retried (§13.2), additional context is prepended:
 - Guidance to try a different approach if the previous one failed
 
 When a task receives a human or orchestrator message while in `question` state, the message is
-delivered via the session's chat interface (§9.2), not by reconstructing the prompt.
+delivered via the session's chat interface (§10.2), not by reconstructing the prompt.
 
-### 15.3 Prompt Rendering
+### 16.3 Prompt Rendering
 
 The prompt is rendered as plain Markdown. No template engine — the server concatenates the
 sections with clear headings. This keeps the system simple and the prompts inspectable.
@@ -1043,9 +1168,9 @@ sections with clear headings. This keeps the system simple and the prompts inspe
 - If you are stuck or the task is ambiguous, describe the problem clearly.
 ```
 
-## 16. Observability
+## 17. Observability
 
-### 16.1 Structured Logging
+### 17.1 Structured Logging
 
 All server components emit structured log entries (JSON) with consistent fields:
 
@@ -1060,7 +1185,7 @@ All server components emit structured log entries (JSON) with consistent fields:
 Logs are written to stdout and optionally to a file. The log level is configurable at startup
 and can be changed at runtime.
 
-### 16.2 GUI Dashboard
+### 17.2 GUI Dashboard
 
 The web GUI (§3.1) provides a real-time view of system state:
 
@@ -1074,7 +1199,7 @@ The web GUI (§3.1) provides a real-time view of system state:
 - **Event stream.** Live feed of events across all tasks, filterable by type and task.
 - **Orchestrator chat.** Persistent conversation with the orchestrator.
 
-### 16.3 Runtime Snapshots
+### 17.3 Runtime Snapshots
 
 The server exposes a snapshot endpoint (HTTP GET) that returns the full system state as JSON:
 
@@ -1087,7 +1212,7 @@ The server exposes a snapshot endpoint (HTTP GET) that returns the full system s
 
 This is useful for debugging, monitoring integrations, and the GUI's initial page load.
 
-### 16.4 Token and Cost Accounting
+### 17.4 Token and Cost Accounting
 
 The server tracks resource consumption per task and per project:
 
@@ -1102,9 +1227,9 @@ Accounting data is stored as events (`system:accounting:*`) and surfaced in the 
 Cost estimation (mapping tokens to dollars) is not built in — the accounting provides the raw
 numbers, and the human can interpret them with their provider's pricing.
 
-## 17. Security and Safety
+## 18. Security and Safety
 
-### 17.1 Workspace Isolation
+### 18.1 Workspace Isolation
 
 Session isolation is provided by the container runtime (session-runtime.md §2):
 
@@ -1113,7 +1238,7 @@ Session isolation is provided by the container runtime (session-runtime.md §2):
 - Each session has its own filesystem. No shared mounts between sessions.
 - The host filesystem is not accessible from inside containers.
 
-### 17.2 Secret Handling
+### 18.2 Secret Handling
 
 Secrets are injected into containers as environment variables at creation time
 (session-runtime.md §3.1):
@@ -1134,7 +1259,7 @@ Secrets are configured on the server side (environment variables, config file, o
 manager). The server reads them and passes them to the container runtime at session creation.
 The mechanism for configuring secrets on the server is an operational concern, not specified here.
 
-### 17.3 Trust Boundaries
+### 18.3 Trust Boundaries
 
 The system has three trust boundaries:
 
@@ -1150,7 +1275,7 @@ The system has three trust boundaries:
    The server trusts the agent provider's API but limits exposure by scoping keys to the minimum
    required permissions where possible.
 
-### 17.4 Agent Sandboxing
+### 18.4 Agent Sandboxing
 
 Agents run inside containers with the following constraints:
 
@@ -1169,14 +1294,14 @@ Agents run inside containers with the following constraints:
     orchestrator or human that the session is running long. The orchestrator may intervene
     (provide guidance, break the task into smaller pieces) or the human may extend or steer.
   - **Hard limit** (soft limit + 15 minutes). If no intervention occurs after the nudge, the
-    session is terminated and the task is retried or failed per §13.
+    session is terminated and the task is retried or failed per §14.
 
 The sandboxing model is: give agents everything they need to do their work, but contain the blast
 radius to a single disposable VM.
 
-## 18. Reference Algorithms
+## 19. Reference Algorithms
 
-### 18.1 Dispatch Tick
+### 19.1 Dispatch Tick
 
 ```
 function dispatch_tick(server):
@@ -1218,7 +1343,7 @@ function dispatch_tick(server):
         emit task:state:running
 ```
 
-### 18.2 Session Lifecycle
+### 19.2 Session Lifecycle
 
 ```
 function create_session(task):
@@ -1270,7 +1395,7 @@ function handle_failure(session, exit_code):
         # Dispatcher will pick it up after backoff.
 ```
 
-### 18.3 Merge Queue Processing
+### 19.3 Merge Queue Processing
 
 ```
 function process_merge_queue(server):
@@ -1324,7 +1449,7 @@ function flush_merge_queue(server):
     emit system:flush
 ```
 
-### 18.4 Event Routing
+### 19.4 Event Routing
 
 ```
 function publish(bus, event):
@@ -1353,9 +1478,9 @@ function matches(pattern, event_type):
     return pattern_parts.len() == type_parts.len()
 ```
 
-## 19. Test and Validation Matrix
+## 20. Test and Validation Matrix
 
-### 19.1 Unit Tests
+### 20.1 Unit Tests
 
 Each crate has unit tests covering its core logic in isolation:
 
@@ -1366,7 +1491,7 @@ Each crate has unit tests covering its core logic in isolation:
 | runtime | Protocol codec (encode/decode/partial lines), command/event serialization |
 | server | Mode transitions (all actor/direction combinations), task state transitions, merge queue operations (enqueue/approve/reject/flush/conflict/cleanup), presence tracking, slot accounting |
 
-### 19.2 Mock Integration Tests
+### 20.2 Mock Integration Tests
 
 Tests that use mock servers or in-process fakes to test cross-component behavior:
 
@@ -1377,7 +1502,7 @@ Tests that use mock servers or in-process fakes to test cross-component behavior
 | Dispatcher | Candidate selection (resume vs new), priority sorting, concurrency enforcement (global and per-project), mode gating, backoff eligibility |
 | Merge queue | Mode-dependent behavior (Stop/Pause/Play), flush in Pause, conflict detection, rejection with feedback |
 
-### 19.3 Container Integration Tests
+### 20.3 Container Integration Tests
 
 Tests that exercise the full session lifecycle with real containers. These are slower and require
 the container runtime to be available.
@@ -1394,7 +1519,7 @@ the container runtime to be available.
 These tests use a mock agent (simple echo process) to avoid depending on a real AI provider.
 The existing `verify.ts` script (§session-runtime.md) is the foundation for these tests.
 
-### 19.4 End-to-End Tests
+### 20.4 End-to-End Tests
 
 Full system tests that exercise the platform from issue discovery to merge:
 
@@ -1411,7 +1536,7 @@ Full system tests that exercise the platform from issue discovery to merge:
 End-to-end tests use a fixture GitHub repository (or mock server) and a mock agent. They
 exercise the full dispatch → session → merge pipeline.
 
-### 19.5 Test Environment
+### 20.5 Test Environment
 
 - **Unit and mock tests:** Run with `cargo test` and require no external dependencies.
 - **Container tests:** Require the container runtime (`container` CLI) and a pre-built base image.
@@ -1421,11 +1546,11 @@ exercise the full dispatch → session → merge pipeline.
 - **GitHub integration tests:** Require a `GITHUB_TOKEN` and a fixture repository. Gated behind
   `--features integration`.
 
-## 20. Implementation Checklist
+## 21. Implementation Checklist
 
 A conforming implementation must satisfy all of the following:
 
-### 20.1 Core Platform
+### 21.1 Core Platform
 
 - [ ] Server starts, tracks mode (Stop/Pause/Play), and enforces transition rules
 - [ ] Event system: append-only log with per-task storage, pub/sub with pattern matching
@@ -1433,14 +1558,14 @@ A conforming implementation must satisfy all of the following:
 - [ ] Human presence tracking based on active GUI connections
 - [ ] Multi-project support with per-project configuration
 
-### 20.2 GitHub Integration
+### 21.2 GitHub Integration
 
 - [ ] GraphQL client fetches issues and PRs with full metadata
 - [ ] Normalized model decoupled from GitHub API shapes
 - [ ] Polling with high-water mark for incremental discovery
 - [ ] Rate limit tracking and backoff
 
-### 20.3 Scheduling and Dispatch
+### 21.3 Scheduling and Dispatch
 
 - [ ] Event-driven dispatch with reconciliation tick
 - [ ] Candidate selection: resume candidates before new work
@@ -1448,7 +1573,7 @@ A conforming implementation must satisfy all of the following:
 - [ ] Global and per-project concurrency limits with slot accounting
 - [ ] Mode-gated dispatch (no dispatch in Stop)
 
-### 20.4 Sessions and Agent Runner
+### 21.4 Sessions and Agent Runner
 
 - [ ] Container lifecycle: create, start, attach, stop, destroy
 - [ ] Supervisor protocol: start, chat, stop, exec commands; all event types
@@ -1457,14 +1582,20 @@ A conforming implementation must satisfy all of the following:
 - [ ] Workspace persistence across session restarts
 - [ ] Session soft/hard time limits with escalation nudge
 
-### 20.5 Merge Queue
+### 21.5 Merge Queue
 
 - [ ] Queue entry lifecycle: pending → approved/rejected → merged/conflict
 - [ ] Mode-dependent merge authority (Stop: held, Pause: held with flush, Play: orchestrator)
 - [ ] Conflict detection and re-engagement
 - [ ] Quality evaluation by orchestrator before queuing
 
-### 20.6 Retry and Recovery
+### 21.6 Reflections (Phase 1)
+
+- [ ] Reflection label filtering: issues with `reflection` label excluded from task import
+- [ ] UI Reflections tab displaying filtered reflection issues
+- [ ] Reflection events: `reflection:created`, `reflection:comment`, `reflection:closed`
+
+### 21.7 Retry and Recovery
 
 - [ ] Failure classification (transient vs deterministic)
 - [ ] Exponential backoff with jitter
@@ -1472,20 +1603,20 @@ A conforming implementation must satisfy all of the following:
 - [ ] Server restart recovery: state reconstruction from event log, orphaned session detection
 - [ ] Failure surfacing to orchestrator and human
 
-### 20.7 Prompt Construction
+### 21.8 Prompt Construction
 
 - [ ] Layered prompt assembly: system prompt, task description, context, instructions
 - [ ] Retry context for failed tasks
 - [ ] Project-level system prompt from workflow configuration
 
-### 20.8 Observability
+### 21.9 Observability
 
 - [ ] Structured JSON logging with consistent fields
 - [ ] Runtime snapshot endpoint (full system state as JSON)
 - [ ] Token and cost accounting per task and per project
 - [ ] GUI dashboard with live task list, session view, merge queue, event stream
 
-### 20.9 Security
+### 21.10 Security
 
 - [ ] Session isolation via container runtime
 - [ ] Secret injection via environment variables (not persisted in logs or state)
