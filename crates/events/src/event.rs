@@ -49,6 +49,10 @@ pub enum EventType {
     MergeCompleted,
     MergeConflict,
 
+    // Workspace events
+    /// Workspace cleaned up (spec §10.3).
+    WorkspaceCleaned,
+
     // Orchestrator events
     OrchestratorFeedback,
     OrchestratorEscalation,
@@ -95,6 +99,7 @@ impl EventType {
             Self::MergeRejected => "merge:rejected",
             Self::MergeCompleted => "merge:completed",
             Self::MergeConflict => "merge:conflict",
+            Self::WorkspaceCleaned => "workspace:cleaned",
             Self::OrchestratorFeedback => "orchestrator:feedback",
             Self::OrchestratorEscalation => "orchestrator:escalation",
             Self::OrchestratorDecision => "orchestrator:decision",
@@ -165,6 +170,7 @@ impl TryFrom<String> for EventType {
             "merge:rejected" => Ok(Self::MergeRejected),
             "merge:completed" => Ok(Self::MergeCompleted),
             "merge:conflict" => Ok(Self::MergeConflict),
+            "workspace:cleaned" => Ok(Self::WorkspaceCleaned),
             "orchestrator:feedback" => Ok(Self::OrchestratorFeedback),
             "orchestrator:escalation" => Ok(Self::OrchestratorEscalation),
             "orchestrator:decision" => Ok(Self::OrchestratorDecision),

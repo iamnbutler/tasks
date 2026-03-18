@@ -816,6 +816,85 @@ impl Server {
         self.presence.is_present()
     }
 
+    // --- Workspace cleanup (spec §10.3) ---
+
+    /// Get all workspace cleanup candidates.
+    ///
+    /// Returns tasks whose workspaces are eligible for cleanup based on:
+    /// - Terminal state (Completed, Failed, Cancelled)
+    /// - Stale/idle workspaces (no activity beyond threshold)
+    ///
+    /// PR merge cleanup is handled separately in the orchestrator loop.
+    pub async fn get_workspace_cleanup_candidates(
+        &self,
+        stale_threshold: std::time::Duration,
+    ) -> Vec<crate::workspace::CleanupCandidate> {
+        let state = self.state.read().await;
+        let now = chrono::Utc::now();
+
+        crate::workspace::find_cleanup_candidates(
+            state.tasks.values().cloned(),
+            now,
+            stale_threshold,
+        )
+    }
+
+    /// Clear the workspace_id from a task after cleanup.
+    ///
+    /// Called after the container/workspace has been destroyed to update
+    /// the task record. Emits a workspace:cleaned event for audit trail.
+    pub async fn clear_workspace_id(
+        &self,
+        task_id: &str,
+        reason: &crate::workspace::CleanupReason,
+    ) -> Result<(), ServerError> {
+        {
+            let mut state = self.state.write().await;
+            if let Some(task) = state.tasks.get_mut(task_id) {
+                let workspace_id = task.workspace_id.take();
+
+                // Write-through to store
+                if let Some(ref store) = self.store {
+                    if let Ok(store) = store.lock() {
+                        if let Err(e) = store.save_task(task) {
+                            tracing::error!(
+                                task_id = %task_id,
+                                error = %e,
+                                "failed to persist workspace cleanup to store"
+                            );
+                        }
+                    }
+                }
+
+                tracing::info!(
+                    task_id = %task_id,
+                    workspace_id = ?workspace_id,
+                    reason = ?reason,
+                    "workspace cleaned up"
+                );
+            }
+        }
+
+        // Emit workspace:cleaned event for audit trail
+        let reason_str = match reason {
+            crate::workspace::CleanupReason::TerminalState(s) => format!("terminal_state:{:?}", s),
+            crate::workspace::CleanupReason::PrMerged => "pr_merged".to_string(),
+            crate::workspace::CleanupReason::Stale { idle_duration } => {
+                format!("stale:{}s", idle_duration.as_secs())
+            }
+        };
+
+        let event = Event::new(
+            EventType::WorkspaceCleaned,
+            task_id,
+            Actor::System,
+            serde_json::json!({ "reason": reason_str }),
+        );
+        self.event_bus.publish(event).await?;
+
+        Ok(())
+    }
+
     // --- Lifecycle ---
 
     /// Emit the system:started event (spec Section 8.3).

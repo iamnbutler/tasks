@@ -126,6 +126,9 @@ pub struct Task {
     pub last_failure: Option<FailureInfo>,
     /// When the source (GitHub issue/PR) was created. Used for dispatch ordering.
     pub source_created_at: Option<DateTime<Utc>>,
+    /// Last activity timestamp for stale workspace detection (spec §10.3).
+    /// Updated when the task transitions to/from active states.
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -156,15 +159,35 @@ impl Task {
             last_failure_at: None,
             last_failure: None,
             source_created_at: None,
+            last_activity_at: None,
             created_at: now,
             updated_at: now,
         }
     }
 
     /// Transition to a new state, updating the timestamp.
+    ///
+    /// Also updates `last_activity_at` when entering or leaving active states
+    /// (Running, Question, Testing) for stale workspace detection (spec §10.3).
     pub fn set_state(&mut self, state: TaskState) {
+        let now = Utc::now();
+
+        // Update last_activity_at when entering/leaving active states
+        let was_active = matches!(
+            self.state,
+            TaskState::Running | TaskState::Question | TaskState::Testing
+        );
+        let is_active = matches!(
+            state,
+            TaskState::Running | TaskState::Question | TaskState::Testing
+        );
+
+        if was_active || is_active {
+            self.last_activity_at = Some(now);
+        }
+
         self.state = state;
-        self.updated_at = Utc::now();
+        self.updated_at = now;
     }
 }
 

@@ -32,6 +32,11 @@ pub struct AppConfig {
     pub memory_soft_limit_pct: u8,
     /// Memory usage percentage at which to emergency-stop sessions (default: 92%).
     pub memory_hard_limit_pct: u8,
+    /// Workspace stale threshold — idle workspaces older than this are cleaned up
+    /// (default: 7 days, spec §10.3).
+    pub workspace_stale_threshold: Duration,
+    /// Workspace cleanup scan interval (default: 1 hour).
+    pub cleanup_interval: Duration,
     /// Whether to run the web UI.
     pub web: bool,
     /// Web server port (default: 4800).
@@ -103,6 +108,16 @@ impl AppConfig {
             ));
         }
 
+        let workspace_stale_threshold_secs = std::env::var("TASKS_WORKSPACE_STALE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(server::DEFAULT_STALE_THRESHOLD_SECS);
+
+        let cleanup_interval_secs = std::env::var("TASKS_CLEANUP_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(server::DEFAULT_CLEANUP_INTERVAL_SECS);
+
         Ok(Self {
             data_dir,
             github_token,
@@ -118,6 +133,8 @@ impl AppConfig {
             memory_warn_pct,
             memory_soft_limit_pct,
             memory_hard_limit_pct,
+            workspace_stale_threshold: Duration::from_secs(workspace_stale_threshold_secs),
+            cleanup_interval: Duration::from_secs(cleanup_interval_secs),
             web: false, // set by CLI flag
             web_port: std::env::var("TASKS_WEB_PORT")
                 .ok()
