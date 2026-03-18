@@ -54,6 +54,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
         .route("/orchestrator/chat", post(orchestrator_chat))
+        .route("/accounting", get(get_accounting_summary))
+        .route("/accounting/tasks", get(list_task_accounting))
+        .route("/accounting/tasks/{id}", get(get_task_accounting))
         .route("/events", get(event_stream));
 
     Router::new()
@@ -389,6 +392,37 @@ async fn orchestrator_chat(
     Ok(StatusCode::OK)
 }
 
+// --- Accounting endpoints (spec §16.4) ---
+
+/// GET /api/accounting — Global accounting summary.
+async fn get_accounting_summary(
+    State(state): State<ApiState>,
+) -> Result<Json<tasks_store::AccountingSummary>, ApiError> {
+    let summary = state.server.get_accounting_summary()
+        .map_err(ApiError::Server)?;
+    Ok(Json(summary))
+}
+
+/// GET /api/accounting/tasks — List all task accounting summaries.
+async fn list_task_accounting(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<tasks_store::TaskAccounting>>, ApiError> {
+    let accounting = state.server.list_task_accounting()
+        .map_err(ApiError::Server)?;
+    Ok(Json(accounting))
+}
+
+/// GET /api/accounting/tasks/:id — Get accounting for a specific task.
+async fn get_task_accounting(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<tasks_store::TaskAccounting>, ApiError> {
+    let accounting = state.server.get_task_accounting(&id)
+        .map_err(ApiError::Server)?
+        .ok_or_else(|| ApiError::NotFound(format!("accounting not found for task: {id}")))?;
+    Ok(Json(accounting))
+}
+
 /// GET /api/events — SSE stream of live events.
 ///
 /// Supports optional query params: `pattern` and `task_id` for filtering.
@@ -431,15 +465,17 @@ enum ApiError {
     BadRequest(String),
     MergeQueue(String),
     SessionManager(String),
+    NotFound(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            ApiError::Server(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::Server(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::NotFound(e) => (StatusCode::NOT_FOUND, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

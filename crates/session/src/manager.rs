@@ -18,6 +18,7 @@ use runtime::{ContainerConfig, ContainerRuntime};
 /// Maximum number of stderr lines to keep in the rolling buffer.
 const MAX_STDERR_LINES: usize = 50;
 
+use crate::accounting::{TokenParser, TokenTracker, TokenUsage};
 use crate::interpreter::{emit_signal_events, OutputInterpreter, OutputSignal};
 
 #[derive(Debug, Error)]
@@ -288,6 +289,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     // Output interpreter for state detection (spec §9.3)
     let mut interpreter = OutputInterpreter::new();
 
+    // Token tracker for accounting (spec §16.4)
+    let mut token_tracker = TokenTracker::new();
+
     // Rolling stderr buffer for failure diagnosis (spec §13.4)
     let mut stderr_buffer: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_LINES);
 
@@ -334,14 +338,30 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
                 }
 
                 // Map and publish platform events, including output interpretation (spec §9.3)
-                handle_supervisor_event(&task_id, &supervisor_event, &event_bus, &mut interpreter).await;
+                // and token accounting (spec §16.4)
+                handle_supervisor_event(
+                    &task_id,
+                    &supervisor_event,
+                    &event_bus,
+                    &mut interpreter,
+                    &mut token_tracker,
+                ).await;
 
                 // Check for agent exit
                 if let runtime::protocol::Event::AgentExit(ref exit) = supervisor_event {
                     let duration_secs = started_at.elapsed().as_secs();
                     let progress_threshold_secs = progress_threshold.as_secs();
                     let stderr_tail: Vec<String> = stderr_buffer.iter().cloned().collect();
-                    handle_exit(&task_id, exit, duration_secs, progress_threshold_secs, stderr_tail, &event_bus).await;
+                    let total_tokens = token_tracker.total();
+                    handle_exit(
+                        &task_id,
+                        exit,
+                        duration_secs,
+                        progress_threshold_secs,
+                        stderr_tail,
+                        total_tokens,
+                        &event_bus,
+                    ).await;
                     break;
                 }
             }
@@ -469,12 +489,14 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
 /// Map a supervisor event to a platform event and publish it.
 ///
 /// For stdout events, also runs the output interpreter (spec §9.3) to detect
-/// questions, completion signals, and failure patterns.
+/// questions, completion signals, and failure patterns, and parses token
+/// usage for accounting (spec §16.4).
 async fn handle_supervisor_event(
     task_id: &str,
     event: &runtime::protocol::Event,
     event_bus: &EventBus,
     interpreter: &mut OutputInterpreter,
+    token_tracker: &mut TokenTracker,
 ) {
     match event {
         runtime::protocol::Event::AgentStarted(e) => {
@@ -513,6 +535,35 @@ async fn handle_supervisor_event(
                     tracing::error!(task_id = %task_id, error = %err, "failed to emit signal events");
                 }
             }
+
+            // Parse token usage for accounting (spec §16.4)
+            if let Some((usage, is_cumulative)) = TokenParser::parse(&e.data) {
+                // Record in tracker (handles delta computation for cumulative totals)
+                token_tracker.record(usage, is_cumulative);
+
+                // Emit accounting event
+                let accounting_event = events::Event::new(
+                    events::EventType::SystemAccountingTokens,
+                    task_id,
+                    events::Actor::System,
+                    serde_json::json!({
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "is_cumulative": is_cumulative,
+                    }),
+                );
+                if let Err(err) = event_bus.publish(accounting_event).await {
+                    tracing::error!(task_id = %task_id, error = %err, "failed to publish accounting event");
+                }
+
+                tracing::debug!(
+                    task_id = %task_id,
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    is_cumulative = is_cumulative,
+                    "recorded token usage"
+                );
+            }
         }
         runtime::protocol::Event::AgentStderr(e) => {
             let platform_event = events::Event::new(
@@ -530,17 +581,45 @@ async fn handle_supervisor_event(
     }
 }
 
-/// Handle an agent exit event — publish success or failure with diagnosis (spec §13.4).
+/// Handle an agent exit event — publish success or failure with diagnosis (spec §13.4),
+/// and emit session accounting event (spec §16.4).
 async fn handle_exit(
     task_id: &str,
     exit: &runtime::protocol::AgentExitEvent,
     duration_secs: u64,
     progress_threshold_secs: u64,
     stderr_tail: Vec<String>,
+    total_tokens: TokenUsage,
     event_bus: &EventBus,
 ) {
     let success = exit.code == Some(0);
     let made_progress = duration_secs >= progress_threshold_secs;
+
+    // Emit session accounting event (spec §16.4)
+    let session_accounting_event = events::Event::new(
+        events::EventType::SystemAccountingSession,
+        task_id,
+        events::Actor::System,
+        serde_json::json!({
+            "duration_seconds": duration_secs,
+            "total_input_tokens": total_tokens.input_tokens,
+            "total_output_tokens": total_tokens.output_tokens,
+            "total_tokens": total_tokens.total(),
+            "exit_code": exit.code,
+        }),
+    );
+    if let Err(e) = event_bus.publish(session_accounting_event).await {
+        tracing::error!(task_id = %task_id, error = %e, "failed to publish session accounting event");
+    }
+
+    tracing::info!(
+        task_id = %task_id,
+        duration_secs = duration_secs,
+        input_tokens = total_tokens.input_tokens,
+        output_tokens = total_tokens.output_tokens,
+        total_tokens = total_tokens.total(),
+        "session ended with token accounting"
+    );
 
     let (event_type, data) = if success {
         (
@@ -600,11 +679,12 @@ mod tests {
     async fn agent_started_maps_to_running() {
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStarted(
             runtime::protocol::AgentStartedEvent { pid: 42 },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateRunning);
@@ -616,13 +696,14 @@ mod tests {
     async fn agent_stdout_maps_to_message() {
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "hello world".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::AgentMessage);
@@ -633,13 +714,14 @@ mod tests {
     async fn agent_stderr_maps_to_message() {
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStderr(
             runtime::protocol::AgentStderrEvent {
                 data: "error output".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::AgentMessage);
@@ -651,11 +733,12 @@ mod tests {
     async fn system_ready_not_mapped() {
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::SystemReady(
             runtime::protocol::SystemReadyEvent {},
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         // No event should have been published — try_recv should fail
         assert!(rx.try_recv().is_err());
@@ -668,9 +751,18 @@ mod tests {
             code: Some(0),
             signal: None,
         };
+        let tokens = TokenUsage::new(1000, 500);
 
-        handle_exit("task-1", &exit, 120, 60, vec![], &bus).await;
+        handle_exit("task-1", &exit, 120, 60, vec![], tokens, &bus).await;
 
+        // First event is session accounting
+        let accounting = rx.recv().await.unwrap();
+        assert_eq!(accounting.event_type, events::EventType::SystemAccountingSession);
+        assert_eq!(accounting.data["duration_seconds"], 120);
+        assert_eq!(accounting.data["total_input_tokens"], 1000);
+        assert_eq!(accounting.data["total_output_tokens"], 500);
+
+        // Second event is the state transition
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateAwaitingMerge);
         assert_eq!(received.data["exit_code"], 0);
@@ -685,7 +777,10 @@ mod tests {
         };
 
         // Short duration (30s) below progress threshold (60s) -> no progress
-        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
+        handle_exit("task-1", &exit, 30, 60, vec![], TokenUsage::default(), &bus).await;
+
+        // Skip accounting event
+        let _ = rx.recv().await.unwrap();
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -701,7 +796,10 @@ mod tests {
         };
 
         // Duration (120s) >= progress threshold (60s) -> made progress
-        handle_exit("task-1", &exit, 120, 60, vec![], &bus).await;
+        handle_exit("task-1", &exit, 120, 60, vec![], TokenUsage::default(), &bus).await;
+
+        // Skip accounting event
+        let _ = rx.recv().await.unwrap();
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -719,8 +817,12 @@ mod tests {
             signal: None,
         };
 
-        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
+        handle_exit("task-1", &exit, 30, 60, vec![], TokenUsage::default(), &bus).await;
 
+        // Skip accounting event (uses System actor)
+        let _ = rx.recv().await.unwrap();
+
+        // State change event should use Agent actor
         let received = rx.recv().await.unwrap();
         assert_eq!(received.actor, events::Actor::Agent);
     }
@@ -734,7 +836,10 @@ mod tests {
         };
         let stderr = vec!["error: something went wrong".to_string()];
 
-        handle_exit("task-1", &exit, 30, 60, stderr, &bus).await;
+        handle_exit("task-1", &exit, 30, 60, stderr, TokenUsage::default(), &bus).await;
+
+        // Skip accounting event
+        let _ = rx.recv().await.unwrap();
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.event_type, events::EventType::TaskStateFailed);
@@ -756,7 +861,10 @@ mod tests {
         };
         let stderr = vec!["API error: rate limit exceeded (429)".to_string()];
 
-        handle_exit("task-1", &exit, 30, 60, stderr, &bus).await;
+        handle_exit("task-1", &exit, 30, 60, stderr, TokenUsage::default(), &bus).await;
+
+        // Skip accounting event
+        let _ = rx.recv().await.unwrap();
 
         let received = rx.recv().await.unwrap();
         let failure_info = &received.data["failure_info"];
@@ -772,7 +880,10 @@ mod tests {
             signal: Some("9".to_string()),
         };
 
-        handle_exit("task-1", &exit, 30, 60, vec![], &bus).await;
+        handle_exit("task-1", &exit, 30, 60, vec![], TokenUsage::default(), &bus).await;
+
+        // Skip accounting event
+        let _ = rx.recv().await.unwrap();
 
         let received = rx.recv().await.unwrap();
         let failure_info = &received.data["failure_info"];
@@ -786,13 +897,14 @@ mod tests {
         // agent:question and task:state:question events (spec §9.3).
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "Please provide the database connection string.".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         // First event is the base agent:message
         let msg_event = rx.recv().await.unwrap();
@@ -815,13 +927,14 @@ mod tests {
         // an agent:error event (spec §9.3).
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "I'm stuck and cannot proceed with this task.".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         // First event is the base agent:message
         let msg_event = rx.recv().await.unwrap();
@@ -839,13 +952,14 @@ mod tests {
         // agent:message with completion_hint=true (spec §9.3).
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "Task completed successfully.".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         // First event is the base agent:message
         let msg_event = rx.recv().await.unwrap();
@@ -864,13 +978,14 @@ mod tests {
         // no additional signal events.
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
         let event = runtime::protocol::Event::AgentStdout(
             runtime::protocol::AgentStdoutEvent {
                 data: "Reading the configuration file...".to_string(),
             },
         );
 
-        handle_supervisor_event("task-1", &event, &bus, &mut interpreter).await;
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
         // Should receive the base agent:message
         let msg_event = rx.recv().await.unwrap();
@@ -878,5 +993,37 @@ mod tests {
 
         // No additional events - try_recv should fail
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stdout_with_token_usage_emits_accounting_event() {
+        // When agent output contains token usage information, we should emit
+        // a system:accounting:tokens event (spec §16.4).
+        let (bus, mut rx) = test_event_bus().await;
+        let mut interpreter = OutputInterpreter::new();
+        let mut token_tracker = TokenTracker::new();
+        let event = runtime::protocol::Event::AgentStdout(
+            runtime::protocol::AgentStdoutEvent {
+                data: r#"{"total_token_usage": {"input_tokens": 1500, "output_tokens": 800}}"#.to_string(),
+            },
+        );
+
+        handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
+
+        // First event is the base agent:message
+        let msg_event = rx.recv().await.unwrap();
+        assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
+
+        // Second event is the accounting event
+        let accounting_event = rx.recv().await.unwrap();
+        assert_eq!(accounting_event.event_type, events::EventType::SystemAccountingTokens);
+        assert_eq!(accounting_event.data["input_tokens"], 1500);
+        assert_eq!(accounting_event.data["output_tokens"], 800);
+        assert_eq!(accounting_event.data["is_cumulative"], true);
+
+        // Verify tracker accumulated the tokens
+        let total = token_tracker.total();
+        assert_eq!(total.input_tokens, 1500);
+        assert_eq!(total.output_tokens, 800);
     }
 }
