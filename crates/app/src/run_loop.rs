@@ -414,8 +414,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         // If a PR's branch matches the `tasks/{task_id}` pattern, we
                         // link it to that task. Otherwise, we use an empty task_id.
                         for pr in &result.pull_requests {
-                            // Skip draft PRs — they aren't merge-ready
-                            if pr.is_draft {
+                            // Only process open, non-draft PRs for the merge queue
+                            if pr.state != tasks_github::model::PullRequestState::Open || pr.is_draft {
                                 continue;
                             }
 
