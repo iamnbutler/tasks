@@ -1051,6 +1051,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 let history = Arc::clone(&chat_history);
                                 let bus = orch_server.event_bus.clone();
                                 tokio::spawn(async move {
+                                    tracing::info!("Spawned orchestrator chat task, calling LLM...");
                                     let history_snapshot = history.lock().await.clone();
                                     match chat.process_message(&message, &context, &history_snapshot).await {
                                         Ok(response) => {
@@ -1073,6 +1074,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                                     "message": response.message,
                                                 }),
                                             );
+                                            tracing::info!(response_len = response.message.len(), "Orchestrator chat response ready, publishing...");
                                             if let Err(e) = bus.publish(resp_event).await {
                                                 tracing::error!(error = %e, "Failed to publish orchestrator response");
                                             }
