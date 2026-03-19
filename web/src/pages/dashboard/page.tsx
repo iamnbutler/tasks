@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Cell, Pie, PieChart, Bar, BarChart, XAxis, YAxis } from "recharts";
 import { AlertTriangle, RefreshCw, Sparkles, Bell } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { summarize } from "@/lib/api";
+import { complete } from "@/lib/api";
 import type { Task, TaskState, MergeQueueEntry, MergeStatus } from "@/lib/types";
 import {
   Card,
@@ -32,7 +32,7 @@ const taskStateColors: Record<TaskState, string> = {
   question: "hsl(45, 93%, 47%)",
   testing: "hsl(270, 50%, 60%)",
   awaiting_merge: "hsl(25, 95%, 53%)",
-  conflict: "hsl(0, 84%, 60%)",
+  conflict: "hsl(25, 95%, 53%)",
   completed: "hsl(142, 71%, 45%)",
   failed: "hsl(0, 84%, 60%)",
   cancelled: "hsl(0, 0%, 50%)",
@@ -236,7 +236,11 @@ function TaskStateBarChart({ tasks }: { tasks: Task[] }) {
           cursor={false}
           content={<ChartTooltipContent hideLabel />}
         />
-        <Bar dataKey="count" radius={[0, 4, 4, 0]} />
+        <Bar dataKey="count" radius={[0, 4, 4, 0]}>
+          {data.map((entry) => (
+            <Cell key={entry.state} fill={entry.fill} />
+          ))}
+        </Bar>
       </BarChart>
     </ChartContainer>
   );
@@ -306,7 +310,7 @@ function AISummary({
     [tasks, mergeQueue]
   );
 
-  const fetchSummary = async () => {
+  const fetchSummary = useCallback(async () => {
     if (tasks.length === 0 && mergeQueue.length === 0) {
       setSummary("No active work to summarize. Add some tasks to get started!");
       return;
@@ -322,32 +326,22 @@ function AISummary({
 
 Be concise and helpful. Don't use bullet points - write in natural sentences.`;
 
-      const response = await fetch("/api/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: context,
-          system: systemPrompt,
-          max_tokens: 256,
-        }),
+      const data = await complete({
+        prompt: context,
+        system: systemPrompt,
+        max_tokens: 256,
       });
-
-      if (!response.ok) {
-        throw new Error("Failed to generate summary");
-      }
-
-      const data = await response.json();
       setSummary(data.text);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to generate summary");
     } finally {
       setLoading(false);
     }
-  };
+  }, [context, tasks.length, mergeQueue.length]);
 
   useEffect(() => {
     fetchSummary();
-  }, []);
+  }, [fetchSummary]);
 
   return (
     <Card>
