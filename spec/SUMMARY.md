@@ -10,7 +10,6 @@
 
 # Reference
 
-- [Symphony (Legacy)](./symphony-legacy.md)
 - [Contributing](./CONTRIBUTING.md)
 
 ---
