@@ -385,6 +385,10 @@ async fn get_mode(State(state): State<ApiState>) -> Json<ModeResponse> {
 }
 
 /// POST /api/mode — Set operating mode.
+///
+/// When transitioning to Stop mode, all running sessions are terminated.
+/// Sessions get 5 seconds to stop gracefully before containers are force-destroyed.
+/// (Spec §6.1: "Running agent processes are terminated")
 async fn set_mode(
     State(state): State<ApiState>,
     Json(req): Json<SetModeRequest>,
@@ -394,6 +398,21 @@ async fn set_mode(
         .set_mode(req.mode, &Actor::Human)
         .await
         .map_err(ApiError::Server)?;
+
+    // When entering Stop mode, terminate all running sessions (spec §6.1).
+    // TODO: Move to an event-driven listener (on system:mode:stop) so that
+    // non-web mode changes (CLI, orchestrator) also trigger session termination.
+    if mode == Mode::Stop {
+        if let Some(ref session_manager) = state.session_manager {
+            // Give sessions 5 seconds to stop gracefully before force-destroying containers
+            let timeout = std::time::Duration::from_secs(5);
+            let stopped = session_manager.stop_all_with_timeout(timeout).await;
+            if stopped > 0 {
+                tracing::info!(stopped_sessions = stopped, "terminated sessions for Stop mode");
+            }
+        }
+    }
+
     Ok(Json(ModeResponse { mode }))
 }
 
