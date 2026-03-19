@@ -11,6 +11,8 @@ import {
   User,
   Bot,
   RotateCcw,
+  Clock,
+  Activity,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -22,6 +24,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -533,14 +540,130 @@ function FailureInfoSection({ failure }: { failure: FailureInfo }) {
 }
 
 // ---------------------------------------------------------------------------
+// Event timeline
+// ---------------------------------------------------------------------------
+
+interface TimelineEvent {
+  id: string;
+  type: string;
+  ts: string;
+  actor: string;
+  description: string;
+}
+
+function parseTimelineEvents(events: Event[]): TimelineEvent[] {
+  const timelineEvents: TimelineEvent[] = [];
+
+  for (const event of events) {
+    // Only include lifecycle/state events in timeline
+    if (event.type.startsWith("task:")) {
+      const label = lifecycleLabels[event.type];
+      if (label) {
+        timelineEvents.push({
+          id: event.id,
+          type: event.type,
+          ts: event.ts,
+          actor: event.actor,
+          description: label,
+        });
+      }
+    }
+  }
+
+  return timelineEvents.sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
+function formatTimelineTime(ts: string): string {
+  try {
+    const date = new Date(ts);
+    return date.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return ts;
+  }
+}
+
+function EventTimeline({ taskId }: { taskId: string }) {
+  const [events, setEvents] = useState<Event[]>([]);
+  const [isOpen, setIsOpen] = useState(false);
+
+  useEffect(() => {
+    fetchTaskEvents(taskId).then((allEvents) => {
+      setEvents(allEvents.sort((a, b) => a.ts.localeCompare(b.ts)));
+    });
+
+    const source = subscribeEvents({ task_id: taskId });
+    source.onmessage = (msg) => {
+      try {
+        const event: Event = JSON.parse(msg.data);
+        setEvents((prev) => [...prev, event]);
+      } catch {
+        // ignore
+      }
+    };
+    return () => source.close();
+  }, [taskId]);
+
+  const timelineEvents = parseTimelineEvents(events);
+
+  if (timelineEvents.length === 0) {
+    return null;
+  }
+
+  return (
+    <Collapsible open={isOpen} onOpenChange={setIsOpen}>
+      <CollapsibleTrigger className="flex items-center gap-2 w-full py-2 text-left hover:bg-muted/50 rounded-md px-2 -mx-2 transition-colors">
+        {isOpen ? (
+          <ChevronDown className="h-4 w-4 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+        )}
+        <Activity className="h-4 w-4 text-muted-foreground" />
+        <span className="text-sm font-medium">Event Timeline</span>
+        <Badge variant="outline" className="ml-auto text-xs">
+          {timelineEvents.length}
+        </Badge>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="mt-2 ml-1 border-l border-border pl-4 space-y-3">
+          {timelineEvents.map((event, idx) => (
+            <div key={event.id} className="relative">
+              {/* Timeline dot */}
+              <div className="absolute -left-[21px] top-1.5 h-2 w-2 rounded-full bg-muted-foreground/50" />
+              <div className="flex flex-col gap-0.5">
+                <span className="text-sm">{event.description}</span>
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Clock className="h-3 w-3" />
+                  <span>{formatTimelineTime(event.ts)}</span>
+                  {event.actor !== "system" && (
+                    <>
+                      <span className="text-muted-foreground/50">by</span>
+                      <span className="capitalize">{event.actor}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Properties sidebar
 // ---------------------------------------------------------------------------
 
 function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-4 py-1.5">
-      <span className="text-xs text-muted-foreground shrink-0 w-20">{label}</span>
-      <div className="text-sm text-right min-w-0">{children}</div>
+    <div className="flex items-center justify-between gap-4 py-2 group">
+      <span className="text-sm text-muted-foreground shrink-0">{label}</span>
+      <div className="text-sm text-right min-w-0 flex items-center justify-end">{children}</div>
     </div>
   );
 }
@@ -584,7 +707,7 @@ function PropertiesSidebar({ task, projectName }: { task: Task; projectName: str
         </PropertyRow>
       )}
 
-      <Separator className="my-2" />
+      <Separator className="my-3" />
 
       <PropertyRow label="Created">
         <span className="text-xs text-muted-foreground">
@@ -640,11 +763,15 @@ function PropertiesSidebar({ task, projectName }: { task: Task; projectName: str
       {/* Failure info */}
       {task.last_failure && (
         <>
-          <Separator className="my-2" />
-          <div className="text-xs font-medium text-red-400 mb-1">Last Failure</div>
+          <Separator className="my-3" />
+          <div className="text-xs font-medium text-red-400 mb-2">Last Failure</div>
           <FailureInfoSection failure={task.last_failure} />
         </>
       )}
+
+      {/* Event timeline */}
+      <Separator className="my-3" />
+      <EventTimeline taskId={task.id} />
     </div>
   );
 }
@@ -711,26 +838,28 @@ export function TaskDetailPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5 shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3 shrink-0 bg-background">
+        <div className="flex items-center gap-2 min-w-0">
           <Breadcrumb>
             <BreadcrumbList>
               <BreadcrumbItem>
                 <BreadcrumbLink asChild>
-                  <Link to="/">Tasks</Link>
+                  <Link to="/" className="text-muted-foreground hover:text-foreground">
+                    Tasks
+                  </Link>
                 </BreadcrumbLink>
               </BreadcrumbItem>
               <BreadcrumbSeparator />
               <BreadcrumbItem>
-                <BreadcrumbPage className="truncate max-w-md">
+                <BreadcrumbPage className="truncate max-w-lg font-medium">
                   {task.title}
                 </BreadcrumbPage>
               </BreadcrumbItem>
             </BreadcrumbList>
           </Breadcrumb>
-          <span className="font-mono text-xs text-muted-foreground shrink-0">
+          <Badge variant="outline" className="font-mono text-xs text-muted-foreground shrink-0">
             {task.id.slice(0, 8)}
-          </span>
+          </Badge>
         </div>
 
         {isSessionActive && (
@@ -739,7 +868,7 @@ export function TaskDetailPage() {
             size="sm"
             onClick={handleCancel}
             disabled={cancelling}
-            className="gap-1 shrink-0"
+            className="gap-1.5 shrink-0"
           >
             <StopCircle className="h-3.5 w-3.5" />
             {cancelling ? "Cancelling..." : "Cancel"}
@@ -755,20 +884,32 @@ export function TaskDetailPage() {
 
           {/* Description */}
           {task.description && (
-            <div className="border-t border-border p-4">
-              <div className="text-xs font-medium text-muted-foreground mb-2">Description</div>
-              <pre className="whitespace-pre-wrap text-sm font-mono bg-muted/50 rounded-md p-3 overflow-x-auto">
-                {task.description}
-              </pre>
-            </div>
+            <Collapsible defaultOpen={true}>
+              <div className="border-t border-border">
+                <CollapsibleTrigger className="flex items-center gap-2 w-full px-4 py-2.5 text-left hover:bg-muted/30 transition-colors">
+                  <ChevronDown className="h-4 w-4 text-muted-foreground data-[state=closed]:rotate-[-90deg] transition-transform" />
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">Description</span>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className="px-4 pb-4">
+                    <div className="prose prose-sm prose-invert max-w-none">
+                      <Markdown remarkPlugins={[remarkGfm]}>{task.description}</Markdown>
+                    </div>
+                  </div>
+                </CollapsibleContent>
+              </div>
+            </Collapsible>
           )}
         </div>
 
         {/* Properties sidebar */}
-        <div className="w-64 shrink-0 border-l border-border">
+        <div className="w-72 shrink-0 border-l border-border bg-muted/20">
           <ScrollArea className="h-full">
             <div className="p-4">
-              <div className="text-xs font-medium text-muted-foreground mb-3">Properties</div>
+              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">
+                Properties
+              </div>
               <PropertiesSidebar task={task} projectName={projectName} />
             </div>
           </ScrollArea>
