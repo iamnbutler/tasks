@@ -139,6 +139,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         data_dir = %config.data_dir,
         max_sessions = config.max_sessions,
+        max_sessions_per_project = config.max_sessions_per_project,
         poll_interval = ?config.poll_interval,
         dispatch_interval = ?config.dispatch_interval,
         container_image = %config.container_image,
@@ -743,6 +744,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let dispatch_session_mgr = session_manager.clone();
     let dispatch_interval = config.dispatch_interval;
     let max_sessions = config.max_sessions;
+    let max_sessions_per_project = config.max_sessions_per_project;
     let max_retries = config.max_retries;
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
@@ -850,15 +852,14 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
             // Run dispatch with pending answers
             let answers_vec: Vec<String> = pending_answers.iter().cloned().collect();
-            // Build per-project session limits from workflow configs
+            // Build per-project session limits: workflow.toml override > env default
             let per_project_limits = {
                 let state = dispatch_server.state.read().await;
                 let mut limits = std::collections::HashMap::new();
                 for project_id in state.projects.keys() {
                     let config = dispatch_config_watcher.get_config(project_id).await;
-                    if let Some(max) = config.project.max_sessions {
-                        limits.insert(project_id.clone(), max);
-                    }
+                    let limit = config.project.max_sessions.unwrap_or(max_sessions_per_project);
+                    limits.insert(project_id.clone(), limit);
                 }
                 limits
             };
