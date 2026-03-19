@@ -3,10 +3,9 @@ import { Link } from "react-router-dom";
 import { ExternalLink, Check, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { formatRelativeTime } from "@/lib/utils";
+import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { approveMerge, rejectMerge } from "@/lib/api";
 import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
-import { projectLabel } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Status badge
@@ -30,60 +29,48 @@ function statusBadge(status: MergeStatus) {
 }
 
 // ---------------------------------------------------------------------------
+// Status sort order (pending last)
+// ---------------------------------------------------------------------------
+
+const statusSortOrder: Record<MergeStatus, number> = {
+  conflict: 0,
+  approved: 1,
+  rejected: 2,
+  merged: 3,
+  pending: 4,
+};
+
+export { statusSortOrder };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Extract PR number from a GitHub PR URL. */
+function prNumber(url: string): string | null {
+  const match = url.match(/\/pull\/(\d+)/);
+  return match?.[1] ?? null;
+}
+
+/** Get the task's title from task list. */
+function getTask(taskId: string, meta: { tasks?: Task[] } | undefined): Task | undefined {
+  return meta?.tasks?.find((t) => t.id === taskId);
+}
+
+// ---------------------------------------------------------------------------
 // Column definitions
+// Row layout: [PR #] [PR title] [project] [status] [linked issue] [queued] [actions]
 // ---------------------------------------------------------------------------
 
 export const columns: ColumnDef<MergeQueueEntry>[] = [
-  {
-    accessorKey: "id",
-    header: "ID",
-    cell: ({ row }) => (
-      <span className="font-mono text-sm">{row.original.id.slice(0, 8)}</span>
-    ),
-  },
-  {
-    accessorKey: "task_id",
-    header: "Task",
-    cell: ({ row, table }) => {
-      const tasks = (table.options.meta as { tasks?: Task[] })?.tasks ?? [];
-      const task = tasks.find((t) => t.id === row.original.task_id);
-      const source = task?.source;
-      const label =
-        source && (source.type === "github_issue" || source.type === "github_pr")
-          ? `#${source.number}`
-          : row.original.task_id.slice(0, 8);
-      return (
-        <Link
-          to={`/tasks/${row.original.task_id}`}
-          className="font-mono text-blue-400 hover:underline"
-        >
-          {label}
-        </Link>
-      );
-    },
-  },
-  {
-    id: "project",
-    header: "Project",
-    cell: ({ row, table }) => {
-      const meta = table.options.meta as { tasks?: Task[]; projects?: Project[] } | undefined;
-      const tasks = meta?.tasks ?? [];
-      const projects = meta?.projects ?? [];
-      const task = tasks.find((t) => t.id === row.original.task_id);
-      const displayName = task?.project ? projectLabel(task.project, projects) : "—";
-      return (
-        <span className="text-muted-foreground">
-          {displayName}
-        </span>
-      );
-    },
-  },
+  // PR number (extracted from pr_url)
   {
     accessorKey: "pr_url",
     header: "PR",
     cell: ({ row }) => {
       const url = row.original.pr_url;
-      if (!url) {
+      const num = prNumber(url);
+      if (!num) {
         return <span className="text-muted-foreground">&mdash;</span>;
       }
       return (
@@ -91,28 +78,97 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           href={url}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-sm"
+          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-sm font-mono"
         >
-          PR
+          #{num}
           <ExternalLink className="h-3 w-3" />
         </a>
       );
     },
   },
+
+  // PR title (from the linked task title)
+  {
+    id: "title",
+    header: "Title",
+    cell: ({ row, table }) => {
+      const task = getTask(row.original.task_id, table.options.meta as { tasks?: Task[] });
+      return (
+        <Link
+          to={`/tasks/${row.original.task_id}`}
+          className="text-sm hover:underline truncate max-w-[400px] block"
+        >
+          {task?.title ?? row.original.task_id.slice(0, 8)}
+        </Link>
+      );
+    },
+  },
+
+  // Project name
+  {
+    id: "project",
+    header: "Project",
+    cell: ({ row, table }) => {
+      const meta = table.options.meta as { tasks?: Task[]; projects?: Project[] } | undefined;
+      const task = getTask(row.original.task_id, meta);
+      const projects = meta?.projects ?? [];
+      const name = task?.project ? projectLabel(task.project, projects) : "—";
+      // Show just the repo name, not owner/repo
+      const short = name.includes("/") ? name.split("/")[1] : name;
+      return <span className="text-sm text-muted-foreground">{short}</span>;
+    },
+  },
+
+  // Status
   {
     accessorKey: "status",
     header: "Status",
     cell: ({ row }) => statusBadge(row.original.status),
+    sortingFn: (rowA, rowB) => {
+      const a = statusSortOrder[rowA.original.status] ?? 99;
+      const b = statusSortOrder[rowB.original.status] ?? 99;
+      return a - b;
+    },
   },
+
+  // Linked issue (from task source)
+  {
+    id: "issue",
+    header: "Issue",
+    cell: ({ row, table }) => {
+      const task = getTask(row.original.task_id, table.options.meta as { tasks?: Task[] });
+      if (!task) return <span className="text-muted-foreground">&mdash;</span>;
+      const { source } = task;
+      if (source.type === "github_issue") {
+        const url = `https://github.com/${source.owner}/${source.repo}/issues/${source.number}`;
+        return (
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+          >
+            #{source.number}
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        );
+      }
+      return <span className="text-muted-foreground">&mdash;</span>;
+    },
+  },
+
+  // Queued time
   {
     accessorKey: "queued_at",
     header: "Queued",
     cell: ({ row }) => (
-      <span className="text-sm text-muted-foreground whitespace-nowrap">
+      <span className="text-xs text-muted-foreground whitespace-nowrap">
         {formatRelativeTime(row.original.queued_at)}
       </span>
     ),
   },
+
+  // Actions
   {
     id: "actions",
     header: "Actions",

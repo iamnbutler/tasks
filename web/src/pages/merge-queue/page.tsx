@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
 import {
   type PaginationState,
+  type SortingState,
   useReactTable,
   getCoreRowModel,
   getPaginationRowModel,
+  getSortedRowModel,
   flexRender,
 } from "@tanstack/react-table";
 import { useAppState } from "@/hooks/use-app-state";
@@ -27,6 +29,9 @@ export function MergeQueuePage() {
     pageIndex: 0,
     pageSize: 50,
   });
+  const [sorting] = useState<SortingState>([
+    { id: "status", desc: false },
+  ]);
 
   const entries = filteredMergeQueue;
 
@@ -41,8 +46,10 @@ export function MergeQueuePage() {
     data: entries,
     columns,
     getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
     state: {
+      sorting,
       pagination,
       columnVisibility: selectedProject ? { project: false } : {},
     },
