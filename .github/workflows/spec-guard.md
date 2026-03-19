@@ -83,7 +83,6 @@ The spec files in this project follow these conventions:
 The main spec (`spec/spec.md`) references companion documents:
 - `spec/github.md` — GitHub integration details
 - `spec/session-runtime.md` — Session and container runtime
-- `spec/symphony-legacy.md` — Historical Symphony spec (legacy reference)
 
 ## Review Priorities
 

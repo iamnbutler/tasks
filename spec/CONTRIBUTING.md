@@ -19,11 +19,6 @@ Current detail specs:
 - `github.md` — GitHub integration (polling, GraphQL, normalized model)
 - `session-runtime.md` — Container provider, supervisor protocol, workspace provisioning
 
-### Legacy Documents
-
-Historical specifications kept for reference but no longer actively maintained.
-- `symphony-legacy.md` — Original Symphony spec (predecessor project)
-
 ## Document Format
 
 ### Required Header
@@ -124,6 +119,5 @@ spec/
 ├── VERSION            # Current version number
 ├── spec.md            # Main platform specification
 ├── github.md          # GitHub integration detail spec
-├── session-runtime.md # Session runtime detail spec
-└── symphony-legacy.md # Historical reference
+└── session-runtime.md # Session runtime detail spec
 ```

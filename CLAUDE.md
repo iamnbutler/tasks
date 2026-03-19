@@ -8,7 +8,6 @@ A human-in-the-loop platform that orchestrates coding agents to get project work
   - `spec.md` — Main platform spec
   - `session-runtime.md` — Session runtime architecture (container provider, supervisor, protocol)
   - `github.md` — GitHub integration: normalized model, GraphQL queries, polling
-  - `symphony-legacy.md` — Historical Symphony spec (predecessor project)
 - `crates/` — Rust crates (host-side server)
   - `app/` — Binary entry point: startup, run loops, component wiring
   - `events/` — Event system: append-only log, pub/sub
