@@ -193,6 +193,133 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             }
         }
     }
+
+    /// Stop all sessions with a timeout, then forcibly destroy remaining containers.
+    ///
+    /// Spec §6.1: When mode changes to Stop, running agent processes are terminated.
+    /// This method first attempts graceful shutdown by sending stop commands to all
+    /// sessions, then waits up to `timeout` for them to exit. Any sessions still
+    /// running after the timeout are forcibly destroyed.
+    ///
+    /// Returns the number of sessions that were stopped (both graceful and forced).
+    pub async fn stop_all_with_timeout(&self, timeout: Duration) -> usize {
+        // Get all session task IDs and their command channels
+        let session_info: Vec<(String, String, tokio::sync::mpsc::Sender<SessionCommand>)> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .map(|h| (h.task_id.clone(), h.container_id.clone(), h.command_tx.clone()))
+                .collect()
+        };
+
+        let count = session_info.len();
+        if count == 0 {
+            tracing::debug!("no sessions to stop");
+            return 0;
+        }
+
+        tracing::info!(
+            session_count = count,
+            timeout_secs = timeout.as_secs(),
+            "stopping all sessions with timeout"
+        );
+
+        // Phase 1: Send stop command to all sessions (graceful shutdown attempt)
+        for (task_id, _, command_tx) in &session_info {
+            if let Err(e) = command_tx.send(SessionCommand::Stop).await {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to send stop command (session may already be ending)"
+                );
+            } else {
+                tracing::debug!(task_id = %task_id, "sent stop command to session");
+            }
+        }
+
+        // Phase 2: Wait for sessions to exit gracefully, with timeout
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(100);
+
+        loop {
+            let remaining = {
+                let sessions = self.sessions.read().await;
+                sessions.len()
+            };
+
+            if remaining == 0 {
+                tracing::info!("all sessions stopped gracefully");
+                break;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    remaining_sessions = remaining,
+                    "timeout reached, forcibly destroying remaining containers"
+                );
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Phase 3: Force-destroy any remaining sessions
+        let remaining_entries: Vec<(String, String, JoinHandle<()>)> = {
+            let mut sessions = self.sessions.write().await;
+            sessions
+                .drain()
+                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle))
+                .collect()
+        };
+
+        for (task_id, container_id, monitor_handle) in remaining_entries {
+            tracing::warn!(
+                task_id = %task_id,
+                container_id = %container_id,
+                "forcibly destroying container after timeout"
+            );
+
+            // Abort the monitor task so it doesn't double-destroy
+            monitor_handle.abort();
+
+            // Emit event to reset task state back to waiting (spec §6.1)
+            // This allows the task to be re-dispatched when mode returns to Pause/Play.
+            let event = events::Event::new(
+                events::EventType::TaskStateWaiting,
+                &task_id,
+                events::Actor::System,
+                serde_json::json!({
+                    "reason": "stop_mode",
+                    "message": "Session terminated due to Stop mode",
+                    "container_id": container_id,
+                }),
+            );
+            if let Err(e) = self.event_bus.publish(event).await {
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to publish task state event after force-stop"
+                );
+            }
+
+            if let Err(e) = self.runtime.destroy(&container_id).await {
+                tracing::error!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    error = %e,
+                    "failed to force-destroy container"
+                );
+            } else {
+                tracing::info!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    "force-destroyed container"
+                );
+            }
+        }
+
+        count
+    }
 }
 
 /// Methods that require `Clone` on the runtime (needed to create `runtime::Session`).
