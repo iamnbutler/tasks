@@ -17,7 +17,7 @@ use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
 use server::{WorkflowConfigWatcher, RefreshResult};
 use tasks_github::client::GitHubClient;
-use tasks_github::model::{IssueState, MergeableState};
+use tasks_github::model::{IssueState, IssueStateReason, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{ConflictContext, ConflictResolution, OperatingMode, Orchestrator};
@@ -457,6 +457,145 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     task_id = %task_id,
                                     "added PR to merge queue"
                                 );
+                            }
+                        }
+
+                        // --- External closure detection (spec §11.3) ---
+                        //
+                        // When a GitHub issue or PR is closed externally, we need to
+                        // transition the corresponding task to an appropriate state.
+
+                        // Detect closed issues and transition tasks to Cancelled/Completed.
+                        for issue in &result.issues {
+                            if issue.state != IssueState::Closed {
+                                continue;
+                            }
+
+                            let source = TaskSource::GithubIssue {
+                                owner: issue.owner.clone(),
+                                repo: issue.repo.clone(),
+                                number: issue.number,
+                            };
+
+                            // Find the task for this issue
+                            if let Some(task_id) = poll_server.task_id_for_source(&source).await {
+                                // Get the task to check its current state
+                                if let Some(task) = poll_server.get_task(&task_id).await {
+                                    // Skip if already terminal
+                                    if task.state.is_terminal() {
+                                        continue;
+                                    }
+
+                                    // Determine target state based on issue state_reason:
+                                    // - Completed → task Completed
+                                    // - NotPlanned or None → task Cancelled
+                                    let new_state = match issue.state_reason {
+                                        Some(IssueStateReason::Completed) => TaskState::Completed,
+                                        _ => TaskState::Cancelled,
+                                    };
+
+                                    info!(
+                                        project = %project_id,
+                                        issue = issue.number,
+                                        task_id = %task_id,
+                                        new_state = ?new_state,
+                                        state_reason = ?issue.state_reason,
+                                        "detected external issue closure, transitioning task"
+                                    );
+
+                                    if let Err(e) = poll_server
+                                        .set_task_state(&task_id, new_state, Actor::Scheduler)
+                                        .await
+                                    {
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to transition task for closed issue"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Detect merged/closed PRs and transition linked tasks.
+                        for pr in &result.pull_requests {
+                            // Only handle closed/merged PRs
+                            if pr.state == PullRequestState::Open {
+                                continue;
+                            }
+
+                            // Find the linked task by branch name
+                            let task_id = match poll_server.find_task_by_branch(&pr.head_ref).await {
+                                Some(id) => id,
+                                None => continue, // No linked task
+                            };
+
+                            // Get the task to check its current state
+                            let task = match poll_server.get_task(&task_id).await {
+                                Some(t) => t,
+                                None => continue,
+                            };
+
+                            // Skip if already terminal
+                            if task.state.is_terminal() {
+                                continue;
+                            }
+
+                            match pr.state {
+                                PullRequestState::Merged => {
+                                    // PR was merged externally → task is Completed
+                                    info!(
+                                        project = %project_id,
+                                        pr = pr.number,
+                                        task_id = %task_id,
+                                        "detected external PR merge, transitioning task to Completed"
+                                    );
+
+                                    if let Err(e) = poll_server
+                                        .set_task_state(&task_id, TaskState::Completed, Actor::Scheduler)
+                                        .await
+                                    {
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to transition task for merged PR"
+                                        );
+                                    }
+                                }
+                                PullRequestState::Closed => {
+                                    // PR was closed without merge.
+                                    // Only cancel if task is in AwaitingMerge state.
+                                    // If task is in other states (Waiting, Running), the PR closure
+                                    // might be part of normal rework — don't cancel.
+                                    if task.state == TaskState::AwaitingMerge {
+                                        info!(
+                                            project = %project_id,
+                                            pr = pr.number,
+                                            task_id = %task_id,
+                                            "detected external PR closure, transitioning task to Cancelled"
+                                        );
+
+                                        if let Err(e) = poll_server
+                                            .set_task_state(&task_id, TaskState::Cancelled, Actor::Scheduler)
+                                            .await
+                                        {
+                                            warn!(
+                                                task_id = %task_id,
+                                                error = %e,
+                                                "failed to transition task for closed PR"
+                                            );
+                                        }
+                                    } else {
+                                        debug!(
+                                            project = %project_id,
+                                            pr = pr.number,
+                                            task_id = %task_id,
+                                            task_state = ?task.state,
+                                            "PR closed but task not in AwaitingMerge, skipping (likely rework)"
+                                        );
+                                    }
+                                }
+                                PullRequestState::Open => unreachable!(), // Already filtered out
                             }
                         }
                     }

@@ -356,3 +356,243 @@ async fn empty_poll_does_not_clear_high_water_mark() {
     // Mark should not have regressed.
     assert_eq!(poller.since(), first_mark);
 }
+
+// ---------------------------------------------------------------------------
+// Closure detection tests (spec §11.3)
+// ---------------------------------------------------------------------------
+
+fn sample_closed_issue(number: u64, updated_at: &str, state_reason: Option<&str>) -> serde_json::Value {
+    json!({
+        "number": number,
+        "id": format!("I_{number}"),
+        "title": format!("Issue {number}"),
+        "body": null,
+        "state": "CLOSED",
+        "stateReason": state_reason,
+        "author": { "login": "alice", "id": "U_alice" },
+        "labels": { "nodes": [] },
+        "assignees": { "nodes": [] },
+        "milestone": null,
+        "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+        },
+        "subIssues": { "nodes": [] },
+        "timelineItems": { "nodes": [] },
+        "createdAt": "2025-01-01T00:00:00Z",
+        "updatedAt": updated_at,
+        "closedAt": updated_at
+    })
+}
+
+fn sample_merged_pr(number: u64, updated_at: &str) -> serde_json::Value {
+    json!({
+        "number": number,
+        "id": format!("PR_{number}"),
+        "title": format!("PR {number}"),
+        "body": null,
+        "state": "MERGED",
+        "headRefName": "branch",
+        "headRefOid": "abc123",
+        "baseRefName": "main",
+        "isDraft": false,
+        "mergeable": "UNKNOWN",
+        "author": { "login": "alice", "id": "U_alice" },
+        "labels": { "nodes": [] },
+        "assignees": { "nodes": [] },
+        "reviewDecision": null,
+        "reviews": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+        },
+        "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+        },
+        "closingIssuesReferences": { "nodes": [] },
+        "createdAt": "2025-01-01T00:00:00Z",
+        "updatedAt": updated_at,
+        "closedAt": updated_at,
+        "mergedAt": updated_at
+    })
+}
+
+fn sample_closed_pr(number: u64, updated_at: &str) -> serde_json::Value {
+    json!({
+        "number": number,
+        "id": format!("PR_{number}"),
+        "title": format!("PR {number}"),
+        "body": null,
+        "state": "CLOSED",
+        "headRefName": "branch",
+        "headRefOid": "abc123",
+        "baseRefName": "main",
+        "isDraft": false,
+        "mergeable": "UNKNOWN",
+        "author": { "login": "alice", "id": "U_alice" },
+        "labels": { "nodes": [] },
+        "assignees": { "nodes": [] },
+        "reviewDecision": null,
+        "reviews": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+        },
+        "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": []
+        },
+        "closingIssuesReferences": { "nodes": [] },
+        "createdAt": "2025-01-01T00:00:00Z",
+        "updatedAt": updated_at,
+        "closedAt": updated_at,
+        "mergedAt": null
+    })
+}
+
+#[tokio::test]
+async fn poll_includes_closed_issues() {
+    // Verify that the poller fetches both open and closed issues
+    // so we can detect external closures (spec §11.3).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(issue_response(json!([
+                    sample_issue(1, "2025-01-10T00:00:00Z"),
+                    sample_closed_issue(2, "2025-01-11T00:00:00Z", Some("COMPLETED")),
+                    sample_closed_issue(3, "2025-01-12T00:00:00Z", Some("NOT_PLANNED")),
+                ]))),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(pr_response(json!([]))),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let mut poller = RepoPoller::new(client, "owner", "repo");
+
+    let result = poller.poll().await.unwrap();
+
+    // Should include both open and closed issues
+    assert_eq!(result.issues.len(), 3);
+
+    // Verify we can distinguish closed issues
+    use tasks_github::model::IssueState;
+    let open_issues: Vec<_> = result.issues.iter()
+        .filter(|i| i.state == IssueState::Open)
+        .collect();
+    let closed_issues: Vec<_> = result.issues.iter()
+        .filter(|i| i.state == IssueState::Closed)
+        .collect();
+
+    assert_eq!(open_issues.len(), 1);
+    assert_eq!(closed_issues.len(), 2);
+}
+
+#[tokio::test]
+async fn poll_includes_merged_prs() {
+    // Verify that the poller fetches merged PRs so we can detect
+    // external merges (spec §11.3).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(issue_response(json!([]))),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(pr_response(json!([
+                    sample_pr(10, "2025-01-10T00:00:00Z"),
+                    sample_merged_pr(11, "2025-01-11T00:00:00Z"),
+                ]))),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let mut poller = RepoPoller::new(client, "owner", "repo");
+
+    let result = poller.poll().await.unwrap();
+
+    // Should include both open and merged PRs
+    assert_eq!(result.pull_requests.len(), 2);
+
+    // Verify we can distinguish merged PRs
+    use tasks_github::model::PullRequestState;
+    let open_prs: Vec<_> = result.pull_requests.iter()
+        .filter(|p| p.state == PullRequestState::Open)
+        .collect();
+    let merged_prs: Vec<_> = result.pull_requests.iter()
+        .filter(|p| p.state == PullRequestState::Merged)
+        .collect();
+
+    assert_eq!(open_prs.len(), 1);
+    assert_eq!(merged_prs.len(), 1);
+}
+
+#[tokio::test]
+async fn poll_includes_closed_prs() {
+    // Verify that the poller fetches closed (not merged) PRs so we can
+    // detect external closures (spec §11.3).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(issue_response(json!([]))),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(pr_response(json!([
+                    sample_pr(10, "2025-01-10T00:00:00Z"),
+                    sample_closed_pr(11, "2025-01-11T00:00:00Z"),
+                ]))),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let mut poller = RepoPoller::new(client, "owner", "repo");
+
+    let result = poller.poll().await.unwrap();
+
+    // Should include both open and closed PRs
+    assert_eq!(result.pull_requests.len(), 2);
+
+    // Verify we can distinguish closed PRs
+    use tasks_github::model::PullRequestState;
+    let open_prs: Vec<_> = result.pull_requests.iter()
+        .filter(|p| p.state == PullRequestState::Open)
+        .collect();
+    let closed_prs: Vec<_> = result.pull_requests.iter()
+        .filter(|p| p.state == PullRequestState::Closed)
+        .collect();
+
+    assert_eq!(open_prs.len(), 1);
+    assert_eq!(closed_prs.len(), 1);
+}
