@@ -14,15 +14,15 @@ import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
 function statusBadge(status: MergeStatus) {
   switch (status) {
     case "pending":
-      return <Badge className="bg-yellow-600 text-white">{status}</Badge>;
+      return <Badge variant="outline" className="bg-yellow-500/15 text-yellow-400 border-yellow-500/30">{status}</Badge>;
     case "approved":
-      return <Badge className="bg-green-600 text-white">{status}</Badge>;
+      return <Badge variant="outline" className="bg-green-500/15 text-green-400 border-green-500/30">{status}</Badge>;
     case "rejected":
-      return <Badge className="bg-red-600 text-white">{status}</Badge>;
+      return <Badge variant="outline" className="bg-red-500/15 text-red-400 border-red-500/30">{status}</Badge>;
     case "merged":
-      return <Badge className="bg-blue-600 text-white">{status}</Badge>;
+      return <Badge variant="outline" className="bg-blue-500/15 text-blue-400 border-blue-500/30">{status}</Badge>;
     case "conflict":
-      return <Badge className="bg-orange-600 text-white">{status}</Badge>;
+      return <Badge variant="outline" className="bg-orange-500/15 text-orange-400 border-orange-500/30">{status}</Badge>;
     default:
       return <Badge variant="outline">{status}</Badge>;
   }
