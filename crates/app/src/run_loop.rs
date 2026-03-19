@@ -850,8 +850,21 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
             // Run dispatch with pending answers
             let answers_vec: Vec<String> = pending_answers.iter().cloned().collect();
+            // Build per-project session limits from workflow configs
+            let per_project_limits = {
+                let state = dispatch_server.state.read().await;
+                let mut limits = std::collections::HashMap::new();
+                for project_id in state.projects.keys() {
+                    let config = dispatch_config_watcher.get_config(project_id).await;
+                    if let Some(max) = config.project.max_sessions {
+                        limits.insert(project_id.clone(), max);
+                    }
+                }
+                limits
+            };
+
             match dispatch_server
-                .run_dispatch(&answers_vec, effective_max)
+                .run_dispatch_with_limits(&answers_vec, effective_max, Some(&per_project_limits))
                 .await
             {
                 Ok(plan) => {

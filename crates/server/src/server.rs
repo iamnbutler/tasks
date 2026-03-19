@@ -439,6 +439,15 @@ impl Server {
         pending_answers: &[String],
         global_max: u32,
     ) -> Result<DispatchPlan, ServerError> {
+        self.run_dispatch_with_limits(pending_answers, global_max, None).await
+    }
+
+    pub async fn run_dispatch_with_limits(
+        &self,
+        pending_answers: &[String],
+        global_max: u32,
+        per_project_limits: Option<&HashMap<String, u32>>,
+    ) -> Result<DispatchPlan, ServerError> {
         // 1. Read current mode — if Stop, return empty plan.
         {
             let state = self.state.read().await;
@@ -476,12 +485,15 @@ impl Server {
             }
         }
 
-        // 3. Build project_limits map (for now, use global_max for all projects).
+        // 3. Build project_limits map from per-project overrides or global default.
         let project_limits = {
             let state = self.state.read().await;
             let mut limits = HashMap::new();
             for project_id in state.projects.keys() {
-                limits.insert(project_id.clone(), global_max);
+                let limit = per_project_limits
+                    .and_then(|m| m.get(project_id).copied())
+                    .unwrap_or(global_max);
+                limits.insert(project_id.clone(), limit);
             }
             limits
         };
