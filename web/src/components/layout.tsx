@@ -209,7 +209,7 @@ function ProjectList() {
     } else {
       setSelectedProject(projectId);
     }
-    navigate("/");
+    navigate("/tasks");
   };
 
   return (
@@ -245,7 +245,7 @@ function ProjectList() {
           <button
             onClick={() => {
               setSelectedProject(null);
-              navigate("/");
+              navigate("/tasks");
             }}
             className={cn(
               "flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors",
