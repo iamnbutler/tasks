@@ -113,3 +113,34 @@ export function subscribeEvents(opts?: {
   const url = query ? `/api/events?${query}` : "/api/events";
   return new EventSource(url);
 }
+
+// Completions API (Haiku-powered fast LLM tasks)
+
+export interface CompletionRequest {
+  prompt: string;
+  system?: string;
+  max_tokens?: number;
+}
+
+export interface CompletionResponse {
+  text: string;
+}
+
+export function complete(req: CompletionRequest): Promise<CompletionResponse> {
+  return request<CompletionResponse>("/api/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export function summarize(
+  text: string,
+  maxWords?: number
+): Promise<{ summary: string }> {
+  return request<{ summary: string }>("/api/completions/summarize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, max_words: maxWords }),
+  });
+}

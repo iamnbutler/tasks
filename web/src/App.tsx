@@ -1,6 +1,7 @@
 import { Routes, Route } from "react-router-dom";
 import { AppStateProvider } from "@/hooks/use-app-state";
 import { Layout } from "@/components/layout";
+import { DashboardPage } from "@/pages/dashboard/page";
 import { TasksPage } from "@/pages/tasks/page";
 import { TaskDetailPage } from "@/pages/task-detail";
 import { MergeQueuePage } from "@/pages/merge-queue/page";
@@ -12,7 +13,8 @@ export function App() {
     <AppStateProvider>
       <Routes>
         <Route element={<Layout />}>
-          <Route path="/" element={<TasksPage />} />
+          <Route path="/" element={<DashboardPage />} />
+          <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:id" element={<TaskDetailPage />} />
           <Route path="/merge-queue" element={<MergeQueuePage />} />
           <Route path="/orchestrator" element={<OrchestratorPage />} />
