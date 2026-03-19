@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
-  ArrowLeft,
   ExternalLink,
   Send,
   ChevronDown,
@@ -18,41 +17,36 @@ import remarkGfm from "remark-gfm";
 import { useAppState } from "@/hooks/use-app-state";
 import { cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
 import type { Event, FailureInfo, Task, TaskState } from "@/lib/types";
+import { taskStateMeta } from "./tasks/columns";
 
 // ---------------------------------------------------------------------------
 // State badge
 // ---------------------------------------------------------------------------
 
-const stateStyles: Record<TaskState, string> = {
-  waiting: "bg-muted text-muted-foreground",
-  blocked: "bg-muted text-muted-foreground",
-  running: "bg-blue-600 text-white",
-  question: "bg-yellow-600 text-white",
-  testing: "bg-purple-600 text-white",
-  awaiting_merge: "bg-orange-500 text-white",
-  conflict: "bg-red-600 text-white",
-  completed: "bg-green-600 text-white",
-  failed: "bg-red-600 text-white",
-  cancelled: "bg-muted text-muted-foreground",
-};
-
-function stateBadge(state: TaskState) {
-  const label = state === "awaiting_merge" ? "awaiting merge" : state;
-  return <Badge className={stateStyles[state]}>{label}</Badge>;
+function StateBadge({ state }: { state: TaskState }) {
+  const meta = taskStateMeta[state];
+  if (!meta) return null;
+  const Icon = meta.icon;
+  return (
+    <Badge variant="outline" className={cn("gap-1", meta.className)}>
+      <Icon className="h-3.5 w-3.5" />
+      {meta.label}
+    </Badge>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -68,9 +62,9 @@ function sourceDisplay(task: Task) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-blue-400 hover:underline"
+        className="inline-flex items-center gap-1 text-blue-400 hover:underline text-sm"
       >
-        {source.owner}/{source.repo}#{source.number}
+        #{source.number}
         <ExternalLink className="h-3 w-3" />
       </a>
     );
@@ -82,24 +76,18 @@ function sourceDisplay(task: Task) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="inline-flex items-center gap-1 text-blue-400 hover:underline"
+        className="inline-flex items-center gap-1 text-blue-400 hover:underline text-sm"
       >
-        {source.owner}/{source.repo}#{source.number} (PR)
+        #{source.number} (PR)
         <ExternalLink className="h-3 w-3" />
       </a>
     );
   }
-  return <span className="text-muted-foreground">Internal</span>;
+  return <span className="text-muted-foreground text-sm">Internal</span>;
 }
 
 // ---------------------------------------------------------------------------
-// Parse Claude Code protocol messages from agent:message events.
-//
-// Event data shape: { text: "<raw JSON line from agent stdout>" }
-// The JSON line is a Claude Code protocol message with structure:
-//   { type: "system"|"assistant"|"user"|"result", message?: { content: [...] }, ... }
-// Content blocks: { type: "text", text }, { type: "tool_use", name, input },
-//   { type: "tool_result", content }, { type: "thinking", thinking }
+// Parse Claude Code protocol messages
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
@@ -110,7 +98,6 @@ interface ParsedBlock {
   timestamp?: string;
 }
 
-/** Human-readable labels for task lifecycle events. */
 const lifecycleLabels: Record<string, string> = {
   "task:created": "Task created",
   "task:state:running": "Agent started",
@@ -130,9 +117,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
   let runningCount = 0;
 
   for (const event of events) {
-    // Track session boundaries — when a task enters running state again (retry).
-    // Note: session_id is not available in the event data (it lives on the Task
-    // model), so we detect retries by counting running transitions instead.
     if (event.type === "task:state:running") {
       runningCount++;
       if (runningCount > 1) {
@@ -144,7 +128,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       }
     }
 
-    // Lifecycle events — task state transitions, container pickup, etc.
     if (event.type.startsWith("task:")) {
       const label = lifecycleLabels[event.type];
       if (label) {
@@ -153,15 +136,10 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       continue;
     }
 
-    // Human messages — user chat input
     if (event.type === "human:message") {
       const message = event.data?.message as string | undefined;
       if (message) {
-        blocks.push({
-          kind: "human_message",
-          content: message,
-          timestamp: event.ts,
-        });
+        blocks.push({ kind: "human_message", content: message, timestamp: event.ts });
       }
       continue;
     }
@@ -175,7 +153,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       continue;
     }
 
-    // event.data.text is a raw JSON line from Claude Code stdout
     const raw = event.data?.text;
     if (typeof raw !== "string") continue;
 
@@ -183,15 +160,12 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
     try {
       msg = JSON.parse(raw);
     } catch {
-      // Not JSON — show as plain text
       if (raw.trim()) blocks.push({ kind: "text", content: raw });
       continue;
     }
 
-    // Skip system init messages
     if (msg.type === "system") continue;
 
-    // result messages (final summary)
     if (msg.type === "result") {
       const result = msg.result as Record<string, unknown> | undefined;
       if (typeof result?.text === "string" && result.text) {
@@ -200,7 +174,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       continue;
     }
 
-    // assistant and user messages — extract content blocks
     const message = msg.message as Record<string, unknown> | undefined;
     const contentBlocks = (message?.content ?? msg.content) as unknown[] | undefined;
     if (!Array.isArray(contentBlocks)) continue;
@@ -209,10 +182,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       if (typeof block !== "object" || block === null) continue;
       const b = block as Record<string, unknown>;
 
-      if (b.type === "thinking" && typeof b.thinking === "string") {
-        // Skip thinking blocks — they're internal reasoning
-        continue;
-      }
+      if (b.type === "thinking") continue;
 
       if (b.type === "text" && typeof b.text === "string") {
         if (b.text.trim()) {
@@ -227,7 +197,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
         const filePath = input.file_path ?? input.filePath ?? input.path ?? input.pattern;
         const command = input.command;
         const description = input.description;
-        // Show the most useful piece of context
         const detail = filePath ?? command ?? description;
         blocks.push({
           kind: "tool_use",
@@ -242,7 +211,6 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       if (b.type === "tool_result") {
         const content = typeof b.content === "string" ? b.content : "";
         if (!content) continue;
-        // Truncate large results
         const lines = content.split("\n");
         const preview =
           lines.length > 30
@@ -258,24 +226,45 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
 }
 
 // ---------------------------------------------------------------------------
-// Rendered block components
+// Block view components
 // ---------------------------------------------------------------------------
 
-/** Format timestamp for display in chat */
 function formatMessageTime(ts?: string): string | null {
   if (!ts) return null;
   try {
-    const date = new Date(ts);
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   } catch {
     return null;
   }
 }
 
+function ToolResultBlock({ block }: { block: ParsedBlock }) {
+  const [open, setOpen] = useState(false);
+  const isLong = block.content.split("\n").length > 5;
+  return (
+    <div className="rounded-md border border-border bg-muted/50 text-sm overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-2 px-3 py-1.5 w-full text-left text-muted-foreground text-sm hover:bg-muted/80"
+      >
+        <FileText className="h-3 w-3 shrink-0" />
+        <span>Output</span>
+        {isLong && (
+          open ? <ChevronDown className="h-3 w-3 ml-auto" /> : <ChevronRight className="h-3 w-3 ml-auto" />
+        )}
+      </button>
+      {(open || !isLong) && (
+        <pre className="px-3 py-2 text-sm font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-muted-foreground border-t border-border">
+          {block.content}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 function BlockView({ block }: { block: ParsedBlock }) {
   const timestamp = formatMessageTime(block.timestamp);
 
-  // Human message — user chat input (right-aligned, distinct style)
   if (block.kind === "human_message") {
     return (
       <div className="flex justify-end">
@@ -287,15 +276,12 @@ function BlockView({ block }: { block: ParsedBlock }) {
           <div className="rounded-lg bg-blue-600 px-3 py-2 text-sm text-white">
             {block.content}
           </div>
-          {timestamp && (
-            <span className="text-xs text-muted-foreground">{timestamp}</span>
-          )}
+          {timestamp && <span className="text-xs text-muted-foreground">{timestamp}</span>}
         </div>
       </div>
     );
   }
 
-  // Session boundary — retry indicator
   if (block.kind === "session_boundary") {
     return (
       <div className="flex items-center gap-2 py-3 text-sm text-yellow-500">
@@ -312,37 +298,13 @@ function BlockView({ block }: { block: ParsedBlock }) {
       <div className="flex items-center gap-2 py-1 text-muted-foreground text-sm">
         <Terminal className="h-3 w-3 shrink-0" />
         <span className="font-medium">{block.toolName}</span>
-        {block.content && (
-          <span className="font-mono truncate">{block.content}</span>
-        )}
+        {block.content && <span className="font-mono truncate">{block.content}</span>}
       </div>
     );
   }
 
   if (block.kind === "tool_result") {
-    const [open, setOpen] = useState(false);
-    const isLong = block.content.split("\n").length > 5;
-    return (
-      <div className="rounded-md border border-border bg-muted/50 text-sm overflow-hidden">
-        <button
-          onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 px-3 py-1.5 w-full text-left text-muted-foreground text-sm hover:bg-muted/80"
-        >
-          <FileText className="h-3 w-3 shrink-0" />
-          <span>Output</span>
-          {isLong && (
-            open
-              ? <ChevronDown className="h-3 w-3 ml-auto" />
-              : <ChevronRight className="h-3 w-3 ml-auto" />
-          )}
-        </button>
-        {(open || !isLong) && (
-          <pre className="px-3 py-2 text-sm font-mono overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-muted-foreground border-t border-border">
-            {block.content}
-          </pre>
-        )}
-      </div>
-    );
+    return <ToolResultBlock block={block} />;
   }
 
   if (block.kind === "lifecycle") {
@@ -363,7 +325,6 @@ function BlockView({ block }: { block: ParsedBlock }) {
     );
   }
 
-  // text — render as markdown (agent message)
   return (
     <div className="flex gap-2">
       <div className="shrink-0 mt-1">
@@ -375,16 +336,14 @@ function BlockView({ block }: { block: ParsedBlock }) {
         <div className="prose prose-sm prose-invert max-w-none">
           <Markdown remarkPlugins={[remarkGfm]}>{block.content}</Markdown>
         </div>
-        {timestamp && (
-          <span className="text-xs text-muted-foreground mt-1 block">{timestamp}</span>
-        )}
+        {timestamp && <span className="text-xs text-muted-foreground mt-1 block">{timestamp}</span>}
       </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Session view — live agent output + chat
+// Session view
 // ---------------------------------------------------------------------------
 
 function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boolean }) {
@@ -405,9 +364,7 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       e.type.startsWith("task:");
 
     fetchTaskEvents(taskId).then((events) => {
-      setRawEvents(
-        events.filter(isRelevant).sort((a, b) => a.ts.localeCompare(b.ts))
-      );
+      setRawEvents(events.filter(isRelevant).sort((a, b) => a.ts.localeCompare(b.ts)));
     });
 
     const source = subscribeEvents({ task_id: taskId });
@@ -427,24 +384,18 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
   const blocks = parseAgentEvents(rawEvents);
   const prevBlocksLength = useRef(blocks.length);
 
-  // Check if user is scrolled to bottom (within threshold)
   const checkIfAtBottom = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return true;
-    const threshold = 50;
-    return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+    return container.scrollHeight - container.scrollTop - container.clientHeight <= 50;
   }, []);
 
-  // Handle scroll events to track position
   const handleScroll = useCallback(() => {
     const atBottom = checkIfAtBottom();
     setIsAtBottom(atBottom);
-    if (atBottom) {
-      setHasNewMessages(false);
-    }
+    if (atBottom) setHasNewMessages(false);
   }, [checkIfAtBottom]);
 
-  // Auto-scroll to bottom only if user was at bottom, otherwise show indicator
   useEffect(() => {
     if (blocks.length > prevBlocksLength.current) {
       if (isAtBottom) {
@@ -456,7 +407,6 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
     prevBlocksLength.current = blocks.length;
   }, [blocks.length, isAtBottom]);
 
-  // Scroll to bottom when clicking the new messages indicator
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     setHasNewMessages(false);
@@ -478,155 +428,225 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
   }, [chatInput, sending, taskId]);
 
   return (
-    <Card className="flex flex-col flex-1 min-h-0">
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium text-muted-foreground">
-          Session
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="flex flex-col flex-1 min-h-0 gap-2">
-        {/* Message stream */}
-        <div className="relative flex-1 min-h-0">
-          <div
-            ref={scrollContainerRef}
-            onScroll={handleScroll}
-            className="absolute inset-0 overflow-y-auto rounded-md border border-border bg-background p-3 space-y-2"
-          >
-            {blocks.length === 0 && (
-              <p className="text-muted-foreground text-center py-8">
-                No agent output yet.
-              </p>
-            )}
-            {blocks.map((block, i) => (
-              <BlockView key={i} block={block} />
-            ))}
-            <div ref={bottomRef} />
-          </div>
-          {/* New messages indicator */}
-          {hasNewMessages && (
-            <button
-              onClick={scrollToBottom}
-              className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 text-white text-sm font-medium shadow-lg hover:bg-blue-700 transition-colors"
-            >
-              <ChevronDown className="h-4 w-4" />
-              New messages
-            </button>
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* Message stream */}
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="absolute inset-0 overflow-y-auto p-4 space-y-2"
+        >
+          {blocks.length === 0 && (
+            <p className="text-muted-foreground text-center py-8 text-sm">
+              No agent output yet.
+            </p>
           )}
+          {blocks.map((block, i) => (
+            <BlockView key={i} block={block} />
+          ))}
+          <div ref={bottomRef} />
         </div>
-
-        {/* Chat input — only when session is active */}
-        {chatEnabled && (
-          <form
-            className="flex gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleSend();
-            }}
+        {hasNewMessages && (
+          <button
+            onClick={scrollToBottom}
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 text-white text-sm font-medium shadow-lg hover:bg-blue-700 transition-colors"
           >
-            <Input
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              placeholder="Send a message to the agent..."
-              className="flex-1"
-              disabled={sending}
-            />
-            <Button type="submit" size="icon" disabled={sending || !chatInput.trim()}>
-              <Send className="h-4 w-4" />
-            </Button>
-          </form>
+            <ChevronDown className="h-4 w-4" />
+            New messages
+          </button>
         )}
-      </CardContent>
-    </Card>
+      </div>
+
+      {/* Chat input */}
+      {chatEnabled && (
+        <form
+          className="flex gap-2 p-3 border-t border-border"
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSend();
+          }}
+        >
+          <Input
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="Send a message to the agent..."
+            className="flex-1"
+            disabled={sending}
+          />
+          <Button type="submit" size="icon" disabled={sending || !chatInput.trim()}>
+            <Send className="h-4 w-4" />
+          </Button>
+        </form>
+      )}
+    </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Failure info display
+// Failure info
 // ---------------------------------------------------------------------------
 
-function FailureInfoCard({ failure }: { failure: FailureInfo }) {
+function FailureInfoSection({ failure }: { failure: FailureInfo }) {
   const [stderrExpanded, setStderrExpanded] = useState(false);
   const hasStderr = failure.stderr_tail.length > 0;
 
   return (
-    <Card className="border-red-500/30">
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium text-red-400">
-          Last Failure
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        <dl className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-2 text-sm">
-          <div>
-            <dt className="text-muted-foreground">Type</dt>
-            <dd className="font-medium">
-              <Badge
-                variant="outline"
-                className={cn(
-                  failure.failure_type === "transient"
-                    ? "border-yellow-500/50 text-yellow-400"
-                    : "border-red-500/50 text-red-400"
-                )}
-              >
-                {failure.failure_type}
-              </Badge>
-            </dd>
-          </div>
-          <div>
-            <dt className="text-muted-foreground">Duration</dt>
-            <dd className="font-medium">{failure.duration_secs}s</dd>
-          </div>
-          {failure.exit_code !== null && (
-            <div>
-              <dt className="text-muted-foreground">Exit Code</dt>
-              <dd className="font-mono">{failure.exit_code}</dd>
-            </div>
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Badge
+          variant="outline"
+          className={cn(
+            failure.failure_type === "transient"
+              ? "border-yellow-500/50 text-yellow-400"
+              : "border-red-500/50 text-red-400"
           )}
-          {failure.signal && (
-            <div>
-              <dt className="text-muted-foreground">Signal</dt>
-              <dd className="font-mono">{failure.signal}</dd>
-            </div>
-          )}
-        </dl>
-
-        <div>
-          <p className="text-sm text-muted-foreground">{failure.summary}</p>
+        >
+          {failure.failure_type}
+        </Badge>
+        <span className="text-xs text-muted-foreground">{failure.duration_secs}s</span>
+      </div>
+      <p className="text-xs text-muted-foreground">{failure.summary}</p>
+      {failure.exit_code !== null && (
+        <div className="text-xs text-muted-foreground">
+          Exit code: <span className="font-mono">{failure.exit_code}</span>
         </div>
-
-        {hasStderr && (
-          <div className="space-y-1">
-            <button
-              onClick={() => setStderrExpanded(!stderrExpanded)}
-              className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {stderrExpanded ? (
-                <ChevronDown className="h-4 w-4" />
-              ) : (
-                <ChevronRight className="h-4 w-4" />
-              )}
-              <Terminal className="h-3 w-3" />
-              Stderr ({failure.stderr_tail.length} lines)
-            </button>
-            {stderrExpanded && (
-              <pre className="text-xs font-mono bg-muted/50 rounded-md p-3 overflow-x-auto max-h-48 overflow-y-auto text-red-300/80">
-                {failure.stderr_tail.join("\n")}
-              </pre>
-            )}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+      )}
+      {hasStderr && (
+        <div>
+          <button
+            onClick={() => setStderrExpanded(!stderrExpanded)}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {stderrExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            <Terminal className="h-3 w-3" />
+            Stderr ({failure.stderr_tail.length} lines)
+          </button>
+          {stderrExpanded && (
+            <pre className="mt-1 text-xs font-mono bg-muted/50 rounded-md p-2 overflow-x-auto max-h-32 overflow-y-auto text-red-300/80">
+              {failure.stderr_tail.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Event data preview
+// Properties sidebar
 // ---------------------------------------------------------------------------
 
-function eventDataPreview(data: Record<string, unknown>): string {
-  const raw = JSON.stringify(data);
-  return raw.length > 120 ? `${raw.slice(0, 120)}...` : raw;
+function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-4 py-1.5">
+      <span className="text-xs text-muted-foreground shrink-0 w-20">{label}</span>
+      <div className="text-sm text-right min-w-0">{children}</div>
+    </div>
+  );
+}
+
+function PropertiesSidebar({ task, projectName }: { task: Task; projectName: string }) {
+  return (
+    <div className="space-y-1">
+      <PropertyRow label="Status">
+        <StateBadge state={task.state} />
+      </PropertyRow>
+
+      <PropertyRow label="Priority">
+        <span className="text-sm">
+          {task.priority === 1
+            ? "High"
+            : task.priority === 2
+              ? "Medium"
+              : task.priority === 3
+                ? "Low"
+                : "None"}
+        </span>
+      </PropertyRow>
+
+      <PropertyRow label="Project">
+        <span className="text-sm">{projectName}</span>
+      </PropertyRow>
+
+      <PropertyRow label="Source">
+        {sourceDisplay(task)}
+      </PropertyRow>
+
+      {task.labels.length > 0 && (
+        <PropertyRow label="Labels">
+          <div className="flex flex-wrap gap-1 justify-end">
+            {task.labels.map((l) => (
+              <Badge key={l} variant="outline" className="text-xs">
+                {l}
+              </Badge>
+            ))}
+          </div>
+        </PropertyRow>
+      )}
+
+      <Separator className="my-2" />
+
+      <PropertyRow label="Created">
+        <span className="text-xs text-muted-foreground">
+          {formatRelativeTime(task.created_at)}
+        </span>
+      </PropertyRow>
+
+      <PropertyRow label="Updated">
+        <span className="text-xs text-muted-foreground">
+          {formatRelativeTime(task.updated_at)}
+        </span>
+      </PropertyRow>
+
+      <PropertyRow label="Retries">
+        <span className="text-xs text-muted-foreground">{task.retry_count}</span>
+      </PropertyRow>
+
+      {task.session_id && (
+        <PropertyRow label="Session">
+          <span className="font-mono text-xs text-muted-foreground">
+            {task.session_id.slice(0, 12)}
+          </span>
+        </PropertyRow>
+      )}
+
+      {task.parent_id && (
+        <PropertyRow label="Parent">
+          <Link
+            to={`/tasks/${task.parent_id}`}
+            className="text-blue-400 hover:underline font-mono text-xs"
+          >
+            {task.parent_id.slice(0, 8)}
+          </Link>
+        </PropertyRow>
+      )}
+
+      {task.blocked_by.length > 0 && (
+        <PropertyRow label="Blocked by">
+          <div className="flex flex-wrap gap-1 justify-end">
+            {task.blocked_by.map((bid) => (
+              <Link
+                key={bid}
+                to={`/tasks/${bid}`}
+                className="text-blue-400 hover:underline font-mono text-xs"
+              >
+                {bid.slice(0, 8)}
+              </Link>
+            ))}
+          </div>
+        </PropertyRow>
+      )}
+
+      {/* Failure info */}
+      {task.last_failure && (
+        <>
+          <Separator className="my-2" />
+          <div className="text-xs font-medium text-red-400 mb-1">Last Failure</div>
+          <FailureInfoSection failure={task.last_failure} />
+        </>
+      )}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -636,9 +656,6 @@ function eventDataPreview(data: Record<string, unknown>): string {
 export function TaskDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { snapshot } = useAppState();
-  const [events, setEvents] = useState<Event[]>([]);
-  const [eventsLoading, setEventsLoading] = useState(true);
-  const [showDetails, setShowDetails] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
   const task = snapshot?.tasks.find((t) => t.id === id);
@@ -660,21 +677,6 @@ export function TaskDetailPage() {
     }
   }, [id, cancelling]);
 
-  useEffect(() => {
-    if (!id) return;
-    setEventsLoading(true);
-    fetchTaskEvents(id)
-      .then((data) => {
-        setEvents(
-          data.sort(
-            (a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()
-          )
-        );
-      })
-      .catch(() => setEvents([]))
-      .finally(() => setEventsLoading(false));
-  }, [id]);
-
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
@@ -685,228 +687,93 @@ export function TaskDetailPage() {
 
   if (!task) {
     return (
-      <div className="space-y-3 p-4">
-        <Link to="/tasks">
-          <Button variant="ghost" size="sm" className="gap-1">
-            <ArrowLeft className="h-4 w-4" />
-            Back to Tasks
-          </Button>
-        </Link>
-        <p className="text-muted-foreground">Task not found.</p>
+      <div className="p-4">
+        <Breadcrumb>
+          <BreadcrumbList>
+            <BreadcrumbItem>
+              <BreadcrumbLink asChild>
+                <Link to="/">Tasks</Link>
+              </BreadcrumbLink>
+            </BreadcrumbItem>
+            <BreadcrumbSeparator />
+            <BreadcrumbItem>
+              <BreadcrumbPage>Not found</BreadcrumbPage>
+            </BreadcrumbItem>
+          </BreadcrumbList>
+        </Breadcrumb>
+        <p className="text-muted-foreground mt-4">Task not found.</p>
       </div>
     );
   }
 
+  const projectName = projectLabel(task.project, snapshot.projects);
+
   return (
-    <div className="flex flex-col h-full p-4 gap-3">
+    <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-start gap-3 shrink-0">
-        <Link to="/tasks">
-          <Button variant="ghost" size="icon" className="shrink-0">
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-        </Link>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <h1 className="text-base font-bold truncate">{task.title}</h1>
-            {stateBadge(task.state)}
-            {isSessionActive && (
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={handleCancel}
-                disabled={cancelling}
-                className="ml-2 gap-1"
-              >
-                <StopCircle className="h-4 w-4" />
-                {cancelling ? "Cancelling..." : "Cancel"}
-              </Button>
-            )}
-          </div>
-          <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground">
-            <span className="font-mono text-sm">{task.id.slice(0, 8)}</span>
-            <Separator orientation="vertical" className="h-4" />
-            {sourceDisplay(task)}
-            <Separator orientation="vertical" className="h-4" />
-            <span>{projectLabel(task.project, snapshot.projects)}</span>
-            {task.labels.length > 0 && (
-              <>
-                <Separator orientation="vertical" className="h-4" />
-                <span className="flex gap-1">
-                  {task.labels.map((l) => (
-                    <Badge key={l} variant="outline">
-                      {l}
-                    </Badge>
-                  ))}
-                </span>
-              </>
-            )}
-          </div>
+      <div className="flex items-center justify-between border-b border-border px-4 py-2.5 shrink-0">
+        <div className="flex items-center gap-3 min-w-0">
+          <Breadcrumb>
+            <BreadcrumbList>
+              <BreadcrumbItem>
+                <BreadcrumbLink asChild>
+                  <Link to="/">Tasks</Link>
+                </BreadcrumbLink>
+              </BreadcrumbItem>
+              <BreadcrumbSeparator />
+              <BreadcrumbItem>
+                <BreadcrumbPage className="truncate max-w-md">
+                  {task.title}
+                </BreadcrumbPage>
+              </BreadcrumbItem>
+            </BreadcrumbList>
+          </Breadcrumb>
+          <span className="font-mono text-xs text-muted-foreground shrink-0">
+            {task.id.slice(0, 8)}
+          </span>
         </div>
-      </div>
 
-      {/* Session view — always shown, chat input only when active */}
-      {id && (
-        <SessionView taskId={id} chatEnabled={isSessionActive} />
-      )}
-
-      {/* Collapsible details */}
-      <div className="shrink-0">
-        <button
-          onClick={() => setShowDetails(!showDetails)}
-          className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
-        >
-          {showDetails ? (
-            <ChevronDown className="h-4 w-4" />
-          ) : (
-            <ChevronRight className="h-4 w-4" />
-          )}
-          Details
-        </button>
-
-        {showDetails && (
-          <div className="mt-2 space-y-3">
-            {/* Metadata */}
-            <Card>
-              <CardContent className="pt-4">
-                <dl className="grid grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-3 text-sm">
-                  <div>
-                    <dt className="text-muted-foreground">Priority</dt>
-                    <dd className="font-medium">
-                      {task.priority !== null ? task.priority : "None"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Created</dt>
-                    <dd className="font-medium">
-                      {formatRelativeTime(task.created_at)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Updated</dt>
-                    <dd className="font-medium">
-                      {formatRelativeTime(task.updated_at)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Retries</dt>
-                    <dd className="font-medium">{task.retry_count}</dd>
-                  </div>
-                  {task.session_id && (
-                    <div>
-                      <dt className="text-muted-foreground">Session</dt>
-                      <dd className="font-mono text-sm">
-                        {task.session_id.slice(0, 12)}
-                      </dd>
-                    </div>
-                  )}
-                  {task.parent_id && (
-                    <div>
-                      <dt className="text-muted-foreground">Parent</dt>
-                      <dd>
-                        <Link
-                          to={`/tasks/${task.parent_id}`}
-                          className="text-blue-400 hover:underline font-mono text-sm"
-                        >
-                          {task.parent_id.slice(0, 8)}
-                        </Link>
-                      </dd>
-                    </div>
-                  )}
-                  {task.blocked_by.length > 0 && (
-                    <div>
-                      <dt className="text-muted-foreground">Blocked by</dt>
-                      <dd className="space-x-1">
-                        {task.blocked_by.map((bid) => (
-                          <Link
-                            key={bid}
-                            to={`/tasks/${bid}`}
-                            className="text-blue-400 hover:underline font-mono text-sm"
-                          >
-                            {bid.slice(0, 8)}
-                          </Link>
-                        ))}
-                      </dd>
-                    </div>
-                  )}
-                </dl>
-              </CardContent>
-            </Card>
-
-            {/* Failure info — shown when task has failed or has last_failure */}
-            {task.last_failure && (
-              <FailureInfoCard failure={task.last_failure} />
-            )}
-
-            {/* Description */}
-            {task.description && (
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-medium text-muted-foreground">
-                    Description
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <pre className="whitespace-pre-wrap text-sm font-mono bg-muted/50 rounded-md p-4 overflow-x-auto">
-                    {task.description}
-                  </pre>
-                </CardContent>
-              </Card>
-            )}
-          </div>
+        {isSessionActive && (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={handleCancel}
+            disabled={cancelling}
+            className="gap-1 shrink-0"
+          >
+            <StopCircle className="h-3.5 w-3.5" />
+            {cancelling ? "Cancelling..." : "Cancel"}
+          </Button>
         )}
       </div>
 
-      {/* Raw event timeline — only in details view */}
-      {showDetails && (
-        <Card className="shrink-0">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Event Timeline
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            {eventsLoading ? (
-              <p className="text-sm text-muted-foreground">Loading events...</p>
-            ) : events.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No events found.</p>
-            ) : (
-              <div className="overflow-x-auto max-h-96 overflow-y-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-[100px]">Time</TableHead>
-                      <TableHead className="w-[160px]">Type</TableHead>
-                      <TableHead className="w-[100px]">Actor</TableHead>
-                      <TableHead>Data</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {events.map((event) => (
-                      <TableRow key={event.id}>
-                        <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
-                          {formatRelativeTime(event.ts)}
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="outline">
-                            {event.type}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="text-sm text-muted-foreground">
-                          {event.actor}
-                        </TableCell>
-                        <TableCell className="text-sm font-mono text-muted-foreground max-w-md truncate">
-                          {eventDataPreview(event.data)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
+      {/* Content: session + properties sidebar */}
+      <div className="flex flex-1 min-h-0">
+        {/* Main: session view */}
+        <div className="flex-1 flex flex-col min-h-0 min-w-0">
+          {id && <SessionView taskId={id} chatEnabled={isSessionActive} />}
+
+          {/* Description */}
+          {task.description && (
+            <div className="border-t border-border p-4">
+              <div className="text-xs font-medium text-muted-foreground mb-2">Description</div>
+              <pre className="whitespace-pre-wrap text-sm font-mono bg-muted/50 rounded-md p-3 overflow-x-auto">
+                {task.description}
+              </pre>
+            </div>
+          )}
+        </div>
+
+        {/* Properties sidebar */}
+        <div className="w-64 shrink-0 border-l border-border">
+          <ScrollArea className="h-full">
+            <div className="p-4">
+              <div className="text-xs font-medium text-muted-foreground mb-3">Properties</div>
+              <PropertiesSidebar task={task} projectName={projectName} />
+            </div>
+          </ScrollArea>
+        </div>
+      </div>
     </div>
   );
 }

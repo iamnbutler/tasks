@@ -3,6 +3,8 @@ import { Pause, Play } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Table,
   TableBody,
@@ -29,22 +31,14 @@ const FILTERS = [
 
 type FilterKey = (typeof FILTERS)[number]["key"];
 
-// ---------------------------------------------------------------------------
-// Event type badge colors
-// ---------------------------------------------------------------------------
-
 function badgeClasses(type: string): string {
-  if (type.startsWith("task:")) return "bg-blue-500/15 text-blue-600 border-blue-500/30";
-  if (type.startsWith("agent:")) return "bg-green-500/15 text-green-600 border-green-500/30";
-  if (type.startsWith("merge:")) return "bg-purple-500/15 text-purple-600 border-purple-500/30";
-  if (type.startsWith("system:")) return "bg-gray-500/15 text-gray-600 border-gray-500/30";
-  if (type.startsWith("orchestrator:")) return "bg-orange-500/15 text-orange-600 border-orange-500/30";
+  if (type.startsWith("task:")) return "bg-blue-500/15 text-blue-400 border-blue-500/30";
+  if (type.startsWith("agent:")) return "bg-green-500/15 text-green-400 border-green-500/30";
+  if (type.startsWith("merge:")) return "bg-purple-500/15 text-purple-400 border-purple-500/30";
+  if (type.startsWith("system:")) return "bg-gray-500/15 text-gray-400 border-gray-500/30";
+  if (type.startsWith("orchestrator:")) return "bg-orange-500/15 text-orange-400 border-orange-500/30";
   return "bg-muted text-muted-foreground";
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function matchesFilter(event: Event, filter: FilterKey): boolean {
   if (filter === "all") return true;
@@ -65,12 +59,10 @@ export function EventsPage() {
   const [activeFilter, setActiveFilter] = useState<FilterKey>("all");
   const [paused, setPaused] = useState(false);
 
-  // When the user pauses, freeze the current event list into the ref.
   const frozenRef = useRef<Event[]>([]);
 
   function handleTogglePause() {
     if (!paused) {
-      // Freezing: capture current live events.
       frozenRef.current = liveEvents;
     }
     setPaused((prev) => !prev);
@@ -85,38 +77,39 @@ export function EventsPage() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Toolbar */}
-      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-2">
-        {/* Filter buttons */}
-        <div className="flex items-center gap-1.5 flex-wrap">
-          {FILTERS.map(({ key, label }) => (
-            <Button
-              key={key}
-              size="sm"
-              variant={activeFilter === key ? "default" : "outline"}
-              onClick={() => setActiveFilter(key)}
-              className="h-7"
-            >
-              {label}
-            </Button>
-          ))}
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+        <div className="flex items-center gap-4">
+          <h1 className="text-sm font-semibold">Events</h1>
+
+          <Tabs
+            value={activeFilter}
+            onValueChange={(v: string) => setActiveFilter(v as FilterKey)}
+          >
+            <TabsList className="h-7">
+              {FILTERS.map(({ key, label }) => (
+                <TabsTrigger key={key} value={key} className="text-xs px-2.5 h-6">
+                  {label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
         </div>
 
-        {/* Pause / Resume */}
         <Button
           size="sm"
           variant="outline"
           onClick={handleTogglePause}
-          className="gap-1.5 shrink-0"
+          className="gap-1.5 h-7 text-xs"
         >
           {paused ? (
             <>
-              <Play className="h-3.5 w-3.5" />
+              <Play className="h-3 w-3" />
               Resume
             </>
           ) : (
             <>
-              <Pause className="h-3.5 w-3.5" />
+              <Pause className="h-3 w-3" />
               Pause
             </>
           )}
@@ -124,9 +117,9 @@ export function EventsPage() {
       </div>
 
       {/* Events table */}
-      <div className="flex-1 overflow-auto">
+      <ScrollArea className="flex-1">
         {filteredEvents.length === 0 ? (
-          <div className="flex items-center justify-center h-full py-32">
+          <div className="flex items-center justify-center py-20">
             <p className="text-muted-foreground text-sm">
               {paused ? "No events match the current filter (paused)." : "No events yet."}
             </p>
@@ -145,22 +138,19 @@ export function EventsPage() {
             <TableBody>
               {filteredEvents.map((event) => (
                 <TableRow key={event.id}>
-                  <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
+                  <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
                     {formatRelativeTime(event.ts)}
                   </TableCell>
                   <TableCell>
-                    <Badge
-                      variant="outline"
-                      className={cn("font-mono", badgeClasses(event.type))}
-                    >
+                    <Badge variant="outline" className={cn("font-mono text-xs", badgeClasses(event.type))}>
                       {event.type}
                     </Badge>
                   </TableCell>
-                  <TableCell>{event.actor}</TableCell>
-                  <TableCell className="font-mono text-sm text-muted-foreground">
+                  <TableCell className="text-xs">{event.actor}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
                     {event.task ? event.task.slice(0, 8) : "\u2014"}
                   </TableCell>
-                  <TableCell className="text-sm text-muted-foreground max-w-[400px] truncate font-mono">
+                  <TableCell className="text-xs text-muted-foreground max-w-[400px] truncate font-mono">
                     {truncateData(event.data)}
                   </TableCell>
                 </TableRow>
@@ -168,7 +158,7 @@ export function EventsPage() {
             </TableBody>
           </Table>
         )}
-      </div>
+      </ScrollArea>
     </div>
   );
 }
