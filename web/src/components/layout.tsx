@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import {
+  LayoutDashboard,
   ListTodo,
   GitMerge,
   Radio,
@@ -416,7 +417,8 @@ export function Layout() {
           <div className="flex flex-col gap-4 py-2">
             {/* Main navigation */}
             <div className="space-y-0.5 px-1">
-              <SidebarNavItem to="/" icon={ListTodo} label="Tasks" end />
+              <SidebarNavItem to="/" icon={LayoutDashboard} label="Dashboard" end />
+              <SidebarNavItem to="/tasks" icon={ListTodo} label="Tasks" />
               <SidebarNavItem to="/merge-queue" icon={GitMerge} label="Merge Queue" />
             </div>
 
