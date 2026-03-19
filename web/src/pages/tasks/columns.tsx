@@ -6,12 +6,11 @@ import {
   FlaskConical,
   GitMerge,
   HelpCircle,
-  Loader,
   MinusCircle,
   XCircle,
   AlertTriangle,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import type { TaskState } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -56,9 +55,7 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
   },
   running: {
     label: "Running",
-    icon: ({ className, ...props }: { className?: string }) => (
-      <Loader className={cn("animate-spin", className)} {...props} />
-    ),
+    icon: Spinner,
     className: "text-blue-500 border-blue-500/30 bg-blue-500/10",
     color: "text-blue-500",
   },
