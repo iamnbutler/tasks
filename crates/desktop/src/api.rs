@@ -31,7 +31,7 @@ pub fn task_state_display_name(state: &TaskState) -> &'static str {
         TaskState::Running => "Running",
         TaskState::Question => "Question",
         TaskState::Testing => "Testing",
-        TaskState::AwaitingMerge => "Awaiting Merge",
+        TaskState::AwaitingMerge => "Changes Submitted",
         TaskState::Conflict => "Conflict",
         TaskState::Completed => "Completed",
         TaskState::Failed => "Failed",
@@ -42,8 +42,8 @@ pub fn task_state_display_name(state: &TaskState) -> &'static str {
 /// Whether the task is actively consuming an agent slot.
 ///
 /// Matches the server definition: Running, Question, Testing.
-/// AwaitingMerge is NOT active — the agent has finished and the PR
-/// is waiting in the merge queue.
+/// "Changes Submitted" (AwaitingMerge state) is NOT active — the agent
+/// has finished and the PR is waiting in the merge queue.
 pub fn task_state_is_active(state: &TaskState) -> bool {
     matches!(
         state,
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(task_state_display_name(&TaskState::Running), "Running");
         assert_eq!(
             task_state_display_name(&TaskState::AwaitingMerge),
-            "Awaiting Merge"
+            "Changes Submitted"
         );
     }
 

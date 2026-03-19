@@ -286,8 +286,9 @@ impl AppState {
 
     /// Get active tasks (Running, Question, Testing).
     ///
-    /// AwaitingMerge is NOT active — it means the agent has finished and the PR
-    /// is waiting in the merge queue. This matches the server definition.
+    /// "Changes Submitted" (AwaitingMerge state) is NOT active — it means the
+    /// agent has finished and the PR is waiting in the merge queue. This
+    /// matches the server definition.
     pub fn active_tasks(&self) -> Vec<&Task> {
         self.filtered_tasks()
             .into_iter()
