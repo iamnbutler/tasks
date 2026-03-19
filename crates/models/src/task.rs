@@ -76,6 +76,9 @@ pub enum TaskState {
     AwaitingMerge,
     /// Merge conflict needs resolution.
     Conflict,
+    /// Changes requested on PR — needs work before re-evaluation.
+    /// This state supersedes Waiting for dispatch priority.
+    ChangesRequested,
     /// Task finished successfully.
     Completed,
     /// Task failed.

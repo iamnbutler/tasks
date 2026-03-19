@@ -250,6 +250,7 @@ fn task_state_badge(state: TaskState, theme: &ComponentTheme) -> Badge {
         TaskState::Waiting => ("waiting", BadgeVariant::Outline),
         TaskState::Blocked => ("blocked", BadgeVariant::Outline),
         TaskState::Conflict => ("conflict", BadgeVariant::Destructive),
+        TaskState::ChangesRequested => ("changes requested", BadgeVariant::Secondary),
         TaskState::Cancelled => ("cancelled", BadgeVariant::Ghost),
     };
 

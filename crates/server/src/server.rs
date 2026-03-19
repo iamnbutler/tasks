@@ -317,6 +317,7 @@ impl Server {
             TaskState::Testing => EventType::TaskStateTesting,
             TaskState::AwaitingMerge => EventType::TaskStateAwaitingMerge,
             TaskState::Conflict => EventType::TaskStateConflict,
+            TaskState::ChangesRequested => EventType::TaskStateChangesRequested,
             TaskState::Completed => EventType::TaskStateCompleted,
             TaskState::Failed => EventType::TaskStateFailed,
             TaskState::Cancelled => EventType::TaskStateCancelled,
@@ -1049,6 +1050,76 @@ impl Server {
 
         // Transition task to terminal state (Completed or Cancelled)
         self.set_task_state(&task_id, final_state, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Request changes on a merge queue entry.
+    ///
+    /// Unlike rejection, the entry stays in the queue with status `ChangesRequested`.
+    /// The task transitions to `ChangesRequested` state, which gets priority dispatch
+    /// over regular `Waiting` tasks.
+    ///
+    /// This preserves the PR and work-in-progress rather than throwing it away,
+    /// allowing the agent to address feedback and re-submit.
+    pub async fn request_changes_merge_entry(
+        &self,
+        entry_id: &str,
+        reasoning: &str,
+        feedback: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .request_changes(entry_id, feedback)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Emit changes requested event
+        let event = Event::new(
+            EventType::MergeChangesRequested,
+            &task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "reasoning": reasoning,
+                "feedback": feedback,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        // Transition task to ChangesRequested state for priority dispatch
+        self.set_task_state(&task_id, TaskState::ChangesRequested, Actor::Orchestrator)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Clear changes requested status after agent addresses feedback.
+    ///
+    /// Returns the entry to Pending status for re-evaluation.
+    pub async fn clear_changes_requested(
+        &self,
+        entry_id: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .clear_changes_requested(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Transition task back to AwaitingMerge for re-evaluation
+        self.set_task_state(&task_id, TaskState::AwaitingMerge, Actor::Orchestrator)
             .await?;
 
         Ok(())

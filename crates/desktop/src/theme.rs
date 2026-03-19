@@ -539,6 +539,7 @@ impl Theme {
             TaskState::Running | TaskState::Testing => self.state_running,
             TaskState::Question => self.state_question,
             TaskState::AwaitingMerge => self.state_merged,
+            TaskState::ChangesRequested => self.state_question, // Uses question color (amber)
             TaskState::Completed => self.state_completed,
             TaskState::Failed | TaskState::Conflict => self.state_failed,
             TaskState::Cancelled => self.state_cancelled,

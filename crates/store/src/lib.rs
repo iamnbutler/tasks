@@ -170,6 +170,7 @@ impl Store {
                     status,
                     queued_at,
                     conflict_info: None, // Not persisted to DB yet
+                    changes_requested_feedback: None, // TODO: persist to DB
                 }))
             }
             None => Ok(None),
@@ -206,6 +207,7 @@ impl Store {
                 status,
                 queued_at,
                 conflict_info: None, // Not persisted to DB yet
+                changes_requested_feedback: None, // TODO: persist to DB
             });
         }
         Ok(entries)

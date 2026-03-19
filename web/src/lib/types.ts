@@ -8,6 +8,7 @@ export type TaskState =
   | "testing"
   | "awaiting_merge"
   | "conflict"
+  | "changes_requested"
   | "completed"
   | "failed"
   | "cancelled";
@@ -62,7 +63,8 @@ export type MergeStatus =
   | "approved"
   | "rejected"
   | "merged"
-  | "conflict";
+  | "conflict"
+  | "changes_requested";
 
 export interface MergeQueueEntry {
   id: string;
@@ -70,6 +72,8 @@ export interface MergeQueueEntry {
   pr_url: string;
   status: MergeStatus;
   queued_at: string;
+  /** Feedback when status is changes_requested */
+  changes_requested_feedback?: string;
 }
 
 export type Actor = "human" | "orchestrator" | "scheduler" | "agent" | "system";

@@ -34,6 +34,7 @@ const taskStateColors: Record<TaskState, string> = {
   testing: "hsl(270, 50%, 60%)",
   awaiting_merge: "hsl(25, 95%, 53%)",
   conflict: "hsl(25, 95%, 53%)",
+  changes_requested: "hsl(38, 92%, 50%)",
   completed: "hsl(142, 71%, 45%)",
   failed: "hsl(0, 84%, 60%)",
   cancelled: "hsl(0, 0%, 50%)",
@@ -47,6 +48,7 @@ const taskStateLabels: Record<TaskState, string> = {
   testing: "Testing",
   awaiting_merge: "Awaiting Merge",
   conflict: "Conflict",
+  changes_requested: "Changes Requested",
   completed: "Completed",
   failed: "Failed",
   cancelled: "Cancelled",
@@ -69,6 +71,7 @@ const mergeStatusColors: Record<MergeStatus, string> = {
   rejected: "hsl(0, 84%, 60%)",
   merged: "hsl(217, 91%, 60%)",
   conflict: "hsl(0, 84%, 60%)",
+  changes_requested: "hsl(38, 92%, 50%)",
 };
 
 const mergeStatusLabels: Record<MergeStatus, string> = {
@@ -77,6 +80,7 @@ const mergeStatusLabels: Record<MergeStatus, string> = {
   rejected: "Rejected",
   merged: "Merged",
   conflict: "Conflict",
+  changes_requested: "Changes Requested",
 };
 
 const mergeChartConfig: ChartConfig = Object.fromEntries(

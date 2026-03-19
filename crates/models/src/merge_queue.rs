@@ -12,6 +12,9 @@ pub enum MergeStatus {
     Rejected,
     Merged,
     Conflict,
+    /// Changes requested by orchestrator or human — PR needs work before re-evaluation.
+    /// Unlike Rejected, the entry stays in the queue and the task gets priority dispatch.
+    ChangesRequested,
 }
 
 /// Type of merge conflict — spec Section 7.4.
@@ -89,6 +92,10 @@ pub struct MergeQueueEntry {
     /// Conflict details when status is Conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_info: Option<ConflictInfo>,
+    /// Feedback provided when changes were requested.
+    /// Set when status is ChangesRequested to guide the agent on what to fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_requested_feedback: Option<String>,
 }
 
 impl MergeQueueEntry {
@@ -100,6 +107,7 @@ impl MergeQueueEntry {
             status: MergeStatus::Pending,
             queued_at: Utc::now(),
             conflict_info: None,
+            changes_requested_feedback: None,
         }
     }
 }

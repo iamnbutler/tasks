@@ -23,6 +23,8 @@ function statusBadge(status: MergeStatus) {
       return <Badge variant="outline" className="bg-blue-500/15 text-blue-400 border-blue-500/30">{status}</Badge>;
     case "conflict":
       return <Badge variant="outline" className="bg-orange-500/15 text-orange-400 border-orange-500/30">{status}</Badge>;
+    case "changes_requested":
+      return <Badge variant="outline" className="bg-amber-500/15 text-amber-400 border-amber-500/30">changes requested</Badge>;
     default:
       return <Badge variant="outline">{status}</Badge>;
   }
@@ -33,11 +35,12 @@ function statusBadge(status: MergeStatus) {
 // ---------------------------------------------------------------------------
 
 const statusSortOrder: Record<MergeStatus, number> = {
-  conflict: 0,
-  approved: 1,
-  rejected: 2,
-  merged: 3,
-  pending: 4,
+  changes_requested: 0, // Changes requested shown first (needs attention)
+  conflict: 1,
+  approved: 2,
+  rejected: 3,
+  merged: 4,
+  pending: 5,
 };
 
 export { statusSortOrder };
