@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub github_token: String,
     /// Global max concurrent sessions (default: 5).
     pub max_sessions: u32,
+    /// Default max sessions per project when no workflow.toml override exists (default: 1).
+    pub max_sessions_per_project: u32,
     /// Maximum retry attempts for failed tasks (default: 3, spec §13.2/§14.1).
     pub max_retries: u32,
     /// GitHub poll interval (default: 60s).
@@ -69,6 +71,11 @@ impl AppConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
+
+        let max_sessions_per_project = std::env::var("TASKS_MAX_SESSIONS_PER_PROJECT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
 
         let max_retries = std::env::var("TASKS_MAX_RETRIES")
             .ok()
@@ -130,6 +137,7 @@ impl AppConfig {
             data_dir,
             github_token,
             max_sessions,
+            max_sessions_per_project,
             max_retries,
             poll_interval: Duration::from_secs(poll_interval_secs),
             dispatch_interval: Duration::from_secs(dispatch_interval_secs),
