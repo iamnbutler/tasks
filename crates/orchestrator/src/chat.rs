@@ -4,16 +4,15 @@
 //! asking questions about system state, requesting actions (create tasks, change mode),
 //! and receiving updates about major events.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tracing::{debug, info};
+use tracing::info;
 
 use models::project::Project;
 use models::task::{Task, TaskState};
 use tasks_agent::{
-    AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider, Tool,
+    AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider,
 };
 
 use crate::error::OrchestratorError;
@@ -68,16 +67,6 @@ pub struct ChatEvent {
 pub struct ChatResponse {
     /// The orchestrator's response text.
     pub message: String,
-    /// Any actions that were executed.
-    pub actions: Vec<ChatAction>,
-}
-
-/// An action taken by the orchestrator during chat.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatAction {
-    pub action_type: String,
-    pub description: String,
-    pub success: bool,
 }
 
 /// Handler for orchestrator chat interactions.
@@ -114,7 +103,6 @@ impl OrchestratorChat {
         info!(message_len = message.len(), "Processing orchestrator chat message");
 
         let system_prompt = self.build_system_prompt(context);
-        let tools = self.define_tools();
 
         // Build messages: history + new user message
         let mut messages = conversation_history.to_vec();
@@ -122,8 +110,7 @@ impl OrchestratorChat {
 
         let config = CompletionConfig::new(CHAT_MODEL).with_max_tokens(MAX_TOKENS);
         let request = CompletionRequest::new(config, messages)
-            .with_system(system_prompt)
-            .with_tools(tools);
+            .with_system(system_prompt);
 
         let response = self
             .provider
@@ -131,22 +118,11 @@ impl OrchestratorChat {
             .await
             .map_err(OrchestratorError::Agent)?;
 
-        // Check for tool calls
-        let mut actions = Vec::new();
-        if !response.tool_calls.is_empty() {
-            debug!(tool_count = response.tool_calls.len(), "Processing tool calls");
-            for tool_call in &response.tool_calls {
-                let action = self.execute_tool(&tool_call.name, &tool_call.arguments).await;
-                actions.push(action);
-            }
-        }
-
         let response_text = response.text();
-        info!(response_len = response_text.len(), actions = actions.len(), "Chat response generated");
+        info!(response_len = response_text.len(), "Chat response generated");
 
         Ok(ChatResponse {
             message: response_text,
-            actions,
         })
     }
 
@@ -161,7 +137,7 @@ impl OrchestratorChat {
 
 ## Your Role
 - You help users understand system status and make decisions
-- You can take actions: create tasks, pause/resume work, change operating mode
+- You can explain system status and help users make decisions
 - You provide updates on merges, conflicts, and agent progress
 - You are helpful, concise, and action-oriented
 
@@ -181,10 +157,8 @@ impl OrchestratorChat {
 
 ## Guidelines
 - Be concise but informative
-- When asked to do something, use the appropriate tool
 - Proactively mention relevant system state when helpful
-- If you can't do something, explain why and suggest alternatives
-- Use the tools available to take actions when requested"#,
+- If asked to take an action, explain how the user can do it through the UI"#,
             mode = context.mode,
             human_present = if context.human_present { "Yes" } else { "No" },
             projects_summary = projects_summary,
@@ -193,104 +167,13 @@ impl OrchestratorChat {
         )
     }
 
-    /// Define tools available to the orchestrator.
-    fn define_tools(&self) -> Vec<Tool> {
-        vec![
-            Tool::new(
-                "get_task_details",
-                "Get detailed information about a specific task by ID or title",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "The task ID (full or partial) or title to search for"
-                        }
-                    },
-                    "required": ["task_id"]
-                }),
-            ),
-            Tool::new(
-                "list_tasks",
-                "List tasks, optionally filtered by state or project",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "state": {
-                            "type": "string",
-                            "enum": ["waiting", "blocked", "running", "question", "testing", "awaiting_merge", "conflict", "completed", "failed", "cancelled"],
-                            "description": "Filter by task state"
-                        },
-                        "project": {
-                            "type": "string",
-                            "description": "Filter by project (owner/repo format)"
-                        }
-                    }
-                }),
-            ),
-            Tool::new(
-                "get_merge_queue_status",
-                "Get the current merge queue status showing pending, approved, and rejected entries",
-                json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-            ),
-            Tool::new(
-                "set_operating_mode",
-                "Change the system operating mode (play, pause, or stop)",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["play", "pause", "stop"],
-                            "description": "The new operating mode"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Reason for changing the mode"
-                        }
-                    },
-                    "required": ["mode"]
-                }),
-            ),
-            Tool::new(
-                "summarize_activity",
-                "Get a summary of recent system activity",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "since_minutes": {
-                            "type": "integer",
-                            "description": "How many minutes of activity to summarize (default: 60)"
-                        }
-                    }
-                }),
-            ),
-        ]
-    }
-
-    /// Execute a tool call and return the action result.
-    async fn execute_tool(&self, name: &str, arguments: &serde_json::Value) -> ChatAction {
-        // Note: Actual execution is handled by the caller (run_loop) which has access
-        // to server state. This returns a placeholder that the caller will fill in.
-        debug!(tool = name, args = %arguments, "Tool call requested");
-
-        ChatAction {
-            action_type: name.to_string(),
-            description: format!("Tool call: {} with args: {}", name, arguments),
-            success: true,
-        }
-    }
-
     /// Summarize tasks for context.
     fn summarize_tasks(&self, tasks: &[Task]) -> String {
         if tasks.is_empty() {
             return "No tasks.".to_string();
         }
 
-        let mut by_state: HashMap<&'static str, Vec<&Task>> = HashMap::new();
+        let mut by_state: BTreeMap<&'static str, Vec<&Task>> = BTreeMap::new();
         for task in tasks {
             let state = task_state_str(&task.state);
             by_state.entry(state).or_default().push(task);
@@ -340,7 +223,7 @@ impl OrchestratorChat {
 }
 
 /// Convert an event to a chat event summary.
-pub fn event_to_chat_event(event_type: &str, data: &serde_json::Value) -> ChatEvent {
+pub fn event_to_chat_event(event_type: &str, data: &serde_json::Value, timestamp: &str) -> ChatEvent {
     let summary = match event_type {
         "orchestrator:decision" => {
             let approved = data.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -379,7 +262,7 @@ pub fn event_to_chat_event(event_type: &str, data: &serde_json::Value) -> ChatEv
 
     ChatEvent {
         event_type: event_type.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: timestamp.to_string(),
         summary,
     }
 }
@@ -387,6 +270,7 @@ pub fn event_to_chat_event(event_type: &str, data: &serde_json::Value) -> ChatEv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_event_to_chat_event_decision_approved() {
@@ -394,7 +278,7 @@ mod tests {
             "approved": true,
             "task_id": "abc123"
         });
-        let event = event_to_chat_event("orchestrator:decision", &data);
+        let event = event_to_chat_event("orchestrator:decision", &data, "2026-01-01T00:00:00Z");
         assert_eq!(event.event_type, "orchestrator:decision");
         assert!(event.summary.contains("Approved"));
         assert!(event.summary.contains("abc123"));
@@ -406,13 +290,13 @@ mod tests {
             "approved": false,
             "task_id": "def456"
         });
-        let event = event_to_chat_event("orchestrator:decision", &data);
+        let event = event_to_chat_event("orchestrator:decision", &data, "2026-01-01T00:00:00Z");
         assert!(event.summary.contains("Rejected"));
     }
 
     #[test]
     fn test_event_to_chat_event_mode_change() {
-        let event = event_to_chat_event("system:mode:play", &json!({}));
+        let event = event_to_chat_event("system:mode:play", &serde_json::json!({}), "2026-01-01T00:00:00Z");
         assert!(event.summary.contains("Play"));
     }
 
