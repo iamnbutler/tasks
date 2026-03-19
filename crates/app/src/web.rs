@@ -399,7 +399,9 @@ async fn set_mode(
         .await
         .map_err(ApiError::Server)?;
 
-    // When entering Stop mode, terminate all running sessions (spec §6.1)
+    // When entering Stop mode, terminate all running sessions (spec §6.1).
+    // TODO: Move to an event-driven listener (on system:mode:stop) so that
+    // non-web mode changes (CLI, orchestrator) also trigger session termination.
     if mode == Mode::Stop {
         if let Some(ref session_manager) = state.session_manager {
             // Give sessions 5 seconds to stop gracefully before force-destroying containers

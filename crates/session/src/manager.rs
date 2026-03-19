@@ -224,6 +224,30 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             "stopping all sessions with timeout"
         );
 
+        // Phase 0: Emit TaskStateWaiting for all sessions BEFORE stopping them.
+        // This ensures tasks return to Waiting state for re-dispatch when mode resumes,
+        // regardless of whether the agent exits gracefully (which would otherwise emit
+        // TaskStateFailed and consume a retry slot — see spec §6.1).
+        for (task_id, container_id, _) in &session_info {
+            let event = events::Event::new(
+                events::EventType::TaskStateWaiting,
+                task_id,
+                events::Actor::System,
+                serde_json::json!({
+                    "reason": "stop_mode",
+                    "message": "Session terminated due to Stop mode",
+                    "container_id": container_id,
+                }),
+            );
+            if let Err(e) = self.event_bus.publish(event).await {
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to publish TaskStateWaiting before stop"
+                );
+            }
+        }
+
         // Phase 1: Send stop command to all sessions (graceful shutdown attempt)
         for (task_id, _, command_tx) in &session_info {
             if let Err(e) = command_tx.send(SessionCommand::Stop).await {
@@ -282,26 +306,8 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             // Abort the monitor task so it doesn't double-destroy
             monitor_handle.abort();
 
-            // Emit event to reset task state back to waiting (spec §6.1)
-            // This allows the task to be re-dispatched when mode returns to Pause/Play.
-            let event = events::Event::new(
-                events::EventType::TaskStateWaiting,
-                &task_id,
-                events::Actor::System,
-                serde_json::json!({
-                    "reason": "stop_mode",
-                    "message": "Session terminated due to Stop mode",
-                    "container_id": container_id,
-                }),
-            );
-            if let Err(e) = self.event_bus.publish(event).await {
-                tracing::error!(
-                    task_id = %task_id,
-                    error = %e,
-                    "failed to publish task state event after force-stop"
-                );
-            }
-
+            // TaskStateWaiting was already emitted in Phase 0 for all sessions.
+            // Just force-destroy the container here.
             if let Err(e) = self.runtime.destroy(&container_id).await {
                 tracing::error!(
                     task_id = %task_id,
