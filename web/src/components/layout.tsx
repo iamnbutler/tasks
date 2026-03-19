@@ -63,7 +63,11 @@ function ModeIndicator() {
   const config = modeConfig[currentMode];
 
   async function handleSetMode(mode: Mode) {
-    await setMode(mode);
+    try {
+      await setMode(mode);
+    } catch {
+      // re-sync UI with server state on failure
+    }
     refreshSnapshot();
   }
 

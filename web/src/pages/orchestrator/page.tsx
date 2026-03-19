@@ -171,7 +171,7 @@ function EscalationBlock({ block }: { block: OrchestratorBlock }) {
 }
 
 function MessageBlock({ block }: { block: OrchestratorBlock }) {
-  const isHuman = block.actor === "Human";
+  const isHuman = block.actor === "human";
   return (
     <div
       className={cn(
