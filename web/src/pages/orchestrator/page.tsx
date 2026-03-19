@@ -10,11 +10,29 @@ import {
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { sendOrchestratorChat, subscribeEvents } from "@/lib/api";
-import { cn, formatRelativeTime } from "@/lib/utils";
+import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import type { Event } from "@/lib/types";
+import type { Event, Task, Project } from "@/lib/types";
+
+// ---------------------------------------------------------------------------
+// Task label helper: resolve task ID → "#123 (repo-name)"
+// ---------------------------------------------------------------------------
+
+function taskLabel(taskId: string | undefined, tasks: Task[], projects: Project[]): string | null {
+  if (!taskId) return null;
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return taskId.slice(0, 8);
+  const { source } = task;
+  const issueNum =
+    (source.type === "github_issue" || source.type === "github_pr")
+      ? `#${source.number}`
+      : taskId.slice(0, 8);
+  const proj = projectLabel(task.project, projects);
+  const repoName = proj.includes("/") ? proj.split("/")[1] : proj;
+  return `${issueNum} (${repoName})`;
+}
 
 // ---------------------------------------------------------------------------
 // Parse orchestrator events
@@ -80,8 +98,9 @@ function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
 // Block components
 // ---------------------------------------------------------------------------
 
-function DecisionBlock({ block }: { block: OrchestratorBlock }) {
-  const [expanded, setExpanded] = useState(false);
+function DecisionBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const label = taskLabel(block.taskId, tasks, projects);
   return (
     <div
       className={cn(
@@ -100,24 +119,26 @@ function DecisionBlock({ block }: { block: OrchestratorBlock }) {
             <span className={cn("font-medium text-sm", block.approved ? "text-green-400" : "text-red-400")}>
               {block.approved ? "Approved" : "Rejected"}
             </span>
-            {block.taskId && (
+            {label && (
               <Badge variant="outline" className="font-mono text-xs">
-                task:{block.taskId.slice(0, 8)}
+                {label}
               </Badge>
             )}
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
           {block.reasoning && (
-            <button
-              onClick={() => setExpanded(!expanded)}
-              className="mt-1 text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
-            >
-              <ChevronDown className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")} />
-              {expanded ? "Hide" : "Show"} reasoning
-            </button>
-          )}
-          {expanded && block.reasoning && (
-            <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.reasoning}</p>
+            <>
+              <button
+                onClick={() => setCollapsed(!collapsed)}
+                className="mt-1 text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
+              >
+                <ChevronDown className={cn("h-3 w-3 transition-transform", collapsed && "-rotate-90")} />
+                {collapsed ? "Show" : "Hide"} reasoning
+              </button>
+              {!collapsed && (
+                <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.reasoning}</p>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -125,7 +146,8 @@ function DecisionBlock({ block }: { block: OrchestratorBlock }) {
   );
 }
 
-function FeedbackBlock({ block }: { block: OrchestratorBlock }) {
+function FeedbackBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+  const label = taskLabel(block.taskId, tasks, projects);
   return (
     <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3">
       <div className="flex items-start gap-2">
@@ -133,8 +155,8 @@ function FeedbackBlock({ block }: { block: OrchestratorBlock }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm text-blue-400">Feedback</span>
-            {block.taskId && (
-              <Badge variant="outline" className="font-mono text-xs">task:{block.taskId.slice(0, 8)}</Badge>
+            {label && (
+              <Badge variant="outline" className="font-mono text-xs">{label}</Badge>
             )}
             {block.content && <Badge variant="outline" className="text-xs">{block.content}</Badge>}
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
@@ -148,7 +170,8 @@ function FeedbackBlock({ block }: { block: OrchestratorBlock }) {
   );
 }
 
-function EscalationBlock({ block }: { block: OrchestratorBlock }) {
+function EscalationBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+  const label = taskLabel(block.taskId, tasks, projects);
   return (
     <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3">
       <div className="flex items-start gap-2">
@@ -156,8 +179,8 @@ function EscalationBlock({ block }: { block: OrchestratorBlock }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm text-yellow-400">Escalation</span>
-            {block.taskId && (
-              <Badge variant="outline" className="font-mono text-xs">task:{block.taskId.slice(0, 8)}</Badge>
+            {label && (
+              <Badge variant="outline" className="font-mono text-xs">{label}</Badge>
             )}
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
@@ -195,11 +218,11 @@ function MessageBlock({ block }: { block: OrchestratorBlock }) {
   );
 }
 
-function BlockView({ block }: { block: OrchestratorBlock }) {
+function BlockView({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
   switch (block.kind) {
-    case "decision": return <DecisionBlock block={block} />;
-    case "feedback": return <FeedbackBlock block={block} />;
-    case "escalation": return <EscalationBlock block={block} />;
+    case "decision": return <DecisionBlock block={block} tasks={tasks} projects={projects} />;
+    case "feedback": return <FeedbackBlock block={block} tasks={tasks} projects={projects} />;
+    case "escalation": return <EscalationBlock block={block} tasks={tasks} projects={projects} />;
     case "message": return <MessageBlock block={block} />;
     default: return null;
   }
@@ -322,7 +345,7 @@ export function OrchestratorPage() {
             </div>
           )}
           {blocks.map((block) => (
-            <BlockView key={block.id} block={block} />
+            <BlockView key={block.id} block={block} tasks={snapshot?.tasks ?? []} projects={snapshot?.projects ?? []} />
           ))}
           <div ref={bottomRef} />
         </div>
