@@ -827,6 +827,73 @@ impl GitHubClient {
         )))
     }
 
+    /// Update a PR's head branch with the base branch (spec §7.4).
+    ///
+    /// Uses GitHub's "Update Branch" API to bring the head branch up to date
+    /// with the base branch. This can resolve simple conflicts by rebasing.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if updated successfully
+    /// - `Ok(false)` if update failed (e.g., conflicts that can't be auto-resolved)
+    /// - `Err` for API errors
+    pub async fn update_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<bool, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        // GitHub REST API: PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/update-branch",
+            self.base_url, owner, repo, number
+        );
+
+        let response = self.http.put(&url).json(&serde_json::json!({})).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        // 202 Accepted = update started successfully
+        if status == reqwest::StatusCode::ACCEPTED {
+            return Ok(true);
+        }
+
+        // 422 = can't update (conflicts, protected branch rules, etc.)
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(false);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected update-branch status {status}: {text}"
+        )))
+    }
+
     // -----------------------------------------------------------------------
     // PR discovery
     // -----------------------------------------------------------------------
