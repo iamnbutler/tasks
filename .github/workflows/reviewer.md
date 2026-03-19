@@ -16,6 +16,12 @@ permissions:
   issues: read
   actions: read
 
+network:
+  allowed:
+    - defaults
+    - "*.crates.io"
+    - "*.docs.rs"
+
 engine: claude
 
 tools:
@@ -52,7 +58,6 @@ steps:
         ~/.cargo/git
         target
       key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
-
 ---
 
 # PR / Review
@@ -120,23 +125,27 @@ Is the code clear and maintainable? Are names accurate? Is there unnecessary com
 For every changed file, evaluate the diff:
 
 **Correctness:**
+
 - Are error cases handled (Result propagation, Option handling)?
 - Are async boundaries correct (no holding locks across await)?
 - Are state transitions valid per the spec's state machines?
 - Could this panic in production? Are unwrap/expect justified?
 
 **Spec compliance:**
+
 - Do new types match spec field lists?
 - Do event types and state transitions match spec sections?
 - Does dispatch logic follow the priority rules in spec §12?
 - Does retry behavior match spec §13?
 
 **Architecture:**
+
 - Are crate dependencies correct? (models has no deps, store depends on models not server, etc.)
 - Is the right logic in the right place? (pure logic in library crates, wiring in app)
 - Are public APIs minimal and well-typed?
 
 **Code quality:**
+
 - Are names clear and consistent with the codebase?
 - Is there dead code, unused imports, or unnecessary complexity?
 - Are tests testing behavior, not implementation details?
@@ -145,6 +154,7 @@ For every changed file, evaluate the diff:
 ### Step 4: Classify Findings
 
 **Important** (requires attention before merging):
+
 - Correctness bugs or data races
 - Spec violations
 - Wrong crate boundary (logic in the wrong place)
@@ -152,12 +162,14 @@ For every changed file, evaluate the diff:
 - Holding async locks across blocking operations
 
 **Suggestion** (nice to have):
+
 - Naming improvements
 - Test coverage gaps
 - Minor code quality improvements
 - Performance observations in non-hot paths
 
 For each finding:
+
 ```
 **[IMPORTANT]** or **[SUGGESTION]**
 
@@ -171,6 +183,7 @@ Priority: Correctness | Spec Compliance | Architecture | Code Quality
 ### Step 5: Build Verification
 
 Run the following to check the PR builds:
+
 ```bash
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
@@ -181,6 +194,7 @@ If tests fail or clippy has errors, note them as important issues in your review
 ### Step 6: Submit Review
 
 Always submit as `COMMENT` (never use `REQUEST_CHANGES`):
+
 - **If important issues found**: Note them clearly in inline comments and review summary
 - **If only suggestions**: Leave inline comments with suggestions
 - **If clean**: Brief acknowledgment that the PR looks good
@@ -190,6 +204,7 @@ Follow the imported formatting guidelines for the review body.
 ### Step 7: Update Memory
 
 After review, update cache memory:
+
 - Record patterns seen (good and bad)
 - Track recurring issues across PRs
 
