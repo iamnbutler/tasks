@@ -244,7 +244,7 @@ fn task_state_badge(state: TaskState, theme: &ComponentTheme) -> Badge {
         TaskState::Running => ("running", BadgeVariant::Default),
         TaskState::Question => ("question", BadgeVariant::Secondary),
         TaskState::Testing => ("testing", BadgeVariant::Outline),
-        TaskState::AwaitingMerge => ("awaiting merge", BadgeVariant::Secondary),
+        TaskState::AwaitingMerge => ("changes submitted", BadgeVariant::Secondary),
         TaskState::Completed => ("completed", BadgeVariant::Default),
         TaskState::Failed => ("failed", BadgeVariant::Destructive),
         TaskState::Waiting => ("waiting", BadgeVariant::Outline),

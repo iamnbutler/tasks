@@ -72,7 +72,7 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
     color: "text-purple-500",
   },
   awaiting_merge: {
-    label: "Awaiting Merge",
+    label: "Changes Submitted",
     icon: GitMerge,
     className: "text-orange-500 border-orange-500/30 bg-orange-500/10",
     color: "text-orange-500",

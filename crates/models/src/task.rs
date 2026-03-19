@@ -72,7 +72,7 @@ pub enum TaskState {
     Question,
     /// Agent done, CI/deterministic testing running.
     Testing,
-    /// Implementation complete, in merge queue.
+    /// Implementation complete, changes submitted to merge queue.
     AwaitingMerge,
     /// Merge conflict needs resolution.
     Conflict,
