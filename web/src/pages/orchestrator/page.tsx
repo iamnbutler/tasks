@@ -82,12 +82,22 @@ function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
         taskId: event.task,
       });
     } else if (event.type === "orchestrator:message") {
+      // Human message to orchestrator
       blocks.push({
         kind: "message",
         id: event.id,
         timestamp: event.ts,
         content: typeof event.data?.message === "string" ? event.data.message : undefined,
-        actor: event.actor,
+        actor: "human",
+      });
+    } else if (event.type === "orchestrator:response") {
+      // Orchestrator response to human
+      blocks.push({
+        kind: "message",
+        id: event.id,
+        timestamp: event.ts,
+        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        actor: "orchestrator",
       });
     }
   }

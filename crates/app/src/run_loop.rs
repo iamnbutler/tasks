@@ -20,7 +20,10 @@ use tasks_github::client::GitHubClient;
 use tasks_github::model::{IssueState, IssueStateReason, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
-use tasks_orchestrator::{ConflictContext, ConflictResolution, OperatingMode, Orchestrator};
+use tasks_orchestrator::{
+    ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
+    OrchestratorChat,
+};
 
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
@@ -235,6 +238,21 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             ))
         }
     });
+
+    // --- 5b2. Create orchestrator chat handler ---
+
+    let orchestrator_chat: Option<Arc<OrchestratorChat>> = match OrchestratorChat::from_env() {
+        Ok(chat) => {
+            info!("orchestrator chat initialized");
+            Some(Arc::new(chat))
+        }
+        Err(e) => {
+            warn!(error = %e, "orchestrator chat not available");
+            None
+        }
+    };
+    let chat_history: Arc<tokio::sync::Mutex<Vec<tasks_agent::Message>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // --- 5c. Create memory watchdog ---
 
@@ -955,7 +973,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Handle specific events for problem tracking and mode lowering
+            // Handle specific events for problem tracking, mode lowering, and chat
             if let Some(ref event) = event_opt {
                 match event.event_type {
                     // Reset problem tracker when human raises mode to Play
@@ -997,6 +1015,88 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(reason) = should_lower {
                             lower_mode(&orch_server, &reason).await;
                         }
+                    }
+                    // Handle orchestrator chat messages from humans
+                    EventType::OrchestratorMessage => {
+                        let message = event
+                            .data
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if !message.is_empty() {
+                            if let Some(ref chat) = orchestrator_chat {
+                                info!(message_len = message.len(), "Received orchestrator chat message");
+
+                                // Build context from current state
+                                let context = {
+                                    let state = orch_server.state.read().await;
+                                    let mode = match state.mode {
+                                        server::Mode::Play => "Play",
+                                        server::Mode::Pause => "Pause",
+                                        server::Mode::Stop => "Stop",
+                                    };
+                                    ChatContext {
+                                        mode: mode.to_string(),
+                                        projects: state.projects.values().cloned().collect(),
+                                        tasks: state.tasks.values().cloned().collect(),
+                                        recent_events: Vec::new(),
+                                        human_present: orch_server.presence.is_present(),
+                                    }
+                                };
+
+                                // Spawn LLM call to avoid blocking the event loop
+                                let chat = Arc::clone(chat);
+                                let history = Arc::clone(&chat_history);
+                                let bus = orch_server.event_bus.clone();
+                                tokio::spawn(async move {
+                                    let history_snapshot = history.lock().await.clone();
+                                    match chat.process_message(&message, &context, &history_snapshot).await {
+                                        Ok(response) => {
+                                            // Update conversation history
+                                            {
+                                                let mut h = history.lock().await;
+                                                h.push(tasks_agent::Message::user(&message));
+                                                h.push(tasks_agent::Message::assistant(&response.message));
+                                                // Keep history bounded
+                                                if h.len() > 40 {
+                                                    let start = h.len() - 40;
+                                                    *h = h[start..].to_vec();
+                                                }
+                                            }
+                                            let resp_event = Event::new(
+                                                EventType::OrchestratorResponse,
+                                                "",
+                                                Actor::Orchestrator,
+                                                serde_json::json!({
+                                                    "message": response.message,
+                                                }),
+                                            );
+                                            if let Err(e) = bus.publish(resp_event).await {
+                                                tracing::error!(error = %e, "Failed to publish orchestrator response");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Failed to process orchestrator chat message");
+                                            let err_event = Event::new(
+                                                EventType::OrchestratorResponse,
+                                                "",
+                                                Actor::Orchestrator,
+                                                serde_json::json!({
+                                                    "message": format!("I encountered an error processing your message: {}", e),
+                                                    "error": true,
+                                                }),
+                                            );
+                                            let _ = bus.publish(err_event).await;
+                                        }
+                                    }
+                                });
+                            } else {
+                                warn!("OrchestratorChat not available (missing ANTHROPIC_API_KEY)");
+                            }
+                        }
+                        continue; // Don't process merge queue for chat messages
                     }
                     // Skip non-relevant events for merge queue processing
                     _ if !matches!(
