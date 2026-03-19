@@ -52,8 +52,21 @@ function prNumber(url: string): string | null {
   return match?.[1] ?? null;
 }
 
-/** Get the task's title from task list. */
+/** Extract owner/repo from a GitHub PR URL. */
+function prRepo(url: string): string | null {
+  const match = url.match(/github\.com\/([^/]+\/[^/]+)\/pull/);
+  return match?.[1] ?? null;
+}
+
+/** Extract just the repo name (no owner) from a GitHub PR URL. */
+function prRepoShort(url: string): string | null {
+  const full = prRepo(url);
+  return full?.split("/")[1] ?? null;
+}
+
+/** Get the task from task list. */
 function getTask(taskId: string, meta: { tasks?: Task[] } | undefined): Task | undefined {
+  if (!taskId) return undefined;
   return meta?.tasks?.find((t) => t.id === taskId);
 }
 
@@ -87,19 +100,35 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     },
   },
 
-  // PR title (from the linked task title)
+  // PR title (from linked task, or fallback to PR link)
   {
     id: "title",
     header: "Title",
     cell: ({ row, table }) => {
       const task = getTask(row.original.task_id, table.options.meta as { tasks?: Task[] });
+      if (task) {
+        return (
+          <Link
+            to={`/tasks/${row.original.task_id}`}
+            className="text-sm hover:underline truncate max-w-[400px] block"
+          >
+            {task.title}
+          </Link>
+        );
+      }
+      // No linked task — show PR repo/number as fallback
+      const repo = prRepo(row.original.pr_url);
+      const num = prNumber(row.original.pr_url);
+      const label = repo && num ? `${repo}#${num}` : row.original.pr_url;
       return (
-        <Link
-          to={`/tasks/${row.original.task_id}`}
-          className="text-sm hover:underline truncate max-w-[400px] block"
+        <a
+          href={row.original.pr_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm text-muted-foreground hover:underline truncate max-w-[400px] block"
         >
-          {task?.title ?? row.original.task_id.slice(0, 8)}
-        </Link>
+          {label}
+        </a>
       );
     },
   },
@@ -112,8 +141,11 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
       const meta = table.options.meta as { tasks?: Task[]; projects?: Project[] } | undefined;
       const task = getTask(row.original.task_id, meta);
       const projects = meta?.projects ?? [];
-      const name = task?.project ? projectLabel(task.project, projects) : "—";
-      // Show just the repo name, not owner/repo
+      let name = task?.project ? projectLabel(task.project, projects) : null;
+      // Fall back to extracting repo from PR URL
+      if (!name) {
+        name = prRepoShort(row.original.pr_url) ?? "—";
+      }
       const short = name.includes("/") ? name.split("/")[1] : name;
       return <span className="text-sm text-muted-foreground">{short}</span>;
     },
