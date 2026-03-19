@@ -3,7 +3,10 @@
 //! The orchestrator is an AI agent that evaluates merge queue entries
 //! for quality and provides feedback to implementor agents.
 //! See spec §4.2 (evaluation) and §7.4 (conflict triage).
+//!
+//! Also provides a chat interface for user interaction (orchestrator chat).
 
+pub mod chat;
 pub mod error;
 mod claude;
 pub mod mock;
@@ -11,6 +14,7 @@ mod orchestrator;
 mod prompt;
 pub mod types;
 
+pub use chat::{ChatContext, ChatEvent, ChatResponse, OrchestratorChat, event_to_chat_event};
 pub use claude::ClaudeOrchestrator;
 pub use error::OrchestratorError;
 pub use mock::MockOrchestrator;

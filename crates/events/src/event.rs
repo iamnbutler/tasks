@@ -58,6 +58,8 @@ pub enum EventType {
     OrchestratorEscalation,
     OrchestratorDecision,
     OrchestratorMessage,
+    /// Orchestrator chat response (LLM-generated reply to human message).
+    OrchestratorResponse,
 
     // System events
     SystemStarted,
@@ -112,6 +114,7 @@ impl EventType {
             Self::OrchestratorEscalation => "orchestrator:escalation",
             Self::OrchestratorDecision => "orchestrator:decision",
             Self::OrchestratorMessage => "orchestrator:message",
+            Self::OrchestratorResponse => "orchestrator:response",
             Self::SystemStarted => "system:started",
             Self::SystemModePlay => "system:mode:play",
             Self::SystemModePause => "system:mode:pause",
@@ -186,6 +189,7 @@ impl TryFrom<String> for EventType {
             "orchestrator:escalation" => Ok(Self::OrchestratorEscalation),
             "orchestrator:decision" => Ok(Self::OrchestratorDecision),
             "orchestrator:message" => Ok(Self::OrchestratorMessage),
+            "orchestrator:response" => Ok(Self::OrchestratorResponse),
             "system:started" => Ok(Self::SystemStarted),
             "system:mode:play" => Ok(Self::SystemModePlay),
             "system:mode:pause" => Ok(Self::SystemModePause),

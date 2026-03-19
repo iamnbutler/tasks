@@ -20,7 +20,10 @@ use tasks_github::client::GitHubClient;
 use tasks_github::model::{IssueState, IssueStateReason, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
-use tasks_orchestrator::{ConflictContext, ConflictResolution, OperatingMode, Orchestrator};
+use tasks_orchestrator::{
+    ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
+    OrchestratorChat,
+};
 
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
@@ -955,7 +958,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Handle specific events for problem tracking and mode lowering
+            // Handle specific events for problem tracking, mode lowering, and chat
             if let Some(ref event) = event_opt {
                 match event.event_type {
                     // Reset problem tracker when human raises mode to Play
@@ -997,6 +1000,73 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(reason) = should_lower {
                             lower_mode(&orch_server, &reason).await;
                         }
+                    }
+                    // Handle orchestrator chat messages from humans
+                    EventType::OrchestratorMessage => {
+                        let message = event
+                            .data
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        if !message.is_empty() {
+                            info!(message_len = message.len(), "Received orchestrator chat message");
+
+                            // Build context from current state
+                            let context = {
+                                let state = orch_server.state.read().await;
+                                let mode = match state.mode {
+                                    server::Mode::Play => "Play",
+                                    server::Mode::Pause => "Pause",
+                                    server::Mode::Stop => "Stop",
+                                };
+                                ChatContext {
+                                    mode: mode.to_string(),
+                                    projects: state.projects.values().cloned().collect(),
+                                    tasks: state.tasks.values().cloned().collect(),
+                                    recent_events: Vec::new(), // TODO: collect recent events
+                                    human_present: orch_server.presence.is_present(),
+                                }
+                            };
+
+                            // Create chat handler and process message
+                            if let Ok(chat) = OrchestratorChat::from_env() {
+                                match chat.process_message(message, &context, &[]).await {
+                                    Ok(response) => {
+                                        // Emit response event
+                                        let resp_event = Event::new(
+                                            EventType::OrchestratorResponse,
+                                            "",
+                                            Actor::Orchestrator,
+                                            serde_json::json!({
+                                                "message": response.message,
+                                                "actions": response.actions,
+                                            }),
+                                        );
+                                        if let Err(e) = orch_server.event_bus.publish(resp_event).await {
+                                            error!(error = %e, "Failed to publish orchestrator response");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to process orchestrator chat message");
+                                        // Emit error response
+                                        let err_event = Event::new(
+                                            EventType::OrchestratorResponse,
+                                            "",
+                                            Actor::Orchestrator,
+                                            serde_json::json!({
+                                                "message": format!("I encountered an error processing your message: {}", e),
+                                                "error": true,
+                                            }),
+                                        );
+                                        let _ = orch_server.event_bus.publish(err_event).await;
+                                    }
+                                }
+                            } else {
+                                warn!("OrchestratorChat not available (missing ANTHROPIC_API_KEY)");
+                            }
+                        }
+                        continue; // Don't process merge queue for chat messages
                     }
                     // Skip non-relevant events for merge queue processing
                     _ if !matches!(
