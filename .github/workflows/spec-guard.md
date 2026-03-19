@@ -82,8 +82,8 @@ The spec files in this project follow these conventions:
 
 The main spec (`spec/spec.md`) references companion documents:
 - `spec/github.md` — GitHub integration details
-- `spec/session-runtime.md` — Session and container runtime (may not exist yet)
-- `spec/example.md` — Worked example of the system
+- `spec/session-runtime.md` — Session and container runtime
+- `spec/symphony-legacy.md` — Historical Symphony spec (legacy reference)
 
 ## Review Priorities
 
@@ -119,7 +119,7 @@ Are new concepts fully specified? Are edge cases addressed? Are interactions wit
 1. Read all spec files to understand the current state:
    - `spec/spec.md` — main platform specification
    - `spec/github.md` — GitHub integration spec
-   - `spec/example.md` — worked example
+   - `spec/session-runtime.md` — session runtime spec
 2. Note the section structure, numbering scheme, and conventions used.
 3. Check cache memory at `/tmp/gh-aw/cache-memory/` for past review patterns.
 

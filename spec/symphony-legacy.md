@@ -1,6 +1,9 @@
 # Symphony Service Specification
 
-Status: Draft v1 (language-agnostic)
+Status: Legacy (superseded by Tasks)
+
+> **Note:** This is the original Symphony specification, kept for historical reference. The
+> Symphony project evolved into Tasks. For the current specification, see [spec.md](./spec.md).
 
 Purpose: Define a service that orchestrates coding agents to get project work done.
 

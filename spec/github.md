@@ -3,7 +3,7 @@
 Status: Draft
 
 This document specifies the GitHub integration layer — how the platform discovers, fetches, and
-normalizes work from GitHub. It is a companion to the main spec (spec.md §11 Issue Tracker
+normalizes work from GitHub. It is a companion to the main spec (spec.md §12 Issue Tracker
 Integration, §3.2 Scheduler).
 
 ## 1. Overview

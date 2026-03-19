@@ -13,9 +13,19 @@ Tasks is a human-in-the-loop platform that orchestrates coding agents to get pro
 
 This specification is organized into the following documents:
 
+### Core Specification
+
 - **[Tasks Platform Specification](./spec.md)** — The main platform specification covering architecture, domain model, operating modes, merge queue, event system, sessions, and more.
-- **[GitHub Integration](./github.md)** — Details of the GitHub integration layer including the normalized model, GraphQL queries, and polling mechanisms.
-- **[Worked Example](./example.md)** — A concrete example showing the system in action.
+
+### Detail Specifications
+
+- **[Session Runtime](./session-runtime.md)** — Container provider, supervisor protocol, and workspace provisioning. Expands spec.md §10-11, §18.
+- **[GitHub Integration](./github.md)** — Normalized model, GraphQL queries, and polling mechanisms. Expands spec.md §12.
+
+### Reference
+
+- **[Symphony (Legacy)](./symphony-legacy.md)** — Historical specification from the predecessor project. Kept for reference.
+- **[Contributing](./CONTRIBUTING.md)** — Guidelines for writing and maintaining spec documents.
 
 ## Status
 
