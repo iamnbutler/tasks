@@ -5,11 +5,13 @@
 # Specification
 
 - [Tasks Platform Specification](./spec.md)
+- [Session Runtime](./session-runtime.md)
 - [GitHub Integration](./github.md)
 
 # Reference
 
-- [Worked Example](./example.md)
+- [Symphony (Legacy)](./symphony-legacy.md)
+- [Contributing](./CONTRIBUTING.md)
 
 ---
 
