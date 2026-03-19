@@ -371,11 +371,18 @@ added to the queue.
 
 1. An open pull request is discovered on a tracked repository.
 2. A merge queue entry is created with status `pending`.
-3. The merge authority (human or orchestrator, depending on mode) reviews and either
+3. The entry is added to the orchestrator's evaluation FIFO queue.
+4. The orchestrator evaluates one entry per tick (default: 15 seconds, configurable via
+   `TASKS_ORCHESTRATOR_EVAL_INTERVAL`). Once evaluated, a PR is not re-evaluated until
+   it receives new commits.
+5. The merge authority (human or orchestrator, depending on mode) reviews and either
    approves or rejects.
-4. Approved entries are merged (in Play mode, continuously; in Pause mode, via Flush).
-5. If rejected, the entry is removed from the queue. If the PR originated from a task,
+6. Approved entries are merged (in Play mode, continuously; in Pause mode, via Flush).
+7. If rejected, the entry is removed from the queue. If the PR originated from a task,
    that task may be re-engaged with feedback.
+
+Human chat messages to the orchestrator bypass the evaluation queue and are processed
+immediately.
 
 ### 7.2 Merge Authority
 
@@ -1397,16 +1404,27 @@ function handle_failure(session, exit_code):
 
 ### 19.3 Merge Queue Processing
 
+The orchestrator maintains a FIFO evaluation queue. Entries are added when
+`merge:queued` events arrive and popped one at a time on a configurable interval
+(default 15s). Once a PR has been evaluated, it is not re-evaluated until it
+receives new commits.
+
 ```
-function process_merge_queue(server):
+function process_merge_queue_tick(server, eval_queue, evaluated_prs):
     if server.mode == Stop:
         return
     if server.mode == Pause:
         return  # Queue is held. Only Flush triggers processing.
 
+    entry = eval_queue.pop_front()
+    if entry is None:
+        return
+    if entry.pr_url in evaluated_prs:
+        return  # Already evaluated this commit
+
     # Play mode: orchestrator has merge authority.
-    for entry in server.merge_queue where status == Pending:
-        evaluation = orchestrator.evaluate(entry.task)
+    evaluation = orchestrator.evaluate(entry.task)
+    evaluated_prs.add(entry.pr_url)  # Don't re-evaluate until new commits
 
         if evaluation.approved:
             entry.status = Approved

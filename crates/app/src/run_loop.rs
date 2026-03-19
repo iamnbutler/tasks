@@ -948,19 +948,32 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let orch_event_bus = server.event_bus.clone();
     let orch_github_token = config.github_token.clone();
 
-    let orchestrator_interval = config.dispatch_interval; // reuse dispatch interval for now
+    let orchestrator_eval_interval = config.orchestrator_eval_interval;
 
     // Problem tracker for mode lowering (spec §6.4)
     let problem_tracker = Arc::new(StdMutex::new(ProblemTracker::new()));
 
     let orchestrator_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(orchestrator_interval);
+        let mut eval_interval = tokio::time::interval(orchestrator_eval_interval);
         let mut event_rx = orch_event_bus.subscribe();
         let merge_github = GitHubClient::new(&orch_github_token);
+
+        // FIFO queue of entry IDs waiting for evaluation.
+        // Entries are pushed when MergeQueued events arrive and popped one at a time
+        // on each eval_interval tick. This throttles LLM calls to at most one per
+        // interval (default 15s) while human chat messages bypass the queue entirely.
+        let mut eval_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        // Track which entry IDs are already in the queue to avoid duplicates.
+        let mut eval_queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Track the PR URL (used as a proxy for "which PR") that was last evaluated for
+        // each entry, so we don't re-evaluate the same PR until it has new commits.
+        // Key: pr_url, Value: last evaluated head SHA (or empty if unknown).
+        let mut evaluated_prs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         loop {
-            // Tick on interval or on relevant events
+            // Either the eval timer fires (pop one entry) or an event arrives
             let event_opt = tokio::select! {
-                _ = interval.tick() => None,
+                _ = eval_interval.tick() => None,
                 result = event_rx.recv() => {
                     match result {
                         Ok(event) => Some(event),
@@ -973,14 +986,40 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Handle specific events for problem tracking, mode lowering, and chat
+            // Handle events: problem tracking, mode changes, chat, and queue additions
             if let Some(ref event) = event_opt {
                 match event.event_type {
+                    // When a new entry is queued, add it to the FIFO
+                    EventType::MergeQueued => {
+                        if let Some(entry_id) = event.data.get("entry_id").and_then(|v| v.as_str()) {
+                            // New entry — always queue it (it's fresh)
+                            if eval_queued.insert(entry_id.to_string()) {
+                                eval_queue.push_back(entry_id.to_string());
+                                info!(entry_id = %entry_id, queue_len = eval_queue.len(), "added entry to eval queue");
+                            }
+                        } else {
+                            // Fallback: scan for any pending entries not yet queued/evaluated
+                            let state = orch_server.state.read().await;
+                            for entry in state.merge_queue.pending() {
+                                if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                                    eval_queue.push_back(entry.id.clone());
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Reset problem tracker when human raises mode to Play
                     EventType::SystemModePlay => {
                         if let Ok(mut tracker) = problem_tracker.lock() {
                             tracker.reset();
                             info!("problem tracker reset (mode raised to Play)");
+                        }
+                        // Seed the queue with pending entries not yet evaluated
+                        let state = orch_server.state.read().await;
+                        for entry in state.merge_queue.pending() {
+                            if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                                eval_queue.push_back(entry.id.clone());
+                            }
                         }
                     }
                     // Track agent errors
@@ -1016,7 +1055,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             lower_mode(&orch_server, &reason).await;
                         }
                     }
-                    // Handle orchestrator chat messages from humans
+                    // Handle orchestrator chat messages from humans (bypass queue)
                     EventType::OrchestratorMessage => {
                         let message = event
                             .data
@@ -1100,17 +1139,23 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue; // Don't process merge queue for chat messages
                     }
-                    // Skip non-relevant events for merge queue processing
-                    _ if !matches!(
-                        event.event_type,
-                        EventType::MergeQueued
-                            | EventType::SystemModePlay
-                            | EventType::SystemModePause
-                    ) =>
-                    {
+                    // All other events — not relevant to the orchestrator loop
+                    _ => {
                         continue;
                     }
-                    _ => {}
+                }
+            }
+
+            // --- Eval tick: pop one entry from the FIFO queue ---
+
+            // On startup or mode change, seed the queue with pending entries
+            // that haven't been evaluated yet.
+            if eval_queue.is_empty() {
+                let state = orch_server.state.read().await;
+                for entry in state.merge_queue.pending() {
+                    if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                        eval_queue.push_back(entry.id.clone());
+                    }
                 }
             }
 
@@ -1120,24 +1165,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // Snapshot pending merge queue entries with their tasks and projects
-            let pending: Vec<(String, String, String)> = {
-                let state = orch_server.state.read().await;
-                state
-                    .merge_queue
-                    .pending()
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.id.clone(),
-                            entry.task_id.clone(),
-                            entry.pr_url.clone(),
-                        )
-                    })
-                    .collect()
+            // Pop one entry from the queue
+            let entry_id = match eval_queue.pop_front() {
+                Some(id) => {
+                    eval_queued.remove(&id);
+                    id
+                }
+                None => continue, // Nothing to evaluate
             };
 
-            for (entry_id, task_id, pr_url) in pending {
+            // Look up the entry — it may have been removed since queuing
+            let (task_id, pr_url) = {
+                let state = orch_server.state.read().await;
+                match state.merge_queue.get(&entry_id) {
+                    Some(e) if e.status == server::model::merge_queue::MergeStatus::Pending => {
+                        (e.task_id.clone(), e.pr_url.clone())
+                    }
+                    _ => continue, // Entry gone or no longer pending
+                }
+            };
+
+            info!(entry_id = %entry_id, queue_remaining = eval_queue.len(), "evaluating merge queue entry");
+
+            {
+            let (entry_id, task_id, pr_url) = (entry_id, task_id, pr_url);
                 // Build evaluation context
                 let (task, project) = {
                     let state = orch_server.state.read().await;
@@ -1207,6 +1258,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 {
                     error!(error = %e, "failed to emit orchestrator decision event");
                 }
+
+                // Mark this PR as evaluated so we don't re-evaluate until new commits
+                evaluated_prs.insert(pr_url.clone());
 
                 // In Play mode: act on the decision
                 if mode == server::Mode::Play {
@@ -1471,7 +1525,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                 // In Pause mode: evaluation is recorded (decision event above)
                 // but no merge/reject action is taken. The human reviews.
-            }
+            } // end single-entry evaluation block
 
             // Cleanup terminal merge queue entries (issue #132).
             // This removes Merged and Rejected entries to prevent unbounded growth.

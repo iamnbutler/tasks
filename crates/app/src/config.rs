@@ -16,6 +16,9 @@ pub struct AppConfig {
     pub poll_interval: Duration,
     /// Dispatch tick interval (default: 30s).
     pub dispatch_interval: Duration,
+    /// Orchestrator evaluation interval — how often the orchestrator pops one
+    /// entry from its FIFO queue for evaluation (default: 15s, spec §7.1).
+    pub orchestrator_eval_interval: Duration,
     /// Container image for sessions.
     pub container_image: String,
     /// Container memory limit (default: 8G).
@@ -82,6 +85,11 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30u64);
 
+        let orchestrator_eval_interval_secs = std::env::var("TASKS_ORCHESTRATOR_EVAL_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(15u64);
+
         let progress_threshold_secs = std::env::var("TASKS_PROGRESS_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -125,6 +133,7 @@ impl AppConfig {
             max_retries,
             poll_interval: Duration::from_secs(poll_interval_secs),
             dispatch_interval: Duration::from_secs(dispatch_interval_secs),
+            orchestrator_eval_interval: Duration::from_secs(orchestrator_eval_interval_secs),
             container_image,
             container_memory,
             session_soft_limit: Duration::from_secs(3600),
