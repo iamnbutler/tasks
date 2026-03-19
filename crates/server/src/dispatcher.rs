@@ -20,12 +20,37 @@ pub struct DispatchPlan {
     pub new_work: Vec<String>,
 }
 
+/// Calculate deterministic jitter factor based on task ID and retry count.
+/// Returns a value in the range [-0.25, +0.25].
+fn jitter_factor(task_id: &str, retry_count: u32) -> f64 {
+    // djb2-like hash combining task_id and retry_count
+    let mut h: u64 = 5381u64.wrapping_add(retry_count as u64 * 2654435761);
+    for b in task_id.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u64);
+    }
+    // Map h to [-0.25, +0.25]
+    // h % 1001 gives [0, 1000], divide by 2000 gives [0, 0.5], subtract 0.25 gives [-0.25, 0.25]
+    ((h % 1001) as f64 / 2000.0) - 0.25
+}
+
 /// Calculate backoff duration for a given retry count (spec §13.2).
-/// Base: 5s, multiplier: 2x, max: 300s. No jitter in the check (jitter is for scheduling).
-pub fn backoff_duration(retry_count: u32) -> Duration {
-    let base_secs = 5i64;
-    let secs = base_secs * 2i64.pow(retry_count.min(6));
-    Duration::seconds(secs.min(300))
+/// Base: 5s, multiplier: 2x, max: 300s, jitter: ±25%.
+///
+/// Jitter is computed deterministically from the task ID to prevent
+/// thundering herd when multiple tasks fail simultaneously, while
+/// remaining predictable across dispatch evaluations.
+pub fn backoff_duration(retry_count: u32, task_id: &str) -> Duration {
+    let base_secs = 5i64 * 2i64.pow(retry_count.min(6));
+    let capped_secs = base_secs.min(300);
+
+    // Apply ±25% jitter
+    let jitter = jitter_factor(task_id, retry_count);
+    let jittered_secs = (capped_secs as f64 * (1.0 + jitter)).round() as i64;
+
+    // Clamp to [5, 300] per spec §13.2
+    let final_secs = jittered_secs.clamp(5, 300);
+
+    Duration::seconds(final_secs)
 }
 
 /// Evaluate which tasks should be dispatched (spec §12.6).
@@ -85,7 +110,7 @@ pub fn evaluate(
             }
             // Check backoff
             if let Some(failure_at) = t.last_failure_at {
-                if failure_at + backoff_duration(t.retry_count) > now {
+                if failure_at + backoff_duration(t.retry_count, &t.id) > now {
                     return false;
                 }
             }
@@ -374,17 +399,64 @@ mod tests {
     }
 
     #[test]
-    fn backoff_duration_values() {
-        // retry 0: 5 * 2^0 = 5s
-        assert_eq!(backoff_duration(0), Duration::seconds(5));
-        // retry 1: 5 * 2^1 = 10s
-        assert_eq!(backoff_duration(1), Duration::seconds(10));
-        // retry 2: 5 * 2^2 = 20s
-        assert_eq!(backoff_duration(2), Duration::seconds(20));
-        // retry 6: 5 * 2^6 = 320 → capped at 300s
-        assert_eq!(backoff_duration(6), Duration::seconds(300));
-        // retry 10: capped at retry_count.min(6), so 5 * 2^6 = 320 → capped at 300s
-        assert_eq!(backoff_duration(10), Duration::seconds(300));
+    fn backoff_duration_within_jitter_range() {
+        // Test that backoff durations fall within expected jitter range (±25%)
+        let task_id = "test-task";
+
+        // retry 0: base 5s, range [4, 6] (clamped to [5, 6])
+        let d0 = backoff_duration(0, task_id).num_seconds();
+        assert!(d0 >= 5 && d0 <= 6, "retry 0: expected [5,6], got {}", d0);
+
+        // retry 1: base 10s, range [8, 13]
+        let d1 = backoff_duration(1, task_id).num_seconds();
+        assert!(d1 >= 8 && d1 <= 13, "retry 1: expected [8,13], got {}", d1);
+
+        // retry 2: base 20s, range [15, 25]
+        let d2 = backoff_duration(2, task_id).num_seconds();
+        assert!(d2 >= 15 && d2 <= 25, "retry 2: expected [15,25], got {}", d2);
+
+        // retry 6: base 320s capped to 300s, range [225, 300] (clamped at 300)
+        let d6 = backoff_duration(6, task_id).num_seconds();
+        assert!(d6 >= 225 && d6 <= 300, "retry 6: expected [225,300], got {}", d6);
+
+        // retry 10: same as retry 6 due to min(6)
+        let d10 = backoff_duration(10, task_id).num_seconds();
+        assert!(d10 >= 225 && d10 <= 300, "retry 10: expected [225,300], got {}", d10);
+    }
+
+    #[test]
+    fn backoff_jitter_is_deterministic() {
+        // Same task_id and retry_count should produce same duration
+        let d1 = backoff_duration(2, "task-abc");
+        let d2 = backoff_duration(2, "task-abc");
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn backoff_jitter_varies_by_task_id() {
+        // Different task_ids should (usually) produce different durations
+        // Use a higher retry count for more variation
+        let d1 = backoff_duration(3, "task-alpha").num_seconds();
+        let d2 = backoff_duration(3, "task-beta").num_seconds();
+        let d3 = backoff_duration(3, "task-gamma").num_seconds();
+
+        // With 3 different task IDs, we should get at least 2 different values
+        let unique_count = [d1, d2, d3]
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(unique_count >= 2, "Expected variation in jitter, got {} {} {}", d1, d2, d3);
+    }
+
+    #[test]
+    fn backoff_jitter_varies_by_retry_count() {
+        // Same task_id with different retry counts should produce different jitter factors
+        let task_id = "fixed-task";
+        let d1 = backoff_duration(1, task_id).num_seconds();
+        let d2 = backoff_duration(2, task_id).num_seconds();
+
+        // Base values are 10s and 20s, so even with jitter they shouldn't be equal
+        assert_ne!(d1, d2);
     }
 
     #[test]
