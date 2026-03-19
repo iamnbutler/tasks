@@ -344,8 +344,8 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.3 Play
 
 - Agents are dispatched and work on tasks normally.
-- The merge queue is continuously active: as pull requests arrive, pass quality evaluation,
-  and are approved by the orchestrator, they merge automatically.
+- The merge queue is active: as pull requests arrive, they are queued for evaluation. The
+  orchestrator evaluates one entry per tick (§7.1) and approved entries merge automatically.
 - The orchestrator owns merge authority. The human can still intervene at any time.
 - Play is the fully autonomous mode. The human delegates merge authority to the orchestrator and
   may step away.
