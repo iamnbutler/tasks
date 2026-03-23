@@ -7,6 +7,7 @@ mod config;
 mod memory;
 mod problem_tracker;
 mod run_loop;
+mod update;
 mod web;
 
 use models::project::Project;
@@ -318,7 +319,14 @@ async fn main() {
             if args.iter().any(|a| a == "--web") {
                 config.web = true;
             }
-            run_loop::run(config).await.map_err(|e| e.to_string())
+            match run_loop::run(config).await {
+                Ok(run_loop::RunResult::Normal) => Ok(()),
+                Ok(run_loop::RunResult::UpdateRestart) => {
+                    eprintln!("Exiting for update (code 100)");
+                    std::process::exit(update::UPDATE_EXIT_CODE);
+                }
+                Err(e) => Err(e.to_string()),
+            }
         }
         "--help" | "-h" | "help" => {
             print_usage();
