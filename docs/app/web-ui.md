@@ -39,7 +39,7 @@ The dashboard provides an at-a-glance view of:
 Click the mode indicator to switch between:
 
 - **Play** - Full autonomy
-- **Pause** - Agents work, merges paused
+- **Pause** - Agents work; only merges are held for human flush. Rejections, conflict handling, and changes-requested still execute.
 - **Stop** - All activity halted
 
 ## Tasks View
@@ -65,6 +65,10 @@ Use the filter controls to narrow down tasks:
 - **State** - Filter by task state
 - **Project** - Filter by project
 - **Search** - Text search in title/description
+
+### Queue Tab
+
+The **Queue** tab in the Tasks view shows tasks in dispatch order (waiting and changes-requested states). Tasks can be dragged to reorder; the new order is persisted as sequential priorities and used by the dispatcher for scheduling.
 
 ### Task Detail
 
@@ -128,6 +132,7 @@ The Events view shows a real-time stream of system events.
 |------|-------------|
 | `task:created` | New task created |
 | `task:updated` | Task state changed |
+| `task:reordered` | Task priorities updated via queue reorder |
 | `session:started` | Agent session began |
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |

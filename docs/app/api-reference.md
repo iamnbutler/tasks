@@ -127,6 +127,36 @@ Content-Type: application/json
 }
 ```
 
+#### Update Task
+
+Update a task's properties. Currently supports setting priority for manual queue reordering.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** The updated task object.
+
+#### Reorder Tasks
+
+Assign sequential priorities to a list of tasks. Used for drag-and-drop reordering in the Queue view.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["task-uuid-1", "task-uuid-2", "task-uuid-3"]
+}
+```
+
+Tasks are assigned priorities `1, 2, 3, ...` in the given order.
+
 #### Cancel Task
 
 Stop a running agent session for the given task.
@@ -361,7 +391,24 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Events
+
+#### Query Historical Events
+
+Scan all task event logs and return events matching a type prefix, sorted ascending by timestamp.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=200
+```
+
+**Query Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `type_prefix` | Yes | Event type prefix to filter (e.g. `orchestrator:`, `task:`) |
+| `limit` | No | Max events to return (default: 200) |
+
+#### SSE Live Stream
 
 Server-Sent Events stream for real-time updates.
 
