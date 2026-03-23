@@ -171,6 +171,19 @@ impl MergeQueue {
         Ok(())
     }
 
+    /// Update the head SHA for an entry.
+    /// Returns true if the SHA was updated (i.e., it changed).
+    pub fn update_head_sha(&mut self, id: &str, head_sha: &str) -> Result<bool, MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        let changed = entry.head_sha.as_ref().map_or(true, |sha| sha != head_sha);
+        if changed {
+            entry.head_sha = Some(head_sha.to_string());
+        }
+        Ok(changed)
+    }
+
     /// Get all entries with conflicts.
     pub fn conflicting(&self) -> Vec<&MergeQueueEntry> {
         self.entries

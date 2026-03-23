@@ -742,96 +742,119 @@ impl Server {
             let entry_id = entry_id.clone();
             let task_id = task_id.clone();
 
-            let action = match pr.state {
+            let (action, entry_id_for_sha_update) = match pr.state {
                 tasks_github::model::PullRequestState::Merged => {
                     if *current_status != MergeStatus::Merged {
-                        MqAction::MarkMerged { entry_id, task_id, pr_url }
+                        (Some(MqAction::MarkMerged { entry_id, task_id, pr_url }), None)
                     } else {
                         continue;
                     }
                 }
                 tasks_github::model::PullRequestState::Closed => {
-                    MqAction::Remove { entry_id, pr_url }
+                    (Some(MqAction::Remove { entry_id, pr_url }), None)
                 }
                 tasks_github::model::PullRequestState::Open => {
+                    // For open PRs, always update head_sha to detect new commits
+                    let sha_update_id = entry_id.clone();
                     // Update conflict status from GitHub's mergeable field
-                    match pr.mergeable {
+                    let conflict_action = match pr.mergeable {
                         Some(tasks_github::model::MergeableState::Conflicting)
                             if *current_status != MergeStatus::Conflict =>
                         {
-                            MqAction::MarkConflict { entry_id, pr_url }
+                            Some(MqAction::MarkConflict { entry_id, pr_url })
                         }
                         Some(tasks_github::model::MergeableState::Mergeable)
                             if *current_status == MergeStatus::Conflict =>
                         {
-                            MqAction::ClearConflict { entry_id }
+                            Some(MqAction::ClearConflict { entry_id })
                         }
-                        _ => continue,
-                    }
+                        _ => None,
+                    };
+                    (conflict_action, Some(sha_update_id))
                 }
             };
-            actions.push(action);
+            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
         }
 
         // Execute all actions
         let mut changes = 0u32;
-        for action in actions {
-            match action {
-                MqAction::MarkMerged { entry_id, pr_url, .. } => {
-                    tracing::info!(
-                        entry_id = %entry_id,
-                        pr_url = %pr_url,
-                        "reconciliation: PR merged externally, marking entry as merged"
-                    );
-                    // mark_entry_merged also transitions the linked task to Completed
-                    if let Err(e) = self.mark_entry_merged(&entry_id, &pr_url).await {
-                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark entry as merged during reconciliation");
-                    } else {
-                        changes += 1;
-                    }
-                }
-                MqAction::Remove { entry_id, pr_url } => {
-                    tracing::info!(
-                        entry_id = %entry_id,
-                        pr_url = %pr_url,
-                        "reconciliation: PR closed without merge, removing entry"
-                    );
-                    let mut state = self.state.write().await;
-                    state.merge_queue.remove_by_pr_url(&pr_url);
-                    // Also remove from store
-                    if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
-                            if let Err(e) = store.delete_merge_entry(&entry_id) {
-                                tracing::error!(entry_id = %entry_id, error = %e, "failed to delete merge entry from store");
-                            }
+        for (action, entry_id_for_sha_update, head_sha) in actions {
+            if let Some(action) = action {
+                match action {
+                    MqAction::MarkMerged { entry_id, pr_url, .. } => {
+                        tracing::info!(
+                            entry_id = %entry_id,
+                            pr_url = %pr_url,
+                            "reconciliation: PR merged externally, marking entry as merged"
+                        );
+                        // mark_entry_merged also transitions the linked task to Completed
+                        if let Err(e) = self.mark_entry_merged(&entry_id, &pr_url).await {
+                            tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark entry as merged during reconciliation");
+                        } else {
+                            changes += 1;
                         }
                     }
-                    changes += 1;
-                }
-                MqAction::MarkConflict { entry_id, pr_url } => {
-                    tracing::debug!(
-                        entry_id = %entry_id,
-                        "reconciliation: PR has merge conflict"
-                    );
-                    let conflict_info = crate::model::merge_queue::ConflictInfo::new(
-                        crate::model::merge_queue::ConflictType::Unknown,
-                        "Conflict detected from GitHub mergeable status",
-                    );
-                    if let Err(e) = self.mark_entry_conflict(&entry_id, &pr_url, Some(conflict_info)).await {
-                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark conflict during reconciliation");
-                    } else {
+                    MqAction::Remove { entry_id, pr_url } => {
+                        tracing::info!(
+                            entry_id = %entry_id,
+                            pr_url = %pr_url,
+                            "reconciliation: PR closed without merge, removing entry"
+                        );
+                        let mut state = self.state.write().await;
+                        state.merge_queue.remove_by_pr_url(&pr_url);
+                        // Also remove from store
+                        if let Some(ref store) = self.store {
+                            if let Ok(store) = store.lock() {
+                                if let Err(e) = store.delete_merge_entry(&entry_id) {
+                                    tracing::error!(entry_id = %entry_id, error = %e, "failed to delete merge entry from store");
+                                }
+                            }
+                        }
                         changes += 1;
                     }
+                    MqAction::MarkConflict { entry_id, pr_url } => {
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            "reconciliation: PR has merge conflict"
+                        );
+                        let conflict_info = crate::model::merge_queue::ConflictInfo::new(
+                            crate::model::merge_queue::ConflictType::Unknown,
+                            "Conflict detected from GitHub mergeable status",
+                        );
+                        if let Err(e) = self.mark_entry_conflict(&entry_id, &pr_url, Some(conflict_info)).await {
+                            tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark conflict during reconciliation");
+                        } else {
+                            changes += 1;
+                        }
+                    }
+                    MqAction::ClearConflict { entry_id } => {
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            "reconciliation: conflict resolved"
+                        );
+                        if let Err(e) = self.clear_entry_conflict(&entry_id).await {
+                            tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
+                        } else {
+                            changes += 1;
+                        }
+                    }
                 }
-                MqAction::ClearConflict { entry_id } => {
-                    tracing::debug!(
-                        entry_id = %entry_id,
-                        "reconciliation: conflict resolved"
-                    );
-                    if let Err(e) = self.clear_entry_conflict(&entry_id).await {
-                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
-                    } else {
-                        changes += 1;
+            }
+
+            // Update head_sha for open PRs to detect new commits
+            if let Some(entry_id) = entry_id_for_sha_update {
+                let mut state = self.state.write().await;
+                match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
+                    Ok(true) => {
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            head_sha = %head_sha,
+                            "reconciliation: updated head_sha for PR"
+                        );
+                    }
+                    Ok(false) => {} // No change
+                    Err(e) => {
+                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to update head_sha during reconciliation");
                     }
                 }
             }
