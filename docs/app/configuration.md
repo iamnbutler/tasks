@@ -67,6 +67,25 @@ Tasks is configured through environment variables and a `.env` file.
 |----------|-------------|---------|
 | `RUST_LOG` | Log level filter | `info` |
 
+### Self-Update
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_UPDATE_CHECK_ENABLED` | Enable update checking | `true` |
+| `TASKS_UPDATE_CHECK_INTERVAL` | Check interval (seconds) | `300` |
+| `TASKS_UPDATE_AUTO_APPLY` | Auto-apply updates | `false` |
+| `TASKS_UPDATE_SESSION_TIMEOUT` | Session drain timeout (seconds) | `300` |
+
+### Wrapper Script
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_MAX_RETRIES` | Max network retry attempts | `10` |
+| `TASKS_RETRY_DELAY` | Initial retry delay (seconds) | `5` |
+| `TASKS_MAX_RETRY_DELAY` | Maximum retry delay (seconds) | `300` |
+| `TASKS_HEALTH_TIMEOUT` | Health check timeout (seconds) | `30` |
+| `TASKS_LOG_MAX_SIZE` | Log rotation size (bytes) | `10485760` |
+
 ## .env File
 
 Create a `.env` file at the project root:

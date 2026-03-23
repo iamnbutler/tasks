@@ -1,0 +1,83 @@
+# Tasks Server systemd unit file
+#
+# Installation:
+#   1. Copy to /etc/systemd/system/tasks.service
+#   2. Create environment file: /etc/tasks/env
+#   3. Create tasks user: sudo useradd -r -s /bin/false tasks
+#   4. Enable: sudo systemctl enable tasks
+#   5. Start: sudo systemctl start tasks
+#
+# Environment file (/etc/tasks/env):
+#   GITHUB_TOKEN=ghp_xxxx
+#   ANTHROPIC_API_KEY=sk-ant-xxxx
+#   TASKS_DATA_DIR=/var/lib/tasks
+#
+# Logs: journalctl -u tasks -f
+
+[Unit]
+Description=Tasks - Human-in-the-loop coding agent orchestrator
+Documentation=https://github.com/iamnbutler/tasks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# User and group (create with: useradd -r -s /bin/false tasks)
+User=tasks
+Group=tasks
+
+# Working directory (clone the repo here)
+WorkingDirectory=/opt/tasks
+
+# Environment
+EnvironmentFile=/etc/tasks/env
+
+# Data directory
+Environment=TASKS_DATA_DIR=/var/lib/tasks
+Environment=RUST_LOG=info
+
+# Main process
+ExecStart=/opt/tasks/scripts/tasks-runner.sh --web
+
+# Graceful shutdown
+TimeoutStopSec=60
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=0
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+
+# Allow write to data directory
+ReadWritePaths=/var/lib/tasks
+
+# Allow network access
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=16G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tasks
+
+[Install]
+WantedBy=multi-user.target

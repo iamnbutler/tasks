@@ -91,9 +91,25 @@ cargo run -- add-project owner/repo
 
 This adds a GitHub repository for Tasks to monitor.
 
+## Production Deployment
+
+For production use, run Tasks with the wrapper script which provides:
+
+- Automatic self-updates when new commits are pushed to `origin/main`
+- Build failure recovery with binary backup
+- Signal handling and graceful shutdown
+- Log rotation
+
+```bash
+./scripts/tasks-runner.sh --web
+```
+
+For systemd (Linux) or launchd (macOS) service setup, see the [Deployment Guide](deployment.md).
+
 ## Next Steps
 
 - [Architecture Overview](architecture.md) - Understand the system design
+- [Deployment](deployment.md) - Production setup with systemd/launchd
 - [CLI Reference](cli-reference.md) - All available commands
 - [API Reference](api-reference.md) - REST API documentation
 - [Web UI Guide](web-ui.md) - Using the web interface

@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tasks Server launchd plist for macOS
+
+  Installation (user agent - runs as current user):
+    1. Copy to ~/Library/LaunchAgents/com.tasks.plist
+    2. Edit paths below to match your setup
+    3. Create environment file: ~/.config/tasks/env
+    4. Load: launchctl load ~/Library/LaunchAgents/com.tasks.plist
+    5. Start: launchctl start com.tasks
+
+  Installation (system daemon - runs as dedicated user):
+    1. Copy to /Library/LaunchDaemons/com.tasks.plist
+    2. Edit paths and add UserName key
+    3. Load: sudo launchctl load /Library/LaunchDaemons/com.tasks.plist
+
+  Environment file (~/.config/tasks/env):
+    GITHUB_TOKEN=ghp_xxxx
+    ANTHROPIC_API_KEY=sk-ant-xxxx
+
+  Logs: tail -f ~/.local/state/tasks/runner.log
+  Status: launchctl list | grep tasks
+  Unload: launchctl unload ~/Library/LaunchAgents/com.tasks.plist
+-->
+<plist version="1.0">
+<dict>
+    <!-- Service identifier -->
+    <key>Label</key>
+    <string>com.tasks</string>
+
+    <!-- Program to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <!-- Source environment and run wrapper script -->
+        <string>source ~/.config/tasks/env 2>/dev/null || true; cd ~/Developer/tasks &amp;&amp; ./scripts/tasks-runner.sh --web</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>~/Developer/tasks</string>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>HOME</key>
+        <string>~</string>
+    </dict>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep running (restart on exit) -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Only restart on crash, not clean exit -->
+        <key>SuccessfulExit</key>
+        <false/>
+        <!-- Don't restart if network is down -->
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle restarts: wait 10 seconds between attempts -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>~/.local/state/tasks/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/.local/state/tasks/launchd-stderr.log</string>
+
+    <!-- Resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <!-- Process settings -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Nice level (lower = higher priority) -->
+    <key>Nice</key>
+    <integer>0</integer>
+
+    <!-- Exit timeout: allow 60 seconds for graceful shutdown -->
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
+</dict>
+</plist>
