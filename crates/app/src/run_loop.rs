@@ -338,7 +338,28 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     let parts: Vec<&str> = repo.split('/').collect();
                     if parts.len() == 2 {
                         let client = GitHubClient::new(&github_token);
-                        let poller = RepoPoller::new(client, parts[0], parts[1]);
+                        // Load persisted high-water mark to avoid cold start (spec github.md §5.3)
+                        let since = match poll_server.get_last_polled_at(project_id) {
+                            Ok(ts) => {
+                                if ts.is_some() {
+                                    debug!(
+                                        project = %project_id,
+                                        since = ?ts,
+                                        "restored poller high-water mark from database"
+                                    );
+                                }
+                                ts
+                            }
+                            Err(e) => {
+                                warn!(
+                                    project = %project_id,
+                                    error = %e,
+                                    "failed to load poller high-water mark, starting cold"
+                                );
+                                None
+                            }
+                        };
+                        let poller = RepoPoller::new(client, parts[0], parts[1]).with_since(since);
                         pollers.insert(project_id.clone(), poller);
                     }
                 }
@@ -590,6 +611,17 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 PullRequestState::Open => unreachable!(),
+                            }
+                        }
+
+                        // Persist the high-water mark after successful poll (spec github.md §5.3)
+                        if let Some(ts) = result.timestamp {
+                            if let Err(e) = poll_server.set_last_polled_at(project_id, ts) {
+                                warn!(
+                                    project = %project_id,
+                                    error = %e,
+                                    "failed to persist poller high-water mark"
+                                );
                             }
                         }
                     }

@@ -46,6 +46,16 @@ impl RepoPoller {
         }
     }
 
+    /// Set the initial high-water mark (for restoring from persisted state).
+    ///
+    /// Call this before the first `poll()` to avoid a cold start that fetches
+    /// all open items. Typically used with a timestamp loaded from the database
+    /// after a server restart.
+    pub fn with_since(mut self, since: Option<DateTime<Utc>>) -> Self {
+        self.since = since;
+        self
+    }
+
     /// The current high-water mark.
     pub fn since(&self) -> Option<DateTime<Utc>> {
         self.since

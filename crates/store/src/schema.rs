@@ -98,5 +98,27 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // Migration: add last_polled_at column to projects table (spec github.md §5.3)
+    // This persists the poller high-water mark to survive server restarts.
+    match conn.execute(
+        "ALTER TABLE projects ADD COLUMN last_polled_at TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added last_polled_at column to projects table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            // Column already exists — this is expected for existing databases
+            tracing::debug!("last_polled_at column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add last_polled_at column");
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
