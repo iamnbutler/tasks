@@ -410,6 +410,25 @@ impl Store {
         Ok(affected)
     }
 
+    /// Cascade-delete all data for a project's tasks: merge queue entries,
+    /// accounting, then tasks. Runs in a transaction so partial failures
+    /// don't leave the store inconsistent.
+    pub fn delete_project_data(&self, project: &str, task_ids: &[String]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Delete merge queue entries and accounting for each task
+        for task_id in task_ids {
+            tx.execute("DELETE FROM merge_queue WHERE task_id = ?1", params![task_id])?;
+            tx.execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
+        }
+
+        // Delete all tasks for the project
+        tx.execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     // ── Accounting (spec §16.4) ───────────────────────────────────
 
     /// Get or create accounting data for a task.
@@ -1065,5 +1084,84 @@ mod tests {
         assert_eq!(summary.total_output_tokens, 0);
         assert_eq!(summary.total_sessions, 0);
         assert_eq!(summary.task_count, 0);
+    }
+
+    // ── Cascade delete tests ──────────────────────────────────────────
+
+    #[test]
+    fn delete_tasks_by_project() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "a/b")).unwrap();
+        store.save_project(&Project::new("p2", "c/d")).unwrap();
+
+        store
+            .save_task(&Task::new("t1", TaskSource::Internal, "Task 1", "p1"))
+            .unwrap();
+        store
+            .save_task(&Task::new("t2", TaskSource::Internal, "Task 2", "p1"))
+            .unwrap();
+        store
+            .save_task(&Task::new("t3", TaskSource::Internal, "Task 3", "p2"))
+            .unwrap();
+
+        // Delete tasks for p1
+        let deleted_ids = store.delete_tasks_by_project("p1").unwrap();
+        assert_eq!(deleted_ids.len(), 2);
+        assert!(deleted_ids.contains(&"t1".to_string()));
+        assert!(deleted_ids.contains(&"t2".to_string()));
+
+        // Verify t1 and t2 are gone, t3 remains
+        assert!(store.get_task("t1").unwrap().is_none());
+        assert!(store.get_task("t2").unwrap().is_none());
+        assert!(store.get_task("t3").unwrap().is_some());
+
+        // Now p1 project can be deleted (no FK constraint violation)
+        assert!(store.delete_project("p1").unwrap());
+    }
+
+    #[test]
+    fn delete_merge_entries_by_task_ids() {
+        let store = Store::open_memory().unwrap();
+
+        // Create merge entries
+        let entry1 = MergeQueueEntry::new("mq-1", "t1", "https://github.com/a/b/pull/1");
+        let entry2 = MergeQueueEntry::new("mq-2", "t1", "https://github.com/a/b/pull/2");
+        let entry3 = MergeQueueEntry::new("mq-3", "t2", "https://github.com/a/b/pull/3");
+
+        store.save_merge_entry(&entry1).unwrap();
+        store.save_merge_entry(&entry2).unwrap();
+        store.save_merge_entry(&entry3).unwrap();
+
+        // Delete entries for t1
+        let deleted = store
+            .delete_merge_entries_by_task_ids(&["t1".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        // Verify mq-1 and mq-2 are gone, mq-3 remains
+        assert!(store.get_merge_entry("mq-1").unwrap().is_none());
+        assert!(store.get_merge_entry("mq-2").unwrap().is_none());
+        assert!(store.get_merge_entry("mq-3").unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_accounting_by_task_ids() {
+        let store = Store::open_memory().unwrap();
+
+        // Create accounting records
+        store.add_token_usage("t1", 100, 50).unwrap();
+        store.add_token_usage("t2", 200, 100).unwrap();
+        store.add_token_usage("t3", 300, 150).unwrap();
+
+        // Delete accounting for t1 and t2
+        let deleted = store
+            .delete_accounting_by_task_ids(&["t1".to_string(), "t2".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        // Verify t1 and t2 accounting gone, t3 remains
+        assert!(store.get_accounting("t1").unwrap().is_none());
+        assert!(store.get_accounting("t2").unwrap().is_none());
+        assert!(store.get_accounting("t3").unwrap().is_some());
     }
 }
