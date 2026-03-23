@@ -161,6 +161,28 @@ export function fetchEvents(params: {
   return request<Event[]>(`/api/events/query?${qs.toString()}`);
 }
 
+export interface BootstrapProjectRequest {
+  prompt: string;
+  repo_name?: string;
+}
+
+export interface BootstrapProjectResponse {
+  project: Project;
+  issue: {
+    number: number;
+    url: string;
+  };
+  repo_url: string;
+}
+
+export function bootstrapProject(req: BootstrapProjectRequest): Promise<BootstrapProjectResponse> {
+  return request<BootstrapProjectResponse>("/api/projects/bootstrap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;

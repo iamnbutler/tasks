@@ -30,6 +30,23 @@ pub struct CreatedIssue {
     pub state: String,
 }
 
+/// Response from GitHub REST API when creating a repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedRepository {
+    /// Repository ID.
+    pub id: u64,
+    /// Repository name (e.g., "my-project").
+    pub name: String,
+    /// Full repository name (e.g., "owner/my-project").
+    pub full_name: String,
+    /// Repository URL (HTML).
+    pub html_url: String,
+    /// Default branch name.
+    pub default_branch: String,
+    /// Whether the repository is private.
+    pub private: bool,
+}
+
 /// Maximum items per page (GitHub's limit).
 const DEFAULT_PAGE_SIZE: u32 = 100;
 
@@ -1023,6 +1040,111 @@ impl GitHubClient {
             .map(String::from);
 
         Ok(url)
+    }
+
+    // -----------------------------------------------------------------------
+    // Repository management
+    // -----------------------------------------------------------------------
+
+    /// Create a new private repository for the authenticated user.
+    ///
+    /// Uses the GitHub REST API to create a repository. The repository is
+    /// automatically initialized with a README so it can be cloned immediately.
+    ///
+    /// Returns the created repository information including owner and URL.
+    pub async fn create_repository(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<CreatedRepository, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!("{}/user/repos", self.base_url);
+
+        let mut request_body = json!({
+            "name": name,
+            "private": true,
+            "auto_init": true,
+        });
+
+        if let Some(desc) = description {
+            request_body["description"] = json!(desc);
+        }
+
+        let response = self.http.post(&url).json(&request_body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::CREATED {
+            let created: CreatedRepository = response.json().await.map_err(|e| {
+                GitHubError::Decode(format!("failed to parse created repository: {e}"))
+            })?;
+            return Ok(created);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Validation(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected create repository status {status}: {text}"
+        )))
+    }
+
+    /// Get the authenticated user's login name.
+    ///
+    /// Uses the GitHub REST API to fetch the current user's information.
+    /// This is needed to determine the owner when creating repositories.
+    pub async fn get_authenticated_user(&self) -> Result<String, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!("{}/user", self.base_url);
+
+        let response = self.http.get(&url).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status.is_success() {
+            #[derive(Deserialize)]
+            struct UserResponse {
+                login: String,
+            }
+            let user: UserResponse = response.json().await.map_err(|e| {
+                GitHubError::Decode(format!("failed to parse user response: {e}"))
+            })?;
+            return Ok(user.login);
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected user status {status}: {text}"
+        )))
     }
 
     // -----------------------------------------------------------------------
