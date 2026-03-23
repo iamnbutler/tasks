@@ -250,6 +250,8 @@ pub struct ParentIssueRef {
 /// Reference to an issue that blocks another issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockingIssueRef {
+    pub owner: String,
+    pub repo: String,
     pub number: u64,
     pub title: String,
     pub state: IssueState,

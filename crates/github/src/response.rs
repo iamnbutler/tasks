@@ -218,10 +218,24 @@ pub(crate) struct GqlTimelineSource {
 /// Blocking issue reference from timeline events.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct GqlBlockingIssue {
+    pub repository: Option<GqlBlockingIssueRepo>,
     pub number: u64,
     pub title: String,
     pub state: String,
     pub id: String,
+}
+
+/// Repository info for a blocking issue.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GqlBlockingIssueRepo {
+    pub owner: GqlBlockingIssueOwner,
+    pub name: String,
+}
+
+/// Owner info for a blocking issue.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GqlBlockingIssueOwner {
+    pub login: String,
 }
 
 impl GqlIssue {
@@ -656,7 +670,13 @@ fn extract_timeline_relationships(
         .into_values()
         .filter_map(|(issue, is_blocked)| {
             if is_blocked {
+                let (owner, repo) = issue.repository.map_or_else(
+                    || (String::new(), String::new()),
+                    |r| (r.owner.login, r.name),
+                );
                 Some(model::BlockingIssueRef {
+                    owner,
+                    repo,
                     number: issue.number,
                     title: issue.title,
                     state: parse_issue_state(&issue.state),
@@ -967,16 +987,24 @@ mod tests {
             GqlTimelineItem {
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
+                    repository: Some(GqlBlockingIssueRepo {
+                        owner: GqlBlockingIssueOwner { login: "acme".into() },
+                        name: "widgets".into(),
+                    }),
                     number: 10,
                     title: "Blocker issue".into(),
                     state: "OPEN".into(),
                     id: "I_10".into(),
                 }),
             },
-            // Issue 20 blocks this issue (marked).
+            // Issue 20 blocks this issue (marked) — from a different repo.
             GqlTimelineItem {
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
+                    repository: Some(GqlBlockingIssueRepo {
+                        owner: GqlBlockingIssueOwner { login: "acme".into() },
+                        name: "backend".into(),
+                    }),
                     number: 20,
                     title: "Another blocker".into(),
                     state: "CLOSED".into(),
@@ -987,6 +1015,10 @@ mod tests {
             GqlTimelineItem {
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
+                    repository: Some(GqlBlockingIssueRepo {
+                        owner: GqlBlockingIssueOwner { login: "acme".into() },
+                        name: "widgets".into(),
+                    }),
                     number: 10,
                     title: "Blocker issue".into(),
                     state: "OPEN".into(),
@@ -1000,6 +1032,8 @@ mod tests {
         // Only issue 20 should remain as a blocker (issue 10 was unmarked).
         assert_eq!(blocked_by.len(), 1);
         assert_eq!(blocked_by[0].number, 20);
+        assert_eq!(blocked_by[0].owner, "acme");
+        assert_eq!(blocked_by[0].repo, "backend");
         assert_eq!(blocked_by[0].state, model::IssueState::Closed);
     }
 
@@ -1033,6 +1067,7 @@ mod tests {
                         "timelineItems": {
                             "nodes": [{
                                 "blockingIssue": {
+                                    "repository": { "owner": { "login": "other-org" }, "name": "core" },
                                     "number": 5,
                                     "title": "Must fix first",
                                     "state": "OPEN",
@@ -1061,8 +1096,10 @@ mod tests {
         assert_eq!(parent.title, "Epic issue");
         assert_eq!(parent.state, model::IssueState::Open);
 
-        // Check blocked_by is populated.
+        // Check blocked_by is populated with cross-repo info.
         assert_eq!(model.blocked_by.len(), 1);
+        assert_eq!(model.blocked_by[0].owner, "other-org");
+        assert_eq!(model.blocked_by[0].repo, "core");
         assert_eq!(model.blocked_by[0].number, 5);
         assert_eq!(model.blocked_by[0].title, "Must fix first");
     }
