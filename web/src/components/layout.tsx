@@ -15,7 +15,9 @@ import {
   Play,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
+import { useUpdateStatus } from "@/hooks/use-update-status";
 import { addProject, deleteProject, setMode } from "@/lib/api";
+import { UpdateBanner } from "@/components/update-banner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -395,7 +397,10 @@ function ProjectList() {
 
 export function Layout() {
   const { connected, snapshot } = useAppState();
+  const { status: updateStatus, dismissed: updateDismissed, dismiss: dismissUpdate } = useUpdateStatus();
   const slotUtil = snapshot?.slot_utilization;
+
+  const showUpdateBanner = updateStatus?.available && !updateDismissed;
 
   return (
     <div className="flex h-screen bg-background text-foreground">
@@ -460,6 +465,11 @@ export function Layout() {
 
       {/* Main content */}
       <main className="flex-1 overflow-auto">
+        {showUpdateBanner && updateStatus && (
+          <div className="p-4 pb-0">
+            <UpdateBanner status={updateStatus} onDismiss={dismissUpdate} />
+          </div>
+        )}
         <Outlet />
       </main>
     </div>

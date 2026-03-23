@@ -5,6 +5,7 @@ import type {
   Project,
   Snapshot,
   Task,
+  UpdateStatus,
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -174,5 +175,24 @@ export function summarize(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, max_words: maxWords }),
+  });
+}
+
+// --- Update endpoints ---
+
+export async function fetchUpdateStatus(): Promise<UpdateStatus | null> {
+  try {
+    return await request<UpdateStatus>("/api/update/status");
+  } catch {
+    // API not implemented yet or server doesn't support updates
+    return null;
+  }
+}
+
+export async function applyUpdate(force?: boolean): Promise<void> {
+  await requestVoid("/api/update/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force: force ?? false }),
   });
 }
