@@ -46,13 +46,18 @@ Click the mode indicator to switch between:
 
 ### Task List
 
-The task list shows all tasks with columns for:
+The task list shows all tasks grouped by state. Each row includes:
 
-- Status (state indicator)
+- Priority indicator
+- Issue/task ID
+- State icon
 - Title
+- Labels
+- PR link (when a pull request is linked via the merge queue)
 - Project
-- Assignee (if any)
-- Created date
+- Last updated time
+
+<!-- UPDATED: PR link column added to task list -->
 
 ### Creating a Task
 
@@ -135,11 +140,21 @@ The Events view shows a real-time stream of system events.
 
 ### Filtering
 
-Filter events by:
+Events can be filtered using the tab bar. The default filter is **Important**, which hides high-frequency verbose events (`agent:message`, `human:message`).
 
-- **Type** - Specific event type
-- **Task** - Events for a specific task
-- **Time** - Time range
+| Filter | Description |
+|--------|-------------|
+| **Important** | All events except `agent:message` and `human:message` (default) |
+| **All** | Every event |
+| **Task** | `task:*` events |
+| **Agent** | `agent:*` events |
+| **Merge** | `merge:*` events |
+| **System** | `system:*` events |
+| **Orchestrator** | `orchestrator:*` events |
+
+Use the **Pause** button to freeze the live stream for inspection.
+
+<!-- UPDATED: events filter tabs and default filter -->
 
 ## Keyboard Shortcuts
 

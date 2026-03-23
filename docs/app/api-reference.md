@@ -65,6 +65,27 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild from GitHub
+
+Clears tasks and merge queue from memory and database, then re-fetches all open issues and PRs from every tracked project. Preserves accounting data, event logs, projects, and operating mode.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 5,
+  "merge_entries_cleared": 2,
+  "tasks_created": 5,
+  "merge_entries_created": 2
+}
+```
+
+<!-- UPDATED: rebuild endpoint added -->
+
 ### Tasks
 
 #### List All Tasks
