@@ -46,6 +46,37 @@ const statusSortOrder: Record<MergeStatus, number> = {
 export { statusSortOrder };
 
 // ---------------------------------------------------------------------------
+// Lifecycle phase grouping
+// ---------------------------------------------------------------------------
+
+export type LifecyclePhase = "review" | "queue" | "completed";
+
+export const lifecyclePhases: Record<LifecyclePhase, { label: string; statuses: MergeStatus[] }> = {
+  review: {
+    label: "Needs Review",
+    statuses: ["changes_requested", "conflict", "pending"],
+  },
+  queue: {
+    label: "Ready to Merge",
+    statuses: ["approved"],
+  },
+  completed: {
+    label: "Completed",
+    statuses: ["merged", "rejected"],
+  },
+};
+
+/** Get the lifecycle phase for a given status */
+export function getLifecyclePhase(status: MergeStatus): LifecyclePhase {
+  for (const [phase, config] of Object.entries(lifecyclePhases)) {
+    if (config.statuses.includes(status)) {
+      return phase as LifecyclePhase;
+    }
+  }
+  return "review"; // default fallback
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
