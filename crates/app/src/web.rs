@@ -64,6 +64,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting", get(get_accounting_summary))
         .route("/accounting/tasks", get(list_task_accounting))
         .route("/accounting/tasks/{id}", get(get_task_accounting))
+        .route("/events/query", get(query_events))
         .route("/events", get(event_stream))
         // Completions endpoints (fast mode with Haiku)
         .route("/completions", post(completions))
@@ -156,6 +157,14 @@ struct EventStreamQuery {
     pattern: Option<String>,
     /// Optional task ID filter.
     task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QueryEventsParams {
+    /// Event type prefix to filter by (e.g. "orchestrator:").
+    type_prefix: Option<String>,
+    /// Maximum number of events to return (default: 200).
+    limit: Option<usize>,
 }
 
 // --- Completions request/response types ---
@@ -697,6 +706,32 @@ impl<S: Stream> Stream for PresenceStream<S> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
     }
+}
+
+/// GET /api/events/query — Query historical events by type prefix.
+///
+/// Returns events matching the given `type_prefix` across all task logs,
+/// sorted by timestamp ascending and capped at `limit` (default 200).
+async fn query_events(
+    State(state): State<ApiState>,
+    Query(params): Query<QueryEventsParams>,
+) -> Result<Json<Vec<events::Event>>, ApiError> {
+    let type_prefix = params.type_prefix.unwrap_or_default();
+    let limit = params.limit.unwrap_or(200);
+
+    if type_prefix.is_empty() {
+        return Err(ApiError::BadRequest(
+            "type_prefix query parameter is required".to_string(),
+        ));
+    }
+
+    state
+        .server
+        .event_bus
+        .query_by_type_prefix(&type_prefix, limit)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))
 }
 
 /// GET /api/events — SSE stream of live events.
