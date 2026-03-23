@@ -929,9 +929,10 @@ Within each pool, candidates are sorted by:
    explicitly prioritized tasks.
 2. **Unblocking value.** Tasks that appear in other tasks' `blocked_by` lists sort before tasks
    that don't. This favors completing work that unblocks downstream tasks.
-3. **Recency.** Among otherwise equal tasks, newer tasks (`created_at` descending) go first.
-   In practice, older tasks in a backlog tend to be lower-priority or complex items; active work
-   is recent.
+3. **Source order.** For GitHub tasks, lower issue/PR numbers sort first (older issues before
+   newer ones). This ensures related tasks (e.g., "Phase 1", "Phase 2", "Phase 3") are processed
+   in logical creation order. For internal tasks without source numbers, older creation dates
+   sort first.
 
 The orchestrator influences dispatch indirectly by setting task priorities and creating or
 cancelling tasks, not by participating in the dispatch loop itself. This keeps dispatch fast and

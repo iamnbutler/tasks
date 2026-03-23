@@ -129,6 +129,9 @@ pub struct Task {
     pub last_failure: Option<FailureInfo>,
     /// When the source (GitHub issue/PR) was created. Used for dispatch ordering.
     pub source_created_at: Option<DateTime<Utc>>,
+    /// GitHub issue/PR number. Used for deterministic dispatch ordering within a project.
+    /// Lower numbers are older and should be processed first among otherwise equal tasks.
+    pub source_number: Option<u64>,
     /// Last activity timestamp for stale workspace detection (spec §10.3).
     /// Updated when the task transitions to/from active states.
     pub last_activity_at: Option<DateTime<Utc>>,
@@ -162,6 +165,7 @@ impl Task {
             last_failure_at: None,
             last_failure: None,
             source_created_at: None,
+            source_number: None,
             last_activity_at: None,
             created_at: now,
             updated_at: now,

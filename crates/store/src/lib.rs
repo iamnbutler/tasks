@@ -284,12 +284,12 @@ impl Store {
                 id, source_json, title, description, state,
                 parent_id, blocked_by_json, project, labels_json, priority,
                 session_id, workspace_id, retry_count, last_failure_at,
-                last_failure_json, source_created_at, last_activity_at, created_at, updated_at
+                last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19
+                ?15, ?16, ?17, ?18, ?19, ?20
             )",
             params![
                 task.id,
@@ -308,6 +308,7 @@ impl Store {
                 last_failure_at,
                 last_failure_json,
                 source_created_at,
+                task.source_number,
                 last_activity_at,
                 created_at,
                 updated_at,
@@ -322,7 +323,7 @@ impl Store {
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
-                    last_failure_json, source_created_at, last_activity_at, created_at, updated_at
+                    last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at
              FROM tasks WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_task)?;
@@ -341,7 +342,7 @@ impl Store {
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
-                    last_failure_json, source_created_at, last_activity_at, created_at, updated_at
+                    last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at
              FROM tasks",
         )?;
         let rows = stmt.query_map([], row_to_task)?;
@@ -358,7 +359,7 @@ impl Store {
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
-                    last_failure_json, source_created_at, last_activity_at, created_at, updated_at
+                    last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at
              FROM tasks WHERE project = ?1",
         )?;
         let rows = stmt.query_map(params![project], row_to_task)?;
@@ -376,7 +377,7 @@ impl Store {
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
-                    last_failure_json, source_created_at, last_activity_at, created_at, updated_at
+                    last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at
              FROM tasks WHERE state = ?1",
         )?;
         let rows = stmt.query_map(params![state_json], row_to_task)?;
@@ -559,9 +560,10 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
     let last_failure_at_str: Option<String> = row.get(13)?;
     let last_failure_json: Option<String> = row.get(14)?;
     let source_created_at_str: Option<String> = row.get(15)?;
-    let last_activity_at_str: Option<String> = row.get(16)?;
-    let created_at_str: String = row.get(17)?;
-    let updated_at_str: String = row.get(18)?;
+    let source_number: Option<u64> = row.get(16)?;
+    let last_activity_at_str: Option<String> = row.get(17)?;
+    let created_at_str: String = row.get(18)?;
+    let updated_at_str: String = row.get(19)?;
 
     let source: TaskSource = serde_json::from_str(&source_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
@@ -619,7 +621,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        16,
+                        17,
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
@@ -630,7 +632,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                17,
+                18,
                 rusqlite::types::Type::Text,
                 Box::new(e),
             )
@@ -639,7 +641,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
-                18,
+                19,
                 rusqlite::types::Type::Text,
                 Box::new(e),
             )
@@ -662,6 +664,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         last_failure_at,
         last_failure,
         source_created_at,
+        source_number,
         last_activity_at,
         created_at,
         updated_at,
