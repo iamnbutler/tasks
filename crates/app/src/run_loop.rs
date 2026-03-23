@@ -964,8 +964,14 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // The orchestrator is the project foreman. On each tick it observes
     // project state and acts: evaluates merge queue entries, comments on
     // PRs, adjusts tasks. Currently only merge queue evaluation is wired.
-    // In Play mode it auto-approves/rejects. In Pause mode it evaluates
-    // but doesn't merge. In Stop mode it's idle.
+    //
+    // Mode behavior (issue #337):
+    // - Play mode: fully autonomous — approves+merges, rejects+re-dispatches,
+    //   handles conflicts.
+    // - Pause mode: evaluates and acts on rejections, conflicts, and
+    //   changes-requested normally, but holds approved merges for human
+    //   flush. Only the actual merge-on-approval is paused.
+    // - Stop mode: idle, no evaluation or action.
     //
     // Mode lowering (spec §6.4): The orchestrator tracks problem patterns
     // and can lower mode from Play to Pause when things go wrong.
@@ -1043,6 +1049,16 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             info!("problem tracker reset (mode raised to Play)");
                         }
                         // Seed the queue with pending entries not yet evaluated
+                        let state = orch_server.state.read().await;
+                        for entry in state.merge_queue.pending() {
+                            if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                                eval_queue.push_back(entry.id.clone());
+                            }
+                        }
+                    }
+                    // Pause mode now actively evaluates and processes rejections/
+                    // conflicts (issue #337), so seed the queue on mode change.
+                    EventType::SystemModePause => {
                         let state = orch_server.state.read().await;
                         for entry in state.merge_queue.pending() {
                             if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
@@ -1290,20 +1306,26 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // Mark this PR as evaluated so we don't re-evaluate until new commits
                 evaluated_prs.insert(pr_url.clone());
 
-                // In Play mode: act on the decision
-                if mode == server::Mode::Play {
-                    if evaluation.approved {
-                        // Track approval (resets rejection counter)
-                        if let Ok(mut tracker) = problem_tracker.lock() {
-                            tracker.record_approval();
-                        }
-                        if let Err(e) = orch_server
-                            .approve_merge_entry(&entry_id, &evaluation.reasoning)
-                            .await
-                        {
-                            error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
-                        }
+                // Act on the decision (issue #337).
+                //
+                // Rejections, conflict handling, and changes-requested execute
+                // in both Play and Pause modes — only the actual merge-on-approval
+                // is held in Pause mode. Stop mode never reaches here (filtered above).
+                if evaluation.approved {
+                    // Track approval (resets rejection counter)
+                    if let Ok(mut tracker) = problem_tracker.lock() {
+                        tracker.record_approval();
+                    }
 
+                    // Always mark the entry as approved so the UI reflects the decision
+                    if let Err(e) = orch_server
+                        .approve_merge_entry(&entry_id, &evaluation.reasoning)
+                        .await
+                    {
+                        error!(entry_id = %entry_id, error = %e, "failed to approve merge entry");
+                    }
+
+                    if mode == server::Mode::Play {
                         // Execute the merge on GitHub (Play mode = continuous merge authority)
                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
                             match merge_github.merge_pull_request(&owner, &repo, number).await {
@@ -1351,13 +1373,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                     // Triage the conflict
                                     if let Some(info) = conflict_info {
                                         let human_present = orch_server.is_human_present();
+                                        let orch_mode = match mode {
+                                            server::Mode::Play => OperatingMode::Play,
+                                            server::Mode::Pause => OperatingMode::Pause,
+                                            server::Mode::Stop => OperatingMode::Stop,
+                                        };
                                         let conflict_ctx = ConflictContext {
                                             entry: context.entry.clone(),
                                             conflict_info: info,
                                             task: context.task.clone(),
                                             project: context.project.clone(),
                                             human_present,
-                                            mode: OperatingMode::Play,
+                                            mode: orch_mode,
                                         };
 
                                         match orchestrator.triage_conflict(&conflict_ctx).await {
@@ -1505,128 +1532,137 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             warn!(entry_id = %entry_id, pr_url = %pr_url, "could not parse PR URL for merge execution");
                         }
                     } else {
-                        // Track rejection and check for mode lowering
-                        let should_lower = {
-                            let mut tracker = problem_tracker.lock().unwrap();
-                            tracker.record_rejection();
-                            tracker.should_lower_mode()
-                        };
-                        if let Some(reason) = should_lower {
-                            lower_mode(&orch_server, &reason).await;
-                        }
+                        // Pause mode: entry is marked approved (above) but NOT merged.
+                        // The human can flush approved entries via the flush endpoint.
+                        info!(
+                            entry_id = %entry_id,
+                            pr_url = %pr_url,
+                            "Pause mode: entry approved but merge held for human flush"
+                        );
+                    }
+                } else {
+                    // Rejected — always act on rejections regardless of mode (issue #337).
+                    // Rejections, conflict re-engagement, and changes-requested must not
+                    // be blocked by Pause mode, only actual merges are held.
 
-                        // Check if the underlying issue is closed (issue #132).
-                        // If so, mark the task as completed instead of re-dispatching.
-                        let issue_closed = match &task.source {
-                            TaskSource::GithubIssue { owner, repo, number } => {
-                                match merge_github.get_issue(owner, repo, *number).await {
-                                    Ok(issue) => issue.state != IssueState::Open,
-                                    Err(e) => {
-                                        // On error, assume issue is still open to avoid
-                                        // incorrectly marking tasks as complete.
-                                        warn!(
-                                            task_id = %task_id,
-                                            error = %e,
-                                            "failed to check issue state, assuming open"
-                                        );
-                                        false
-                                    }
+                    // Track rejection and check for mode lowering
+                    let should_lower = {
+                        let mut tracker = problem_tracker.lock().unwrap();
+                        tracker.record_rejection();
+                        tracker.should_lower_mode()
+                    };
+                    if let Some(reason) = should_lower {
+                        lower_mode(&orch_server, &reason).await;
+                    }
+
+                    // Check if the underlying issue is closed (issue #132).
+                    // If so, mark the task as completed instead of re-dispatching.
+                    let issue_closed = match &task.source {
+                        TaskSource::GithubIssue { owner, repo, number } => {
+                            match merge_github.get_issue(owner, repo, *number).await {
+                                Ok(issue) => issue.state != IssueState::Open,
+                                Err(e) => {
+                                    // On error, assume issue is still open to avoid
+                                    // incorrectly marking tasks as complete.
+                                    warn!(
+                                        task_id = %task_id,
+                                        error = %e,
+                                        "failed to check issue state, assuming open"
+                                    );
+                                    false
                                 }
                             }
-                            _ => false,
-                        };
+                        }
+                        _ => false,
+                    };
 
-                        if issue_closed {
-                            // Issue is closed — don't re-dispatch. Mark task as completed.
-                            info!(
-                                task_id = %task_id,
-                                entry_id = %entry_id,
-                                "underlying issue is closed, marking task completed instead of re-dispatching"
-                            );
-                            if let Err(e) = orch_server
-                                .reject_merge_entry_closed(
-                                    &entry_id,
-                                    &format!("{} (issue already closed)", &evaluation.reasoning),
-                                    TaskState::Completed,
-                                )
-                                .await
-                            {
-                                error!(entry_id = %entry_id, error = %e, "failed to reject merge entry for closed issue");
+                    if issue_closed {
+                        // Issue is closed — don't re-dispatch. Mark task as completed.
+                        info!(
+                            task_id = %task_id,
+                            entry_id = %entry_id,
+                            "underlying issue is closed, marking task completed instead of re-dispatching"
+                        );
+                        if let Err(e) = orch_server
+                            .reject_merge_entry_closed(
+                                &entry_id,
+                                &format!("{} (issue already closed)", &evaluation.reasoning),
+                                TaskState::Completed,
+                            )
+                            .await
+                        {
+                            error!(entry_id = %entry_id, error = %e, "failed to reject merge entry for closed issue");
+                        }
+                    } else {
+                        // Issue is still open — normal rejection with re-dispatch.
+                        if let Err(e) = orch_server
+                            .reject_merge_entry(
+                                &entry_id,
+                                &evaluation.reasoning,
+                                evaluation.feedback.as_deref(),
+                            )
+                            .await
+                        {
+                            error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
+                        }
+
+                        // Delete the remote branch so the agent starts fresh (issue #143).
+                        // Without this, the agent would find the old branch and resubmit
+                        // the same work instead of starting over.
+                        let branch = format!("tasks/{}", task_id);
+                        let repo_parts: Vec<&str> = context.project.repo.split('/').collect();
+                        if repo_parts.len() == 2 {
+                            match merge_github.delete_branch(repo_parts[0], repo_parts[1], &branch).await {
+                                Ok(true) => {
+                                    info!(
+                                        task_id = %task_id,
+                                        branch = %branch,
+                                        "deleted remote branch for re-dispatch"
+                                    );
+                                }
+                                Ok(false) => {
+                                    // Branch didn't exist — that's fine
+                                    debug!(
+                                        task_id = %task_id,
+                                        branch = %branch,
+                                        "branch did not exist on remote"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Log but don't fail — the task can still be re-dispatched.
+                                    // The agent may find old work, but that's better than
+                                    // blocking the entire rejection flow.
+                                    warn!(
+                                        task_id = %task_id,
+                                        branch = %branch,
+                                        error = %e,
+                                        "failed to delete remote branch for re-dispatch"
+                                    );
+                                }
                             }
                         } else {
-                            // Issue is still open — normal rejection with re-dispatch.
-                            if let Err(e) = orch_server
-                                .reject_merge_entry(
-                                    &entry_id,
-                                    &evaluation.reasoning,
-                                    evaluation.feedback.as_deref(),
-                                )
-                                .await
-                            {
-                                error!(entry_id = %entry_id, error = %e, "failed to reject merge entry");
-                            }
-
-                            // Delete the remote branch so the agent starts fresh (issue #143).
-                            // Without this, the agent would find the old branch and resubmit
-                            // the same work instead of starting over.
-                            let branch = format!("tasks/{}", task_id);
-                            let repo_parts: Vec<&str> = context.project.repo.split('/').collect();
-                            if repo_parts.len() == 2 {
-                                match merge_github.delete_branch(repo_parts[0], repo_parts[1], &branch).await {
-                                    Ok(true) => {
-                                        info!(
-                                            task_id = %task_id,
-                                            branch = %branch,
-                                            "deleted remote branch for re-dispatch"
-                                        );
-                                    }
-                                    Ok(false) => {
-                                        // Branch didn't exist — that's fine
-                                        debug!(
-                                            task_id = %task_id,
-                                            branch = %branch,
-                                            "branch did not exist on remote"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // Log but don't fail — the task can still be re-dispatched.
-                                        // The agent may find old work, but that's better than
-                                        // blocking the entire rejection flow.
-                                        warn!(
-                                            task_id = %task_id,
-                                            branch = %branch,
-                                            error = %e,
-                                            "failed to delete remote branch for re-dispatch"
-                                        );
-                                    }
-                                }
-                            } else {
-                                warn!(
-                                    task_id = %task_id,
-                                    repo = %context.project.repo,
-                                    "invalid repo format, cannot delete branch"
-                                );
-                            }
-
-                            // Emit orchestrator:feedback event when feedback is provided
-                            if let Some(feedback) = &evaluation.feedback {
-                                if let Err(e) = orch_server.emit_orchestrator_feedback(
-                                    &task_id,
-                                    feedback,
-                                    Some("merge_rejection"),
-                                ).await {
-                                    error!(error = %e, "failed to emit orchestrator feedback event");
-                                }
-                            }
-                            // TODO: The feedback event is now recorded in the audit trail.
-                            // Delivering feedback to the re-dispatched session's prompt
-                            // context still needs dispatch loop changes.
+                            warn!(
+                                task_id = %task_id,
+                                repo = %context.project.repo,
+                                "invalid repo format, cannot delete branch"
+                            );
                         }
+
+                        // Emit orchestrator:feedback event when feedback is provided
+                        if let Some(feedback) = &evaluation.feedback {
+                            if let Err(e) = orch_server.emit_orchestrator_feedback(
+                                &task_id,
+                                feedback,
+                                Some("merge_rejection"),
+                            ).await {
+                                error!(error = %e, "failed to emit orchestrator feedback event");
+                            }
+                        }
+                        // TODO: The feedback event is now recorded in the audit trail.
+                        // Delivering feedback to the re-dispatched session's prompt
+                        // context still needs dispatch loop changes.
                     }
                 }
-
-                // In Pause mode: evaluation is recorded (decision event above)
-                // but no merge/reject action is taken. The human reviews.
             } // end single-entry evaluation block
 
             // Cleanup terminal merge queue entries (issue #132, #282).
