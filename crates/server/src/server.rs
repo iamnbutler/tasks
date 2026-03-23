@@ -307,7 +307,13 @@ impl Server {
             return Ok(());
         }
 
-        self.apply_task_state(task_id, new_state).await?;
+        let applied = self.apply_task_state(task_id, new_state).await?;
+        if !applied {
+            // The authoritative guard inside apply_task_state (under the
+            // write lock) determined the task is already terminal — skip
+            // the event to avoid duplicates.
+            return Ok(());
+        }
 
         let event_type = match new_state {
             TaskState::Waiting => EventType::TaskStateWaiting,
@@ -333,16 +339,35 @@ impl Server {
     /// state-change event was already published by the session monitor.
     /// All other callers should use [`set_task_state`], which publishes
     /// the corresponding event.
+    ///
+    /// Returns `true` if the state was applied, `false` if the task was
+    /// already in a terminal state.  This is the authoritative guard
+    /// against TOCTOU races — it checks under the write lock so two
+    /// concurrent callers cannot both pass the terminal-state check.
     pub async fn apply_task_state(
         &self,
         task_id: &str,
         new_state: TaskState,
-    ) -> Result<(), ServerError> {
+    ) -> Result<bool, ServerError> {
         let mut state = self.state.write().await;
         let task = state
             .tasks
             .get_mut(task_id)
             .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+        // Authoritative terminal-state guard under the write lock.
+        // The read-lock pre-check in set_task_state is just a fast path;
+        // this is the real guard that prevents duplicate transitions.
+        if task.state.is_terminal() {
+            tracing::debug!(
+                task_id = %task_id,
+                current_state = ?task.state,
+                requested_state = ?new_state,
+                "apply_task_state: task already terminal, skipping"
+            );
+            return Ok(false);
+        }
+
         task.set_state(new_state);
 
         // Write-through to store
@@ -353,7 +378,7 @@ impl Server {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     // --- Merge queue (spec §7) ---
@@ -2283,5 +2308,46 @@ mod tests {
             .find_task_by_branch("tasks/gh-owner-repo-issue-123--abcd1234")
             .await;
         assert_eq!(result, None);
+    }
+
+    // --- Terminal state guard tests ---
+
+    #[tokio::test]
+    async fn set_task_state_emits_only_one_event_when_called_twice_with_terminal() {
+        let server = test_server().await;
+        let mut rx = server.event_bus.subscribe();
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Drain the TaskCreated event
+        let _ = rx.recv().await.unwrap();
+
+        // First call: should apply and emit TaskStateCompleted
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, EventType::TaskStateCompleted);
+
+        // Second call: task is already terminal, should be a no-op
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+
+        // No more events should have been emitted — try_recv should fail
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no second TaskStateCompleted event"
+        );
+
+        // Task should still be Completed
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.state, TaskState::Completed);
     }
 }

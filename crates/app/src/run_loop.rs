@@ -811,7 +811,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
             // Check operating mode — no dispatch in Stop mode (spec §6.1)
             let mode = dispatch_server.mode().await;
-            if mode == server::Mode::Stop {
+            if !mode.allows_dispatch() {
                 continue;
             }
 
