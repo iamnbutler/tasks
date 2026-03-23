@@ -33,6 +33,7 @@ pub fn task_state_display_name(state: &TaskState) -> &'static str {
         TaskState::Testing => "Testing",
         TaskState::AwaitingMerge => "Changes Submitted",
         TaskState::Conflict => "Conflict",
+        TaskState::ChangesRequested => "Changes Requested",
         TaskState::Completed => "Completed",
         TaskState::Failed => "Failed",
         TaskState::Cancelled => "Cancelled",
@@ -68,6 +69,7 @@ pub fn merge_status_display_name(status: &MergeStatus) -> &'static str {
         MergeStatus::Rejected => "Rejected",
         MergeStatus::Merged => "Merged",
         MergeStatus::Conflict => "Conflict",
+        MergeStatus::ChangesRequested => "Changes Requested",
     }
 }
 

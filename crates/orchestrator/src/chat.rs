@@ -30,6 +30,7 @@ fn task_state_str(state: &TaskState) -> &'static str {
         TaskState::Testing => "testing",
         TaskState::AwaitingMerge => "awaiting_merge",
         TaskState::Conflict => "conflict",
+        TaskState::ChangesRequested => "changes_requested",
         TaskState::Completed => "completed",
         TaskState::Failed => "failed",
         TaskState::Cancelled => "cancelled",

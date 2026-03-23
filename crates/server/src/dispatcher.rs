@@ -96,16 +96,21 @@ pub fn evaluate(
         }
     }
 
-    // 3. Collect new work candidates: Waiting tasks with backoff elapsed
-    //    and no active PR in merge queue.
+    // 3. Collect new work candidates: Waiting or ChangesRequested tasks with
+    //    backoff elapsed and (for Waiting only) no active PR in merge queue.
+    //    ChangesRequested tasks supersede Waiting tasks per spec §7.1.
     let mut candidates: Vec<&Task> = tasks
         .values()
         .filter(|t| {
-            if t.state != TaskState::Waiting {
+            // Accept Waiting or ChangesRequested tasks
+            let is_waiting = t.state == TaskState::Waiting;
+            let is_changes_requested = t.state == TaskState::ChangesRequested;
+            if !is_waiting && !is_changes_requested {
                 return false;
             }
-            // Skip tasks that already have an unclosed PR in the merge queue
-            if tasks_with_active_prs.contains(&t.id) {
+            // Skip Waiting tasks that already have an unclosed PR in the merge queue
+            // (ChangesRequested tasks DO have a PR, so skip this check for them)
+            if is_waiting && tasks_with_active_prs.contains(&t.id) {
                 return false;
             }
             // Check backoff
@@ -128,6 +133,15 @@ pub fn evaluate(
 
     // 5. Sort candidates by priority rules (spec §13.3).
     candidates.sort_by(|a, b| {
+        // ChangesRequested tasks supersede Waiting tasks (spec §7.1).
+        // This ensures work that needs minor fixes gets addressed before new work.
+        let cr_a = a.state == TaskState::ChangesRequested;
+        let cr_b = b.state == TaskState::ChangesRequested;
+        let cr_cmp = cr_b.cmp(&cr_a); // true before false
+        if cr_cmp != std::cmp::Ordering::Equal {
+            return cr_cmp;
+        }
+
         // Explicit priority: lower number first, None sorts last.
         let pri_a = a.priority.unwrap_or(i32::MAX);
         let pri_b = b.priority.unwrap_or(i32::MAX);
@@ -568,5 +582,68 @@ mod tests {
 
         let plan = evaluate(&tasks, &[], &active_prs, &HashMap::new(), 10);
         assert!(plan.new_work.is_empty());
+    }
+
+    #[test]
+    fn changes_requested_tasks_supersede_waiting() {
+        let mut tasks = HashMap::new();
+
+        // t1 is Waiting with high priority
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::Waiting;
+        t1.priority = Some(1); // highest priority
+        insert(&mut tasks, t1);
+
+        // t2 is ChangesRequested with low priority
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::ChangesRequested;
+        t2.priority = Some(100); // low priority
+        insert(&mut tasks, t2);
+
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
+        // ChangesRequested should come first regardless of priority
+        assert_eq!(plan.new_work.len(), 2);
+        assert_eq!(plan.new_work[0], "t2"); // ChangesRequested first
+        assert_eq!(plan.new_work[1], "t1"); // Waiting second
+    }
+
+    #[test]
+    fn changes_requested_tasks_sorted_by_priority() {
+        let mut tasks = HashMap::new();
+
+        // Both are ChangesRequested, different priorities
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::ChangesRequested;
+        t1.priority = Some(10);
+        insert(&mut tasks, t1);
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::ChangesRequested;
+        t2.priority = Some(1);
+        insert(&mut tasks, t2);
+
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
+        // Both ChangesRequested, so sort by priority
+        assert_eq!(plan.new_work.len(), 2);
+        assert_eq!(plan.new_work[0], "t2"); // priority 1
+        assert_eq!(plan.new_work[1], "t1"); // priority 10
+    }
+
+    #[test]
+    fn changes_requested_counts_as_slot() {
+        let mut tasks = HashMap::new();
+
+        // t1 is ChangesRequested (should dispatch and consume a slot)
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::ChangesRequested;
+        insert(&mut tasks, t1);
+
+        // t2 is Waiting
+        insert(&mut tasks, make_task("t2", "proj"));
+
+        // global_max=1: only one task should dispatch
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 1);
+        assert_eq!(plan.new_work.len(), 1);
+        assert_eq!(plan.new_work[0], "t1"); // ChangesRequested gets priority
     }
 }

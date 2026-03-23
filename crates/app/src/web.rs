@@ -54,6 +54,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/merge-queue/flush", post(flush_merge_queue))
         .route("/merge-queue/{id}/approve", post(approve_merge))
         .route("/merge-queue/{id}/reject", post(reject_merge))
+        .route("/merge-queue/{id}/request-changes", post(request_changes))
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
         .route("/orchestrator/chat", post(orchestrator_chat))
@@ -136,6 +137,14 @@ struct ChatRequest {
 #[derive(Deserialize)]
 struct OrchestratorChatRequest {
     message: String,
+}
+
+#[derive(Deserialize)]
+struct RequestChangesRequest {
+    /// Reason for requesting changes.
+    reasoning: String,
+    /// Specific, actionable feedback for the agent.
+    feedback: String,
 }
 
 #[derive(Deserialize)]
@@ -516,6 +525,22 @@ async fn reject_merge(
         .merge_queue
         .reject(&id)
         .map_err(|e| ApiError::MergeQueue(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /api/merge-queue/:id/request-changes — Request changes on a merge queue entry.
+///
+/// Unlike rejection, the entry stays in the queue and the task gets priority dispatch.
+async fn request_changes(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RequestChangesRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .server
+        .request_changes_merge_entry(&id, &req.reasoning, &req.feedback)
+        .await
+        .map_err(ApiError::Server)?;
     Ok(StatusCode::OK)
 }
 

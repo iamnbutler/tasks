@@ -133,6 +133,44 @@ impl MergeQueue {
         Ok(())
     }
 
+    /// Request changes on an entry (spec Section 7.1).
+    ///
+    /// Unlike reject, the entry stays in the queue and the task gets
+    /// priority dispatch to address the feedback.
+    pub fn request_changes(
+        &mut self,
+        id: &str,
+        feedback: impl Into<String>,
+    ) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        entry.status = MergeStatus::ChangesRequested;
+        entry.changes_requested_feedback = Some(feedback.into());
+        Ok(())
+    }
+
+    /// Get all entries with changes requested.
+    pub fn changes_requested(&self) -> Vec<&MergeQueueEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == MergeStatus::ChangesRequested)
+            .collect()
+    }
+
+    /// Clear changes requested status from an entry (after agent addresses feedback).
+    /// Returns the entry to Pending status for re-evaluation.
+    pub fn clear_changes_requested(&mut self, id: &str) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        if entry.status == MergeStatus::ChangesRequested {
+            entry.status = MergeStatus::Pending;
+            entry.changes_requested_feedback = None;
+        }
+        Ok(())
+    }
+
     /// Get all entries with conflicts.
     pub fn conflicting(&self) -> Vec<&MergeQueueEntry> {
         self.entries

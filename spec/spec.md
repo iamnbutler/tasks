@@ -258,6 +258,7 @@ Fields:
 - `testing` — agent done, CI/deterministic testing running
 - `awaiting_merge` — implementation complete, in merge queue
 - `conflict` — merge conflict needs resolution
+- `changes_requested` — PR needs work before re-evaluation; gets priority dispatch
 - `completed` — task finished successfully
 - `failed` — task failed
 - `cancelled` — task was cancelled
@@ -303,8 +304,9 @@ Fields:
 - `id` (string) — queue entry ID
 - `task_id` (string) — the originating task, if any
 - `pr_url` (string) — pull request URL
-- `status` (string) — pending, approved, rejected, merged, conflict
+- `status` (string) — pending, approved, rejected, merged, conflict, changes_requested
 - `queued_at` (timestamp)
+- `changes_requested_feedback` (string or null) — feedback when status is changes_requested
 
 ### 5.6 Project
 
@@ -376,9 +378,12 @@ added to the queue.
    `TASKS_ORCHESTRATOR_EVAL_INTERVAL`). Once evaluated, a PR is not re-evaluated until
    it receives new commits.
 5. The merge authority (human or orchestrator, depending on mode) reviews and either
-   approves or rejects.
+   approves, requests changes, or rejects.
 6. Approved entries are merged (in Play mode, continuously; in Pause mode, via Flush).
-7. If rejected, the entry is removed from the queue. If the PR originated from a task,
+7. If changes are requested, the entry transitions to `changes_requested` status with
+   feedback. The associated task transitions to `changes_requested` state and gets
+   priority dispatch to address the feedback. The PR and entry remain in the queue.
+8. If rejected, the entry is removed from the queue. If the PR originated from a task,
    that task may be re-engaged with feedback.
 
 Human chat messages to the orchestrator bypass the evaluation queue and are processed
@@ -425,7 +430,31 @@ If the work isn't ready, the orchestrator rejects the entry with specific, actio
 referencing the actual code. If the PR originated from a task, that task may be re-engaged with
 the feedback rather than queuing a bad merge.
 
-### 7.4 Conflicts
+### 7.4 Changes Requested
+
+When work needs minor fixes rather than outright rejection, the orchestrator or human can
+request changes instead of rejecting:
+
+- The entry transitions to `changes_requested` status with specific, actionable feedback.
+- The associated task transitions to `changes_requested` state.
+- `changes_requested` tasks get priority dispatch over regular `waiting` tasks. This ensures
+  work that's close to completion gets addressed quickly rather than sitting in a queue
+  behind new work.
+- When the agent addresses the feedback and pushes new commits, the entry returns to
+  `pending` status for re-evaluation.
+
+This preserves the PR and work-in-progress rather than throwing it away, allowing the agent
+to make targeted fixes. It's appropriate when:
+
+- The implementation is mostly correct but has minor issues
+- The code needs a rebase onto the latest base branch
+- Small edge cases or error handling need to be addressed
+- Documentation or tests need minor additions
+
+For major rework or fundamentally incorrect approaches, rejection with a new task is more
+appropriate.
+
+### 7.5 Conflicts
 
 When a pending merge has conflicts:
 

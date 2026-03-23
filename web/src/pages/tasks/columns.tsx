@@ -9,6 +9,7 @@ import {
   MinusCircle,
   XCircle,
   AlertTriangle,
+  MessageSquareWarning,
 } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import type { TaskState } from "@/lib/types";
@@ -28,16 +29,17 @@ export interface TaskStateMeta {
 
 // State priority for sorting (lower number = higher priority / shown first)
 export const stateSortOrder: Record<TaskState, number> = {
-  running: 0,
-  question: 1,
-  conflict: 2,
-  testing: 3,
-  waiting: 4,
-  blocked: 5,
-  awaiting_merge: 6,
-  completed: 7,
-  failed: 8,
-  cancelled: 9,
+  changes_requested: 0, // Changes requested tasks get top priority
+  running: 1,
+  question: 2,
+  conflict: 3,
+  testing: 4,
+  waiting: 5,
+  blocked: 6,
+  awaiting_merge: 7,
+  completed: 8,
+  failed: 9,
+  cancelled: 10,
 };
 
 export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
@@ -82,6 +84,12 @@ export const taskStateMeta: Record<TaskState, TaskStateMeta> = {
     icon: AlertTriangle,
     className: "text-red-500 border-red-500/30 bg-red-500/10",
     color: "text-red-500",
+  },
+  changes_requested: {
+    label: "Changes Requested",
+    icon: MessageSquareWarning,
+    className: "text-amber-500 border-amber-500/30 bg-amber-500/10",
+    color: "text-amber-500",
   },
   completed: {
     label: "Completed",

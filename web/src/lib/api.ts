@@ -66,6 +66,18 @@ export function rejectMerge(id: string): Promise<void> {
   return requestVoid(`/api/merge-queue/${id}/reject`, { method: "POST" });
 }
 
+export function requestChanges(
+  id: string,
+  reasoning: string,
+  feedback: string
+): Promise<void> {
+  return requestVoid(`/api/merge-queue/${id}/request-changes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reasoning, feedback }),
+  });
+}
+
 export function flushMergeQueue(): Promise<string[]> {
   return request<string[]>("/api/merge-queue/flush", { method: "POST" });
 }
