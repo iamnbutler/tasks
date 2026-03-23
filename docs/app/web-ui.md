@@ -38,9 +38,9 @@ The dashboard provides an at-a-glance view of:
 
 Click the mode indicator to switch between:
 
-- **Play** - Full autonomy
-- **Pause** - Agents work, merges paused
-- **Stop** - All activity halted
+- **Play** - Full autonomy; orchestrator owns merge authority
+- **Pause** - Agents work; orchestrator evaluates, rejects, and handles conflicts normally, but approved merges are held for human flush
+- **Stop** - No new work dispatched, all sessions terminated
 
 ## Tasks View
 
@@ -65,6 +65,10 @@ Use the filter controls to narrow down tasks:
 - **State** - Filter by task state
 - **Project** - Filter by project
 - **Search** - Text search in title/description
+
+### Queue
+
+The **Queue** tab shows tasks in dispatch order — tasks with state `waiting` or `changes_requested`. Tasks can be dragged to reorder. The order is persisted as sequential priorities (1, 2, 3, …) which the dispatcher uses for scheduling.
 
 ### Task Detail
 
@@ -108,7 +112,7 @@ The Orchestrator view shows a conversational feed of the AI project foreman's ac
 
 ### Feed
 
-Events appear as context-rich messages including:
+The feed loads historical orchestrator events on page mount and merges them with the live SSE stream (deduped by ID). Events appear as context-rich messages including:
 
 - **Decisions** - e.g., "Approving 'Fix login bug' (#42) in owner/repo"
 - **Feedback** - Orchestrator comments on work quality

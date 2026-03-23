@@ -94,6 +94,36 @@ GET /api/tasks
 GET /api/tasks/:id
 ```
 
+#### Update Task Priority
+
+Update a task's priority for manual queue reordering. Lower numbers are higher priority.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** The updated task object.
+
+#### Reorder Tasks
+
+Bulk reorder tasks by assigning sequential priorities. Used for drag-and-drop reordering in the Queue view.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["uuid-1", "uuid-2", "uuid-3"]
+}
+```
+
+Tasks are assigned priorities `1, 2, 3, ...` in the given order.
+
 #### Get Task Events
 
 Returns the event history for a task.
@@ -361,7 +391,26 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Events
+
+#### Query Historical Events
+
+Query events across all task logs by event type prefix. Useful for loading historical data on page mount.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=200
+```
+
+**Query Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `type_prefix` | Event type prefix to filter by (required, e.g. `orchestrator:`) | — |
+| `limit` | Maximum number of events to return | 200 |
+
+**Response:** Array of events sorted by timestamp ascending.
+
+#### SSE Live Stream
 
 Server-Sent Events stream for real-time updates.
 
