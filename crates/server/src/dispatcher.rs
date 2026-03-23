@@ -158,16 +158,16 @@ pub fn evaluate(
             return unblock_cmp;
         }
 
-        // Source number: lower issue/PR numbers first (ascending).
-        // GitHub issues are numbered sequentially, so lower numbers are older.
-        // This ensures related tasks (e.g., "Phase 1", "Phase 2", "Phase 3")
-        // are processed in logical order. Tasks without a source number
-        // (internal tasks) sort after those with numbers.
-        let num_a = a.source_number.unwrap_or(u64::MAX);
-        let num_b = b.source_number.unwrap_or(u64::MAX);
-        let num_cmp = num_a.cmp(&num_b);
-        if num_cmp != std::cmp::Ordering::Equal {
-            return num_cmp;
+        // Source number: lower issue/PR numbers first (ascending), but only
+        // compared within the same project. Issue numbers are per-repo, so
+        // comparing across projects has no semantic meaning.
+        if a.project == b.project {
+            let num_a = a.source_number.unwrap_or(u64::MAX);
+            let num_b = b.source_number.unwrap_or(u64::MAX);
+            let num_cmp = num_a.cmp(&num_b);
+            if num_cmp != std::cmp::Ordering::Equal {
+                return num_cmp;
+            }
         }
 
         // Fallback: older creation date first (ascending).

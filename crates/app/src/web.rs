@@ -577,6 +577,10 @@ async fn set_mode(
 /// Clears tasks and merge queue from both memory and database,
 /// then signals the poll loop to re-fetch all data from GitHub.
 /// Preserves: accounting data, event logs, projects table, operating mode.
+///
+/// Note: The response contains counts of items *cleared*. The actual re-fetch
+/// happens asynchronously in the poll loop — new data will appear as the
+/// pollers discover items from GitHub.
 async fn rebuild_from_github(
     State(state): State<ApiState>,
 ) -> Result<Json<server::RebuildStats>, ApiError> {

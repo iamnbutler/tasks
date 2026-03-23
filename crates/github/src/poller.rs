@@ -61,12 +61,6 @@ impl RepoPoller {
         self.since
     }
 
-    /// Reset the high-water mark to None (for rebuild command, issue #256).
-    /// Next poll will fetch all open items from scratch.
-    pub fn reset(&mut self) {
-        self.since = None;
-    }
-
     /// Poll for both issues and PRs updated since the last poll.
     ///
     /// On first call, fetches all open items. On subsequent calls, only items

@@ -181,18 +181,26 @@ function TaskRow({
         </Badge>
       ))}
 
-      {/* PR link */}
-      {prUrl && (
-        <a
-          href={prUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs font-mono shrink-0"
+      {/* PR link — use span + onPointerUp to avoid invalid nested <a> inside <button> */}
+      {prUrl && prNumber(prUrl) && (
+        <span
+          role="link"
+          tabIndex={0}
+          onPointerUp={(e) => {
+            e.stopPropagation();
+            window.open(prUrl, "_blank", "noopener,noreferrer");
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.stopPropagation();
+              window.open(prUrl, "_blank", "noopener,noreferrer");
+            }
+          }}
+          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs font-mono shrink-0 cursor-pointer"
         >
           #{prNumber(prUrl)}
           <ExternalLink className="h-3 w-3" />
-        </a>
+        </span>
       )}
 
       {/* Project */}

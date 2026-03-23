@@ -156,9 +156,19 @@ async fn cmd_rebuild() -> Result<(), String> {
                         );
                         let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
 
-                        // Try to find linked task by branch name
-                        let task_id = find_task_by_branch_in_store(&store, &pr.head_ref)
-                            .unwrap_or_default();
+                        // Try to find linked task by branch name.
+                        // Skip PRs with no linked task — a merge queue entry with
+                        // an empty task_id is unusable.
+                        let task_id = match find_task_by_branch_in_store(&store, &pr.head_ref) {
+                            Some(id) => id,
+                            None => {
+                                eprintln!(
+                                    "  Skipping PR #{}: no linked task found for branch {}",
+                                    pr.number, pr.head_ref
+                                );
+                                continue;
+                            }
+                        };
 
                         let entry = server::model::merge_queue::MergeQueueEntry::new(
                             entry_id,
