@@ -11,27 +11,49 @@ import {
 import { useAppState } from "@/hooks/use-app-state";
 import { sendOrchestratorChat, subscribeEvents } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { Event, Task, Project } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
-// Task label helper: resolve task ID → "#123 (repo-name)"
+// Task helpers: resolve task ID → title, number, repo info
 // ---------------------------------------------------------------------------
 
-function taskLabel(taskId: string | undefined, tasks: Task[], projects: Project[]): string | null {
+interface TaskInfo {
+  taskId: string;
+  number: string;       // "#123" or truncated ID
+  title: string;        // Full title from task
+  repoName: string;     // Just repo name (e.g., "tasks")
+  fullRepo: string;     // Full owner/repo (e.g., "owner/tasks")
+  prUrl?: string;       // PR URL if available
+}
+
+function getTaskInfo(taskId: string | undefined, tasks: Task[], projects: Project[]): TaskInfo | null {
   if (!taskId) return null;
   const task = tasks.find((t) => t.id === taskId);
-  if (!task) return taskId.slice(0, 8);
+  if (!task) {
+    return {
+      taskId,
+      number: taskId.slice(0, 8),
+      title: "Unknown task",
+      repoName: "unknown",
+      fullRepo: "unknown",
+    };
+  }
   const { source } = task;
-  const issueNum =
+  const number =
     (source.type === "github_issue" || source.type === "github_pr")
       ? `#${source.number}`
       : taskId.slice(0, 8);
-  const proj = projectLabel(task.project, projects);
-  const repoName = proj.includes("/") ? proj.split("/")[1] : proj;
-  return `${issueNum} (${repoName})`;
+  const fullRepo = projectLabel(task.project, projects);
+  const repoName = fullRepo.includes("/") ? fullRepo.split("/")[1]! : fullRepo;
+  return {
+    taskId,
+    number,
+    title: task.title,
+    repoName,
+    fullRepo,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +71,8 @@ interface OrchestratorBlock {
   entryId?: string;
   content?: string;
   actor?: string;
+  /** Resolved task info for richer display */
+  taskInfo?: TaskInfo;
   /** Escalation-specific fields */
   escalationAction?: "conflict_needs_human" | "mode_lowered" | string;
   prUrl?: string;
@@ -56,26 +80,34 @@ interface OrchestratorBlock {
   toMode?: string;
 }
 
-function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
+function parseOrchestratorEvents(
+  events: Event[],
+  tasks: Task[],
+  projects: Project[]
+): OrchestratorBlock[] {
   const blocks: OrchestratorBlock[] = [];
   for (const event of events) {
     if (event.type === "orchestrator:decision") {
+      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
       blocks.push({
         kind: "decision",
         id: event.id,
         timestamp: event.ts,
         approved: event.data?.approved === true,
         reasoning: typeof event.data?.reasoning === "string" ? event.data.reasoning : undefined,
-        taskId: typeof event.data?.task_id === "string" ? event.data.task_id : event.task,
+        taskId,
+        taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
         entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
       });
     } else if (event.type === "orchestrator:feedback") {
+      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
       blocks.push({
         kind: "feedback",
         id: event.id,
         timestamp: event.ts,
         feedback: typeof event.data?.feedback === "string" ? event.data.feedback : undefined,
-        taskId: typeof event.data?.task_id === "string" ? event.data.task_id : event.task,
+        taskId,
+        taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
         content: typeof event.data?.context === "string" ? event.data.context : undefined,
       });
     } else if (event.type === "orchestrator:escalation") {
@@ -85,13 +117,15 @@ function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
         typeof event.data?.reasoning === "string" ? event.data.reasoning :
         typeof event.data?.reason === "string" ? event.data.reason :
         undefined;
+      const taskId = event.task;
 
       blocks.push({
         kind: "escalation",
         id: event.id,
         timestamp: event.ts,
         content: reasoning,
-        taskId: event.task,
+        taskId,
+        taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
         entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
         escalationAction: action,
         prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
@@ -125,45 +159,57 @@ function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
 // Block components
 // ---------------------------------------------------------------------------
 
-function DecisionBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+function DecisionBlock({ block }: { block: OrchestratorBlock }) {
   const [collapsed, setCollapsed] = useState(false);
-  const label = taskLabel(block.taskId, tasks, projects);
+  const info = block.taskInfo;
+
+  // Build a conversational header message
+  let headerText: string;
+  if (block.approved) {
+    if (info) {
+      headerText = `Approving "${info.title}" (${info.number}) in ${info.repoName} to merge.`;
+    } else {
+      headerText = "Approving merge request.";
+    }
+  } else {
+    if (info) {
+      headerText = `Rejecting "${info.title}" (${info.number}) in ${info.repoName}.`;
+    } else {
+      headerText = "Rejecting merge request.";
+    }
+  }
+
   return (
-    <div
-      className={cn(
-        "rounded-md border p-3",
-        block.approved ? "border-green-500/30 bg-green-500/10" : "border-red-500/30 bg-red-500/10"
-      )}
-    >
-      <div className="flex items-start gap-2">
-        {block.approved ? (
-          <CheckCircle2 className="h-4 w-4 text-green-500 mt-0.5 shrink-0" />
-        ) : (
-          <XCircle className="h-4 w-4 text-red-500 mt-0.5 shrink-0" />
-        )}
+    <div className="rounded-md border border-border/50 bg-card/50 p-4">
+      <div className="flex items-start gap-3">
+        <div className={cn(
+          "rounded-full p-1.5 shrink-0",
+          block.approved ? "bg-green-500/20" : "bg-red-500/20"
+        )}>
+          {block.approved ? (
+            <CheckCircle2 className="h-4 w-4 text-green-500" />
+          ) : (
+            <XCircle className="h-4 w-4 text-red-500" />
+          )}
+        </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className={cn("font-medium text-sm", block.approved ? "text-green-400" : "text-red-400")}>
-              {block.approved ? "Approved" : "Rejected"}
-            </span>
-            {label && (
-              <Badge variant="outline" className="font-mono text-xs">
-                {label}
-              </Badge>
-            )}
+          <div className="flex items-center justify-between gap-2">
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
+          <p className="mt-1 text-sm leading-relaxed">{headerText}</p>
           {block.reasoning && (
             <>
               <button
                 onClick={() => setCollapsed(!collapsed)}
-                className="mt-1 text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
+                className="mt-2 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
               >
                 <ChevronDown className={cn("h-3 w-3 transition-transform", collapsed && "-rotate-90")} />
                 {collapsed ? "Show" : "Hide"} reasoning
               </button>
               {!collapsed && (
-                <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.reasoning}</p>
+                <p className="mt-2 text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                  {block.reasoning}
+                </p>
               )}
             </>
           )}
@@ -173,23 +219,33 @@ function DecisionBlock({ block, tasks, projects }: { block: OrchestratorBlock; t
   );
 }
 
-function FeedbackBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
-  const label = taskLabel(block.taskId, tasks, projects);
+function FeedbackBlock({ block }: { block: OrchestratorBlock }) {
+  const info = block.taskInfo;
+
+  // Build a conversational header
+  let headerText: string;
+  if (info) {
+    const contextLabel = block.content ? ` (${block.content})` : "";
+    headerText = `Sending feedback to "${info.title}" (${info.number})${contextLabel}:`;
+  } else {
+    headerText = "Sending feedback to agent:";
+  }
+
   return (
-    <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3">
-      <div className="flex items-start gap-2">
-        <MessageSquare className="h-4 w-4 text-blue-500 mt-0.5 shrink-0" />
+    <div className="rounded-md border border-border/50 bg-card/50 p-4">
+      <div className="flex items-start gap-3">
+        <div className="rounded-full p-1.5 bg-blue-500/20 shrink-0">
+          <MessageSquare className="h-4 w-4 text-blue-500" />
+        </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-sm text-blue-400">Feedback</span>
-            {label && (
-              <Badge variant="outline" className="font-mono text-xs">{label}</Badge>
-            )}
-            {block.content && <Badge variant="outline" className="text-xs">{block.content}</Badge>}
+          <div className="flex items-center justify-between gap-2">
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
+          <p className="mt-1 text-sm leading-relaxed">{headerText}</p>
           {block.feedback && (
-            <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.feedback}</p>
+            <p className="mt-2 text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
+              {block.feedback}
+            </p>
           )}
         </div>
       </div>
@@ -197,33 +253,54 @@ function FeedbackBlock({ block, tasks, projects }: { block: OrchestratorBlock; t
   );
 }
 
-function EscalationBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+function EscalationBlock({ block }: { block: OrchestratorBlock }) {
   const [collapsed, setCollapsed] = useState(false);
-  const label = taskLabel(block.taskId, tasks, projects);
+  const info = block.taskInfo;
 
-  // Determine escalation type label
-  let escalationLabel = "Escalation";
-  if (block.escalationAction === "conflict_needs_human") {
-    escalationLabel = "Conflict Needs Review";
-  } else if (block.escalationAction === "mode_lowered") {
-    escalationLabel = "Mode Lowered";
+  // Build a conversational message based on escalation type
+  let headerText: string;
+  let actionHint: string | null = null;
+
+  if (block.escalationAction === "mode_lowered") {
+    // Mode was lowered due to errors
+    const modeTransition = block.fromMode && block.toMode
+      ? ` from ${block.fromMode} to ${block.toMode}`
+      : "";
+    headerText = `I've lowered the system mode${modeTransition} due to detected issues.`;
+    if (block.content) {
+      // The content often contains the reason like "3 agent errors in tracking window"
+      actionHint = `Reason: ${block.content}. You can review the recent activity and raise the mode when ready.`;
+    } else {
+      actionHint = "Review recent activity and raise the mode when ready to continue.";
+    }
+  } else if (block.escalationAction === "conflict_needs_human") {
+    // Conflict needs human review
+    if (info) {
+      headerText = `"${info.title}" (${info.number}) in ${info.repoName} has a merge conflict that needs your attention.`;
+    } else {
+      headerText = "A merge conflict needs your attention.";
+    }
+    actionHint = block.prUrl
+      ? "Please review the PR and resolve the conflict manually."
+      : "Please resolve the conflict manually.";
+  } else {
+    // Generic escalation
+    if (info) {
+      headerText = `An issue with "${info.title}" (${info.number}) requires your attention.`;
+    } else {
+      headerText = "An issue requires your attention.";
+    }
   }
 
   return (
-    <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3">
-      <div className="flex items-start gap-2">
-        <AlertTriangle className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
+    <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-4">
+      <div className="flex items-start gap-3">
+        <div className="rounded-full p-1.5 bg-yellow-500/20 shrink-0">
+          <AlertTriangle className="h-4 w-4 text-yellow-500" />
+        </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-sm text-yellow-400">{escalationLabel}</span>
-            {label && (
-              <Badge variant="outline" className="font-mono text-xs">{label}</Badge>
-            )}
-            {block.escalationAction === "mode_lowered" && block.fromMode && block.toMode && (
-              <Badge variant="outline" className="text-xs bg-yellow-500/10">
-                {block.fromMode} → {block.toMode}
-              </Badge>
-            )}
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
             {block.prUrl && (
               <a
                 href={block.prUrl}
@@ -234,19 +311,24 @@ function EscalationBlock({ block, tasks, projects }: { block: OrchestratorBlock;
                 View PR
               </a>
             )}
-            <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
-          {block.content && (
+          <p className="mt-1 text-sm leading-relaxed">{headerText}</p>
+          {actionHint && (
+            <p className="mt-1 text-sm text-muted-foreground leading-relaxed">{actionHint}</p>
+          )}
+          {block.content && block.escalationAction !== "mode_lowered" && (
             <>
               <button
                 onClick={() => setCollapsed(!collapsed)}
-                className="mt-1 text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
+                className="mt-2 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
               >
                 <ChevronDown className={cn("h-3 w-3 transition-transform", collapsed && "-rotate-90")} />
                 {collapsed ? "Show" : "Hide"} details
               </button>
               {!collapsed && (
-                <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.content}</p>
+                <p className="mt-2 text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                  {block.content}
+                </p>
               )}
             </>
           )}
@@ -259,33 +341,35 @@ function EscalationBlock({ block, tasks, projects }: { block: OrchestratorBlock;
 function MessageBlock({ block }: { block: OrchestratorBlock }) {
   const isHuman = block.actor === "human";
   return (
-    <div
-      className={cn(
-        "rounded-md border p-3",
-        isHuman ? "border-purple-500/30 bg-purple-500/10" : "border-orange-500/30 bg-orange-500/10"
-      )}
-    >
-      <div className="flex items-start gap-2">
-        <Brain className={cn("h-4 w-4 mt-0.5 shrink-0", isHuman ? "text-purple-500" : "text-orange-500")} />
+    <div className="rounded-md border border-border/50 bg-card/50 p-4">
+      <div className="flex items-start gap-3">
+        <div className={cn(
+          "rounded-full p-1.5 shrink-0",
+          isHuman ? "bg-purple-500/20" : "bg-orange-500/20"
+        )}>
+          <Brain className={cn("h-4 w-4", isHuman ? "text-purple-500" : "text-orange-500")} />
+        </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className={cn("font-medium text-sm", isHuman ? "text-purple-400" : "text-orange-400")}>
+          <div className="flex items-center gap-2">
+            <span className={cn("text-sm font-medium", isHuman ? "text-purple-400" : "text-orange-400")}>
               {isHuman ? "You" : "Orchestrator"}
             </span>
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
-          {block.content && <p className="mt-1 text-sm whitespace-pre-wrap">{block.content}</p>}
+          {block.content && (
+            <p className="mt-1 text-sm leading-relaxed whitespace-pre-wrap">{block.content}</p>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function BlockView({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+function BlockView({ block }: { block: OrchestratorBlock }) {
   switch (block.kind) {
-    case "decision": return <DecisionBlock block={block} tasks={tasks} projects={projects} />;
-    case "feedback": return <FeedbackBlock block={block} tasks={tasks} projects={projects} />;
-    case "escalation": return <EscalationBlock block={block} tasks={tasks} projects={projects} />;
+    case "decision": return <DecisionBlock block={block} />;
+    case "feedback": return <FeedbackBlock block={block} />;
+    case "escalation": return <EscalationBlock block={block} />;
     case "message": return <MessageBlock block={block} />;
     default: return null;
   }
@@ -327,7 +411,12 @@ export function OrchestratorPage() {
     return () => source.close();
   }, []);
 
-  const blocks = parseOrchestratorEvents(orchestratorEvents);
+  const tasks = snapshot?.tasks ?? [];
+  const projects = snapshot?.projects ?? [];
+  const blocks = useMemo(
+    () => parseOrchestratorEvents(orchestratorEvents, tasks, projects),
+    [orchestratorEvents, tasks, projects]
+  );
   const prevBlocksLength = useRef(blocks.length);
 
   const checkIfAtBottom = useCallback(() => {
@@ -396,7 +485,7 @@ export function OrchestratorPage() {
         <div
           ref={scrollContainerRef}
           onScroll={handleScroll}
-          className="absolute inset-0 overflow-y-auto p-4 space-y-2"
+          className="absolute inset-0 overflow-y-auto p-4 space-y-3"
         >
           {blocks.length === 0 && (
             <div className="flex flex-col items-center justify-center h-full py-8 text-center">
@@ -408,7 +497,7 @@ export function OrchestratorPage() {
             </div>
           )}
           {blocks.map((block) => (
-            <BlockView key={block.id} block={block} tasks={snapshot?.tasks ?? []} projects={snapshot?.projects ?? []} />
+            <BlockView key={block.id} block={block} />
           ))}
           <div ref={bottomRef} />
         </div>
