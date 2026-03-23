@@ -44,11 +44,12 @@ const ISSUE_FIELDS: &str = r#"
             id
         }
     }
-    # NOTE: Do NOT add MARKED_AS_BLOCKED_BY_EVENT or UNMARKED_AS_BLOCKED_BY_EVENT
-    # here — they do not exist in GitHub's GraphQL schema and will break the
-    # entire poller. This has been attempted and reverted twice (#266, #292).
-    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+    # NOTE: The correct event types for blocking relationships are:
+    # BLOCKED_BY_ADDED_EVENT and BLOCKED_BY_REMOVED_EVENT (not MARKED_AS_BLOCKED_BY_EVENT).
+    # Previous attempts used incorrect names that don't exist in GitHub's schema (#266, #292).
+    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, BLOCKED_BY_ADDED_EVENT, BLOCKED_BY_REMOVED_EVENT]) {
         nodes {
+            __typename
             ... on CrossReferencedEvent {
                 source {
                     ... on PullRequest {
@@ -57,6 +58,24 @@ const ISSUE_FIELDS: &str = r#"
                         state
                         id
                     }
+                }
+            }
+            ... on BlockedByAddedEvent {
+                blockingIssue {
+                    repository { owner { login } name }
+                    number
+                    title
+                    state
+                    id
+                }
+            }
+            ... on BlockedByRemovedEvent {
+                blockingIssue {
+                    repository { owner { login } name }
+                    number
+                    title
+                    state
+                    id
                 }
             }
         }
