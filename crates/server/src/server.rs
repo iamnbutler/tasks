@@ -184,13 +184,41 @@ impl Server {
         let mut state = self.state.write().await;
         let removed = state.projects.remove(id).is_some();
         if removed {
+            // Collect task IDs for this project
+            let task_ids: Vec<String> = state
+                .tasks
+                .iter()
+                .filter(|(_, task)| task.project == id)
+                .map(|(task_id, _)| task_id.clone())
+                .collect();
+
+            // Remove tasks from in-memory state
+            for task_id in &task_ids {
+                state.tasks.remove(task_id);
+            }
+
+            // Remove merge queue entries for these tasks from in-memory state
+            if !task_ids.is_empty() {
+                state.merge_queue.remove_by_task_ids(&task_ids);
+            }
+
+            // Cascade delete in persistent store (transactional)
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
+                    if let Err(e) = store.delete_project_data(id, &task_ids) {
+                        tracing::error!(project_id = %id, error = %e, "failed to cascade-delete project data from store");
+                    }
                     if let Err(e) = store.delete_project(id) {
                         tracing::error!(project_id = %id, error = %e, "failed to delete project from store");
                     }
                 }
             }
+
+            tracing::info!(
+                project_id = %id,
+                tasks_removed = task_ids.len(),
+                "project removed with cascading cleanup"
+            );
         }
         removed
     }
@@ -2641,5 +2669,62 @@ mod tests {
         // Task should still be Completed
         let task = server.get_task("t1").await.unwrap();
         assert_eq!(task.state, TaskState::Completed);
+    }
+
+    #[tokio::test]
+    async fn remove_project_cascades_to_tasks_and_merge_queue() {
+        let server = test_server().await;
+
+        // Add two projects
+        let project1 = Project::new("proj-1", "owner/repo1");
+        let project2 = Project::new("proj-2", "owner/repo2");
+        server.add_project(project1).await;
+        server.add_project(project2).await;
+
+        // Add tasks to both projects
+        let task1 = Task::new("task-1", TaskSource::Internal, "Task 1", "proj-1");
+        let task2 = Task::new("task-2", TaskSource::Internal, "Task 2", "proj-1");
+        let task3 = Task::new("task-3", TaskSource::Internal, "Task 3", "proj-2");
+        server.add_task(task1).await.unwrap();
+        server.add_task(task2).await.unwrap();
+        server.add_task(task3).await.unwrap();
+
+        // Add merge queue entries for tasks in proj-1
+        let entry1 = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo1/pull/1",
+        );
+        let entry2 = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-2", "task-2", "https://github.com/owner/repo1/pull/2",
+        );
+        server.add_to_merge_queue(entry1).await.unwrap();
+        server.add_to_merge_queue(entry2).await.unwrap();
+
+        // Verify initial state
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.projects.len(), 2);
+            assert_eq!(state.tasks.len(), 3);
+            assert_eq!(state.merge_queue.entries().len(), 2);
+        }
+
+        // Remove proj-1
+        let removed = server.remove_project("proj-1").await;
+        assert!(removed);
+
+        // Verify cascade deletion
+        let state = server.state.read().await;
+        // Project removed
+        assert_eq!(state.projects.len(), 1);
+        assert!(state.projects.get("proj-2").is_some());
+        assert!(state.projects.get("proj-1").is_none());
+
+        // Tasks for proj-1 removed, task for proj-2 remains
+        assert_eq!(state.tasks.len(), 1);
+        assert!(state.tasks.get("task-3").is_some());
+        assert!(state.tasks.get("task-1").is_none());
+        assert!(state.tasks.get("task-2").is_none());
+
+        // Merge queue entries for proj-1 tasks removed
+        assert_eq!(state.merge_queue.entries().len(), 0);
     }
 }

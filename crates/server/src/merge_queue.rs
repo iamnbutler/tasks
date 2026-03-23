@@ -241,6 +241,20 @@ impl MergeQueue {
             true
         });
     }
+
+    /// Remove entries for the given task IDs. Returns the removed entries.
+    pub fn remove_by_task_ids(&mut self, task_ids: &[String]) -> Vec<MergeQueueEntry> {
+        let mut removed = Vec::new();
+        self.entries.retain(|e| {
+            if task_ids.contains(&e.task_id) {
+                removed.push(e.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
 }
 
 impl Default for MergeQueue {
