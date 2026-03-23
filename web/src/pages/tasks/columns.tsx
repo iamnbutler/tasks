@@ -28,13 +28,13 @@ export interface TaskStateMeta {
 
 // State priority for sorting (lower number = higher priority / shown first)
 export const stateSortOrder: Record<TaskState, number> = {
-  awaiting_merge: 0,
-  running: 1,
-  question: 2,
-  conflict: 3,
-  testing: 4,
-  waiting: 5,
-  blocked: 6,
+  running: 0,
+  question: 1,
+  conflict: 2,
+  testing: 3,
+  waiting: 4,
+  blocked: 5,
+  awaiting_merge: 6,
   completed: 7,
   failed: 8,
   cancelled: 9,
