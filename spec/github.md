@@ -127,7 +127,8 @@ Fetches issues for a repository, with filtering and pagination.
 
 **Parameters:**
 - `owner`, `repo` — repository identifier
-- `states` (optional) — filter by Open, Closed, or both. Default: Open only
+- `states` (optional) — filter by Open, Closed, or both. Default: Open only (but see §5.5 — the
+  `RepoPoller` fetches all states to detect external closures)
 - `labels` (optional) — filter to issues with any of these labels
 - `since` (optional) — only issues updated after this timestamp (for polling)
 - `first` / `after` (optional) — cursor-based pagination
@@ -141,7 +142,8 @@ Fetches PRs for a repository, with filtering and pagination.
 
 **Parameters:**
 - `owner`, `repo` — repository identifier
-- `states` (optional) — filter by Open, Closed, Merged. Default: Open only
+- `states` (optional) — filter by Open, Closed, Merged. Default: Open only (but see §5.5 — the
+  `RepoPoller` fetches all states to detect external closures)
 - `since` (optional) — only PRs updated after this timestamp
 - `first` / `after` (optional) — cursor-based pagination
 
@@ -298,6 +300,25 @@ The poller tracks a single `since` timestamp per repository:
 The poller does not own its own timer. The scheduler calls `poll()` on whatever cadence it chooses
 (spec.md §3.2 says configurable). This keeps the crate free of tokio::time dependencies and
 scheduling opinions.
+
+### 5.5 State Filtering for Closure Detection
+
+Although the raw GraphQL queries (§3.1, §3.2) default to fetching only open items, the `RepoPoller`
+intentionally fetches **all states** (Open and Closed for issues; Open, Closed, and Merged for PRs)
+when polling.
+
+This is necessary to detect external closures (spec.md §12.3). When an issue or PR is closed
+externally (by a human or another automation), its `updated_at` timestamp changes. By including
+closed/merged items in the query with a `since` filter, the poller sees these state changes and can
+report them to the scheduler.
+
+Without this behavior, externally closed items would disappear from poll results entirely — the
+scheduler would never learn that they closed, and the corresponding tasks would remain in stale
+states.
+
+**Implementation note:** The high-water mark (§5.3) ensures that each closed item is only returned
+once — in the first poll after its `updated_at` changes. Subsequent polls will have a `since` value
+newer than the closed item's timestamp, so it won't appear again.
 
 ## 6. Testing
 
