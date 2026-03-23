@@ -1338,16 +1338,90 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
                                                 // Act on the triage decision
                                                 match triage.resolution {
-                                                    ConflictResolution::Rebase | ConflictResolution::AutoResolve => {
-                                                        // Mechanical resolution — would need git operations
-                                                        // For now, re-engage agent with instructions
-                                                        info!(entry_id = %entry_id, "mechanical conflict — re-engaging agent");
-                                                        if let Some(feedback) = triage.agent_feedback {
-                                                            if let Err(e) = orch_server
-                                                                .reengage_for_conflict(&entry_id, &feedback)
-                                                                .await
-                                                            {
-                                                                error!(error = %e, "failed to re-engage for conflict");
+                                                    ConflictResolution::Rebase => {
+                                                        // Mechanical resolution via GitHub update-branch API (spec §7.4)
+                                                        info!(entry_id = %entry_id, "attempting mechanical rebase via update-branch API");
+                                                        match merge_github.update_branch(&owner, &repo, number).await {
+                                                            Ok(true) => {
+                                                                info!(entry_id = %entry_id, pr_url = %pr_url, "branch updated successfully, clearing conflict");
+                                                                // Clear conflict status so entry returns to pending
+                                                                if let Err(e) = orch_server.clear_entry_conflict(&entry_id).await {
+                                                                    error!(entry_id = %entry_id, error = %e, "failed to clear conflict after successful rebase");
+                                                                }
+                                                                // Emit event for audit trail
+                                                                let event = Event::new(
+                                                                    EventType::OrchestratorFeedback,
+                                                                    &task_id,
+                                                                    Actor::Orchestrator,
+                                                                    serde_json::json!({
+                                                                        "action": "mechanical_rebase",
+                                                                        "entry_id": entry_id,
+                                                                        "pr_url": pr_url,
+                                                                        "success": true,
+                                                                    }),
+                                                                );
+                                                                if let Err(e) = orch_server.event_bus.publish(event).await {
+                                                                    error!(error = %e, "failed to emit rebase success event");
+                                                                }
+                                                                // Remove from evaluated set so it gets re-evaluated next cycle
+                                                                evaluated_prs.remove(&pr_url);
+                                                            }
+                                                            Ok(false) => {
+                                                                // Update failed (conflicts can't be auto-resolved) — fall back to agent
+                                                                warn!(entry_id = %entry_id, pr_url = %pr_url, "update-branch failed, falling back to agent re-engagement");
+                                                                let feedback = format!(
+                                                                    "Automatic rebase failed. Please manually rebase your branch on the latest main branch and resolve any conflicts."
+                                                                );
+                                                                if let Err(e) = orch_server.reengage_for_conflict(&entry_id, &feedback).await {
+                                                                    error!(error = %e, "failed to re-engage agent after rebase failure");
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                error!(entry_id = %entry_id, error = %e, "update-branch API error, falling back to agent");
+                                                                let feedback = format!(
+                                                                    "Automatic rebase failed due to an error. Please manually rebase your branch on the latest main branch."
+                                                                );
+                                                                if let Err(e) = orch_server.reengage_for_conflict(&entry_id, &feedback).await {
+                                                                    error!(error = %e, "failed to re-engage agent after rebase error");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    ConflictResolution::AutoResolve => {
+                                                        // Trivial conflicts (lock files, generated code) — try update-branch first
+                                                        // If that fails, the agent needs to resolve them manually
+                                                        info!(entry_id = %entry_id, "attempting auto-resolve via update-branch API");
+                                                        match merge_github.update_branch(&owner, &repo, number).await {
+                                                            Ok(true) => {
+                                                                info!(entry_id = %entry_id, pr_url = %pr_url, "branch updated, trivial conflict resolved");
+                                                                if let Err(e) = orch_server.clear_entry_conflict(&entry_id).await {
+                                                                    error!(entry_id = %entry_id, error = %e, "failed to clear conflict after auto-resolve");
+                                                                }
+                                                                let event = Event::new(
+                                                                    EventType::OrchestratorFeedback,
+                                                                    &task_id,
+                                                                    Actor::Orchestrator,
+                                                                    serde_json::json!({
+                                                                        "action": "auto_resolve",
+                                                                        "entry_id": entry_id,
+                                                                        "pr_url": pr_url,
+                                                                        "success": true,
+                                                                    }),
+                                                                );
+                                                                if let Err(e) = orch_server.event_bus.publish(event).await {
+                                                                    error!(error = %e, "failed to emit auto-resolve success event");
+                                                                }
+                                                                evaluated_prs.remove(&pr_url);
+                                                            }
+                                                            Ok(false) | Err(_) => {
+                                                                // Can't auto-resolve — re-engage agent with specific instructions
+                                                                warn!(entry_id = %entry_id, "auto-resolve failed, re-engaging agent");
+                                                                let feedback = triage.agent_feedback.unwrap_or_else(|| {
+                                                                    "Your branch has conflicts in lock files or generated code. Please regenerate these files after rebasing on the latest main branch.".to_string()
+                                                                });
+                                                                if let Err(e) = orch_server.reengage_for_conflict(&entry_id, &feedback).await {
+                                                                    error!(error = %e, "failed to re-engage for auto-resolve fallback");
+                                                                }
                                                             }
                                                         }
                                                     }
