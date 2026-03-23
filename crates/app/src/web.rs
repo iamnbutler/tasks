@@ -358,7 +358,7 @@ async fn create_issue(
 
     // Create GitHub client and issue
     let github_token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| ApiError::BadRequest("GITHUB_TOKEN not configured".to_string()))?;
+        .map_err(|_| ApiError::GitHub("GITHUB_TOKEN not configured on server".to_string()))?;
 
     let client = tasks_github::GitHubClient::new(&github_token);
 

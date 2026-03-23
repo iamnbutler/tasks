@@ -402,7 +402,9 @@ export function TasksPage() {
       </ScrollArea>
 
       {/* New Task Dialog */}
-      <Dialog open={newTaskOpen} onOpenChange={setNewTaskOpen}>
+      <Dialog open={newTaskOpen} onOpenChange={(open) => {
+          if (!creating) setNewTaskOpen(open);
+        }}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Create new task</DialogTitle>
