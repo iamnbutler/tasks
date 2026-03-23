@@ -186,6 +186,28 @@ impl Server {
         state.projects.get(id).cloned()
     }
 
+    /// Get the last polled timestamp for a project (poller high-water mark).
+    ///
+    /// Used to initialize the poller after server restarts (spec github.md §5.3).
+    pub fn get_last_polled_at(&self, id: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.get_last_polled_at(id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// Set the last polled timestamp for a project (poller high-water mark).
+    ///
+    /// Called after each successful poll to persist the high-water mark.
+    pub fn set_last_polled_at(&self, id: &str, timestamp: chrono::DateTime<chrono::Utc>) -> Result<(), ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.set_last_polled_at(id, timestamp)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
     // --- Mode management (spec Section 6) ---
 
     pub async fn mode(&self) -> Mode {

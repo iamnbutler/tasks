@@ -124,6 +124,45 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Get the last polled timestamp for a project (poller high-water mark).
+    ///
+    /// Returns `None` if the project doesn't exist or hasn't been polled yet.
+    /// Used to initialize the poller after server restarts (spec github.md §5.3).
+    pub fn get_last_polled_at(&self, id: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT last_polled_at FROM projects WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], |row| row.get::<_, Option<String>>(0))?;
+        match rows.next() {
+            Some(row) => {
+                let ts_str: Option<String> = row?;
+                match ts_str {
+                    Some(s) => {
+                        let ts: DateTime<Utc> = s.parse().map_err(|e: chrono::ParseError| {
+                            serde_json::from_str::<()>(&e.to_string()).unwrap_err()
+                        })?;
+                        Ok(Some(ts))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set the last polled timestamp for a project (poller high-water mark).
+    ///
+    /// Called after each successful poll to persist the high-water mark.
+    /// On restart, this value is used to avoid re-fetching all open items.
+    pub fn set_last_polled_at(&self, id: &str, timestamp: DateTime<Utc>) -> Result<(), StoreError> {
+        let ts_str = timestamp.to_rfc3339();
+        self.conn.execute(
+            "UPDATE projects SET last_polled_at = ?1 WHERE id = ?2",
+            params![ts_str, id],
+        )?;
+        Ok(())
+    }
+
     // ── Merge queue ──────────────────────────────────────────────
 
     /// Insert or replace a merge queue entry.
