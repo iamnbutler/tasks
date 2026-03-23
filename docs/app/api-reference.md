@@ -195,6 +195,8 @@ Content-Type: application/json
 
 #### Remove Project
 
+Removes the project and cascades deletion to all associated tasks and merge queue entries in a single transaction.
+
 ```http
 DELETE /api/projects/:id
 ```

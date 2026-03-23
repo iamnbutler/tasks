@@ -66,6 +66,20 @@ Use the filter controls to narrow down tasks:
 - **Project** - Filter by project
 - **Search** - Text search in title/description
 
+### Task List Tabs
+
+The task list is organized into tabs:
+
+| Tab | States shown | Description |
+|-----|-------------|-------------|
+| **Active** | `running`, `testing`, `awaiting_merge`, `conflict` | Tasks currently being worked on |
+| **Backlog** | `waiting`, `blocked` | Tasks queued or waiting on external input |
+| **Completed** | `completed`, `failed`, `cancelled` | Finished tasks |
+| **All** | All states | Unfiltered view |
+| **Queue** | `waiting`, `blocked`, `ready` | Draggable dispatch-priority queue |
+
+The Queue tab allows drag-and-drop reordering to set dispatch priority.
+
 ### Task Detail
 
 Click a task to view its detail page. The detail view is split into tabs:
