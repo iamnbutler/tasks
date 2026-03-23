@@ -389,55 +389,120 @@ async fn list_merge_queue(
 
 /// POST /api/merge-queue/flush — Flush approved entries (Pause mode only).
 ///
-/// Flushes approved entries and executes the actual GitHub merges.
+/// Collects approved entries and executes the actual GitHub merges.
+/// Each entry's status is updated based on the merge result:
+/// - Success: marked as Merged, task transitions to Completed
+/// - Failure: marked as Conflict
 async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<String>>, ApiError> {
-    let flushed_entries = state
+    // Collect approved entries (mode check happens here - Pause mode only)
+    let entries_to_merge = state
         .server
-        .flush_merge_queue()
+        .collect_entries_for_flush()
         .await
         .map_err(ApiError::Server)?;
 
-    // Execute GitHub merges for each flushed entry
+    if entries_to_merge.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let mut merged_ids: Vec<String> = Vec::new();
+
+    // Execute GitHub merges for each entry
     let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-    if !github_token.is_empty() {
-        let client = tasks_github::client::GitHubClient::new(&github_token);
-        for (entry_id, pr_url) in &flushed_entries {
-            if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
-                match client.merge_pull_request(&owner, &repo, number).await {
-                    Ok(true) => {
-                        tracing::info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged via flush");
-                        if let Err(e) = state.server.mark_entry_merged(entry_id, pr_url).await {
-                            tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry merged after flush");
-                        }
+    if github_token.is_empty() {
+        tracing::warn!("GITHUB_TOKEN not set, cannot perform merges");
+        return Ok(Json(Vec::new()));
+    }
+
+    let client = tasks_github::client::GitHubClient::new(&github_token);
+    for (entry_id, pr_url) in &entries_to_merge {
+        if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+            match client.merge_pull_request(&owner, &repo, number).await {
+                Ok(true) => {
+                    tracing::info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged via flush");
+                    if let Err(e) = state.server.mark_entry_merged(entry_id, pr_url).await {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry merged after flush");
+                    } else {
+                        merged_ids.push(entry_id.clone());
                     }
-                    Ok(false) => {
-                        tracing::warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable during flush");
-                        if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url, None).await {
-                            tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict after flush");
-                        }
+                }
+                Ok(false) => {
+                    tracing::warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable during flush");
+                    if let Err(e) = state.server.mark_entry_conflict(entry_id, pr_url, None).await {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict after flush");
                     }
-                    Err(e) => {
-                        tracing::error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR during flush");
-                    }
+                }
+                Err(e) => {
+                    tracing::error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR during flush");
                 }
             }
         }
     }
 
-    let ids: Vec<String> = flushed_entries.into_iter().map(|(id, _)| id).collect();
-    Ok(Json(ids))
+    // Emit flush event with the IDs that were successfully merged
+    if !merged_ids.is_empty() {
+        if let Err(e) = state.server.emit_flush_event(&merged_ids).await {
+            tracing::error!(error = %e, "failed to emit flush event");
+        }
+    }
+
+    Ok(Json(merged_ids))
 }
 
 /// POST /api/merge-queue/:id/approve — Approve a merge queue entry.
+///
+/// In Play mode, this also triggers an immediate merge via the GitHub API.
+/// In Pause mode, the entry is approved but merge happens on flush.
 async fn approve_merge(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let mut server_state = state.server.state.write().await;
-    server_state
-        .merge_queue
-        .approve(&id)
-        .map_err(|e| ApiError::MergeQueue(e.to_string()))?;
+    // Get entry details and current mode before modifying state
+    let (pr_url, mode) = {
+        let server_state = state.server.state.read().await;
+        let entry = server_state
+            .merge_queue
+            .get(&id)
+            .ok_or_else(|| ApiError::MergeQueue(format!("entry not found: {}", id)))?;
+        (entry.pr_url.clone(), server_state.mode)
+    };
+
+    // Approve the entry using the server method (emits merge:approved event)
+    state
+        .server
+        .approve_merge_entry(&id, "Manual approval via API")
+        .await
+        .map_err(ApiError::Server)?;
+
+    // In Play mode, trigger immediate merge (Play mode = continuous merge authority)
+    if mode == Mode::Play {
+        let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+        if !github_token.is_empty() {
+            if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                let client = tasks_github::client::GitHubClient::new(&github_token);
+                match client.merge_pull_request(&owner, &repo, number).await {
+                    Ok(true) => {
+                        tracing::info!(entry_id = %id, pr_url = %pr_url, "PR merged after manual approval (Play mode)");
+                        if let Err(e) = state.server.mark_entry_merged(&id, &pr_url).await {
+                            tracing::error!(entry_id = %id, error = %e, "failed to mark entry merged");
+                        }
+                    }
+                    Ok(false) => {
+                        tracing::warn!(entry_id = %id, pr_url = %pr_url, "PR not mergeable after approval");
+                        if let Err(e) = state.server.mark_entry_conflict(&id, &pr_url, None).await {
+                            tracing::error!(entry_id = %id, error = %e, "failed to mark entry conflict");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(entry_id = %id, pr_url = %pr_url, error = %e, "failed to merge PR after approval");
+                    }
+                }
+            }
+        } else {
+            tracing::warn!("GITHUB_TOKEN not set, cannot perform merge in Play mode");
+        }
+    }
+
     Ok(StatusCode::OK)
 }
 
