@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Clock,
   Activity,
+  MessageSquare,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -37,6 +38,7 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Event, FailureInfo, Task, TaskState } from "@/lib/types";
 import { taskStateMeta } from "./tasks/columns";
 
@@ -876,32 +878,42 @@ export function TaskDetailPage() {
         )}
       </div>
 
-      {/* Content: session + properties sidebar */}
+      {/* Content: tabbed view + properties sidebar */}
       <div className="flex flex-1 min-h-0">
-        {/* Main: session view */}
-        <div className="flex-1 flex flex-col min-h-0 min-w-0">
-          {id && <SessionView taskId={id} chatEnabled={isSessionActive} />}
+        {/* Main: tabbed content */}
+        <Tabs defaultValue="chat" className="flex-1 flex flex-col min-h-0 min-w-0">
+          {/* Tab bar */}
+          <div className="flex items-center border-b border-border px-4 shrink-0">
+            <TabsList variant="line" className="h-10">
+              <TabsTrigger value="chat" className="gap-1.5 px-3">
+                <MessageSquare className="h-3.5 w-3.5" />
+                Chat
+              </TabsTrigger>
+              <TabsTrigger value="details" className="gap-1.5 px-3">
+                <FileText className="h-3.5 w-3.5" />
+                Details
+              </TabsTrigger>
+            </TabsList>
+          </div>
 
-          {/* Description */}
-          {task.description && (
-            <Collapsible defaultOpen={true}>
-              <div className="border-t border-border">
-                <CollapsibleTrigger className="flex items-center gap-2 w-full px-4 py-2.5 text-left hover:bg-muted/30 transition-colors">
-                  <ChevronDown className="h-4 w-4 text-muted-foreground data-[state=closed]:rotate-[-90deg] transition-transform" />
-                  <FileText className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm font-medium">Description</span>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <div className="px-4 pb-4">
-                    <div className="prose prose-sm prose-invert max-w-none">
-                      <Markdown remarkPlugins={[remarkGfm]}>{task.description}</Markdown>
-                    </div>
-                  </div>
-                </CollapsibleContent>
-              </div>
-            </Collapsible>
-          )}
-        </div>
+          {/* Chat tab */}
+          <TabsContent value="chat" className="flex-1 min-h-0 flex flex-col">
+            {id && <SessionView taskId={id} chatEnabled={isSessionActive} />}
+          </TabsContent>
+
+          {/* Details tab */}
+          <TabsContent value="details" className="flex-1 min-h-0 overflow-auto">
+            <div className="p-4">
+              {task.description ? (
+                <div className="prose prose-sm prose-invert max-w-none">
+                  <Markdown remarkPlugins={[remarkGfm]}>{task.description}</Markdown>
+                </div>
+              ) : (
+                <p className="text-muted-foreground text-sm">No description provided.</p>
+              )}
+            </div>
+          </TabsContent>
+        </Tabs>
 
         {/* Properties sidebar */}
         <div className="w-72 shrink-0 border-l border-border bg-muted/20">
