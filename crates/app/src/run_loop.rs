@@ -638,7 +638,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                         "detected external PR merge, transitioning task to Completed"
                                     );
                                     if let Err(e) = poll_server
-                                        .set_task_state(&task_id, TaskState::Completed, Actor::Scheduler)
+                                        .set_task_state_with_data(
+                                            &task_id,
+                                            TaskState::Completed,
+                                            Actor::Scheduler,
+                                            serde_json::json!({ "source": "reconciliation" }),
+                                        )
                                         .await
                                     {
                                         warn!(task_id = %task_id, error = %e, "failed to transition task for merged PR");
@@ -653,7 +658,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             "detected external PR closure, transitioning task to Cancelled"
                                         );
                                         if let Err(e) = poll_server
-                                            .set_task_state(&task_id, TaskState::Cancelled, Actor::Scheduler)
+                                            .set_task_state_with_data(
+                                                &task_id,
+                                                TaskState::Cancelled,
+                                                Actor::Scheduler,
+                                                serde_json::json!({ "source": "reconciliation" }),
+                                            )
                                             .await
                                         {
                                             warn!(task_id = %task_id, error = %e, "failed to transition task for closed PR");

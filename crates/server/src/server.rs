@@ -323,6 +323,23 @@ impl Server {
         new_state: TaskState,
         actor: Actor,
     ) -> Result<(), ServerError> {
+        self.set_task_state_with_data(task_id, new_state, actor, serde_json::json!({}))
+            .await
+    }
+
+    /// Transition a task's state and emit the corresponding event with custom data.
+    ///
+    /// Like [`set_task_state`], but allows passing custom event data for
+    /// downstream consumers. Use this when the state change source needs to
+    /// be distinguished (e.g., `{ "source": "reconciliation" }` for external
+    /// closure detection during polling).
+    pub async fn set_task_state_with_data(
+        &self,
+        task_id: &str,
+        new_state: TaskState,
+        actor: Actor,
+        data: serde_json::Value,
+    ) -> Result<(), ServerError> {
         // Check if task is already terminal to prevent duplicate events
         let current_state = {
             let state = self.state.read().await;
@@ -365,7 +382,7 @@ impl Server {
             TaskState::Cancelled => EventType::TaskStateCancelled,
         };
 
-        let event = Event::new(event_type, task_id, actor, serde_json::json!({}));
+        let event = Event::new(event_type, task_id, actor, data);
         self.event_bus.publish(event).await?;
         Ok(())
     }
