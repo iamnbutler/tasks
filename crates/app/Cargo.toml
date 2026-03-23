@@ -24,6 +24,7 @@ tracing-appender = "0.2"
 chrono.workspace = true
 dotenvy = "0.15"
 futures = "0.3"
+pin-project = "1"
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
