@@ -84,6 +84,33 @@ ID  Repository              Status
 2   example/other-repo      active
 ```
 
+### `rebuild`
+
+Rebuild state from GitHub by clearing tasks and merge queue, then re-polling all tracked projects from scratch. Useful for recovering from data corruption or after the platform has been offline for an extended period.
+
+```bash
+tasks rebuild
+```
+
+**Behavior:**
+
+- Clears all tasks and merge queue entries from the database
+- Preserves: accounting data, event logs, projects table, operating mode
+- Re-polls each tracked project and recreates tasks from open issues
+- Recreates merge queue entries from open, non-draft PRs
+
+> **Warning:** This is a destructive operation. All current task state (including in-progress agent sessions) will be lost. The platform must not be running (`run`) when you execute this.
+
+**Example:**
+
+```bash
+tasks rebuild
+# Cleared 12 tasks and 3 merge queue entries
+# Polling iamnbutler/tasks...
+#   8 issues, 2 PRs processed
+# Rebuild complete: 8 tasks, 2 merge queue entries created
+```
+
 ## Environment Variables
 
 | Variable | Description | Required |

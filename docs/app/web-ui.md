@@ -50,9 +50,12 @@ The task list shows all tasks with columns for:
 
 - Status (state indicator)
 - Title
+- Labels
 - Project
-- Assignee (if any)
-- Created date
+- PR link (if the task has submitted changes in the merge queue)
+- Updated date
+
+Tasks that have a corresponding merge queue entry display the PR number as a clickable external link on the right side of the row, making it easy to navigate directly to the PR on GitHub.
 
 ### Creating a Task
 
@@ -135,11 +138,20 @@ The Events view shows a real-time stream of system events.
 
 ### Filtering
 
-Filter events by:
+The Events page defaults to the **Important** filter, which hides high-frequency `agent:message` and `human:message` events. These are verbose raw agent output that can obscure meaningful state-changing events.
 
-- **Type** - Specific event type
-- **Task** - Events for a specific task
-- **Time** - Time range
+Filter by:
+
+| Filter | Description |
+|--------|-------------|
+| **Important** (default) | All events except `agent:message` and `human:message` |
+| **All** | Every event including verbose agent output |
+| **Task** | Events scoped to tasks |
+| **Session** | Events scoped to sessions |
+| **Merge** | Events scoped to merge queue |
+| **Agent** | Agent events only (includes verbose output) |
+
+> **Note:** The task detail page always shows all events including agent messages, regardless of the global filter setting.
 
 ## Keyboard Shortcuts
 

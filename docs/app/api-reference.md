@@ -65,6 +65,27 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild from GitHub
+
+Rebuild platform state from GitHub. Clears tasks and merge queue, then re-polls all tracked projects. Preserves accounting data, projects, and operating mode.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3,
+  "tasks_created": 8,
+  "merge_entries_created": 2
+}
+```
+
+> **Warning:** Destructive — all current task state is lost. Do not call while the platform is actively running sessions.
+
 ### Tasks
 
 #### List All Tasks
