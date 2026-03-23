@@ -55,6 +55,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/merge-queue/{id}/reject", post(reject_merge))
         .route("/mode", get(get_mode))
         .route("/mode", post(set_mode))
+        .route("/rebuild", post(rebuild_from_github))
         .route("/orchestrator/chat", post(orchestrator_chat))
         .route("/accounting", get(get_accounting_summary))
         .route("/accounting/tasks", get(list_task_accounting))
@@ -414,6 +415,23 @@ async fn set_mode(
     }
 
     Ok(Json(ModeResponse { mode }))
+}
+
+/// POST /api/rebuild — Rebuild state from GitHub (issue #256).
+///
+/// Clears tasks and merge queue from both memory and database,
+/// then signals the poll loop to re-fetch all data from GitHub.
+/// Preserves: accounting data, event logs, projects table, operating mode.
+async fn rebuild_from_github(
+    State(state): State<ApiState>,
+) -> Result<Json<server::RebuildStats>, ApiError> {
+    let stats = state
+        .server
+        .rebuild_from_github()
+        .await
+        .map_err(ApiError::Server)?;
+
+    Ok(Json(stats))
 }
 
 /// POST /api/tasks/:id/chat — Send a chat message to a running session (spec §9.2).

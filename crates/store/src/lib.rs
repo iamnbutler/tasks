@@ -354,6 +354,20 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Delete all tasks from the database (for rebuild command, issue #256).
+    /// Returns the number of rows deleted.
+    pub fn clear_tasks(&self) -> Result<usize, StoreError> {
+        let affected = self.conn.execute("DELETE FROM tasks", [])?;
+        Ok(affected)
+    }
+
+    /// Delete all merge queue entries from the database (for rebuild command, issue #256).
+    /// Returns the number of rows deleted.
+    pub fn clear_merge_queue(&self) -> Result<usize, StoreError> {
+        let affected = self.conn.execute("DELETE FROM merge_queue", [])?;
+        Ok(affected)
+    }
+
     // ── Accounting (spec §16.4) ───────────────────────────────────
 
     /// Get or create accounting data for a task.
