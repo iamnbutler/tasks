@@ -4,6 +4,7 @@ use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::GitHubError;
@@ -13,6 +14,21 @@ use crate::model::{
 };
 use crate::queries;
 use crate::response::*;
+
+/// Response from GitHub REST API when creating an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedIssue {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue body (markdown).
+    pub body: Option<String>,
+    /// Issue URL (HTML).
+    pub html_url: String,
+    /// Issue state.
+    pub state: String,
+}
 
 /// Maximum items per page (GitHub's limit).
 const DEFAULT_PAGE_SIZE: u32 = 100;
@@ -219,6 +235,78 @@ impl GitHubClient {
         }
 
         Ok(issue)
+    }
+
+    /// Create a new issue in a repository.
+    ///
+    /// Uses the GitHub REST API to create an issue. Returns the created issue
+    /// with its assigned number and other populated fields.
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: Option<&str>,
+        labels: Option<&[String]>,
+    ) -> Result<CreatedIssue, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!("{}/repos/{}/{}/issues", self.base_url, owner, repo);
+
+        let mut request_body = json!({
+            "title": title,
+        });
+
+        if let Some(b) = body {
+            request_body["body"] = json!(b);
+        }
+
+        if let Some(l) = labels {
+            request_body["labels"] = json!(l);
+        }
+
+        let response = self.http.post(&url).json(&request_body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::CREATED {
+            let created: CreatedIssue = response.json().await.map_err(|e| {
+                GitHubError::Decode(format!("failed to parse created issue: {e}"))
+            })?;
+            return Ok(created);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!("{owner}/{repo}")));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Validation(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected create issue status {status}: {text}"
+        )))
     }
 
     // -----------------------------------------------------------------------

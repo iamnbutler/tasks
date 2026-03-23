@@ -31,6 +31,10 @@ pub enum GitHubError {
     /// Response did not match expected shape.
     #[error("decode error: {0}")]
     Decode(String),
+
+    /// Validation error (422) — invalid input parameters.
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 /// A single error from a GraphQL response.

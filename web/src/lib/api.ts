@@ -102,6 +102,26 @@ export function sendOrchestratorChat(message: string): Promise<void> {
   });
 }
 
+export interface CreateIssueRequest {
+  project_id: string;
+  title: string;
+  body?: string;
+  labels?: string[];
+}
+
+export interface CreateIssueResponse {
+  number: number;
+  url: string;
+}
+
+export function createIssue(req: CreateIssueRequest): Promise<CreateIssueResponse> {
+  return request<CreateIssueResponse>("/api/issues", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;
