@@ -17,7 +17,7 @@ use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
 use server::{WorkflowConfigWatcher, RefreshResult};
 use tasks_github::client::GitHubClient;
-use tasks_github::model::{IssueState, IssueStateReason, MergeableState, PullRequestState};
+use tasks_github::model::{IssueState, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
@@ -400,14 +400,50 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             for (project_id, poller) in pollers.iter_mut() {
                 match poller.poll().await {
                     Ok(result) => {
-                        // Create tasks for new issues
+                        // --- Issue processing: create or reconcile (issue #254) ---
                         for issue in &result.issues {
                             let source = TaskSource::GithubIssue {
                                 owner: issue.owner.clone(),
                                 repo: issue.repo.clone(),
                                 number: issue.number,
                             };
-                            if !poll_server.has_task_for_source(&source).await {
+
+                            if let Some(task_id) = poll_server.task_id_for_source(&source).await {
+                                // Task exists — reconcile with fresh GitHub data
+                                match poll_server.reconcile_task(&task_id, issue, &label_config).await {
+                                    Ok(Some(result)) if result.has_changes() => {
+                                        if let Some(new_state) = result.new_state {
+                                            info!(
+                                                project = %project_id,
+                                                issue = issue.number,
+                                                task_id = %task_id,
+                                                new_state = ?new_state,
+                                                updated_fields = ?result.updated_fields,
+                                                "reconciled task from GitHub"
+                                            );
+                                        } else if !result.updated_fields.is_empty() {
+                                            debug!(
+                                                project = %project_id,
+                                                issue = issue.number,
+                                                task_id = %task_id,
+                                                updated_fields = ?result.updated_fields,
+                                                "synced task metadata from GitHub"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            project = %project_id,
+                                            issue = issue.number,
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to reconcile task"
+                                        );
+                                    }
+                                    _ => {} // No changes or task not found
+                                }
+                            } else {
+                                // New issue — create task (existing behavior)
                                 if let Some(task) = server::scheduler::issue_to_task(
                                     issue,
                                     project_id,
@@ -424,168 +460,112 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        // Add open PRs to the merge queue (spec §7).
+
+                        // --- PR processing: create merge entries + reconcile (issue #255) ---
                         //
-                        // We don't create tasks for PRs here — that would cause loops
-                        // where agent-created PRs get picked up as new tasks. Instead,
-                        // we only add PRs to the merge queue, which is PR-centric.
-                        //
-                        // If a PR's branch matches the `tasks/{task_id}` pattern, we
-                        // link it to that task. Otherwise, we use an empty task_id.
+                        // Add open, non-draft PRs to the merge queue. We don't create
+                        // tasks for PRs — that would cause loops where agent-created PRs
+                        // get picked up as new tasks. The merge queue is PR-centric.
                         for pr in &result.pull_requests {
-                            // Only process open, non-draft PRs for the merge queue
-                            if pr.state != tasks_github::model::PullRequestState::Open || pr.is_draft {
-                                continue;
-                            }
-
-                            let pr_url = format!(
-                                "https://github.com/{}/{}/pull/{}",
-                                pr.owner, pr.repo, pr.number
-                            );
-
-                            // Skip if already in merge queue
-                            if poll_server.has_merge_entry_for_pr(&pr_url).await {
-                                continue;
-                            }
-
-                            // Try to find a linked task by branch name
-                            let task_id = poll_server
-                                .find_task_by_branch(&pr.head_ref)
-                                .await
-                                .unwrap_or_default();
-
-                            // Create merge queue entry
-                            let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
-                            let entry = MergeQueueEntry::new(
-                                entry_id.clone(),
-                                task_id.clone(),
-                                &pr_url,
-                            );
-
-                            if let Err(e) = poll_server.add_to_merge_queue(entry).await {
-                                warn!(
-                                    project = %project_id,
-                                    pr = pr.number,
-                                    error = %e,
-                                    "failed to add PR to merge queue"
+                            // Only create new entries for open, non-draft PRs
+                            if pr.state == tasks_github::model::PullRequestState::Open && !pr.is_draft {
+                                let pr_url = format!(
+                                    "https://github.com/{}/{}/pull/{}",
+                                    pr.owner, pr.repo, pr.number
                                 );
-                            } else {
-                                info!(
-                                    project = %project_id,
-                                    pr = pr.number,
-                                    task_id = %task_id,
-                                    "added PR to merge queue"
-                                );
-                            }
-                        }
 
-                        // --- External closure detection (spec §11.3) ---
-                        //
-                        // When a GitHub issue or PR is closed externally, we need to
-                        // transition the corresponding task to an appropriate state.
+                                if !poll_server.has_merge_entry_for_pr(&pr_url).await {
+                                    let task_id = poll_server
+                                        .find_task_by_branch(&pr.head_ref)
+                                        .await
+                                        .unwrap_or_default();
 
-                        // Detect closed issues and transition tasks to Cancelled/Completed.
-                        for issue in &result.issues {
-                            if issue.state != IssueState::Closed {
-                                continue;
-                            }
-
-                            let source = TaskSource::GithubIssue {
-                                owner: issue.owner.clone(),
-                                repo: issue.repo.clone(),
-                                number: issue.number,
-                            };
-
-                            // Find the task for this issue
-                            if let Some(task_id) = poll_server.task_id_for_source(&source).await {
-                                // Get the task to check its current state
-                                if let Some(task) = poll_server.get_task(&task_id).await {
-                                    // Skip if already terminal
-                                    if task.state.is_terminal() {
-                                        continue;
-                                    }
-
-                                    // Determine target state based on issue state_reason:
-                                    // - Completed → task Completed
-                                    // - NotPlanned or None → task Cancelled
-                                    let new_state = match issue.state_reason {
-                                        Some(IssueStateReason::Completed) => TaskState::Completed,
-                                        _ => TaskState::Cancelled,
-                                    };
-
-                                    info!(
-                                        project = %project_id,
-                                        issue = issue.number,
-                                        task_id = %task_id,
-                                        new_state = ?new_state,
-                                        state_reason = ?issue.state_reason,
-                                        "detected external issue closure, transitioning task"
+                                    let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
+                                    let entry = MergeQueueEntry::new(
+                                        entry_id.clone(),
+                                        task_id.clone(),
+                                        &pr_url,
                                     );
 
-                                    if let Err(e) = poll_server
-                                        .set_task_state(&task_id, new_state, Actor::Scheduler)
-                                        .await
-                                    {
+                                    if let Err(e) = poll_server.add_to_merge_queue(entry).await {
                                         warn!(
-                                            task_id = %task_id,
+                                            project = %project_id,
+                                            pr = pr.number,
                                             error = %e,
-                                            "failed to transition task for closed issue"
+                                            "failed to add PR to merge queue"
+                                        );
+                                    } else {
+                                        info!(
+                                            project = %project_id,
+                                            pr = pr.number,
+                                            task_id = %task_id,
+                                            "added PR to merge queue"
                                         );
                                     }
                                 }
                             }
                         }
 
-                        // Detect merged/closed PRs and transition linked tasks.
+                        // Reconcile merge queue: detect externally merged/closed PRs,
+                        // update conflict status from GitHub's mergeable field.
+                        match poll_server.reconcile_merge_queue(&result.pull_requests).await {
+                            Ok(changes) if changes > 0 => {
+                                info!(
+                                    project = %project_id,
+                                    changes = changes,
+                                    "reconciled merge queue from GitHub PR data"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    project = %project_id,
+                                    error = %e,
+                                    "failed to reconcile merge queue"
+                                );
+                            }
+                            _ => {} // No changes
+                        }
+
+                        // --- PR closure: transition linked tasks (spec §11.3) ---
+                        //
+                        // When a PR is merged/closed externally, transition the linked
+                        // task. This is separate from merge queue reconciliation because
+                        // the task linkage is via branch name, not merge queue entry.
                         for pr in &result.pull_requests {
-                            // Only handle closed/merged PRs
                             if pr.state == PullRequestState::Open {
                                 continue;
                             }
 
-                            // Find the linked task by branch name
                             let task_id = match poll_server.find_task_by_branch(&pr.head_ref).await {
                                 Some(id) => id,
-                                None => continue, // No linked task
+                                None => continue,
                             };
 
-                            // Get the task to check its current state
                             let task = match poll_server.get_task(&task_id).await {
                                 Some(t) => t,
                                 None => continue,
                             };
 
-                            // Skip if already terminal
                             if task.state.is_terminal() {
                                 continue;
                             }
 
                             match pr.state {
                                 PullRequestState::Merged => {
-                                    // PR was merged externally → task is Completed
                                     info!(
                                         project = %project_id,
                                         pr = pr.number,
                                         task_id = %task_id,
                                         "detected external PR merge, transitioning task to Completed"
                                     );
-
                                     if let Err(e) = poll_server
                                         .set_task_state(&task_id, TaskState::Completed, Actor::Scheduler)
                                         .await
                                     {
-                                        warn!(
-                                            task_id = %task_id,
-                                            error = %e,
-                                            "failed to transition task for merged PR"
-                                        );
+                                        warn!(task_id = %task_id, error = %e, "failed to transition task for merged PR");
                                     }
                                 }
                                 PullRequestState::Closed => {
-                                    // PR was closed without merge.
-                                    // Only cancel if task is in AwaitingMerge state.
-                                    // If task is in other states (Waiting, Running), the PR closure
-                                    // might be part of normal rework — don't cancel.
                                     if task.state == TaskState::AwaitingMerge {
                                         info!(
                                             project = %project_id,
@@ -593,16 +573,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                             task_id = %task_id,
                                             "detected external PR closure, transitioning task to Cancelled"
                                         );
-
                                         if let Err(e) = poll_server
                                             .set_task_state(&task_id, TaskState::Cancelled, Actor::Scheduler)
                                             .await
                                         {
-                                            warn!(
-                                                task_id = %task_id,
-                                                error = %e,
-                                                "failed to transition task for closed PR"
-                                            );
+                                            warn!(task_id = %task_id, error = %e, "failed to transition task for closed PR");
                                         }
                                     } else {
                                         debug!(
@@ -614,7 +589,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                     }
                                 }
-                                PullRequestState::Open => unreachable!(), // Already filtered out
+                                PullRequestState::Open => unreachable!(),
                             }
                         }
                     }
