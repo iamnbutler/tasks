@@ -168,14 +168,11 @@ pub fn reconcile_task(
 
     // Derive blocked_by from GitHub blocking issue relationships.
     // Format: "gh-{owner}-{repo}-issue-{number}" to match our task ID convention.
-    // NOTE: BlockingIssueRef lacks owner/repo fields, so we assume same-repo
-    // blockers. Cross-repo blocking relationships generate wrong task IDs.
-    // See #261 for the fix.
     let new_blocked_by: Vec<String> = issue
         .blocked_by
         .iter()
         .filter(|b| b.state == tasks_github::model::IssueState::Open)
-        .map(|b| format!("gh-{}-{}-issue-{}", issue.owner, issue.repo, b.number))
+        .map(|b| format!("gh-{}-{}-issue-{}", b.owner, b.repo, b.number))
         .collect();
     if task.blocked_by != new_blocked_by {
         task.blocked_by = new_blocked_by;
@@ -720,5 +717,34 @@ mod tests {
         let result = reconcile_task(&mut task, &updated_issue, &cfg);
         assert!(result.new_state.is_none());
         assert!(task.updated_at >= original_updated);
+    }
+
+    #[test]
+    fn reconcile_cross_repo_blocking() {
+        // Test that cross-repo blocking issues generate correct task IDs.
+        // Issue acme/frontend#10 is blocked by acme/backend#5.
+        let mut issue = make_issue(10, vec![make_label("feature")], GhIssueState::Open);
+        issue.owner = "acme".to_string();
+        issue.repo = "frontend".to_string();
+        issue.blocked_by = vec![
+            tasks_github::model::BlockingIssueRef {
+                owner: "acme".to_string(),
+                repo: "backend".to_string(),
+                number: 5,
+                title: "Backend API".to_string(),
+                state: GhIssueState::Open,
+                node_id: "I_5".to_string(),
+            },
+        ];
+
+        let cfg = default_label_config();
+        let mut task = issue_to_task(&issue, "proj-1", &cfg).expect("should produce a task");
+
+        let result = reconcile_task(&mut task, &issue, &cfg);
+        assert!(result.has_changes() || !task.blocked_by.is_empty());
+
+        // The blocked_by should point to acme/backend#5, not acme/frontend#5.
+        assert_eq!(task.blocked_by.len(), 1);
+        assert_eq!(task.blocked_by[0], "gh-acme-backend-issue-5");
     }
 }

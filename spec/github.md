@@ -108,7 +108,7 @@ Dismissed), `body` (string or null), `submitted_at` (timestamp)
 
 **SubIssueRef:** `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
 
-**BlockingIssueRef:** `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
+**BlockingIssueRef:** `owner` (string), `repo` (string), `number` (u64), `title` (string), `state` (Open | Closed), `node_id` (string)
 
 **LinkedPR:** `number` (u64), `title` (string), `state` (Open | Closed | Merged),
 `node_id` (string)
