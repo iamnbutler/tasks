@@ -1,0 +1,118 @@
+name: Mirror Docs to Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/app/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout wiki
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Initialize wiki if needed
+        id: init-wiki
+        run: |
+          if [ ! -d "wiki/.git" ]; then
+            echo "Wiki not found, creating initial structure"
+            mkdir -p wiki
+            cd wiki
+            git init
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
+            echo "initialized=true" >> $GITHUB_OUTPUT
+          else
+            echo "initialized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync documentation to wiki
+        run: |
+          # Create wiki directory if it doesn't exist
+          mkdir -p wiki
+
+          # Copy all documentation files
+          for file in docs/app/*.md; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+
+              # Transform index.md to Home.md for wiki
+              if [ "$filename" = "index.md" ]; then
+                dest="wiki/Home.md"
+              else
+                dest="wiki/$filename"
+              fi
+
+              # Copy and transform links for wiki format
+              sed -e 's/index\.md/Home/g' \
+                  -e 's/\.md)/)/g' \
+                  -e 's/<!-- LAST_UPDATED -->/'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'/g' \
+                  "$file" > "$dest"
+
+              echo "Copied $file -> $dest"
+            fi
+          done
+
+      - name: Create sidebar
+        run: |
+          cat > wiki/_Sidebar.md << 'EOF'
+          ## Navigation
+
+          - [Home](Home)
+          - [Getting Started](getting-started)
+          - [Architecture](architecture)
+          - [CLI Reference](cli-reference)
+          - [API Reference](api-reference)
+          - [Web UI Guide](web-ui)
+          - [Configuration](configuration)
+
+          ---
+
+          [View on GitHub](https://github.com/${{ github.repository }})
+          EOF
+
+      - name: Create footer
+        run: |
+          cat > wiki/_Footer.md << 'EOF'
+          ---
+
+          *Documentation automatically synced from [docs/app/](https://github.com/${{ github.repository }}/tree/main/docs/app)*
+          EOF
+
+      - name: Commit and push to wiki
+        working-directory: wiki
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "docs: sync from main repository
+
+          Synced from commit: ${{ github.sha }}
+          Triggered by: ${{ github.event_name }}"
+
+          git push origin HEAD:master || git push origin HEAD:main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
