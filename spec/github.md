@@ -275,6 +275,12 @@ RepoPoller::new(client: GitHubClient, owner: String, repo: String) -> RepoPoller
 - `timestamp` — the `updated_at` high-water mark from this poll (used as `since` on the next call)
 - `rate_limit` — rate limit state after this poll
 
+**Merge queue population:** The scheduler uses `pull_requests` from the poll result to populate
+the merge queue. PRs that are open and not drafts are added as merge queue entries. See spec.md
+§7.0 for full eligibility criteria. This happens automatically on each poll cycle — the GitHub
+crate does not filter PRs for merge queue purposes; it returns all PRs matching the query filters,
+and the scheduler applies the merge queue eligibility rules.
+
 ### 5.2 Change Detection
 
 The poller returns all items updated since the last poll. It is the caller's (scheduler's)
