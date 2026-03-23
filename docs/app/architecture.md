@@ -68,6 +68,15 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 7. **Human** approves/rejects in merge queue
 8. **Merger** lands approved changes
 
+### Orchestrator Re-evaluation
+
+The orchestrator tracks the last-evaluated `head_sha` per PR URL in an in-memory map. During each eval tick, an entry is re-queued if:
+
+- It has never been evaluated, or
+- Its current `head_sha` (updated from GitHub during reconciliation) differs from the last-evaluated SHA.
+
+This ensures that new commits pushed to a PR branch after an initial review automatically trigger a fresh quality evaluation.
+
 ### Event System
 
 All state changes are recorded as immutable events:
@@ -144,4 +153,4 @@ Per-task event logs at `~/.local/state/tasks/events/{task-id}/events.jsonl`.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*

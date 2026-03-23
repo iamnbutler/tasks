@@ -216,10 +216,13 @@ GET /api/merge-queue
     "task_id": "task-uuid",
     "pr_number": 123,
     "state": "pending",
-    "created_at": "2024-01-15T12:00:00Z"
+    "created_at": "2024-01-15T12:00:00Z",
+    "head_sha": "abc123def456"
   }
 ]
 ```
+
+> **Note:** `head_sha` is the current head commit SHA of the PR branch. It is populated during GitHub reconciliation and used to detect new commits that require re-evaluation by the orchestrator. It may be `null` until the first reconciliation cycle.
 
 #### Approve Entry
 
@@ -412,4 +415,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*
