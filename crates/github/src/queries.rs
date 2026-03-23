@@ -44,7 +44,7 @@ const ISSUE_FIELDS: &str = r#"
             id
         }
     }
-    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, MARKED_AS_BLOCKED_BY_EVENT, UNMARKED_AS_BLOCKED_BY_EVENT]) {
+    timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
         nodes {
             ... on CrossReferencedEvent {
                 source {
@@ -54,24 +54,6 @@ const ISSUE_FIELDS: &str = r#"
                         state
                         id
                     }
-                }
-            }
-            ... on MarkedAsBlockedByEvent {
-                blockingIssue {
-                    repository { owner { login } name }
-                    number
-                    title
-                    state
-                    id
-                }
-            }
-            ... on UnmarkedAsBlockedByEvent {
-                blockingIssue {
-                    repository { owner { login } name }
-                    number
-                    title
-                    state
-                    id
                 }
             }
         }
