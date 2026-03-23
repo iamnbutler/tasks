@@ -333,7 +333,7 @@ Agents are dispatched and work normally in all modes except Stop.
 ### 6.2 Pause
 
 - Agents are dispatched and work on tasks normally.
-- Open pull requests enter the merge queue.
+- Eligible pull requests enter the merge queue (see §7.0 for eligibility criteria).
 - The merge queue is held: nothing merges automatically.
 - The orchestrator continues to manage agents, answer questions, and evaluate quality — but does
   not approve merges.
@@ -366,8 +366,27 @@ Mode transitions follow a severity ordering: Stop < Pause < Play.
 
 The merge queue is an ordered list of pull requests waiting to be merged. It is independent of
 tasks — a task may produce a PR that enters the queue, but the queue itself operates on pull
-requests regardless of how they originated. Open PRs on tracked repositories are automatically
-added to the queue.
+requests regardless of how they originated.
+
+### 7.0 PR Eligibility
+
+A pull request enters the merge queue when all of the following are true:
+
+- **State is Open** — Closed or merged PRs are not queued.
+- **Not a draft** — Draft PRs are excluded until marked ready for review.
+- **On a tracked repository** — The PR must be on a repository added to the platform.
+
+The platform does not filter PRs by author, branch name, or label. All eligible PRs on tracked
+repositories enter the queue, regardless of whether they were created by an agent or a human.
+This uniform treatment avoids the need to track "agent-created" status and supports repos where
+both humans and agents contribute PRs.
+
+Implications:
+
+- When you add a repository with existing open PRs, those PRs immediately enter the merge queue.
+- Human-authored PRs on tracked repos will be evaluated by the orchestrator.
+- If this behavior is undesired, consider using a dedicated repository for agent work, or using
+  draft PRs for human work-in-progress to keep them out of the queue until ready.
 
 ### 7.1 Queue Entry Lifecycle
 
