@@ -134,6 +134,16 @@ export function createIssue(req: CreateIssueRequest): Promise<CreateIssueRespons
   });
 }
 
+export function fetchEvents(params: {
+  type_prefix: string;
+  limit?: number;
+}): Promise<Event[]> {
+  const qs = new URLSearchParams();
+  qs.set("type_prefix", params.type_prefix);
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  return request<Event[]>(`/api/events/query?${qs.toString()}`);
+}
+
 export function subscribeEvents(opts?: {
   pattern?: string;
   task_id?: string;

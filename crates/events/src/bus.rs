@@ -62,6 +62,17 @@ impl EventBus {
         self.store.read_task(task_id).await
     }
 
+    /// Query events across all tasks by event-type prefix.
+    ///
+    /// See [`EventStore::query_by_type_prefix`] for details.
+    pub async fn query_by_type_prefix(
+        &self,
+        type_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.store.query_by_type_prefix(type_prefix, limit).await
+    }
+
     /// List all task IDs with event logs.
     pub async fn list_tasks(&self) -> Result<Vec<String>, StoreError> {
         self.store.list_tasks().await

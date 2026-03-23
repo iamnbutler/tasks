@@ -99,6 +99,47 @@ impl EventStore {
         Ok(events.into_iter().skip(offset).collect())
     }
 
+    /// Query events across all tasks, filtered by an event-type prefix.
+    ///
+    /// Scans every task's event log and returns events whose type starts with
+    /// `type_prefix` (e.g. `"orchestrator:"`).  Results are sorted by timestamp
+    /// ascending and truncated to `limit`.
+    pub async fn query_by_type_prefix(
+        &self,
+        type_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        let task_ids = self.list_tasks().await?;
+        let mut matching = Vec::new();
+
+        for task_id in &task_ids {
+            let events = self.read_task(task_id).await?;
+            for event in events {
+                if event.event_type.as_str().starts_with(type_prefix) {
+                    matching.push(event);
+                }
+            }
+        }
+
+        // Also scan the empty-string task dir (system-wide events like orchestrator messages)
+        let empty_events = self.read_task("").await?;
+        for event in empty_events {
+            if event.event_type.as_str().starts_with(type_prefix) {
+                matching.push(event);
+            }
+        }
+
+        // Sort by timestamp ascending
+        matching.sort_by(|a, b| a.ts.cmp(&b.ts));
+
+        // Apply limit (take from the end to get the most recent)
+        if matching.len() > limit {
+            matching = matching.split_off(matching.len() - limit);
+        }
+
+        Ok(matching)
+    }
+
     /// List all task IDs that have event logs.
     pub async fn list_tasks(&self) -> Result<Vec<String>, StoreError> {
         let mut tasks = Vec::new();
@@ -188,5 +229,88 @@ mod tests {
         let mut tasks = store.list_tasks().await.unwrap();
         tasks.sort();
         assert_eq!(tasks, vec!["task-a", "task-b"]);
+    }
+
+    #[tokio::test]
+    async fn query_by_type_prefix() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Events across different task dirs
+        store
+            .append(&Event::new(
+                EventType::OrchestratorDecision,
+                "task-1",
+                Actor::Orchestrator,
+                serde_json::json!({"approved": true}),
+            ))
+            .await
+            .unwrap();
+
+        store
+            .append(&Event::new(
+                EventType::TaskCreated,
+                "task-1",
+                Actor::System,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        store
+            .append(&Event::new(
+                EventType::OrchestratorMessage,
+                "", // system-wide
+                Actor::Human,
+                serde_json::json!({"message": "hello"}),
+            ))
+            .await
+            .unwrap();
+
+        store
+            .append(&Event::new(
+                EventType::OrchestratorFeedback,
+                "task-2",
+                Actor::Orchestrator,
+                serde_json::json!({"feedback": "add tests"}),
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        // All should be orchestrator events
+        for event in &results {
+            assert!(event.event_type.as_str().starts_with("orchestrator:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn query_by_type_prefix_respects_limit() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        for i in 0..5 {
+            store
+                .append(&Event::new(
+                    EventType::OrchestratorDecision,
+                    &format!("task-{}", i),
+                    Actor::Orchestrator,
+                    serde_json::json!({"approved": true}),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let results = store
+            .query_by_type_prefix("orchestrator:", 3)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
     }
 }

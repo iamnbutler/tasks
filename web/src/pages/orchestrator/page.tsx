@@ -9,7 +9,7 @@ import {
   Brain,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { sendOrchestratorChat, subscribeEvents } from "@/lib/api";
+import { fetchEvents, sendOrchestratorChat, subscribeEvents } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -382,6 +382,7 @@ function BlockView({ block }: { block: OrchestratorBlock }) {
 export function OrchestratorPage() {
   const { snapshot, events: allEvents } = useAppState();
   const [localEvents, setLocalEvents] = useState<Event[]>([]);
+  const [historicalEvents, setHistoricalEvents] = useState<Event[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
@@ -391,12 +392,27 @@ export function OrchestratorPage() {
 
   const orchestratorEvents = useMemo(() => {
     const globalOrchEvents = allEvents.filter((e) => e.type.startsWith("orchestrator:"));
-    const merged = [...globalOrchEvents, ...localEvents];
+    const merged = [...historicalEvents, ...globalOrchEvents, ...localEvents];
     const seen = new Set<string>();
     return merged
       .filter((e) => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
       .sort((a, b) => a.ts.localeCompare(b.ts));
-  }, [allEvents, localEvents]);
+  }, [allEvents, localEvents, historicalEvents]);
+
+  // Fetch historical orchestrator events on mount
+  useEffect(() => {
+    let cancelled = false;
+    fetchEvents({ type_prefix: "orchestrator:", limit: 200 })
+      .then((events) => {
+        if (!cancelled) {
+          setHistoricalEvents(events);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to fetch historical orchestrator events:", err);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const source = subscribeEvents({ pattern: "orchestrator:*" });
