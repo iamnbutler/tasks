@@ -127,6 +127,38 @@ Content-Type: application/json
 }
 ```
 
+#### Update Task
+
+Update a task's properties. Currently supports setting priority for manual queue reordering.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** Updated task object.
+
+> Lower priority numbers are dispatched first.
+
+#### Reorder Tasks
+
+Bulk-reorder tasks by assigning sequential priorities. Used by the drag-and-drop Queue view.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["uuid-1", "uuid-2", "uuid-3"]
+}
+```
+
+Tasks are assigned priorities 1, 2, 3, … in the given order.
+
 #### Cancel Task
 
 Stop a running agent session for the given task.
@@ -361,7 +393,28 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Events
+
+#### Query Historical Events
+
+Returns events matching a type prefix across all task logs, sorted ascending by timestamp.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=200
+```
+
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `type_prefix` | Required. Event type prefix to filter by (e.g. `orchestrator:`, `task:`) |
+| `limit` | Maximum events to return (default: 200) |
+
+**Response:** Array of event objects.
+
+> `type_prefix` is required — omitting it returns a 400 error.
+
+#### SSE Event Stream
 
 Server-Sent Events stream for real-time updates.
 
@@ -412,4 +465,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23 <!-- LAST_UPDATED -->*

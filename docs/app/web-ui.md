@@ -38,8 +38,8 @@ The dashboard provides an at-a-glance view of:
 
 Click the mode indicator to switch between:
 
-- **Play** - Full autonomy
-- **Pause** - Agents work, merges paused
+- **Play** - Full autonomy; merges execute immediately on approval
+- **Pause** - Agents continue working; only the merge path is held. Rejections, conflict handling, and changes-requested all execute normally. Approved entries accumulate until you **Flush**.
 - **Stop** - All activity halted
 
 ## Tasks View
@@ -65,6 +65,10 @@ Use the filter controls to narrow down tasks:
 - **State** - Filter by task state
 - **Project** - Filter by project
 - **Search** - Text search in title/description
+
+### Queue
+
+The **Queue** tab shows tasks in dispatch order — only tasks in `waiting` or `changes_requested` states are listed. Drag the handle on any row to reorder tasks. The new order is persisted as sequential priorities (1, 2, 3, …) which the dispatcher uses for scheduling.
 
 ### Task Detail
 
@@ -104,7 +108,7 @@ In Pause mode, use the **Flush** button to merge all approved entries via the Gi
 
 ## Orchestrator
 
-The Orchestrator view shows a conversational feed of the AI project foreman's activity.
+The Orchestrator view shows a conversational feed of the AI project foreman's activity. Historical events are loaded on page mount, so you see the full record even if you just opened the page.
 
 ### Feed
 
@@ -128,6 +132,7 @@ The Events view shows a real-time stream of system events.
 |------|-------------|
 | `task:created` | New task created |
 | `task:updated` | Task state changed |
+| `task:reordered` | Task queue priorities changed |
 | `session:started` | Agent session began |
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
@@ -154,4 +159,4 @@ Filter events by:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23 <!-- LAST_UPDATED -->*
