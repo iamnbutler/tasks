@@ -5,7 +5,9 @@
 //! exposes API endpoints under `/api/`.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::{
     Json, Router,
@@ -26,6 +28,7 @@ use tower_http::cors::CorsLayer;
 use tasks_agent::CompletionsService;
 use events::Actor;
 use server::Server;
+use server::presence::OwnedConnectionGuard;
 use models::Mode;
 
 /// Shared state for API handlers.
@@ -524,6 +527,26 @@ async fn get_task_accounting(
     Ok(Json(accounting))
 }
 
+/// A stream wrapper that holds a presence guard until the stream ends.
+///
+/// This ensures the human presence is tracked for the entire duration
+/// of an SSE connection, not just when the handler function returns.
+#[pin_project::pin_project]
+struct PresenceStream<S> {
+    #[pin]
+    inner: S,
+    #[allow(dead_code)]
+    guard: OwnedConnectionGuard,
+}
+
+impl<S: Stream> Stream for PresenceStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
 /// GET /api/events — SSE stream of live events.
 ///
 /// Supports optional query params: `pattern` and `task_id` for filtering.
@@ -531,8 +554,8 @@ async fn event_stream(
     State(state): State<ApiState>,
     Query(query): Query<EventStreamQuery>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    // Register presence — the connection guard will decrement on drop.
-    let _presence_guard = state.server.presence.connect();
+    // Register presence — the guard lives until the stream is dropped (client disconnects).
+    let presence_guard = state.server.presence.connect_owned();
 
     let rx = state.server.event_bus.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
@@ -556,7 +579,13 @@ async fn event_stream(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Wrap the stream to keep the presence guard alive until disconnection.
+    let presence_stream = PresenceStream {
+        inner: stream,
+        guard: presence_guard,
+    };
+
+    Sse::new(presence_stream).keep_alive(KeepAlive::default())
 }
 
 // --- Completions handlers ---
