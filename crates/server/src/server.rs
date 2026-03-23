@@ -540,19 +540,18 @@ impl Server {
 
             // Execute the action outside the read lock
             match action {
-                MqAction::MarkMerged { entry_id, task_id, pr_url } => {
+                MqAction::MarkMerged { entry_id, pr_url, .. } => {
                     tracing::info!(
                         entry_id = %entry_id,
                         pr_url = %pr_url,
                         "reconciliation: PR merged externally, marking entry as merged"
                     );
+                    // mark_entry_merged also transitions the linked task to Completed
                     if let Err(e) = self.mark_entry_merged(&entry_id, &pr_url).await {
                         tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark entry as merged during reconciliation");
                     } else {
                         changes += 1;
                     }
-                    // mark_entry_merged already transitions the task to Completed
-                    let _ = task_id;
                 }
                 MqAction::Remove { entry_id, pr_url } => {
                     tracing::info!(
@@ -592,8 +591,7 @@ impl Server {
                         entry_id = %entry_id,
                         "reconciliation: conflict resolved"
                     );
-                    let mut state = self.state.write().await;
-                    if let Err(e) = state.merge_queue.clear_conflict(&entry_id) {
+                    if let Err(e) = self.clear_entry_conflict(&entry_id).await {
                         tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
                     } else {
                         changes += 1;

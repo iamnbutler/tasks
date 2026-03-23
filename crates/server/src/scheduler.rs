@@ -168,6 +168,9 @@ pub fn reconcile_task(
 
     // Derive blocked_by from GitHub blocking issue relationships.
     // Format: "gh-{owner}-{repo}-issue-{number}" to match our task ID convention.
+    // NOTE: BlockingIssueRef lacks owner/repo fields, so we assume same-repo
+    // blockers. Cross-repo blocking relationships would need BlockingIssueRef
+    // extended with owner/repo to generate correct task IDs.
     let new_blocked_by: Vec<String> = issue
         .blocked_by
         .iter()
@@ -192,6 +195,10 @@ pub fn reconcile_task(
     let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
 
     // Check for skip/ignore labels added after import → cancel the task.
+    // This is a hard override for ALL non-terminal states including active ones
+    // (Running, Conflict, etc.). Skip is an explicit human signal meaning "don't
+    // work on this." Cancelling doesn't kill running sessions — it prevents
+    // re-dispatch once the current session ends.
     let should_cancel = issue_label_names.contains(&SKIP_LABEL)
         || label_config
             .ignore
@@ -243,7 +250,9 @@ pub fn reconcile_task(
         }
     }
 
-    if result.has_changes() {
+    // Only manually update updated_at for metadata-only changes (no state transition).
+    // When set_state() was called above, it already handled updated_at and last_activity_at.
+    if result.has_changes() && result.new_state.is_none() {
         task.updated_at = chrono::Utc::now();
     }
 
@@ -657,5 +666,59 @@ mod tests {
         let result = reconcile_task(&mut task, &updated_issue, &cfg);
         assert!(result.new_state.is_none());
         assert_eq!(task.state, TaskState::Running);
+    }
+
+    #[test]
+    fn reconcile_skip_label_cancels_active_task() {
+        // Skip label is a hard override — cancels even Running/Conflict tasks.
+        // It doesn't kill the session, just prevents re-dispatch.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        task.set_state(TaskState::Running);
+
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label(super::SKIP_LABEL)];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.cancelled);
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_skip_label_trumps_closure_reason() {
+        // If an issue has tasks/skip AND is closed-as-completed,
+        // skip wins → Cancelled, not Completed. Skip is an explicit
+        // human override.
+        let mut issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        issue.state = GhIssueState::Closed;
+        issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+        issue.labels = vec![make_label("bug"), make_label(super::SKIP_LABEL)];
+
+        let result = reconcile_task(&mut task, &issue, &cfg);
+        assert!(result.cancelled);
+        assert_eq!(result.new_state, Some(TaskState::Cancelled));
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_metadata_only_sets_updated_at_once() {
+        // When only metadata changes (no state transition), updated_at
+        // should be set once by reconcile_task, not by set_state.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        let original_updated = task.updated_at;
+
+        // Small delay to ensure timestamps differ
+        let mut updated_issue = issue.clone();
+        updated_issue.title = "New title".to_string();
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.new_state.is_none());
+        assert!(task.updated_at >= original_updated);
     }
 }
