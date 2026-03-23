@@ -68,6 +68,26 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 7. **Human** approves/rejects in merge queue
 8. **Merger** lands approved changes
 
+### Task Dispatch Ordering
+
+When multiple tasks are ready, the dispatcher prioritizes them as follows:
+
+1. **Priority field** — higher explicit priority first
+2. **Unblocking** — tasks whose completion would unblock other tasks are preferred
+3. **Source number** — lower GitHub issue/PR numbers first (older issues process before newer ones, ensuring logical sequencing of related work e.g. "Phase 1" before "Phase 2")
+4. **Creation date** — fallback for tasks without a source number; older tasks first
+
+### PR-to-Task Linkage
+
+When the poller detects a PR ready to enter the merge queue, it resolves the associated task using a priority lookup:
+
+1. **Branch name match** — finds a task whose session created a branch with the PR's head ref (fast and precise)
+2. **GitHub linked issues** — falls back to GitHub's own `linked_issues` relationship, populated by closing keywords (`Fixes #N`) or manual PR links
+
+### Cross-Repo Blocking
+
+Tasks can be blocked by issues in other repositories. The `blocked_by` field uses the full `owner/repo/number` coordinates from GitHub's `MarkedAsBlockedBy` timeline events, so cross-repo blocking relationships generate correct task IDs (e.g. `gh-acme-backend-issue-5` blocking a task in `acme/frontend`).
+
 ### Event System
 
 All state changes are recorded as immutable events:
@@ -144,4 +164,4 @@ Per-task event logs at `~/.local/state/tasks/events/{task-id}/events.jsonl`.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*
