@@ -36,11 +36,6 @@ pub struct CleanupConfig {
     pub stale_threshold: Duration,
     /// Interval between cleanup scans.
     pub cleanup_interval: Duration,
-    /// Max age for conflict entries before they're eligible for cleanup.
-    ///
-    /// Conflict entries older than this threshold are removed during cleanup
-    /// to prevent stale conflicts from cluttering the merge queue. See issue #282.
-    pub conflict_max_age: Duration,
 }
 
 impl Default for CleanupConfig {
@@ -48,7 +43,6 @@ impl Default for CleanupConfig {
         Self {
             stale_threshold: Duration::from_secs(DEFAULT_STALE_THRESHOLD_SECS),
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
-            conflict_max_age: Duration::from_secs(DEFAULT_CONFLICT_MAX_AGE_SECS),
         }
     }
 }
@@ -58,7 +52,6 @@ impl CleanupConfig {
     ///
     /// - `TASKS_WORKSPACE_STALE_THRESHOLD` — Idle threshold in seconds (default: 7 days)
     /// - `TASKS_CLEANUP_INTERVAL` — Scan interval in seconds (default: 15 minutes)
-    /// - `TASKS_CONFLICT_MAX_AGE` — Max age for conflict entries in seconds (default: 24 hours)
     pub fn from_env() -> Self {
         let stale_threshold = std::env::var("TASKS_WORKSPACE_STALE_THRESHOLD")
             .ok()
@@ -72,16 +65,9 @@ impl CleanupConfig {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS));
 
-        let conflict_max_age = std::env::var("TASKS_CONFLICT_MAX_AGE")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_CONFLICT_MAX_AGE_SECS));
-
         Self {
             stale_threshold,
             cleanup_interval,
-            conflict_max_age,
         }
     }
 }
@@ -376,7 +362,5 @@ mod tests {
         assert_eq!(config.stale_threshold, Duration::from_secs(7 * 24 * 60 * 60));
         // Default cleanup interval is 15 minutes (issue #282)
         assert_eq!(config.cleanup_interval, Duration::from_secs(15 * 60));
-        // Default conflict max age is 24 hours (issue #282)
-        assert_eq!(config.conflict_max_age, Duration::from_secs(24 * 60 * 60));
     }
 }

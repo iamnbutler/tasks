@@ -1519,7 +1519,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 
             // Cleanup terminal merge queue entries (issue #132, #282).
             // This removes Merged, Rejected, and stale Conflict entries to prevent unbounded growth.
-            let conflict_cutoff = chrono::Utc::now() - chrono::Duration::from_std(conflict_max_age).unwrap_or(chrono::Duration::hours(24));
+            let chrono_max_age = match chrono::Duration::from_std(conflict_max_age) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        fallback = "24h",
+                        "conflict_max_age exceeds chrono::Duration range, falling back to 24h"
+                    );
+                    chrono::Duration::hours(24)
+                }
+            };
+            let conflict_cutoff = chrono::Utc::now() - chrono_max_age;
             orch_server.cleanup_merge_queue(Some(conflict_cutoff)).await;
         }
     });

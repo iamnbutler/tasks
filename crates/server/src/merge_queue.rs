@@ -194,13 +194,10 @@ impl MergeQueue {
                         if info.detected_at < cutoff {
                             return false;
                         }
-                    } else {
-                        // No conflict_info means we don't know when the conflict started.
-                        // Fall back to queued_at as a conservative estimate.
-                        if e.queued_at < cutoff {
-                            return false;
-                        }
                     }
+                    // No conflict_info means we don't know when the conflict started.
+                    // Retain unknown-age conflicts rather than risk premature removal
+                    // (e.g., entry queued 30h ago but conflicted 1 minute ago).
                 }
             }
 
@@ -361,19 +358,21 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_stale_conflicts_without_info() {
+    fn cleanup_retains_conflicts_without_info() {
         use chrono::{Duration, Utc};
 
         let mut q = MergeQueue::new();
 
-        // Create an entry with an old queued_at time
+        // Create an entry with an old queued_at time but no conflict_info.
+        // Without conflict_info we don't know when the conflict actually started,
+        // so cleanup must retain it to avoid premature removal.
         let mut old_entry = MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1");
         old_entry.queued_at = Utc::now() - Duration::hours(48);
         old_entry.status = MergeStatus::Conflict;
         // No conflict_info — falls back to queued_at
         q.enqueue(old_entry);
 
-        // Create a recent entry
+        // Create another conflict entry without info
         let mut recent_entry = MergeQueueEntry::new("m2", "t2", "https://github.com/test/repo/pull/2");
         recent_entry.queued_at = Utc::now() - Duration::hours(1);
         recent_entry.status = MergeStatus::Conflict;
@@ -383,9 +382,9 @@ mod tests {
         let cutoff = Utc::now() - Duration::hours(24);
         q.cleanup(Some(cutoff));
 
-        // m1 (old, no conflict_info) should be removed, m2 (recent) should remain
-        assert_eq!(q.entries().len(), 1);
-        assert!(q.get("m1").is_none());
+        // Both should be retained â no conflict_info means unknown conflict age
+        assert_eq!(q.entries().len(), 2);
+        assert!(q.get("m1").is_some());
         assert!(q.get("m2").is_some());
     }
 }
