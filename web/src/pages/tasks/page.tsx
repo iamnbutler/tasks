@@ -5,6 +5,7 @@ import {
   ArrowRight,
   ArrowUp,
   ChevronRight,
+  ExternalLink,
   Minus,
   Plus,
   Search,
@@ -33,7 +34,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { Task, TaskState } from "@/lib/types";
+import type { MergeQueueEntry, Task, TaskState } from "@/lib/types";
 import { taskStateMeta, stateSortOrder } from "./columns";
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,16 @@ function groupByState(tasks: Task[]): TaskGroup[] {
 }
 
 // ---------------------------------------------------------------------------
+// PR number helper
+// ---------------------------------------------------------------------------
+
+/** Extract PR number from a GitHub PR URL. */
+function prNumber(url: string): string | null {
+  const match = url.match(/\/pull\/(\d+)/);
+  return match?.[1] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Priority indicator
 // ---------------------------------------------------------------------------
 
@@ -127,9 +138,11 @@ function PriorityIcon({ priority }: { priority: number | null }) {
 function TaskRow({
   task,
   projectName,
+  prUrl,
 }: {
   task: Task;
   projectName: string;
+  prUrl?: string;
 }) {
   const navigate = useNavigate();
   const meta = taskStateMeta[task.state];
@@ -168,6 +181,20 @@ function TaskRow({
         </Badge>
       ))}
 
+      {/* PR link */}
+      {prUrl && (
+        <a
+          href={prUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs font-mono shrink-0"
+        >
+          #{prNumber(prUrl)}
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      )}
+
       {/* Project */}
       <span className="shrink-0 text-xs text-muted-foreground">
         {projectName}
@@ -188,10 +215,12 @@ function TaskRow({
 function TaskGroupSection({
   group,
   projectIdToRepo,
+  taskToPrUrl,
   defaultOpen,
 }: {
   group: TaskGroup;
   projectIdToRepo: Record<string, string>;
+  taskToPrUrl: Record<string, string>;
   defaultOpen: boolean;
 }) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
@@ -223,6 +252,7 @@ function TaskGroupSection({
               key={task.id}
               task={task}
               projectName={projectIdToRepo[task.project] ?? task.project}
+              prUrl={taskToPrUrl[task.id]}
             />
           ))}
         </div>
@@ -250,6 +280,8 @@ export function TasksPage() {
   const [createError, setCreateError] = useState<string | null>(null);
 
   const projects = snapshot?.projects ?? [];
+  const mergeQueue = snapshot?.merge_queue ?? [];
+
   const projectIdToRepo = useMemo(() => {
     const map: Record<string, string> = {};
     for (const p of projects) {
@@ -257,6 +289,17 @@ export function TasksPage() {
     }
     return map;
   }, [projects]);
+
+  // Map task IDs to PR URLs from merge queue entries
+  const taskToPrUrl = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const entry of mergeQueue) {
+      if (entry.pr_url) {
+        map[entry.task_id] = entry.pr_url;
+      }
+    }
+    return map;
+  }, [mergeQueue]);
 
   // Filter by tab and search
   const displayedTasks = useMemo(() => {
@@ -394,6 +437,7 @@ export function TasksPage() {
                 key={group.state}
                 group={group}
                 projectIdToRepo={projectIdToRepo}
+                taskToPrUrl={taskToPrUrl}
                 defaultOpen={!COMPLETED_STATES.includes(group.state)}
               />
             ))}
