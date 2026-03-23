@@ -44,6 +44,9 @@ const ISSUE_FIELDS: &str = r#"
             id
         }
     }
+    # NOTE: Do NOT add MARKED_AS_BLOCKED_BY_EVENT or UNMARKED_AS_BLOCKED_BY_EVENT
+    # here — they do not exist in GitHub's GraphQL schema and will break the
+    # entire poller. This has been attempted and reverted twice (#266, #292).
     timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
         nodes {
             ... on CrossReferencedEvent {
