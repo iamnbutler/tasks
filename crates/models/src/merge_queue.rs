@@ -96,6 +96,10 @@ pub struct MergeQueueEntry {
     /// Set when status is ChangesRequested to guide the agent on what to fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes_requested_feedback: Option<String>,
+    /// Current head commit SHA of the PR branch.
+    /// Used to detect new commits for re-evaluation (spec Section 7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
 }
 
 impl MergeQueueEntry {
@@ -108,7 +112,14 @@ impl MergeQueueEntry {
             queued_at: Utc::now(),
             conflict_info: None,
             changes_requested_feedback: None,
+            head_sha: None,
         }
+    }
+
+    /// Set the head SHA for this entry (builder pattern).
+    pub fn with_head_sha(mut self, sha: impl Into<String>) -> Self {
+        self.head_sha = Some(sha.into());
+        self
     }
 }
 

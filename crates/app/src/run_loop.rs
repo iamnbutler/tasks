@@ -538,7 +538,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                         entry_id.clone(),
                                         task_id.clone(),
                                         &pr_url,
-                                    );
+                                    )
+                                    .with_head_sha(&pr.head_sha);
 
                                     if let Err(e) = poll_server.add_to_merge_queue(entry).await {
                                         warn!(
@@ -1045,6 +1046,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Problem tracker for mode lowering (spec §6.4)
     let problem_tracker = Arc::new(StdMutex::new(ProblemTracker::new()));
 
+    /// Check if a merge queue entry needs evaluation: never evaluated, or has
+    /// new commits (head_sha changed since last evaluation).
+    fn needs_eval(
+        evaluated_prs: &std::collections::HashMap<String, String>,
+        entry: &server::model::merge_queue::MergeQueueEntry,
+    ) -> bool {
+        match evaluated_prs.get(&entry.pr_url) {
+            None => true,
+            Some(last_sha) => entry.head_sha.as_ref().is_some_and(|sha| sha != last_sha),
+        }
+    }
+
     let orchestrator_handle = tokio::spawn(async move {
         let mut eval_interval = tokio::time::interval(orchestrator_eval_interval);
         let mut event_rx = orch_event_bus.subscribe();
@@ -1059,8 +1072,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         let mut eval_queued: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Track the PR URL (used as a proxy for "which PR") that was last evaluated for
         // each entry, so we don't re-evaluate the same PR until it has new commits.
-        // Key: pr_url, Value: last evaluated head SHA (or empty if unknown).
-        let mut evaluated_prs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Key: pr_url, Value: last evaluated head SHA.
+        let mut evaluated_prs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         loop {
             // Either the eval timer fires (pop one entry) or an event arrives
@@ -1093,7 +1106,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                             // Fallback: scan for any pending entries not yet queued/evaluated
                             let state = orch_server.state.read().await;
                             for entry in state.merge_queue.pending() {
-                                if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                                if needs_eval(&evaluated_prs, &entry) && eval_queued.insert(entry.id.clone()) {
                                     eval_queue.push_back(entry.id.clone());
                                 }
                             }
@@ -1109,7 +1122,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                         // Seed the queue with pending entries not yet evaluated
                         let state = orch_server.state.read().await;
                         for entry in state.merge_queue.pending() {
-                            if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                            // Check if PR needs evaluation: never evaluated or has new commits
+                            let needs_eval = match evaluated_prs.get(&entry.pr_url) {
+                                None => true,
+                                Some(last_sha) => entry.head_sha.as_ref().is_some_and(|sha| sha != last_sha),
+                            };
+                            if needs_eval && eval_queued.insert(entry.id.clone()) {
                                 eval_queue.push_back(entry.id.clone());
                             }
                         }
@@ -1119,7 +1137,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     EventType::SystemModePause => {
                         let state = orch_server.state.read().await;
                         for entry in state.merge_queue.pending() {
-                            if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                            if !evaluated_prs.contains_key(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
                                 eval_queue.push_back(entry.id.clone());
                             }
                         }
@@ -1251,11 +1269,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
             // --- Eval tick: pop one entry from the FIFO queue ---
 
             // On startup or mode change, seed the queue with pending entries
-            // that haven't been evaluated yet.
+            // that haven't been evaluated yet or have new commits.
             if eval_queue.is_empty() {
                 let state = orch_server.state.read().await;
                 for entry in state.merge_queue.pending() {
-                    if !evaluated_prs.contains(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
+                    // Check if PR needs evaluation: never evaluated or has new commits
+                    if needs_eval(&evaluated_prs, &entry) && eval_queued.insert(entry.id.clone()) {
                         eval_queue.push_back(entry.id.clone());
                     }
                 }
@@ -1305,10 +1324,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     (task, project)
                 };
 
-                let entry = {
+                let (entry, entry_head_sha) = {
                     let state = orch_server.state.read().await;
                     match state.merge_queue.get(&entry_id) {
-                        Some(e) => e.clone(),
+                        Some(e) => (e.clone(), e.head_sha.clone()),
                         None => continue,
                     }
                 };
@@ -1361,8 +1380,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                     error!(error = %e, "failed to emit orchestrator decision event");
                 }
 
-                // Mark this PR as evaluated so we don't re-evaluate until new commits
-                evaluated_prs.insert(pr_url.clone());
+                // Mark this PR as evaluated so we don't re-evaluate until new commits.
+                // Only record the SHA if we actually know it — if head_sha is None,
+                // don't insert so reconciliation can trigger re-evaluation once the
+                // SHA is discovered.
+                if let Some(sha) = &entry_head_sha {
+                    evaluated_prs.insert(pr_url.clone(), sha.clone());
+                }
 
                 // Act on the decision (issue #337).
                 //
