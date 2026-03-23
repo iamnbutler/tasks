@@ -483,8 +483,9 @@ When a pending merge has conflicts:
   - In Play mode: the orchestrator resolves the conflict autonomously — typically re-engaging the
     implementor agent, or resolving it directly when the resolution is mechanical (rebases,
     trivial merge conflicts).
-  - In Pause mode or when the human is present: the orchestrator surfaces non-trivial conflicts
-    to the human for guidance. Mechanical conflicts are resolved by the orchestrator directly.
+  - In Pause or Stop mode: the orchestrator surfaces non-trivial conflicts to the human for
+    guidance. When the human is not present, mechanical conflicts are resolved directly while
+    complex conflicts wait for human input.
 
 ## 8. Reflections
 
