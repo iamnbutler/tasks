@@ -475,11 +475,36 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 );
 
                                 if !poll_server.has_merge_entry_for_pr(&pr_url).await {
-                                    let task_id = poll_server
+                                    // Priority 1: Branch name match (existing, fast, precise)
+                                    let mut task_id = poll_server
                                         .find_task_by_branch(&pr.head_ref)
-                                        .await
-                                        .unwrap_or_default();
+                                        .await;
 
+                                    // Priority 2: PR's linked_issues (GitHub's own linkage via
+                                    // closing keywords or manual links) — issue #258
+                                    if task_id.is_none() {
+                                        for linked_issue in &pr.linked_issues {
+                                            if let Some(id) = poll_server
+                                                .find_task_by_github_issue(
+                                                    &pr.owner,
+                                                    &pr.repo,
+                                                    linked_issue.number,
+                                                )
+                                                .await
+                                            {
+                                                debug!(
+                                                    pr = pr.number,
+                                                    issue = linked_issue.number,
+                                                    task_id = %id,
+                                                    "linked task via PR's linked_issues"
+                                                );
+                                                task_id = Some(id);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    let task_id = task_id.unwrap_or_default();
                                     let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
                                     let entry = MergeQueueEntry::new(
                                         entry_id.clone(),
@@ -536,7 +561,33 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
-                            let task_id = match poll_server.find_task_by_branch(&pr.head_ref).await {
+                            // Priority 1: Branch name match
+                            let mut task_id = poll_server.find_task_by_branch(&pr.head_ref).await;
+
+                            // Priority 2: PR's linked_issues (issue #258)
+                            if task_id.is_none() {
+                                for linked_issue in &pr.linked_issues {
+                                    if let Some(id) = poll_server
+                                        .find_task_by_github_issue(
+                                            &pr.owner,
+                                            &pr.repo,
+                                            linked_issue.number,
+                                        )
+                                        .await
+                                    {
+                                        debug!(
+                                            pr = pr.number,
+                                            issue = linked_issue.number,
+                                            task_id = %id,
+                                            "linked task via PR's linked_issues for closure"
+                                        );
+                                        task_id = Some(id);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let task_id = match task_id {
                                 Some(id) => id,
                                 None => continue,
                             };
