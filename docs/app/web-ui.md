@@ -53,6 +53,7 @@ The task list shows all tasks with columns for:
 - Project
 - Assignee (if any)
 - Created date
+- PR link (shown on the right for tasks with submitted changes in the merge queue)
 
 ### Creating a Task
 
@@ -140,6 +141,8 @@ Filter events by:
 - **Type** - Specific event type
 - **Task** - Events for a specific task
 - **Time** - Time range
+
+The default filter is **Important**, which excludes high-frequency `agent:message` and `human:message` events (raw agent output). Use the **All** or **Agent** filter presets to see verbose output. Task-specific event views (task detail page) always show all events.
 
 ## Keyboard Shortcuts
 

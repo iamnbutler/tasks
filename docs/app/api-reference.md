@@ -65,6 +65,25 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild from GitHub
+
+Clears all tasks and merge queue entries (in memory and database), then signals the poll loop to re-fetch all data from GitHub. Preserves accounting data, event logs, projects, and operating mode.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3
+}
+```
+
+> **Warning:** Destructive. All in-progress task state is lost. Use when local state has diverged from GitHub.
+
 ### Tasks
 
 #### List All Tasks
@@ -79,11 +98,18 @@ GET /api/tasks
 [
   {
     "id": "task-uuid",
+    "source": { "type": "github_issue", "owner": "acme", "repo": "app", "number": 42 },
     "title": "Fix login bug",
-    "state": "in_progress",
-    "project_id": "project-uuid",
-    "github_issue_number": 42,
-    "created_at": "2024-01-15T10:30:00Z"
+    "description": "...",
+    "state": "running",
+    "project": "project-uuid",
+    "labels": ["bug"],
+    "priority": null,
+    "session_id": null,
+    "retry_count": 0,
+    "source_number": 42,
+    "created_at": "2024-01-15T10:30:00Z",
+    "updated_at": "2024-01-15T10:31:00Z"
   }
 ]
 ```
