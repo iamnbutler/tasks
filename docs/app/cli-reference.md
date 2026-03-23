@@ -84,6 +84,22 @@ ID  Repository              Status
 2   example/other-repo      active
 ```
 
+### `rebuild`
+
+Rebuild state from GitHub. Clears all tasks and merge queue entries, then re-polls all tracked projects to reconstruct state from scratch.
+
+```bash
+tasks rebuild
+```
+
+Requires `GITHUB_TOKEN`. Preserves projects, accounting data, and event logs.
+
+> **Warning:** Destructive. All current task state will be cleared. Use to recover from data corruption or to resync after database issues.
+
+**Behavior:**
+- Open issues → tasks (via the standard label-based scheduler rules)
+- Open, non-draft PRs → merge queue entries (only if a linked task is found by branch name; PRs without a linked task are skipped)
+
 ## Environment Variables
 
 | Variable | Description | Required |

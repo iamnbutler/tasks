@@ -65,6 +65,27 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild from GitHub
+
+Clears all tasks and merge queue entries (in memory and database), then signals the poll loop to re-fetch all data from GitHub. Preserves accounting data, event logs, projects, and operating mode.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3
+}
+```
+
+> **Note:** The response contains counts of items *cleared*. The actual re-fetch happens asynchronously in the poll loop — new tasks and merge entries will appear as the pollers discover items from GitHub.
+
+> **Warning:** Destructive. All in-progress task state is lost. Use when local state has diverged from GitHub.
+
 ### Tasks
 
 #### List All Tasks
