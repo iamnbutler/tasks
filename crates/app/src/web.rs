@@ -46,6 +46,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}", axum::routing::patch(update_task))
+        .route("/tasks/reorder", post(reorder_tasks))
         .route("/tasks/{id}/events", get(get_task_events))
         .route("/tasks/{id}/chat", post(send_chat))
         .route("/tasks/{id}/cancel", post(cancel_task))
@@ -135,6 +137,19 @@ struct CreateIssueResponse {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateTaskRequest {
+    /// New priority value. Lower numbers are higher priority.
+    priority: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct ReorderTasksRequest {
+    /// Task IDs in the desired order. Tasks will be assigned
+    /// priorities 1, 2, 3, ... in this order.
+    task_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -283,6 +298,46 @@ async fn get_task(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// PATCH /api/tasks/:id — Update a task's properties.
+///
+/// Currently supports updating priority for manual queue reordering.
+async fn update_task(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateTaskRequest>,
+) -> Result<Json<models::task::Task>, ApiError> {
+    state
+        .server
+        .set_task_priority(&id, req.priority, Actor::Human)
+        .await
+        .map_err(ApiError::Server)?;
+
+    let server_state = state.server.state.read().await;
+    server_state
+        .tasks
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("task not found: {}", id)))
+}
+
+/// POST /api/tasks/reorder — Reorder tasks by assigning sequential priorities.
+///
+/// Takes a list of task IDs in the desired order. Tasks will be assigned
+/// priorities 1, 2, 3, ... in that order. This is used for drag-and-drop
+/// reordering in the GUI.
+async fn reorder_tasks(
+    State(state): State<ApiState>,
+    Json(req): Json<ReorderTasksRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .server
+        .reorder_tasks(&req.task_ids, Actor::Human)
+        .await
+        .map_err(ApiError::Server)?;
+    Ok(StatusCode::OK)
 }
 
 /// GET /api/tasks/:id/events — Get event history for a task.
