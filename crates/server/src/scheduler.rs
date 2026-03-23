@@ -169,8 +169,8 @@ pub fn reconcile_task(
     // Derive blocked_by from GitHub blocking issue relationships.
     // Format: "gh-{owner}-{repo}-issue-{number}" to match our task ID convention.
     // NOTE: BlockingIssueRef lacks owner/repo fields, so we assume same-repo
-    // blockers. Cross-repo blocking relationships would need BlockingIssueRef
-    // extended with owner/repo to generate correct task IDs.
+    // blockers. Cross-repo blocking relationships generate wrong task IDs.
+    // See #261 for the fix.
     let new_blocked_by: Vec<String> = issue
         .blocked_by
         .iter()
