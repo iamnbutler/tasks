@@ -81,8 +81,9 @@ GET /api/tasks
     "id": "task-uuid",
     "title": "Fix login bug",
     "state": "in_progress",
-    "project_id": "project-uuid",
-    "github_issue_number": 42,
+    "project": "project-uuid",
+    "source_number": 42,
+    "source_created_at": "2024-01-15T10:00:00Z",
     "created_at": "2024-01-15T10:30:00Z"
   }
 ]

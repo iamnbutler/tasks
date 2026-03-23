@@ -68,6 +68,15 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 7. **Human** approves/rejects in merge queue
 8. **Merger** lands approved changes
 
+### Task Dispatch Ordering
+
+The dispatcher sorts ready tasks using these criteria (in order):
+
+1. **Blocked**: Tasks with unresolved blocking issues are held back.
+2. **Priority**: Higher numeric priority value runs first.
+3. **Source number**: Lower GitHub issue/PR number runs first. Issues are assigned sequentially, so lower numbers are older — this ensures related tasks (e.g., Phase 1, Phase 2, Phase 3) are processed in logical sequence.
+4. **Created at**: For tasks without a source number (internal tasks), older `created_at` timestamps run first.
+
 ### Event System
 
 All state changes are recorded as immutable events:
