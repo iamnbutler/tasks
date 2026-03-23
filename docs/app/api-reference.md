@@ -121,6 +121,32 @@ Content-Type: application/json
 }
 ```
 
+#### Cancel Task
+
+Cancel an active task.
+
+```http
+POST /api/tasks/:id/cancel
+```
+
+### Issues
+
+#### Create Issue
+
+Create a new GitHub issue (which becomes a task on the next poll cycle).
+
+```http
+POST /api/issues
+Content-Type: application/json
+
+{
+  "project_id": "project-uuid",
+  "title": "Fix login bug",
+  "body": "Description of the issue",
+  "labels": ["bug", "priority:high"]
+}
+```
+
 ### Projects
 
 #### List Projects
@@ -211,6 +237,47 @@ Merge all approved entries (Pause mode only).
 POST /api/merge-queue/flush
 ```
 
+### Orchestrator
+
+#### Chat with Orchestrator
+
+Send a message to the AI project foreman.
+
+```http
+POST /api/orchestrator/chat
+Content-Type: application/json
+
+{
+  "message": "What's the status of the authentication work?"
+}
+```
+
+### Accounting
+
+#### Get Accounting Summary
+
+Returns aggregate token and cost usage.
+
+```http
+GET /api/accounting
+```
+
+#### List Task Accounting
+
+Returns per-task accounting entries.
+
+```http
+GET /api/accounting/tasks
+```
+
+#### Get Task Accounting
+
+Returns accounting details for a specific task.
+
+```http
+GET /api/accounting/tasks/:id
+```
+
 ### Events (SSE)
 
 Server-Sent Events stream for real-time updates.
@@ -239,6 +306,18 @@ event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
 
+### AI Completions
+
+Internal endpoints used by the web frontend for AI-assisted task creation.
+
+```http
+POST /api/completions
+POST /api/completions/name
+POST /api/completions/describe
+POST /api/completions/brainstorm
+POST /api/completions/summarize
+```
+
 ## Error Responses
 
 All errors return JSON with the following structure:
@@ -261,4 +340,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*

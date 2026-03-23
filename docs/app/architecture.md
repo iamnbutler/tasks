@@ -144,4 +144,4 @@ Per-task event logs at `~/.local/state/tasks/events/{task-id}/events.jsonl`.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*

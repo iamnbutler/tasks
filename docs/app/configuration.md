@@ -13,9 +13,52 @@ Tasks is configured through environment variables and a `.env` file.
 
 ### Optional
 
+#### Server
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TASKS_DATA_DIR` | Data storage directory | `~/.local/state/tasks/` |
+| `TASKS_WEB_PORT` | Web UI port | `4800` |
+
+#### Sessions & Dispatch
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_MAX_SESSIONS` | Global max concurrent sessions | `5` |
+| `TASKS_MAX_SESSIONS_PER_PROJECT` | Max sessions per project | `1` |
+| `TASKS_MAX_RETRIES` | Max retry attempts for failed tasks | `3` |
+| `TASKS_POLL_INTERVAL` | GitHub poll interval (seconds) | `60` |
+| `TASKS_DISPATCH_INTERVAL` | Dispatch tick interval (seconds) | `30` |
+| `TASKS_ORCHESTRATOR_EVAL_INTERVAL` | Orchestrator evaluation interval (seconds) | `15` |
+| `TASKS_PROGRESS_THRESHOLD` | Min session duration to count as progress (seconds) | `60` |
+
+#### Containers
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_CONTAINER_IMAGE` | Container image for agent sessions | `tasks-agent:latest` |
+| `TASKS_CONTAINER_MEMORY` | Container memory limit | `8G` |
+
+#### Memory Management
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_MEMORY_WARN_PCT` | Memory % to trigger a warning | `75` |
+| `TASKS_MEMORY_SOFT_LIMIT_PCT` | Memory % to pause dispatch | `85` |
+| `TASKS_MEMORY_HARD_LIMIT_PCT` | Memory % to emergency-stop sessions | `92` |
+
+#### Cleanup
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_WORKSPACE_STALE_THRESHOLD` | Idle workspace age before cleanup (seconds) | `604800` (7 days) |
+| `TASKS_CLEANUP_INTERVAL` | Workspace cleanup scan interval (seconds) | `900` (15 min) |
+| `TASKS_CONFLICT_MAX_AGE` | Max age for stale conflict entries before cleanup (seconds) | `86400` (24 hours) |
+
+#### Desktop App
+
+| Variable | Description | Default |
+|----------|-------------|---------|
 | `TASKS_SERVER_URL` | Server URL (for desktop app) | `http://localhost:4800` |
 
 ## .env File
@@ -154,4 +197,4 @@ Consider network isolation for sensitive environments.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*

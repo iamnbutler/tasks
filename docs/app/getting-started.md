@@ -100,4 +100,4 @@ This adds a GitHub repository for Tasks to monitor.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*

@@ -63,11 +63,23 @@ Use the filter controls to narrow down tasks:
 
 ### Task Detail
 
-Click a task to view its detail page:
+Click a task to view its detail page. The main area uses a tabbed interface:
 
-- **Description Tab** - Full task description and metadata
-- **Events Tab** - Timeline of all task events
-- **Chat Tab** - Send messages to active agent session
+- **Chat Tab** - Send messages to the active agent session (shown by default)
+- **Details Tab** - Full task description and metadata
+
+The properties sidebar on the right shows task metadata, status, project, and a timeline of lifecycle events.
+
+### Creating a Task
+
+Use the **New Task** button in the task list to create a GitHub issue directly from the UI. Fill in:
+
+- **Project** - Which repository to create the issue in
+- **Title** - Issue title
+- **Description** - Markdown-formatted body
+- **Labels** - Comma-separated labels (optional)
+
+The task appears in the list once the poller picks up the new issue on its next cycle.
 
 ## Merge Queue
 
@@ -96,20 +108,24 @@ In Pause mode, use the "Flush" button to merge all approved entries.
 
 ## Orchestrator
 
-The Orchestrator view provides a chat interface with the AI project foreman.
+The Orchestrator view shows an activity feed of orchestrator decisions and provides a chat interface with the AI project foreman.
 
-### Capabilities
+### Activity Feed
 
-The orchestrator can:
+The feed displays orchestrator actions in a conversational format, including:
+
+- **Decisions** - Approvals, rejections, and escalations with task context (e.g. "Approving 'Fix bug' (#123) in tasks")
+- **Feedback** - Quality evaluation results with reasoning
+- **Escalations** - Actions that require human attention, with context about what happened and what to do
+
+### Chat Interface
+
+Type messages in the input field and press Enter to send. The orchestrator can:
 
 - Provide project status updates
 - Answer questions about task progress
 - Explain decisions and prioritization
 - Discuss architecture and approach
-
-### Chat Interface
-
-Type messages in the input field and press Enter to send. The conversation history is preserved across sessions.
 
 ## Events
 
@@ -147,4 +163,4 @@ Filter events by:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-23*
