@@ -360,6 +360,23 @@ Mode transitions follow a severity ordering: Stop < Pause < Play.
 - This ensures the system can protect itself, but only the human can grant more autonomy.
 - Transitions take effect immediately for new dispatches and merge decisions.
 
+**Mode Lowering Triggers**
+
+The orchestrator monitors for failure patterns that warrant lowering operating mode from Play to
+Pause:
+
+- **Consecutive evaluation failures**: 3 consecutive API or internal errors during merge evaluation
+- **Consecutive PR rejections**: 5 consecutive PR rejections (pattern of bad PRs)
+- **Repeated merge conflicts**: 3 conflicts within a 10-minute window
+- **Repeated agent errors**: 3 agent errors within a 10-minute window
+- **Repeated task failures**: 3 task failures within a 10-minute window
+
+These thresholds are defaults. When any threshold is exceeded, the orchestrator emits an escalation
+event and transitions from Play to Pause.
+
+When the human raises the mode back to Play, the problem tracker resets, allowing it to detect new
+failure patterns.
+
 ## 7. Merge Queue
 
 The merge queue is an ordered list of pull requests waiting to be merged. It is independent of
