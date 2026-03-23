@@ -28,6 +28,7 @@ use tasks_orchestrator::{
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
 use crate::problem_tracker::ProblemTracker;
+use crate::update::UpdateChecker;
 
 /// Enum wrapper for orchestrator implementations.
 ///
@@ -131,11 +132,23 @@ fn classify_conflict(status: &tasks_github::model::PrMergeStatus) -> ConflictTyp
     }
 }
 
+/// Result of running the platform.
+#[derive(Debug)]
+pub enum RunResult {
+    /// Normal shutdown (ctrl-c or signal).
+    Shutdown,
+    /// Update ready — exit with code 100 for wrapper script.
+    UpdateReady,
+}
+
 /// Run the Tasks platform.
 ///
 /// Constructs all components and starts the GitHub poll loop,
 /// dispatch tick loop, and session management.
-pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Returns `RunResult::UpdateReady` when an update is ready and the
+/// platform should restart after pulling/rebuilding.
+pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Error>> {
     info!(
         data_dir = %config.data_dir,
         max_sessions = config.max_sessions,
@@ -291,6 +304,34 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
     });
+
+    // --- 5d. Create update checker (self-update mechanism) ---
+
+    let (update_shutdown_tx, update_shutdown_rx) = tokio::sync::watch::channel(false);
+    let update_checker = if config.update_check_enabled {
+        let checker = UpdateChecker::new(config.update_check_interval);
+        let state = checker.state();
+
+        // Clone values needed for the spawned task
+        let shutdown_rx = update_shutdown_rx.clone();
+        let check_interval = config.update_check_interval;
+
+        let handle = tokio::spawn(async move {
+            let checker = UpdateChecker::new(check_interval);
+            checker.run_loop(shutdown_rx).await;
+        });
+
+        info!(
+            interval = ?config.update_check_interval,
+            auto_apply = config.update_auto_apply,
+            "update checker enabled"
+        );
+
+        Some((state, handle))
+    } else {
+        info!("update checker disabled");
+        None
+    };
 
     // --- 6. Emit system:started ---
 
@@ -1794,13 +1835,92 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- 10. Wait for shutdown ---
+    // --- 10. Wait for shutdown or update trigger ---
 
-    tokio::signal::ctrl_c().await?;
+    let update_triggered = if let Some((ref update_state, _)) = update_checker {
+        // Check if auto-apply is enabled and wait for either shutdown or update
+        if config.update_auto_apply {
+            let state = update_state.clone();
+            let session_timeout = config.update_session_timeout;
+
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        break false;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        let update = state.read().await;
+                        if update.update_available && update.scope.needs_rebuild() {
+                            info!(
+                                current = ?update.current_commit,
+                                target = ?update.target_commit,
+                                scope = ?update.scope,
+                                "update available, initiating graceful shutdown for update"
+                            );
+                            drop(update);
+
+                            // Lower mode to Stop
+                            if let Err(e) = server
+                                .set_mode(server::Mode::Stop, &events::Actor::System)
+                                .await
+                            {
+                                error!(error = %e, "failed to lower mode to Stop for update");
+                            }
+
+                            // Wait for all sessions to finish (with timeout)
+                            let start = std::time::Instant::now();
+                            loop {
+                                let active = session_manager.active_count().await;
+                                if active == 0 {
+                                    info!("all sessions stopped, proceeding with update");
+                                    break;
+                                }
+                                if start.elapsed() > session_timeout {
+                                    warn!(
+                                        active_sessions = active,
+                                        "session timeout exceeded, forcing update"
+                                    );
+                                    session_manager.destroy_all().await;
+                                    break;
+                                }
+                                debug!(
+                                    active_sessions = active,
+                                    elapsed = ?start.elapsed(),
+                                    "waiting for sessions to stop"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+
+                            // Write scope file for wrapper script
+                            let scope = state.read().await.scope.clone();
+                            if let Err(e) = crate::update::write_scope_file(&scope, &config.data_dir) {
+                                error!(error = %e, "failed to write update scope file");
+                            }
+
+                            break true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Auto-apply disabled, just wait for ctrl-c
+            tokio::signal::ctrl_c().await?;
+            false
+        }
+    } else {
+        tokio::signal::ctrl_c().await?;
+        false
+    };
+
     info!("shutting down");
 
+    // Signal update checker to stop
+    let _ = update_shutdown_tx.send(true);
+
     // Stop all sessions and destroy their containers
-    session_manager.destroy_all().await;
+    if !update_triggered {
+        session_manager.destroy_all().await;
+    }
 
     // Cancel the loops
     poll_handle.abort();
@@ -1810,12 +1930,20 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     watchdog_handle.abort();
     cleanup_handle.abort();
     stop_mode_handle.abort();
+    if let Some((_, handle)) = update_checker {
+        handle.abort();
+    }
     if let Some(h) = web_handle {
         h.abort();
     }
 
-    info!("shutdown complete");
-    Ok(())
+    if update_triggered {
+        info!("shutdown complete, exiting for update (code 100)");
+        Ok(RunResult::UpdateReady)
+    } else {
+        info!("shutdown complete");
+        Ok(RunResult::Shutdown)
+    }
 }
 
 /// Per-project workflow settings loaded from `workflow.toml` (spec §14).

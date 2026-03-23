@@ -49,6 +49,15 @@ pub struct AppConfig {
     pub web: bool,
     /// Web server port (default: 4800).
     pub web_port: u16,
+    /// Whether to run the update checker background task (default: true).
+    pub update_check_enabled: bool,
+    /// Update check interval (default: 300s / 5 minutes).
+    pub update_check_interval: Duration,
+    /// Whether to automatically apply updates when detected (default: false).
+    /// When false, updates are detected but not applied until manually triggered.
+    pub update_auto_apply: bool,
+    /// Timeout for waiting on sessions to stop during update (default: 300s / 5 minutes).
+    pub update_session_timeout: Duration,
 }
 
 impl AppConfig {
@@ -166,6 +175,24 @@ impl AppConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4800),
+            update_check_enabled: std::env::var("TASKS_UPDATE_CHECK_ENABLED")
+                .map(|s| s != "false" && s != "0")
+                .unwrap_or(true),
+            update_check_interval: Duration::from_secs(
+                std::env::var("TASKS_UPDATE_CHECK_INTERVAL")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300),
+            ),
+            update_auto_apply: std::env::var("TASKS_UPDATE_AUTO_APPLY")
+                .map(|s| s == "true" || s == "1")
+                .unwrap_or(false),
+            update_session_timeout: Duration::from_secs(
+                std::env::var("TASKS_UPDATE_SESSION_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300),
+            ),
         })
     }
 }
