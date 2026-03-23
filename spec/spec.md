@@ -225,6 +225,46 @@ Human <--chat/voice--> Orchestrator
 The human primarily interacts with the orchestrator. Direct interaction with sessions is
 available for steering or answering questions, but the default flow is autonomous.
 
+### 4.5 Orchestrator Chat Interface
+
+The human can talk to the orchestrator directly via chat (§4.1). This section specifies the
+interface.
+
+#### Chat Context
+
+When processing a message, the orchestrator receives a snapshot of current system state:
+
+- Current operating mode (Stop, Pause, Play)
+- All projects
+- All tasks with their current state
+- Recent orchestrator events (decisions, escalations, mode changes)
+- Whether a human is currently connected
+
+This context enables the orchestrator to answer questions about system status, explain recent
+activity, and make informed suggestions.
+
+#### Conversation History
+
+The orchestrator maintains conversation history across messages within a server session.
+
+- History is bounded to 40 messages to prevent unbounded growth.
+- History persists while the server is running but is not persisted to disk.
+- When the server restarts, conversation history starts fresh.
+
+#### Queue Bypass
+
+Human chat messages to the orchestrator bypass the evaluation queue (§7.1) and are processed
+immediately. This ensures the human can always communicate with the orchestrator without
+waiting for queued PR evaluations to complete.
+
+#### Events
+
+- `orchestrator:message` — Emitted when the human sends a message to the orchestrator.
+  Contains `{ message: string }`. The `task` field is `"system"` (not scoped to a task).
+- `orchestrator:response` — Emitted when the orchestrator responds. Contains
+  `{ message: string }` and optionally `{ error: true }` if an error occurred.
+  The `task` field is `"system"`.
+
 ## 5. Domain Model
 
 ### 5.1 Task
@@ -423,7 +463,7 @@ Implications:
    that task may be re-engaged with feedback.
 
 Human chat messages to the orchestrator bypass the evaluation queue and are processed
-immediately.
+immediately (see §4.5).
 
 ### 7.2 Merge Authority
 
@@ -689,6 +729,8 @@ Orchestrator events:
 - `orchestrator:feedback` — orchestrator sent feedback to an agent
 - `orchestrator:escalation` — orchestrator surfaced something to the human
 - `orchestrator:decision` — orchestrator made a judgment call
+- `orchestrator:message` — human sent a chat message to the orchestrator (§4.5)
+- `orchestrator:response` — orchestrator replied to human chat (§4.5)
 
 System events:
 
