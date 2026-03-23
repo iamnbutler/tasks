@@ -494,6 +494,11 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
     let client = tasks_github::client::GitHubClient::new(&github_token);
     for (entry_id, pr_url) in &entries_to_merge {
         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+            // Transition to Merging before the API call for visibility
+            if let Err(e) = state.server.mark_entry_merging(entry_id, pr_url).await {
+                tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging");
+            }
+
             match client.merge_pull_request(&owner, &repo, number).await {
                 Ok(true) => {
                     tracing::info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged via flush");
@@ -556,6 +561,11 @@ async fn approve_merge(
         let github_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
         if !github_token.is_empty() {
             if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                // Transition to Merging before the API call for visibility
+                if let Err(e) = state.server.mark_entry_merging(&id, &pr_url).await {
+                    tracing::error!(entry_id = %id, error = %e, "failed to mark entry as merging");
+                }
+
                 let client = tasks_github::client::GitHubClient::new(&github_token);
                 match client.merge_pull_request(&owner, &repo, number).await {
                     Ok(true) => {

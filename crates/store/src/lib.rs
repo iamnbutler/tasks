@@ -807,9 +807,10 @@ mod tests {
         for (id, status) in [
             ("m1", MergeStatus::Pending),
             ("m2", MergeStatus::Approved),
-            ("m3", MergeStatus::Rejected),
-            ("m4", MergeStatus::Merged),
-            ("m5", MergeStatus::Conflict),
+            ("m3", MergeStatus::Merging),
+            ("m4", MergeStatus::Rejected),
+            ("m5", MergeStatus::Merged),
+            ("m6", MergeStatus::Conflict),
         ] {
             let mut entry = MergeQueueEntry::new(id, "t1", "https://github.com/test/repo/pull/1");
             entry.status = status;

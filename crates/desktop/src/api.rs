@@ -66,6 +66,7 @@ pub fn merge_status_display_name(status: &MergeStatus) -> &'static str {
     match status {
         MergeStatus::Pending => "Pending",
         MergeStatus::Approved => "Approved",
+        MergeStatus::Merging => "Merging",
         MergeStatus::Rejected => "Rejected",
         MergeStatus::Merged => "Merged",
         MergeStatus::Conflict => "Conflict",

@@ -48,6 +48,8 @@ pub enum EventType {
     // Merge events
     MergeQueued,
     MergeApproved,
+    /// Merge in progress — GitHub API call executing.
+    MergeMerging,
     MergeRejected,
     MergeChangesRequested,
     MergeCompleted,
@@ -115,6 +117,7 @@ impl EventType {
             Self::HumanMessage => "human:message",
             Self::MergeQueued => "merge:queued",
             Self::MergeApproved => "merge:approved",
+            Self::MergeMerging => "merge:merging",
             Self::MergeRejected => "merge:rejected",
             Self::MergeChangesRequested => "merge:changes_requested",
             Self::MergeCompleted => "merge:completed",
@@ -195,6 +198,7 @@ impl TryFrom<String> for EventType {
             "human:message" => Ok(Self::HumanMessage),
             "merge:queued" => Ok(Self::MergeQueued),
             "merge:approved" => Ok(Self::MergeApproved),
+            "merge:merging" => Ok(Self::MergeMerging),
             "merge:rejected" => Ok(Self::MergeRejected),
             "merge:changes_requested" => Ok(Self::MergeChangesRequested),
             "merge:completed" => Ok(Self::MergeCompleted),

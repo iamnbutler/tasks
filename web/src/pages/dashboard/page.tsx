@@ -68,6 +68,7 @@ const taskChartConfig: ChartConfig = Object.fromEntries(
 const mergeStatusColors: Record<MergeStatus, string> = {
   pending: "hsl(45, 93%, 47%)",
   approved: "hsl(142, 71%, 45%)",
+  merging: "hsl(187, 71%, 55%)",
   rejected: "hsl(0, 84%, 60%)",
   merged: "hsl(217, 91%, 60%)",
   conflict: "hsl(0, 84%, 60%)",
@@ -77,6 +78,7 @@ const mergeStatusColors: Record<MergeStatus, string> = {
 const mergeStatusLabels: Record<MergeStatus, string> = {
   pending: "Pending",
   approved: "Approved",
+  merging: "Merging",
   rejected: "Rejected",
   merged: "Merged",
   conflict: "Conflict",
