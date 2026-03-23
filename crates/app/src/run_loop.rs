@@ -1707,6 +1707,45 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- 8d. Spawn stop mode listener (spec §6.1) ---
+    //
+    // When mode changes to Stop, terminate all running sessions.
+    // This is event-driven so that any mode change source (web, CLI, orchestrator)
+    // triggers session termination consistently.
+
+    let stop_session_mgr = session_manager.clone();
+    let stop_event_bus = server.event_bus.clone();
+
+    let stop_mode_handle = tokio::spawn(async move {
+        let mut rx = stop_event_bus.subscribe();
+        loop {
+            let event = match rx.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        skipped = n,
+                        "stop mode listener lagged, some events may be missed"
+                    );
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            // Only handle SystemModeStop events
+            if event.event_type == EventType::SystemModeStop {
+                // Give sessions 5 seconds to stop gracefully before force-destroying containers
+                let timeout = std::time::Duration::from_secs(5);
+                let stopped = stop_session_mgr.stop_all_with_timeout(timeout).await;
+                if stopped > 0 {
+                    info!(
+                        stopped_sessions = stopped,
+                        "terminated sessions for Stop mode (event-driven)"
+                    );
+                }
+            }
+        }
+    });
+
     // --- 9. Optionally spawn web server ---
 
     let web_handle = if config.web {
@@ -1770,6 +1809,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     orchestrator_handle.abort();
     watchdog_handle.abort();
     cleanup_handle.abort();
+    stop_mode_handle.abort();
     if let Some(h) = web_handle {
         h.abort();
     }
