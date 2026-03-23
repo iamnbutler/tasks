@@ -283,6 +283,19 @@ impl Server {
         new_state: TaskState,
         actor: Actor,
     ) -> Result<(), ServerError> {
+        self.set_task_state_with_data(task_id, new_state, actor, serde_json::json!({}))
+            .await
+    }
+
+    /// Transition a task's state and emit the corresponding event with custom data.
+    /// Update task state, persist to store, and publish an event with the provided data.
+    pub async fn set_task_state_with_data(
+        &self,
+        task_id: &str,
+        new_state: TaskState,
+        actor: Actor,
+        data: serde_json::Value,
+    ) -> Result<(), ServerError> {
         self.apply_task_state(task_id, new_state).await?;
 
         let event_type = match new_state {
@@ -298,7 +311,7 @@ impl Server {
             TaskState::Cancelled => EventType::TaskStateCancelled,
         };
 
-        let event = Event::new(event_type, task_id, actor, serde_json::json!({}));
+        let event = Event::new(event_type, task_id, actor, data);
         self.event_bus.publish(event).await?;
         Ok(())
     }
