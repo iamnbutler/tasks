@@ -277,12 +277,36 @@ impl Server {
 
     /// Transition a task's state and emit the corresponding event.
     /// Update task state, persist to store, and publish an event.
+    ///
+    /// If the task is already in a terminal state, this is a no-op to prevent
+    /// duplicate events when multiple paths detect the same completion
+    /// (e.g., issue closure + PR merge in the same poll cycle).
     pub async fn set_task_state(
         &self,
         task_id: &str,
         new_state: TaskState,
         actor: Actor,
     ) -> Result<(), ServerError> {
+        // Check if task is already terminal to prevent duplicate events
+        let current_state = {
+            let state = self.state.read().await;
+            state
+                .tasks
+                .get(task_id)
+                .map(|t| t.state)
+                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?
+        };
+
+        if current_state.is_terminal() {
+            tracing::debug!(
+                task_id = %task_id,
+                current_state = ?current_state,
+                requested_state = ?new_state,
+                "skipping state transition: task already in terminal state"
+            );
+            return Ok(());
+        }
+
         self.apply_task_state(task_id, new_state).await?;
 
         let event_type = match new_state {
