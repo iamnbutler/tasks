@@ -21,6 +21,7 @@ import type { Event } from "@/lib/types";
 // ---------------------------------------------------------------------------
 
 const FILTERS = [
+  { key: "important", label: "Important" },
   { key: "all", label: "All" },
   { key: "task", label: "Task" },
   { key: "agent", label: "Agent" },
@@ -30,6 +31,9 @@ const FILTERS = [
 ] as const;
 
 type FilterKey = (typeof FILTERS)[number]["key"];
+
+/** Event types excluded from "Important" filter (high-frequency, verbose events) */
+const VERBOSE_EVENT_TYPES = ["agent:message", "human:message"];
 
 function badgeClasses(type: string): string {
   if (type.startsWith("task:")) return "bg-blue-500/15 text-blue-400 border-blue-500/30";
@@ -42,6 +46,7 @@ function badgeClasses(type: string): string {
 
 function matchesFilter(event: Event, filter: FilterKey): boolean {
   if (filter === "all") return true;
+  if (filter === "important") return !VERBOSE_EVENT_TYPES.includes(event.type);
   return event.type.startsWith(`${filter}:`);
 }
 
@@ -56,7 +61,7 @@ function truncateData(data: Record<string, unknown>, max = 100): string {
 
 export function EventsPage() {
   const { events: liveEvents } = useAppState();
-  const [activeFilter, setActiveFilter] = useState<FilterKey>("all");
+  const [activeFilter, setActiveFilter] = useState<FilterKey>("important");
   const [paused, setPaused] = useState(false);
 
   const frozenRef = useRef<Event[]>([]);

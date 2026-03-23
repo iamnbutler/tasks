@@ -18,6 +18,10 @@ const POLL_INTERVAL_MS = 5_000;
 /** Regex matching event types that should trigger a snapshot refresh. */
 const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
 
+/** High-frequency event types excluded from the global events buffer.
+ * These events are still available via task-specific event fetches. */
+const EXCLUDED_FROM_BUFFER = ["agent:message", "human:message"];
+
 export interface AppState {
   snapshot: Snapshot | null;
   events: Event[];
@@ -133,10 +137,15 @@ function useAppStateCore(): AppState {
         try {
           const event: Event = JSON.parse(msg.data);
 
-          setEvents((prev) => {
-            const next = [event, ...prev];
-            return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
-          });
+          // Only add non-excluded events to the buffer to prevent
+          // high-frequency events like agent:message from drowning out
+          // important state changes (see issue #318).
+          if (!EXCLUDED_FROM_BUFFER.includes(event.type)) {
+            setEvents((prev) => {
+              const next = [event, ...prev];
+              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+            });
+          }
 
           if (STATE_CHANGING_EVENT.test(event.type)) {
             refreshSnapshot();
