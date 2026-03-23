@@ -139,28 +139,27 @@ impl MergeQueue {
             .collect()
     }
 
-    /// Flush: push through all approved entries (spec Section 6.2).
+    /// Collect approved entries for flush (spec Section 6.2).
     ///
-    /// Returns the IDs of entries that were flushed. Only valid in Pause mode.
-    pub fn flush(&mut self, mode: Mode) -> Result<Vec<String>, MergeQueueError> {
+    /// Returns (entry_id, pr_url) pairs of approved entries. Only valid in Pause mode.
+    /// The caller is responsible for performing the actual merge and updating status
+    /// via mark_merged() or mark_conflict().
+    pub fn collect_approved_for_flush(
+        &self,
+        mode: Mode,
+    ) -> Result<Vec<(String, String)>, MergeQueueError> {
         if !mode.flush_available() {
             return Err(MergeQueueError::Held(mode));
         }
 
-        let ids: Vec<String> = self
+        let entries: Vec<(String, String)> = self
             .entries
             .iter()
             .filter(|e| e.status == MergeStatus::Approved)
-            .map(|e| e.id.clone())
+            .map(|e| (e.id.clone(), e.pr_url.clone()))
             .collect();
 
-        for entry in &mut self.entries {
-            if entry.status == MergeStatus::Approved {
-                entry.status = MergeStatus::Merged;
-            }
-        }
-
-        Ok(ids)
+        Ok(entries)
     }
 
     /// Remove a specific entry by PR URL. Returns the removed entry if found.
@@ -204,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn approve_and_flush() {
+    fn approve_and_collect_for_flush() {
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
         q.enqueue(entry("m2", "t2"));
@@ -212,22 +211,27 @@ mod tests {
         q.approve("m1").unwrap();
         assert_eq!(q.approved().len(), 1);
 
-        let flushed = q.flush(Mode::Pause).unwrap();
-        assert_eq!(flushed, vec!["m1"]);
-        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Merged);
+        // collect_approved_for_flush returns entries but doesn't mark them as Merged
+        let collected = q.collect_approved_for_flush(Mode::Pause).unwrap();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].0, "m1");
+        // Entry should still be Approved (not Merged) - caller is responsible for marking
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Approved);
         // m2 stays pending
         assert_eq!(q.get("m2").unwrap().status, MergeStatus::Pending);
+
+        // Caller marks as merged after successful GitHub merge
+        q.mark_merged("m1").unwrap();
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Merged);
     }
 
     #[test]
-    fn flush_only_in_pause() {
-        let mut q = MergeQueue::new();
-        q.enqueue(entry("m1", "t1"));
-        q.approve("m1").unwrap();
+    fn collect_for_flush_only_in_pause() {
+        let q = MergeQueue::new();
 
-        assert!(q.flush(Mode::Stop).is_err());
-        assert!(q.flush(Mode::Play).is_err());
-        assert!(q.flush(Mode::Pause).is_ok());
+        assert!(q.collect_approved_for_flush(Mode::Stop).is_err());
+        assert!(q.collect_approved_for_flush(Mode::Play).is_err());
+        assert!(q.collect_approved_for_flush(Mode::Pause).is_ok());
     }
 
     #[test]

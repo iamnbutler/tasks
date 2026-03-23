@@ -730,42 +730,35 @@ impl Server {
 
     // --- Merge queue (spec Section 7) ---
 
-    /// Flush the merge queue (spec Section 6.2).
+    /// Collect approved entries for flush (spec Section 6.2).
     ///
     /// Only valid in Pause mode. Returns (entry_id, pr_url) pairs for
-    /// the caller to execute the actual GitHub merges.
-    pub async fn flush_merge_queue(&self) -> Result<Vec<(String, String)>, ServerError> {
-        let flushed_entries = {
-            let mut state = self.state.write().await;
-            let mode = state.mode;
-            // Collect entry details before flushing
-            let entries: Vec<(String, String)> = state
-                .merge_queue
-                .approved()
-                .iter()
-                .map(|e| (e.id.clone(), e.pr_url.clone()))
-                .collect();
-            state
-                .merge_queue
-                .flush(mode)
-                .map_err(|e| ServerError::EventStore(events::StoreError::Io(
-                    std::io::Error::other(e.to_string()),
-                )))?;
-            entries
-        };
+    /// the caller to execute the actual GitHub merges. Does NOT mark entries
+    /// as merged - the caller must call mark_entry_merged() or mark_entry_conflict()
+    /// based on the result of the GitHub API call.
+    pub async fn collect_entries_for_flush(&self) -> Result<Vec<(String, String)>, ServerError> {
+        let state = self.state.read().await;
+        let mode = state.mode;
+        state
+            .merge_queue
+            .collect_approved_for_flush(mode)
+            .map_err(|e| ServerError::EventStore(events::StoreError::Io(
+                std::io::Error::other(e.to_string()),
+            )))
+    }
 
-        let ids: Vec<String> = flushed_entries.iter().map(|(id, _)| id.clone()).collect();
-
-        // Emit flush event
+    /// Emit the system:flush event after merges have been processed.
+    ///
+    /// This should be called after all merge operations are complete.
+    pub async fn emit_flush_event(&self, merged_ids: &[String]) -> Result<(), ServerError> {
         let event = Event::new(
             EventType::SystemFlush,
             "system",
             Actor::Human,
-            serde_json::json!({ "flushed": ids }),
+            serde_json::json!({ "flushed": merged_ids }),
         );
         self.event_bus.publish(event).await?;
-
-        Ok(flushed_entries)
+        Ok(())
     }
 
     /// Approve a merge queue entry and emit a `merge:approved` event.
