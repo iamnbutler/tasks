@@ -7,7 +7,7 @@ The Tasks web interface provides a dashboard for monitoring and managing the pla
 Start Tasks with the `--web` flag:
 
 ```bash
-tasks run --web
+cargo run -- run --web
 ```
 
 Open your browser to `http://localhost:4800`.
@@ -21,7 +21,7 @@ The main navigation includes:
 | **Dashboard** | System overview and statistics |
 | **Tasks** | Task list with filtering and details |
 | **Merge Queue** | Review and approve pending changes |
-| **Orchestrator** | Chat with the AI project foreman |
+| **Orchestrator** | AI project foreman feed and chat |
 | **Events** | Real-time event log viewer |
 
 ## Dashboard
@@ -32,6 +32,7 @@ The dashboard provides an at-a-glance view of:
 - **Active Tasks** - Number of tasks in progress
 - **Pending Reviews** - Merge queue items awaiting approval
 - **Recent Activity** - Latest events across all tasks
+- **Escalations** - Up to 5 recent orchestrator escalation events with task context
 
 ### Changing Mode
 
@@ -53,6 +54,10 @@ The task list shows all tasks with columns for:
 - Assignee (if any)
 - Created date
 
+### Creating a Task
+
+Use the **New Task** button to create a GitHub issue directly from the UI without leaving Tasks. Select a project, enter a title and optional description (Markdown), and add labels. The poller picks up the new issue on its next cycle.
+
 ### Filtering
 
 Use the filter controls to narrow down tasks:
@@ -63,11 +68,14 @@ Use the filter controls to narrow down tasks:
 
 ### Task Detail
 
-Click a task to view its detail page:
+Click a task to view its detail page. The detail view is split into tabs:
 
-- **Description Tab** - Full task description and metadata
-- **Events Tab** - Timeline of all task events
-- **Chat Tab** - Send messages to active agent session
+| Tab | Description |
+|-----|-------------|
+| **Chat** | Send messages to the active agent session |
+| **Details** | Full task description (Markdown rendered) |
+
+A **Properties** sidebar on the right shows metadata (state, project, created date) and the task event timeline.
 
 ## Merge Queue
 
@@ -80,36 +88,35 @@ The merge queue shows PRs awaiting human review.
 | **Pending** | Awaiting review |
 | **Approved** | Ready to merge |
 | **Rejected** | Declined |
-| **Changes Requested** | Needs modification |
+| **Changes Requested** | Needs modification before merging |
 
 ### Actions
 
 For each entry:
 
-- **Approve** - Mark ready for merge
+- **Approve** - Mark ready for merge. In Play mode, triggers an immediate GitHub merge. In Pause mode, entry waits for flush.
 - **Reject** - Decline the changes
-- **Request Changes** - Ask for modifications with feedback
+- **Request Changes** - Ask for modifications with specific feedback; the task gets priority re-dispatch
 
 ### Flush
 
-In Pause mode, use the "Flush" button to merge all approved entries.
+In Pause mode, use the **Flush** button to merge all approved entries via the GitHub API.
 
 ## Orchestrator
 
-The Orchestrator view provides a chat interface with the AI project foreman.
+The Orchestrator view shows a conversational feed of the AI project foreman's activity.
 
-### Capabilities
+### Feed
 
-The orchestrator can:
+Events appear as context-rich messages including:
 
-- Provide project status updates
-- Answer questions about task progress
-- Explain decisions and prioritization
-- Discuss architecture and approach
+- **Decisions** - e.g., "Approving 'Fix login bug' (#42) in owner/repo"
+- **Feedback** - Orchestrator comments on work quality
+- **Escalations** - Issues requiring human intervention, with actionable context and PR links
 
-### Chat Interface
+### Chat
 
-Type messages in the input field and press Enter to send. The conversation history is preserved across sessions.
+Type messages in the input field to ask the orchestrator questions or provide direction. The orchestrator responds via the event feed.
 
 ## Events
 

@@ -28,7 +28,11 @@ GET /api/snapshot
   "projects": [...],
   "tasks": [...],
   "merge_queue": [...],
-  "sessions": [...]
+  "slot_utilization": {
+    "active": 2,
+    "max": 5
+  },
+  "human_present": true
 }
 ```
 
@@ -58,6 +62,8 @@ Content-Type: application/json
 ```
 
 **Valid modes:** `play`, `pause`, `stop`
+
+> **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
 ### Tasks
 
@@ -118,6 +124,41 @@ Content-Type: application/json
 
 {
   "message": "Can you also add tests for this?"
+}
+```
+
+#### Cancel Task
+
+Stop a running agent session for the given task.
+
+```http
+POST /api/tasks/:id/cancel
+```
+
+### Issues
+
+#### Create Issue
+
+Create a new GitHub issue in a tracked project. The poller will pick it up on its next cycle and create a task from it.
+
+```http
+POST /api/issues
+Content-Type: application/json
+
+{
+  "project_id": "project-uuid",
+  "title": "Fix the login bug",
+  "body": "Description in markdown (optional)",
+  "labels": ["bug", "priority:high"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "number": 42,
+  "url": "https://github.com/owner/repo/issues/42"
 }
 ```
 
@@ -182,6 +223,8 @@ GET /api/merge-queue
 
 #### Approve Entry
 
+In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
+
 ```http
 POST /api/merge-queue/:id/approve
 ```
@@ -194,22 +237,129 @@ POST /api/merge-queue/:id/reject
 
 #### Request Changes
 
+Keeps the entry in the queue and gives the task priority dispatch so the agent can address feedback.
+
 ```http
 POST /api/merge-queue/:id/request-changes
 Content-Type: application/json
 
 {
-  "message": "Please add more tests"
+  "reasoning": "The implementation is incomplete",
+  "feedback": "Please add unit tests for the edge cases in login.rs"
 }
 ```
 
 #### Flush Approved Entries
 
-Merge all approved entries (Pause mode only).
+Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of successfully merged entries.
 
 ```http
 POST /api/merge-queue/flush
 ```
+
+### Orchestrator
+
+#### Chat with Orchestrator
+
+Send a message to the AI project foreman.
+
+```http
+POST /api/orchestrator/chat
+Content-Type: application/json
+
+{
+  "message": "What tasks are currently being worked on?"
+}
+```
+
+### Accounting
+
+#### Get Accounting Summary
+
+Global summary of API token usage across all tasks.
+
+```http
+GET /api/accounting
+```
+
+#### List Task Accounting
+
+Per-task accounting summaries.
+
+```http
+GET /api/accounting/tasks
+```
+
+#### Get Task Accounting
+
+Accounting for a specific task.
+
+```http
+GET /api/accounting/tasks/:id
+```
+
+### Completions
+
+Fast LLM completions powered by Haiku. All endpoints enforce a 32 KB input limit.
+
+#### General Completion
+
+```http
+POST /api/completions
+Content-Type: application/json
+
+{
+  "prompt": "Summarize this PR in one sentence",
+  "system": "You are a helpful assistant",
+  "max_tokens": 1024
+}
+```
+
+**Response:** `{ "text": "..." }`
+
+#### Generate Name
+
+```http
+POST /api/completions/name
+Content-Type: application/json
+
+{ "context": "Fix login page redirect loop after auth" }
+```
+
+**Response:** `{ "name": "..." }`
+
+#### Generate Description
+
+```http
+POST /api/completions/describe
+Content-Type: application/json
+
+{ "context": "..." }
+```
+
+**Response:** `{ "description": "..." }`
+
+#### Brainstorm Ideas
+
+```http
+POST /api/completions/brainstorm
+Content-Type: application/json
+
+{ "topic": "Ways to improve test coverage", "count": 5 }
+```
+
+**Response:** `{ "ideas": ["...", ...] }`
+
+#### Summarize Text
+
+```http
+POST /api/completions/summarize
+Content-Type: application/json
+
+{ "text": "...", "max_words": 50 }
+```
+
+**Response:** `{ "summary": "..." }`
 
 ### Events (SSE)
 
@@ -245,8 +395,7 @@ All errors return JSON with the following structure:
 
 ```json
 {
-  "error": "Error message",
-  "code": "ERROR_CODE"
+  "error": "Error message"
 }
 ```
 
@@ -257,6 +406,8 @@ All errors return JSON with the following structure:
 | 200 | Success |
 | 400 | Bad Request |
 | 404 | Not Found |
+| 502 | Bad Gateway (GitHub API error) |
+| 503 | Service Unavailable (completions not configured) |
 | 500 | Internal Server Error |
 
 ---

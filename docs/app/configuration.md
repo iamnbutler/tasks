@@ -11,12 +11,61 @@ Tasks is configured through environment variables and a `.env` file.
 | `GITHUB_TOKEN` | GitHub personal access token with `repo` scope |
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude access |
 
-### Optional
+### Server
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TASKS_DATA_DIR` | Data storage directory | `~/.local/state/tasks/` |
+| `TASKS_WEB_PORT` | Web server port | `4800` |
+
+### Session Limits
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_MAX_SESSIONS` | Global max concurrent agent sessions | `5` |
+| `TASKS_MAX_SESSIONS_PER_PROJECT` | Default max sessions per project | `1` |
+| `TASKS_MAX_RETRIES` | Max retry attempts for failed tasks | `3` |
+
+### Timing
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_POLL_INTERVAL` | GitHub poll interval (seconds) | `60` |
+| `TASKS_DISPATCH_INTERVAL` | Dispatch tick interval (seconds) | `30` |
+| `TASKS_ORCHESTRATOR_EVAL_INTERVAL` | Orchestrator evaluation interval (seconds) | `15` |
+| `TASKS_PROGRESS_THRESHOLD` | Minimum session duration to count as progress (seconds) | `60` |
+| `TASKS_WORKSPACE_STALE_THRESHOLD` | Age at which idle workspaces are cleaned up (seconds) | `604800` (7 days) |
+| `TASKS_CLEANUP_INTERVAL` | Workspace cleanup scan interval (seconds) | `900` (15 min) |
+| `TASKS_CONFLICT_MAX_AGE` | Max age for stale conflict entries before cleanup (seconds) | `86400` (24 hours) |
+
+### Container
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_CONTAINER_IMAGE` | Container image for agent sessions | `tasks-agent:latest` |
+| `TASKS_CONTAINER_MEMORY` | Container memory limit | `8G` |
+
+### Memory Pressure
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_MEMORY_WARN_PCT` | Memory % at which to log a warning | `75` |
+| `TASKS_MEMORY_SOFT_LIMIT_PCT` | Memory % at which to pause dispatch | `85` |
+| `TASKS_MEMORY_HARD_LIMIT_PCT` | Memory % at which to emergency-stop sessions | `92` |
+
+> Memory thresholds must be ordered: `WARN < SOFT < HARD`, or the server will refuse to start.
+
+### Desktop App
+
+| Variable | Description | Default |
+|----------|-------------|---------|
 | `TASKS_SERVER_URL` | Server URL (for desktop app) | `http://localhost:4800` |
+
+### Logging
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUST_LOG` | Log level filter | `info` |
 
 ## .env File
 
@@ -29,6 +78,8 @@ ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxx
 
 # Optional
 TASKS_DATA_DIR=/custom/path/to/data
+TASKS_MAX_SESSIONS=5
+TASKS_WEB_PORT=4800
 ```
 
 ## GitHub Token
@@ -73,6 +124,7 @@ Be aware of Anthropic API rate limits. Tasks uses Claude for:
 ```
 ~/.local/state/tasks/
 ├── db.sqlite           # SQLite database
+├── server.log          # Server log file (auto-truncated at 3000 lines)
 ├── events/             # Event logs (per-task)
 │   └── {task-id}/
 │       └── events.jsonl
@@ -128,10 +180,10 @@ RUST_LOG=tasks=debug   # Debug only for tasks crates
 
 ### Log Output
 
-Logs are written to stderr. Redirect as needed:
+Logs are written to stderr and also to `~/.local/state/tasks/server.log`. Redirect stderr as needed:
 
 ```bash
-tasks run --web 2>&1 | tee tasks.log
+cargo run -- run --web 2>&1 | tee tasks.log
 ```
 
 ## Security Considerations
