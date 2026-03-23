@@ -65,6 +65,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting/tasks", get(list_task_accounting))
         .route("/accounting/tasks/{id}", get(get_task_accounting))
         .route("/events", get(event_stream))
+        // Self-update endpoints
+        .route("/self-update", get(get_self_update_status))
+        .route("/self-update/apply", post(apply_self_update))
         // Completions endpoints (fast mode with Haiku)
         .route("/completions", post(completions))
         .route("/completions/name", post(completions_name))
@@ -156,6 +159,42 @@ struct EventStreamQuery {
     pattern: Option<String>,
     /// Optional task ID filter.
     task_id: Option<String>,
+}
+
+// --- Self-update request/response types ---
+
+/// Response for GET /api/self-update.
+#[derive(Serialize)]
+struct SelfUpdateStatusResponse {
+    /// Whether an update is available.
+    available: bool,
+    /// Current commit hash.
+    current_commit: String,
+    /// Target commit hash (if update available).
+    target_commit: Option<String>,
+    /// Rebuild scope: "frontend", "server", or "container".
+    rebuild_scope: Option<String>,
+    /// Summary of the commit(s) to be applied.
+    commit_summary: Option<String>,
+    /// When the update check was last performed.
+    last_checked: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Request for POST /api/self-update/apply.
+#[derive(Deserialize)]
+struct ApplySelfUpdateRequest {
+    /// Force update even if sessions are active.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Response for POST /api/self-update/apply.
+#[derive(Serialize)]
+struct ApplySelfUpdateResponse {
+    /// Status of the apply operation: "applying", "waiting", or "error".
+    status: String,
+    /// Human-readable message describing the current state.
+    message: String,
 }
 
 // --- Completions request/response types ---
@@ -875,6 +914,72 @@ async fn completions_summarize(
     Ok(Json(SummarizeResponse { summary }))
 }
 
+// --- Self-update handlers ---
+
+/// Get the current git commit hash.
+fn get_current_commit() -> String {
+    // Try to get the commit from git
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// GET /api/self-update — Get current update status.
+///
+/// Returns the current update availability status. When Phase 1 infrastructure
+/// is connected, this will return actual update state from the update checker.
+async fn get_self_update_status(State(_state): State<ApiState>) -> Json<SelfUpdateStatusResponse> {
+    // TODO: Connect to Phase 1 update checker infrastructure when available.
+    // For now, return a placeholder indicating no update is available.
+    Json(SelfUpdateStatusResponse {
+        available: false,
+        current_commit: get_current_commit(),
+        target_commit: None,
+        rebuild_scope: None,
+        commit_summary: None,
+        last_checked: Some(chrono::Utc::now()),
+    })
+}
+
+/// POST /api/self-update/apply — Trigger update application.
+///
+/// When Phase 1 infrastructure is connected, this will:
+/// 1. Lower mode to Stop
+/// 2. Wait for active sessions to complete (or force if requested)
+/// 3. Exit with code 100 to signal the wrapper script to update
+async fn apply_self_update(
+    State(state): State<ApiState>,
+    Json(req): Json<ApplySelfUpdateRequest>,
+) -> Result<Json<ApplySelfUpdateResponse>, ApiError> {
+    // TODO: Connect to Phase 1 update executor when available.
+    // For now, return an error indicating the feature is not yet implemented.
+
+    // Even though we can't apply updates yet, we can emit an event for observability
+    let event = events::Event::new(
+        events::EventType::SystemUpdateApplying,
+        "",
+        events::Actor::Human,
+        serde_json::json!({
+            "force": req.force,
+            "status": "not_implemented",
+        }),
+    );
+    let _ = state.server.event_bus.publish(event).await;
+
+    Err(ApiError::UpdateUnavailable(
+        "Self-update infrastructure not yet configured. See issue #319.".to_string(),
+    ))
+}
+
 // --- Error handling ---
 
 enum ApiError {
@@ -886,6 +991,7 @@ enum ApiError {
     CompletionsUnavailable(String),
     CompletionsError(String),
     GitHub(String),
+    UpdateUnavailable(String),
 }
 
 impl IntoResponse for ApiError {
@@ -899,6 +1005,7 @@ impl IntoResponse for ApiError {
             ApiError::CompletionsUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e),
             ApiError::CompletionsError(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
             ApiError::GitHub(e) => (StatusCode::BAD_GATEWAY, e),
+            ApiError::UpdateUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e),
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }

@@ -95,6 +95,8 @@ bun web dev                    # dev mode (proxies /api to localhost:4800)
 - `POST /api/merge-queue/flush` — Flush approved entries (Pause mode only)
 - `POST /api/tasks/:id/chat` — Send chat message to agent session `{ message: string }`
 - `GET /api/events` — SSE live event stream (optional `?pattern=&task_id=` filters)
+- `GET /api/self-update` — Current update status (available, commit info, rebuild scope)
+- `POST /api/self-update/apply` — Trigger update `{ force: boolean }`
 
 ## Desktop app (GPUI)
 

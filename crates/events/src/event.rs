@@ -86,6 +86,12 @@ pub enum EventType {
     SystemAccountingApiCall,
     /// Session duration and total token accounting.
     SystemAccountingSession,
+
+    // Self-update events (spec §18)
+    /// Update available from upstream.
+    SystemUpdateAvailable,
+    /// Update is being applied (graceful shutdown in progress).
+    SystemUpdateApplying,
 }
 
 impl EventType {
@@ -134,6 +140,8 @@ impl EventType {
             Self::SystemAccountingTokens => "system:accounting:tokens",
             Self::SystemAccountingApiCall => "system:accounting:api_call",
             Self::SystemAccountingSession => "system:accounting:session",
+            Self::SystemUpdateAvailable => "system:update_available",
+            Self::SystemUpdateApplying => "system:update_applying",
         }
     }
 
@@ -211,6 +219,8 @@ impl TryFrom<String> for EventType {
             "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
             "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
             "system:accounting:session" => Ok(Self::SystemAccountingSession),
+            "system:update_available" => Ok(Self::SystemUpdateAvailable),
+            "system:update_applying" => Ok(Self::SystemUpdateApplying),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
@@ -409,5 +419,56 @@ mod tests {
         assert!(tokens.matches("system:accounting:*"));
         assert!(api_call.matches("system:accounting:*"));
         assert!(session.matches("system:accounting:*"));
+    }
+
+    #[test]
+    fn update_available_event_serializes() {
+        let e = Event::new(
+            EventType::SystemUpdateAvailable,
+            "",
+            Actor::System,
+            serde_json::json!({
+                "target_commit": "def5678",
+                "rebuild_scope": "server",
+                "commit_summary": "Fix SSE presence guard (#279)",
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:update_available\""));
+        assert!(json.contains("\"target_commit\":\"def5678\""));
+    }
+
+    #[test]
+    fn update_applying_event_serializes() {
+        let e = Event::new(
+            EventType::SystemUpdateApplying,
+            "",
+            Actor::System,
+            serde_json::json!({
+                "target_commit": "def5678",
+                "sessions_remaining": 2,
+            }),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"type\":\"system:update_applying\""));
+        assert!(json.contains("\"sessions_remaining\":2"));
+    }
+
+    #[test]
+    fn update_events_deserialize() {
+        let available = EventType::try_from("system:update_available".to_string()).unwrap();
+        assert_eq!(available, EventType::SystemUpdateAvailable);
+
+        let applying = EventType::try_from("system:update_applying".to_string()).unwrap();
+        assert_eq!(applying, EventType::SystemUpdateApplying);
+    }
+
+    #[test]
+    fn update_events_match_system_wildcard() {
+        let available = EventType::SystemUpdateAvailable;
+        let applying = EventType::SystemUpdateApplying;
+
+        assert!(available.matches("system:*"));
+        assert!(applying.matches("system:*"));
     }
 }
