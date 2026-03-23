@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowDown,
@@ -36,12 +36,13 @@ import {
 } from "@/components/ui/select";
 import type { MergeQueueEntry, Task, TaskState } from "@/lib/types";
 import { taskStateMeta, stateSortOrder } from "./columns";
+import { SortableTaskList } from "./sortable-task-list";
 
 // ---------------------------------------------------------------------------
 // Tab definitions
 // ---------------------------------------------------------------------------
 
-type TabKey = "all" | "active" | "completed";
+type TabKey = "all" | "active" | "completed" | "queue";
 
 const ACTIVE_STATES: TaskState[] = [
   "running",
@@ -55,15 +56,43 @@ const ACTIVE_STATES: TaskState[] = [
 
 const COMPLETED_STATES: TaskState[] = ["completed", "failed", "cancelled"];
 
+// States eligible for dispatch queue (can be reordered)
+const QUEUE_STATES: TaskState[] = [
+  "waiting",
+  "changes_requested",
+];
+
 function filterByTab(tasks: Task[], tab: TabKey): Task[] {
   switch (tab) {
     case "active":
       return tasks.filter((t) => ACTIVE_STATES.includes(t.state));
     case "completed":
       return tasks.filter((t) => COMPLETED_STATES.includes(t.state));
+    case "queue":
+      return tasks.filter((t) => QUEUE_STATES.includes(t.state));
     default:
       return tasks;
   }
+}
+
+// Sort tasks by dispatch priority (matching backend dispatcher logic)
+function sortByDispatchPriority(tasks: Task[]): Task[] {
+  return [...tasks].sort((a, b) => {
+    // 1. ChangesRequested tasks supersede Waiting tasks
+    const crA = a.state === "changes_requested";
+    const crB = b.state === "changes_requested";
+    if (crA !== crB) return crB ? 1 : -1;
+
+    // 2. Explicit priority: lower number first, null sorts last
+    const priA = a.priority ?? Number.MAX_SAFE_INTEGER;
+    const priB = b.priority ?? Number.MAX_SAFE_INTEGER;
+    if (priA !== priB) return priA - priB;
+
+    // 3. Recency: newer source_created_at first (fall back to created_at)
+    const timeA = new Date(a.created_at).getTime();
+    const timeB = new Date(b.created_at).getTime();
+    return timeB - timeA;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +304,14 @@ function TaskGroupSection({
 
 export function TasksPage() {
   const { filteredTasks, selectedProject, snapshot, refreshSnapshot } = useAppState();
-  const [activeTab, setActiveTab] = useState<TabKey>("all");
+  const [activeTab, setActiveTab] = useState<TabKey>("active");
   const [search, setSearch] = useState("");
+
+  // Callback when tasks are reordered in queue view
+  const handleReorder = useCallback(() => {
+    // Refresh to get updated priorities from server
+    refreshSnapshot();
+  }, [refreshSnapshot]);
 
   // New task dialog state
   const [newTaskOpen, setNewTaskOpen] = useState(false);
@@ -330,8 +365,23 @@ export function TasksPage() {
     const all = filteredTasks.length;
     const active = filteredTasks.filter((t) => ACTIVE_STATES.includes(t.state)).length;
     const completed = filteredTasks.filter((t) => COMPLETED_STATES.includes(t.state)).length;
-    return { all, active, completed };
+    const queue = filteredTasks.filter((t) => QUEUE_STATES.includes(t.state)).length;
+    return { all, active, completed, queue };
   }, [filteredTasks]);
+
+  // Tasks sorted for queue view (dispatch order)
+  const queueTasks = useMemo(() => {
+    let tasks = filterByTab(filteredTasks, "queue");
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      tasks = tasks.filter(
+        (t) =>
+          t.title.toLowerCase().includes(q) ||
+          t.id.toLowerCase().includes(q)
+      );
+    }
+    return sortByDispatchPriority(tasks);
+  }, [filteredTasks, search]);
 
   // Reset dialog state when opening
   const handleOpenNewTask = () => {
@@ -395,14 +445,17 @@ export function TasksPage() {
             onValueChange={(v: string) => setActiveTab(v as TabKey)}
           >
             <TabsList className="h-7">
-              <TabsTrigger value="all" className="text-xs px-2.5 h-6">
-                All {counts.all > 0 && <span className="ml-1 text-muted-foreground">{counts.all}</span>}
+              <TabsTrigger value="queue" className="text-xs px-2.5 h-6">
+                Queue {counts.queue > 0 && <span className="ml-1 text-muted-foreground">{counts.queue}</span>}
               </TabsTrigger>
               <TabsTrigger value="active" className="text-xs px-2.5 h-6">
                 Active {counts.active > 0 && <span className="ml-1 text-muted-foreground">{counts.active}</span>}
               </TabsTrigger>
               <TabsTrigger value="completed" className="text-xs px-2.5 h-6">
                 Done {counts.completed > 0 && <span className="ml-1 text-muted-foreground">{counts.completed}</span>}
+              </TabsTrigger>
+              <TabsTrigger value="all" className="text-xs px-2.5 h-6">
+                All {counts.all > 0 && <span className="ml-1 text-muted-foreground">{counts.all}</span>}
               </TabsTrigger>
             </TabsList>
           </Tabs>
@@ -432,7 +485,29 @@ export function TasksPage() {
 
       {/* Task list */}
       <ScrollArea className="flex-1">
-        {groups.length === 0 ? (
+        {activeTab === "queue" ? (
+          // Queue view - sortable drag-and-drop list
+          <div className="py-2">
+            {queueTasks.length === 0 ? (
+              <div className="flex items-center justify-center py-20">
+                <p className="text-sm text-muted-foreground">
+                  {search ? "No tasks match your search." : "No tasks in queue."}
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="px-4 py-2 text-xs text-muted-foreground border-b border-border">
+                  Drag tasks to reorder the dispatch queue. Tasks at the top will be picked up first.
+                </div>
+                <SortableTaskList
+                  tasks={queueTasks}
+                  projectIdToRepo={projectIdToRepo}
+                  onReorder={handleReorder}
+                />
+              </>
+            )}
+          </div>
+        ) : groups.length === 0 ? (
           <div className="flex items-center justify-center py-20">
             <p className="text-sm text-muted-foreground">
               {search ? "No tasks match your search." : "No tasks."}

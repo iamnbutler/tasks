@@ -106,6 +106,22 @@ export function cancelTask(taskId: string): Promise<void> {
   return requestVoid(`/api/tasks/${taskId}/cancel`, { method: "POST" });
 }
 
+export function updateTaskPriority(taskId: string, priority: number | null): Promise<Task> {
+  return request<Task>(`/api/tasks/${taskId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ priority }),
+  });
+}
+
+export function reorderTasks(taskIds: string[]): Promise<void> {
+  return requestVoid("/api/tasks/reorder", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_ids: taskIds }),
+  });
+}
+
 export function sendOrchestratorChat(message: string): Promise<void> {
   return requestVoid("/api/orchestrator/chat", {
     method: "POST",

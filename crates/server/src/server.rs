@@ -418,6 +418,89 @@ impl Server {
         Ok(true)
     }
 
+    /// Update a task's priority and persist to store.
+    ///
+    /// Used for manual queue reordering via the GUI. Lower numbers are
+    /// higher priority (dispatched first).
+    pub async fn set_task_priority(
+        &self,
+        task_id: &str,
+        priority: Option<i32>,
+        actor: Actor,
+    ) -> Result<(), ServerError> {
+        {
+            let mut state = self.state.write().await;
+            let task = state
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+            task.priority = priority;
+            task.updated_at = chrono::Utc::now();
+
+            // Write-through to store
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_task(task) {
+                        tracing::error!(task_id = %task_id, error = %e, "failed to persist task priority to store");
+                    }
+                }
+            }
+        }
+
+        // Emit task:updated event to notify clients
+        let event = Event::new(
+            EventType::TaskUpdated,
+            task_id,
+            actor,
+            serde_json::json!({ "priority": priority }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
+    /// Reorder tasks by updating their priorities.
+    ///
+    /// Takes a list of task IDs in the desired order and assigns sequential
+    /// priorities (1, 2, 3, ...) to them. Tasks not in the list keep their
+    /// current priority.
+    pub async fn reorder_tasks(
+        &self,
+        task_ids: &[String],
+        actor: Actor,
+    ) -> Result<(), ServerError> {
+        {
+            let mut state = self.state.write().await;
+            let now = chrono::Utc::now();
+
+            for (index, task_id) in task_ids.iter().enumerate() {
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.priority = Some((index + 1) as i32);
+                    task.updated_at = now;
+
+                    // Write-through to store
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Err(e) = store.save_task(task) {
+                                tracing::error!(task_id = %task_id, error = %e, "failed to persist task priority to store");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit task:reordered event to notify clients
+        let event = Event::new(
+            EventType::TaskReordered,
+            "",
+            actor,
+            serde_json::json!({ "task_ids": task_ids }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     // --- Merge queue (spec §7) ---
 
     /// Add an entry to the merge queue, persisting to store and publishing

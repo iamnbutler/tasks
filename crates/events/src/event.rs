@@ -23,6 +23,8 @@ pub enum Actor {
 pub enum EventType {
     // Task events
     TaskCreated,
+    TaskUpdated,
+    TaskReordered,
     TaskStateRunning,
     TaskStateQuestion,
     TaskStateWaiting,
@@ -94,6 +96,8 @@ impl EventType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::TaskCreated => "task:created",
+            Self::TaskUpdated => "task:updated",
+            Self::TaskReordered => "task:reordered",
             Self::TaskStateRunning => "task:state:running",
             Self::TaskStateQuestion => "task:state:question",
             Self::TaskStateWaiting => "task:state:waiting",
@@ -172,6 +176,8 @@ impl TryFrom<String> for EventType {
     fn try_from(s: String) -> Result<Self, Self::Error> {
         match s.as_str() {
             "task:created" => Ok(Self::TaskCreated),
+            "task:updated" => Ok(Self::TaskUpdated),
+            "task:reordered" => Ok(Self::TaskReordered),
             "task:state:running" => Ok(Self::TaskStateRunning),
             "task:state:question" => Ok(Self::TaskStateQuestion),
             "task:state:waiting" => Ok(Self::TaskStateWaiting),
