@@ -870,7 +870,8 @@ Resume candidates are always processed before new work candidates. They represen
 closer to completion and are cheaper to start.
 
 **New work candidates.** Tasks in `waiting` state with no active session. These require a new
-session, container, and workspace.
+session, container, and workspace. Tasks with an unclosed pull request already in the merge queue
+are skipped — work is already in progress on that task and should not be re-dispatched.
 
 ### 13.3 Prioritization
 
@@ -896,7 +897,8 @@ Two limits control how many tasks can run simultaneously:
   the primary resource constraint — each session is a container consuming host CPU and memory.
   Default: 5.
 - **Per-project limit** (`max_sessions` on project config, optional). Prevents one project from
-  consuming all available slots. Defaults to the global limit if unset.
+  consuming all available slots. Defaults to 1 if unset, which allows multiple projects to make
+  progress concurrently. The default can be overridden via `TASKS_MAX_SESSIONS_PER_PROJECT`.
 
 ### 13.5 Slot Accounting
 
@@ -968,7 +970,8 @@ delays:
 - Base delay: 5 seconds
 - Multiplier: 2x per attempt
 - Maximum delay: 5 minutes
-- Jitter: ±25% (prevents thundering herd when multiple tasks fail simultaneously)
+- Jitter: ±25%, deterministic (derived from task ID and retry count, preventing thundering herd
+  while remaining predictable across dispatch evaluations)
 
 Sequence: ~5s, ~10s, ~20s, ~40s, ~80s, capped at ~300s.
 
@@ -1330,6 +1333,7 @@ function dispatch_tick(server):
     candidates = server.tasks
         where state == Waiting
         and retry_backoff_elapsed(task)
+        and not has_unclosed_pr_in_merge_queue(task)
         sorted by priority_sort(task)
 
     for task in candidates:

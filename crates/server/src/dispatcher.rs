@@ -1,4 +1,4 @@
-//! Dispatch evaluation — spec §12.
+//! Dispatch evaluation — spec §13 (Scheduling and Dispatch).
 //!
 //! Pure logic for selecting and prioritizing task candidates.
 //! No async, no sessions — just candidate selection and sorting.
@@ -33,7 +33,7 @@ fn jitter_factor(task_id: &str, retry_count: u32) -> f64 {
     ((h % 1001) as f64 / 2000.0) - 0.25
 }
 
-/// Calculate backoff duration for a given retry count (spec §13.2).
+/// Calculate backoff duration for a given retry count (spec §14.2).
 /// Base: 5s, multiplier: 2x, max: 300s, jitter: ±25%.
 ///
 /// Jitter is computed deterministically from the task ID to prevent
@@ -53,7 +53,7 @@ pub fn backoff_duration(retry_count: u32, task_id: &str) -> Duration {
     Duration::seconds(final_secs)
 }
 
-/// Evaluate which tasks should be dispatched (spec §12.6).
+/// Evaluate which tasks should be dispatched (spec §13.6).
 ///
 /// Takes current tasks, per-project session limits, and global max.
 /// Returns a DispatchPlan with resume candidates and new work in priority order.
@@ -126,7 +126,7 @@ pub fn evaluate(
         }
     }
 
-    // 5. Sort candidates by priority rules (spec §12.3).
+    // 5. Sort candidates by priority rules (spec §13.3).
     candidates.sort_by(|a, b| {
         // Explicit priority: lower number first, None sorts last.
         let pri_a = a.priority.unwrap_or(i32::MAX);

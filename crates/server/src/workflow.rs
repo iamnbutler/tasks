@@ -19,7 +19,7 @@ pub struct WorkflowConfig {
 #[serde(default)]
 #[derive(Default)]
 pub struct ProjectConfig {
-    /// Per-project concurrency limit (spec §12.4).
+    /// Per-project concurrency limit (spec §13.4).
     pub max_sessions: Option<u32>,
     /// Override project default branch.
     pub default_branch: Option<String>,
@@ -28,7 +28,7 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DispatchConfig {
-    /// Task retry limit (spec §13.2). Default: 3.
+    /// Task retry limit (spec §14.2). Default: 3.
     pub max_retries: u32,
     /// Base backoff delay in seconds (spec §13.2). Default: 5.
     pub retry_base_delay: u64,
