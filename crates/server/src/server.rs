@@ -493,6 +493,28 @@ impl Server {
         None
     }
 
+    /// Find a task ID by its linked GitHub issue.
+    ///
+    /// This is a fallback lookup for when branch name matching fails. It searches
+    /// for tasks whose source is the specified GitHub issue coordinates.
+    pub async fn find_task_by_github_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Option<String> {
+        let state = self.state.read().await;
+        state.tasks.values()
+            .find(|task| {
+                matches!(
+                    &task.source,
+                    TaskSource::GithubIssue { owner: o, repo: r, number: n }
+                    if o == owner && r == repo && *n == issue_number
+                )
+            })
+            .map(|task| task.id.clone())
+    }
+
     // --- Reconciliation (issue #254, #255) ---
 
     /// Reconcile a task with fresh GitHub issue data.
