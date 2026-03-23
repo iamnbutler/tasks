@@ -510,59 +510,77 @@ impl Server {
     /// - If PR is open and has a merge entry → update conflict status
     ///
     /// Returns the number of entries updated/removed.
+    ///
+    /// ## Performance
+    ///
+    /// This method builds a HashMap index of merge queue entries in a single
+    /// read pass, then computes all actions with O(1) lookups per PR. This
+    /// avoids O(N*M) lock churn from acquiring a lock and doing a linear scan
+    /// for each of N PRs across M merge queue entries.
     pub async fn reconcile_merge_queue(
         &self,
         prs: &[tasks_github::model::PullRequest],
     ) -> Result<u32, ServerError> {
-        let mut changes = 0u32;
+        // Build a HashMap index of pr_url -> (entry_id, task_id, status) in one read pass.
+        // This avoids O(N*M) from acquiring a lock and linear scanning for each PR.
+        let entry_index: HashMap<String, (String, String, MergeStatus)> = {
+            let state = self.state.read().await;
+            state
+                .merge_queue
+                .entries()
+                .iter()
+                .map(|e| (e.pr_url.clone(), (e.id.clone(), e.task_id.clone(), e.status)))
+                .collect()
+        };
 
+        // Compute all actions with O(1) lookups
+        let mut actions = Vec::new();
         for pr in prs {
             let pr_url = format!(
                 "https://github.com/{}/{}/pull/{}",
                 pr.owner, pr.repo, pr.number
             );
 
-            let action = {
-                let state = self.state.read().await;
-                match state.merge_queue.get_by_pr_url(&pr_url) {
-                    None => continue,
-                    Some(entry) => {
-                        let entry_id = entry.id.clone();
-                        let task_id = entry.task_id.clone();
-                        let current_status = entry.status;
-                        match pr.state {
-                            tasks_github::model::PullRequestState::Merged => {
-                                if current_status != MergeStatus::Merged {
-                                    MqAction::MarkMerged { entry_id, task_id, pr_url: pr_url.clone() }
-                                } else {
-                                    continue;
-                                }
-                            }
-                            tasks_github::model::PullRequestState::Closed => {
-                                MqAction::Remove { entry_id, pr_url: pr_url.clone() }
-                            }
-                            tasks_github::model::PullRequestState::Open => {
-                                // Update conflict status from GitHub's mergeable field
-                                match pr.mergeable {
-                                    Some(tasks_github::model::MergeableState::Conflicting)
-                                        if current_status != MergeStatus::Conflict =>
-                                    {
-                                        MqAction::MarkConflict { entry_id, pr_url: pr_url.clone() }
-                                    }
-                                    Some(tasks_github::model::MergeableState::Mergeable)
-                                        if current_status == MergeStatus::Conflict =>
-                                    {
-                                        MqAction::ClearConflict { entry_id }
-                                    }
-                                    _ => continue,
-                                }
-                            }
+            let Some((entry_id, task_id, current_status)) = entry_index.get(&pr_url) else {
+                continue;
+            };
+            let entry_id = entry_id.clone();
+            let task_id = task_id.clone();
+
+            let action = match pr.state {
+                tasks_github::model::PullRequestState::Merged => {
+                    if *current_status != MergeStatus::Merged {
+                        MqAction::MarkMerged { entry_id, task_id, pr_url }
+                    } else {
+                        continue;
+                    }
+                }
+                tasks_github::model::PullRequestState::Closed => {
+                    MqAction::Remove { entry_id, pr_url }
+                }
+                tasks_github::model::PullRequestState::Open => {
+                    // Update conflict status from GitHub's mergeable field
+                    match pr.mergeable {
+                        Some(tasks_github::model::MergeableState::Conflicting)
+                            if *current_status != MergeStatus::Conflict =>
+                        {
+                            MqAction::MarkConflict { entry_id, pr_url }
                         }
+                        Some(tasks_github::model::MergeableState::Mergeable)
+                            if *current_status == MergeStatus::Conflict =>
+                        {
+                            MqAction::ClearConflict { entry_id }
+                        }
+                        _ => continue,
                     }
                 }
             };
+            actions.push(action);
+        }
 
-            // Execute the action outside the read lock
+        // Execute all actions
+        let mut changes = 0u32;
+        for action in actions {
             match action {
                 MqAction::MarkMerged { entry_id, pr_url, .. } => {
                     tracing::info!(
