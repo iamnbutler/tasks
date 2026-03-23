@@ -46,13 +46,19 @@ Click the mode indicator to switch between:
 
 ### Task List
 
-The task list shows all tasks with columns for:
+Tasks are grouped by state and sorted by priority. Each row shows:
 
-- Status (state indicator)
-- Title
-- Project
-- Assignee (if any)
-- Created date
+| Column | Description |
+|--------|-------------|
+| Priority | Up/right/down arrow (high/medium/low) or dash |
+| ID | GitHub issue/PR number, or short task ID for internal tasks |
+| State | Colored icon indicating current state |
+| Title | Task title |
+| Labels | GitHub labels |
+| Project | Repository name |
+| Updated | Last activity time |
+
+Tasks with `changes_requested` state appear at the top — they have higher dispatch priority than waiting tasks.
 
 ### Creating a Task
 
@@ -60,11 +66,15 @@ Use the **New Task** button to create a GitHub issue directly from the UI withou
 
 ### Filtering
 
-Use the filter controls to narrow down tasks:
+Use the header tabs to filter tasks by lifecycle:
 
-- **State** - Filter by task state
-- **Project** - Filter by project
-- **Search** - Text search in title/description
+| Tab | Shows |
+|-----|-------|
+| **All** | Every task |
+| **Active** | Running, waiting, blocked, testing, in merge queue, conflict |
+| **Done** | Completed, failed, cancelled |
+
+Use the **search box** to filter by title or task ID within the current tab.
 
 ### Task Detail
 
@@ -135,11 +145,18 @@ The Events view shows a real-time stream of system events.
 
 ### Filtering
 
-Filter events by:
+Use the category tabs to filter events:
 
-- **Type** - Specific event type
-- **Task** - Events for a specific task
-- **Time** - Time range
+| Tab | Shows |
+|-----|-------|
+| **All** | Every event |
+| **Task** | `task:*` events (state changes, creation) |
+| **Agent** | `agent:*` events (session output) |
+| **Merge** | `merge:*` events (queue actions) |
+| **System** | `system:*` events (mode changes, startup) |
+| **Orchestrator** | `orchestrator:*` events (decisions, escalations) |
+
+Use the **Pause** button to freeze the list at its current state for inspection.
 
 ## Keyboard Shortcuts
 

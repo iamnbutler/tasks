@@ -123,7 +123,7 @@ Communication uses JSON-line protocol over stdio:
 
 ### SQLite Database
 
-Located at `~/.local/state/tasks/db.sqlite`:
+Located at `~/.tasks/db.sqlite` (or `$TASKS_DATA_DIR/db.sqlite`):
 
 - Projects - Tracked repositories
 - Tasks - Work items with state
@@ -132,13 +132,13 @@ Located at `~/.local/state/tasks/db.sqlite`:
 
 ### Event Logs
 
-Per-task event logs at `~/.local/state/tasks/events/{task-id}/events.jsonl`.
+Per-task event logs at `~/.tasks/events/{task-id}/events.jsonl` (or `$TASKS_DATA_DIR/events/...`).
 
 ## Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TASKS_DATA_DIR` | Data directory | `~/.local/state/tasks/` |
+| `TASKS_DATA_DIR` | Data directory | `~/.tasks/` |
 | `GITHUB_TOKEN` | GitHub API token | Required |
 | `ANTHROPIC_API_KEY` | Claude API key | Required |
 
