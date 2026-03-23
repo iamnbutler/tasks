@@ -94,6 +94,7 @@ This adds a GitHub repository for Tasks to monitor.
 ## Next Steps
 
 - [Architecture Overview](architecture.md) - Understand the system design
+- [Deployment Guide](deployment.md) - Run as a persistent service with self-update
 - [CLI Reference](cli-reference.md) - All available commands
 - [API Reference](api-reference.md) - REST API documentation
 - [Web UI Guide](web-ui.md) - Using the web interface

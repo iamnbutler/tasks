@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.tasks.plist - launchd plist for Tasks server (macOS)
+
+  Installation (user agent - runs when logged in):
+    1. Copy to ~/Library/LaunchAgents/com.tasks.plist
+    2. Edit paths to match your installation
+    3. Run: launchctl load ~/Library/LaunchAgents/com.tasks.plist
+
+  Installation (system daemon - runs at boot):
+    1. Copy to /Library/LaunchDaemons/com.tasks.plist
+    2. Edit paths and set UserName
+    3. Run: sudo launchctl load /Library/LaunchDaemons/com.tasks.plist
+
+  View logs:
+    tail -f ~/Library/Logs/tasks/runner.log
+    # or check Console.app
+
+  Commands:
+    launchctl start com.tasks     # Start
+    launchctl stop com.tasks      # Stop
+    launchctl unload <path>       # Disable
+    launchctl load <path>         # Enable
+-->
+<plist version="1.0">
+<dict>
+    <!-- Service identifier (must match filename without .plist) -->
+    <key>Label</key>
+    <string>com.tasks</string>
+
+    <!-- Command to run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/tasks/scripts/tasks-runner.sh</string>
+        <string>--web</string>
+    </array>
+
+    <!-- Working directory (must be the tasks repository root) -->
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/tasks</string>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Required: Set these to your actual tokens -->
+        <key>GITHUB_TOKEN</key>
+        <string>ghp_YOUR_TOKEN_HERE</string>
+        <key>ANTHROPIC_API_KEY</key>
+        <string>sk-ant-YOUR_KEY_HERE</string>
+
+        <!-- Optional: Override data directory -->
+        <key>TASKS_DATA_DIR</key>
+        <string>/Users/YOUR_USERNAME/.local/state/tasks</string>
+
+        <!-- Optional: Enable auto-updates -->
+        <key>TASKS_UPDATE_CHECK_ENABLED</key>
+        <string>true</string>
+
+        <!-- PATH for cargo, git, bun, etc. -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/YOUR_USERNAME/.cargo/bin</string>
+    </dict>
+
+    <!-- Start at login/boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep running (restart if it exits) -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Only restart on crash, not on clean exit -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle restarts (wait at least 10 seconds between restarts) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/tasks/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/tasks/stderr.log</string>
+
+    <!-- Nice level (lower priority to not compete with interactive apps) -->
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- Soft resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
+    <!-- Hard resource limits -->
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>16384</integer>
+    </dict>
+
+    <!-- Process type (Background = lower priority) -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

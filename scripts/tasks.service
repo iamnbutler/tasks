@@ -1,0 +1,73 @@
+# tasks.service - systemd unit file for Tasks server
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/tasks.service (or ~/.config/systemd/user/)
+#   2. Edit the file to set correct paths and user
+#   3. Run: systemctl daemon-reload
+#   4. Run: systemctl enable tasks
+#   5. Run: systemctl start tasks
+#
+# View logs:
+#   journalctl -u tasks -f
+#
+# Environment:
+#   Create /etc/tasks/environment with your environment variables:
+#     GITHUB_TOKEN=ghp_...
+#     ANTHROPIC_API_KEY=sk-ant-...
+#     TASKS_DATA_DIR=/var/lib/tasks
+#     TASKS_UPDATE_CHECK_ENABLED=true
+
+[Unit]
+Description=Tasks - Human-in-the-loop coding agent orchestrator
+Documentation=https://github.com/iamnbutler/tasks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as a dedicated user (recommended)
+# Create the user with: useradd -r -s /bin/false tasks
+User=tasks
+Group=tasks
+
+# Working directory must be the tasks repository root
+# This is where the server binary and scripts are located
+WorkingDirectory=/opt/tasks
+
+# Use the wrapper script for self-update support
+ExecStart=/opt/tasks/scripts/tasks-runner.sh --web
+
+# Environment file for secrets and configuration
+# Create this file with your GITHUB_TOKEN and ANTHROPIC_API_KEY
+EnvironmentFile=-/etc/tasks/environment
+
+# Restart policy
+# on-failure: Restart if the service exits with non-zero exit code
+# Note: The wrapper script handles most restarts internally (exit 100)
+#       This catches unexpected crashes of the wrapper script itself
+Restart=on-failure
+RestartSec=10
+
+# Give the service time to shut down gracefully
+# The wrapper script forwards SIGTERM to the server
+TimeoutStopSec=90
+
+# Security hardening (optional, adjust as needed)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tasks /opt/tasks/target
+
+# Resource limits (optional)
+# MemoryMax=4G
+# CPUQuota=200%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tasks
+
+[Install]
+WantedBy=multi-user.target
