@@ -42,7 +42,7 @@ import { SortableTaskList } from "./sortable-task-list";
 // Tab definitions
 // ---------------------------------------------------------------------------
 
-type TabKey = "all" | "active" | "completed" | "queue";
+type TabKey = "all" | "active" | "backlog" | "completed" | "queue";
 
 const ACTIVE_STATES: TaskState[] = [
   "running",
@@ -50,9 +50,9 @@ const ACTIVE_STATES: TaskState[] = [
   "testing",
   "awaiting_merge",
   "conflict",
-  "waiting",
-  "blocked",
 ];
+
+const BACKLOG_STATES: TaskState[] = ["waiting", "blocked"];
 
 const COMPLETED_STATES: TaskState[] = ["completed", "failed", "cancelled"];
 
@@ -66,6 +66,8 @@ function filterByTab(tasks: Task[], tab: TabKey): Task[] {
   switch (tab) {
     case "active":
       return tasks.filter((t) => ACTIVE_STATES.includes(t.state));
+    case "backlog":
+      return tasks.filter((t) => BACKLOG_STATES.includes(t.state));
     case "completed":
       return tasks.filter((t) => COMPLETED_STATES.includes(t.state));
     case "queue":
@@ -364,9 +366,10 @@ export function TasksPage() {
   const counts = useMemo(() => {
     const all = filteredTasks.length;
     const active = filteredTasks.filter((t) => ACTIVE_STATES.includes(t.state)).length;
+    const backlog = filteredTasks.filter((t) => BACKLOG_STATES.includes(t.state)).length;
     const completed = filteredTasks.filter((t) => COMPLETED_STATES.includes(t.state)).length;
     const queue = filteredTasks.filter((t) => QUEUE_STATES.includes(t.state)).length;
-    return { all, active, completed, queue };
+    return { all, active, backlog, completed, queue };
   }, [filteredTasks]);
 
   // Tasks sorted for queue view (dispatch order)
@@ -451,8 +454,11 @@ export function TasksPage() {
               <TabsTrigger value="active" className="text-xs px-2.5 h-6">
                 Active {counts.active > 0 && <span className="ml-1 text-muted-foreground">{counts.active}</span>}
               </TabsTrigger>
+              <TabsTrigger value="backlog" className="text-xs px-2.5 h-6">
+                Backlog {counts.backlog > 0 && <span className="ml-1 text-muted-foreground">{counts.backlog}</span>}
+              </TabsTrigger>
               <TabsTrigger value="completed" className="text-xs px-2.5 h-6">
-                Done {counts.completed > 0 && <span className="ml-1 text-muted-foreground">{counts.completed}</span>}
+                Completed {counts.completed > 0 && <span className="ml-1 text-muted-foreground">{counts.completed}</span>}
               </TabsTrigger>
               <TabsTrigger value="all" className="text-xs px-2.5 h-6">
                 All {counts.all > 0 && <span className="ml-1 text-muted-foreground">{counts.all}</span>}
