@@ -163,6 +163,15 @@ impl MergeQueue {
         Ok(ids)
     }
 
+    /// Remove a specific entry by PR URL. Returns the removed entry if found.
+    pub fn remove_by_pr_url(&mut self, pr_url: &str) -> Option<MergeQueueEntry> {
+        if let Some(pos) = self.entries.iter().position(|e| e.pr_url == pr_url) {
+            Some(self.entries.remove(pos))
+        } else {
+            None
+        }
+    }
+
     /// Remove terminal entries (merged, rejected) from the queue.
     pub fn cleanup(&mut self) {
         self.entries.retain(|e| {

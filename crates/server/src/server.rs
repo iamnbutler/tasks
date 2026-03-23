@@ -20,6 +20,15 @@ use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
 use crate::presence::PresenceTracker;
 
+/// Internal action type for merge queue reconciliation.
+/// Used to decide what to do outside the read lock.
+enum MqAction {
+    MarkMerged { entry_id: String, task_id: String, pr_url: String },
+    Remove { entry_id: String, pr_url: String },
+    MarkConflict { entry_id: String, pr_url: String },
+    ClearConflict { entry_id: String },
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("mode transition: {0}")]
@@ -410,6 +419,188 @@ impl Server {
         }
 
         None
+    }
+
+    // --- Reconciliation (issue #254, #255) ---
+
+    /// Reconcile a task with fresh GitHub issue data.
+    ///
+    /// Updates GitHub-authoritative fields and persists to store.
+    /// Returns the reconciliation result for logging/events.
+    pub async fn reconcile_task(
+        &self,
+        task_id: &str,
+        issue: &tasks_github::model::Issue,
+        label_config: &crate::workflow::LabelConfig,
+    ) -> Result<Option<crate::scheduler::ReconcileResult>, ServerError> {
+        let result = {
+            let mut state = self.state.write().await;
+            let task = match state.tasks.get_mut(task_id) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+
+            let result = crate::scheduler::reconcile_task(task, issue, label_config);
+
+            if result.has_changes() {
+                // Write-through to store
+                if let Some(ref store) = self.store {
+                    if let Ok(store) = store.lock() {
+                        if let Err(e) = store.save_task(task) {
+                            tracing::error!(task_id = %task_id, error = %e, "failed to persist reconciled task");
+                        }
+                    }
+                }
+            }
+
+            result
+        };
+
+        // Emit state change events outside the write lock
+        if let Some(new_state) = result.new_state {
+            let event_type = match new_state {
+                TaskState::Waiting => EventType::TaskStateWaiting,
+                TaskState::Blocked => EventType::TaskStateBlocked,
+                TaskState::Completed => EventType::TaskStateCompleted,
+                TaskState::Cancelled => EventType::TaskStateCancelled,
+                _ => EventType::TaskStateWaiting, // shouldn't happen from reconciliation
+            };
+
+            let event = Event::new(
+                event_type,
+                task_id,
+                Actor::Scheduler,
+                serde_json::json!({ "source": "reconciliation" }),
+            );
+            self.event_bus.publish(event).await?;
+        }
+
+        Ok(Some(result))
+    }
+
+    /// Reconcile merge queue entries against fresh PR data from GitHub.
+    ///
+    /// For each PR in the poll results:
+    /// - If PR is merged and has a merge entry → mark entry as Merged
+    /// - If PR is closed (not merged) and has a merge entry → remove entry
+    /// - If PR is open and has a merge entry → update conflict status
+    ///
+    /// Returns the number of entries updated/removed.
+    pub async fn reconcile_merge_queue(
+        &self,
+        prs: &[tasks_github::model::PullRequest],
+    ) -> Result<u32, ServerError> {
+        let mut changes = 0u32;
+
+        for pr in prs {
+            let pr_url = format!(
+                "https://github.com/{}/{}/pull/{}",
+                pr.owner, pr.repo, pr.number
+            );
+
+            let action = {
+                let state = self.state.read().await;
+                match state.merge_queue.get_by_pr_url(&pr_url) {
+                    None => continue,
+                    Some(entry) => {
+                        let entry_id = entry.id.clone();
+                        let task_id = entry.task_id.clone();
+                        let current_status = entry.status;
+                        match pr.state {
+                            tasks_github::model::PullRequestState::Merged => {
+                                if current_status != MergeStatus::Merged {
+                                    MqAction::MarkMerged { entry_id, task_id, pr_url: pr_url.clone() }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            tasks_github::model::PullRequestState::Closed => {
+                                MqAction::Remove { entry_id, pr_url: pr_url.clone() }
+                            }
+                            tasks_github::model::PullRequestState::Open => {
+                                // Update conflict status from GitHub's mergeable field
+                                match pr.mergeable {
+                                    Some(tasks_github::model::MergeableState::Conflicting)
+                                        if current_status != MergeStatus::Conflict =>
+                                    {
+                                        MqAction::MarkConflict { entry_id, pr_url: pr_url.clone() }
+                                    }
+                                    Some(tasks_github::model::MergeableState::Mergeable)
+                                        if current_status == MergeStatus::Conflict =>
+                                    {
+                                        MqAction::ClearConflict { entry_id }
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Execute the action outside the read lock
+            match action {
+                MqAction::MarkMerged { entry_id, pr_url, .. } => {
+                    tracing::info!(
+                        entry_id = %entry_id,
+                        pr_url = %pr_url,
+                        "reconciliation: PR merged externally, marking entry as merged"
+                    );
+                    // mark_entry_merged also transitions the linked task to Completed
+                    if let Err(e) = self.mark_entry_merged(&entry_id, &pr_url).await {
+                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark entry as merged during reconciliation");
+                    } else {
+                        changes += 1;
+                    }
+                }
+                MqAction::Remove { entry_id, pr_url } => {
+                    tracing::info!(
+                        entry_id = %entry_id,
+                        pr_url = %pr_url,
+                        "reconciliation: PR closed without merge, removing entry"
+                    );
+                    let mut state = self.state.write().await;
+                    state.merge_queue.remove_by_pr_url(&pr_url);
+                    // Also remove from store
+                    if let Some(ref store) = self.store {
+                        if let Ok(store) = store.lock() {
+                            if let Err(e) = store.delete_merge_entry(&entry_id) {
+                                tracing::error!(entry_id = %entry_id, error = %e, "failed to delete merge entry from store");
+                            }
+                        }
+                    }
+                    changes += 1;
+                }
+                MqAction::MarkConflict { entry_id, pr_url } => {
+                    tracing::debug!(
+                        entry_id = %entry_id,
+                        "reconciliation: PR has merge conflict"
+                    );
+                    let conflict_info = crate::model::merge_queue::ConflictInfo::new(
+                        crate::model::merge_queue::ConflictType::Unknown,
+                        "Conflict detected from GitHub mergeable status",
+                    );
+                    if let Err(e) = self.mark_entry_conflict(&entry_id, &pr_url, Some(conflict_info)).await {
+                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to mark conflict during reconciliation");
+                    } else {
+                        changes += 1;
+                    }
+                }
+                MqAction::ClearConflict { entry_id } => {
+                    tracing::debug!(
+                        entry_id = %entry_id,
+                        "reconciliation: conflict resolved"
+                    );
+                    if let Err(e) = self.clear_entry_conflict(&entry_id).await {
+                        tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
+                    } else {
+                        changes += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(changes)
     }
 
     /// Get the effective session limit for a project.

@@ -115,6 +115,150 @@ pub fn pr_to_task(
     Some(task)
 }
 
+/// Describes what changed during reconciliation, so the caller can emit
+/// appropriate events and log messages.
+#[derive(Debug, Default)]
+pub struct ReconcileResult {
+    /// Fields that were updated (for logging).
+    pub updated_fields: Vec<&'static str>,
+    /// If the task state changed, the new state.
+    pub new_state: Option<TaskState>,
+    /// If the task should be cancelled (skip label added).
+    pub cancelled: bool,
+}
+
+impl ReconcileResult {
+    pub fn has_changes(&self) -> bool {
+        !self.updated_fields.is_empty() || self.new_state.is_some() || self.cancelled
+    }
+}
+
+/// Reconcile a local task with fresh GitHub issue data (spec §12, issue #254).
+///
+/// Updates GitHub-authoritative fields: title, description, labels, blocked_by.
+/// Detects state transitions: closed → Completed/Cancelled, skip label → Cancelled,
+/// blocked label changes → Blocked/Waiting.
+///
+/// Platform-authoritative fields (session_id, retry_count, etc.) are never touched.
+/// Returns a `ReconcileResult` describing what changed.
+pub fn reconcile_task(
+    task: &mut Task,
+    issue: &Issue,
+    label_config: &LabelConfig,
+) -> ReconcileResult {
+    let mut result = ReconcileResult::default();
+
+    // --- GitHub-authoritative field sync ---
+
+    if task.title != issue.title {
+        task.title = issue.title.clone();
+        result.updated_fields.push("title");
+    }
+
+    if task.description != issue.body {
+        task.description = issue.body.clone();
+        result.updated_fields.push("description");
+    }
+
+    let new_labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+    if task.labels != new_labels {
+        task.labels = new_labels;
+        result.updated_fields.push("labels");
+    }
+
+    // Derive blocked_by from GitHub blocking issue relationships.
+    // Format: "gh-{owner}-{repo}-issue-{number}" to match our task ID convention.
+    // NOTE: BlockingIssueRef lacks owner/repo fields, so we assume same-repo
+    // blockers. Cross-repo blocking relationships generate wrong task IDs.
+    // See #261 for the fix.
+    let new_blocked_by: Vec<String> = issue
+        .blocked_by
+        .iter()
+        .filter(|b| b.state == tasks_github::model::IssueState::Open)
+        .map(|b| format!("gh-{}-{}-issue-{}", issue.owner, issue.repo, b.number))
+        .collect();
+    if task.blocked_by != new_blocked_by {
+        task.blocked_by = new_blocked_by;
+        result.updated_fields.push("blocked_by");
+    }
+
+    // --- State transitions from GitHub ---
+
+    // If already terminal, don't change state.
+    if task.state.is_terminal() {
+        if result.has_changes() {
+            task.updated_at = chrono::Utc::now();
+        }
+        return result;
+    }
+
+    let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+
+    // Check for skip/ignore labels added after import → cancel the task.
+    // This is a hard override for ALL non-terminal states including active ones
+    // (Running, Conflict, etc.). Skip is an explicit human signal meaning "don't
+    // work on this." Cancelling doesn't kill running sessions — it prevents
+    // re-dispatch once the current session ends.
+    let should_cancel = issue_label_names.contains(&SKIP_LABEL)
+        || label_config
+            .ignore
+            .iter()
+            .any(|ig| issue_label_names.contains(&ig.as_str()));
+
+    if should_cancel {
+        result.cancelled = true;
+        result.new_state = Some(TaskState::Cancelled);
+        task.set_state(TaskState::Cancelled);
+        return result;
+    }
+
+    // Detect external closure.
+    if issue.state == tasks_github::model::IssueState::Closed {
+        let new_state = match issue.state_reason {
+            Some(tasks_github::model::IssueStateReason::Completed) => TaskState::Completed,
+            _ => TaskState::Cancelled,
+        };
+        result.new_state = Some(new_state);
+        task.set_state(new_state);
+        return result;
+    }
+
+    // Check blocked label changes — only for tasks not in active states
+    // (Running, Question, Testing, AwaitingMerge, Conflict).
+    let is_active = matches!(
+        task.state,
+        TaskState::Running
+            | TaskState::Question
+            | TaskState::Testing
+            | TaskState::AwaitingMerge
+            | TaskState::Conflict
+    );
+
+    if !is_active {
+        let is_blocked = label_config
+            .blocked
+            .iter()
+            .any(|b| issue_label_names.contains(&b.as_str()));
+        let has_open_blockers = !task.blocked_by.is_empty();
+
+        if (is_blocked || has_open_blockers) && task.state != TaskState::Blocked {
+            result.new_state = Some(TaskState::Blocked);
+            task.set_state(TaskState::Blocked);
+        } else if !is_blocked && !has_open_blockers && task.state == TaskState::Blocked {
+            result.new_state = Some(TaskState::Waiting);
+            task.set_state(TaskState::Waiting);
+        }
+    }
+
+    // Only manually update updated_at for metadata-only changes (no state transition).
+    // When set_state() was called above, it already handled updated_at and last_activity_at.
+    if result.has_changes() && result.new_state.is_none() {
+        task.updated_at = chrono::Utc::now();
+    }
+
+    result
+}
+
 /// Check if a task already exists for a given GitHub source.
 /// Used to deduplicate — don't create tasks for issues we've already imported.
 pub fn task_exists_for_source(
@@ -357,4 +501,224 @@ mod tests {
         assert!(result.is_none(), "PR with tasks/skip label should be skipped");
     }
 
+    // --- reconcile_task tests ---
+
+    fn make_task_from_issue(issue: &Issue, cfg: &LabelConfig) -> Task {
+        issue_to_task(issue, "proj-1", cfg).expect("should produce a task")
+    }
+
+    #[test]
+    fn reconcile_syncs_title_and_description() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        // Simulate GitHub title/description change
+        let mut updated_issue = issue.clone();
+        updated_issue.title = "Updated title".to_string();
+        updated_issue.body = Some("Updated body".to_string());
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.has_changes());
+        assert!(result.updated_fields.contains(&"title"));
+        assert!(result.updated_fields.contains(&"description"));
+        assert_eq!(task.title, "Updated title");
+        assert_eq!(task.description.as_deref(), Some("Updated body"));
+    }
+
+    #[test]
+    fn reconcile_syncs_labels() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label("priority-high")];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.updated_fields.contains(&"labels"));
+        assert_eq!(task.labels, vec!["bug", "priority-high"]);
+    }
+
+    #[test]
+    fn reconcile_detects_external_closure_completed() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        closed_issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Completed));
+        assert_eq!(task.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn reconcile_detects_external_closure_cancelled() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        closed_issue.state_reason = Some(tasks_github::model::IssueStateReason::NotPlanned);
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Cancelled));
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_skip_label_cancels_task() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        // Add skip label on GitHub
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label(super::SKIP_LABEL)];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.cancelled);
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_blocked_label_transitions_to_blocked() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        assert_eq!(task.state, TaskState::Waiting);
+
+        // Add blocked label on GitHub
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label("needs-design")];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Blocked));
+        assert_eq!(task.state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn reconcile_blocked_label_removed_transitions_to_waiting() {
+        let issue = make_issue(
+            42,
+            vec![make_label("bug"), make_label("needs-design")],
+            GhIssueState::Open,
+        );
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        assert_eq!(task.state, TaskState::Blocked);
+
+        // Remove blocked label
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug")];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Waiting));
+        assert_eq!(task.state, TaskState::Waiting);
+    }
+
+    #[test]
+    fn reconcile_no_changes_returns_empty() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let result = reconcile_task(&mut task, &issue, &cfg);
+        assert!(!result.has_changes());
+        assert!(result.updated_fields.is_empty());
+        assert!(result.new_state.is_none());
+    }
+
+    #[test]
+    fn reconcile_terminal_task_still_syncs_metadata() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        task.set_state(TaskState::Completed);
+
+        // Title changed on GitHub
+        let mut updated_issue = issue.clone();
+        updated_issue.title = "Final title".to_string();
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.updated_fields.contains(&"title"));
+        assert_eq!(task.title, "Final title");
+        // State should NOT change
+        assert!(result.new_state.is_none());
+        assert_eq!(task.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn reconcile_active_task_ignores_blocked_label() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        task.set_state(TaskState::Running);
+
+        // Add blocked label — shouldn't affect a running task
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label("needs-design")];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.new_state.is_none());
+        assert_eq!(task.state, TaskState::Running);
+    }
+
+    #[test]
+    fn reconcile_skip_label_cancels_active_task() {
+        // Skip label is a hard override — cancels even Running/Conflict tasks.
+        // It doesn't kill the session, just prevents re-dispatch.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        task.set_state(TaskState::Running);
+
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label(super::SKIP_LABEL)];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.cancelled);
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_skip_label_trumps_closure_reason() {
+        // If an issue has tasks/skip AND is closed-as-completed,
+        // skip wins → Cancelled, not Completed. Skip is an explicit
+        // human override.
+        let mut issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        issue.state = GhIssueState::Closed;
+        issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+        issue.labels = vec![make_label("bug"), make_label(super::SKIP_LABEL)];
+
+        let result = reconcile_task(&mut task, &issue, &cfg);
+        assert!(result.cancelled);
+        assert_eq!(result.new_state, Some(TaskState::Cancelled));
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn reconcile_metadata_only_sets_updated_at_once() {
+        // When only metadata changes (no state transition), updated_at
+        // should be set once by reconcile_task, not by set_state.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        let original_updated = task.updated_at;
+
+        // Small delay to ensure timestamps differ
+        let mut updated_issue = issue.clone();
+        updated_issue.title = "New title".to_string();
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.new_state.is_none());
+        assert!(task.updated_at >= original_updated);
+    }
 }
