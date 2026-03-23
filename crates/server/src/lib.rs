@@ -23,5 +23,5 @@ pub use workflow_watcher::{WorkflowConfigCache, WorkflowConfigWatcher, RefreshRe
 pub use workspace::{
     CleanupCandidate, CleanupConfig, CleanupReason,
     find_cleanup_candidates, is_stale_cleanup, is_terminal_state_cleanup,
-    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_STALE_THRESHOLD_SECS,
+    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_CONFLICT_MAX_AGE_SECS, DEFAULT_STALE_THRESHOLD_SECS,
 };

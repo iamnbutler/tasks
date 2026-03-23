@@ -40,8 +40,11 @@ pub struct AppConfig {
     /// Workspace stale threshold — idle workspaces older than this are cleaned up
     /// (default: 7 days, spec §10.3).
     pub workspace_stale_threshold: Duration,
-    /// Workspace cleanup scan interval (default: 1 hour).
+    /// Workspace cleanup scan interval (default: 15 minutes).
     pub cleanup_interval: Duration,
+    /// Max age for conflict entries before they're eligible for cleanup
+    /// (default: 24 hours). See issue #282.
+    pub conflict_max_age: Duration,
     /// Whether to run the web UI.
     pub web: bool,
     /// Web server port (default: 4800).
@@ -133,6 +136,11 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(server::DEFAULT_CLEANUP_INTERVAL_SECS);
 
+        let conflict_max_age_secs = std::env::var("TASKS_CONFLICT_MAX_AGE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(server::DEFAULT_CONFLICT_MAX_AGE_SECS);
+
         Ok(Self {
             data_dir,
             github_token,
@@ -152,6 +160,7 @@ impl AppConfig {
             memory_hard_limit_pct,
             workspace_stale_threshold: Duration::from_secs(workspace_stale_threshold_secs),
             cleanup_interval: Duration::from_secs(cleanup_interval_secs),
+            conflict_max_age: Duration::from_secs(conflict_max_age_secs),
             web: false, // set by CLI flag
             web_port: std::env::var("TASKS_WEB_PORT")
                 .ok()

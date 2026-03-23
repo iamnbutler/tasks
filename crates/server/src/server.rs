@@ -1023,9 +1023,16 @@ impl Server {
     ///
     /// Should be called periodically to prevent unbounded queue growth.
     /// See issue #132.
-    pub async fn cleanup_merge_queue(&self) {
+    ///
+    /// If `conflict_cutoff` is provided, also removes conflict entries that have
+    /// been in conflict state since before the cutoff time. This prevents stale
+    /// conflicts from accumulating indefinitely. See issue #282.
+    pub async fn cleanup_merge_queue(
+        &self,
+        conflict_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let mut state = self.state.write().await;
-        state.merge_queue.cleanup();
+        state.merge_queue.cleanup(conflict_cutoff);
     }
 
     /// Emit an orchestrator:decision event recording an evaluation.
@@ -2146,8 +2153,8 @@ mod tests {
             assert_eq!(state.merge_queue.entries().len(), 3);
         }
 
-        // Run cleanup
-        server.cleanup_merge_queue().await;
+        // Run cleanup (without conflict cutoff for this test)
+        server.cleanup_merge_queue(None).await;
 
         // After cleanup: only the pending entry remains
         let state = server.state.read().await;

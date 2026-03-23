@@ -4,6 +4,8 @@
 
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::model::merge_queue::ConflictType;
 use crate::model::merge_queue::{ConflictInfo, MergeQueueEntry, MergeStatus};
 use crate::mode::Mode;
 
@@ -173,9 +175,36 @@ impl MergeQueue {
     }
 
     /// Remove terminal entries (merged, rejected) from the queue.
-    pub fn cleanup(&mut self) {
+    ///
+    /// If `conflict_cutoff` is provided, also removes conflict entries that have
+    /// been in conflict state since before the cutoff time. This prevents stale
+    /// conflicts from accumulating indefinitely. See issue #282.
+    pub fn cleanup(&mut self, conflict_cutoff: Option<chrono::DateTime<chrono::Utc>>) {
         self.entries.retain(|e| {
-            !matches!(e.status, MergeStatus::Merged | MergeStatus::Rejected)
+            // Always remove merged and rejected entries
+            if matches!(e.status, MergeStatus::Merged | MergeStatus::Rejected) {
+                return false;
+            }
+
+            // Optionally remove stale conflict entries
+            if let Some(cutoff) = conflict_cutoff {
+                if e.status == MergeStatus::Conflict {
+                    // If we have conflict_info with a timestamp, use it
+                    if let Some(ref info) = e.conflict_info {
+                        if info.detected_at < cutoff {
+                            return false;
+                        }
+                    } else {
+                        // No conflict_info means we don't know when the conflict started.
+                        // Fall back to queued_at as a conservative estimate.
+                        if e.queued_at < cutoff {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            true
         });
     }
 }
@@ -288,8 +317,75 @@ mod tests {
         q.mark_merged("m1").unwrap();
         q.reject("m2").unwrap();
 
-        q.cleanup();
+        q.cleanup(None);
         assert_eq!(q.entries().len(), 1);
         assert_eq!(q.entries()[0].id, "m3");
+    }
+
+    #[test]
+    fn cleanup_removes_stale_conflicts() {
+        use chrono::{Duration, Utc};
+
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+        q.enqueue(entry("m3", "t3"));
+
+        // Mark m1 as conflict with a timestamp in the past
+        let old_conflict = ConflictInfo {
+            conflict_type: ConflictType::SourceConflict,
+            conflicting_files: vec![],
+            description: "old conflict".to_string(),
+            detected_at: Utc::now() - Duration::hours(48),
+        };
+        q.mark_conflict("m1", Some(old_conflict)).unwrap();
+
+        // Mark m2 as conflict with a recent timestamp
+        let recent_conflict = ConflictInfo {
+            conflict_type: ConflictType::SourceConflict,
+            conflicting_files: vec![],
+            description: "recent conflict".to_string(),
+            detected_at: Utc::now() - Duration::hours(1),
+        };
+        q.mark_conflict("m2", Some(recent_conflict)).unwrap();
+
+        // Cleanup with 24-hour cutoff
+        let cutoff = Utc::now() - Duration::hours(24);
+        q.cleanup(Some(cutoff));
+
+        // m1 (stale conflict) should be removed, m2 (recent conflict) and m3 (pending) should remain
+        assert_eq!(q.entries().len(), 2);
+        assert!(q.get("m1").is_none());
+        assert!(q.get("m2").is_some());
+        assert!(q.get("m3").is_some());
+    }
+
+    #[test]
+    fn cleanup_removes_stale_conflicts_without_info() {
+        use chrono::{Duration, Utc};
+
+        let mut q = MergeQueue::new();
+
+        // Create an entry with an old queued_at time
+        let mut old_entry = MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1");
+        old_entry.queued_at = Utc::now() - Duration::hours(48);
+        old_entry.status = MergeStatus::Conflict;
+        // No conflict_info — falls back to queued_at
+        q.enqueue(old_entry);
+
+        // Create a recent entry
+        let mut recent_entry = MergeQueueEntry::new("m2", "t2", "https://github.com/test/repo/pull/2");
+        recent_entry.queued_at = Utc::now() - Duration::hours(1);
+        recent_entry.status = MergeStatus::Conflict;
+        q.enqueue(recent_entry);
+
+        // Cleanup with 24-hour cutoff
+        let cutoff = Utc::now() - Duration::hours(24);
+        q.cleanup(Some(cutoff));
+
+        // m1 (old, no conflict_info) should be removed, m2 (recent) should remain
+        assert_eq!(q.entries().len(), 1);
+        assert!(q.get("m1").is_none());
+        assert!(q.get("m2").is_some());
     }
 }

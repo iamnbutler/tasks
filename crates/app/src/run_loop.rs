@@ -938,6 +938,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let orch_github_token = config.github_token.clone();
 
     let orchestrator_eval_interval = config.orchestrator_eval_interval;
+    let conflict_max_age = config.conflict_max_age;
 
     // Problem tracker for mode lowering (spec §6.4)
     let problem_tracker = Arc::new(StdMutex::new(ProblemTracker::new()));
@@ -1516,9 +1517,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 // but no merge/reject action is taken. The human reviews.
             } // end single-entry evaluation block
 
-            // Cleanup terminal merge queue entries (issue #132).
-            // This removes Merged and Rejected entries to prevent unbounded growth.
-            orch_server.cleanup_merge_queue().await;
+            // Cleanup terminal merge queue entries (issue #132, #282).
+            // This removes Merged, Rejected, and stale Conflict entries to prevent unbounded growth.
+            let conflict_cutoff = chrono::Utc::now() - chrono::Duration::from_std(conflict_max_age).unwrap_or(chrono::Duration::hours(24));
+            orch_server.cleanup_merge_queue(Some(conflict_cutoff)).await;
         }
     });
 
