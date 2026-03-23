@@ -78,6 +78,8 @@ pub enum EventType {
     SystemTimeLimitSoft,
     /// Session hard time limit reached (spec §17.4).
     SystemTimeLimitHard,
+    /// State rebuild from GitHub (issue #256).
+    SystemRebuild,
 
     // Accounting events (spec §16.4)
     /// Token usage accounting (input/output tokens per request).
@@ -131,6 +133,7 @@ impl EventType {
             Self::SystemMemoryEmergency => "system:memory:emergency",
             Self::SystemTimeLimitSoft => "system:time_limit:soft",
             Self::SystemTimeLimitHard => "system:time_limit:hard",
+            Self::SystemRebuild => "system:rebuild",
             Self::SystemAccountingTokens => "system:accounting:tokens",
             Self::SystemAccountingApiCall => "system:accounting:api_call",
             Self::SystemAccountingSession => "system:accounting:session",
@@ -208,6 +211,7 @@ impl TryFrom<String> for EventType {
             "system:memory:emergency" => Ok(Self::SystemMemoryEmergency),
             "system:time_limit:soft" => Ok(Self::SystemTimeLimitSoft),
             "system:time_limit:hard" => Ok(Self::SystemTimeLimitHard),
+            "system:rebuild" => Ok(Self::SystemRebuild),
             "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
             "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
             "system:accounting:session" => Ok(Self::SystemAccountingSession),

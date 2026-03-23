@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -41,6 +42,15 @@ pub enum ServerError {
     TaskNotFound(String),
     #[error("store error: {0}")]
     StoreError(String),
+}
+
+/// Statistics from a rebuild operation (issue #256).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RebuildStats {
+    /// Number of tasks cleared from memory/database.
+    pub tasks_cleared: usize,
+    /// Number of merge queue entries cleared from memory/database.
+    pub merge_entries_cleared: usize,
 }
 
 /// Shared server state.
@@ -92,6 +102,8 @@ pub struct Server {
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
     pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    /// Flag to signal the poll loop to reset pollers (issue #256).
+    rebuild_requested: AtomicBool,
 }
 
 impl Server {
@@ -101,6 +113,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: None,
+            rebuild_requested: AtomicBool::new(false),
         }
     }
 
@@ -111,6 +124,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: Some(Arc::new(StdMutex::new(store))),
+            rebuild_requested: AtomicBool::new(false),
         }
     }
 
@@ -1381,6 +1395,79 @@ impl Server {
         );
         self.event_bus.publish(event).await?;
         Ok(())
+    }
+
+    // --- Rebuild from GitHub (issue #256) ---
+
+    /// Request a rebuild from GitHub.
+    ///
+    /// This sets a flag that the poll loop will check. When set, the poll loop
+    /// will clear its pollers, causing them to be recreated with `since: None`
+    /// (which fetches all open items from scratch).
+    ///
+    /// The rebuild process:
+    /// 1. Clear in-memory tasks and merge queue
+    /// 2. Clear database tables (preserving accounting and projects)
+    /// 3. Set rebuild_requested flag for poll loop
+    /// 4. Emit system:rebuild event
+    /// 5. Poll loop resets pollers and re-fetches all data
+    pub async fn rebuild_from_github(&self) -> Result<RebuildStats, ServerError> {
+        let (tasks_cleared, merge_entries_cleared) = {
+            // Clear in-memory state
+            let mut state = self.state.write().await;
+            let tasks_count = state.tasks.len();
+            let merge_count = state.merge_queue.entries().len();
+            state.tasks.clear();
+            state.merge_queue = crate::merge_queue::MergeQueue::new();
+            (tasks_count, merge_count)
+        };
+
+        // Clear database tables
+        let (db_tasks, db_merge) = if let Some(ref store) = self.store {
+            let store = store.lock().unwrap();
+            let tasks = store.clear_tasks()
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let merge = store.clear_merge_queue()
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            (tasks, merge)
+        } else {
+            (0, 0)
+        };
+
+        // Signal poll loop to reset pollers
+        self.rebuild_requested.store(true, Ordering::SeqCst);
+
+        // Emit rebuild event
+        let event = Event::new(
+            EventType::SystemRebuild,
+            "system",
+            Actor::Human,
+            serde_json::json!({
+                "tasks_cleared": tasks_cleared,
+                "merge_entries_cleared": merge_entries_cleared,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::info!(
+            tasks_cleared = tasks_cleared,
+            merge_entries_cleared = merge_entries_cleared,
+            db_tasks_cleared = db_tasks,
+            db_merge_cleared = db_merge,
+            "rebuild from GitHub initiated"
+        );
+
+        Ok(RebuildStats {
+            tasks_cleared,
+            merge_entries_cleared,
+        })
+    }
+
+    /// Check if a rebuild has been requested.
+    ///
+    /// Called by the poll loop. Returns true and clears the flag if set.
+    pub fn take_rebuild_requested(&self) -> bool {
+        self.rebuild_requested.swap(false, Ordering::SeqCst)
     }
 
     // --- Session failure handling (spec §13.1, §13.2) ---

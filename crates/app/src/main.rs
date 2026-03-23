@@ -71,6 +71,155 @@ fn cmd_list_projects() -> Result<(), String> {
     Ok(())
 }
 
+/// Rebuild state from GitHub (issue #256).
+///
+/// This is a standalone CLI operation that:
+/// 1. Clears tasks and merge_queue tables (preserving accounting and projects)
+/// 2. Polls all tracked projects from scratch
+/// 3. Re-creates tasks from all open issues
+/// 4. Re-creates merge queue entries from all open PRs
+async fn cmd_rebuild() -> Result<(), String> {
+    use server::workflow::LabelConfig;
+    use tasks_github::client::GitHubClient;
+    use tasks_github::poller::RepoPoller;
+
+    let github_token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GITHUB_TOKEN environment variable not set")?;
+
+    let store = open_store()?;
+
+    // Get list of projects before clearing
+    let projects = store
+        .list_projects()
+        .map_err(|e| format!("Failed to list projects: {e}"))?;
+
+    if projects.is_empty() {
+        eprintln!("No projects configured. Nothing to rebuild.");
+        return Ok(());
+    }
+
+    // Clear tasks and merge_queue tables
+    let tasks_cleared = store
+        .clear_tasks()
+        .map_err(|e| format!("Failed to clear tasks: {e}"))?;
+    let merge_cleared = store
+        .clear_merge_queue()
+        .map_err(|e| format!("Failed to clear merge queue: {e}"))?;
+
+    eprintln!(
+        "Cleared {} tasks and {} merge queue entries",
+        tasks_cleared, merge_cleared
+    );
+
+    let label_config = LabelConfig::default();
+    let mut total_tasks = 0;
+    let mut total_merge_entries = 0;
+
+    // Poll each project and recreate state
+    for project in &projects {
+        let parts: Vec<&str> = project.repo.split('/').collect();
+        if parts.len() != 2 {
+            eprintln!("Skipping invalid project repo format: {}", project.repo);
+            continue;
+        }
+
+        let (owner, repo_name) = (parts[0], parts[1]);
+        eprintln!("Polling {}/{}...", owner, repo_name);
+
+        let client = GitHubClient::new(&github_token);
+        let mut poller = RepoPoller::new(client, owner, repo_name);
+
+        match poller.poll().await {
+            Ok(result) => {
+                // Create tasks from issues
+                for issue in &result.issues {
+                    if let Some(task) =
+                        server::scheduler::issue_to_task(issue, &project.id, &label_config)
+                    {
+                        if let Err(e) = store.save_task(&task) {
+                            eprintln!(
+                                "  Warning: failed to save task for issue #{}: {}",
+                                issue.number, e
+                            );
+                        } else {
+                            total_tasks += 1;
+                        }
+                    }
+                }
+
+                // Create merge queue entries from open, non-draft PRs
+                for pr in &result.pull_requests {
+                    if pr.state == tasks_github::model::PullRequestState::Open && !pr.is_draft {
+                        let pr_url = format!(
+                            "https://github.com/{}/{}/pull/{}",
+                            pr.owner, pr.repo, pr.number
+                        );
+                        let entry_id = format!("mq-{}-{}-pr-{}", pr.owner, pr.repo, pr.number);
+
+                        // Try to find linked task by branch name
+                        let task_id = find_task_by_branch_in_store(&store, &pr.head_ref)
+                            .unwrap_or_default();
+
+                        let entry = server::model::merge_queue::MergeQueueEntry::new(
+                            entry_id,
+                            task_id,
+                            &pr_url,
+                        );
+
+                        if let Err(e) = store.save_merge_entry(&entry) {
+                            eprintln!(
+                                "  Warning: failed to save merge entry for PR #{}: {}",
+                                pr.number, e
+                            );
+                        } else {
+                            total_merge_entries += 1;
+                        }
+                    }
+                }
+
+                eprintln!(
+                    "  {} issues, {} PRs processed",
+                    result.issues.len(),
+                    result.pull_requests.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("  Error polling {}/{}: {}", owner, repo_name, e);
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "Rebuild complete: {} tasks, {} merge queue entries created",
+        total_tasks, total_merge_entries
+    );
+
+    Ok(())
+}
+
+/// Find a task ID by its branch name from the store.
+fn find_task_by_branch_in_store(store: &tasks_store::Store, branch: &str) -> Option<String> {
+    // Strip the "tasks/" prefix
+    let branch_suffix = branch.strip_prefix("tasks/")?;
+
+    let tasks = store.list_tasks().ok()?;
+
+    // New format: "tasks/{task_id}--{unique_suffix}"
+    if let Some((task_id, _suffix)) = branch_suffix.split_once("--") {
+        if tasks.iter().any(|t| t.id == task_id) {
+            return Some(task_id.to_string());
+        }
+    }
+
+    // Legacy format: "tasks/{task_id}" (exact match)
+    if tasks.iter().any(|t| t.id == branch_suffix) {
+        return Some(branch_suffix.to_string());
+    }
+
+    None
+}
+
 fn print_usage() {
     eprintln!("Usage: tasks-app <command>");
     eprintln!();
@@ -79,6 +228,7 @@ fn print_usage() {
     eprintln!("  add-project <owner/repo>  Add a project to track");
     eprintln!("  remove-project <id>       Remove a project");
     eprintln!("  list-projects             List configured projects");
+    eprintln!("  rebuild                   Rebuild state from GitHub (clears tasks/merge queue)");
 }
 
 #[tokio::main]
@@ -146,6 +296,7 @@ async fn main() {
             cmd_remove_project(id)
         }
         "list-projects" => cmd_list_projects(),
+        "rebuild" => cmd_rebuild().await,
         "run" => {
             let mut config = match AppConfig::from_env() {
                 Ok(c) => c,

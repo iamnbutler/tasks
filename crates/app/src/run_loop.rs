@@ -317,6 +317,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
 
+            // Check if rebuild was requested (issue #256)
+            // If so, clear all pollers so they're recreated with since=None
+            if poll_server.take_rebuild_requested() {
+                info!("rebuild requested, clearing pollers for full re-fetch");
+                pollers.clear();
+            }
+
             // Sync pollers with live project list
             let projects: Vec<(String, String)> = {
                 let state = poll_server.state.read().await;

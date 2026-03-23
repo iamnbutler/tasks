@@ -18,7 +18,7 @@ mod server;
 
 pub use mode::Mode;
 pub use recovery::{RecoveryResult, DEFAULT_MAX_RETRIES};
-pub use server::{Server, ServerError, ServerState};
+pub use server::{Server, ServerError, ServerState, RebuildStats};
 pub use workflow_watcher::{WorkflowConfigCache, WorkflowConfigWatcher, RefreshResult};
 pub use workspace::{
     CleanupCandidate, CleanupConfig, CleanupReason,
