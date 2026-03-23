@@ -43,6 +43,10 @@ Click the mode indicator to switch between:
 
 ## Tasks View
 
+### Creating a Task
+
+Use the **New Task** button to create a GitHub issue directly from the UI. Select a project, enter a title and optional markdown description, and optionally add comma-separated labels. The poller picks up the new issue on its next cycle.
+
 ### Task List
 
 The task list shows all tasks with columns for:
@@ -63,11 +67,12 @@ Use the filter controls to narrow down tasks:
 
 ### Task Detail
 
-Click a task to view its detail page:
+Click a task to view its detail page. The main area has two tabs:
 
-- **Description Tab** - Full task description and metadata
-- **Events Tab** - Timeline of all task events
-- **Chat Tab** - Send messages to active agent session
+- **Chat Tab** - Agent session messages and human-in-the-loop interaction
+- **Details Tab** - Full task description rendered as markdown
+
+The properties sidebar on the right shows metadata (state, source issue/PR, labels, timestamps) and a collapsible event timeline.
 
 ## Merge Queue
 
@@ -96,20 +101,20 @@ In Pause mode, use the "Flush" button to merge all approved entries.
 
 ## Orchestrator
 
-The Orchestrator view provides a chat interface with the AI project foreman.
+The Orchestrator view shows a conversational, context-rich feed of orchestrator activity plus a chat input to send messages to the AI project foreman.
 
-### Capabilities
+### Feed
 
-The orchestrator can:
+The feed displays orchestrator events with full context:
 
-- Provide project status updates
-- Answer questions about task progress
-- Explain decisions and prioritization
-- Discuss architecture and approach
+- **Decisions** - Approval/rejection reasoning with task titles and PR links
+- **Feedback** - Actionable feedback sent to agents
+- **Escalations** - Issues requiring human attention, with context on what happened and what to do
+- **Mode changes** - Operating mode transitions with reasoning
 
-### Chat Interface
+### Chat
 
-Type messages in the input field and press Enter to send. The conversation history is preserved across sessions.
+Type messages in the input field and press Enter to send. The orchestrator processes the message and responds via the event feed.
 
 ## Events
 

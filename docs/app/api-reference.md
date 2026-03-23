@@ -28,7 +28,8 @@ GET /api/snapshot
   "projects": [...],
   "tasks": [...],
   "merge_queue": [...],
-  "sessions": [...]
+  "slot_utilization": { "active": 2, "max": 5 },
+  "human_present": true
 }
 ```
 
@@ -121,6 +122,14 @@ Content-Type: application/json
 }
 ```
 
+#### Cancel Task
+
+Stop a running agent session.
+
+```http
+POST /api/tasks/:id/cancel
+```
+
 ### Projects
 
 #### List Projects
@@ -156,6 +165,33 @@ Content-Type: application/json
 
 ```http
 DELETE /api/projects/:id
+```
+
+### Issues
+
+#### Create Issue
+
+Create a new GitHub issue in a tracked project. The poller will pick it up on its next cycle and create a task.
+
+```http
+POST /api/issues
+Content-Type: application/json
+
+{
+  "project_id": "project-uuid",
+  "title": "Fix login bug",
+  "body": "Optional markdown description",
+  "labels": ["bug", "priority:high"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "number": 42,
+  "url": "https://github.com/owner/repo/issues/42"
+}
 ```
 
 ### Merge Queue
@@ -194,22 +230,143 @@ POST /api/merge-queue/:id/reject
 
 #### Request Changes
 
+Unlike rejection, the entry stays in the queue and the task receives priority dispatch.
+
 ```http
 POST /api/merge-queue/:id/request-changes
 Content-Type: application/json
 
 {
-  "message": "Please add more tests"
+  "reasoning": "Why changes are needed",
+  "feedback": "Specific, actionable instructions for the agent"
 }
 ```
 
 #### Flush Approved Entries
 
-Merge all approved entries (Pause mode only).
+Merge all approved entries (Pause mode only). Calls the GitHub API for each entry and returns the IDs of successfully merged entries.
 
 ```http
 POST /api/merge-queue/flush
 ```
+
+**Response:** Array of merged entry IDs.
+
+```json
+["entry-uuid-1", "entry-uuid-2"]
+```
+
+### Orchestrator
+
+#### Send Orchestrator Message
+
+Send a message to the orchestrator. Emits an `orchestrator:message` event that the orchestrator processes.
+
+```http
+POST /api/orchestrator/chat
+Content-Type: application/json
+
+{
+  "message": "What's the status of the authentication work?"
+}
+```
+
+### Accounting
+
+#### Get Accounting Summary
+
+Get global token usage and cost summary.
+
+```http
+GET /api/accounting
+```
+
+#### List Task Accounting
+
+Get per-task token usage summaries.
+
+```http
+GET /api/accounting/tasks
+```
+
+#### Get Task Accounting
+
+Get token usage for a specific task.
+
+```http
+GET /api/accounting/tasks/:id
+```
+
+### Completions
+
+Fast LLM completion endpoints powered by Claude Haiku. Input is limited to 32 KB.
+
+#### General Completion
+
+```http
+POST /api/completions
+Content-Type: application/json
+
+{
+  "prompt": "Your prompt here",
+  "system": "Optional system prompt",
+  "max_tokens": 1024
+}
+```
+
+**Response:** `{ "text": "..." }`
+
+#### Generate Name
+
+Generate a concise name from context.
+
+```http
+POST /api/completions/name
+Content-Type: application/json
+
+{ "context": "task title and summary" }
+```
+
+**Response:** `{ "name": "..." }`
+
+#### Generate Description
+
+Generate a brief description (1–2 sentences) from context.
+
+```http
+POST /api/completions/describe
+Content-Type: application/json
+
+{ "context": "..." }
+```
+
+**Response:** `{ "description": "..." }`
+
+#### Brainstorm Ideas
+
+Generate a list of ideas for a topic.
+
+```http
+POST /api/completions/brainstorm
+Content-Type: application/json
+
+{ "topic": "...", "count": 5 }
+```
+
+**Response:** `{ "ideas": ["...", "..."] }`
+
+#### Summarize Text
+
+Summarize text with an optional word limit.
+
+```http
+POST /api/completions/summarize
+Content-Type: application/json
+
+{ "text": "...", "max_words": 100 }
+```
+
+**Response:** `{ "summary": "..." }`
 
 ### Events (SSE)
 
@@ -258,6 +415,8 @@ All errors return JSON with the following structure:
 | 400 | Bad Request |
 | 404 | Not Found |
 | 500 | Internal Server Error |
+| 502 | Bad Gateway (GitHub API error) |
+| 503 | Service Unavailable (completions not configured) |
 
 ---
 

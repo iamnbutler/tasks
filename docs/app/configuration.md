@@ -17,6 +17,23 @@ Tasks is configured through environment variables and a `.env` file.
 |----------|-------------|---------|
 | `TASKS_DATA_DIR` | Data storage directory | `~/.local/state/tasks/` |
 | `TASKS_SERVER_URL` | Server URL (for desktop app) | `http://localhost:4800` |
+| `TASKS_WEB_PORT` | Web server port | `4800` |
+| `TASKS_MAX_SESSIONS` | Global max concurrent sessions | `5` |
+| `TASKS_MAX_SESSIONS_PER_PROJECT` | Default max sessions per project | `1` |
+| `TASKS_MAX_RETRIES` | Max retry attempts for failed tasks | `3` |
+| `TASKS_POLL_INTERVAL` | GitHub poll interval (seconds) | `60` |
+| `TASKS_DISPATCH_INTERVAL` | Dispatch tick interval (seconds) | `30` |
+| `TASKS_ORCHESTRATOR_EVAL_INTERVAL` | Orchestrator evaluation interval (seconds) | `15` |
+| `TASKS_CONTAINER_IMAGE` | Container image for sessions | `tasks-agent:latest` |
+| `TASKS_CONTAINER_MEMORY` | Container memory limit | `8G` |
+| `TASKS_PROGRESS_THRESHOLD` | Minimum session duration to count as progress (seconds) | `60` |
+| `TASKS_MEMORY_WARN_PCT` | Memory usage % to warn | `75` |
+| `TASKS_MEMORY_SOFT_LIMIT_PCT` | Memory usage % to pause dispatch | `85` |
+| `TASKS_MEMORY_HARD_LIMIT_PCT` | Memory usage % to emergency-stop sessions | `92` |
+| `TASKS_WORKSPACE_STALE_THRESHOLD` | Idle workspace age before cleanup (seconds) | `604800` (7 days) |
+| `TASKS_CLEANUP_INTERVAL` | Workspace cleanup scan interval (seconds) | `900` (15 min) |
+| `TASKS_CONFLICT_MAX_AGE` | Max age for conflict entries before cleanup (seconds) | `86400` (24 h) |
+| `RUST_LOG` | Log verbosity | `info` |
 
 ## .env File
 
