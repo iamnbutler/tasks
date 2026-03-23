@@ -58,6 +58,7 @@ pub fn issue_to_task(
     task.description = issue.body.clone();
     task.labels = issue.labels.iter().map(|l| l.name.clone()).collect();
     task.source_created_at = Some(issue.created_at);
+    task.source_number = Some(issue.number);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| issue_label_names.contains(&b.as_str()));
@@ -105,6 +106,7 @@ pub fn pr_to_task(
     task.description = pr.body.clone();
     task.labels = pr.labels.iter().map(|l| l.name.clone()).collect();
     task.source_created_at = Some(pr.created_at);
+    task.source_number = Some(pr.number);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| pr_label_names.contains(&b.as_str()));

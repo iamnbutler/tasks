@@ -158,12 +158,24 @@ pub fn evaluate(
             return unblock_cmp;
         }
 
-        // Recency: newer source creation date first (descending).
-        // Use source_created_at (GitHub issue/PR date) when available,
-        // fall back to internal created_at for non-GitHub tasks.
+        // Source number: lower issue/PR numbers first (ascending).
+        // GitHub issues are numbered sequentially, so lower numbers are older.
+        // This ensures related tasks (e.g., "Phase 1", "Phase 2", "Phase 3")
+        // are processed in logical order. Tasks without a source number
+        // (internal tasks) sort after those with numbers.
+        let num_a = a.source_number.unwrap_or(u64::MAX);
+        let num_b = b.source_number.unwrap_or(u64::MAX);
+        let num_cmp = num_a.cmp(&num_b);
+        if num_cmp != std::cmp::Ordering::Equal {
+            return num_cmp;
+        }
+
+        // Fallback: older creation date first (ascending).
+        // For tasks with the same source number (shouldn't happen) or
+        // both without source numbers, prefer older tasks.
         let time_a = a.source_created_at.unwrap_or(a.created_at);
         let time_b = b.source_created_at.unwrap_or(b.created_at);
-        time_b.cmp(&time_a)
+        time_a.cmp(&time_b)
     });
 
     // 6. Apply concurrency limits.
@@ -319,11 +331,33 @@ mod tests {
     }
 
     #[test]
-    fn priority_sorting_recency() {
+    fn priority_sorting_by_source_number() {
+        let mut tasks = HashMap::new();
+
+        // t1 has lower issue number (older), should sort first
+        let mut t1 = make_task("t1", "proj");
+        t1.priority = Some(1);
+        t1.source_number = Some(10);
+        insert(&mut tasks, t1);
+
+        // t2 has higher issue number (newer), should sort second
+        let mut t2 = make_task("t2", "proj");
+        t2.priority = Some(1);
+        t2.source_number = Some(15);
+        insert(&mut tasks, t2);
+
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
+        // Lower source_number (older issue) sorts first.
+        assert_eq!(plan.new_work, vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn priority_sorting_fallback_to_created_at() {
         let mut tasks = HashMap::new();
 
         let now = Utc::now();
 
+        // Both tasks have no source_number (internal tasks), so fall back to created_at.
         let mut t1 = make_task("t1", "proj");
         t1.priority = Some(1);
         t1.created_at = now - Duration::seconds(100);
@@ -335,8 +369,8 @@ mod tests {
         insert(&mut tasks, t2);
 
         let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
-        // t2 is newer, so it sorts first at same priority.
-        assert_eq!(plan.new_work, vec!["t2", "t1"]);
+        // Without source_number, older created_at sorts first.
+        assert_eq!(plan.new_work, vec!["t1", "t2"]);
     }
 
     #[test]

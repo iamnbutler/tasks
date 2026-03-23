@@ -30,6 +30,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_failure_at TEXT,
             last_failure_json TEXT,
             source_created_at TEXT,
+            source_number INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -116,6 +117,28 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to add last_polled_at column");
+            return Err(e);
+        }
+    }
+
+    // Migration: add source_number column if it doesn't exist (issue #327)
+    // This stores the GitHub issue/PR number for deterministic dispatch ordering.
+    match conn.execute(
+        "ALTER TABLE tasks ADD COLUMN source_number INTEGER",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added source_number column to tasks table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            // Column already exists — this is expected for existing databases
+            tracing::debug!("source_number column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add source_number column");
             return Err(e);
         }
     }
