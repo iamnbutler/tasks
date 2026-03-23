@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Cell, Pie, PieChart, Bar, BarChart, XAxis, YAxis } from "recharts";
-import { AlertTriangle, RefreshCw, Sparkles, Bell } from "lucide-react";
+import { AlertTriangle, RefreshCw, Sparkles, Bell, ExternalLink } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { complete } from "@/lib/api";
-import type { Task, TaskState, MergeQueueEntry, MergeStatus } from "@/lib/types";
+import type { Task, TaskState, MergeQueueEntry, MergeStatus, Event, Project } from "@/lib/types";
+import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import {
   Card,
   CardContent,
@@ -387,34 +388,166 @@ Be concise and helpful. Don't use bullet points - write in natural sentences.`;
 }
 
 // ---------------------------------------------------------------------------
-// Orchestrator Alerts Placeholder
+// Escalation event parsing helper
 // ---------------------------------------------------------------------------
 
-function OrchestratorAlerts() {
+interface EscalationAlert {
+  id: string;
+  timestamp: string;
+  action: string;
+  reasoning?: string;
+  prUrl?: string;
+  taskId?: string;
+  fromMode?: string;
+  toMode?: string;
+}
+
+function parseEscalationEvents(events: Event[]): EscalationAlert[] {
+  return events
+    .filter((e) => e.type === "orchestrator:escalation")
+    .map((event) => ({
+      id: event.id,
+      timestamp: event.ts,
+      action: typeof event.data?.action === "string" ? event.data.action : "unknown",
+      reasoning:
+        typeof event.data?.reasoning === "string" ? event.data.reasoning :
+        typeof event.data?.reason === "string" ? event.data.reason :
+        undefined,
+      prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
+      taskId: event.task,
+      fromMode: typeof event.data?.from === "string" ? event.data.from : undefined,
+      toMode: typeof event.data?.to === "string" ? event.data.to : undefined,
+    }))
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp)); // Most recent first
+}
+
+function taskLabel(taskId: string | undefined, tasks: Task[], projects: Project[]): string | null {
+  if (!taskId) return null;
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) return taskId.slice(0, 8);
+  const { source } = task;
+  const issueNum =
+    (source.type === "github_issue" || source.type === "github_pr")
+      ? `#${source.number}`
+      : taskId.slice(0, 8);
+  const proj = projectLabel(task.project, projects);
+  const repoName = proj.includes("/") ? proj.split("/")[1] : proj;
+  return `${issueNum} (${repoName})`;
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator Alerts Component
+// ---------------------------------------------------------------------------
+
+function OrchestratorAlerts({
+  events,
+  tasks,
+  projects,
+}: {
+  events: Event[];
+  tasks: Task[];
+  projects: Project[];
+}) {
+  const escalations = useMemo(() => parseEscalationEvents(events), [events]);
+
+  // Show at most 5 recent escalations
+  const recentEscalations = escalations.slice(0, 5);
+
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <Bell className="h-4 w-4" />
           Orchestrator Notifications
+          {escalations.length > 0 && (
+            <span className="ml-auto rounded-full bg-yellow-500/20 px-2 py-0.5 text-xs font-medium text-yellow-500">
+              {escalations.length}
+            </span>
+          )}
         </CardTitle>
         <CardDescription>
           System alerts and concerns will appear here
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="flex flex-col items-center justify-center py-8 text-center">
-          <div className="rounded-full bg-muted p-3">
-            <Bell className="h-6 w-6 text-muted-foreground" />
+        {recentEscalations.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-8 text-center">
+            <div className="rounded-full bg-muted p-3">
+              <Bell className="h-6 w-6 text-muted-foreground" />
+            </div>
+            <p className="mt-3 text-sm text-muted-foreground">
+              No alerts at this time
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground/70">
+              The orchestrator will notify you of conflicts, failures, or items
+              needing attention
+            </p>
           </div>
-          <p className="mt-3 text-sm text-muted-foreground">
-            No alerts at this time
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground/70">
-            The orchestrator will notify you of conflicts, failures, or items
-            needing attention
-          </p>
-        </div>
+        ) : (
+          <div className="space-y-3">
+            {recentEscalations.map((alert) => {
+              const label = taskLabel(alert.taskId, tasks, projects);
+              let title = "Alert";
+              if (alert.action === "conflict_needs_human") {
+                title = "Conflict Needs Review";
+              } else if (alert.action === "mode_lowered") {
+                title = "Mode Lowered";
+              }
+
+              return (
+                <div
+                  key={alert.id}
+                  className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-medium text-sm text-yellow-400">
+                          {title}
+                        </span>
+                        {label && (
+                          <span className="rounded border border-border px-1.5 py-0.5 font-mono text-xs">
+                            {label}
+                          </span>
+                        )}
+                        {alert.action === "mode_lowered" && alert.fromMode && alert.toMode && (
+                          <span className="rounded border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-xs">
+                            {alert.fromMode} → {alert.toMode}
+                          </span>
+                        )}
+                        {alert.prUrl && (
+                          <a
+                            href={alert.prUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs text-blue-400 hover:underline"
+                          >
+                            View PR
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                        <span className="text-xs text-muted-foreground">
+                          {formatRelativeTime(alert.timestamp)}
+                        </span>
+                      </div>
+                      {alert.reasoning && (
+                        <p className="mt-1 text-sm text-muted-foreground line-clamp-2">
+                          {alert.reasoning}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {escalations.length > 5 && (
+              <p className="text-center text-xs text-muted-foreground">
+                +{escalations.length - 5} more alerts
+              </p>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -497,9 +630,10 @@ function StatsCards({
 // ---------------------------------------------------------------------------
 
 export function DashboardPage() {
-  const { filteredTasks, filteredMergeQueue, selectedProject, snapshot } =
+  const { filteredTasks, filteredMergeQueue, selectedProject, snapshot, events } =
     useAppState();
   const projects = snapshot?.projects ?? [];
+  const tasks = snapshot?.tasks ?? [];
 
   const projectName = selectedProject
     ? projects.find((p) => p.id === selectedProject)?.repo ?? "Project"
@@ -555,7 +689,7 @@ export function DashboardPage() {
         {/* AI Summary and Alerts */}
         <div className="grid gap-6 md:grid-cols-2">
           <AISummary tasks={filteredTasks} mergeQueue={filteredMergeQueue} />
-          <OrchestratorAlerts />
+          <OrchestratorAlerts events={events} tasks={tasks} projects={projects} />
         </div>
       </div>
     </ScrollArea>

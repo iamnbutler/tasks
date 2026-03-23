@@ -49,6 +49,11 @@ interface OrchestratorBlock {
   entryId?: string;
   content?: string;
   actor?: string;
+  /** Escalation-specific fields */
+  escalationAction?: "conflict_needs_human" | "mode_lowered" | string;
+  prUrl?: string;
+  fromMode?: string;
+  toMode?: string;
 }
 
 function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
@@ -74,12 +79,24 @@ function parseOrchestratorEvents(events: Event[]): OrchestratorBlock[] {
         content: typeof event.data?.context === "string" ? event.data.context : undefined,
       });
     } else if (event.type === "orchestrator:escalation") {
+      const action = typeof event.data?.action === "string" ? event.data.action : undefined;
+      // Extract reasoning - backend sends "reasoning" for conflicts, "reason" for mode changes
+      const reasoning =
+        typeof event.data?.reasoning === "string" ? event.data.reasoning :
+        typeof event.data?.reason === "string" ? event.data.reason :
+        undefined;
+
       blocks.push({
         kind: "escalation",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.reason === "string" ? event.data.reason : JSON.stringify(event.data),
+        content: reasoning,
         taskId: event.task,
+        entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
+        escalationAction: action,
+        prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
+        fromMode: typeof event.data?.from === "string" ? event.data.from : undefined,
+        toMode: typeof event.data?.to === "string" ? event.data.to : undefined,
       });
     } else if (event.type === "orchestrator:message") {
       // Human message to orchestrator
@@ -181,21 +198,57 @@ function FeedbackBlock({ block, tasks, projects }: { block: OrchestratorBlock; t
 }
 
 function EscalationBlock({ block, tasks, projects }: { block: OrchestratorBlock; tasks: Task[]; projects: Project[] }) {
+  const [collapsed, setCollapsed] = useState(false);
   const label = taskLabel(block.taskId, tasks, projects);
+
+  // Determine escalation type label
+  let escalationLabel = "Escalation";
+  if (block.escalationAction === "conflict_needs_human") {
+    escalationLabel = "Conflict Needs Review";
+  } else if (block.escalationAction === "mode_lowered") {
+    escalationLabel = "Mode Lowered";
+  }
+
   return (
     <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3">
       <div className="flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-sm text-yellow-400">Escalation</span>
+            <span className="font-medium text-sm text-yellow-400">{escalationLabel}</span>
             {label && (
               <Badge variant="outline" className="font-mono text-xs">{label}</Badge>
+            )}
+            {block.escalationAction === "mode_lowered" && block.fromMode && block.toMode && (
+              <Badge variant="outline" className="text-xs bg-yellow-500/10">
+                {block.fromMode} → {block.toMode}
+              </Badge>
+            )}
+            {block.prUrl && (
+              <a
+                href={block.prUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-blue-400 hover:underline"
+              >
+                View PR
+              </a>
             )}
             <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
           </div>
           {block.content && (
-            <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.content}</p>
+            <>
+              <button
+                onClick={() => setCollapsed(!collapsed)}
+                className="mt-1 text-sm text-muted-foreground hover:text-foreground flex items-center gap-1"
+              >
+                <ChevronDown className={cn("h-3 w-3 transition-transform", collapsed && "-rotate-90")} />
+                {collapsed ? "Show" : "Hide"} details
+              </button>
+              {!collapsed && (
+                <p className="mt-2 text-sm text-muted-foreground whitespace-pre-wrap">{block.content}</p>
+              )}
+            </>
           )}
         </div>
       </div>
