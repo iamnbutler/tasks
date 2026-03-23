@@ -84,6 +84,26 @@ ID  Repository              Status
 2   example/other-repo      active
 ```
 
+### `rebuild`
+
+Rebuild task state from GitHub. Clears the local tasks and merge queue tables, then re-polls all tracked repositories to reconstruct state from live GitHub data.
+
+```bash
+tasks rebuild
+```
+
+> **Warning:** This clears all local task records and merge queue entries. Project configurations and accounting data are preserved.
+
+**Example:**
+
+```bash
+tasks rebuild
+# Cleared 12 tasks and 3 merge queue entries
+# Polling iamnbutler/tasks...
+#   8 issues, 2 PRs processed
+# Rebuild complete: 8 tasks, 2 merge queue entries created
+```
+
 ## Environment Variables
 
 | Variable | Description | Required |

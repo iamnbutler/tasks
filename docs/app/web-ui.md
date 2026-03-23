@@ -46,13 +46,24 @@ Click the mode indicator to switch between:
 
 ### Task List
 
-The task list shows all tasks with columns for:
+The task list groups tasks by state and displays them in collapsible sections. Use the tabs at the top to filter:
 
-- Status (state indicator)
+| Tab | Description |
+|-----|-------------|
+| **All** | Every task |
+| **Active** | Tasks in progress (running, waiting, blocked, etc.) |
+| **Done** | Completed, failed, or cancelled tasks |
+
+Each task row shows:
+
+- Priority indicator
+- Issue/task ID (e.g. `#42`)
+- State icon
 - Title
+- Labels
+- PR link — shown when the task has a submitted pull request (links to GitHub)
 - Project
-- Assignee (if any)
-- Created date
+- Last updated time
 
 ### Creating a Task
 
@@ -135,11 +146,19 @@ The Events view shows a real-time stream of system events.
 
 ### Filtering
 
-Filter events by:
+Use the filter tabs to narrow down the event stream:
 
-- **Type** - Specific event type
-- **Task** - Events for a specific task
-- **Time** - Time range
+| Filter | Description |
+|--------|-------------|
+| **Important** *(default)* | All events except verbose agent/human messages |
+| **All** | Every event, including raw `agent:message` and `human:message` |
+| **Task** | Task lifecycle events (`task:*`) |
+| **Agent** | Agent session events (`agent:*`) |
+| **Merge** | Merge queue events (`merge:*`) |
+| **System** | System-level events (`system:*`) |
+| **Orchestrator** | Orchestrator events (`orchestrator:*`) |
+
+Use the **Pause** button to freeze the event stream for inspection. Click **Resume** to continue live updates.
 
 ## Keyboard Shortcuts
 
