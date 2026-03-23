@@ -44,15 +44,38 @@ Click the mode indicator to switch between:
 
 ## Tasks View
 
-### Task List
+### Task List Tabs
 
-The task list shows all tasks with columns for:
+The task list uses tabs to group tasks by lifecycle stage:
 
-- Status (state indicator)
+| Tab | States Included | Description |
+|-----|-----------------|-------------|
+| **Queue** | `waiting`, `changes_requested` | Tasks eligible for dispatch, in priority order. Supports drag-and-drop reordering. |
+| **Active** | `running`, `question`, `testing`, `awaiting_merge`, `conflict` | Tasks currently being worked on by agents. |
+| **Backlog** | `waiting`, `blocked` | Tasks waiting to be dispatched or blocked on dependencies. |
+| **Completed** | `completed`, `failed`, `cancelled` | Finished tasks. |
+| **All** | All states | Unfiltered view of every task. |
+
+Each tab shows a count of tasks in that category.
+
+### Queue Tab
+
+The Queue tab shows tasks in dispatch priority order (matching the backend dispatcher). Tasks can be dragged to reorder — the order is persisted as sequential priorities (1, 2, 3, …) which the dispatcher uses for scheduling.
+
+`changes_requested` tasks always sort above `waiting` tasks. Within each group, tasks are ordered by explicit priority, then by recency.
+
+### Task Columns
+
+Each task row shows:
+
+- Priority indicator (arrow icon)
+- Issue/task ID
+- State icon
 - Title
+- Labels
+- PR link (if a PR exists in the merge queue)
 - Project
-- Assignee (if any)
-- Created date
+- Last updated time
 
 ### Creating a Task
 
@@ -60,11 +83,7 @@ Use the **New Task** button to create a GitHub issue directly from the UI withou
 
 ### Filtering
 
-Use the filter controls to narrow down tasks:
-
-- **State** - Filter by task state
-- **Project** - Filter by project
-- **Search** - Text search in title/description
+Use the search input to filter tasks by title or ID within the current tab.
 
 ### Task Detail
 

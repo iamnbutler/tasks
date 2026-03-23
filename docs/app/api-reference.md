@@ -94,6 +94,36 @@ GET /api/tasks
 GET /api/tasks/:id
 ```
 
+#### Update Task
+
+Update a task's properties. Currently supports updating priority for manual queue reordering.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 2
+}
+```
+
+**Response:** Updated task object.
+
+#### Reorder Tasks
+
+Assign sequential priorities to tasks in the given order. Used for drag-and-drop queue reordering in the UI. Tasks are assigned priorities 1, 2, 3, … in the order provided.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["uuid-a", "uuid-b", "uuid-c"]
+}
+```
+
+**Response:** `200 OK`
+
 #### Get Task Events
 
 Returns the event history for a task.
@@ -257,6 +287,25 @@ Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of 
 POST /api/merge-queue/flush
 ```
 
+#### Rebuild from GitHub
+
+Clear tasks and merge queue from memory and database, then re-fetch all data from GitHub. Preserves accounting data, event logs, projects, and operating mode.
+
+> **Note:** The response reflects items *cleared*. The actual re-fetch happens asynchronously in the poll loop — new data appears as pollers rediscover items from GitHub.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_queue_cleared": 3
+}
+```
+
 ### Orchestrator
 
 #### Chat with Orchestrator
@@ -361,7 +410,26 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Events
+
+#### Query Historical Events
+
+Query historical events by type prefix across all task logs.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=200
+```
+
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `type_prefix` | Event type prefix to filter by (required, e.g. `orchestrator:`) |
+| `limit` | Maximum number of events to return (default: 200) |
+
+**Response:** Array of event objects sorted by timestamp ascending.
+
+#### SSE Live Stream
 
 Server-Sent Events stream for real-time updates.
 
