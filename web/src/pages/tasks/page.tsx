@@ -6,14 +6,33 @@ import {
   ArrowUp,
   ChevronRight,
   Minus,
+  Plus,
   Search,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { cn, formatRelativeTime } from "@/lib/utils";
+import { createIssue } from "@/lib/api";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type { Task, TaskState } from "@/lib/types";
 import { taskStateMeta, stateSortOrder } from "./columns";
 
@@ -217,9 +236,18 @@ function TaskGroupSection({
 // ---------------------------------------------------------------------------
 
 export function TasksPage() {
-  const { filteredTasks, selectedProject, snapshot } = useAppState();
+  const { filteredTasks, selectedProject, snapshot, refreshSnapshot } = useAppState();
   const [activeTab, setActiveTab] = useState<TabKey>("all");
   const [search, setSearch] = useState("");
+
+  // New task dialog state
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
+  const [newTaskProjectId, setNewTaskProjectId] = useState<string>("");
+  const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [newTaskBody, setNewTaskBody] = useState("");
+  const [newTaskLabels, setNewTaskLabels] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const projects = snapshot?.projects ?? [];
   const projectIdToRepo = useMemo(() => {
@@ -254,6 +282,52 @@ export function TasksPage() {
     return { all, active, completed };
   }, [filteredTasks]);
 
+  // Reset dialog state when opening
+  const handleOpenNewTask = () => {
+    setNewTaskProjectId(selectedProject ?? (projects[0]?.id ?? ""));
+    setNewTaskTitle("");
+    setNewTaskBody("");
+    setNewTaskLabels("");
+    setCreateError(null);
+    setNewTaskOpen(true);
+  };
+
+  // Handle create task
+  const handleCreateTask = async () => {
+    if (!newTaskTitle.trim()) {
+      setCreateError("Title is required");
+      return;
+    }
+    if (!newTaskProjectId) {
+      setCreateError("Please select a project");
+      return;
+    }
+
+    setCreating(true);
+    setCreateError(null);
+
+    try {
+      const labels = newTaskLabels
+        .split(",")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+
+      await createIssue({
+        project_id: newTaskProjectId,
+        title: newTaskTitle.trim(),
+        body: newTaskBody.trim() || undefined,
+        labels: labels.length > 0 ? labels : undefined,
+      });
+
+      setNewTaskOpen(false);
+      await refreshSnapshot();
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : "Failed to create task");
+    } finally {
+      setCreating(false);
+    }
+  };
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -283,14 +357,25 @@ export function TasksPage() {
           </Tabs>
         </div>
 
-        <div className="relative w-48">
-          <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            placeholder="Filter..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="h-7 pl-7 text-xs"
-          />
+        <div className="flex items-center gap-2">
+          <div className="relative w-48">
+            <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              placeholder="Filter..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="h-7 pl-7 text-xs"
+            />
+          </div>
+          <Button
+            size="sm"
+            className="h-7 text-xs gap-1"
+            onClick={handleOpenNewTask}
+            disabled={projects.length === 0}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            New Task
+          </Button>
         </div>
       </div>
 
@@ -315,6 +400,107 @@ export function TasksPage() {
           </div>
         )}
       </ScrollArea>
+
+      {/* New Task Dialog */}
+      <Dialog open={newTaskOpen} onOpenChange={setNewTaskOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Create new task</DialogTitle>
+            <DialogDescription>
+              Create a GitHub issue that will become a task. The poller will pick it up on the next cycle.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleCreateTask();
+            }}
+          >
+            <div className="space-y-4 py-3">
+              {/* Project selector */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">Project</label>
+                <Select
+                  value={newTaskProjectId}
+                  onValueChange={setNewTaskProjectId}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select a project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {projects.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.repo}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Title */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">Title</label>
+                <Input
+                  placeholder="Issue title..."
+                  value={newTaskTitle}
+                  onChange={(e) => {
+                    setNewTaskTitle(e.target.value);
+                    setCreateError(null);
+                  }}
+                  disabled={creating}
+                  autoFocus
+                />
+              </div>
+
+              {/* Body */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">Description (optional)</label>
+                <Textarea
+                  placeholder="Issue description in markdown..."
+                  value={newTaskBody}
+                  onChange={(e) => setNewTaskBody(e.target.value)}
+                  disabled={creating}
+                  className="min-h-24"
+                />
+              </div>
+
+              {/* Labels */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">Labels (optional)</label>
+                <Input
+                  placeholder="bug, enhancement, help wanted"
+                  value={newTaskLabels}
+                  onChange={(e) => setNewTaskLabels(e.target.value)}
+                  disabled={creating}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Comma-separated list of labels
+                </p>
+              </div>
+
+              {createError && (
+                <p className="text-sm text-red-400">{createError}</p>
+              )}
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setNewTaskOpen(false)}
+                disabled={creating}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                disabled={creating || !newTaskTitle.trim() || !newTaskProjectId}
+              >
+                {creating ? "Creating..." : "Create Task"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
