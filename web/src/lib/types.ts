@@ -100,3 +100,17 @@ export interface Snapshot {
   slot_utilization: SlotUtilization;
   human_present: boolean;
 }
+
+/** Rebuild scope for self-update mechanism */
+export type RebuildScope = "frontend" | "server" | "container";
+
+/** Update status for self-update mechanism */
+export interface UpdateStatus {
+  available: boolean;
+  current_commit: string;
+  target_commit?: string;
+  rebuild_scope?: RebuildScope;
+  commit_summary?: string;
+  last_checked?: string;
+  applying?: boolean;
+}
