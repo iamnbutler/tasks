@@ -27,7 +27,8 @@ pub struct ModeTransitionError {
 pub enum Mode {
     /// No new work dispatched, agents terminated, merge queue held.
     Stop = 0,
-    /// Agents work normally, merge queue held, Flush available.
+    /// Agents work normally. Orchestrator evaluates, rejects, and handles
+    /// conflicts, but approved merges are held for human flush.
     Pause = 1,
     /// Fully autonomous. Orchestrator owns merge authority.
     Play = 2,
