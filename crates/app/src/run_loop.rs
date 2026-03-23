@@ -809,6 +809,12 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Check operating mode — no dispatch in Stop mode (spec §6.1)
+            let mode = dispatch_server.mode().await;
+            if mode == server::Mode::Stop {
+                continue;
+            }
+
             // Check memory pressure before dispatching new work.
             // When paused, pass global_max=0 so the dispatcher won't select
             // new work (which would transition tasks to Running prematurely),
