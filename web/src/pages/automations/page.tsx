@@ -1,8 +1,9 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Calendar,
   Clock,
-  History,
+  ExternalLink,
   MoreHorizontal,
   Pause,
   Pencil,
@@ -36,7 +37,6 @@ import {
 import {
   ListView,
   ListEmptyState,
-  ListSplitView,
 } from "@/components/ui/list-view";
 import { ListHeader } from "@/components/ui/list-header";
 import {
@@ -49,7 +49,6 @@ import {
   ActionsCell,
 } from "@/components/ui/list-row";
 import type { Automation, AutomationState } from "@/lib/types";
-import { AutomationRunsPanel } from "./automation-runs-panel";
 import { AutomationFormDialog } from "./automation-form-dialog";
 
 // ---------------------------------------------------------------------------
@@ -107,15 +106,13 @@ function TriggerDisplay({ trigger }: { trigger: Automation["trigger"] }) {
 function AutomationRow({
   automation,
   projectName,
-  isSelected,
-  onSelect,
+  onNavigate,
   onEdit,
   onRefresh,
 }: {
   automation: Automation;
   projectName: string;
-  isSelected: boolean;
-  onSelect: () => void;
+  onNavigate: () => void;
   onEdit: () => void;
   onRefresh: () => Promise<void>;
 }) {
@@ -129,8 +126,8 @@ function AutomationRow({
     try {
       await triggerAutomation(automation.id);
       await onRefresh();
-      // Select this automation to show the new run
-      onSelect();
+      // Navigate to detail page to see the run
+      onNavigate();
     } catch (error) {
       console.error("Failed to run automation:", error);
     } finally {
@@ -164,8 +161,7 @@ function AutomationRow({
   return (
     <>
       <ListRow
-        selected={isSelected}
-        onRowClick={onSelect}
+        onRowClick={onNavigate}
         className="gap-4 py-3"
       >
         <IconCell>
@@ -207,9 +203,9 @@ function AutomationRow({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={onSelect}>
-                <History className="mr-2 h-3.5 w-3.5" />
-                View Runs
+              <DropdownMenuItem onClick={onNavigate}>
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                Open
               </DropdownMenuItem>
               <DropdownMenuItem onClick={onEdit}>
                 <Pencil className="mr-2 h-3.5 w-3.5" />
@@ -288,11 +284,10 @@ function EmptyState() {
 // ---------------------------------------------------------------------------
 
 export function AutomationsPage() {
+  const navigate = useNavigate();
   const { filteredAutomations, selectedProject, snapshot, refreshAutomations } = useAppState();
   const projects = snapshot?.projects ?? [];
 
-  // State for selected automation (to show runs panel)
-  const [selectedAutomation, setSelectedAutomation] = useState<Automation | null>(null);
   // State for form dialog
   const [formOpen, setFormOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<Automation | undefined>(undefined);
@@ -302,11 +297,6 @@ export function AutomationsPage() {
   for (const p of projects) {
     projectIdToRepo[p.id] = p.repo;
   }
-
-  // Keep selected automation in sync with latest data
-  const currentSelectedAutomation = selectedAutomation
-    ? filteredAutomations.find((a) => a.id === selectedAutomation.id) ?? null
-    : null;
 
   function handleOpenCreate() {
     setEditingAutomation(undefined);
@@ -334,47 +324,33 @@ export function AutomationsPage() {
     </Button>
   );
 
-  const listContent = (
-    <ListView
-      header={
-        <ListHeader
-          title={selectedProject ? projectIdToRepo[selectedProject] ?? "Automations" : "Automations"}
-          count={filteredAutomations.length}
-          countLabel="automations"
-          actions={headerActions}
-        />
-      }
-      isEmpty={filteredAutomations.length === 0}
-      emptyState={<EmptyState />}
-    >
-      <div>
-        {filteredAutomations.map((automation) => (
-          <AutomationRow
-            key={automation.id}
-            automation={automation}
-            projectName={projectIdToRepo[automation.project_id] ?? automation.project_id}
-            isSelected={currentSelectedAutomation?.id === automation.id}
-            onSelect={() => setSelectedAutomation(automation)}
-            onEdit={() => handleOpenEdit(automation)}
-            onRefresh={refreshAutomations}
-          />
-        ))}
-      </div>
-    </ListView>
-  );
-
-  const runsPanel = currentSelectedAutomation ? (
-    <AutomationRunsPanel
-      automation={currentSelectedAutomation}
-      onClose={() => setSelectedAutomation(null)}
-    />
-  ) : undefined;
-
   return (
     <>
-      <ListSplitView panel={runsPanel}>
-        {listContent}
-      </ListSplitView>
+      <ListView
+        header={
+          <ListHeader
+            title={selectedProject ? projectIdToRepo[selectedProject] ?? "Automations" : "Automations"}
+            count={filteredAutomations.length}
+            countLabel="automations"
+            actions={headerActions}
+          />
+        }
+        isEmpty={filteredAutomations.length === 0}
+        emptyState={<EmptyState />}
+      >
+        <div>
+          {filteredAutomations.map((automation) => (
+            <AutomationRow
+              key={automation.id}
+              automation={automation}
+              projectName={projectIdToRepo[automation.project_id] ?? automation.project_id}
+              onNavigate={() => navigate(`/automations/${automation.id}`)}
+              onEdit={() => handleOpenEdit(automation)}
+              onRefresh={refreshAutomations}
+            />
+          ))}
+        </div>
+      </ListView>
 
       {/* Create/Edit dialog */}
       <AutomationFormDialog
