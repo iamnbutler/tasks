@@ -65,6 +65,25 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild from GitHub
+
+Clears tasks and merge queue (memory + database), then signals the poll loop to re-fetch all data from GitHub. Preserves accounting data, event logs, projects table, and operating mode.
+
+> **Note:** The response contains counts of items *cleared*. The actual re-fetch happens asynchronously as the poll loop re-discovers items from GitHub.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3
+}
+```
+
 ### Tasks
 
 #### List All Tasks
@@ -82,7 +101,9 @@ GET /api/tasks
     "title": "Fix login bug",
     "state": "in_progress",
     "project_id": "project-uuid",
-    "github_issue_number": 42,
+    "source_number": 42,
+    "source_created_at": "2024-01-10T08:00:00Z",
+    "priority": null,
     "created_at": "2024-01-15T10:30:00Z"
   }
 ]
@@ -93,6 +114,36 @@ GET /api/tasks
 ```http
 GET /api/tasks/:id
 ```
+
+#### Update Task
+
+Update a task's properties. Currently supports updating `priority` for manual queue reordering.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** Updated task object.
+
+#### Reorder Tasks
+
+Bulk reorder tasks by assigning sequential priorities. Used by the drag-and-drop Queue view.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["uuid-1", "uuid-2", "uuid-3"]
+}
+```
+
+Tasks are assigned priorities 1, 2, 3, … in the given order.
 
 #### Get Task Events
 
@@ -195,6 +246,8 @@ Content-Type: application/json
 
 #### Remove Project
 
+Removes the project and cascades deletion of all associated tasks and merge queue entries in a single transaction.
+
 ```http
 DELETE /api/projects/:id
 ```
@@ -215,11 +268,15 @@ GET /api/merge-queue
     "id": "entry-uuid",
     "task_id": "task-uuid",
     "pr_number": 123,
+    "pr_url": "https://github.com/owner/repo/pull/123",
+    "head_sha": "abc1234",
     "state": "pending",
     "created_at": "2024-01-15T12:00:00Z"
   }
 ]
 ```
+
+The `head_sha` field is populated during GitHub reconciliation and used to detect new commits that require re-evaluation.
 
 #### Approve Entry
 
@@ -271,6 +328,82 @@ Content-Type: application/json
   "message": "What tasks are currently being worked on?"
 }
 ```
+
+### Self-Update
+
+#### Get Update Status
+
+Returns the current update status from the background `UpdateChecker`.
+
+```http
+GET /api/self-update
+```
+
+**Response when update is available:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "rebuild_scope": "server",
+  "commit_summary": null,
+  "last_checked": null
+}
+```
+
+**Response when no update:**
+
+```json
+{
+  "available": false,
+  "applying": false,
+  "current_commit": null,
+  "target_commit": null,
+  "rebuild_scope": null,
+  "commit_summary": null,
+  "last_checked": null
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | Whether a newer commit is available upstream |
+| `applying` | Whether an update is currently being applied |
+| `current_commit` | Short (7-char) hash of the running commit |
+| `target_commit` | Short (7-char) hash of the available update |
+| `rebuild_scope` | What needs rebuilding: `"server"`, `"container"`, or `"frontend"` |
+| `commit_summary` | First line of the target commit message (not yet populated) |
+| `last_checked` | Timestamp of last check (not yet populated) |
+
+#### Apply Update
+
+Triggers the self-update shutdown path. The server sets mode to Stop, waits for active sessions to drain (unless `force=true`), then exits with code 100 for the wrapper script to rebuild and restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update is being applied. The server will restart shortly."
+}
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `"applying"` | Update triggered successfully |
+| `"no_update"` | No update available |
+| `"already_applying"` | An update is already in progress |
 
 ### Accounting
 
@@ -361,7 +494,26 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Events
+
+#### Query Historical Events
+
+Query the event log by type prefix. Returns up to `limit` events (default 200), sorted by timestamp ascending. The `type_prefix` parameter is required.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=100
+```
+
+**Query Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `type_prefix` | Event type prefix to filter by (required, e.g. `"orchestrator:"`, `"task:"`) |
+| `limit` | Maximum events to return (default: 200) |
+
+**Response:** Array of event objects.
+
+#### SSE Live Stream
 
 Server-Sent Events stream for real-time updates.
 
@@ -389,6 +541,25 @@ event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
 
+**Common Event Types:**
+
+| Type | Description |
+|------|-------------|
+| `task:created` | New task created from a GitHub issue |
+| `task:updated` | Task state changed |
+| `task:closed` | Task closed externally; data includes `{"source":"reconciliation"}` |
+| `task:reordered` | Task priority updated via manual reorder |
+| `session:started` | Agent session began |
+| `session:ended` | Agent session completed |
+| `merge:approved` | Entry approved in queue |
+| `merge:completed` | Changes merged |
+| `orchestrator:message` | Human message sent to orchestrator |
+| `orchestrator:response` | Orchestrator response |
+| `system:update:available` | Update detected by background checker |
+| `system:update:applying` | Update process has started |
+
+> **Note on `task:closed`:** Both issue closures (detected via `reconcile_task()`) and PR closures (detected in the run loop) emit `task:closed` events with `{ "source": "reconciliation" }` data, providing a unified event format for external closures detected during polling.
+
 ## Error Responses
 
 All errors return JSON with the following structure:
@@ -412,4 +583,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*
