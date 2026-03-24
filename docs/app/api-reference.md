@@ -495,7 +495,7 @@ GET /api/automations/:id/runs
 ]
 ```
 
-**Run statuses:** `pending`, `running`, `completed`, `failed`
+**Run statuses:** `pending`, `running`, `completed`, `failed`, `cancelled`
 
 #### Trigger Automation Run
 
@@ -506,6 +506,16 @@ POST /api/automations/:id/run
 ```
 
 **Response:** The created `AutomationRun` object.
+
+#### Cancel Automation Run
+
+Cancel a running or pending automation run.
+
+```http
+POST /api/automations/:id/runs/:run_id/cancel
+```
+
+**Response:** The updated `AutomationRun` object with status `cancelled`.
 
 ### Self-Update
 

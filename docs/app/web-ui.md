@@ -190,7 +190,7 @@ The automation form dialog collects:
 
 Clicking an automation row (or choosing **View Runs**) opens the runs history panel. Each run shows:
 
-- Color-coded status badge: pending (yellow), running (blue, animated), completed (green), failed (red)
+- Color-coded status badge: pending (yellow), running (blue, animated), completed (green), failed (red), cancelled (gray)
 - Relative timestamp with absolute time on hover
 - Duration for completed/failed runs
 - Collapsible output section and error message (if any)
