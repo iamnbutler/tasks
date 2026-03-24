@@ -102,6 +102,10 @@ pub struct MergeQueueEntry {
     /// Used to detect new commits for re-evaluation (spec Section 7.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
+    /// Position in merge queue (1-indexed).
+    /// Only set for Approved/Merging entries to show merge order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<u32>,
 }
 
 impl MergeQueueEntry {
@@ -115,6 +119,7 @@ impl MergeQueueEntry {
             conflict_info: None,
             changes_requested_feedback: None,
             head_sha: None,
+            queue_position: None,
         }
     }
 
