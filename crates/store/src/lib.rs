@@ -720,19 +720,6 @@ impl Store {
         Ok(runs)
     }
 
-    /// Get a single automation run by ID.
-    pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, automation_id, status, started_at, completed_at, output, error
-             FROM automation_runs WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![run_id], row_to_automation_run)?;
-        match rows.next() {
-            Some(Ok(run)) => Ok(Some(run)),
-            Some(Err(e)) => Err(StoreError::Sqlite(e)),
-            None => Ok(None),
-        }
-    }
 }
 
 /// Map a rusqlite Row to a TaskAccounting.
