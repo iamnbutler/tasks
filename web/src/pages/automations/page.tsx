@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Calendar,
   Clock,
+  Copy,
   ExternalLink,
   History,
   MoreHorizontal,
@@ -53,6 +54,7 @@ import {
 import type { Automation, AutomationState } from "@/lib/types";
 import { AutomationRunsPanel, type AutomationRunsPanelHandle } from "./automation-runs-panel";
 import { AutomationFormDialog } from "./automation-form-dialog";
+import { DuplicateAutomationDialog } from "./duplicate-automation-dialog";
 
 // ---------------------------------------------------------------------------
 // State badge configuration
@@ -112,6 +114,7 @@ function AutomationRow({
   isSelected,
   onSelect,
   onEdit,
+  onDuplicate,
   onRefresh,
   onRefreshRuns,
 }: {
@@ -120,6 +123,7 @@ function AutomationRow({
   isSelected: boolean;
   onSelect: () => void;
   onEdit: () => void;
+  onDuplicate: () => void;
   onRefresh: () => Promise<void>;
   onRefreshRuns: () => void;
 }) {
@@ -227,6 +231,10 @@ function AutomationRow({
                 <Pencil className="mr-2 h-3.5 w-3.5" />
                 Edit
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={onDuplicate}>
+                <Copy className="mr-2 h-3.5 w-3.5" />
+                Duplicate to Project
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={handleToggleState}>
                 {automation.state === "active" ? (
@@ -308,6 +316,9 @@ export function AutomationsPage() {
   // State for form dialog
   const [formOpen, setFormOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<Automation | undefined>(undefined);
+  // State for duplicate dialog
+  const [duplicateOpen, setDuplicateOpen] = useState(false);
+  const [duplicatingAutomation, setDuplicatingAutomation] = useState<Automation | undefined>(undefined);
 
   // Ref for the runs panel to trigger refresh after triggering an automation
   const runsPanelRef = useRef<AutomationRunsPanelHandle>(null);
@@ -337,7 +348,16 @@ export function AutomationsPage() {
     setFormOpen(true);
   }
 
+  function handleOpenDuplicate(automation: Automation) {
+    setDuplicatingAutomation(automation);
+    setDuplicateOpen(true);
+  }
+
   function handleFormSuccess() {
+    refreshAutomations();
+  }
+
+  function handleDuplicateSuccess() {
     refreshAutomations();
   }
 
@@ -375,6 +395,7 @@ export function AutomationsPage() {
             isSelected={currentSelectedAutomation?.id === automation.id}
             onSelect={() => setSelectedAutomation(automation)}
             onEdit={() => handleOpenEdit(automation)}
+            onDuplicate={() => handleOpenDuplicate(automation)}
             onRefresh={refreshAutomations}
             onRefreshRuns={refreshRunsPanel}
           />
@@ -406,6 +427,17 @@ export function AutomationsPage() {
         automation={editingAutomation}
         onSuccess={handleFormSuccess}
       />
+
+      {/* Duplicate dialog */}
+      {duplicatingAutomation && (
+        <DuplicateAutomationDialog
+          open={duplicateOpen}
+          onOpenChange={setDuplicateOpen}
+          automation={duplicatingAutomation}
+          projects={projects}
+          onSuccess={handleDuplicateSuccess}
+        />
+      )}
     </>
   );
 }
