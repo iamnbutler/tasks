@@ -58,7 +58,7 @@ export function DuplicateAutomationDialog({
       setError(null);
     }
     prevOpen.current = open;
-  });
+  }, [open, automation.project_id, automation.name, projects]);
 
   // Validate form
   const validate = (): string | null => {
@@ -103,7 +103,6 @@ export function DuplicateAutomationDialog({
 
   // Find project names for display
   const sourceProject = projects.find((p) => p.id === automation.project_id);
-  const targetProject = projects.find((p) => p.id === targetProjectId);
 
   return (
     <Dialog
