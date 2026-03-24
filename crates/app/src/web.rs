@@ -1387,7 +1387,10 @@ async fn create_automation(
         .server
         .add_automation(automation.clone())
         .await
-        .map_err(ApiError::Server)?;
+        .map_err(|e| match e {
+            server::ServerError::ProjectNotFound(_) => ApiError::NotFound(e.to_string()),
+            _ => ApiError::Server(e),
+        })?;
 
     Ok(Json(automation))
 }
@@ -1429,7 +1432,12 @@ async fn update_automation(
         .server
         .update_automation(&id, req.name, req.prompt, req.state, req.trigger)
         .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+        .map_err(|e| match e {
+            server::ServerError::StoreError(ref msg) if msg.contains("not found") => {
+                ApiError::NotFound(e.to_string())
+            }
+            _ => ApiError::Server(e),
+        })?;
 
     Ok(Json(automation))
 }
@@ -1463,7 +1471,7 @@ async fn list_automation_runs(
     let runs = state
         .server
         .list_automation_runs(&id)
-        .map_err(|e| ApiError::Server(e))?;
+        .map_err(ApiError::Server)?;
 
     Ok(Json(runs))
 }
@@ -1477,7 +1485,12 @@ async fn trigger_automation(
         .server
         .create_automation_run(&id)
         .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+        .map_err(|e| match e {
+            server::ServerError::StoreError(ref msg) if msg.contains("not found") => {
+                ApiError::NotFound(e.to_string())
+            }
+            _ => ApiError::Server(e),
+        })?;
 
     Ok(Json(run))
 }
