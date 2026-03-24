@@ -341,9 +341,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // and triggers runs when their schedules match. It ticks every 60 seconds
     // and respects operating mode (no runs in Stop mode).
 
-    let automation_scheduler = AutomationScheduler::new(server.clone());
+    let automation_scheduler = AutomationScheduler::new(server.clone(), Some(session_manager.clone()));
     let automation_scheduler_handle = automation_scheduler.start();
     info!("automation scheduler started");
+
+    // --- 6c. Spawn automation event listener ---
+    //
+    // Watches for session completion/failure events on automation sessions
+    // (task_id starting with "automation-run:") and updates run records.
+
+    let automation_listener_handle = crate::automation_runner::spawn_automation_event_listener(
+        &server.event_bus,
+        server.clone(),
+    );
+    info!("automation event listener started");
 
     // --- 7. Spawn GitHub poll loop ---
     //
@@ -2069,6 +2080,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // Cancel the loops
     poll_handle.abort();
     automation_scheduler_handle.abort();
+    automation_listener_handle.abort();
     dispatch_handle.abort();
     event_handler_handle.abort();
     orchestrator_handle.abort();

@@ -13,10 +13,14 @@ use server::Server;
 use tracing::{debug, error, info, warn};
 
 use models::automation::{AutomationState, TriggerType};
+use runtime::AppleContainerRuntime;
+use tasks_session::SessionManager;
 
 /// Automation scheduler that evaluates cron triggers.
 pub struct AutomationScheduler {
     server: Arc<Server>,
+    /// Session manager for dispatching automation runs to container sessions.
+    session_manager: Option<Arc<SessionManager<AppleContainerRuntime>>>,
     /// Track next run time for each automation.
     /// Key: automation_id, Value: next scheduled run time
     next_runs: HashMap<String, DateTime<Utc>>,
@@ -26,9 +30,13 @@ pub struct AutomationScheduler {
 
 impl AutomationScheduler {
     /// Create a new scheduler attached to the server.
-    pub fn new(server: Arc<Server>) -> Self {
+    pub fn new(
+        server: Arc<Server>,
+        session_manager: Option<Arc<SessionManager<AppleContainerRuntime>>>,
+    ) -> Self {
         Self {
             server,
+            session_manager,
             next_runs: HashMap::new(),
             last_runs: HashMap::new(),
         }
@@ -193,19 +201,38 @@ impl AutomationScheduler {
                     "scheduler: automation run created"
                 );
 
-                // For now, immediately complete the run since we don't have
-                // actual execution logic yet. In the future, this would hand off
-                // to an execution engine that creates tasks or runs workflows.
-                if let Err(e) = self
-                    .server
-                    .complete_automation_run(&run.id, Some("Scheduled run completed".to_string()))
-                    .await
-                {
-                    error!(
+                // Dispatch to a container session if session manager is available,
+                // otherwise fall back to the auto-complete stub.
+                if let Some(sm) = &self.session_manager {
+                    let sm = sm.clone();
+                    let server = self.server.clone();
+                    let run_id = run.id.clone();
+                    let auto_id = automation_id.to_string();
+                    tokio::spawn(async move {
+                        crate::automation_runner::execute_automation_run(
+                            &sm, &server, &run_id, &auto_id,
+                        )
+                        .await;
+                    });
+                } else {
+                    warn!(
                         run_id = %run.id,
-                        error = %e,
-                        "scheduler: failed to complete automation run"
+                        "scheduler: no session manager — auto-completing run"
                     );
+                    if let Err(e) = self
+                        .server
+                        .complete_automation_run(
+                            &run.id,
+                            Some("Scheduled run completed (no session manager)".to_string()),
+                        )
+                        .await
+                    {
+                        error!(
+                            run_id = %run.id,
+                            error = %e,
+                            "scheduler: failed to complete automation run"
+                        );
+                    }
                 }
             }
             Err(e) => {
