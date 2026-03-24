@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Cell, Pie, PieChart, Bar, BarChart, XAxis, YAxis } from "recharts";
-import { AlertTriangle, RefreshCw, Sparkles, Bell, ExternalLink } from "lucide-react";
+import { AlertTriangle, RefreshCw, Sparkles, Bell, ExternalLink, Info, AlertCircle, CheckCircle2 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { complete } from "@/lib/api";
-import type { Task, TaskState, MergeQueueEntry, MergeStatus, Event, Project } from "@/lib/types";
+import type { Task, TaskState, MergeQueueEntry, MergeStatus, Event, Project, Mode, Snapshot } from "@/lib/types";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import {
   Card,
@@ -159,6 +159,235 @@ function buildSummaryContext(
   }
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// System Status Banner
+// ---------------------------------------------------------------------------
+
+interface StatusMessage {
+  type: "info" | "warning" | "error" | "success";
+  message: string;
+  detail?: string;
+}
+
+function computeStatusMessages(
+  snapshot: Snapshot | null,
+  filteredTasks: Task[],
+  filteredMergeQueue: MergeQueueEntry[]
+): StatusMessage[] {
+  if (!snapshot) return [];
+
+  const messages: StatusMessage[] = [];
+  const { mode, slot_utilization } = snapshot;
+  const tasks = filteredTasks;
+  const mergeQueue = filteredMergeQueue;
+
+  // Count tasks by state
+  const taskCounts = {
+    waiting: 0,
+    blocked: 0,
+    running: 0,
+    testing: 0,
+    question: 0,
+    awaiting_merge: 0,
+    conflict: 0,
+    changes_requested: 0,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+  };
+  for (const task of tasks) {
+    taskCounts[task.state]++;
+  }
+
+  // Count merge queue by status
+  const mergeCounts = {
+    pending: 0,
+    approved: 0,
+    rejected: 0,
+    merged: 0,
+    conflict: 0,
+    changes_requested: 0,
+  };
+  for (const entry of mergeQueue) {
+    mergeCounts[entry.status]++;
+  }
+
+  const activeWork = taskCounts.running + taskCounts.testing + taskCounts.question;
+  const dispatchable = taskCounts.waiting;
+  const slotsAvailable = slot_utilization.max - slot_utilization.active;
+  const totalTasks = tasks.length;
+  const nonTerminalTasks = totalTasks - taskCounts.completed - taskCounts.failed - taskCounts.cancelled;
+
+  // Mode-specific messages
+  if (mode === "stop") {
+    messages.push({
+      type: "error",
+      message: "System stopped",
+      detail: "No new work will be started. Switch to Play or Pause to resume.",
+    });
+  } else if (mode === "pause") {
+    // In pause mode, explain what's being held
+    if (mergeCounts.pending > 0 || mergeCounts.approved > 0) {
+      const awaitingApproval = mergeCounts.pending;
+      const approved = mergeCounts.approved;
+      const parts: string[] = [];
+      if (awaitingApproval > 0) {
+        parts.push(`${awaitingApproval} ${awaitingApproval === 1 ? "entry" : "entries"} awaiting approval`);
+      }
+      if (approved > 0) {
+        parts.push(`${approved} approved`);
+      }
+      messages.push({
+        type: "warning",
+        message: `Paused: ${parts.join(", ")}`,
+        detail: dispatchable > 0
+          ? `${dispatchable} ${dispatchable === 1 ? "task" : "tasks"} ready to dispatch. Approve entries or switch to Play.`
+          : "Review and approve entries, then use Flush or switch to Play.",
+      });
+    } else if (activeWork === 0 && dispatchable === 0 && nonTerminalTasks > 0) {
+      messages.push({
+        type: "warning",
+        message: "Paused with no dispatchable work",
+        detail: "All active tasks are awaiting merge decisions or blocked.",
+      });
+    }
+  }
+
+  // Conflicts need attention
+  if (mergeCounts.conflict > 0) {
+    messages.push({
+      type: "error",
+      message: `${mergeCounts.conflict} ${mergeCounts.conflict === 1 ? "PR has" : "PRs have"} conflicts that need resolution`,
+      detail: "Resolve merge conflicts to unblock these tasks.",
+    });
+  }
+
+  // Changes requested
+  if (mergeCounts.changes_requested > 0) {
+    messages.push({
+      type: "warning",
+      message: `${mergeCounts.changes_requested} ${mergeCounts.changes_requested === 1 ? "PR has" : "PRs have"} changes requested`,
+      detail: "Review feedback and address requested changes.",
+    });
+  }
+
+  // All tasks awaiting merge
+  if (nonTerminalTasks > 0 && taskCounts.awaiting_merge === nonTerminalTasks && activeWork === 0) {
+    messages.push({
+      type: "info",
+      message: "All tasks awaiting merge decisions",
+      detail: mode === "pause"
+        ? "Approve entries or switch to Play to auto-merge."
+        : "Review and approve merge queue entries.",
+    });
+  }
+
+  // Questions pending
+  if (taskCounts.question > 0) {
+    messages.push({
+      type: "warning",
+      message: `${taskCounts.question} ${taskCounts.question === 1 ? "task needs" : "tasks need"} your input`,
+      detail: "Check the Tasks page to respond to agent questions.",
+    });
+  }
+
+  // Idle in Play mode with no work
+  if (mode === "play" && activeWork === 0 && dispatchable === 0 && nonTerminalTasks === 0 && totalTasks > 0) {
+    messages.push({
+      type: "success",
+      message: "All work completed",
+      detail: `${taskCounts.completed} ${taskCounts.completed === 1 ? "task" : "tasks"} completed successfully.`,
+    });
+  }
+
+  // Idle in Play mode with blocked tasks
+  if (mode === "play" && activeWork === 0 && dispatchable === 0 && taskCounts.blocked > 0) {
+    messages.push({
+      type: "info",
+      message: `${taskCounts.blocked} ${taskCounts.blocked === 1 ? "task is" : "tasks are"} blocked`,
+      detail: "These tasks are waiting for dependencies to complete.",
+    });
+  }
+
+  // Failed tasks need attention
+  if (taskCounts.failed > 0) {
+    messages.push({
+      type: "error",
+      message: `${taskCounts.failed} ${taskCounts.failed === 1 ? "task has" : "tasks have"} failed`,
+      detail: "Review failed tasks to retry or investigate.",
+    });
+  }
+
+  return messages;
+}
+
+const statusConfig: Record<StatusMessage["type"], { bg: string; border: string; icon: typeof Info; iconColor: string }> = {
+  info: {
+    bg: "bg-blue-500/10",
+    border: "border-blue-500/30",
+    icon: Info,
+    iconColor: "text-blue-400",
+  },
+  warning: {
+    bg: "bg-yellow-500/10",
+    border: "border-yellow-500/30",
+    icon: AlertCircle,
+    iconColor: "text-yellow-400",
+  },
+  error: {
+    bg: "bg-red-500/10",
+    border: "border-red-500/30",
+    icon: AlertTriangle,
+    iconColor: "text-red-400",
+  },
+  success: {
+    bg: "bg-green-500/10",
+    border: "border-green-500/30",
+    icon: CheckCircle2,
+    iconColor: "text-green-400",
+  },
+};
+
+function SystemStatusBanner({
+  snapshot,
+  tasks,
+  mergeQueue,
+}: {
+  snapshot: Snapshot | null;
+  tasks: Task[];
+  mergeQueue: MergeQueueEntry[];
+}) {
+  const messages = useMemo(
+    () => computeStatusMessages(snapshot, tasks, mergeQueue),
+    [snapshot, tasks, mergeQueue]
+  );
+
+  if (messages.length === 0) return null;
+
+  return (
+    <div className="space-y-2">
+      {messages.map((msg, idx) => {
+        const config = statusConfig[msg.type];
+        const Icon = config.icon;
+        return (
+          <div
+            key={idx}
+            className={`flex items-start gap-3 rounded-lg border p-3 ${config.bg} ${config.border}`}
+          >
+            <Icon className={`h-5 w-5 mt-0.5 shrink-0 ${config.iconColor}`} />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium">{msg.message}</p>
+              {msg.detail && (
+                <p className="text-sm text-muted-foreground mt-0.5">{msg.detail}</p>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +884,13 @@ export function DashboardPage() {
             Overview of current work and system status
           </p>
         </div>
+
+        {/* System Status Banner */}
+        <SystemStatusBanner
+          snapshot={snapshot}
+          tasks={filteredTasks}
+          mergeQueue={filteredMergeQueue}
+        />
 
         {/* Stats Cards */}
         <StatsCards tasks={filteredTasks} mergeQueue={filteredMergeQueue} />
