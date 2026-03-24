@@ -194,13 +194,17 @@ pub(crate) struct GqlParentIssue {
     pub id: String,
 }
 
-/// A timeline item — we request CROSS_REFERENCED_EVENT and blocking events.
+/// A timeline item — we request CROSS_REFERENCED_EVENT, BLOCKED_BY_ADDED_EVENT,
+/// and BLOCKED_BY_REMOVED_EVENT.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GqlTimelineItem {
+    /// The GraphQL __typename field to distinguish event types.
+    #[serde(rename = "__typename")]
+    pub typename: Option<String>,
     /// Present for CrossReferencedEvent.
     pub source: Option<GqlTimelineSource>,
-    /// Present for MarkedAsBlockedByEvent and UnmarkedAsBlockedByEvent.
+    /// Present for BlockedByAddedEvent and BlockedByRemovedEvent.
     pub blocking_issue: Option<GqlBlockingIssue>,
 }
 
@@ -608,7 +612,7 @@ fn ghost_user() -> model::User {
 ///
 /// Returns (linked_pull_requests, blocked_by).
 ///
-/// For blocking relationships, we track MARKED_AS_BLOCKED_BY and UNMARKED_AS_BLOCKED_BY
+/// For blocking relationships, we track BlockedByAddedEvent and BlockedByRemovedEvent
 /// events to compute the current blocking state. An issue is blocked if it has been
 /// marked as blocked and not subsequently unmarked.
 fn extract_timeline_relationships(
@@ -645,23 +649,25 @@ fn extract_timeline_relationships(
             }
         }
 
-        // Handle blocking events.
-        // Timeline items include both marked and unmarked events.
-        // The presence of blocking_issue indicates a blocking-related event.
-        // We determine if it's a "mark" or "unmark" by checking if this issue
-        // was previously seen. GitHub returns events in chronological order,
-        // so the last event for each blocking issue determines its current state.
+        // Handle blocking events using __typename to distinguish event types.
+        // BlockedByAddedEvent -> issue is now blocking
+        // BlockedByRemovedEvent -> issue is no longer blocking
         if let Some(blocking) = item.blocking_issue {
             let number = blocking.number;
-            // Check if this is a removal (unmarked) by seeing if we already have it marked.
-            // This is a simplified heuristic - the actual event type would be better,
-            // but since we can't distinguish mark/unmark from the struct alone,
-            // we track it by order of appearance. First appearance = marked,
-            // second appearance of same issue = unmarked, etc.
-            blocking_state
-                .entry(number)
-                .and_modify(|(_, is_blocked)| *is_blocked = !*is_blocked)
-                .or_insert((blocking, true));
+            let is_added = item.typename.as_deref() == Some("BlockedByAddedEvent");
+            let is_removed = item.typename.as_deref() == Some("BlockedByRemovedEvent");
+
+            if is_added {
+                blocking_state.insert(number, (blocking, true));
+            } else if is_removed {
+                // Update existing entry to mark as unblocked, or insert as unblocked.
+                blocking_state
+                    .entry(number)
+                    .and_modify(|(_, is_blocked)| *is_blocked = false)
+                    .or_insert((blocking, false));
+            } else {
+                tracing::warn!(typename = ?item.typename, "blocking_issue with unknown typename, skipping");
+            }
         }
     }
 
@@ -933,6 +939,7 @@ mod tests {
     fn linked_prs_from_timeline_deduplicates() {
         let items = vec![
             GqlTimelineItem {
+                typename: Some("CrossReferencedEvent".into()),
                 source: Some(GqlTimelineSource {
                     number: Some(1),
                     title: Some("PR one".into()),
@@ -943,6 +950,7 @@ mod tests {
             },
             // Duplicate reference to the same PR.
             GqlTimelineItem {
+                typename: Some("CrossReferencedEvent".into()),
                 source: Some(GqlTimelineSource {
                     number: Some(1),
                     title: Some("PR one".into()),
@@ -952,6 +960,7 @@ mod tests {
                 blocking_issue: None,
             },
             GqlTimelineItem {
+                typename: Some("CrossReferencedEvent".into()),
                 source: Some(GqlTimelineSource {
                     number: Some(2),
                     title: Some("PR two".into()),
@@ -962,6 +971,7 @@ mod tests {
             },
             // Incomplete source (not a PR) — should be skipped.
             GqlTimelineItem {
+                typename: Some("CrossReferencedEvent".into()),
                 source: Some(GqlTimelineSource {
                     number: None,
                     title: None,
@@ -983,8 +993,9 @@ mod tests {
     #[test]
     fn blocking_relationships_from_timeline() {
         let items = vec![
-            // Issue 10 blocks this issue (marked).
+            // Issue 10 blocks this issue (added).
             GqlTimelineItem {
+                typename: Some("BlockedByAddedEvent".into()),
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
                     repository: Some(GqlBlockingIssueRepo {
@@ -997,8 +1008,9 @@ mod tests {
                     id: "I_10".into(),
                 }),
             },
-            // Issue 20 blocks this issue (marked) — from a different repo.
+            // Issue 20 blocks this issue (added) — from a different repo.
             GqlTimelineItem {
+                typename: Some("BlockedByAddedEvent".into()),
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
                     repository: Some(GqlBlockingIssueRepo {
@@ -1011,8 +1023,9 @@ mod tests {
                     id: "I_20".into(),
                 }),
             },
-            // Issue 10 unblocked (unmarked) — toggles the blocked state.
+            // Issue 10 unblocked (removed).
             GqlTimelineItem {
+                typename: Some("BlockedByRemovedEvent".into()),
                 source: None,
                 blocking_issue: Some(GqlBlockingIssue {
                     repository: Some(GqlBlockingIssueRepo {
@@ -1029,7 +1042,7 @@ mod tests {
 
         let (prs, blocked_by) = extract_timeline_relationships(items);
         assert!(prs.is_empty());
-        // Only issue 20 should remain as a blocker (issue 10 was unmarked).
+        // Only issue 20 should remain as a blocker (issue 10 was removed).
         assert_eq!(blocked_by.len(), 1);
         assert_eq!(blocked_by[0].number, 20);
         assert_eq!(blocked_by[0].owner, "acme");
@@ -1066,6 +1079,7 @@ mod tests {
                         "subIssues": { "nodes": [] },
                         "timelineItems": {
                             "nodes": [{
+                                "__typename": "BlockedByAddedEvent",
                                 "blockingIssue": {
                                     "repository": { "owner": { "login": "other-org" }, "name": "core" },
                                     "number": 5,
