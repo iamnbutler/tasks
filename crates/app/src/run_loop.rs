@@ -1902,6 +1902,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     // --- 9. Optionally spawn web server ---
 
+    // Create update trigger channel (shared between API and auto-apply)
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let web_handle = if config.web {
         // Initialize completions service for fast Haiku-based completions.
         let completions_service = tasks_agent::CompletionsService::from_env()
@@ -1918,6 +1921,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             max_sessions: config.max_sessions,
             session_manager: Some(session_manager.clone()),
             completions_service,
+            update_state: update_state.clone(),
+            update_tx: update_tx.clone(),
         };
         let web_port = config.web_port;
 
@@ -1953,9 +1958,6 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // The server can shut down due to:
     // - Ctrl-C (normal shutdown)
     // - Update trigger (exit with code 100 for restart)
-
-    // Create update trigger channel
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // If auto-apply is enabled, spawn a task that triggers update when available
     let auto_apply_handle = if config.update_auto_apply && config.update_check_enabled {
