@@ -9,14 +9,17 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { createElement } from "react";
-import type { Event, Snapshot, Task, MergeQueueEntry } from "@/lib/types";
-import { fetchSnapshot, subscribeEvents } from "@/lib/api";
+import type { Event, Snapshot, Task, MergeQueueEntry, UpdateStatus } from "@/lib/types";
+import { fetchSnapshot, fetchUpdateStatus, subscribeEvents } from "@/lib/api";
 
 const MAX_EVENTS = 200;
 const POLL_INTERVAL_MS = 5_000;
 
 /** Regex matching event types that should trigger a snapshot refresh. */
 const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
+
+/** Regex matching event types that should trigger an update status refresh. */
+const UPDATE_EVENT = /^system:update:/;
 
 export interface AppState {
   snapshot: Snapshot | null;
@@ -33,6 +36,14 @@ export interface AppState {
   filteredTasks: Task[];
   /** Merge queue entries filtered by selected project */
   filteredMergeQueue: MergeQueueEntry[];
+  /** Update status for self-update mechanism */
+  updateStatus: UpdateStatus | null;
+  /** Whether the update banner has been dismissed */
+  updateDismissed: boolean;
+  /** Dismiss the update banner (reappears on next check) */
+  dismissUpdate: () => void;
+  /** Refresh update status */
+  refreshUpdateStatus: () => Promise<void>;
 }
 
 const defaultState: AppState = {
@@ -46,6 +57,10 @@ const defaultState: AppState = {
   setSelectedProject: () => {},
   filteredTasks: [],
   filteredMergeQueue: [],
+  updateStatus: null,
+  updateDismissed: false,
+  dismissUpdate: () => {},
+  refreshUpdateStatus: async () => {},
 };
 
 export const AppStateContext = createContext<AppState | null>(null);
@@ -61,12 +76,16 @@ function useAppStateCore(): AppState {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
 
   // Track seen orchestrator event IDs for deduplication
   const seenOrchestratorIds = useRef(new Set<string>());
 
   // Keep a ref to the latest snapshot-fetch promise so we can avoid races.
   const fetchInFlight = useRef(false);
+  const updateFetchInFlight = useRef(false);
+  const prevTargetCommit = useRef<string | undefined>(undefined);
 
   const refreshSnapshot = useCallback(async () => {
     if (fetchInFlight.current) return;
@@ -80,6 +99,28 @@ function useAppStateCore(): AppState {
     } finally {
       fetchInFlight.current = false;
     }
+  }, []);
+
+  const refreshUpdateStatus = useCallback(async () => {
+    if (updateFetchInFlight.current) return;
+    updateFetchInFlight.current = true;
+    try {
+      const status = await fetchUpdateStatus();
+      setUpdateStatus(status);
+      // Reset dismissed state when a new update becomes available
+      if (status.available && status.target_commit !== prevTargetCommit.current) {
+        setUpdateDismissed(false);
+      }
+      prevTargetCommit.current = status.target_commit;
+    } catch {
+      // Update status endpoint may not exist yet; ignore errors silently
+    } finally {
+      updateFetchInFlight.current = false;
+    }
+  }, []);
+
+  const dismissUpdate = useCallback(() => {
+    setUpdateDismissed(true);
   }, []);
 
   // Compute filtered tasks based on selected project
@@ -105,13 +146,22 @@ function useAppStateCore(): AppState {
   useEffect(() => {
     // Fetch immediately on mount.
     refreshSnapshot();
+    refreshUpdateStatus();
 
     const interval = setInterval(() => {
       refreshSnapshot();
     }, POLL_INTERVAL_MS);
 
-    return () => clearInterval(interval);
-  }, [refreshSnapshot]);
+    // Update status is checked less frequently (every 60 seconds)
+    const updateInterval = setInterval(() => {
+      refreshUpdateStatus();
+    }, 60_000);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(updateInterval);
+    };
+  }, [refreshSnapshot, refreshUpdateStatus]);
 
   // --- SSE subscription with reconnection --------------------------------
   useEffect(() => {
@@ -156,6 +206,11 @@ function useAppStateCore(): AppState {
           if (STATE_CHANGING_EVENT.test(event.type)) {
             refreshSnapshot();
           }
+
+          // Handle update events
+          if (UPDATE_EVENT.test(event.type)) {
+            refreshUpdateStatus();
+          }
         } catch {
           // Ignore unparseable messages.
         }
@@ -182,7 +237,7 @@ function useAppStateCore(): AppState {
       source?.close();
       setConnected(false);
     };
-  }, [refreshSnapshot]);
+  }, [refreshSnapshot, refreshUpdateStatus]);
 
   return {
     snapshot,
@@ -195,6 +250,10 @@ function useAppStateCore(): AppState {
     setSelectedProject,
     filteredTasks,
     filteredMergeQueue,
+    updateStatus,
+    updateDismissed,
+    dismissUpdate,
+    refreshUpdateStatus,
   };
 }
 

@@ -5,6 +5,7 @@ import type {
   Project,
   Snapshot,
   Task,
+  UpdateStatus,
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -200,5 +201,19 @@ export function summarize(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text, max_words: maxWords }),
+  });
+}
+
+// Update API (self-update mechanism)
+
+export function fetchUpdateStatus(): Promise<UpdateStatus> {
+  return request<UpdateStatus>("/api/self-update");
+}
+
+export function applyUpdate(force?: boolean): Promise<void> {
+  return requestVoid("/api/self-update/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force: force ?? false }),
   });
 }
