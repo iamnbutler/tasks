@@ -692,6 +692,20 @@ impl Store {
         self.list_runs_for_automation(automation_id)
     }
 
+    /// Get a single automation run by ID.
+    pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, automation_id, status, started_at, completed_at, output, error
+             FROM automation_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![run_id], row_to_automation_run)?;
+        match rows.next() {
+            Some(Ok(run)) => Ok(Some(run)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     /// List all runs for an automation.
     pub fn list_runs_for_automation(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
         let mut stmt = self.conn.prepare(
@@ -706,19 +720,6 @@ impl Store {
         Ok(runs)
     }
 
-    /// Get a single automation run by ID.
-    pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, automation_id, status, started_at, completed_at, output, error
-             FROM automation_runs WHERE id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![run_id], row_to_automation_run)?;
-        match rows.next() {
-            Some(Ok(run)) => Ok(Some(run)),
-            Some(Err(e)) => Err(StoreError::Sqlite(e)),
-            None => Ok(None),
-        }
-    }
 }
 
 /// Map a rusqlite Row to a TaskAccounting.
@@ -1585,5 +1586,36 @@ mod tests {
         let loaded2 = runs.iter().find(|r| r.id == "r2").unwrap();
         assert_eq!(loaded2.error, Some("Something went wrong".to_string()));
         assert!(loaded2.completed_at.is_some());
+    }
+
+    #[test]
+    fn get_automation_run_by_id() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        // Non-existent run returns None
+        assert!(store.get_automation_run("nonexistent").unwrap().is_none());
+
+        // Create and save a run
+        let mut run = AutomationRun::new("r1", "a1");
+        run.start();
+        store.save_automation_run(&run).unwrap();
+
+        // Get by ID works
+        let loaded = store.get_automation_run("r1").unwrap().unwrap();
+        assert_eq!(loaded.id, "r1");
+        assert_eq!(loaded.automation_id, "a1");
+        assert_eq!(loaded.status, RunStatus::Running);
+
+        // Update the run
+        let mut run2 = loaded;
+        run2.complete(Some("Output text".to_string()));
+        store.save_automation_run(&run2).unwrap();
+
+        // Get updated run
+        let updated = store.get_automation_run("r1").unwrap().unwrap();
+        assert_eq!(updated.status, RunStatus::Completed);
+        assert_eq!(updated.output, Some("Output text".to_string()));
     }
 }

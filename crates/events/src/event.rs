@@ -60,6 +60,8 @@ pub enum EventType {
     AutomationUpdated,
     AutomationDeleted,
     AutomationRunStarted,
+    /// Streaming output chunk from an automation run.
+    AutomationRunOutput,
     AutomationRunCompleted,
     AutomationRunFailed,
 
@@ -140,6 +142,7 @@ impl EventType {
             Self::AutomationUpdated => "automation:updated",
             Self::AutomationDeleted => "automation:deleted",
             Self::AutomationRunStarted => "automation:run:started",
+            Self::AutomationRunOutput => "automation:run:output",
             Self::AutomationRunCompleted => "automation:run:completed",
             Self::AutomationRunFailed => "automation:run:failed",
             Self::WorkspaceCleaned => "workspace:cleaned",
@@ -229,6 +232,7 @@ impl TryFrom<String> for EventType {
             "automation:updated" => Ok(Self::AutomationUpdated),
             "automation:deleted" => Ok(Self::AutomationDeleted),
             "automation:run:started" => Ok(Self::AutomationRunStarted),
+            "automation:run:output" => Ok(Self::AutomationRunOutput),
             "automation:run:completed" => Ok(Self::AutomationRunCompleted),
             "automation:run:failed" => Ok(Self::AutomationRunFailed),
             "workspace:cleaned" => Ok(Self::WorkspaceCleaned),
