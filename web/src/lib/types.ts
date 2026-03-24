@@ -75,6 +75,8 @@ export interface MergeQueueEntry {
   queued_at: string;
   /** Feedback when status is changes_requested */
   changes_requested_feedback?: string;
+  /** Position in merge queue (1-indexed). Only set for approved/merging entries. */
+  queue_position?: number;
 }
 
 export type Actor = "human" | "orchestrator" | "scheduler" | "agent" | "system";

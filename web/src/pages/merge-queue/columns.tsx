@@ -200,6 +200,28 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     },
   },
 
+  // Queue position (for approved/merging entries)
+  {
+    accessorKey: "queue_position",
+    header: "Position",
+    cell: ({ row }) => {
+      const pos = row.original.queue_position;
+      if (pos === undefined || pos === null) {
+        return <span className="text-muted-foreground">&mdash;</span>;
+      }
+      return (
+        <span className="text-xs font-mono text-muted-foreground">
+          #{pos}
+        </span>
+      );
+    },
+    sortingFn: (rowA, rowB) => {
+      const a = rowA.original.queue_position ?? Infinity;
+      const b = rowB.original.queue_position ?? Infinity;
+      return a - b;
+    },
+  },
+
   // Linked issue (from task source)
   {
     id: "issue",

@@ -324,7 +324,7 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         mode: server_state.mode,
         projects: server_state.projects.values().cloned().collect(),
         tasks: server_state.tasks.values().cloned().collect(),
-        merge_queue: server_state.merge_queue.entries().to_vec(),
+        merge_queue: server_state.merge_queue.entries_with_positions(),
         slot_utilization: SlotUtilization {
             active,
             max: state.max_sessions,
@@ -506,7 +506,7 @@ async fn list_merge_queue(
     State(state): State<ApiState>,
 ) -> Json<Vec<models::merge_queue::MergeQueueEntry>> {
     let server_state = state.server.state.read().await;
-    Json(server_state.merge_queue.entries().to_vec())
+    Json(server_state.merge_queue.entries_with_positions())
 }
 
 /// POST /api/merge-queue/flush — Flush approved entries (Pause mode only).

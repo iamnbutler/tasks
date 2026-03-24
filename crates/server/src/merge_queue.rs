@@ -44,6 +44,43 @@ impl MergeQueue {
         &self.entries
     }
 
+    /// Get entries with queue positions computed for Approved/Merging entries.
+    ///
+    /// Positions are 1-indexed and assigned based on `queued_at` order.
+    /// Position 1 = next to merge.
+    pub fn entries_with_positions(&self) -> Vec<MergeQueueEntry> {
+        // First, collect indices of entries that should have positions (Approved or Merging)
+        // and sort them by queued_at
+        let mut queue_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.status, MergeStatus::Approved | MergeStatus::Merging))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Sort by queued_at (earliest first = position 1)
+        queue_indices.sort_by(|&a, &b| self.entries[a].queued_at.cmp(&self.entries[b].queued_at));
+
+        // Create a map from entry index to position
+        let mut position_map: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
+        for (pos, &idx) in queue_indices.iter().enumerate() {
+            position_map.insert(idx, (pos + 1) as u32);
+        }
+
+        // Clone entries and set positions
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut entry = e.clone();
+                entry.queue_position = position_map.get(&i).copied();
+                entry
+            })
+            .collect()
+    }
+
     /// Get a mutable entry by ID.
     pub fn get_mut(&mut self, id: &str) -> Option<&mut MergeQueueEntry> {
         self.entries.iter_mut().find(|e| e.id == id)
@@ -464,5 +501,98 @@ mod tests {
         assert_eq!(q.entries().len(), 2);
         assert!(q.get("m1").is_some());
         assert!(q.get("m2").is_some());
+    }
+
+    #[test]
+    fn entries_with_positions_basic() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+        q.enqueue(entry("m3", "t3"));
+
+        // Approve m1 and m3, leave m2 pending
+        q.approve("m1").unwrap();
+        q.approve("m3").unwrap();
+
+        let entries = q.entries_with_positions();
+        assert_eq!(entries.len(), 3);
+
+        // m1 is approved first (by queued_at order), so position 1
+        let m1 = entries.iter().find(|e| e.id == "m1").unwrap();
+        assert_eq!(m1.queue_position, Some(1));
+
+        // m2 is pending, no position
+        let m2 = entries.iter().find(|e| e.id == "m2").unwrap();
+        assert_eq!(m2.queue_position, None);
+
+        // m3 is approved second, so position 2
+        let m3 = entries.iter().find(|e| e.id == "m3").unwrap();
+        assert_eq!(m3.queue_position, Some(2));
+    }
+
+    #[test]
+    fn entries_with_positions_merging_included() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+
+        // Approve both, then mark m1 as merging
+        q.approve("m1").unwrap();
+        q.approve("m2").unwrap();
+        q.mark_merging("m1").unwrap();
+
+        let entries = q.entries_with_positions();
+
+        // m1 (merging) should be position 1
+        let m1 = entries.iter().find(|e| e.id == "m1").unwrap();
+        assert_eq!(m1.status, MergeStatus::Merging);
+        assert_eq!(m1.queue_position, Some(1));
+
+        // m2 (approved) should be position 2
+        let m2 = entries.iter().find(|e| e.id == "m2").unwrap();
+        assert_eq!(m2.status, MergeStatus::Approved);
+        assert_eq!(m2.queue_position, Some(2));
+    }
+
+    #[test]
+    fn entries_with_positions_respects_queued_at_order() {
+        use chrono::{Duration, Utc};
+
+        let mut q = MergeQueue::new();
+
+        // Create entries with explicit timestamps (m2 queued before m1)
+        let mut e1 = MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1");
+        e1.queued_at = Utc::now();
+
+        let mut e2 = MergeQueueEntry::new("m2", "t2", "https://github.com/test/repo/pull/2");
+        e2.queued_at = Utc::now() - Duration::hours(1); // Queued earlier
+
+        // Enqueue in m1, m2 order (but m2 has earlier timestamp)
+        q.enqueue(e1);
+        q.enqueue(e2);
+
+        q.approve("m1").unwrap();
+        q.approve("m2").unwrap();
+
+        let entries = q.entries_with_positions();
+
+        // m2 was queued earlier, so it should be position 1
+        let m1 = entries.iter().find(|e| e.id == "m1").unwrap();
+        let m2 = entries.iter().find(|e| e.id == "m2").unwrap();
+
+        assert_eq!(m2.queue_position, Some(1)); // Earlier timestamp = first
+        assert_eq!(m1.queue_position, Some(2));
+    }
+
+    #[test]
+    fn entries_with_positions_no_approved() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+
+        // All entries pending, none should have positions
+        let entries = q.entries_with_positions();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.queue_position.is_none()));
     }
 }
