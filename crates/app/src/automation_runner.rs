@@ -50,12 +50,20 @@ pub async fn execute_automation_run(
         }
     };
 
-    // Resolve the project to get the repo URL and default branch.
-    let project = server.get_project(&project_id).await;
-    let repo_url = project
-        .as_ref()
-        .map(|p| format!("https://github.com/{}.git", p.repo))
-        .unwrap_or_default();
+    // Resolve the project to get the repo URL.
+    let repo_url = match server.get_project(&project_id).await {
+        Some(p) => format!("https://github.com/{}.git", p.repo),
+        None => {
+            error!(run_id = %run_id, project_id = %project_id, "project not found");
+            if let Err(e) = server
+                .fail_automation_run(run_id, format!("project not found: {project_id}"))
+                .await
+            {
+                error!(run_id = %run_id, error = %e, "failed to mark automation run as failed");
+            }
+            return;
+        }
+    };
 
     // Automation sessions work on a unique branch so they don't collide.
     let unique_suffix = &Uuid::new_v4().to_string()[..8];
@@ -103,10 +111,11 @@ pub fn run_id_from_session(session_id: &str) -> Option<&str> {
 /// Spawn a background task that listens for session completion/failure events
 /// and updates automation run records accordingly.
 ///
-/// When a session with an `automation-run:` prefix completes (exit code 0,
-/// emitting `TaskStateAwaitingMerge`) or fails (`TaskStateFailed`), this
-/// listener calls `server.complete_automation_run()` or
-/// `server.fail_automation_run()`.
+/// When a session with an `automation-run:` prefix reaches a terminal state
+/// (`TaskStateCompleted` or `TaskStateFailed`), this listener calls
+/// `server.complete_automation_run()` or `server.fail_automation_run()`.
+/// We use `TaskStateCompleted` (not `TaskStateAwaitingMerge`) as the
+/// terminal event because automations don't go through the merge queue.
 pub fn spawn_automation_event_listener(
     event_bus: &EventBus,
     server: Arc<Server>,
@@ -124,9 +133,8 @@ pub fn spawn_automation_event_listener(
                     };
 
                     match event.event_type {
-                        // Agent exited successfully — session emits TaskStateAwaitingMerge
-                        events::EventType::TaskStateAwaitingMerge
-                        | events::EventType::TaskStateCompleted => {
+                        // Agent exited successfully
+                        events::EventType::TaskStateCompleted => {
                             info!(
                                 run_id = %run_id,
                                 event_type = %event.event_type.as_str(),
