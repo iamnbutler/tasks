@@ -154,7 +154,8 @@ impl AutomationScheduler {
         // Check if it's time to run
         if let Some(next_run) = self.next_runs.get(automation_id) {
             if now >= *next_run {
-                // Check if we already ran in this minute (prevent double-runs)
+                // Safety net: if find_next_occurrence fails and next_run isn't
+                // advanced, prevent re-triggering within the same calendar minute.
                 if let Some(last_run) = self.last_runs.get(automation_id) {
                     // Round both to minute precision to check
                     let last_minute = last_run.format("%Y-%m-%d %H:%M").to_string();
@@ -218,27 +219,6 @@ impl AutomationScheduler {
                 // failure stop the scheduler
             }
         }
-    }
-}
-
-/// Reload scheduled automations and recalculate next run times.
-///
-/// Called when automations are created, updated, or deleted to ensure
-/// the scheduler picks up changes immediately.
-impl AutomationScheduler {
-    /// Clear cached next run time for an automation, forcing recalculation.
-    pub fn invalidate(&mut self, automation_id: &str) {
-        self.next_runs.remove(automation_id);
-        debug!(
-            automation_id = %automation_id,
-            "scheduler: invalidated cached next run time"
-        );
-    }
-
-    /// Clear all cached run times.
-    pub fn invalidate_all(&mut self) {
-        self.next_runs.clear();
-        debug!("scheduler: invalidated all cached next run times");
     }
 }
 
