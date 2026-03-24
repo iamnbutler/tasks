@@ -28,6 +28,7 @@ use tasks_orchestrator::{
 use crate::config::AppConfig;
 use crate::memory::{MemoryGate, MemoryThresholds};
 use crate::problem_tracker::ProblemTracker;
+use crate::scheduler::AutomationScheduler;
 use crate::update::{self, UpdateState};
 
 /// Result of running the server — indicates how the process should exit.
@@ -333,6 +334,16 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let project_count = server.state.read().await.projects.len();
     server.emit_started().await?;
     info!(projects = project_count, "tasks platform started");
+
+    // --- 6b. Spawn automation scheduler ---
+    //
+    // The scheduler evaluates cron expressions for scheduled automations
+    // and triggers runs when their schedules match. It ticks every 60 seconds
+    // and respects operating mode (no runs in Stop mode).
+
+    let automation_scheduler = AutomationScheduler::new(server.clone());
+    let automation_scheduler_handle = automation_scheduler.start();
+    info!("automation scheduler started");
 
     // --- 7. Spawn GitHub poll loop ---
     //
@@ -2046,6 +2057,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     // Cancel the loops
     poll_handle.abort();
+    automation_scheduler_handle.abort();
     dispatch_handle.abort();
     event_handler_handle.abort();
     orchestrator_handle.abort();

@@ -7,6 +7,7 @@ mod config;
 mod memory;
 mod problem_tracker;
 mod run_loop;
+mod scheduler;
 mod update;
 mod web;
 

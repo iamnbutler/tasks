@@ -461,6 +461,93 @@ impl Server {
         Ok(run)
     }
 
+    /// Complete an automation run successfully.
+    pub async fn complete_automation_run(
+        &self,
+        run_id: &str,
+        output: Option<String>,
+    ) -> Result<(), ServerError> {
+        // Load the run from store
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+
+        let mut run = {
+            let store = store.lock().unwrap();
+            store.get_automation_run(run_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?
+                .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
+        };
+
+        // Complete the run
+        run.complete(output);
+
+        // Save to store
+        {
+            let store = store.lock().unwrap();
+            if let Err(e) = store.save_automation_run(&run) {
+                tracing::error!(run_id = %run_id, error = %e, "failed to persist completed run to store");
+            }
+        }
+
+        // Emit run completed event
+        let event = Event::new(
+            EventType::AutomationRunCompleted,
+            run_id,
+            Actor::System,
+            serde_json::json!({ "automation_id": run.automation_id }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::info!(run_id = %run_id, "automation run completed");
+        Ok(())
+    }
+
+    /// Fail an automation run with an error message.
+    pub async fn fail_automation_run(
+        &self,
+        run_id: &str,
+        error: impl Into<String>,
+    ) -> Result<(), ServerError> {
+        let error_msg = error.into();
+
+        // Load the run from store
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+
+        let mut run = {
+            let store = store.lock().unwrap();
+            store.get_automation_run(run_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?
+                .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
+        };
+
+        // Fail the run
+        run.fail(&error_msg);
+
+        // Save to store
+        {
+            let store = store.lock().unwrap();
+            if let Err(e) = store.save_automation_run(&run) {
+                tracing::error!(run_id = %run_id, error = %e, "failed to persist failed run to store");
+            }
+        }
+
+        // Emit run failed event
+        let event = Event::new(
+            EventType::AutomationRunFailed,
+            run_id,
+            Actor::System,
+            serde_json::json!({
+                "automation_id": run.automation_id,
+                "error": error_msg,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::warn!(run_id = %run_id, error = %error_msg, "automation run failed");
+        Ok(())
+    }
+
     // --- Mode management (spec Section 6) ---
 
     pub async fn mode(&self) -> Mode {
