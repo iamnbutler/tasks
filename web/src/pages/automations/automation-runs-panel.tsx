@@ -218,11 +218,14 @@ function RunRow({ run }: { run: AutomationRun }) {
 interface AutomationRunsPanelProps {
   automation: Automation;
   onClose: () => void;
+  /** Increment to force an immediate refresh of runs */
+  refreshKey?: number;
 }
 
 export function AutomationRunsPanel({
   automation,
   onClose,
+  refreshKey,
 }: AutomationRunsPanelProps) {
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [loading, setLoading] = useState(true);
@@ -245,15 +248,19 @@ export function AutomationRunsPanel({
     }
   }, [automation.id]);
 
-  // Initial load + regular polling
-  // Always poll so new runs appear even if triggered externally.
-  // Poll faster (2s) when a run is in progress, otherwise every 5s.
+  // Compute whether there's a running run for dynamic polling interval
+  const hasRunningRun = runs.some((r) => r.status === "running");
+
+  // Initial load on mount and when refreshKey changes (after trigger)
   useEffect(() => {
     loadRuns();
-    const hasRunningRun = runs.some((r) => r.status === "running");
+  }, [loadRuns, refreshKey]);
+
+  // Polling: faster when a run is in progress, otherwise slower
+  useEffect(() => {
     const interval = setInterval(loadRuns, hasRunningRun ? 2000 : 5000);
     return () => clearInterval(interval);
-  }, [runs, loadRuns]);
+  }, [hasRunningRun, loadRuns]);
 
   return (
     <div className="flex flex-col h-full border-l border-border bg-background">
