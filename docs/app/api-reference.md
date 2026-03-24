@@ -257,6 +257,66 @@ Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of 
 POST /api/merge-queue/flush
 ```
 
+### Self-Update
+
+#### Get Update Status
+
+Returns the current self-update status from the background checker.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "4df757d",
+  "target_commit": "eac0c44",
+  "rebuild_scope": "server",
+  "commit_summary": "Group merge queue entries by lifecycle phase in UI",
+  "last_checked": "2024-01-15T10:30:00Z"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | Whether an update is available |
+| `applying` | Whether an update is currently being applied |
+| `current_commit` | Short SHA of the running commit |
+| `target_commit` | Short SHA to update to (null if no update available) |
+| `rebuild_scope` | What needs rebuilding: `"server"`, `"container"`, or `"frontend"` |
+| `commit_summary` | First line of the target commit message |
+| `last_checked` | ISO 8601 timestamp of the last update check |
+
+#### Apply Update
+
+Trigger a self-update. The server drains active sessions then exits with code 100 so the wrapper script can rebuild and restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+Set `force: true` to skip waiting for active sessions to complete.
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update scheduled; server will restart shortly"
+}
+```
+
+**Status values:** `applying` (update triggered), `no_update` (nothing to apply), `already_applying` (update already in progress).
+
 ### Orchestrator
 
 #### Chat with Orchestrator

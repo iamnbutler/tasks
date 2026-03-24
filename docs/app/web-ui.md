@@ -79,7 +79,17 @@ A **Properties** sidebar on the right shows metadata (state, project, created da
 
 ## Merge Queue
 
-The merge queue shows PRs awaiting human review.
+The merge queue shows PRs awaiting human review, organized into three lifecycle phases via tabs.
+
+### Lifecycle Phases
+
+| Tab | Statuses | Description |
+|-----|----------|-------------|
+| **Needs Review** | pending, changes_requested, conflict | Entries requiring human attention |
+| **Ready to Merge** | approved | Entries cleared for merge |
+| **Completed** | merged, rejected | Finished entries |
+
+Each tab shows a count of entries in that phase.
 
 ### Entry States
 
@@ -89,18 +99,19 @@ The merge queue shows PRs awaiting human review.
 | **Approved** | Ready to merge |
 | **Rejected** | Declined |
 | **Changes Requested** | Needs modification before merging |
+| **Conflict** | PR has a merge conflict |
+| **Merged** | Successfully merged |
 
 ### Actions
 
-For each entry:
+For each pending entry:
 
 - **Approve** - Mark ready for merge. In Play mode, triggers an immediate GitHub merge. In Pause mode, entry waits for flush.
 - **Reject** - Decline the changes
-- **Request Changes** - Ask for modifications with specific feedback; the task gets priority re-dispatch
 
 ### Flush
 
-In Pause mode, use the **Flush** button to merge all approved entries via the GitHub API.
+In Pause mode, use the **Flush approved** button (visible in the header when approved entries exist) to merge all approved entries via the GitHub API.
 
 ## Orchestrator
 
