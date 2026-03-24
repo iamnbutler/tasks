@@ -6,6 +6,7 @@ Tasks is a human-in-the-loop platform that orchestrates AI coding agents to get 
 
 - [Getting Started](getting-started.md) - Installation and first run
 - [Architecture](architecture.md) - System design and components
+- [Deployment](deployment.md) - Production setup with systemd/launchd
 - [CLI Reference](cli-reference.md) - Command-line interface
 - [API Reference](api-reference.md) - REST API endpoints
 - [Web UI Guide](web-ui.md) - Using the web interface
