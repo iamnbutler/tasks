@@ -7,6 +7,7 @@ import { TaskDetailPage } from "@/pages/task-detail";
 import { MergeQueuePage } from "@/pages/merge-queue/page";
 import { ContainersPage } from "@/pages/containers/page";
 import { AutomationsPage } from "@/pages/automations/page";
+import { AutomationDetailPage } from "@/pages/automation-detail";
 import { OrchestratorPage } from "@/pages/orchestrator/page";
 import { EventsPage } from "@/pages/events/page";
 
@@ -21,6 +22,7 @@ export function App() {
           <Route path="/merge-queue" element={<MergeQueuePage />} />
           <Route path="/containers" element={<ContainersPage />} />
           <Route path="/automations" element={<AutomationsPage />} />
+          <Route path="/automations/:id" element={<AutomationDetailPage />} />
           <Route path="/orchestrator" element={<OrchestratorPage />} />
           <Route path="/events" element={<EventsPage />} />
         </Route>

@@ -311,3 +311,10 @@ export function triggerAutomation(id: string): Promise<AutomationRun> {
     method: "POST",
   });
 }
+
+export function fetchAutomationRunEvents(
+  automationId: string,
+  runId: string
+): Promise<Event[]> {
+  return request<Event[]>(`/api/automations/${automationId}/runs/${runId}/events`);
+}

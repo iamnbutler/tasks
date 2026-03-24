@@ -1,7 +1,9 @@
 import { useState, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Calendar,
   Clock,
+  ExternalLink,
   History,
   MoreHorizontal,
   Pause,
@@ -121,6 +123,7 @@ function AutomationRow({
   onRefresh: () => Promise<void>;
   onRefreshRuns: () => void;
 }) {
+  const navigate = useNavigate();
   const [running, setRunning] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -212,6 +215,10 @@ function AutomationRow({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => navigate(`/automations/${automation.id}`)}>
+                <ExternalLink className="mr-2 h-3.5 w-3.5" />
+                View Details
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={onSelect}>
                 <History className="mr-2 h-3.5 w-3.5" />
                 View Runs
