@@ -8,12 +8,6 @@ description: |
 
 on:
   schedule: "0 6 * * 1-5"
-  push:
-    branches: [main]
-    paths:
-      - "crates/**/*.rs"
-      - "web/src/**"
-      - "docs/app/**"
   workflow_dispatch:
   slash_command:
     name: sync-docs
