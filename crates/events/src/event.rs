@@ -55,6 +55,14 @@ pub enum EventType {
     MergeCompleted,
     MergeConflict,
 
+    // Automation events (spec §5.7)
+    AutomationCreated,
+    AutomationUpdated,
+    AutomationDeleted,
+    AutomationRunStarted,
+    AutomationRunCompleted,
+    AutomationRunFailed,
+
     // Workspace events
     /// Workspace cleaned up (spec §10.3).
     WorkspaceCleaned,
@@ -128,6 +136,12 @@ impl EventType {
             Self::MergeChangesRequested => "merge:changes_requested",
             Self::MergeCompleted => "merge:completed",
             Self::MergeConflict => "merge:conflict",
+            Self::AutomationCreated => "automation:created",
+            Self::AutomationUpdated => "automation:updated",
+            Self::AutomationDeleted => "automation:deleted",
+            Self::AutomationRunStarted => "automation:run:started",
+            Self::AutomationRunCompleted => "automation:run:completed",
+            Self::AutomationRunFailed => "automation:run:failed",
             Self::WorkspaceCleaned => "workspace:cleaned",
             Self::OrchestratorFeedback => "orchestrator:feedback",
             Self::OrchestratorEscalation => "orchestrator:escalation",
@@ -211,6 +225,12 @@ impl TryFrom<String> for EventType {
             "merge:changes_requested" => Ok(Self::MergeChangesRequested),
             "merge:completed" => Ok(Self::MergeCompleted),
             "merge:conflict" => Ok(Self::MergeConflict),
+            "automation:created" => Ok(Self::AutomationCreated),
+            "automation:updated" => Ok(Self::AutomationUpdated),
+            "automation:deleted" => Ok(Self::AutomationDeleted),
+            "automation:run:started" => Ok(Self::AutomationRunStarted),
+            "automation:run:completed" => Ok(Self::AutomationRunCompleted),
+            "automation:run:failed" => Ok(Self::AutomationRunFailed),
             "workspace:cleaned" => Ok(Self::WorkspaceCleaned),
             "orchestrator:feedback" => Ok(Self::OrchestratorFeedback),
             "orchestrator:escalation" => Ok(Self::OrchestratorEscalation),

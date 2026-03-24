@@ -16,6 +16,7 @@ use events::{Actor, Event, EventBus, EventType};
 use crate::merge_queue::MergeQueue;
 use crate::model::merge_queue::MergeStatus;
 use crate::mode::{Mode, ModeTransitionError};
+use crate::model::automation::{Automation, AutomationRun, AutomationState, TriggerType};
 use crate::model::project::Project;
 use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
 use crate::dispatcher::{self, DispatchPlan};
@@ -65,6 +66,8 @@ pub struct ServerState {
     pub tasks: HashMap<String, Task>,
     /// The merge queue (spec Section 7).
     pub merge_queue: MergeQueue,
+    /// All automations indexed by ID (spec Section 5.7).
+    pub automations: HashMap<String, Automation>,
 }
 
 impl ServerState {
@@ -74,6 +77,7 @@ impl ServerState {
             projects: HashMap::new(),
             tasks: HashMap::new(),
             merge_queue: MergeQueue::new(),
+            automations: HashMap::new(),
         }
     }
 }
@@ -163,6 +167,14 @@ impl Server {
             state.merge_queue.enqueue(entry);
         }
 
+        // Load automations
+        let automations = store
+            .list_automations()
+            .map_err(|e| ServerError::StoreError(e.to_string()))?;
+        for automation in automations {
+            state.automations.insert(automation.id.clone(), automation);
+        }
+
         Ok(())
     }
 
@@ -202,11 +214,25 @@ impl Server {
                 state.merge_queue.remove_by_task_ids(&task_ids);
             }
 
+            // Remove automations for this project from in-memory state
+            let automation_ids: Vec<String> = state
+                .automations
+                .iter()
+                .filter(|(_, automation)| automation.project_id == id)
+                .map(|(automation_id, _)| automation_id.clone())
+                .collect();
+            for automation_id in &automation_ids {
+                state.automations.remove(automation_id);
+            }
+
             // Cascade delete in persistent store (transactional)
             if let Some(ref store) = self.store {
                 if let Ok(store) = store.lock() {
                     if let Err(e) = store.delete_project_data(id, &task_ids) {
                         tracing::error!(project_id = %id, error = %e, "failed to cascade-delete project data from store");
+                    }
+                    if let Err(e) = store.delete_automations_for_project(id) {
+                        tracing::error!(project_id = %id, error = %e, "failed to cascade-delete automations from store");
                     }
                     if let Err(e) = store.delete_project(id) {
                         tracing::error!(project_id = %id, error = %e, "failed to delete project from store");
@@ -217,6 +243,7 @@ impl Server {
             tracing::info!(
                 project_id = %id,
                 tasks_removed = task_ids.len(),
+                automations_removed = automation_ids.len(),
                 "project removed with cascading cleanup"
             );
         }
@@ -248,6 +275,190 @@ impl Server {
         let store = store.lock().unwrap();
         store.set_last_polled_at(id, timestamp)
             .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    // --- Automation management (spec Section 5.7) ---
+
+    /// Add a new automation.
+    pub async fn add_automation(&self, automation: Automation) -> Result<(), ServerError> {
+        let automation_id = automation.id.clone();
+        let project_id = automation.project_id.clone();
+
+        // Verify project exists
+        {
+            let state = self.state.read().await;
+            if !state.projects.contains_key(&project_id) {
+                return Err(ServerError::ProjectNotFound(project_id));
+            }
+        }
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_automation(&automation) {
+                    tracing::error!(automation_id = %automation_id, error = %e, "failed to persist automation to store");
+                }
+            }
+        }
+
+        {
+            let mut state = self.state.write().await;
+            state.automations.insert(automation_id.clone(), automation);
+        }
+
+        // Emit automation created event
+        let event = Event::new(
+            EventType::AutomationCreated,
+            &automation_id,
+            Actor::Human,
+            serde_json::json!({ "project_id": project_id }),
+        );
+        self.event_bus.publish(event).await?;
+
+        Ok(())
+    }
+
+    /// Get an automation by ID.
+    pub async fn get_automation(&self, id: &str) -> Option<Automation> {
+        let state = self.state.read().await;
+        state.automations.get(id).cloned()
+    }
+
+    /// Update an automation.
+    pub async fn update_automation(
+        &self,
+        id: &str,
+        name: Option<String>,
+        prompt: Option<String>,
+        state_update: Option<AutomationState>,
+        trigger: Option<TriggerType>,
+    ) -> Result<Automation, ServerError> {
+        let mut automation = {
+            let state = self.state.read().await;
+            state
+                .automations
+                .get(id)
+                .cloned()
+                .ok_or_else(|| ServerError::StoreError(format!("automation not found: {}", id)))?
+        };
+
+        // Apply updates
+        if let Some(name) = name {
+            automation.name = name;
+        }
+        if let Some(prompt) = prompt {
+            automation.prompt = prompt;
+        }
+        if let Some(new_state) = state_update {
+            automation.state = new_state;
+        }
+        if let Some(trigger) = trigger {
+            automation.trigger = trigger;
+        }
+        automation.updated_at = chrono::Utc::now();
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_automation(&automation) {
+                    tracing::error!(automation_id = %id, error = %e, "failed to persist automation update to store");
+                }
+            }
+        }
+
+        {
+            let mut state = self.state.write().await;
+            state.automations.insert(id.to_string(), automation.clone());
+        }
+
+        // Emit automation updated event
+        let event = Event::new(
+            EventType::AutomationUpdated,
+            id,
+            Actor::Human,
+            serde_json::json!({}),
+        );
+        self.event_bus.publish(event).await?;
+
+        Ok(automation)
+    }
+
+    /// Remove an automation.
+    pub async fn remove_automation(&self, id: &str) -> bool {
+        let removed = {
+            let mut state = self.state.write().await;
+            state.automations.remove(id).is_some()
+        };
+
+        if removed {
+            // Delete from store
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.delete_automation(id) {
+                        tracing::error!(automation_id = %id, error = %e, "failed to delete automation from store");
+                    }
+                }
+            }
+
+            // Emit automation deleted event
+            let event = Event::new(
+                EventType::AutomationDeleted,
+                id,
+                Actor::Human,
+                serde_json::json!({}),
+            );
+            if let Err(e) = self.event_bus.publish(event).await {
+                tracing::error!(automation_id = %id, error = %e, "failed to publish automation deleted event");
+            }
+
+            tracing::info!(automation_id = %id, "automation removed");
+        }
+
+        removed
+    }
+
+    /// List runs for an automation.
+    pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<AutomationRun>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+        store.list_automation_runs(automation_id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// Create a new automation run.
+    pub async fn create_automation_run(&self, automation_id: &str) -> Result<AutomationRun, ServerError> {
+        // Verify automation exists
+        {
+            let state = self.state.read().await;
+            if !state.automations.contains_key(automation_id) {
+                return Err(ServerError::StoreError(format!("automation not found: {}", automation_id)));
+            }
+        }
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut run = AutomationRun::new(&run_id, automation_id);
+        run.start();
+
+        // Save to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_automation_run(&run) {
+                    tracing::error!(run_id = %run_id, error = %e, "failed to persist automation run to store");
+                }
+            }
+        }
+
+        // Emit run started event
+        let event = Event::new(
+            EventType::AutomationRunStarted,
+            &run_id,
+            Actor::System,
+            serde_json::json!({ "automation_id": automation_id }),
+        );
+        self.event_bus.publish(event).await?;
+
+        Ok(run)
     }
 
     // --- Mode management (spec Section 6) ---
