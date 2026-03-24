@@ -1064,9 +1064,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdout_question_emits_question_events() {
-        // When agent output contains a question pattern, we should emit
-        // agent:question and task:state:question events (spec §9.3).
+    async fn stdout_question_like_text_treated_as_message() {
+        // Question detection is disabled (see #415) because output-based pattern
+        // matching produced too many false positives. Question-like text should
+        // only emit the base agent:message event, no question-related events.
         let (bus, mut rx) = test_event_bus().await;
         let mut interpreter = OutputInterpreter::new();
         let mut token_tracker = TokenTracker::new();
@@ -1078,19 +1079,12 @@ mod tests {
 
         handle_supervisor_event("task-1", &event, &bus, &mut interpreter, &mut token_tracker).await;
 
-        // First event is the base agent:message
+        // Should only receive the base agent:message event
         let msg_event = rx.recv().await.unwrap();
         assert_eq!(msg_event.event_type, events::EventType::AgentMessage);
 
-        // Second event is agent:question
-        let question_event = rx.recv().await.unwrap();
-        assert_eq!(question_event.event_type, events::EventType::AgentQuestion);
-        assert_eq!(question_event.data["source"], "output_interpretation");
-
-        // Third event is task:state:question
-        let state_event = rx.recv().await.unwrap();
-        assert_eq!(state_event.event_type, events::EventType::TaskStateQuestion);
-        assert_eq!(state_event.data["reason"], "agent_question");
+        // No additional events (question detection is disabled)
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
