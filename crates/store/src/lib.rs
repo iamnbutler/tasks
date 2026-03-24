@@ -660,6 +660,38 @@ impl Store {
         Ok(())
     }
 
+    /// List all automations across all projects.
+    pub fn list_automations(&self) -> Result<Vec<Automation>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, prompt, compiled_workflow,
+                    trigger_type, trigger_config, state, created_at, updated_at
+             FROM automations",
+        )?;
+        let rows = stmt.query_map([], row_to_automation)?;
+        let mut automations = Vec::new();
+        for row in rows {
+            automations.push(row?);
+        }
+        Ok(automations)
+    }
+
+    /// Delete all automations (and their runs) for a project.
+    pub fn delete_automations_for_project(&self, project_id: &str) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM automation_runs WHERE automation_id IN (SELECT id FROM automations WHERE project_id = ?1)",
+            params![project_id],
+        )?;
+        let affected = tx.execute("DELETE FROM automations WHERE project_id = ?1", params![project_id])?;
+        tx.commit()?;
+        Ok(affected)
+    }
+
+    /// Alias: list runs for an automation (matches server API naming).
+    pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
+        self.list_runs_for_automation(automation_id)
+    }
+
     /// List all runs for an automation.
     pub fn list_runs_for_automation(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
         let mut stmt = self.conn.prepare(

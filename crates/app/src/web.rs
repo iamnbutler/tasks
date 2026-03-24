@@ -83,7 +83,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/completions/name", post(completions_name))
         .route("/completions/describe", post(completions_describe))
         .route("/completions/brainstorm", post(completions_brainstorm))
-        .route("/completions/summarize", post(completions_summarize));
+        .route("/completions/summarize", post(completions_summarize))
+        // Automation endpoints (spec §5.7)
+        .route("/automations", get(list_automations))
+        .route("/automations", post(create_automation))
+        .route("/automations/{id}", get(get_automation))
+        .route("/automations/{id}", axum::routing::patch(update_automation))
+        .route("/automations/{id}", axum::routing::delete(delete_automation))
+        .route("/automations/{id}/runs", get(list_automation_runs))
+        .route("/automations/{id}/run", post(trigger_automation));
 
     Router::new()
         .nest("/api", api)
@@ -99,6 +107,7 @@ struct SnapshotResponse {
     projects: Vec<models::project::Project>,
     tasks: Vec<models::task::Task>,
     merge_queue: Vec<models::merge_queue::MergeQueueEntry>,
+    automations: Vec<models::automation::Automation>,
     slot_utilization: SlotUtilization,
     human_present: bool,
 }
@@ -330,6 +339,38 @@ struct SummarizeResponse {
     summary: String,
 }
 
+// --- Automation request/response types (spec §5.7) ---
+
+#[derive(Deserialize)]
+struct ListAutomationsQuery {
+    /// Optional project_id to filter automations by.
+    project_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateAutomationRequest {
+    /// Project ID this automation belongs to.
+    project_id: String,
+    /// Human-readable name.
+    name: String,
+    /// Prompt template for the automation.
+    prompt: String,
+    /// Trigger type for the automation.
+    trigger: models::automation::TriggerType,
+}
+
+#[derive(Deserialize)]
+struct UpdateAutomationRequest {
+    /// Update the name.
+    name: Option<String>,
+    /// Update the prompt.
+    prompt: Option<String>,
+    /// Update the state (active, paused, disabled).
+    state: Option<models::automation::AutomationState>,
+    /// Update the trigger.
+    trigger: Option<models::automation::TriggerType>,
+}
+
 // --- Handlers ---
 
 /// GET /api/snapshot — Full system state (spec §16.3).
@@ -353,6 +394,7 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         projects: server_state.projects.values().cloned().collect(),
         tasks: server_state.tasks.values().cloned().collect(),
         merge_queue: server_state.merge_queue.entries_with_positions(),
+        automations: server_state.automations.values().cloned().collect(),
         slot_utilization: SlotUtilization {
             active,
             max: state.max_sessions,
@@ -1302,6 +1344,155 @@ async fn completions_summarize(
         .map_err(|e| ApiError::CompletionsError(e.to_string()))?;
 
     Ok(Json(SummarizeResponse { summary }))
+}
+
+// --- Automation handlers (spec §5.7) ---
+
+/// GET /api/automations — List automations (optionally filtered by project_id).
+async fn list_automations(
+    State(state): State<ApiState>,
+    Query(query): Query<ListAutomationsQuery>,
+) -> Json<Vec<models::automation::Automation>> {
+    let server_state = state.server.state.read().await;
+    let automations: Vec<_> = if let Some(ref project_id) = query.project_id {
+        server_state
+            .automations
+            .values()
+            .filter(|a| &a.project_id == project_id)
+            .cloned()
+            .collect()
+    } else {
+        server_state.automations.values().cloned().collect()
+    };
+    Json(automations)
+}
+
+/// POST /api/automations — Create a new automation.
+async fn create_automation(
+    State(state): State<ApiState>,
+    Json(req): Json<CreateAutomationRequest>,
+) -> Result<Json<models::automation::Automation>, ApiError> {
+    // Validate name and prompt are not empty
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name cannot be empty".to_string()));
+    }
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::BadRequest("prompt cannot be empty".to_string()));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let automation = models::automation::Automation::new(&id, &req.project_id, &req.name, &req.prompt, req.trigger);
+
+    state
+        .server
+        .add_automation(automation.clone())
+        .await
+        .map_err(|e| match e {
+            server::ServerError::ProjectNotFound(_) => ApiError::NotFound(e.to_string()),
+            _ => ApiError::Server(e),
+        })?;
+
+    Ok(Json(automation))
+}
+
+/// GET /api/automations/:id — Get a single automation.
+async fn get_automation(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<models::automation::Automation>, ApiError> {
+    let server_state = state.server.state.read().await;
+    server_state
+        .automations
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("automation not found: {}", id)))
+}
+
+/// PATCH /api/automations/:id — Update an automation.
+async fn update_automation(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAutomationRequest>,
+) -> Result<Json<models::automation::Automation>, ApiError> {
+    // Validate name if provided
+    if let Some(ref name) = req.name {
+        if name.trim().is_empty() {
+            return Err(ApiError::BadRequest("name cannot be empty".to_string()));
+        }
+    }
+    // Validate prompt if provided
+    if let Some(ref prompt) = req.prompt {
+        if prompt.trim().is_empty() {
+            return Err(ApiError::BadRequest("prompt cannot be empty".to_string()));
+        }
+    }
+
+    let automation = state
+        .server
+        .update_automation(&id, req.name, req.prompt, req.state, req.trigger)
+        .await
+        .map_err(|e| match e {
+            server::ServerError::StoreError(ref msg) if msg.contains("not found") => {
+                ApiError::NotFound(e.to_string())
+            }
+            _ => ApiError::Server(e),
+        })?;
+
+    Ok(Json(automation))
+}
+
+/// DELETE /api/automations/:id — Delete an automation.
+async fn delete_automation(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state.server.remove_automation(&id).await;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("automation not found: {}", id)))
+    }
+}
+
+/// GET /api/automations/:id/runs — List runs for an automation.
+async fn list_automation_runs(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<models::automation::AutomationRun>>, ApiError> {
+    // Verify automation exists
+    {
+        let server_state = state.server.state.read().await;
+        if !server_state.automations.contains_key(&id) {
+            return Err(ApiError::NotFound(format!("automation not found: {}", id)));
+        }
+    }
+
+    let runs = state
+        .server
+        .list_automation_runs(&id)
+        .map_err(ApiError::Server)?;
+
+    Ok(Json(runs))
+}
+
+/// POST /api/automations/:id/run — Manually trigger an automation run.
+async fn trigger_automation(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<models::automation::AutomationRun>, ApiError> {
+    let run = state
+        .server
+        .create_automation_run(&id)
+        .await
+        .map_err(|e| match e {
+            server::ServerError::StoreError(ref msg) if msg.contains("not found") => {
+                ApiError::NotFound(e.to_string())
+            }
+            _ => ApiError::Server(e),
+        })?;
+
+    Ok(Json(run))
 }
 
 // --- Error handling ---
