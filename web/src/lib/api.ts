@@ -1,13 +1,14 @@
 import type {
-  ContainerInfo,
   Automation,
   AutomationRun,
+  ContainerInfo,
   Event,
   MergeQueueEntry,
   Mode,
   Project,
   Snapshot,
   Task,
+  TriggerConfig,
   UpdateStatus,
 } from "./types";
 
@@ -247,7 +248,9 @@ export function applyUpdate(force?: boolean): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------
 // Automations API
+// ---------------------------------------------------------------------------
 
 export function fetchAutomations(projectId?: string): Promise<Automation[]> {
   const params = new URLSearchParams();
@@ -261,15 +264,13 @@ export interface CreateAutomationRequest {
   project_id: string;
   name: string;
   prompt: string;
-  trigger: {
-    type: "schedule" | "event" | "manual";
-    cron?: string;
-    event_type?: string;
-  };
+  trigger: TriggerConfig;
   state?: "active" | "paused" | "disabled";
 }
 
-export function createAutomation(req: CreateAutomationRequest): Promise<Automation> {
+export function createAutomation(
+  req: CreateAutomationRequest
+): Promise<Automation> {
   return request<Automation>("/api/automations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -280,11 +281,7 @@ export function createAutomation(req: CreateAutomationRequest): Promise<Automati
 export interface UpdateAutomationRequest {
   name?: string;
   prompt?: string;
-  trigger?: {
-    type: "schedule" | "event" | "manual";
-    cron?: string;
-    event_type?: string;
-  };
+  trigger?: TriggerConfig;
   state?: "active" | "paused" | "disabled";
 }
 
@@ -303,7 +300,9 @@ export function deleteAutomation(id: string): Promise<void> {
   return requestVoid(`/api/automations/${id}`, { method: "DELETE" });
 }
 
-export function fetchAutomationRuns(automationId: string): Promise<AutomationRun[]> {
+export function fetchAutomationRuns(
+  automationId: string
+): Promise<AutomationRun[]> {
   return request<AutomationRun[]>(`/api/automations/${automationId}/runs`);
 }
 
