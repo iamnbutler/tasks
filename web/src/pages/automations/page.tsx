@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   Calendar,
   Clock,
+  Copy,
   History,
   MoreHorizontal,
   Pause,
@@ -48,9 +49,10 @@ import {
   ProjectCell,
   ActionsCell,
 } from "@/components/ui/list-row";
-import type { Automation, AutomationState } from "@/lib/types";
+import type { Automation, AutomationState, Project } from "@/lib/types";
 import { AutomationRunsPanel } from "./automation-runs-panel";
 import { AutomationFormDialog } from "./automation-form-dialog";
+import { DuplicateAutomationDialog } from "./duplicate-automation-dialog";
 
 // ---------------------------------------------------------------------------
 // State badge configuration
@@ -107,6 +109,7 @@ function TriggerDisplay({ trigger }: { trigger: Automation["trigger"] }) {
 function AutomationRow({
   automation,
   projectName,
+  projects,
   isSelected,
   onSelect,
   onEdit,
@@ -114,6 +117,7 @@ function AutomationRow({
 }: {
   automation: Automation;
   projectName: string;
+  projects: Project[];
   isSelected: boolean;
   onSelect: () => void;
   onEdit: () => void;
@@ -122,6 +126,7 @@ function AutomationRow({
   const [running, setRunning] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [duplicateOpen, setDuplicateOpen] = useState(false);
 
   async function handleRun(e: React.MouseEvent) {
     e.stopPropagation();
@@ -215,6 +220,10 @@ function AutomationRow({
                 <Pencil className="mr-2 h-3.5 w-3.5" />
                 Edit
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setDuplicateOpen(true)}>
+                <Copy className="mr-2 h-3.5 w-3.5" />
+                Duplicate to...
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={handleToggleState}>
                 {automation.state === "active" ? (
@@ -265,6 +274,15 @@ function AutomationRow({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Duplicate automation dialog */}
+      <DuplicateAutomationDialog
+        open={duplicateOpen}
+        onOpenChange={setDuplicateOpen}
+        automation={automation}
+        projects={projects}
+        onSuccess={onRefresh}
+      />
     </>
   );
 }
@@ -353,6 +371,7 @@ export function AutomationsPage() {
             key={automation.id}
             automation={automation}
             projectName={projectIdToRepo[automation.project_id] ?? automation.project_id}
+            projects={projects}
             isSelected={currentSelectedAutomation?.id === automation.id}
             onSelect={() => setSelectedAutomation(automation)}
             onEdit={() => handleOpenEdit(automation)}
