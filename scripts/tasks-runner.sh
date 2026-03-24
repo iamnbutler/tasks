@@ -23,7 +23,7 @@
 #
 # Environment:
 #   TASKS_DATA_DIR        — Data directory (default: ~/.local/state/tasks)
-#   TASKS_MAX_RETRIES     — Max network retry attempts (default: 10)
+#   TASKS_NET_MAX_RETRIES — Max network retry attempts (default: 10)
 #   TASKS_RETRY_DELAY     — Initial retry delay in seconds (default: 5)
 #   TASKS_MAX_RETRY_DELAY — Maximum retry delay in seconds (default: 300)
 #   TASKS_HEALTH_TIMEOUT  — Health check timeout in seconds (default: 30)
@@ -56,7 +56,7 @@ STATE_FILE="$DATA_DIR/.update-state"
 BACKUP_DIR="$DATA_DIR/backup"
 
 # Retry configuration
-MAX_RETRIES="${TASKS_MAX_RETRIES:-10}"
+MAX_RETRIES="${TASKS_NET_MAX_RETRIES:-10}"
 RETRY_DELAY="${TASKS_RETRY_DELAY:-5}"
 MAX_RETRY_DELAY="${TASKS_MAX_RETRY_DELAY:-300}"
 HEALTH_TIMEOUT="${TASKS_HEALTH_TIMEOUT:-30}"
@@ -410,15 +410,20 @@ resume_update() {
             return 1
             ;;
         fetching|merging)
-            log_info "Resuming update from state: $state"
-            # Start over from fetch
+            log_info "Resuming update from state: $state (restarting fetch)"
+            if pull_updates; then
+                local scope
+                scope=$(read_scope)
+                rebuild "$scope" && cleanup_state
+            fi
             return 0
             ;;
         building:*)
             local scope="${state#building:}"
             log_info "Resuming build from state: $scope"
-            # Continue from where we left off
-            rebuild "$scope"
+            if rebuild "$scope"; then
+                cleanup_state
+            fi
             return $?
             ;;
         *)
@@ -483,8 +488,15 @@ main() {
 
         # Run the server in background so we can track PID
         set +e
-        cargo run --release --package tasks-app -- run "$@" &
+        if [[ -x ./target/release/tasks-app ]]; then
+            ./target/release/tasks-app run "$@" &
+        else
+            cargo run --release --package tasks-app -- run "$@" &
+        fi
         SERVER_PID=$!
+
+        # Run health check in background (non-blocking, just logging)
+        health_check &
 
         # Wait for server to exit
         wait $SERVER_PID
@@ -505,9 +517,6 @@ main() {
 
                 # Small delay before restart
                 sleep 2
-
-                # Health check after restart (non-blocking, just logging)
-                # The health check will run once server starts in next iteration
             else
                 cleanup_state
                 log_error "Update failed, restarting server with current version..."

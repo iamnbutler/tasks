@@ -234,7 +234,7 @@ The `scripts/tasks-runner.sh` wrapper provides production-ready features:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TASKS_DATA_DIR` | Data directory | `~/.local/state/tasks` |
-| `TASKS_MAX_RETRIES` | Network retry attempts | `10` |
+| `TASKS_NET_MAX_RETRIES` | Network retry attempts | `10` |
 | `TASKS_RETRY_DELAY` | Initial retry delay (seconds) | `5` |
 | `TASKS_MAX_RETRY_DELAY` | Maximum retry delay (seconds) | `300` |
 | `TASKS_HEALTH_TIMEOUT` | Health check timeout (seconds) | `30` |

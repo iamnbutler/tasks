@@ -49,8 +49,6 @@
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
         <key>RUST_LOG</key>
         <string>info</string>
-        <key>HOME</key>
-        <string>~</string>
     </dict>
 
     <!-- Start at login -->

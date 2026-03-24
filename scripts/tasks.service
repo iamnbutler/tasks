@@ -64,8 +64,8 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 MemoryDenyWriteExecute=false
 
-# Allow write to data directory
-ReadWritePaths=/var/lib/tasks
+# Allow write to data directory and repo (for self-update)
+ReadWritePaths=/var/lib/tasks /opt/tasks
 
 # Allow network access
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

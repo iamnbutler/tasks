@@ -80,7 +80,7 @@ Tasks is configured through environment variables and a `.env` file.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TASKS_MAX_RETRIES` | Max network retry attempts | `10` |
+| `TASKS_NET_MAX_RETRIES` | Max network retry attempts | `10` |
 | `TASKS_RETRY_DELAY` | Initial retry delay (seconds) | `5` |
 | `TASKS_MAX_RETRY_DELAY` | Maximum retry delay (seconds) | `300` |
 | `TASKS_HEALTH_TIMEOUT` | Health check timeout (seconds) | `30` |
