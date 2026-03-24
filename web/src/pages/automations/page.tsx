@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import {
   Calendar,
   Clock,
@@ -49,7 +49,7 @@ import {
   ActionsCell,
 } from "@/components/ui/list-row";
 import type { Automation, AutomationState } from "@/lib/types";
-import { AutomationRunsPanel } from "./automation-runs-panel";
+import { AutomationRunsPanel, type AutomationRunsPanelHandle } from "./automation-runs-panel";
 import { AutomationFormDialog } from "./automation-form-dialog";
 
 // ---------------------------------------------------------------------------
@@ -111,6 +111,7 @@ function AutomationRow({
   onSelect,
   onEdit,
   onRefresh,
+  onRefreshRuns,
 }: {
   automation: Automation;
   projectName: string;
@@ -118,6 +119,7 @@ function AutomationRow({
   onSelect: () => void;
   onEdit: () => void;
   onRefresh: () => Promise<void>;
+  onRefreshRuns: () => void;
 }) {
   const [running, setRunning] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -131,6 +133,9 @@ function AutomationRow({
       await onRefresh();
       // Select this automation to show the new run
       onSelect();
+      // Immediately refresh the runs panel to show the new running state
+      // Use a small delay to ensure the panel has mounted if it wasn't selected before
+      setTimeout(() => onRefreshRuns(), 50);
     } catch (error) {
       console.error("Failed to run automation:", error);
     } finally {
@@ -297,6 +302,13 @@ export function AutomationsPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<Automation | undefined>(undefined);
 
+  // Ref for the runs panel to trigger refresh after triggering an automation
+  const runsPanelRef = useRef<AutomationRunsPanelHandle>(null);
+
+  const refreshRunsPanel = () => {
+    runsPanelRef.current?.refresh();
+  };
+
   // Map project IDs to repo names
   const projectIdToRepo: Record<string, string> = {};
   for (const p of projects) {
@@ -357,6 +369,7 @@ export function AutomationsPage() {
             onSelect={() => setSelectedAutomation(automation)}
             onEdit={() => handleOpenEdit(automation)}
             onRefresh={refreshAutomations}
+            onRefreshRuns={refreshRunsPanel}
           />
         ))}
       </div>
@@ -365,6 +378,7 @@ export function AutomationsPage() {
 
   const runsPanel = currentSelectedAutomation ? (
     <AutomationRunsPanel
+      ref={runsPanelRef}
       automation={currentSelectedAutomation}
       onClose={() => setSelectedAutomation(null)}
     />
