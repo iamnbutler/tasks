@@ -15,6 +15,7 @@ import {
   Pause,
   Play,
   Rocket,
+  Workflow,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { addProject, deleteProject, setMode, bootstrapProject } from "@/lib/api";
@@ -603,6 +604,7 @@ export function Layout() {
               <SidebarNavItem to="/tasks" icon={ListTodo} label="Tasks" />
               <SidebarNavItem to="/merge-queue" icon={GitMerge} label="Merge Queue" />
               <SidebarNavItem to="/containers" icon={Box} label="Containers" />
+              <SidebarNavItem to="/automations" icon={Workflow} label="Automations" />
             </div>
 
             {/* Projects */}
