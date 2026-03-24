@@ -31,6 +31,8 @@ use server::Server;
 use server::presence::OwnedConnectionGuard;
 use models::Mode;
 
+use crate::update::UpdateState;
+
 /// Shared state for API handlers.
 #[derive(Clone)]
 pub struct ApiState {
@@ -38,6 +40,8 @@ pub struct ApiState {
     pub max_sessions: u32,
     pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
     pub completions_service: Option<Arc<CompletionsService>>,
+    pub update_state: Arc<UpdateState>,
+    pub update_tx: tokio::sync::mpsc::Sender<()>,
 }
 
 /// Build the API router.
@@ -193,6 +197,8 @@ struct QueryEventsParams {
 struct SelfUpdateStatusResponse {
     /// Whether an update is available.
     available: bool,
+    /// Whether an update is currently being applied.
+    applying: bool,
     /// Current commit hash (short form).
     current_commit: Option<String>,
     /// Target commit hash to update to (short form).
@@ -811,18 +817,29 @@ async fn get_task_accounting(
 /// Returns information about whether an update is available from upstream.
 /// Note: Full functionality requires Phase 1 infrastructure (#319).
 async fn get_self_update_status(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
 ) -> Json<SelfUpdateStatusResponse> {
-    // TODO(#319): Integrate with SelfUpdateManager from Phase 1
-    // For now, return a stub response indicating no update mechanism is configured
-    Json(SelfUpdateStatusResponse {
-        available: false,
-        current_commit: None,
-        target_commit: None,
-        rebuild_scope: None,
-        commit_summary: None,
-        last_checked: None,
-    })
+    let applying = state.update_state.is_applying();
+    match state.update_state.get_info().await {
+        Some(info) => Json(SelfUpdateStatusResponse {
+            available: true,
+            applying,
+            current_commit: Some(info.current_commit[..7.min(info.current_commit.len())].to_string()),
+            target_commit: Some(info.available_commit[..7.min(info.available_commit.len())].to_string()),
+            rebuild_scope: Some(info.scope.as_str().to_string()),
+            commit_summary: None,
+            last_checked: None,
+        }),
+        None => Json(SelfUpdateStatusResponse {
+            available: false,
+            applying,
+            current_commit: None,
+            target_commit: None,
+            rebuild_scope: None,
+            commit_summary: None,
+            last_checked: None,
+        }),
+    }
 }
 
 /// POST /api/self-update/apply — Trigger a self-update.
@@ -834,15 +851,36 @@ async fn get_self_update_status(
 ///
 /// Note: Full functionality requires Phase 1 infrastructure (#319).
 async fn apply_self_update(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(req): Json<ApplySelfUpdateRequest>,
 ) -> Result<Json<ApplySelfUpdateResponse>, ApiError> {
-    // TODO(#319): Integrate with SelfUpdateManager from Phase 1
-    tracing::debug!(force = req.force, "self-update apply called (stub, #319 not yet integrated)");
+    // Already applying?
+    if state.update_state.is_applying() {
+        return Ok(Json(ApplySelfUpdateResponse {
+            status: "already_applying".to_string(),
+            message: "An update is already being applied.".to_string(),
+        }));
+    }
+
+    // No update available?
+    if !state.update_state.is_available().await {
+        return Ok(Json(ApplySelfUpdateResponse {
+            status: "no_update".to_string(),
+            message: "No update available.".to_string(),
+        }));
+    }
+
+    tracing::info!(force = req.force, "self-update apply triggered via API");
+
+    // Send the update trigger — the run loop will handle shutdown and exit 100
+    if let Err(e) = state.update_tx.send(()).await {
+        tracing::error!(error = %e, "failed to send update trigger");
+        return Err(ApiError::BadRequest(format!("failed to trigger update: {e}")));
+    }
 
     Ok(Json(ApplySelfUpdateResponse {
-        status: "no_update".to_string(),
-        message: "Self-update infrastructure not yet configured. See issue #319.".to_string(),
+        status: "applying".to_string(),
+        message: "Update is being applied. The server will restart shortly.".to_string(),
     }))
 }
 

@@ -106,7 +106,6 @@ impl RebuildScope {
 
 /// State of an available update.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future API endpoints and logging
 pub struct UpdateInfo {
     /// The commit SHA we're currently at.
     pub current_commit: String,
