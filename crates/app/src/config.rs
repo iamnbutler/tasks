@@ -10,6 +10,14 @@ pub struct AppConfig {
     pub github_token: String,
     /// Global max concurrent sessions (default: 5).
     pub max_sessions: u32,
+    /// Whether the update checker is enabled (default: true).
+    pub update_check_enabled: bool,
+    /// Interval between update checks (default: 300s).
+    pub update_check_interval: Duration,
+    /// Whether to automatically apply updates when detected (default: false).
+    pub update_auto_apply: bool,
+    /// Timeout for waiting for sessions to drain before update (default: 300s).
+    pub update_session_timeout: Duration,
     /// Default max sessions per project when no workflow.toml override exists (default: 1).
     pub max_sessions_per_project: u32,
     /// Maximum retry attempts for failed tasks (default: 3, spec §13.2/§14.1).
@@ -141,6 +149,27 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(server::DEFAULT_CONFLICT_MAX_AGE_SECS);
 
+        // Update checker configuration
+        let update_check_enabled = std::env::var("TASKS_UPDATE_CHECK_ENABLED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(true);
+
+        let update_check_interval_secs = std::env::var("TASKS_UPDATE_CHECK_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300u64);
+
+        let update_auto_apply = std::env::var("TASKS_UPDATE_AUTO_APPLY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(false);
+
+        let update_session_timeout_secs = std::env::var("TASKS_UPDATE_SESSION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300u64);
+
         Ok(Self {
             data_dir,
             github_token,
@@ -166,6 +195,10 @@ impl AppConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4800),
+            update_check_enabled,
+            update_check_interval: Duration::from_secs(update_check_interval_secs),
+            update_auto_apply,
+            update_session_timeout: Duration::from_secs(update_session_timeout_secs),
         })
     }
 }
