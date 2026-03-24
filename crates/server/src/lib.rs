@@ -3,6 +3,7 @@
 //! Spec Section 3.1: The server is the long-running process that hosts
 //! the event log, task state, merge queue, and scheduler.
 
+pub mod automation_executor;
 pub mod model;
 pub mod mode;
 pub mod merge_queue;
@@ -16,6 +17,7 @@ pub mod scheduler;
 pub mod workspace;
 mod server;
 
+pub use automation_executor::{AutomationExecutor, ExecutionResult};
 pub use mode::Mode;
 pub use recovery::{RecoveryResult, DEFAULT_MAX_RETRIES};
 pub use server::{Server, ServerError, ServerState, RebuildStats};

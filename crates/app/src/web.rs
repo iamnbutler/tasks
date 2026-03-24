@@ -1492,6 +1492,17 @@ async fn trigger_automation(
             _ => ApiError::Server(e),
         })?;
 
+    // Spawn the automation execution in the background
+    // The run is returned immediately while execution continues
+    if let Err(e) = state
+        .server
+        .execute_automation_run(run.id.clone(), id)
+        .await
+    {
+        tracing::error!(run_id = %run.id, error = %e, "failed to start automation execution");
+        // Don't fail the request - the run was created, execution just didn't start
+    }
+
     Ok(Json(run))
 }
 

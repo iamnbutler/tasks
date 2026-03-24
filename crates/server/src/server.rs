@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 
 use events::{Actor, Event, EventBus, EventType};
 
+use crate::automation_executor::AutomationExecutor;
 use crate::merge_queue::MergeQueue;
 use crate::model::merge_queue::MergeStatus;
 use crate::mode::{Mode, ModeTransitionError};
@@ -106,6 +107,8 @@ pub struct Server {
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
     pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    /// Optional executor for running automations.
+    executor: Option<Arc<AutomationExecutor>>,
     /// Flag to signal the poll loop to reset pollers (issue #256).
     rebuild_requested: AtomicBool,
 }
@@ -117,6 +120,7 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: None,
+            executor: None,
             rebuild_requested: AtomicBool::new(false),
         }
     }
@@ -128,8 +132,19 @@ impl Server {
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: Some(Arc::new(StdMutex::new(store))),
+            executor: None,
             rebuild_requested: AtomicBool::new(false),
         }
+    }
+
+    /// Set the automation executor for running automation prompts.
+    pub fn set_executor(&mut self, executor: AutomationExecutor) {
+        self.executor = Some(Arc::new(executor));
+    }
+
+    /// Check if the server has an executor configured.
+    pub fn has_executor(&self) -> bool {
+        self.executor.is_some()
     }
 
     /// Load projects, tasks, and merge queue entries from the store into memory.
@@ -459,6 +474,151 @@ impl Server {
         self.event_bus.publish(event).await?;
 
         Ok(run)
+    }
+
+    /// Complete an automation run successfully.
+    pub async fn complete_automation_run(
+        &self,
+        run_id: &str,
+        automation_id: &str,
+        output: Option<String>,
+    ) -> Result<(), ServerError> {
+        // Create the updated run
+        let mut run = AutomationRun::new(run_id, automation_id);
+        run.complete(output.clone());
+
+        // Save to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_automation_run(&run) {
+                    tracing::error!(run_id = %run_id, error = %e, "failed to persist completed automation run");
+                }
+            }
+        }
+
+        // Emit completion event
+        let event = Event::new(
+            EventType::AutomationRunCompleted,
+            run_id,
+            Actor::System,
+            serde_json::json!({
+                "automation_id": automation_id,
+                "output": output,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::info!(run_id = %run_id, automation_id = %automation_id, "automation run completed");
+        Ok(())
+    }
+
+    /// Fail an automation run with an error.
+    pub async fn fail_automation_run(
+        &self,
+        run_id: &str,
+        automation_id: &str,
+        error: String,
+    ) -> Result<(), ServerError> {
+        // Create the updated run
+        let mut run = AutomationRun::new(run_id, automation_id);
+        run.fail(&error);
+
+        // Save to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_automation_run(&run) {
+                    tracing::error!(run_id = %run_id, error = %e, "failed to persist failed automation run");
+                }
+            }
+        }
+
+        // Emit failure event
+        let event = Event::new(
+            EventType::AutomationRunFailed,
+            run_id,
+            Actor::System,
+            serde_json::json!({
+                "automation_id": automation_id,
+                "error": error,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::warn!(run_id = %run_id, automation_id = %automation_id, error = %error, "automation run failed");
+        Ok(())
+    }
+
+    /// Execute an automation run.
+    ///
+    /// This spawns a background task that:
+    /// 1. Gets the automation and project context
+    /// 2. Executes the prompt via the agent provider
+    /// 3. Updates the run with the result
+    ///
+    /// Returns immediately after spawning the task.
+    pub async fn execute_automation_run(
+        self: &Arc<Self>,
+        run_id: String,
+        automation_id: String,
+    ) -> Result<(), ServerError> {
+        // Get executor
+        let executor = match &self.executor {
+            Some(e) => Arc::clone(e),
+            None => {
+                // No executor configured - fail the run immediately
+                self.fail_automation_run(&run_id, &automation_id, "No executor configured".to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        // Get automation and project
+        let (automation, project) = {
+            let state = self.state.read().await;
+            let automation = state.automations.get(&automation_id).cloned();
+            let project = automation.as_ref().and_then(|a| state.projects.get(&a.project_id).cloned());
+            (automation, project)
+        };
+
+        let automation = match automation {
+            Some(a) => a,
+            None => {
+                self.fail_automation_run(&run_id, &automation_id, "Automation not found".to_string()).await?;
+                return Ok(());
+            }
+        };
+
+        // Check if automation is active
+        if automation.state != AutomationState::Active {
+            self.fail_automation_run(
+                &run_id,
+                &automation_id,
+                format!("Automation is not active (state: {:?})", automation.state),
+            ).await?;
+            return Ok(());
+        }
+
+        // Spawn the execution task
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            tracing::info!(run_id = %run_id, automation_id = %automation_id, "executing automation");
+
+            // Execute the automation
+            let result = executor.execute(&automation, project.as_ref()).await;
+
+            // Update the run based on result
+            if result.success {
+                if let Err(e) = server.complete_automation_run(&run_id, &automation_id, result.output).await {
+                    tracing::error!(run_id = %run_id, error = %e, "failed to complete automation run");
+                }
+            } else {
+                let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
+                if let Err(e) = server.fail_automation_run(&run_id, &automation_id, error).await {
+                    tracing::error!(run_id = %run_id, error = %e, "failed to mark automation run as failed");
+                }
+            }
+        });
+
+        Ok(())
     }
 
     // --- Mode management (spec Section 6) ---

@@ -13,6 +13,7 @@ use events::{Actor, Event, EventBus, EventStore, EventType};
 use uuid::Uuid;
 use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
+use server::AutomationExecutor;
 use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
 use server::{WorkflowConfigWatcher, RefreshResult};
@@ -175,7 +176,24 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     // --- 2. Create server ---
 
-    let server = Arc::new(Server::with_store(bus, store));
+    let mut server = Server::with_store(bus, store);
+
+    // Set up automation executor if ANTHROPIC_API_KEY is available
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        match AutomationExecutor::from_env() {
+            Ok(executor) => {
+                server.set_executor(executor);
+                info!("automation executor initialized");
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to initialize automation executor - automations will not run");
+            }
+        }
+    } else {
+        debug!("ANTHROPIC_API_KEY not set - automation executor disabled");
+    }
+
+    let server = Arc::new(server);
     server
         .load_from_store()
         .await
