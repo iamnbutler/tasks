@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   AlertCircle,
   Check,
   ChevronDown,
   ChevronRight,
   Clock,
+  ExternalLink,
   Loader2,
   X,
 } from "lucide-react";
@@ -226,6 +228,7 @@ interface AutomationRunsPanelProps {
 
 export const AutomationRunsPanel = forwardRef<AutomationRunsPanelHandle, AutomationRunsPanelProps>(
   function AutomationRunsPanel({ automation, onClose }, ref) {
+  const navigate = useNavigate();
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -304,14 +307,25 @@ export const AutomationRunsPanel = forwardRef<AutomationRunsPanelHandle, Automat
             Run History
           </span>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-6 w-6 shrink-0"
-          onClick={onClose}
-        >
-          <X className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-1 shrink-0">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={() => navigate(`/automations/${automation.id}`)}
+            title="Open details"
+          >
+            <ExternalLink className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={onClose}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
 
       {/* Content */}

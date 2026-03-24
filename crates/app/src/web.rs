@@ -92,6 +92,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}", axum::routing::patch(update_automation))
         .route("/automations/{id}", axum::routing::delete(delete_automation))
         .route("/automations/{id}/runs", get(list_automation_runs))
+        .route("/automations/{id}/runs/{run_id}/events", get(list_automation_run_events))
         .route("/automations/{id}/run", post(trigger_automation));
 
     Router::new()
@@ -1578,6 +1579,44 @@ async fn trigger_automation(
     }
 
     Ok(Json(run))
+}
+
+/// GET /api/automations/:id/runs/:run_id/events — Get events for a specific automation run.
+///
+/// Returns events where the task field matches `automation-run:{run_id}`.
+/// This includes agent messages, errors, and lifecycle events from the container session.
+async fn list_automation_run_events(
+    State(state): State<ApiState>,
+    Path((automation_id, run_id)): Path<(String, String)>,
+) -> Result<Json<Vec<events::Event>>, ApiError> {
+    // Verify automation exists
+    {
+        let server_state = state.server.state.read().await;
+        if !server_state.automations.contains_key(&automation_id) {
+            return Err(ApiError::NotFound(format!("automation not found: {}", automation_id)));
+        }
+    }
+
+    // Verify run exists and belongs to this automation
+    let runs = state
+        .server
+        .list_automation_runs(&automation_id)
+        .map_err(ApiError::Server)?;
+
+    if !runs.iter().any(|r| r.id == run_id) {
+        return Err(ApiError::NotFound(format!("run not found: {}", run_id)));
+    }
+
+    // Query events with the automation-run: prefix
+    let session_id = format!("automation-run:{}", run_id);
+    let events = state
+        .server
+        .event_bus
+        .read_task(&session_id)
+        .await
+        .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))?;
+
+    Ok(Json(events))
 }
 
 // --- Error handling ---
