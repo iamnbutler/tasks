@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -122,9 +122,10 @@ export function AutomationFormDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Reset form when dialog opens or automation changes
+  // Reset form only when the dialog transitions from closed → open
+  const prevOpen = useRef(false);
   useEffect(() => {
-    if (open) {
+    if (open && !prevOpen.current) {
       if (automation) {
         // Edit mode: populate form with existing data
         setProjectId(automation.project_id);
@@ -162,7 +163,8 @@ export function AutomationFormDialog({
       }
       setError(null);
     }
-  }, [open, automation, selectedProjectId, projects]);
+    prevOpen.current = open;
+  });
 
   // Get the actual cron value (handles custom preset)
   const getCronValue = (): string => {

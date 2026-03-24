@@ -144,11 +144,11 @@ function RunDetailView({ run }: { run: AutomationRun }) {
               Output
             </CollapsibleTrigger>
             <CollapsibleContent>
-              <ScrollArea className="max-h-60 rounded-md border border-border bg-muted/50">
+              <div className="max-h-60 overflow-auto rounded-md border border-border bg-muted/50">
                 <pre className="p-2 text-xs whitespace-pre-wrap break-words font-mono">
                   {run.output}
                 </pre>
-              </ScrollArea>
+              </div>
             </CollapsibleContent>
           </div>
         </Collapsible>
@@ -245,17 +245,13 @@ export function AutomationRunsPanel({
     }
   }, [automation.id]);
 
-  // Initial load
+  // Initial load + regular polling
+  // Always poll so new runs appear even if triggered externally.
+  // Poll faster (2s) when a run is in progress, otherwise every 5s.
   useEffect(() => {
     loadRuns();
-  }, [loadRuns]);
-
-  // Auto-refresh when there are running runs
-  useEffect(() => {
     const hasRunningRun = runs.some((r) => r.status === "running");
-    if (!hasRunningRun) return;
-
-    const interval = setInterval(loadRuns, 2000);
+    const interval = setInterval(loadRuns, hasRunningRun ? 2000 : 5000);
     return () => clearInterval(interval);
   }, [runs, loadRuns]);
 

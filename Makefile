@@ -10,9 +10,17 @@ LINKER := $(TARGET)-gcc
 SUPERVISOR_BIN := target/$(TARGET)/release/tasks-supervisor
 CONTAINER_IMAGE := tasks-agent:latest
 
-.PHONY: all check-linker supervisor container-image clean
+.PHONY: all run web check-linker supervisor container-image clean
 
 all: container-image
+
+# Build the web frontend and start the server
+run: web
+	cargo run -- run --web
+
+# Build the web frontend
+web:
+	cd web && bun install && bun run build
 
 # Verify the cross-compilation toolchain is available
 check-linker:

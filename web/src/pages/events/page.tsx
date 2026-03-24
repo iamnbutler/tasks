@@ -28,6 +28,7 @@ const FILTERS = [
   { key: "merge", label: "Merge" },
   { key: "system", label: "System" },
   { key: "orchestrator", label: "Orchestrator" },
+  { key: "automation", label: "Automation" },
 ] as const;
 
 type FilterKey = (typeof FILTERS)[number]["key"];
@@ -41,6 +42,7 @@ function badgeClasses(type: string): string {
   if (type.startsWith("merge:")) return "bg-purple-500/15 text-purple-400 border-purple-500/30";
   if (type.startsWith("system:")) return "bg-gray-500/15 text-gray-400 border-gray-500/30";
   if (type.startsWith("orchestrator:")) return "bg-orange-500/15 text-orange-400 border-orange-500/30";
+  if (type.startsWith("automation:")) return "bg-teal-500/15 text-teal-400 border-teal-500/30";
   return "bg-muted text-muted-foreground";
 }
 
