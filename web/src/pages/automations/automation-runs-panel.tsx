@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef } from "react";
 import {
   AlertCircle,
   Check,
@@ -215,18 +215,24 @@ function RunRow({ run }: { run: AutomationRun }) {
 // AutomationRunsPanel
 // ---------------------------------------------------------------------------
 
+export interface AutomationRunsPanelHandle {
+  refresh: () => void;
+}
+
 interface AutomationRunsPanelProps {
   automation: Automation;
   onClose: () => void;
 }
 
-export function AutomationRunsPanel({
-  automation,
-  onClose,
-}: AutomationRunsPanelProps) {
+export const AutomationRunsPanel = forwardRef<AutomationRunsPanelHandle, AutomationRunsPanelProps>(
+  function AutomationRunsPanel({ automation, onClose }, ref) {
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Track if there's a running run for polling interval adjustment
+  const runsRef = useRef<AutomationRun[]>([]);
+  runsRef.current = runs;
 
   const loadRuns = useCallback(async () => {
     try {
@@ -245,15 +251,48 @@ export function AutomationRunsPanel({
     }
   }, [automation.id]);
 
-  // Initial load + regular polling
-  // Always poll so new runs appear even if triggered externally.
-  // Poll faster (2s) when a run is in progress, otherwise every 5s.
+  // Expose refresh method via ref
+  useImperativeHandle(ref, () => ({
+    refresh: loadRuns,
+  }), [loadRuns]);
+
+  // Initial load
   useEffect(() => {
     loadRuns();
-    const hasRunningRun = runs.some((r) => r.status === "running");
-    const interval = setInterval(loadRuns, hasRunningRun ? 2000 : 5000);
-    return () => clearInterval(interval);
-  }, [runs, loadRuns]);
+  }, [loadRuns]);
+
+  // Polling: poll faster (2s) when a run is in progress, otherwise slower (5s)
+  // Use a ref to track the current interval timing
+  const intervalRef = useRef<number | null>(null);
+  const currentIntervalMs = useRef<number>(5000);
+
+  useEffect(() => {
+    // Function to set up the polling interval
+    const setupInterval = (ms: number) => {
+      if (intervalRef.current !== null) {
+        clearInterval(intervalRef.current);
+      }
+      currentIntervalMs.current = ms;
+      intervalRef.current = window.setInterval(async () => {
+        await loadRuns();
+        // After load, check if we need to adjust the interval
+        const hasRunningRun = runsRef.current.some((r) => r.status === "running");
+        const targetMs = hasRunningRun ? 2000 : 5000;
+        if (targetMs !== currentIntervalMs.current) {
+          setupInterval(targetMs);
+        }
+      }, ms);
+    };
+
+    // Start with faster polling initially to catch new runs quickly
+    setupInterval(2000);
+
+    return () => {
+      if (intervalRef.current !== null) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, [loadRuns]);
 
   return (
     <div className="flex flex-col h-full border-l border-border bg-background">
@@ -322,4 +361,4 @@ export function AutomationRunsPanel({
       )}
     </div>
   );
-}
+});
