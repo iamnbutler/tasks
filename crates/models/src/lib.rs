@@ -2,6 +2,7 @@
 //!
 //! These types are used by both the server and the store crates.
 
+pub mod automation;
 pub mod task;
 pub mod session;
 pub mod merge_queue;

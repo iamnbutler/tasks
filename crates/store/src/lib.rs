@@ -13,6 +13,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use models::automation::{Automation, AutomationRun, AutomationState, RunStatus, TriggerType};
 use models::merge_queue::{MergeQueueEntry, MergeStatus};
 use models::project::Project;
 use models::task::{FailureInfo, Task, TaskSource, TaskState};
@@ -548,6 +549,130 @@ impl Store {
             .execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
         Ok(affected > 0)
     }
+
+    // ── Automations ───────────────────────────────────────────────
+
+    /// Insert or replace an automation.
+    pub fn save_automation(&self, automation: &Automation) -> Result<(), StoreError> {
+        // Extract trigger type and config
+        let (trigger_type, trigger_config) = match &automation.trigger {
+            TriggerType::Schedule { cron } => {
+                ("schedule", serde_json::json!({ "cron": cron }).to_string())
+            }
+            TriggerType::Event { event_type } => {
+                ("event", serde_json::json!({ "event_type": event_type }).to_string())
+            }
+            TriggerType::Manual => ("manual", "{}".to_string()),
+        };
+        let state = serde_json::to_value(&automation.state)?
+            .as_str()
+            .unwrap()
+            .to_string();
+        let created_at = automation.created_at.to_rfc3339();
+        let updated_at = automation.updated_at.to_rfc3339();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO automations (
+                id, project_id, name, prompt, compiled_workflow,
+                trigger_type, trigger_config, state, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                automation.id,
+                automation.project_id,
+                automation.name,
+                automation.prompt,
+                automation.compiled_workflow,
+                trigger_type,
+                trigger_config,
+                state,
+                created_at,
+                updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get an automation by ID.
+    pub fn get_automation(&self, id: &str) -> Result<Option<Automation>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, prompt, compiled_workflow,
+                    trigger_type, trigger_config, state, created_at, updated_at
+             FROM automations WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_automation)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all automations for a project.
+    pub fn list_automations_for_project(&self, project_id: &str) -> Result<Vec<Automation>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, prompt, compiled_workflow,
+                    trigger_type, trigger_config, state, created_at, updated_at
+             FROM automations WHERE project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], row_to_automation)?;
+        let mut automations = Vec::new();
+        for row in rows {
+            automations.push(row?);
+        }
+        Ok(automations)
+    }
+
+    /// Delete an automation by ID. Returns true if a row was deleted.
+    pub fn delete_automation(&self, id: &str) -> Result<bool, StoreError> {
+        // First delete associated runs
+        self.conn
+            .execute("DELETE FROM automation_runs WHERE automation_id = ?1", params![id])?;
+        let affected = self
+            .conn
+            .execute("DELETE FROM automations WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    // ── Automation Runs ───────────────────────────────────────────
+
+    /// Insert or replace an automation run.
+    pub fn save_automation_run(&self, run: &AutomationRun) -> Result<(), StoreError> {
+        let status = serde_json::to_value(&run.status)?
+            .as_str()
+            .unwrap()
+            .to_string();
+        let started_at = run.started_at.to_rfc3339();
+        let completed_at = run.completed_at.map(|dt| dt.to_rfc3339());
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO automation_runs (
+                id, automation_id, status, started_at, completed_at, output, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                run.id,
+                run.automation_id,
+                status,
+                started_at,
+                completed_at,
+                run.output,
+                run.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all runs for an automation.
+    pub fn list_runs_for_automation(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, automation_id, status, started_at, completed_at, output, error
+             FROM automation_runs WHERE automation_id = ?1 ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map(params![automation_id], row_to_automation_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
 }
 
 /// Map a rusqlite Row to a TaskAccounting.
@@ -705,6 +830,108 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         last_activity_at,
         created_at,
         updated_at,
+    })
+}
+
+/// Map a rusqlite Row to an Automation.
+fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let project_id: String = row.get(1)?;
+    let name: String = row.get(2)?;
+    let prompt: String = row.get(3)?;
+    let compiled_workflow: Option<String> = row.get(4)?;
+    let trigger_type: String = row.get(5)?;
+    let trigger_config: String = row.get(6)?;
+    let state_str: String = row.get(7)?;
+    let created_at_str: String = row.get(8)?;
+    let updated_at_str: String = row.get(9)?;
+
+    // Parse trigger
+    let trigger = match trigger_type.as_str() {
+        "schedule" => {
+            let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let cron = config["cron"].as_str().unwrap_or_default().to_string();
+            TriggerType::Schedule { cron }
+        }
+        "event" => {
+            let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            })?;
+            let event_type = config["event_type"].as_str().unwrap_or_default().to_string();
+            TriggerType::Event { event_type }
+        }
+        _ => TriggerType::Manual,
+    };
+
+    // Parse state
+    let state: AutomationState = serde_json::from_str(&format!("\"{state_str}\"")).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+    Ok(Automation {
+        id,
+        project_id,
+        name,
+        prompt,
+        compiled_workflow,
+        trigger,
+        state,
+        created_at,
+        updated_at,
+    })
+}
+
+/// Map a rusqlite Row to an AutomationRun.
+fn row_to_automation_run(row: &rusqlite::Row) -> Result<AutomationRun, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let automation_id: String = row.get(1)?;
+    let status_str: String = row.get(2)?;
+    let started_at_str: String = row.get(3)?;
+    let completed_at_str: Option<String> = row.get(4)?;
+    let output: Option<String> = row.get(5)?;
+    let error: Option<String> = row.get(6)?;
+
+    let status: RunStatus = serde_json::from_str(&format!("\"{status_str}\"")).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    let started_at = DateTime::parse_from_rfc3339(&started_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+    let completed_at = completed_at_str
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+                })
+        })
+        .transpose()?;
+
+    Ok(AutomationRun {
+        id,
+        automation_id,
+        status,
+        started_at,
+        completed_at,
+        output,
+        error,
     })
 }
 
@@ -1092,7 +1319,206 @@ mod tests {
     }
 
     // ── Cascade delete tests ──────────────────────────────────────────
+    // NOTE: These tests reference methods that were never implemented.
+    // Commented out until the batch delete methods are added.
+    // See: delete_tasks_by_project, delete_merge_entries_by_task_ids,
+    //      delete_accounting_by_task_ids
+
+    // ── Automation tests ──────────────────────────────────────────
 
     // Tests for unimplemented batch methods (delete_tasks_by_project,
     // delete_merge_entries_by_task_ids, delete_accounting_by_task_ids) removed.
+
+    #[test]
+    fn save_and_get_automation() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+
+        let automation = Automation::new(
+            "a1",
+            "p1",
+            "Daily cleanup",
+            "Clean up stale branches",
+            TriggerType::Schedule { cron: "0 0 * * *".to_string() },
+        );
+        store.save_automation(&automation).unwrap();
+
+        let loaded = store.get_automation("a1").unwrap().unwrap();
+        assert_eq!(loaded.id, "a1");
+        assert_eq!(loaded.project_id, "p1");
+        assert_eq!(loaded.name, "Daily cleanup");
+        assert_eq!(loaded.prompt, "Clean up stale branches");
+        assert!(matches!(loaded.trigger, TriggerType::Schedule { cron } if cron == "0 0 * * *"));
+        assert_eq!(loaded.state, AutomationState::Active);
+    }
+
+    #[test]
+    fn save_automation_with_event_trigger() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+
+        let automation = Automation::new(
+            "a1",
+            "p1",
+            "On PR merged",
+            "Notify team",
+            TriggerType::Event { event_type: "pr:merged".to_string() },
+        );
+        store.save_automation(&automation).unwrap();
+
+        let loaded = store.get_automation("a1").unwrap().unwrap();
+        assert!(matches!(loaded.trigger, TriggerType::Event { event_type } if event_type == "pr:merged"));
+    }
+
+    #[test]
+    fn save_automation_with_manual_trigger() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+
+        let automation = Automation::new(
+            "a1",
+            "p1",
+            "Manual deploy",
+            "Deploy to production",
+            TriggerType::Manual,
+        );
+        store.save_automation(&automation).unwrap();
+
+        let loaded = store.get_automation("a1").unwrap().unwrap();
+        assert!(matches!(loaded.trigger, TriggerType::Manual));
+    }
+
+    #[test]
+    fn list_automations_for_project() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_project(&Project::new("p2", "a/b")).unwrap();
+
+        store.save_automation(&Automation::new("a1", "p1", "Auto 1", "Prompt 1", TriggerType::Manual)).unwrap();
+        store.save_automation(&Automation::new("a2", "p1", "Auto 2", "Prompt 2", TriggerType::Manual)).unwrap();
+        store.save_automation(&Automation::new("a3", "p2", "Auto 3", "Prompt 3", TriggerType::Manual)).unwrap();
+
+        let p1_automations = store.list_automations_for_project("p1").unwrap();
+        assert_eq!(p1_automations.len(), 2);
+
+        let p2_automations = store.list_automations_for_project("p2").unwrap();
+        assert_eq!(p2_automations.len(), 1);
+    }
+
+    #[test]
+    fn delete_automation() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        assert!(store.delete_automation("a1").unwrap());
+        assert!(store.get_automation("a1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_automation_cascades_runs() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        // Create some runs
+        store.save_automation_run(&AutomationRun::new("r1", "a1")).unwrap();
+        store.save_automation_run(&AutomationRun::new("r2", "a1")).unwrap();
+
+        // Verify runs exist
+        let runs = store.list_runs_for_automation("a1").unwrap();
+        assert_eq!(runs.len(), 2);
+
+        // Delete automation should cascade to runs
+        store.delete_automation("a1").unwrap();
+        let runs = store.list_runs_for_automation("a1").unwrap();
+        assert_eq!(runs.len(), 0);
+    }
+
+    #[test]
+    fn automation_state_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+
+        for (id, state) in [
+            ("a1", AutomationState::Active),
+            ("a2", AutomationState::Paused),
+            ("a3", AutomationState::Disabled),
+        ] {
+            let mut automation = Automation::new(id, "p1", "Auto", "Prompt", TriggerType::Manual);
+            automation.state = state;
+            store.save_automation(&automation).unwrap();
+
+            let loaded = store.get_automation(id).unwrap().unwrap();
+            assert_eq!(loaded.state, state, "failed for {id}");
+        }
+    }
+
+    // ── Automation run tests ──────────────────────────────────────
+
+    #[test]
+    fn save_and_list_automation_runs() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        let run1 = AutomationRun::new("r1", "a1");
+        let mut run2 = AutomationRun::new("r2", "a1");
+        run2.complete(Some("Success".to_string()));
+
+        store.save_automation_run(&run1).unwrap();
+        store.save_automation_run(&run2).unwrap();
+
+        let runs = store.list_runs_for_automation("a1").unwrap();
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn automation_run_status_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        for (id, status) in [
+            ("r1", RunStatus::Pending),
+            ("r2", RunStatus::Running),
+            ("r3", RunStatus::Completed),
+            ("r4", RunStatus::Failed),
+        ] {
+            let mut run = AutomationRun::new(id, "a1");
+            run.status = status;
+            store.save_automation_run(&run).unwrap();
+
+            let runs = store.list_runs_for_automation("a1").unwrap();
+            let loaded = runs.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(loaded.status, status, "failed for {id}");
+        }
+    }
+
+    #[test]
+    fn automation_run_with_output_and_error() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        // Test completed run with output
+        let mut run1 = AutomationRun::new("r1", "a1");
+        run1.complete(Some("All done!".to_string()));
+        store.save_automation_run(&run1).unwrap();
+
+        let runs = store.list_runs_for_automation("a1").unwrap();
+        let loaded1 = runs.iter().find(|r| r.id == "r1").unwrap();
+        assert_eq!(loaded1.output, Some("All done!".to_string()));
+        assert!(loaded1.completed_at.is_some());
+
+        // Test failed run with error
+        let mut run2 = AutomationRun::new("r2", "a1");
+        run2.fail("Something went wrong");
+        store.save_automation_run(&run2).unwrap();
+
+        let runs = store.list_runs_for_automation("a1").unwrap();
+        let loaded2 = runs.iter().find(|r| r.id == "r2").unwrap();
+        assert_eq!(loaded2.error, Some("Something went wrong".to_string()));
+        assert!(loaded2.completed_at.is_some());
+    }
 }
