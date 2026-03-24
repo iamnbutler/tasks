@@ -72,6 +72,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting", get(get_accounting_summary))
         .route("/accounting/tasks", get(list_task_accounting))
         .route("/accounting/tasks/{id}", get(get_task_accounting))
+        .route("/containers", get(list_containers))
         .route("/events/query", get(query_events))
         // Self-update endpoints (issue #305, #320)
         .route("/self-update", get(get_self_update_status))
@@ -987,6 +988,24 @@ async fn get_task_accounting(
         .map_err(ApiError::Server)?
         .ok_or_else(|| ApiError::NotFound(format!("accounting not found for task: {id}")))?;
     Ok(Json(accounting))
+}
+
+// --- Containers endpoint ---
+
+/// GET /api/containers — List all active container sessions.
+///
+/// Returns information about each running container including its ID, associated
+/// task, start time, and uptime. Used for the containers monitoring view.
+async fn list_containers(
+    State(state): State<ApiState>,
+) -> Json<Vec<tasks_session::ContainerInfo>> {
+    match &state.session_manager {
+        Some(session_manager) => {
+            let containers = session_manager.container_info().await;
+            Json(containers)
+        }
+        None => Json(vec![]),
+    }
 }
 
 // --- Self-update endpoints (issue #305, #320) ---

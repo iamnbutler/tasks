@@ -7,6 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -20,6 +22,21 @@ const MAX_STDERR_LINES: usize = 50;
 
 use crate::accounting::{TokenParser, TokenTracker, TokenUsage};
 use crate::interpreter::{emit_signal_events, OutputInterpreter, OutputSignal};
+
+/// Information about an active container session.
+///
+/// Returned by `SessionManager::container_info()` for the containers view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerInfo {
+    /// Container ID (from the container runtime).
+    pub container_id: String,
+    /// The task this container is executing.
+    pub task_id: String,
+    /// When the container session started (UTC).
+    pub started_at: DateTime<Utc>,
+    /// How long the container has been running (seconds).
+    pub uptime_secs: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
@@ -138,6 +155,28 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             .values()
             .max_by_key(|h| h.started_at)
             .map(|h| h.task_id.clone())
+    }
+
+    /// Get information about all active container sessions.
+    ///
+    /// Returns a list of `ContainerInfo` structs for the containers view.
+    pub async fn container_info(&self) -> Vec<ContainerInfo> {
+        let sessions = self.sessions.read().await;
+        let now = Instant::now();
+        sessions
+            .values()
+            .map(|handle| {
+                let uptime = now.duration_since(handle.started_at);
+                // Convert Instant to DateTime<Utc> by subtracting uptime from current time
+                let started_at = Utc::now() - chrono::Duration::seconds(uptime.as_secs() as i64);
+                ContainerInfo {
+                    container_id: handle.container_id.clone(),
+                    task_id: handle.task_id.clone(),
+                    started_at,
+                    uptime_secs: uptime.as_secs(),
+                }
+            })
+            .collect()
     }
 
     /// Send a chat message to a running session (spec §9.2).

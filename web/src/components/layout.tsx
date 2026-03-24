@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   ListTodo,
   GitMerge,
+  Box,
   Radio,
   Brain,
   ChevronRight,
@@ -601,6 +602,7 @@ export function Layout() {
               <SidebarNavItem to="/" icon={LayoutDashboard} label="Dashboard" end />
               <SidebarNavItem to="/tasks" icon={ListTodo} label="Tasks" />
               <SidebarNavItem to="/merge-queue" icon={GitMerge} label="Merge Queue" />
+              <SidebarNavItem to="/containers" icon={Box} label="Containers" />
             </div>
 
             {/* Projects */}
