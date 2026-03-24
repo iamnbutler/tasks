@@ -168,7 +168,7 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             .map(|handle| {
                 let uptime = now.duration_since(handle.started_at);
                 // Convert Instant to DateTime<Utc> by subtracting uptime from current time
-                let started_at = Utc::now() - chrono::Duration::seconds(uptime.as_secs() as i64);
+                let started_at = Utc::now() - chrono::Duration::seconds(i64::try_from(uptime.as_secs()).unwrap_or(i64::MAX));
                 ContainerInfo {
                     container_id: handle.container_id.clone(),
                     task_id: handle.task_id.clone(),
