@@ -107,6 +107,42 @@ export interface Snapshot {
 /** Rebuild scope for self-update mechanism */
 export type RebuildScope = "frontend" | "server" | "container";
 
+// ---------------------------------------------------------------------------
+// Automations
+// ---------------------------------------------------------------------------
+
+export type AutomationState = "active" | "paused" | "disabled";
+
+export type TriggerType = "schedule" | "event" | "manual";
+
+export interface TriggerConfig {
+  type: TriggerType;
+  cron?: string; // For schedule triggers
+  event_type?: string; // For event triggers (e.g., "pr_opened", "issue_created")
+}
+
+export interface Automation {
+  id: string;
+  project_id: string;
+  name: string;
+  prompt: string;
+  compiled_workflow?: string;
+  trigger: TriggerConfig;
+  state: AutomationState;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AutomationRun {
+  id: string;
+  automation_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  started_at: string;
+  completed_at?: string;
+  output?: string;
+  error?: string;
+}
+
 /** Update status for self-update mechanism */
 export interface UpdateStatus {
   available: boolean;
@@ -126,39 +162,3 @@ export interface ContainerInfo {
   uptime_secs: number;
 }
 
-/** Automation state */
-export type AutomationState = "active" | "paused" | "disabled";
-
-/** Trigger configuration for automations */
-export interface TriggerConfig {
-  type: "schedule" | "event" | "manual";
-  cron?: string;        // For schedule triggers
-  event_type?: string;  // For event triggers
-}
-
-/** Automation definition */
-export interface Automation {
-  id: string;
-  project_id: string;
-  name: string;
-  prompt: string;
-  compiled_workflow?: string;
-  trigger: TriggerConfig;
-  state: AutomationState;
-  created_at: string;
-  updated_at: string;
-}
-
-/** Automation run status */
-export type AutomationRunStatus = "pending" | "running" | "completed" | "failed";
-
-/** Automation run record */
-export interface AutomationRun {
-  id: string;
-  automation_id: string;
-  status: AutomationRunStatus;
-  started_at: string;
-  completed_at?: string;
-  output?: string;
-  error?: string;
-}
