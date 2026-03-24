@@ -665,6 +665,8 @@ fn extract_timeline_relationships(
                     .entry(number)
                     .and_modify(|(_, is_blocked)| *is_blocked = false)
                     .or_insert((blocking, false));
+            } else {
+                tracing::warn!(typename = ?item.typename, "blocking_issue with unknown typename, skipping");
             }
         }
     }
