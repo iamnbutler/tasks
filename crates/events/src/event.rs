@@ -147,8 +147,8 @@ impl EventType {
             Self::SystemAccountingTokens => "system:accounting:tokens",
             Self::SystemAccountingApiCall => "system:accounting:api_call",
             Self::SystemAccountingSession => "system:accounting:session",
-            Self::SystemUpdateAvailable => "system:update_available",
-            Self::SystemUpdateApplying => "system:update_applying",
+            Self::SystemUpdateAvailable => "system:update:available",
+            Self::SystemUpdateApplying => "system:update:applying",
         }
     }
 
@@ -229,8 +229,8 @@ impl TryFrom<String> for EventType {
             "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
             "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
             "system:accounting:session" => Ok(Self::SystemAccountingSession),
-            "system:update_available" => Ok(Self::SystemUpdateAvailable),
-            "system:update_applying" => Ok(Self::SystemUpdateApplying),
+            "system:update:available" => Ok(Self::SystemUpdateAvailable),
+            "system:update:applying" => Ok(Self::SystemUpdateApplying),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
@@ -444,7 +444,7 @@ mod tests {
             }),
         );
         let json = serde_json::to_string(&e).unwrap();
-        assert!(json.contains("\"type\":\"system:update_available\""));
+        assert!(json.contains("\"type\":\"system:update:available\""));
         assert!(json.contains("\"target_commit\":\"def5678\""));
     }
 
@@ -460,16 +460,16 @@ mod tests {
             }),
         );
         let json = serde_json::to_string(&e).unwrap();
-        assert!(json.contains("\"type\":\"system:update_applying\""));
+        assert!(json.contains("\"type\":\"system:update:applying\""));
         assert!(json.contains("\"sessions_remaining\":2"));
     }
 
     #[test]
     fn update_events_deserialize() {
-        let available = EventType::try_from("system:update_available".to_string()).unwrap();
+        let available = EventType::try_from("system:update:available".to_string()).unwrap();
         assert_eq!(available, EventType::SystemUpdateAvailable);
 
-        let applying = EventType::try_from("system:update_applying".to_string()).unwrap();
+        let applying = EventType::try_from("system:update:applying".to_string()).unwrap();
         assert_eq!(applying, EventType::SystemUpdateApplying);
     }
 
@@ -480,5 +480,15 @@ mod tests {
 
         assert!(available.matches("system:*"));
         assert!(applying.matches("system:*"));
+    }
+
+    #[test]
+    fn update_events_match_update_wildcard() {
+        let available = EventType::SystemUpdateAvailable;
+        let applying = EventType::SystemUpdateApplying;
+
+        assert!(available.matches("system:update:*"));
+        assert!(applying.matches("system:update:*"));
+        assert!(!EventType::SystemModePlay.matches("system:update:*"));
     }
 }

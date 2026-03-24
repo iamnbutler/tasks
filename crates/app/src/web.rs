@@ -834,24 +834,11 @@ async fn get_self_update_status(
 ///
 /// Note: Full functionality requires Phase 1 infrastructure (#319).
 async fn apply_self_update(
-    State(state): State<ApiState>,
+    State(_state): State<ApiState>,
     Json(req): Json<ApplySelfUpdateRequest>,
 ) -> Result<Json<ApplySelfUpdateResponse>, ApiError> {
     // TODO(#319): Integrate with SelfUpdateManager from Phase 1
-    // For now, return an error indicating the feature is not yet available
-
-    // Emit an event indicating update was requested (for debugging/logging)
-    let event = events::Event::new(
-        events::EventType::SystemUpdateApplying,
-        "",
-        Actor::System,
-        serde_json::json!({
-            "force": req.force,
-            "status": "not_available",
-            "reason": "Self-update infrastructure not yet configured (see #319)",
-        }),
-    );
-    let _ = state.server.event_bus.publish(event).await;
+    tracing::debug!(force = req.force, "self-update apply called (stub, #319 not yet integrated)");
 
     Ok(Json(ApplySelfUpdateResponse {
         status: "no_update".to_string(),
