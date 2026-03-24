@@ -307,7 +307,7 @@ export function fetchAutomationRuns(
 }
 
 export function triggerAutomation(id: string): Promise<AutomationRun> {
-  return request<AutomationRun>(`/api/automations/${id}/trigger`, {
+  return request<AutomationRun>(`/api/automations/${id}/run`, {
     method: "POST",
   });
 }
