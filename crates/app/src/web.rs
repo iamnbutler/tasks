@@ -1508,8 +1508,19 @@ async fn trigger_automation(
             _ => ApiError::Server(e),
         })?;
 
-    // If executor is available, spawn the execution in background
-    if let Some(executor) = &state.automation_executor {
+    // Prefer container session for execution; fall back to direct LLM executor.
+    if let Some(ref session_manager) = state.session_manager {
+        // Dispatch to a full container session (agent gets tools, git, etc.)
+        let run_id = run.id.clone();
+        let automation_id = automation.id.clone();
+        let server = state.server.clone();
+        let sm = session_manager.clone();
+        tokio::spawn(async move {
+            crate::automation_runner::execute_automation_run(&sm, &server, &run_id, &automation_id)
+                .await;
+        });
+    } else if let Some(executor) = &state.automation_executor {
+        // Fall back to direct LLM streaming execution
         let run_id = run.id.clone();
         let automation_id = automation.id.clone();
         let server = state.server.clone();
@@ -1562,7 +1573,7 @@ async fn trigger_automation(
         tokio::spawn(async move {
             if let Err(e) = server.fail_automation_run(
                 &run_id,
-                "Automation executor not available (ANTHROPIC_API_KEY not set)",
+                "No session manager or automation executor available",
             ).await {
                 tracing::error!(run_id = %run_id, error = %e, "Failed to mark automation run as failed");
             }
