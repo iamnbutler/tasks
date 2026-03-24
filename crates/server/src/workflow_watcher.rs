@@ -22,6 +22,8 @@ pub struct CachedConfig {
     pub content_hash: u64,
     /// When this config was last fetched.
     pub fetched_at: Instant,
+    /// If set, don't retry fetches until this time (e.g., after rate limiting).
+    pub backoff_until: Option<Instant>,
 }
 
 /// Workflow configuration cache with change detection.
@@ -58,12 +60,37 @@ impl WorkflowConfigCache {
         configs.get(project_id).map(|c| c.config.clone())
     }
 
-    /// Check if we should refresh the config for a project (debounce check).
+    /// Check if we should refresh the config for a project (debounce + backoff check).
     pub async fn should_refresh(&self, project_id: &str) -> bool {
         let configs = self.configs.read().await;
         match configs.get(project_id) {
-            Some(cached) => cached.fetched_at.elapsed() >= self.debounce_interval,
+            Some(cached) => {
+                // Respect backoff (e.g., from rate limiting)
+                if let Some(until) = cached.backoff_until {
+                    if Instant::now() < until {
+                        return false;
+                    }
+                }
+                cached.fetched_at.elapsed() >= self.debounce_interval
+            }
             None => true, // No cache, should fetch
+        }
+    }
+
+    /// Set a backoff period for a project (e.g., after rate limiting).
+    pub async fn set_backoff(&self, project_id: &str, duration: Duration) {
+        let mut configs = self.configs.write().await;
+        if let Some(cached) = configs.get_mut(project_id) {
+            cached.backoff_until = Some(Instant::now() + duration);
+            cached.fetched_at = Instant::now();
+        } else {
+            // No cached entry yet — create a default one with backoff
+            configs.insert(project_id.to_string(), CachedConfig {
+                config: WorkflowConfig::default(),
+                content_hash: 0,
+                fetched_at: Instant::now(),
+                backoff_until: Some(Instant::now() + duration),
+            });
         }
     }
 
@@ -118,6 +145,7 @@ impl WorkflowConfigCache {
             config: config.clone(),
             content_hash: new_hash,
             fetched_at: Instant::now(),
+            backoff_until: None,
         };
 
         let mut configs = self.configs.write().await;
@@ -148,6 +176,7 @@ impl WorkflowConfigCache {
             config,
             content_hash: 0, // Special hash for "no file"
             fetched_at: Instant::now(),
+            backoff_until: None,
         };
 
         let mut configs = self.configs.write().await;
@@ -169,6 +198,7 @@ impl WorkflowConfigCache {
             config,
             content_hash: 0,
             fetched_at: Instant::now(),
+            backoff_until: None,
         };
         configs.insert(project_id.to_string(), cached);
 
@@ -265,7 +295,19 @@ impl WorkflowConfigWatcher {
                 return RefreshResult::NoConfig;
             }
             Err(e) => {
-                warn!(project_id = %project_id, error = %e, "failed to fetch workflow.toml");
+                // Back off on fetch errors to avoid spamming (e.g., rate limits)
+                let backoff = if e.contains("rate limit") {
+                    Duration::from_secs(300) // 5 minutes for rate limits
+                } else {
+                    Duration::from_secs(60) // 1 minute for other errors
+                };
+                self.cache.set_backoff(project_id, backoff).await;
+                warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "failed to fetch workflow.toml, backing off"
+                );
                 return RefreshResult::FetchError(e);
             }
         };
