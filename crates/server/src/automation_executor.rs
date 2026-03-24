@@ -167,9 +167,8 @@ impl AutomationExecutor {
                     on_chunk(&text);
                     output.push_str(&text);
                 }
-                tasks_agent::StreamChunk::Thinking(text) => {
-                    // Include thinking in callback but not in final output
-                    on_chunk(&format!("[thinking] {}", text));
+                tasks_agent::StreamChunk::Thinking(_) => {
+                    // Skip thinking chunks — don't emit to callback or output
                 }
                 tasks_agent::StreamChunk::Complete(response) => {
                     let (i, o) = extract_usage(&response);
