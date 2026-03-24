@@ -50,6 +50,23 @@ GET /api/mode
 }
 ```
 
+#### Rebuild from GitHub
+
+Clears tasks and merge queue (memory + database) and signals the poll loop to re-fetch all data from GitHub. Preserves accounting data, event logs, projects, and operating mode. The actual re-fetch happens asynchronously.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 3,
+  "merge_queue_cleared": 1
+}
+```
+
 #### Set Operating Mode
 
 ```http
@@ -124,6 +141,34 @@ Content-Type: application/json
 
 {
   "message": "Can you also add tests for this?"
+}
+```
+
+#### Update Task
+
+Update a task's properties (currently supports `priority`).
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** Updated task object.
+
+#### Reorder Tasks
+
+Assign sequential priorities to tasks in the given order. Used for drag-and-drop reordering in the UI.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["uuid-1", "uuid-2", "uuid-3"]
 }
 ```
 
@@ -361,7 +406,82 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
-### Events (SSE)
+### Self-Update
+
+Endpoints for checking and triggering server self-updates. Full update automation requires Phase 1 infrastructure (issue #319); these endpoints currently return stub responses.
+
+#### Get Update Status
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": false,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "rebuild_scope": "server",
+  "commit_summary": "Fix SSE presence guard",
+  "last_checked": "2024-01-15T10:30:00Z"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | Whether an update is available |
+| `current_commit` | Current running commit (short SHA) |
+| `target_commit` | Target commit to update to (short SHA) |
+| `rebuild_scope` | What needs rebuilding: `"server"`, `"container"`, or `"frontend"` |
+| `commit_summary` | First line of the target commit message |
+| `last_checked` | When update was last checked |
+
+#### Apply Update
+
+Triggers the update process: sets mode to Stop, waits for sessions to complete (unless `force=true`), then exits with code 100 for the wrapper script to restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Waiting for 2 active sessions to complete"
+}
+```
+
+**Status values:** `"applying"`, `"no_update"`, `"already_applying"`
+
+### Events
+
+#### Query Historical Events
+
+Query historical events by type prefix across all task logs.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=50
+```
+
+**Query Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `type_prefix` | Event type prefix to filter by (required) | — |
+| `limit` | Maximum events to return | 200 |
+
+**Response:** Array of event objects (sorted by timestamp ascending).
+
+#### SSE Live Stream
 
 Server-Sent Events stream for real-time updates.
 
@@ -373,13 +493,14 @@ GET /api/events
 
 | Parameter | Description |
 |-----------|-------------|
-| `pattern` | Filter by event type pattern |
+| `pattern` | Filter by event type pattern (e.g. `task:*`, `system:update:*`) |
 | `task_id` | Filter by task ID |
 
 **Example:**
 
 ```bash
 curl -N http://localhost:4800/api/events?task_id=abc123
+curl -N "http://localhost:4800/api/events?pattern=system:update:*"
 ```
 
 **Event Format:**
@@ -388,6 +509,52 @@ curl -N http://localhost:4800/api/events?task_id=abc123
 event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
+
+**Event Types:**
+
+| Type | Description |
+|------|-------------|
+| `task:created` | New task created |
+| `task:updated` | Task properties updated |
+| `task:reordered` | Task queue reordered |
+| `task:state:running` | Task agent started |
+| `task:state:question` | Agent waiting for human input |
+| `task:state:waiting` | Task waiting to be dispatched |
+| `task:state:blocked` | Task blocked |
+| `task:state:testing` | Agent running tests |
+| `task:state:awaiting_merge` | PR submitted, awaiting merge review |
+| `task:state:conflict` | Merge conflict detected |
+| `task:state:changes_requested` | Changes requested on PR |
+| `task:state:completed` | Task completed |
+| `task:state:failed` | Task failed |
+| `task:state:cancelled` | Task cancelled |
+| `agent:message` | Agent output message |
+| `agent:question` | Agent question to human |
+| `agent:error` | Agent error |
+| `human:message` | Human chat message sent |
+| `merge:queued` | PR added to merge queue |
+| `merge:approved` | Merge queue entry approved |
+| `merge:rejected` | Merge queue entry rejected |
+| `merge:changes_requested` | Changes requested |
+| `merge:completed` | PR merged |
+| `merge:conflict` | Merge conflict |
+| `orchestrator:feedback` | Orchestrator quality feedback |
+| `orchestrator:escalation` | Orchestrator escalation |
+| `orchestrator:decision` | Orchestrator decision |
+| `orchestrator:message` | Human message to orchestrator |
+| `orchestrator:response` | Orchestrator LLM reply |
+| `system:started` | Server started |
+| `system:mode:play` / `pause` / `stop` | Mode changed |
+| `system:flush` | Merge queue flushed |
+| `system:rebuild` | State rebuilt from GitHub |
+| `system:update:available` | New server update detected |
+| `system:update:applying` | Update in progress |
+| `system:accounting:tokens` | Token usage recorded |
+| `system:accounting:api_call` | API call recorded |
+| `system:accounting:session` | Session accounting summary |
+| `system:memory:warning` / `pressure` / `emergency` | Memory threshold events |
+| `system:time_limit:soft` / `hard` | Session time limit events |
+| `workspace:cleaned` | Session workspace cleaned up |
 
 ## Error Responses
 
@@ -412,4 +579,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*
