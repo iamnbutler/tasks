@@ -221,6 +221,10 @@ GET /api/merge-queue
 ]
 ```
 
+**Entry states:** `pending`, `approved`, `merging`, `merged`, `rejected`, `changes_requested`
+
+The `merging` state is transient — it appears while the GitHub merge API call is in flight and transitions to `merged` on success.
+
 #### Approve Entry
 
 In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
@@ -360,6 +364,55 @@ Content-Type: application/json
 ```
 
 **Response:** `{ "summary": "..." }`
+
+### Self-Update
+
+#### Get Update Status
+
+Returns the current update check state from the background `UpdateChecker` task.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "commit_summary": "Fix merge queue race condition",
+  "rebuild_scope": "binary",
+  "applying": false
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | Whether a newer version is available |
+| `current_commit` | Currently running commit SHA |
+| `target_commit` | Latest available commit SHA (null if not available) |
+| `commit_summary` | Short description of the target commit |
+| `rebuild_scope` | `"binary"` (binary-only rebuild) or `"full"` (full rebuild with deps) |
+| `applying` | Whether an update shutdown is currently in progress |
+
+#### Apply Update
+
+Triggers the update shutdown path. The server drains active sessions, writes a scope file, and exits with code 100. The wrapper script (`tasks-runner.sh`) handles pulling, rebuilding, and restarting.
+
+```http
+POST /api/self-update/apply
+```
+
+**Response:** `200 OK` (empty body) — update shutdown initiated.
+
+**SSE events emitted:**
+
+| Event | Description |
+|-------|-------------|
+| `system:update:available` | New version detected by background checker |
+| `system:update:applying` | Update shutdown initiated |
 
 ### Events (SSE)
 

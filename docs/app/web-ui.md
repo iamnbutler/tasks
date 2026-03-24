@@ -79,7 +79,15 @@ A **Properties** sidebar on the right shows metadata (state, project, created da
 
 ## Merge Queue
 
-The merge queue shows PRs awaiting human review.
+The merge queue shows PRs awaiting human review. Entries are grouped into three lifecycle tabs:
+
+| Tab | Statuses Shown |
+|-----|---------------|
+| **Needs Review** | Pending, Changes Requested, Conflict |
+| **Ready to Merge** | Approved |
+| **Completed** | Merged, Rejected |
+
+Each tab shows a count of entries in that phase.
 
 ### Entry States
 
@@ -87,6 +95,8 @@ The merge queue shows PRs awaiting human review.
 |-------|-------------|
 | **Pending** | Awaiting review |
 | **Approved** | Ready to merge |
+| **Merging** | Actively being merged (transient) |
+| **Merged** | Successfully merged |
 | **Rejected** | Declined |
 | **Changes Requested** | Needs modification before merging |
 
@@ -131,6 +141,7 @@ The Events view shows a real-time stream of system events.
 | `session:started` | Agent session began |
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
+| `merge:merging` | Entry actively being merged |
 | `merge:completed` | Changes merged |
 
 ### Filtering
@@ -140,6 +151,17 @@ Filter events by:
 - **Type** - Specific event type
 - **Task** - Events for a specific task
 - **Time** - Time range
+
+## Update Banner
+
+When a newer version of Tasks is available, an update banner appears at the top of the main content area. The banner shows:
+
+- The target commit summary
+- The rebuild scope (binary-only or full)
+- **Update Now** button — triggers the update shutdown path immediately
+- **Dismiss** button — hides the banner until a new target commit is detected
+
+The banner is driven by SSE events (`system:update:available`, `system:update:applying`) and polls `GET /api/self-update` for current status.
 
 ## Keyboard Shortcuts
 
