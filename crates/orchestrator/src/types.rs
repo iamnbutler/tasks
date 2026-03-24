@@ -4,10 +4,54 @@
 //! QualityEvaluation: what the orchestrator returns.
 //! ConflictTriage: conflict resolution decision (spec §7.4).
 
-use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
+use chrono::{DateTime, Utc};
+use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry, MergeStatus};
 use models::project::Project;
 use models::task::Task;
 use serde::{Deserialize, Serialize};
+
+/// Summary of another merge queue entry for context during evaluation.
+///
+/// When evaluating a PR, the orchestrator receives summaries of other PRs
+/// in the queue. This helps identify dependencies or ordering issues —
+/// e.g., if a PR builds on changes from another PR that hasn't merged yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueEntrySummary {
+    /// GitHub PR URL.
+    pub pr_url: String,
+    /// PR number (parsed from URL).
+    pub pr_number: u64,
+    /// Title of the associated task.
+    pub task_title: String,
+    /// Current status of this queue entry.
+    pub status: MergeStatus,
+    /// When this entry was added to the queue.
+    pub queued_at: DateTime<Utc>,
+    /// Position in queue (1 = first to merge). Only set for Pending/Approved entries.
+    pub queue_position: Option<u32>,
+}
+
+impl QueueEntrySummary {
+    /// Create a summary from a merge queue entry and its associated task title.
+    pub fn from_entry(entry: &MergeQueueEntry, task_title: &str, queue_position: Option<u32>) -> Self {
+        // Parse PR number from URL (e.g., "https://github.com/owner/repo/pull/123")
+        let pr_number = entry
+            .pr_url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        Self {
+            pr_url: entry.pr_url.clone(),
+            pr_number,
+            task_title: task_title.to_string(),
+            status: entry.status,
+            queued_at: entry.queued_at,
+            queue_position,
+        }
+    }
+}
 
 /// Context for evaluating a merge queue entry.
 ///
@@ -21,6 +65,9 @@ pub struct EvaluationContext {
     pub task: Task,
     /// The project this task belongs to.
     pub project: Project,
+    /// Summaries of other PRs in the queue (for context).
+    /// Sorted by queue position (PRs ahead of current entry come first).
+    pub queue_context: Vec<QueueEntrySummary>,
 }
 
 /// Verdict from the orchestrator's quality evaluation.

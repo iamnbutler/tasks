@@ -1392,18 +1392,54 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     (task, project)
                 };
 
-                let (entry, entry_head_sha) = {
+                let (entry, entry_head_sha, queue_context) = {
                     let state = orch_server.state.read().await;
-                    match state.merge_queue.get(&entry_id) {
-                        Some(e) => (e.clone(), e.head_sha.clone()),
+                    let entry = match state.merge_queue.get(&entry_id) {
+                        Some(e) => e.clone(),
                         None => continue,
-                    }
+                    };
+                    let entry_head_sha: Option<String> = entry.head_sha.clone();
+
+                    // Build queue context: summaries of other PRs in the queue
+                    // This helps the orchestrator understand dependencies between PRs
+                    let mut queue_context: Vec<tasks_orchestrator::QueueEntrySummary> = state
+                        .merge_queue
+                        .entries()
+                        .iter()
+                        .filter(|other_entry| other_entry.id != entry_id) // Exclude current entry
+                        .map(|other_entry| {
+                            // Get task title for this entry
+                            let task_title = state
+                                .tasks
+                                .get(&other_entry.task_id)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| "(unknown task)".to_string());
+                            tasks_orchestrator::QueueEntrySummary::from_entry(
+                                other_entry,
+                                &task_title,
+                                other_entry.queue_position,
+                            )
+                        })
+                        .collect();
+
+                    // Sort by queue position (entries without position come last)
+                    queue_context.sort_by(|a, b| {
+                        match (a.queue_position, b.queue_position) {
+                            (Some(pa), Some(pb)) => pa.cmp(&pb),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.queued_at.cmp(&b.queued_at),
+                        }
+                    });
+
+                    (entry, entry_head_sha, queue_context)
                 };
 
                 let context = tasks_orchestrator::EvaluationContext {
                     entry,
                     task: task.clone(),
                     project,
+                    queue_context,
                 };
 
                 // Evaluate
