@@ -34,6 +34,19 @@ The dashboard provides an at-a-glance view of:
 - **Recent Activity** - Latest events across all tasks
 - **Escalations** - Up to 5 recent orchestrator escalation events with task context
 
+### System Status Banner
+
+When the system is idle or blocked, a status banner appears at the top of the dashboard explaining why. Possible messages include:
+
+- System is stopped or paused
+- Merge queue entries awaiting approval
+- Tasks awaiting merge decisions
+- PRs with conflicts or changes requested
+- Tasks needing user input (questions)
+- Blocked tasks waiting on dependencies
+- Failed tasks requiring attention
+- All work completed successfully
+
 ### Changing Mode
 
 Click the mode indicator to switch between:
@@ -79,7 +92,15 @@ A **Properties** sidebar on the right shows metadata (state, project, created da
 
 ## Merge Queue
 
-The merge queue shows PRs awaiting human review.
+The merge queue shows PRs awaiting human review. Entries are grouped into three tabs:
+
+| Tab | Statuses shown |
+|-----|----------------|
+| **Needs Review** | `pending`, `changes_requested`, `conflict` |
+| **Ready to Merge** | `approved`, `merging` |
+| **Completed** | `merged`, `rejected` |
+
+Each tab displays a count of entries in that phase.
 
 ### Entry States
 
@@ -87,8 +108,15 @@ The merge queue shows PRs awaiting human review.
 |-------|-------------|
 | **Pending** | Awaiting review |
 | **Approved** | Ready to merge |
+| **Merging** | GitHub merge API call in progress |
 | **Rejected** | Declined |
+| **Merged** | Successfully merged |
+| **Conflict** | Branch has conflicts that need resolution |
 | **Changes Requested** | Needs modification before merging |
+
+### Position Column
+
+Approved and merging entries display a **Position** column showing their place in the merge queue (1 = next to merge). Position is determined by `queued_at` timestamp order.
 
 ### Actions
 

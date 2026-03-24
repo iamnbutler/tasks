@@ -214,12 +214,22 @@ GET /api/merge-queue
   {
     "id": "entry-uuid",
     "task_id": "task-uuid",
-    "pr_number": 123,
-    "state": "pending",
-    "created_at": "2024-01-15T12:00:00Z"
+    "pr_url": "https://github.com/owner/repo/pull/123",
+    "status": "approved",
+    "queued_at": "2024-01-15T12:00:00Z",
+    "queue_position": 1
   }
 ]
 ```
+
+**MergeStatus values:** `pending`, `approved`, `merging`, `rejected`, `merged`, `conflict`, `changes_requested`
+
+**Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `queue_position` | Position in merge queue (1-indexed). Only present for `approved` and `merging` entries. |
+| `changes_requested_feedback` | Feedback string. Only present when `status` is `changes_requested`. |
 
 #### Approve Entry
 
@@ -360,6 +370,56 @@ Content-Type: application/json
 ```
 
 **Response:** `{ "summary": "..." }`
+
+### Self-Update
+
+#### Get Update Status
+
+Returns whether an update is available from upstream.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "e4d7f4c",
+  "target_commit": "81f647c",
+  "rebuild_scope": "server",
+  "commit_summary": "Add queue_position field for merge ordering visibility",
+  "last_checked": "2024-01-15T12:00:00Z"
+}
+```
+
+**rebuild_scope values:** `frontend`, `server`, `container`
+
+#### Apply Update
+
+Triggers a self-update. The server sets mode to Stop, waits for active sessions to complete (unless `force: true`), then exits with code 100 for the wrapper script to restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update is being applied. The server will restart shortly."
+}
+```
+
+**status values:** `applying`, `no_update`, `already_applying`
 
 ### Events (SSE)
 
