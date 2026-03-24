@@ -125,3 +125,40 @@ export interface ContainerInfo {
   started_at: string;
   uptime_secs: number;
 }
+
+/** Automation state */
+export type AutomationState = "active" | "paused" | "disabled";
+
+/** Trigger configuration for automations */
+export interface TriggerConfig {
+  type: "schedule" | "event" | "manual";
+  cron?: string;        // For schedule triggers
+  event_type?: string;  // For event triggers
+}
+
+/** Automation definition */
+export interface Automation {
+  id: string;
+  project_id: string;
+  name: string;
+  prompt: string;
+  compiled_workflow?: string;
+  trigger: TriggerConfig;
+  state: AutomationState;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Automation run status */
+export type AutomationRunStatus = "pending" | "running" | "completed" | "failed";
+
+/** Automation run record */
+export interface AutomationRun {
+  id: string;
+  automation_id: string;
+  status: AutomationRunStatus;
+  started_at: string;
+  completed_at?: string;
+  output?: string;
+  error?: string;
+}

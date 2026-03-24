@@ -9,14 +9,17 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { createElement } from "react";
-import type { Event, Snapshot, Task, MergeQueueEntry, UpdateStatus } from "@/lib/types";
-import { fetchSnapshot, fetchUpdateStatus, subscribeEvents } from "@/lib/api";
+import type { Automation, Event, Snapshot, Task, MergeQueueEntry, UpdateStatus } from "@/lib/types";
+import { fetchAutomations, fetchSnapshot, fetchUpdateStatus, subscribeEvents } from "@/lib/api";
 
 const MAX_EVENTS = 200;
 const POLL_INTERVAL_MS = 5_000;
 
 /** Regex matching event types that should trigger a snapshot refresh. */
 const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
+
+/** Regex matching event types that should trigger an automations refresh. */
+const AUTOMATION_EVENT = /^automation:/;
 
 /** Regex matching event types that should trigger an update status refresh. */
 const UPDATE_EVENT = /^system:update:/;
@@ -36,6 +39,12 @@ export interface AppState {
   filteredTasks: Task[];
   /** Merge queue entries filtered by selected project */
   filteredMergeQueue: MergeQueueEntry[];
+  /** All automations */
+  automations: Automation[];
+  /** Automations filtered by selected project */
+  filteredAutomations: Automation[];
+  /** Refresh automations list */
+  refreshAutomations: () => Promise<void>;
   /** Update status for self-update mechanism */
   updateStatus: UpdateStatus | null;
   /** Whether the update banner has been dismissed */
@@ -57,6 +66,9 @@ const defaultState: AppState = {
   setSelectedProject: () => {},
   filteredTasks: [],
   filteredMergeQueue: [],
+  automations: [],
+  filteredAutomations: [],
+  refreshAutomations: async () => {},
   updateStatus: null,
   updateDismissed: false,
   dismissUpdate: () => {},
@@ -78,6 +90,7 @@ function useAppStateCore(): AppState {
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [automations, setAutomations] = useState<Automation[]>([]);
 
   // Track seen orchestrator event IDs for deduplication
   const seenOrchestratorIds = useRef(new Set<string>());
@@ -85,6 +98,7 @@ function useAppStateCore(): AppState {
   // Keep a ref to the latest snapshot-fetch promise so we can avoid races.
   const fetchInFlight = useRef(false);
   const updateFetchInFlight = useRef(false);
+  const automationsFetchInFlight = useRef(false);
   const prevTargetCommit = useRef<string | undefined>(undefined);
 
   const refreshSnapshot = useCallback(async () => {
@@ -123,6 +137,19 @@ function useAppStateCore(): AppState {
     setUpdateDismissed(true);
   }, []);
 
+  const refreshAutomations = useCallback(async () => {
+    if (automationsFetchInFlight.current) return;
+    automationsFetchInFlight.current = true;
+    try {
+      const data = await fetchAutomations();
+      setAutomations(data);
+    } catch {
+      // Automations endpoint may not exist yet; ignore errors silently
+    } finally {
+      automationsFetchInFlight.current = false;
+    }
+  }, []);
+
   // Compute filtered tasks based on selected project
   const filteredTasks = useMemo(() => {
     const tasks = snapshot?.tasks ?? [];
@@ -142,14 +169,26 @@ function useAppStateCore(): AppState {
     return entries.filter((e) => projectTaskIds.has(e.task_id));
   }, [snapshot, selectedProject]);
 
+  // Compute filtered automations based on selected project
+  const filteredAutomations = useMemo(() => {
+    if (!selectedProject) return automations;
+    return automations.filter((a) => a.project_id === selectedProject);
+  }, [automations, selectedProject]);
+
   // --- Polling -----------------------------------------------------------
   useEffect(() => {
     // Fetch immediately on mount.
     refreshSnapshot();
     refreshUpdateStatus();
+    refreshAutomations();
 
     const interval = setInterval(() => {
       refreshSnapshot();
+    }, POLL_INTERVAL_MS);
+
+    // Automations are polled at the same interval as snapshot
+    const automationsInterval = setInterval(() => {
+      refreshAutomations();
     }, POLL_INTERVAL_MS);
 
     // Update status is checked less frequently (every 60 seconds)
@@ -159,9 +198,10 @@ function useAppStateCore(): AppState {
 
     return () => {
       clearInterval(interval);
+      clearInterval(automationsInterval);
       clearInterval(updateInterval);
     };
-  }, [refreshSnapshot, refreshUpdateStatus]);
+  }, [refreshSnapshot, refreshUpdateStatus, refreshAutomations]);
 
   // --- SSE subscription with reconnection --------------------------------
   useEffect(() => {
@@ -207,6 +247,11 @@ function useAppStateCore(): AppState {
             refreshSnapshot();
           }
 
+          // Handle automation events
+          if (AUTOMATION_EVENT.test(event.type)) {
+            refreshAutomations();
+          }
+
           // Handle update events
           if (UPDATE_EVENT.test(event.type)) {
             refreshUpdateStatus();
@@ -237,7 +282,7 @@ function useAppStateCore(): AppState {
       source?.close();
       setConnected(false);
     };
-  }, [refreshSnapshot, refreshUpdateStatus]);
+  }, [refreshSnapshot, refreshAutomations, refreshUpdateStatus]);
 
   return {
     snapshot,
@@ -250,6 +295,9 @@ function useAppStateCore(): AppState {
     setSelectedProject,
     filteredTasks,
     filteredMergeQueue,
+    automations,
+    filteredAutomations,
+    refreshAutomations,
     updateStatus,
     updateDismissed,
     dismissUpdate,

@@ -1,5 +1,7 @@
 import type {
   ContainerInfo,
+  Automation,
+  AutomationRun,
   Event,
   MergeQueueEntry,
   Mode,
@@ -242,5 +244,71 @@ export function applyUpdate(force?: boolean): Promise<void> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ force: force ?? false }),
+  });
+}
+
+// Automations API
+
+export function fetchAutomations(projectId?: string): Promise<Automation[]> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  const query = params.toString();
+  const url = query ? `/api/automations?${query}` : "/api/automations";
+  return request<Automation[]>(url);
+}
+
+export interface CreateAutomationRequest {
+  project_id: string;
+  name: string;
+  prompt: string;
+  trigger: {
+    type: "schedule" | "event" | "manual";
+    cron?: string;
+    event_type?: string;
+  };
+  state?: "active" | "paused" | "disabled";
+}
+
+export function createAutomation(req: CreateAutomationRequest): Promise<Automation> {
+  return request<Automation>("/api/automations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+}
+
+export interface UpdateAutomationRequest {
+  name?: string;
+  prompt?: string;
+  trigger?: {
+    type: "schedule" | "event" | "manual";
+    cron?: string;
+    event_type?: string;
+  };
+  state?: "active" | "paused" | "disabled";
+}
+
+export function updateAutomation(
+  id: string,
+  updates: UpdateAutomationRequest
+): Promise<Automation> {
+  return request<Automation>(`/api/automations/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+}
+
+export function deleteAutomation(id: string): Promise<void> {
+  return requestVoid(`/api/automations/${id}`, { method: "DELETE" });
+}
+
+export function fetchAutomationRuns(automationId: string): Promise<AutomationRun[]> {
+  return request<AutomationRun[]>(`/api/automations/${automationId}/runs`);
+}
+
+export function triggerAutomation(id: string): Promise<AutomationRun> {
+  return request<AutomationRun>(`/api/automations/${id}/trigger`, {
+    method: "POST",
   });
 }
