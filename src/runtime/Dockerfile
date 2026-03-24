@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     ca-certificates \
     unzip \
+    jq \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI
@@ -27,6 +31,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
+
+# bun (JavaScript package manager/runtime)
+RUN curl -fsSL https://bun.sh/install | bash && \
+    mv /root/.bun/bin/bun /usr/local/bin/bun && \
+    chmod +x /usr/local/bin/bun && \
+    rm -rf /root/.bun
 
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
