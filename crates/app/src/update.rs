@@ -246,6 +246,11 @@ pub async fn check_for_updates(repo_path: &Path) -> Result<Option<UpdateInfo>, S
         .await
         .map_err(|e| format!("Failed to get HEAD: {e}"))?;
 
+    if !head_output.status.success() {
+        let stderr = String::from_utf8_lossy(&head_output.stderr);
+        return Err(format!("git rev-parse HEAD failed: {stderr}"));
+    }
+
     let current_commit = String::from_utf8_lossy(&head_output.stdout)
         .trim()
         .to_string();
@@ -257,6 +262,11 @@ pub async fn check_for_updates(repo_path: &Path) -> Result<Option<UpdateInfo>, S
         .output()
         .await
         .map_err(|e| format!("Failed to get origin/main: {e}"))?;
+
+    if !origin_output.status.success() {
+        let stderr = String::from_utf8_lossy(&origin_output.stderr);
+        return Err(format!("git rev-parse origin/main failed: {stderr}"));
+    }
 
     let available_commit = String::from_utf8_lossy(&origin_output.stdout)
         .trim()
