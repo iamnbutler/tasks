@@ -303,6 +303,11 @@ pub async fn check_for_updates(repo_path: &Path) -> Result<Option<UpdateInfo>, S
         .await
         .map_err(|e| format!("Failed to get diff: {e}"))?;
 
+    if !diff_output.status.success() {
+        let stderr = String::from_utf8_lossy(&diff_output.stderr);
+        return Err(format!("git diff failed: {stderr}"));
+    }
+
     let diff_text = String::from_utf8_lossy(&diff_output.stdout);
     let changed_files: Vec<String> = diff_text.lines().map(|s| s.to_string()).collect();
 
