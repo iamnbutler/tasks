@@ -261,7 +261,7 @@ POST /api/merge-queue/flush
 
 #### Chat with Orchestrator
 
-Send a message to the AI project foreman.
+Send a message to the AI project foreman. The orchestrator receives a full system state snapshot (mode, projects, tasks, recent events) and maintains conversation history for the server session (bounded at 40 messages). Chat messages bypass the PR evaluation queue and are processed immediately. <!-- UPDATED: 2026-03-24, PR #299 -->
 
 ```http
 POST /api/orchestrator/chat
@@ -271,6 +271,8 @@ Content-Type: application/json
   "message": "What tasks are currently being worked on?"
 }
 ```
+
+The orchestrator's reply arrives via SSE as an `orchestrator:response` event (see [Events](#events-sse)).
 
 ### Accounting
 
@@ -388,6 +390,25 @@ curl -N http://localhost:4800/api/events?task_id=abc123
 event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
+
+**Common Event Types:**
+
+| Type | Description |
+|------|-------------|
+| `task:created` | New task created |
+| `task:updated` | Task state changed |
+| `session:started` | Agent session began |
+| `session:ended` | Agent session completed |
+| `merge:approved` | Entry approved in queue |
+| `merge:completed` | Changes merged |
+| `orchestrator:message` | Human sent a chat message (`{ message: string }`, `task: "system"`) |
+| `orchestrator:response` | Orchestrator replied to chat (`{ message: string }`, `task: "system"`) |
+| `orchestrator:feedback` | Orchestrator sent feedback to an agent |
+| `orchestrator:escalation` | Orchestrator surfaced an issue requiring human attention |
+| `orchestrator:decision` | Orchestrator made a judgment call |
+| `system:mode` | Operating mode changed |
+
+> **Note:** Orchestrator events use `task: "system"` rather than a task ID as they are not scoped to a specific task. <!-- UPDATED: 2026-03-24, PR #299 -->
 
 ## Error Responses
 

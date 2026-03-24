@@ -114,9 +114,13 @@ Events appear as context-rich messages including:
 - **Feedback** - Orchestrator comments on work quality
 - **Escalations** - Issues requiring human intervention, with actionable context and PR links
 
+Orchestrator events are stored globally in app state with no event cap and full deduplication. The feed persists across page navigation — navigating away and back does not lose history. <!-- UPDATED: 2026-03-24, PR #316 -->
+
 ### Chat
 
-Type messages in the input field to ask the orchestrator questions or provide direction. The orchestrator responds via the event feed.
+Type messages in the input field to ask the orchestrator questions or provide direction. The orchestrator has context of the full system state (current mode, all projects, all tasks, recent events) when responding.
+
+The orchestrator responds via the event feed. Chat messages bypass the PR evaluation queue and are processed immediately.
 
 ## Events
 
@@ -132,6 +136,11 @@ The Events view shows a real-time stream of system events.
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
 | `merge:completed` | Changes merged |
+| `orchestrator:message` | Human sent a chat message to the orchestrator |
+| `orchestrator:response` | Orchestrator replied to a human chat message |
+| `orchestrator:feedback` | Orchestrator sent feedback to an agent |
+| `orchestrator:escalation` | Orchestrator surfaced an issue requiring human attention |
+| `orchestrator:decision` | Orchestrator made a judgment call |
 
 ### Filtering
 
