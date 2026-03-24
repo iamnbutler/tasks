@@ -57,6 +57,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/projects", get(list_projects))
         .route("/projects", post(add_project))
+        .route("/projects/bootstrap", post(bootstrap_project))
         .route("/projects/{id}", axum::routing::delete(delete_project))
         .route("/issues", post(create_issue))
         .route("/merge-queue", get(list_merge_queue))
@@ -138,6 +139,32 @@ struct CreateIssueRequest {
 #[derive(Serialize)]
 struct CreateIssueResponse {
     /// Created issue number.
+    number: u64,
+    /// Issue URL.
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct BootstrapProjectRequest {
+    /// The prompt describing what to build.
+    prompt: String,
+    /// Optional repository name. If not provided, a name will be derived from the prompt.
+    repo_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BootstrapProjectResponse {
+    /// The created project.
+    project: models::project::Project,
+    /// The created GitHub issue.
+    issue: BootstrapIssueInfo,
+    /// The repository URL.
+    repo_url: String,
+}
+
+#[derive(Serialize)]
+struct BootstrapIssueInfo {
+    /// Issue number.
     number: u64,
     /// Issue URL.
     url: String,
@@ -443,6 +470,148 @@ async fn delete_project(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::BadRequest(format!("Project not found: {id}")))
+    }
+}
+
+/// POST /api/projects/bootstrap — Create a new project from scratch.
+///
+/// Creates a new private GitHub repository, adds it as a project, and creates
+/// an initial issue with the prompt. The poller will pick up the issue and
+/// dispatch an agent to work on it.
+async fn bootstrap_project(
+    State(state): State<ApiState>,
+    Json(req): Json<BootstrapProjectRequest>,
+) -> Result<Json<BootstrapProjectResponse>, ApiError> {
+    // Validate prompt
+    let prompt = req.prompt.trim();
+    if prompt.is_empty() {
+        return Err(ApiError::BadRequest("prompt cannot be empty".to_string()));
+    }
+
+    // Get GitHub token
+    let github_token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| ApiError::GitHub("GITHUB_TOKEN not configured on server".to_string()))?;
+
+    let client = tasks_github::GitHubClient::new(&github_token);
+
+    // Determine repository name
+    let repo_name = if let Some(name) = req.repo_name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ApiError::BadRequest("repo_name cannot be empty if provided".to_string()));
+        }
+        // Sanitize: replace spaces with hyphens, lowercase, remove non-alphanumeric
+        sanitize_repo_name(name)
+    } else {
+        // Derive from prompt: take first few words, sanitize
+        derive_repo_name(prompt)
+    };
+
+    // Create the repository
+    let description_text;
+    let description = if prompt.chars().count() > 200 {
+        description_text = prompt.chars().take(200).collect::<String>();
+        Some(description_text.as_str())
+    } else {
+        Some(prompt)
+    };
+
+    let created_repo = client
+        .create_repository(&repo_name, description)
+        .await
+        .map_err(|e| ApiError::GitHub(format!("failed to create repository: {e}")))?;
+
+    // Add the project to tracking
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let project = models::project::Project::new(&project_id, &created_repo.full_name);
+    state.server.add_project(project.clone()).await;
+
+    // Parse owner/repo from the created repository
+    let parts: Vec<&str> = created_repo.full_name.split('/').collect();
+    let (owner, repo) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        return Err(ApiError::GitHub(format!(
+            "unexpected full_name format: {}",
+            created_repo.full_name
+        )));
+    };
+
+    // Create the initial issue with the prompt
+    let issue_title = derive_issue_title(prompt);
+    let issue_body = format!(
+        "## What to build\n\n{}\n\n---\n\n*This project was bootstrapped automatically. \
+        Create additional issues for questions or clarifications.*",
+        prompt
+    );
+
+    let created_issue = client
+        .create_issue(owner, repo, &issue_title, Some(&issue_body), None)
+        .await
+        .map_err(|e| ApiError::GitHub(format!(
+            "failed to create issue (repo was created at {}): {e}",
+            created_repo.html_url
+        )))?;
+
+    Ok(Json(BootstrapProjectResponse {
+        project,
+        issue: BootstrapIssueInfo {
+            number: created_issue.number,
+            url: created_issue.html_url,
+        },
+        repo_url: created_repo.html_url,
+    }))
+}
+
+/// Sanitize a user-provided repository name.
+fn sanitize_repo_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "new-project".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Derive a repository name from a prompt.
+fn derive_repo_name(prompt: &str) -> String {
+    // Take the first ~5 meaningful words
+    let words: Vec<&str> = prompt
+        .split_whitespace()
+        .filter(|w| w.len() > 2) // Skip short words like "a", "an", "to"
+        .take(5)
+        .collect();
+
+    let name = if words.is_empty() {
+        "new-project".to_string()
+    } else {
+        words.join("-")
+    };
+
+    sanitize_repo_name(&name)
+}
+
+/// Derive an issue title from a prompt.
+fn derive_issue_title(prompt: &str) -> String {
+    // Take the first line or first ~60 chars
+    let first_line = prompt.lines().next().unwrap_or(prompt);
+    if first_line.len() <= 60 {
+        first_line.to_string()
+    } else {
+        let truncated: String = first_line.chars().take(57).collect();
+        format!("{truncated}...")
     }
 }
 

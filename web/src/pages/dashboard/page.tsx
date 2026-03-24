@@ -202,9 +202,10 @@ function computeStatusMessages(
   }
 
   // Count merge queue by status
-  const mergeCounts = {
+  const mergeCounts: Record<MergeStatus, number> = {
     pending: 0,
     approved: 0,
+    merging: 0,
     rejected: 0,
     merged: 0,
     conflict: 0,

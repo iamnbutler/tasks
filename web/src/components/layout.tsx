@@ -13,9 +13,10 @@ import {
   Square,
   Pause,
   Play,
+  Rocket,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { addProject, deleteProject, setMode } from "@/lib/api";
+import { addProject, deleteProject, setMode, bootstrapProject } from "@/lib/api";
 import { UpdateBanner } from "@/components/update-banner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -40,6 +41,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -167,6 +169,14 @@ function ProjectList() {
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; repo: string } | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // Bootstrap project state
+  const [bootstrapOpen, setBootstrapOpen] = useState(false);
+  const [bootstrapPrompt, setBootstrapPrompt] = useState("");
+  const [bootstrapRepoName, setBootstrapRepoName] = useState("");
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+  const [bootstrapResult, setBootstrapResult] = useState<{ repoUrl: string; issueUrl: string } | null>(null);
+
   const projects = snapshot?.projects ?? [];
 
   const handleAdd = async () => {
@@ -213,6 +223,42 @@ function ProjectList() {
     navigate("/tasks");
   };
 
+  const handleBootstrap = async () => {
+    const prompt = bootstrapPrompt.trim();
+    if (!prompt) return;
+
+    setBootstrapping(true);
+    setBootstrapError(null);
+    setBootstrapResult(null);
+    try {
+      const result = await bootstrapProject({
+        prompt,
+        repo_name: bootstrapRepoName.trim() || undefined,
+      });
+      await refreshSnapshot();
+      setSelectedProject(result.project.id);
+      setBootstrapResult({
+        repoUrl: result.repo_url,
+        issueUrl: result.issue.url,
+      });
+      // Clear the form but keep the dialog open to show the result
+      setBootstrapPrompt("");
+      setBootstrapRepoName("");
+    } catch (e) {
+      setBootstrapError(e instanceof Error ? e.message : "Failed to bootstrap project");
+    } finally {
+      setBootstrapping(false);
+    }
+  };
+
+  const resetBootstrapDialog = () => {
+    setBootstrapOpen(false);
+    setBootstrapPrompt("");
+    setBootstrapRepoName("");
+    setBootstrapError(null);
+    setBootstrapResult(null);
+  };
+
   return (
     <>
       <Collapsible open={isOpen} onOpenChange={setIsOpen}>
@@ -226,19 +272,34 @@ function ProjectList() {
             />
             Projects
           </CollapsibleTrigger>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-5 w-5 text-muted-foreground/70 hover:text-foreground"
-                onClick={() => setAddOpen(true)}
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">Add project</TooltipContent>
-          </Tooltip>
+          <div className="flex items-center gap-0.5">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5 w-5 text-muted-foreground/70 hover:text-foreground"
+                  onClick={() => setBootstrapOpen(true)}
+                >
+                  <Rocket className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right">Bootstrap new project</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5 w-5 text-muted-foreground/70 hover:text-foreground"
+                  onClick={() => setAddOpen(true)}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="right">Add existing project</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
 
         <CollapsibleContent className="space-y-0.5 px-1">
@@ -384,6 +445,122 @@ function ProjectList() {
               Remove
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bootstrap project dialog */}
+      <Dialog open={bootstrapOpen} onOpenChange={(open) => !open && resetBootstrapDialog()}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Bootstrap new project</DialogTitle>
+            <DialogDescription>
+              Describe what you want to build. A new private repository will be created
+              and an agent will start working on your idea.
+            </DialogDescription>
+          </DialogHeader>
+          {bootstrapResult ? (
+            <div className="space-y-4 py-3">
+              <div className="rounded-md bg-green-500/10 border border-green-500/20 p-4 space-y-2">
+                <p className="text-sm font-medium text-green-400">Project created!</p>
+                <div className="space-y-1 text-sm text-muted-foreground">
+                  <p>
+                    <span className="text-foreground">Repository: </span>
+                    <a
+                      href={bootstrapResult.repoUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-400 hover:underline"
+                    >
+                      {bootstrapResult.repoUrl}
+                    </a>
+                  </p>
+                  <p>
+                    <span className="text-foreground">Initial issue: </span>
+                    <a
+                      href={bootstrapResult.issueUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-400 hover:underline"
+                    >
+                      {bootstrapResult.issueUrl}
+                    </a>
+                  </p>
+                </div>
+                <p className="text-xs text-muted-foreground pt-2">
+                  The agent will pick up the task shortly. Create additional issues
+                  in the repository for questions or clarifications.
+                </p>
+              </div>
+              <DialogFooter>
+                <Button onClick={resetBootstrapDialog}>Done</Button>
+              </DialogFooter>
+            </div>
+          ) : (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleBootstrap();
+              }}
+            >
+              <div className="space-y-4 py-3">
+                <div className="space-y-2">
+                  <label htmlFor="prompt" className="text-sm font-medium">
+                    What do you want to build?
+                  </label>
+                  <Textarea
+                    id="prompt"
+                    placeholder="Describe your project idea in detail. What should it do? What technologies should it use?"
+                    value={bootstrapPrompt}
+                    onChange={(e) => {
+                      setBootstrapPrompt(e.target.value);
+                      setBootstrapError(null);
+                    }}
+                    disabled={bootstrapping}
+                    className="min-h-32"
+                    autoFocus
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="repoName" className="text-sm font-medium">
+                    Repository name{" "}
+                    <span className="text-muted-foreground font-normal">(optional)</span>
+                  </label>
+                  <Input
+                    id="repoName"
+                    placeholder="my-awesome-project"
+                    value={bootstrapRepoName}
+                    onChange={(e) => {
+                      setBootstrapRepoName(e.target.value);
+                      setBootstrapError(null);
+                    }}
+                    disabled={bootstrapping}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Leave empty to derive from your description.
+                  </p>
+                </div>
+                {bootstrapError && (
+                  <p className="text-sm text-red-400">{bootstrapError}</p>
+                )}
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={resetBootstrapDialog}
+                  disabled={bootstrapping}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={bootstrapping || !bootstrapPrompt.trim()}
+                >
+                  {bootstrapping ? "Creating..." : "Create project"}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
         </DialogContent>
       </Dialog>
     </>
