@@ -508,8 +508,10 @@ async fn bootstrap_project(
     };
 
     // Create the repository
-    let description = if prompt.len() > 200 {
-        Some(&prompt[..200])
+    let description_text;
+    let description = if prompt.chars().count() > 200 {
+        description_text = prompt.chars().take(200).collect::<String>();
+        Some(description_text.as_str())
     } else {
         Some(prompt)
     };
@@ -546,7 +548,10 @@ async fn bootstrap_project(
     let created_issue = client
         .create_issue(owner, repo, &issue_title, Some(&issue_body), None)
         .await
-        .map_err(|e| ApiError::GitHub(format!("failed to create issue: {e}")))?;
+        .map_err(|e| ApiError::GitHub(format!(
+            "failed to create issue (repo was created at {}): {e}",
+            created_repo.html_url
+        )))?;
 
     Ok(Json(BootstrapProjectResponse {
         project,
@@ -560,19 +565,24 @@ async fn bootstrap_project(
 
 /// Sanitize a user-provided repository name.
 fn sanitize_repo_name(name: &str) -> String {
-    name.chars()
+    let sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c.to_ascii_lowercase()
-            } else if c.is_whitespace() {
-                '-'
             } else {
                 '-'
             }
         })
         .collect::<String>()
         .trim_matches('-')
-        .to_string()
+        .to_string();
+
+    if sanitized.is_empty() {
+        "new-project".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Derive a repository name from a prompt.
@@ -600,7 +610,8 @@ fn derive_issue_title(prompt: &str) -> String {
     if first_line.len() <= 60 {
         first_line.to_string()
     } else {
-        format!("{}...", &first_line[..57])
+        let truncated: String = first_line.chars().take(57).collect();
+        format!("{truncated}...")
     }
 }
 

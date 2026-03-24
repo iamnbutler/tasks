@@ -1111,42 +1111,6 @@ impl GitHubClient {
         )))
     }
 
-    /// Get the authenticated user's login name.
-    ///
-    /// Uses the GitHub REST API to fetch the current user's information.
-    /// This is needed to determine the owner when creating repositories.
-    pub async fn get_authenticated_user(&self) -> Result<String, GitHubError> {
-        self.wait_for_rate_limit().await;
-
-        let url = format!("{}/user", self.base_url);
-
-        let response = self.http.get(&url).send().await?;
-        self.update_rate_limit(&response);
-
-        let status = response.status();
-
-        if status.is_success() {
-            #[derive(Deserialize)]
-            struct UserResponse {
-                login: String,
-            }
-            let user: UserResponse = response.json().await.map_err(|e| {
-                GitHubError::Decode(format!("failed to parse user response: {e}"))
-            })?;
-            return Ok(user.login);
-        }
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            let text = response.text().await.unwrap_or_default();
-            return Err(GitHubError::Auth(text));
-        }
-
-        let text = response.text().await.unwrap_or_default();
-        Err(GitHubError::Decode(format!(
-            "unexpected user status {status}: {text}"
-        )))
-    }
-
     // -----------------------------------------------------------------------
     // Nested pagination helpers
     // -----------------------------------------------------------------------
