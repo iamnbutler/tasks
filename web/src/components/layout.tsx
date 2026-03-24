@@ -7,7 +7,7 @@ import {
   Box,
   Radio,
   Brain,
-  ChevronRight,
+  ChevronDown,
   FolderGit2,
   Plus,
   Trash2,
@@ -16,6 +16,7 @@ import {
   Play,
   Rocket,
   Workflow,
+  Check,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { addProject, deleteProject, setMode, bootstrapProject } from "@/lib/api";
@@ -23,11 +24,6 @@ import { UpdateBanner } from "@/components/update-banner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import {
   Dialog,
   DialogContent,
@@ -40,15 +36,11 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import type { Mode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -157,12 +149,11 @@ function SidebarNavItem({
 }
 
 // ---------------------------------------------------------------------------
-// Project list in sidebar
+// Project selector dropdown
 // ---------------------------------------------------------------------------
 
-function ProjectList() {
+function ProjectSelector() {
   const { snapshot, refreshSnapshot, selectedProject, setSelectedProject } = useAppState();
-  const [isOpen, setIsOpen] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [newRepo, setNewRepo] = useState("");
   const [adding, setAdding] = useState(false);
@@ -179,6 +170,11 @@ function ProjectList() {
   const [bootstrapResult, setBootstrapResult] = useState<{ repoUrl: string; issueUrl: string } | null>(null);
 
   const projects = snapshot?.projects ?? [];
+
+  // Get display name for the selected project
+  const selectedProjectName = selectedProject
+    ? projects.find((p) => p.id === selectedProject)?.repo.split("/")[1] ?? "Project"
+    : null;
 
   const handleAdd = async () => {
     const repo = newRepo.trim();
@@ -213,15 +209,6 @@ function ProjectList() {
     } catch (e) {
       setDeleteError(e instanceof Error ? e.message : "Failed to delete project");
     }
-  };
-
-  const handleProjectClick = (projectId: string) => {
-    if (selectedProject === projectId) {
-      setSelectedProject(null);
-    } else {
-      setSelectedProject(projectId);
-    }
-    // Don't navigate - let the user filter the current page
   };
 
   const handleBootstrap = async () => {
@@ -262,106 +249,89 @@ function ProjectList() {
 
   return (
     <>
-      <Collapsible open={isOpen} onOpenChange={setIsOpen}>
-        <div className="flex items-center justify-between px-3 py-1">
-          <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground/70 uppercase tracking-wider hover:text-muted-foreground transition-colors">
-            <ChevronRight
-              className={cn(
-                "h-3 w-3 transition-transform",
-                isOpen && "rotate-90"
-              )}
-            />
-            Projects
-          </CollapsibleTrigger>
-          <div className="flex items-center gap-0.5">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-5 w-5 text-muted-foreground/70 hover:text-foreground"
-                  onClick={() => setBootstrapOpen(true)}
-                >
-                  <Rocket className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right">Bootstrap new project</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-5 w-5 text-muted-foreground/70 hover:text-foreground"
-                  onClick={() => setAddOpen(true)}
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right">Add existing project</TooltipContent>
-            </Tooltip>
-          </div>
-        </div>
-
-        <CollapsibleContent className="space-y-0.5 px-1">
-          {/* All Projects option */}
-          <button
-            onClick={() => {
-              setSelectedProject(null);
-            }}
-            className={cn(
-              "flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors",
-              !selectedProject
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
-            )}
-          >
-            <FolderGit2 className="h-4 w-4 shrink-0" />
-            <span className="truncate">All Projects</span>
-            <span className="ml-auto text-xs text-muted-foreground">
-              {projects.length}
-            </span>
-          </button>
-
-          {projects.map((project) => {
-            const repoName = project.repo.includes("/")
-              ? project.repo.split("/")[1]
-              : project.repo;
-            return (
-              <div
-                key={project.id}
-                className={cn(
-                  "group flex items-center rounded-md transition-colors",
-                  selectedProject === project.id
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
-                )}
-              >
-                <button
-                  onClick={() => handleProjectClick(project.id)}
-                  className="flex flex-1 items-center gap-2 px-3 py-1.5 text-sm min-w-0"
-                >
-                  <FolderGit2 className="h-4 w-4 shrink-0" />
-                  <span className="truncate" title={project.repo}>
-                    {repoName}
-                  </span>
-                </button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 shrink-0 mr-1 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-opacity"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setDeleteConfirm({ id: project.id, repo: project.repo });
-                  }}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </Button>
+      <div className="px-2 py-2 border-b border-border">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button className="flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm bg-accent/50 hover:bg-accent transition-colors">
+              <div className="flex items-center gap-2 min-w-0">
+                <FolderGit2 className="h-4 w-4 shrink-0" />
+                <span className="truncate font-medium">
+                  {selectedProjectName ?? "All Projects"}
+                </span>
               </div>
-            );
-          })}
-        </CollapsibleContent>
-      </Collapsible>
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="w-[calc(var(--radix-dropdown-menu-trigger-width))]">
+            {/* All Projects option */}
+            <DropdownMenuItem
+              onClick={() => setSelectedProject(null)}
+              className="flex items-center justify-between"
+            >
+              <div className="flex items-center gap-2">
+                <FolderGit2 className="h-4 w-4" />
+                <span>All Projects</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">{projects.length}</span>
+                {!selectedProject && <Check className="h-4 w-4" />}
+              </div>
+            </DropdownMenuItem>
+
+            {projects.length > 0 && <DropdownMenuSeparator />}
+
+            {/* Individual projects */}
+            {projects.map((project) => {
+              const repoName = project.repo.includes("/")
+                ? project.repo.split("/")[1]
+                : project.repo;
+              const isSelected = selectedProject === project.id;
+              return (
+                <DropdownMenuItem
+                  key={project.id}
+                  className="flex items-center justify-between group"
+                >
+                  <button
+                    onClick={() => setSelectedProject(project.id)}
+                    className="flex flex-1 items-center gap-2 min-w-0"
+                  >
+                    <FolderGit2 className="h-4 w-4 shrink-0" />
+                    <span className="truncate" title={project.repo}>
+                      {repoName}
+                    </span>
+                  </button>
+                  <div className="flex items-center gap-1">
+                    {isSelected && <Check className="h-4 w-4" />}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5 shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400 transition-opacity"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDeleteConfirm({ id: project.id, repo: project.repo });
+                      }}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </div>
+                </DropdownMenuItem>
+              );
+            })}
+
+            <DropdownMenuSeparator />
+
+            {/* Actions */}
+            <DropdownMenuItem onClick={() => setAddOpen(true)}>
+              <Plus className="h-4 w-4" />
+              <span>Add Project</span>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => setBootstrapOpen(true)}>
+              <Rocket className="h-4 w-4" />
+              <span>Bootstrap Project</span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
 
       {/* Add project dialog */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
@@ -593,6 +563,9 @@ export function Layout() {
           <ModeIndicator />
         </div>
 
+        {/* Project selector */}
+        <ProjectSelector />
+
         {/* Navigation */}
         <ScrollArea className="flex-1">
           <div className="flex flex-col gap-4 py-2">
@@ -604,9 +577,6 @@ export function Layout() {
               <SidebarNavItem to="/containers" icon={Box} label="Containers" />
               <SidebarNavItem to="/automations" icon={Workflow} label="Automations" />
             </div>
-
-            {/* Projects */}
-            <ProjectList />
 
             {/* System */}
             <div className="space-y-1">
