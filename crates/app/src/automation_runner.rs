@@ -6,9 +6,11 @@
 
 use std::sync::Arc;
 
-use tracing::{error, info};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use events::EventBus;
 use runtime::AppleContainerRuntime;
 use server::Server;
 use tasks_session::SessionManager;
@@ -96,6 +98,88 @@ pub fn is_automation_session(session_id: &str) -> bool {
 /// Returns `None` if the session ID does not have the automation prefix.
 pub fn run_id_from_session(session_id: &str) -> Option<&str> {
     session_id.strip_prefix(SESSION_PREFIX)
+}
+
+/// Spawn a background task that listens for session completion/failure events
+/// and updates automation run records accordingly.
+///
+/// When a session with an `automation-run:` prefix completes (exit code 0,
+/// emitting `TaskStateAwaitingMerge`) or fails (`TaskStateFailed`), this
+/// listener calls `server.complete_automation_run()` or
+/// `server.fail_automation_run()`.
+pub fn spawn_automation_event_listener(
+    event_bus: &EventBus,
+    server: Arc<Server>,
+) -> JoinHandle<()> {
+    let mut rx = event_bus.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    // Only care about automation sessions
+                    let run_id = match run_id_from_session(&event.task) {
+                        Some(id) => id.to_string(),
+                        None => continue,
+                    };
+
+                    match event.event_type {
+                        // Agent exited successfully — session emits TaskStateAwaitingMerge
+                        events::EventType::TaskStateAwaitingMerge
+                        | events::EventType::TaskStateCompleted => {
+                            info!(
+                                run_id = %run_id,
+                                event_type = %event.event_type.as_str(),
+                                "automation session completed, marking run as complete"
+                            );
+                            if let Err(e) = server.complete_automation_run(&run_id, None).await {
+                                error!(
+                                    run_id = %run_id,
+                                    error = %e,
+                                    "failed to complete automation run"
+                                );
+                            }
+                        }
+                        // Agent exited with failure
+                        events::EventType::TaskStateFailed => {
+                            let reason = event
+                                .data
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("session failed");
+                            info!(
+                                run_id = %run_id,
+                                reason = %reason,
+                                "automation session failed, marking run as failed"
+                            );
+                            if let Err(e) = server
+                                .fail_automation_run(&run_id, reason.to_string())
+                                .await
+                            {
+                                error!(
+                                    run_id = %run_id,
+                                    error = %e,
+                                    "failed to mark automation run as failed"
+                                );
+                            }
+                        }
+                        // Ignore all other event types
+                        _ => {}
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        skipped = n,
+                        "automation event listener lagged, skipped {n} events"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!("event bus closed, automation event listener shutting down");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
