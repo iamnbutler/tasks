@@ -461,13 +461,12 @@ impl Server {
         Ok(run)
     }
 
-    /// Complete an automation run successfully.
+    /// Complete an automation run with output.
     pub async fn complete_automation_run(
         &self,
         run_id: &str,
         output: Option<String>,
-    ) -> Result<(), ServerError> {
-        // Load the run from store
+    ) -> Result<AutomationRun, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
@@ -478,15 +477,13 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
 
-        // Complete the run
-        run.complete(output);
+        run.complete(output.clone());
 
         // Save to store
         {
             let store = store.lock().unwrap();
-            if let Err(e) = store.save_automation_run(&run) {
-                tracing::error!(run_id = %run_id, error = %e, "failed to persist completed run to store");
-            }
+            store.save_automation_run(&run)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
         // Emit run completed event
@@ -494,12 +491,15 @@ impl Server {
             EventType::AutomationRunCompleted,
             run_id,
             Actor::System,
-            serde_json::json!({ "automation_id": run.automation_id }),
+            serde_json::json!({
+                "automation_id": run.automation_id,
+                "output": output,
+            }),
         );
         self.event_bus.publish(event).await?;
 
-        tracing::info!(run_id = %run_id, "automation run completed");
-        Ok(())
+        tracing::info!(run_id = %run_id, "Automation run completed");
+        Ok(run)
     }
 
     /// Fail an automation run with an error message.
@@ -507,10 +507,8 @@ impl Server {
         &self,
         run_id: &str,
         error: impl Into<String>,
-    ) -> Result<(), ServerError> {
-        let error_msg = error.into();
-
-        // Load the run from store
+    ) -> Result<AutomationRun, ServerError> {
+        let error_str = error.into();
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
@@ -521,15 +519,13 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
 
-        // Fail the run
-        run.fail(&error_msg);
+        run.fail(&error_str);
 
         // Save to store
         {
             let store = store.lock().unwrap();
-            if let Err(e) = store.save_automation_run(&run) {
-                tracing::error!(run_id = %run_id, error = %e, "failed to persist failed run to store");
-            }
+            store.save_automation_run(&run)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
         // Emit run failed event
@@ -539,13 +535,33 @@ impl Server {
             Actor::System,
             serde_json::json!({
                 "automation_id": run.automation_id,
-                "error": error_msg,
+                "error": error_str,
             }),
         );
         self.event_bus.publish(event).await?;
 
-        tracing::warn!(run_id = %run_id, error = %error_msg, "automation run failed");
-        Ok(())
+        tracing::warn!(run_id = %run_id, error = %error_str, "Automation run failed");
+        Ok(run)
+    }
+
+    /// Get the automation associated with a run.
+    pub async fn get_automation_for_run(&self, run_id: &str) -> Result<Option<Automation>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+
+        let run = {
+            let store = store.lock().unwrap();
+            store.get_automation_run(run_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?
+        };
+
+        match run {
+            Some(run) => {
+                let state = self.state.read().await;
+                Ok(state.automations.get(&run.automation_id).cloned())
+            }
+            None => Ok(None),
+        }
     }
 
     // --- Mode management (spec Section 6) ---

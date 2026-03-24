@@ -1942,11 +1942,22 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             warn!("completions service unavailable (ANTHROPIC_API_KEY not set)");
         }
 
+        // Initialize automation executor for running automation prompts.
+        let automation_executor = server::AutomationExecutor::from_env()
+            .map(Arc::new)
+            .ok();
+        if automation_executor.is_some() {
+            info!("automation executor available");
+        } else {
+            warn!("automation executor unavailable (ANTHROPIC_API_KEY not set)");
+        }
+
         let api_state = crate::web::ApiState {
             server: server.clone(),
             max_sessions: config.max_sessions,
             session_manager: Some(session_manager.clone()),
             completions_service,
+            automation_executor,
             update_state: update_state.clone(),
             update_tx: update_tx.clone(),
         };

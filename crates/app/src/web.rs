@@ -40,6 +40,7 @@ pub struct ApiState {
     pub max_sessions: u32,
     pub session_manager: Option<Arc<tasks_session::SessionManager<runtime::AppleContainerRuntime>>>,
     pub completions_service: Option<Arc<CompletionsService>>,
+    pub automation_executor: Option<Arc<server::AutomationExecutor>>,
     pub update_state: Arc<UpdateState>,
     pub update_tx: tokio::sync::mpsc::Sender<()>,
 }
@@ -1481,6 +1482,21 @@ async fn trigger_automation(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<models::automation::AutomationRun>, ApiError> {
+    // Get the automation first to validate it exists
+    let automation = state
+        .server
+        .get_automation(&id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("automation not found: {}", id)))?;
+
+    // Get the project for the automation
+    let project = state
+        .server
+        .get_project(&automation.project_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("project not found: {}", automation.project_id)))?;
+
+    // Create the run
     let run = state
         .server
         .create_automation_run(&id)
@@ -1491,6 +1507,67 @@ async fn trigger_automation(
             }
             _ => ApiError::Server(e),
         })?;
+
+    // If executor is available, spawn the execution in background
+    if let Some(executor) = &state.automation_executor {
+        let run_id = run.id.clone();
+        let automation_id = automation.id.clone();
+        let server = state.server.clone();
+        let executor = executor.clone();
+        let event_bus = server.event_bus.clone();
+        let context = server::ExecutionContext::default();
+
+        tokio::spawn(async move {
+            // Use streaming execution to emit output events in real-time
+            let result = executor.execute_streaming(
+                &automation,
+                &project,
+                &context,
+                |chunk| {
+                    // Emit output event for each chunk (fire-and-forget)
+                    let event = events::Event::new(
+                        events::EventType::AutomationRunOutput,
+                        &run_id,
+                        Actor::System,
+                        serde_json::json!({
+                            "automation_id": &automation_id,
+                            "chunk": chunk,
+                        }),
+                    );
+                    // Try to publish but don't block on it
+                    let bus = event_bus.clone();
+                    let _ = tokio::spawn(async move {
+                        let _ = bus.publish(event).await;
+                    });
+                },
+            ).await;
+
+            match result {
+                Ok(exec_result) => {
+                    if let Err(e) = server.complete_automation_run(&run_id, Some(exec_result.output)).await {
+                        tracing::error!(run_id = %run_id, error = %e, "Failed to complete automation run");
+                    }
+                }
+                Err(e) => {
+                    if let Err(e2) = server.fail_automation_run(&run_id, e.to_string()).await {
+                        tracing::error!(run_id = %run_id, error = %e2, "Failed to mark automation run as failed");
+                    }
+                }
+            }
+        });
+    } else {
+        // No executor available, fail the run immediately
+        let run_id = run.id.clone();
+        let server = state.server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.fail_automation_run(
+                &run_id,
+                "Automation executor not available (ANTHROPIC_API_KEY not set)",
+            ).await {
+                tracing::error!(run_id = %run_id, error = %e, "Failed to mark automation run as failed");
+            }
+        });
+    }
 
     Ok(Json(run))
 }

@@ -14,6 +14,7 @@ pub mod workflow_watcher;
 pub mod dispatcher;
 pub mod scheduler;
 pub mod workspace;
+pub mod automation_executor;
 mod server;
 
 pub use mode::Mode;
@@ -25,3 +26,4 @@ pub use workspace::{
     find_cleanup_candidates, is_stale_cleanup, is_terminal_state_cleanup,
     DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_CONFLICT_MAX_AGE_SECS, DEFAULT_STALE_THRESHOLD_SECS,
 };
+pub use automation_executor::{AutomationExecutor, ExecutionContext, ExecutionError, ExecutionResult};
