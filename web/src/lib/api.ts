@@ -3,6 +3,7 @@ import type {
   MergeQueueEntry,
   Mode,
   Project,
+  Session,
   Snapshot,
   Task,
   UpdateStatus,
@@ -45,6 +46,10 @@ export function fetchProjects(): Promise<Project[]> {
 
 export function fetchMergeQueue(): Promise<MergeQueueEntry[]> {
   return request<MergeQueueEntry[]>("/api/merge-queue");
+}
+
+export function fetchSessions(): Promise<Session[]> {
+  return request<Session[]>("/api/sessions");
 }
 
 export function fetchMode(): Promise<{ mode: Mode }> {

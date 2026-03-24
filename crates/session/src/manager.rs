@@ -41,6 +41,17 @@ pub(crate) enum SessionCommand {
     Stop,
 }
 
+/// Snapshot of session info for external consumption.
+#[derive(Debug, Clone)]
+pub struct SessionInfoSnapshot {
+    /// Task ID this session is executing.
+    pub task_id: String,
+    /// Container ID for this session.
+    pub container_id: String,
+    /// Session uptime in seconds.
+    pub uptime_secs: u64,
+}
+
 /// Handle for a running session — tracks metadata and communication channel.
 pub struct SessionHandle {
     /// The task this session is executing.
@@ -138,6 +149,28 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
             .values()
             .max_by_key(|h| h.started_at)
             .map(|h| h.task_id.clone())
+    }
+
+    /// Get session info for all active sessions.
+    ///
+    /// Returns a list of (task_id, container_id, uptime_secs) tuples for all
+    /// active sessions, ordered by longest-running first.
+    pub async fn session_info(&self) -> Vec<SessionInfoSnapshot> {
+        let sessions = self.sessions.read().await;
+        let now = std::time::Instant::now();
+
+        let mut info: Vec<SessionInfoSnapshot> = sessions
+            .values()
+            .map(|h| SessionInfoSnapshot {
+                task_id: h.task_id.clone(),
+                container_id: h.container_id.clone(),
+                uptime_secs: now.duration_since(h.started_at).as_secs(),
+            })
+            .collect();
+
+        // Sort by uptime descending (longest-running first)
+        info.sort_by(|a, b| b.uptime_secs.cmp(&a.uptime_secs));
+        info
     }
 
     /// Send a chat message to a running session (spec §9.2).

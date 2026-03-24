@@ -95,6 +95,18 @@ export interface SlotUtilization {
   max: number;
 }
 
+/** Active container session info. */
+export interface Session {
+  task_id: string;
+  container_id: string;
+  task_title: string;
+  task_state: TaskState;
+  project_id: string;
+  project_repo: string | null;
+  started_at: string;
+  uptime_secs: number;
+}
+
 export interface Snapshot {
   mode: Mode;
   projects: Project[];

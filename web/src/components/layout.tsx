@@ -13,6 +13,7 @@ import {
   Square,
   Pause,
   Play,
+  Container,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { addProject, deleteProject, setMode } from "@/lib/api";
@@ -423,6 +424,7 @@ export function Layout() {
             <div className="space-y-0.5 px-1">
               <SidebarNavItem to="/" icon={LayoutDashboard} label="Dashboard" end />
               <SidebarNavItem to="/tasks" icon={ListTodo} label="Tasks" />
+              <SidebarNavItem to="/containers" icon={Container} label="Containers" />
               <SidebarNavItem to="/merge-queue" icon={GitMerge} label="Merge Queue" />
             </div>
 

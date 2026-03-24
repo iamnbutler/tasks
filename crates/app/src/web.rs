@@ -48,6 +48,7 @@ pub struct ApiState {
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
+        .route("/sessions", get(list_sessions))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}", axum::routing::patch(update_task))
@@ -105,6 +106,27 @@ struct SnapshotResponse {
 struct SlotUtilization {
     active: u32,
     max: u32,
+}
+
+/// Session info for the /api/sessions endpoint.
+#[derive(Serialize)]
+struct SessionInfo {
+    /// Task ID this session is executing.
+    task_id: String,
+    /// Container ID for this session.
+    container_id: String,
+    /// Task title (from task data).
+    task_title: String,
+    /// Current task state.
+    task_state: models::task::TaskState,
+    /// Project ID for the task.
+    project_id: String,
+    /// Project repo name (owner/repo).
+    project_repo: Option<String>,
+    /// Session start time (ISO 8601).
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Session uptime in seconds.
+    uptime_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -331,6 +353,51 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         },
         human_present: state.server.is_human_present(),
     })
+}
+
+/// GET /api/sessions — List active container sessions.
+///
+/// Returns information about all currently running sessions including
+/// container ID, associated task info, and uptime.
+async fn list_sessions(State(state): State<ApiState>) -> Json<Vec<SessionInfo>> {
+    let Some(sm) = state.session_manager.as_ref() else {
+        return Json(Vec::new());
+    };
+
+    // Get session info snapshots (already sorted by uptime descending)
+    let session_snapshots = sm.session_info().await;
+
+    // Read server state for task/project info
+    let server_state = state.server.state.read().await;
+    let wall_clock_now = chrono::Utc::now();
+
+    let sessions: Vec<SessionInfo> = session_snapshots
+        .into_iter()
+        .filter_map(|snapshot| {
+            let task = server_state.tasks.get(&snapshot.task_id)?;
+            let project_repo = server_state
+                .projects
+                .get(&task.project)
+                .map(|p| p.repo.clone());
+
+            // Approximate start time by subtracting uptime from current wall clock
+            let uptime_duration = chrono::Duration::seconds(snapshot.uptime_secs as i64);
+            let started_at = wall_clock_now - uptime_duration;
+
+            Some(SessionInfo {
+                task_id: snapshot.task_id,
+                container_id: snapshot.container_id,
+                task_title: task.title.clone(),
+                task_state: task.state.clone(),
+                project_id: task.project.clone(),
+                project_repo,
+                started_at,
+                uptime_secs: snapshot.uptime_secs,
+            })
+        })
+        .collect();
+
+    Json(sessions)
 }
 
 /// GET /api/tasks — List all tasks.
