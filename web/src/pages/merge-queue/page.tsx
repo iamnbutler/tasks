@@ -20,27 +20,26 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { columns } from "./columns";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { columns, lifecyclePhases, type LifecyclePhase } from "./columns";
+import type { MergeQueueEntry } from "@/lib/types";
 
-export function MergeQueuePage() {
-  const { snapshot, refreshSnapshot, filteredMergeQueue, selectedProject } = useAppState();
-  const [flushing, setFlushing] = useState(false);
+function MergeTable({
+  entries,
+  selectedProject,
+  refreshSnapshot,
+  snapshot,
+}: {
+  entries: MergeQueueEntry[];
+  selectedProject: string | null;
+  refreshSnapshot: () => Promise<void>;
+  snapshot: NonNullable<ReturnType<typeof useAppState>["snapshot"]>;
+}) {
   const [pagination, setPagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: 50,
   });
-  const [sorting] = useState<SortingState>([
-    { id: "status", desc: false },
-  ]);
-
-  const entries = filteredMergeQueue;
-
-  const approvedCount = useMemo(
-    () => entries.filter((e) => e.status === "approved").length,
-    [entries],
-  );
-
-  const isPaused = snapshot?.mode === "pause";
+  const [sorting] = useState<SortingState>([{ id: "status", desc: false }]);
 
   const table = useReactTable({
     data: entries,
@@ -57,10 +56,110 @@ export function MergeQueuePage() {
     onPaginationChange: setPagination,
     meta: {
       refreshSnapshot,
-      tasks: snapshot?.tasks ?? [],
-      projects: snapshot?.projects ?? [],
+      tasks: snapshot.tasks ?? [],
+      projects: snapshot.projects ?? [],
     },
   });
+
+  if (entries.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <p className="text-sm text-muted-foreground">No entries in this phase.</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <Table>
+        <TableHeader>
+          {table.getHeaderGroups().map((headerGroup) => (
+            <TableRow key={headerGroup.id}>
+              {headerGroup.headers.map((header) => (
+                <TableHead key={header.id}>
+                  {header.isPlaceholder
+                    ? null
+                    : flexRender(header.column.columnDef.header, header.getContext())}
+                </TableHead>
+              ))}
+            </TableRow>
+          ))}
+        </TableHeader>
+        <TableBody>
+          {table.getRowModel().rows.map((row) => (
+            <TableRow key={row.id}>
+              {row.getVisibleCells().map((cell) => (
+                <TableCell key={cell.id}>
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </TableCell>
+              ))}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+
+      {table.getPageCount() > 1 && (
+        <div className="flex items-center justify-between px-4 py-2 border-t">
+          <span className="text-xs text-muted-foreground">
+            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => table.previousPage()}
+              disabled={!table.getCanPreviousPage()}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => table.nextPage()}
+              disabled={!table.getCanNextPage()}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+export function MergeQueuePage() {
+  const { snapshot, refreshSnapshot, filteredMergeQueue, selectedProject } = useAppState();
+  const [flushing, setFlushing] = useState(false);
+  const [activeTab, setActiveTab] = useState<LifecyclePhase>("review");
+
+  const entries = filteredMergeQueue;
+
+  // Group entries by lifecycle phase
+  const groupedEntries = useMemo(() => {
+    const groups: Record<LifecyclePhase, MergeQueueEntry[]> = {
+      review: [],
+      queue: [],
+      completed: [],
+    };
+
+    for (const entry of entries) {
+      const statuses = lifecyclePhases.review.statuses;
+      if (statuses.includes(entry.status)) {
+        groups.review.push(entry);
+      } else if (lifecyclePhases.queue.statuses.includes(entry.status)) {
+        groups.queue.push(entry);
+      } else if (lifecyclePhases.completed.statuses.includes(entry.status)) {
+        groups.completed.push(entry);
+      }
+    }
+
+    return groups;
+  }, [entries]);
+
+  const approvedCount = groupedEntries.queue.length;
+  const isPaused = snapshot?.mode === "pause";
 
   async function handleFlush() {
     setFlushing(true);
@@ -101,71 +200,37 @@ export function MergeQueuePage() {
         )}
       </div>
 
-      {/* Table */}
-      <ScrollArea className="flex-1">
-        {entries.length === 0 ? (
-          <div className="flex items-center justify-center py-20">
-            <p className="text-sm text-muted-foreground">No entries in the merge queue.</p>
-          </div>
-        ) : (
-          <>
-            <Table>
-              <TableHeader>
-                {table.getHeaderGroups().map((headerGroup) => (
-                  <TableRow key={headerGroup.id}>
-                    {headerGroup.headers.map((header) => (
-                      <TableHead key={header.id}>
-                        {header.isPlaceholder
-                          ? null
-                          : flexRender(header.column.columnDef.header, header.getContext())}
-                      </TableHead>
-                    ))}
-                  </TableRow>
-                ))}
-              </TableHeader>
-              <TableBody>
-                {table.getRowModel().rows.map((row) => (
-                  <TableRow key={row.id}>
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell key={cell.id}>
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-
-            {table.getPageCount() > 1 && (
-              <div className="flex items-center justify-between px-4 py-2 border-t">
-                <span className="text-xs text-muted-foreground">
-                  Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
-                </span>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    onClick={() => table.previousPage()}
-                    disabled={!table.getCanPreviousPage()}
-                  >
-                    Previous
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    onClick={() => table.nextPage()}
-                    disabled={!table.getCanNextPage()}
-                  >
-                    Next
-                  </Button>
-                </div>
-              </div>
+      {/* Tabs */}
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => setActiveTab(v as LifecyclePhase)}
+        className="flex flex-col flex-1 min-h-0"
+      >
+        <div className="px-4 pt-3 pb-1 border-b border-border">
+          <TabsList variant="line">
+            {(Object.entries(lifecyclePhases) as [LifecyclePhase, typeof lifecyclePhases.review][]).map(
+              ([phase, config]) => (
+                <TabsTrigger key={phase} value={phase}>
+                  {config.label} ({groupedEntries[phase].length})
+                </TabsTrigger>
+              )
             )}
-          </>
-        )}
-      </ScrollArea>
+          </TabsList>
+        </div>
+
+        <ScrollArea className="flex-1">
+          {(Object.keys(lifecyclePhases) as LifecyclePhase[]).map((phase) => (
+            <TabsContent key={phase} value={phase} className="m-0">
+              <MergeTable
+                entries={groupedEntries[phase]}
+                selectedProject={selectedProject}
+                refreshSnapshot={refreshSnapshot}
+                snapshot={snapshot}
+              />
+            </TabsContent>
+          ))}
+        </ScrollArea>
+      </Tabs>
     </div>
   );
 }
