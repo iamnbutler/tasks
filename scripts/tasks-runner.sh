@@ -449,7 +449,7 @@ health_check() {
             return 0
         fi
         sleep 2
-        ((attempts++))
+        attempts=$((attempts + 1))
     done
 
     log_warn "Health check timed out after ${HEALTH_TIMEOUT}s"
