@@ -104,15 +104,21 @@ function AutomationRow({
     try {
       await triggerAutomation(automation.id);
       await onRefresh();
+    } catch (error) {
+      console.error("Failed to run automation:", error);
     } finally {
       setRunning(false);
     }
   }
 
   async function handleToggleState() {
-    const newState: AutomationState = automation.state === "active" ? "paused" : "active";
-    await updateAutomation(automation.id, { state: newState });
-    await onRefresh();
+    try {
+      const newState: AutomationState = automation.state === "active" ? "paused" : "active";
+      await updateAutomation(automation.id, { state: newState });
+      await onRefresh();
+    } catch (error) {
+      console.error("Failed to toggle automation state:", error);
+    }
   }
 
   async function handleDelete() {
@@ -121,6 +127,8 @@ function AutomationRow({
       await deleteAutomation(automation.id);
       await onRefresh();
       setDeleteOpen(false);
+    } catch (error) {
+      console.error("Failed to delete automation:", error);
     } finally {
       setDeleting(false);
     }
