@@ -1,4 +1,5 @@
 import type {
+  ContainerInfo,
   Event,
   MergeQueueEntry,
   Mode,
@@ -45,6 +46,10 @@ export function fetchProjects(): Promise<Project[]> {
 
 export function fetchMergeQueue(): Promise<MergeQueueEntry[]> {
   return request<MergeQueueEntry[]>("/api/merge-queue");
+}
+
+export function fetchContainers(): Promise<ContainerInfo[]> {
+  return request<ContainerInfo[]>("/api/containers");
 }
 
 export function fetchMode(): Promise<{ mode: Mode }> {

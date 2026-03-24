@@ -117,3 +117,11 @@ export interface UpdateStatus {
   last_checked?: string;
   applying?: boolean;
 }
+
+/** Information about an active container session */
+export interface ContainerInfo {
+  container_id: string;
+  task_id: string;
+  started_at: string;
+  uptime_secs: number;
+}

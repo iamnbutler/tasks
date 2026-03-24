@@ -9,4 +9,4 @@ mod manager;
 
 pub use accounting::{TokenParser, TokenTracker, TokenUsage};
 pub use interpreter::{OutputInterpreter, OutputSignal, emit_signal_events};
-pub use manager::{SessionManager, SessionManagerError, SessionHandle};
+pub use manager::{ContainerInfo, SessionManager, SessionManagerError, SessionHandle};
