@@ -6,7 +6,9 @@
 //! - Conflicts: Are there merge conflicts?
 //! - Conventions: Does the change meet project standards?
 
-use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
+use crate::types::QueuedPrSummary;
+use models::merge_queue::MergeStatus;
+use tasks_github::model::{Issue, MergeableState, PullRequest, ReviewDecision};
 
 /// Build the system prompt for quality evaluation.
 pub fn system_prompt() -> String {
@@ -62,7 +64,16 @@ Response format for Pass 2 is the same, but `needs_deeper_review` must be false.
 - Look at what the diff actually does, not what the PR says it does.
 - For feature removals: check if anything in the diff's context still references the removed feature.
 - For large diffs: if truncated, lean toward requesting deeper review rather than approving blind.
-- Be concise but specific. If rejecting, point to exact lines/hunks in the diff."#.to_string()
+- Be concise but specific. If rejecting, point to exact lines/hunks in the diff.
+
+## Queue awareness
+
+You will be shown other PRs currently in the merge queue. Consider:
+- **Dependencies**: Does this PR depend on changes from another queued PR? If so, it should wait.
+- **Conflicts**: Will this PR conflict with another queued PR if merged first? Consider merge order.
+- **Related work**: Are there other PRs touching the same areas? They may need to be coordinated.
+
+If you identify a dependency or ordering issue, explain it in your feedback. The system merges PRs serially, so queue order matters."#.to_string()
 }
 
 /// Build the user prompt with PR and issue context.
@@ -72,6 +83,7 @@ pub fn build_evaluation_prompt(
     task_title: &str,
     task_description: Option<&str>,
     diff: Option<&str>,
+    other_queue_entries: &[QueuedPrSummary],
 ) -> String {
     let mut prompt = String::new();
 
@@ -187,9 +199,40 @@ pub fn build_evaluation_prompt(
         prompt.push_str("**No diff available.** Evaluate based on metadata only, and lean toward requesting deeper review.\n\n");
     }
 
+    // Queue context — other PRs waiting for merge
+    if !other_queue_entries.is_empty() {
+        prompt.push_str("## Other PRs in Merge Queue\n\n");
+        prompt.push_str("These PRs are also pending or approved in the merge queue. Consider whether this PR depends on or conflicts with any of them.\n\n");
+
+        for entry in other_queue_entries {
+            let status_str = match entry.status {
+                MergeStatus::Pending => "Pending review".to_string(),
+                MergeStatus::Approved => {
+                    if let Some(pos) = entry.queue_position {
+                        format!("Approved (position #{})", pos)
+                    } else {
+                        "Approved".to_string()
+                    }
+                }
+                MergeStatus::Merging => "Currently merging".to_string(),
+                MergeStatus::ChangesRequested => "Changes requested".to_string(),
+                MergeStatus::Conflict => "Has conflicts".to_string(),
+                _ => "Other".to_string(),
+            };
+            prompt.push_str(&format!(
+                "- **{}**: {} — {}\n",
+                entry.task_title, status_str, entry.pr_url
+            ));
+        }
+        prompt.push('\n');
+    }
+
     prompt.push_str("## Evaluation Request\n\n");
     prompt.push_str("Review the diff above against the issue requirements. ");
     prompt.push_str("Evaluate correctness, completeness, and whether this actually solves the issue. ");
+    if !other_queue_entries.is_empty() {
+        prompt.push_str("Also consider whether this PR has dependencies on other queued PRs or potential conflicts with them. ");
+    }
     prompt.push_str("Respond with your evaluation in the JSON format specified in your instructions.");
 
     prompt
@@ -206,9 +249,17 @@ pub fn build_deep_review_prompt(
     diff: &str,
     review_reasoning: &str,
     files: &[(String, String)],
+    other_queue_entries: &[QueuedPrSummary],
 ) -> String {
     // Start with the same base prompt
-    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, Some(diff));
+    let mut prompt = build_evaluation_prompt(
+        pr,
+        issue,
+        task_title,
+        task_description,
+        Some(diff),
+        other_queue_entries,
+    );
 
     // Add the reviewer's reasoning from pass 1
     prompt.push_str("\n## Previous Review Notes\n\n");
@@ -394,7 +445,7 @@ mod tests {
     #[test]
     fn test_build_evaluation_prompt_basic() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None, None);
+        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None, None, &[]);
 
         // Should contain task info
         assert!(prompt.contains("Fix auth bug"));
@@ -422,6 +473,7 @@ mod tests {
             "Fix auth bug",
             Some("Fix the timeout issue"),
             None,
+            &[],
         );
 
         // Should contain issue info
@@ -438,7 +490,7 @@ mod tests {
         let mut pr = test_pr();
         pr.mergeable = Some(MergeableState::Conflicting);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
         assert!(prompt.contains("has conflicts"));
     }
 
@@ -447,14 +499,14 @@ mod tests {
         let mut pr = test_pr();
         pr.review_decision = Some(ReviewDecision::ChangesRequested);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
         assert!(prompt.contains("Changes requested"));
     }
 
     #[test]
     fn test_build_evaluation_prompt_with_reviews() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
 
         // Should contain review info
         assert!(prompt.contains("@testuser"));
@@ -478,6 +530,7 @@ mod tests {
             "Fix auth bug",
             None,
             Some("diff --git a/src/auth.rs b/src/auth.rs\n-old\n+new"),
+            &[],
         );
         assert!(prompt.contains("## Diff"));
         assert!(prompt.contains("-old"));
@@ -487,7 +540,7 @@ mod tests {
     #[test]
     fn test_build_evaluation_prompt_no_diff_notes_absence() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
         assert!(prompt.contains("No diff available"));
     }
 
@@ -505,10 +558,59 @@ mod tests {
             "diff content here",
             "I need to see src/auth.rs to verify the login flow is complete",
             &files,
+            &[],
         );
         assert!(prompt.contains("## Requested Files"));
         assert!(prompt.contains("src/auth.rs"));
         assert!(prompt.contains("fn login()"));
         assert!(prompt.contains("Previous Review Notes"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_queue_context() {
+        use crate::types::QueuedPrSummary;
+        use chrono::Utc;
+
+        let pr = test_pr();
+        let other_entries = vec![
+            QueuedPrSummary {
+                pr_url: "https://github.com/owner/repo/pull/41".to_string(),
+                task_title: "Add logging".to_string(),
+                status: MergeStatus::Approved,
+                queued_at: Utc::now(),
+                queue_position: Some(1),
+            },
+            QueuedPrSummary {
+                pr_url: "https://github.com/owner/repo/pull/40".to_string(),
+                task_title: "Fix database connection".to_string(),
+                status: MergeStatus::Pending,
+                queued_at: Utc::now(),
+                queue_position: None,
+            },
+        ];
+
+        let prompt = build_evaluation_prompt(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            None,
+            &other_entries,
+        );
+
+        // Should contain queue context section
+        assert!(prompt.contains("Other PRs in Merge Queue"));
+        assert!(prompt.contains("Add logging"));
+        assert!(prompt.contains("Approved (position #1)"));
+        assert!(prompt.contains("Fix database connection"));
+        assert!(prompt.contains("Pending review"));
+    }
+
+    #[test]
+    fn test_system_prompt_includes_queue_awareness() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("Queue awareness"));
+        assert!(prompt.contains("Dependencies"));
+        assert!(prompt.contains("queue order matters"));
     }
 }

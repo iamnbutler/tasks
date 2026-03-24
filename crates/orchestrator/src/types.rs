@@ -4,10 +4,29 @@
 //! QualityEvaluation: what the orchestrator returns.
 //! ConflictTriage: conflict resolution decision (spec §7.4).
 
-use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
+use chrono::{DateTime, Utc};
+use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry, MergeStatus};
 use models::project::Project;
 use models::task::Task;
 use serde::{Deserialize, Serialize};
+
+/// Summary of another PR in the merge queue.
+///
+/// Used to provide context about other pending work when evaluating a PR,
+/// so the orchestrator can consider queue ordering and potential conflicts.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueuedPrSummary {
+    /// The PR URL.
+    pub pr_url: String,
+    /// The associated task's title.
+    pub task_title: String,
+    /// Current status in the queue.
+    pub status: MergeStatus,
+    /// When this PR was queued.
+    pub queued_at: DateTime<Utc>,
+    /// Queue position (1-indexed) for approved entries awaiting merge.
+    pub queue_position: Option<u32>,
+}
 
 /// Context for evaluating a merge queue entry.
 ///
@@ -21,6 +40,11 @@ pub struct EvaluationContext {
     pub task: Task,
     /// The project this task belongs to.
     pub project: Project,
+    /// Other PRs currently in the merge queue for the same project.
+    /// Includes both pending and approved PRs (excluding the current entry).
+    /// This allows the orchestrator to consider queue ordering and detect
+    /// potential conflicts or dependencies between PRs.
+    pub other_queue_entries: Vec<QueuedPrSummary>,
 }
 
 /// Verdict from the orchestrator's quality evaluation.

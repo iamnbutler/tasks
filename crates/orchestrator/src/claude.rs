@@ -183,6 +183,7 @@ impl Orchestrator for ClaudeOrchestrator {
             &context.task.title,
             context.task.description.as_deref(),
             diff.as_deref(),
+            &context.other_queue_entries,
         );
 
         let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);
@@ -252,6 +253,7 @@ impl Orchestrator for ClaudeOrchestrator {
             diff.as_deref().unwrap_or("(no diff available)"),
             &pass1.reasoning,
             &files,
+            &context.other_queue_entries,
         );
 
         let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);

@@ -22,7 +22,7 @@ use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
     ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
-    OrchestratorChat,
+    OrchestratorChat, QueuedPrSummary,
 };
 
 use crate::config::AppConfig;
@@ -1379,7 +1379,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             {
             let (entry_id, task_id, pr_url) = (entry_id, task_id, pr_url);
                 // Build evaluation context
-                let (task, project) = {
+                let (task, project, other_queue_entries) = {
                     let state = orch_server.state.read().await;
                     let task = match state.tasks.get(&task_id) {
                         Some(t) => t.clone(),
@@ -1389,7 +1389,36 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         Some(p) => p.clone(),
                         None => continue,
                     };
-                    (task, project)
+
+                    // Collect other queue entries for the same project (excluding the current one)
+                    let other_entries: Vec<QueuedPrSummary> = state
+                        .merge_queue
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            // Exclude the current entry
+                            e.id != entry_id
+                        })
+                        .filter_map(|e| {
+                            // Get the associated task to check project and get title
+                            state.tasks.get(&e.task_id).and_then(|t| {
+                                // Only include entries from the same project
+                                if t.project == task.project {
+                                    Some(QueuedPrSummary {
+                                        pr_url: e.pr_url.clone(),
+                                        task_title: t.title.clone(),
+                                        status: e.status,
+                                        queued_at: e.queued_at,
+                                        queue_position: e.queue_position,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+
+                    (task, project, other_entries)
                 };
 
                 let (entry, entry_head_sha) = {
@@ -1404,6 +1433,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     entry,
                     task: task.clone(),
                     project,
+                    other_queue_entries,
                 };
 
                 // Evaluate

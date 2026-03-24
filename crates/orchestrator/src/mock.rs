@@ -113,6 +113,7 @@ mod tests {
             entry: MergeQueueEntry::new("mq-1", "task-1", "https://github.com/owner/repo/pull/1"),
             task: Task::new("task-1", TaskSource::Internal, "Test task", "proj-1"),
             project: Project::new("proj-1", "owner/repo"),
+            other_queue_entries: Vec::new(),
         }
     }
 
