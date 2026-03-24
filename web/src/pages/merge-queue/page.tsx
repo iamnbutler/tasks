@@ -1,30 +1,173 @@
 import { useMemo, useState } from "react";
-import {
-  type PaginationState,
-  type SortingState,
-  useReactTable,
-  getCoreRowModel,
-  getPaginationRowModel,
-  getSortedRowModel,
-  flexRender,
-} from "@tanstack/react-table";
+import { Link } from "react-router-dom";
+import { ExternalLink, Check, X } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { flushMergeQueue } from "@/lib/api";
+import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
+import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ListView, ListEmptyState } from "@/components/ui/list-view";
+import { ListHeader, ListHeaderTabs } from "@/components/ui/list-header";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { columns, lifecyclePhases, type LifecyclePhase } from "./columns";
-import type { MergeQueueEntry } from "@/lib/types";
+  ListRow,
+  LinkCell,
+  TextCell,
+  BadgeCell,
+  TimeCell,
+  IdCell,
+  ProjectCell,
+  ActionsCell,
+} from "@/components/ui/list-row";
+import {
+  lifecyclePhases,
+  type LifecyclePhase,
+  statusBadge,
+  prNumber,
+  prRepo,
+  prRepoShort,
+  getTask,
+} from "./columns";
+import type { MergeQueueEntry, Project, Task } from "@/lib/types";
 
-function MergeTable({
+// ---------------------------------------------------------------------------
+// Merge Queue Row
+// ---------------------------------------------------------------------------
+
+function MergeQueueRow({
+  entry,
+  tasks,
+  projects,
+  showProject,
+  onRefresh,
+}: {
+  entry: MergeQueueEntry;
+  tasks: Task[];
+  projects: Project[];
+  showProject: boolean;
+  onRefresh: () => Promise<void>;
+}) {
+  const task = getTask(entry.task_id, tasks);
+  const num = prNumber(entry.pr_url);
+
+  // Get project name
+  let projectName = task?.project ? projectLabel(task.project, projects) : null;
+  if (!projectName) {
+    projectName = prRepoShort(entry.pr_url) ?? "\u2014";
+  }
+  const shortProject = projectName.includes("/") ? projectName.split("/")[1] : projectName;
+
+  // Get linked issue info
+  let issueLink: { url: string; number: number } | null = null;
+  if (task?.source.type === "github_issue") {
+    const { source } = task;
+    issueLink = {
+      url: `https://github.com/${source.owner}/${source.repo}/issues/${source.number}`,
+      number: source.number,
+    };
+  }
+
+  async function handleApprove() {
+    await approveMerge(entry.id);
+    onRefresh();
+  }
+
+  async function handleReject() {
+    await rejectMerge(entry.id);
+    onRefresh();
+  }
+
+  return (
+    <ListRow>
+      {/* PR number */}
+      {num ? (
+        <LinkCell href={entry.pr_url} icon={<ExternalLink className="h-3 w-3" />} className="w-16">
+          #{num}
+        </LinkCell>
+      ) : (
+        <IdCell width="w-16">{"\u2014"}</IdCell>
+      )}
+
+      {/* Title */}
+      <TextCell>
+        {task ? (
+          <Link
+            to={`/tasks/${entry.task_id}`}
+            className="hover:underline truncate block"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {task.title}
+          </Link>
+        ) : (
+          <a
+            href={entry.pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-muted-foreground hover:underline truncate block"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {prRepo(entry.pr_url)}#{num}
+          </a>
+        )}
+      </TextCell>
+
+      {/* Project */}
+      {showProject && <ProjectCell>{shortProject}</ProjectCell>}
+
+      {/* Status */}
+      <BadgeCell>{statusBadge(entry.status)}</BadgeCell>
+
+      {/* Queue position */}
+      <IdCell width="w-12">
+        {entry.queue_position !== undefined && entry.queue_position !== null
+          ? `#${entry.queue_position}`
+          : "\u2014"}
+      </IdCell>
+
+      {/* Linked issue */}
+      {issueLink ? (
+        <LinkCell href={issueLink.url} icon={<ExternalLink className="h-3 w-3" />} className="w-16">
+          #{issueLink.number}
+        </LinkCell>
+      ) : (
+        <IdCell width="w-16">{"\u2014"}</IdCell>
+      )}
+
+      {/* Queued time */}
+      <TimeCell width="w-20">{formatRelativeTime(entry.queued_at)}</TimeCell>
+
+      {/* Actions */}
+      {entry.status === "pending" && (
+        <ActionsCell>
+          <div className="inline-flex items-center rounded-md border border-border">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1 rounded-r-none border-r border-border"
+              onClick={handleApprove}
+            >
+              <Check className="h-3.5 w-3.5" />
+              Approve
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1 rounded-l-none"
+              onClick={handleReject}
+            >
+              <X className="h-3.5 w-3.5" />
+              Reject
+            </Button>
+          </div>
+        </ActionsCell>
+      )}
+    </ListRow>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Merge List (with pagination)
+// ---------------------------------------------------------------------------
+
+function MergeList({
   entries,
   selectedProject,
   refreshSnapshot,
@@ -35,81 +178,50 @@ function MergeTable({
   refreshSnapshot: () => Promise<void>;
   snapshot: NonNullable<ReturnType<typeof useAppState>["snapshot"]>;
 }) {
-  const [pagination, setPagination] = useState<PaginationState>({
-    pageIndex: 0,
-    pageSize: 50,
-  });
-  const [sorting] = useState<SortingState>([{ id: "status", desc: false }]);
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
 
-  const table = useReactTable({
-    data: entries,
-    columns,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    state: {
-      sorting,
-      pagination,
-      columnVisibility: selectedProject ? { project: false } : {},
-    },
-    autoResetPageIndex: false,
-    onPaginationChange: setPagination,
-    meta: {
-      refreshSnapshot,
-      tasks: snapshot.tasks ?? [],
-      projects: snapshot.projects ?? [],
-    },
-  });
+  const tasks = snapshot.tasks ?? [];
+  const projects = snapshot.projects ?? [];
+  const showProject = !selectedProject;
+
+  // Simple pagination
+  const totalPages = Math.ceil(entries.length / pageSize);
+  const paginatedEntries = entries.slice(page * pageSize, (page + 1) * pageSize);
 
   if (entries.length === 0) {
     return (
-      <div className="flex items-center justify-center py-20">
-        <p className="text-sm text-muted-foreground">No entries in this phase.</p>
-      </div>
+      <ListEmptyState message="No entries in this phase." />
     );
   }
 
   return (
     <>
-      <Table>
-        <TableHeader>
-          {table.getHeaderGroups().map((headerGroup) => (
-            <TableRow key={headerGroup.id}>
-              {headerGroup.headers.map((header) => (
-                <TableHead key={header.id}>
-                  {header.isPlaceholder
-                    ? null
-                    : flexRender(header.column.columnDef.header, header.getContext())}
-                </TableHead>
-              ))}
-            </TableRow>
-          ))}
-        </TableHeader>
-        <TableBody>
-          {table.getRowModel().rows.map((row) => (
-            <TableRow key={row.id}>
-              {row.getVisibleCells().map((cell) => (
-                <TableCell key={cell.id}>
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      <div>
+        {paginatedEntries.map((entry) => (
+          <MergeQueueRow
+            key={entry.id}
+            entry={entry}
+            tasks={tasks}
+            projects={projects}
+            showProject={showProject}
+            onRefresh={refreshSnapshot}
+          />
+        ))}
+      </div>
 
-      {table.getPageCount() > 1 && (
+      {totalPages > 1 && (
         <div className="flex items-center justify-between px-4 py-2 border-t">
           <span className="text-xs text-muted-foreground">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+            Page {page + 1} of {totalPages}
           </span>
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
               size="sm"
               className="h-7 text-xs"
-              onClick={() => table.previousPage()}
-              disabled={!table.getCanPreviousPage()}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
             >
               Previous
             </Button>
@@ -117,8 +229,8 @@ function MergeTable({
               variant="outline"
               size="sm"
               className="h-7 text-xs"
-              onClick={() => table.nextPage()}
-              disabled={!table.getCanNextPage()}
+              onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+              disabled={page >= totalPages - 1}
             >
               Next
             </Button>
@@ -173,64 +285,61 @@ export function MergeQueuePage() {
 
   if (!snapshot) {
     return (
-      <div className="flex items-center justify-center h-full py-32">
-        <p className="text-muted-foreground text-sm">Loading...</p>
-      </div>
+      <ListEmptyState message="Loading..." />
     );
   }
 
+  const tabsConfig = (Object.entries(lifecyclePhases) as [LifecyclePhase, typeof lifecyclePhases.review][]).map(
+    ([phase, config]) => ({
+      key: phase,
+      label: config.label,
+      count: groupedEntries[phase].length,
+    })
+  );
+
+  const headerTabs = (
+    <ListHeaderTabs
+      tabs={tabsConfig}
+      activeTab={activeTab}
+      onTabChange={setActiveTab}
+      variant="line"
+      className="mt-1"
+    />
+  );
+
+  const headerActions = isPaused && approvedCount > 0 ? (
+    <Button
+      size="sm"
+      onClick={handleFlush}
+      disabled={flushing}
+      className="h-7 text-xs"
+    >
+      {flushing ? "Flushing..." : `Flush ${approvedCount} approved`}
+    </Button>
+  ) : undefined;
+
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <div className="flex items-center gap-3">
-          <h1 className="text-sm font-semibold">Merge Queue</h1>
-          <span className="text-xs text-muted-foreground">{entries.length} entries</span>
+    <ListView
+      header={
+        <div className="border-b border-border">
+          <ListHeader
+            title="Merge Queue"
+            count={entries.length}
+            countLabel="entries"
+            actions={headerActions}
+          />
+          <div className="px-4 pb-1">
+            {headerTabs}
+          </div>
         </div>
-
-        {isPaused && approvedCount > 0 && (
-          <Button
-            size="sm"
-            onClick={handleFlush}
-            disabled={flushing}
-            className="h-7 text-xs"
-          >
-            {flushing ? "Flushing..." : `Flush ${approvedCount} approved`}
-          </Button>
-        )}
-      </div>
-
-      {/* Tabs */}
-      <Tabs
-        value={activeTab}
-        onValueChange={(v) => setActiveTab(v as LifecyclePhase)}
-        className="flex flex-col flex-1 min-h-0"
-      >
-        <div className="px-4 pt-3 pb-1 border-b border-border">
-          <TabsList variant="line">
-            {(Object.entries(lifecyclePhases) as [LifecyclePhase, typeof lifecyclePhases.review][]).map(
-              ([phase, config]) => (
-                <TabsTrigger key={phase} value={phase}>
-                  {config.label} ({groupedEntries[phase].length})
-                </TabsTrigger>
-              )
-            )}
-          </TabsList>
-        </div>
-
-        <ScrollArea className="flex-1">
-          {(Object.keys(lifecyclePhases) as LifecyclePhase[]).map((phase) => (
-            <TabsContent key={phase} value={phase} className="m-0">
-              <MergeTable
-                entries={groupedEntries[phase]}
-                selectedProject={selectedProject}
-                refreshSnapshot={refreshSnapshot}
-                snapshot={snapshot}
-              />
-            </TabsContent>
-          ))}
-        </ScrollArea>
-      </Tabs>
-    </div>
+      }
+    >
+      <MergeList
+        entries={groupedEntries[activeTab]}
+        selectedProject={selectedProject}
+        refreshSnapshot={refreshSnapshot}
+        snapshot={snapshot}
+      />
+    </ListView>
   );
 }

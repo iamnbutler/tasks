@@ -5,16 +5,21 @@ import { useAppState } from "@/hooks/use-app-state";
 import { fetchContainers } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { cn } from "@/lib/utils";
+import {
+  ListView,
+  ListEmptyState,
+  ListErrorState,
+} from "@/components/ui/list-view";
+import { ListHeader, ListHeaderBadge } from "@/components/ui/list-header";
+import {
+  ListRow,
+  IdCell,
+  BadgeCell,
+  TimeCell,
+  TextCell,
+  ActionsCell,
+} from "@/components/ui/list-row";
 import type { ContainerInfo, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -63,6 +68,57 @@ function stateColor(state: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// Container row component
+// ---------------------------------------------------------------------------
+
+function ContainerRow({
+  container,
+  tasks,
+  onViewTask,
+}: {
+  container: ContainerInfo;
+  tasks: Task[];
+  onViewTask: (taskId: string) => void;
+}) {
+  const taskTitle = getTaskTitle(tasks, container.task_id);
+  const taskState = getTaskState(tasks, container.task_id);
+
+  return (
+    <ListRow onRowClick={() => onViewTask(container.task_id)}>
+      <IdCell width="w-28">{container.container_id.slice(0, 12)}</IdCell>
+      <BadgeCell>
+        <Badge
+          variant="outline"
+          className={cn("text-xs capitalize", stateColor(taskState))}
+        >
+          {taskState ?? "unknown"}
+        </Badge>
+      </BadgeCell>
+      <TimeCell width="w-24" icon={<Clock className="h-3 w-3" />}>
+        {formatUptime(container.uptime_secs)}
+      </TimeCell>
+      <TextCell>
+        <span className="truncate" title={taskTitle ?? undefined}>
+          {taskTitle ?? "Unknown task"}
+        </span>
+      </TextCell>
+      <IdCell width="w-20">{container.task_id.slice(0, 8)}</IdCell>
+      <ActionsCell>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 text-xs gap-1"
+          onClick={() => onViewTask(container.task_id)}
+        >
+          <ExternalLink className="h-3 w-3" />
+          View
+        </Button>
+      </ActionsCell>
+    </ListRow>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Containers page
 // ---------------------------------------------------------------------------
 
@@ -103,105 +159,63 @@ export function ContainersPage() {
     navigate(`/tasks/${taskId}`);
   };
 
-  return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <div className="flex items-center gap-3">
-          <h1 className="text-sm font-semibold">Containers</h1>
-          <Badge variant="outline" className="text-xs">
-            {containers.length} active
-          </Badge>
-        </div>
+  const headerActions = (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={handleRefresh}
+      disabled={loading}
+      className="gap-1.5 h-7 text-xs"
+    >
+      <RefreshCw className={cn("h-3 w-3", loading && "animate-spin")} />
+      Refresh
+    </Button>
+  );
 
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={handleRefresh}
-          disabled={loading}
-          className="gap-1.5 h-7 text-xs"
-        >
-          <RefreshCw className={cn("h-3 w-3", loading && "animate-spin")} />
-          Refresh
-        </Button>
+  const renderContent = () => {
+    if (error) {
+      return <ListErrorState message={error} onRetry={handleRefresh} />;
+    }
+
+    if (containers.length === 0) {
+      return (
+        <ListEmptyState
+          icon={<Box className="h-6 w-6 text-muted-foreground" />}
+          message={loading ? "Loading containers..." : "No active containers"}
+        />
+      );
+    }
+
+    return (
+      <div>
+        {containers.map((container) => (
+          <ContainerRow
+            key={container.container_id}
+            container={container}
+            tasks={tasks}
+            onViewTask={handleTaskClick}
+          />
+        ))}
       </div>
+    );
+  };
 
-      {/* Containers table */}
-      <ScrollArea className="flex-1">
-        {error ? (
-          <div className="flex items-center justify-center py-20">
-            <p className="text-red-400 text-sm">{error}</p>
-          </div>
-        ) : containers.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-20 gap-3">
-            <Box className="h-10 w-10 text-muted-foreground/50" />
-            <p className="text-muted-foreground text-sm">
-              {loading ? "Loading containers..." : "No active containers"}
-            </p>
-          </div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-[200px]">Container ID</TableHead>
-                <TableHead className="w-[100px]">Status</TableHead>
-                <TableHead className="w-[120px]">Uptime</TableHead>
-                <TableHead>Task</TableHead>
-                <TableHead className="w-[100px]">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {containers.map((container) => {
-                const taskTitle = getTaskTitle(tasks, container.task_id);
-                const taskState = getTaskState(tasks, container.task_id);
-                return (
-                  <TableRow key={container.container_id}>
-                    <TableCell className="font-mono text-xs">
-                      {container.container_id.slice(0, 12)}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant="outline"
-                        className={cn("text-xs capitalize", stateColor(taskState))}
-                      >
-                        {taskState ?? "unknown"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      <div className="flex items-center gap-1.5">
-                        <Clock className="h-3 w-3" />
-                        {formatUptime(container.uptime_secs)}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-col gap-0.5">
-                        <span className="text-sm truncate max-w-[300px]" title={taskTitle ?? undefined}>
-                          {taskTitle ?? "Unknown task"}
-                        </span>
-                        <span className="font-mono text-xs text-muted-foreground">
-                          {container.task_id.slice(0, 8)}
-                        </span>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 text-xs gap-1"
-                        onClick={() => handleTaskClick(container.task_id)}
-                      >
-                        <ExternalLink className="h-3 w-3" />
-                        View Task
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        )}
-      </ScrollArea>
-    </div>
+  return (
+    <ListView
+      header={
+        <ListHeader
+          title="Containers"
+          actions={
+            <div className="flex items-center gap-2">
+              <ListHeaderBadge count={containers.length} label="active" />
+              {headerActions}
+            </div>
+          }
+        />
+      }
+    >
+      {renderContent()}
+    </ListView>
   );
 }
 

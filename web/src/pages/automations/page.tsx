@@ -18,7 +18,6 @@ import { deleteAutomation, triggerAutomation, updateAutomation } from "@/lib/api
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -34,6 +33,21 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  ListView,
+  ListEmptyState,
+  ListSplitView,
+} from "@/components/ui/list-view";
+import { ListHeader } from "@/components/ui/list-header";
+import {
+  ListRow,
+  IconCell,
+  TextCell,
+  BadgeCell,
+  TimeCell,
+  ProjectCell,
+  ActionsCell,
+} from "@/components/ui/list-row";
 import type { Automation, AutomationState } from "@/lib/types";
 import { AutomationRunsPanel } from "./automation-runs-panel";
 import { AutomationFormDialog } from "./automation-form-dialog";
@@ -149,38 +163,32 @@ function AutomationRow({
 
   return (
     <>
-      <div
-        className={cn(
-          "flex items-center gap-4 px-4 py-3 border-b border-border hover:bg-accent/30 transition-colors cursor-pointer",
-          isSelected && "bg-accent/50"
-        )}
-        onClick={onSelect}
+      <ListRow
+        selected={isSelected}
+        onRowClick={onSelect}
+        className="gap-4 py-3"
       >
-        {/* Icon */}
-        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-accent shrink-0">
-          <Workflow className="h-4 w-4 text-muted-foreground" />
-        </div>
+        <IconCell>
+          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-accent">
+            <Workflow className="h-4 w-4 text-muted-foreground" />
+          </div>
+        </IconCell>
 
-        {/* Name and trigger */}
-        <div className="flex-1 min-w-0">
+        <TextCell className="flex flex-col gap-0.5">
           <div className="flex items-center gap-2">
             <span className="font-medium text-sm truncate">{automation.name}</span>
             <StateBadge state={automation.state} />
           </div>
           <TriggerDisplay trigger={automation.trigger} />
-        </div>
+        </TextCell>
 
-        {/* Project */}
-        <span className="text-xs text-muted-foreground shrink-0">{projectName}</span>
+        <ProjectCell>{projectName}</ProjectCell>
 
-        {/* Updated */}
-        <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 w-20">
-          <Clock className="h-3 w-3" />
-          <span>{formatRelativeTime(automation.updated_at)}</span>
-        </div>
+        <TimeCell width="w-20" icon={<Clock className="h-3 w-3" />}>
+          {formatRelativeTime(automation.updated_at)}
+        </TimeCell>
 
-        {/* Actions */}
-        <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+        <ActionsCell>
           <Button
             variant="ghost"
             size="icon"
@@ -231,8 +239,8 @@ function AutomationRow({
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-        </div>
-      </div>
+        </ActionsCell>
+      </ListRow>
 
       {/* Delete confirmation dialog */}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
@@ -267,16 +275,11 @@ function AutomationRow({
 
 function EmptyState() {
   return (
-    <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
-      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-accent mb-4">
-        <Workflow className="h-6 w-6 text-muted-foreground" />
-      </div>
-      <h3 className="text-sm font-medium mb-1">No automations</h3>
-      <p className="text-sm text-muted-foreground max-w-sm">
-        Automations let you run workflows on a schedule, in response to events, or manually.
-        Create your first automation to get started.
-      </p>
-    </div>
+    <ListEmptyState
+      icon={<Workflow className="h-6 w-6 text-muted-foreground" />}
+      message="No automations"
+      description="Automations let you run workflows on a schedule, in response to events, or manually. Create your first automation to get started."
+    />
   );
 }
 
@@ -319,66 +322,59 @@ export function AutomationsPage() {
     refreshAutomations();
   }
 
-  return (
-    <div className="flex h-full">
-      {/* Main list */}
-      <div className={cn(
-        "flex flex-col h-full transition-all",
-        currentSelectedAutomation ? "flex-1" : "w-full"
-      )}>
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-          <div className="flex items-center gap-3">
-            <h1 className="text-sm font-semibold">
-              {selectedProject ? projectIdToRepo[selectedProject] ?? "Automations" : "Automations"}
-            </h1>
-            <span className="text-xs text-muted-foreground">
-              {filteredAutomations.length} {filteredAutomations.length === 1 ? "automation" : "automations"}
-            </span>
-          </div>
+  const headerActions = (
+    <Button
+      size="sm"
+      className="h-7 text-xs gap-1"
+      onClick={handleOpenCreate}
+      disabled={projects.length === 0}
+    >
+      <Plus className="h-3.5 w-3.5" />
+      New Automation
+    </Button>
+  );
 
-          <Button
-            size="sm"
-            className="h-7 text-xs gap-1"
-            onClick={handleOpenCreate}
-            disabled={projects.length === 0}
-          >
-            <Plus className="h-3.5 w-3.5" />
-            New Automation
-          </Button>
-        </div>
-
-        {/* List */}
-        <ScrollArea className="flex-1">
-          {filteredAutomations.length === 0 ? (
-            <EmptyState />
-          ) : (
-            <div>
-              {filteredAutomations.map((automation) => (
-                <AutomationRow
-                  key={automation.id}
-                  automation={automation}
-                  projectName={projectIdToRepo[automation.project_id] ?? automation.project_id}
-                  isSelected={currentSelectedAutomation?.id === automation.id}
-                  onSelect={() => setSelectedAutomation(automation)}
-                  onEdit={() => handleOpenEdit(automation)}
-                  onRefresh={refreshAutomations}
-                />
-              ))}
-            </div>
-          )}
-        </ScrollArea>
-      </div>
-
-      {/* Runs panel (side drawer) */}
-      {currentSelectedAutomation && (
-        <div className="w-96 shrink-0">
-          <AutomationRunsPanel
-            automation={currentSelectedAutomation}
-            onClose={() => setSelectedAutomation(null)}
+  const listContent = (
+    <ListView
+      header={
+        <ListHeader
+          title={selectedProject ? projectIdToRepo[selectedProject] ?? "Automations" : "Automations"}
+          count={filteredAutomations.length}
+          countLabel="automations"
+          actions={headerActions}
+        />
+      }
+      isEmpty={filteredAutomations.length === 0}
+      emptyState={<EmptyState />}
+    >
+      <div>
+        {filteredAutomations.map((automation) => (
+          <AutomationRow
+            key={automation.id}
+            automation={automation}
+            projectName={projectIdToRepo[automation.project_id] ?? automation.project_id}
+            isSelected={currentSelectedAutomation?.id === automation.id}
+            onSelect={() => setSelectedAutomation(automation)}
+            onEdit={() => handleOpenEdit(automation)}
+            onRefresh={refreshAutomations}
           />
-        </div>
-      )}
+        ))}
+      </div>
+    </ListView>
+  );
+
+  const runsPanel = currentSelectedAutomation ? (
+    <AutomationRunsPanel
+      automation={currentSelectedAutomation}
+      onClose={() => setSelectedAutomation(null)}
+    />
+  ) : undefined;
+
+  return (
+    <>
+      <ListSplitView panel={runsPanel}>
+        {listContent}
+      </ListSplitView>
 
       {/* Create/Edit dialog */}
       <AutomationFormDialog
@@ -389,6 +385,6 @@ export function AutomationsPage() {
         automation={editingAutomation}
         onSuccess={handleFormSuccess}
       />
-    </div>
+    </>
   );
 }

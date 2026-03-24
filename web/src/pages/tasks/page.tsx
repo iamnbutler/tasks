@@ -8,7 +8,6 @@ import {
   ExternalLink,
   Minus,
   Plus,
-  Search,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { cn, formatRelativeTime } from "@/lib/utils";
@@ -17,8 +16,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Dialog,
   DialogContent,
@@ -34,6 +31,25 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  ListView,
+  ListEmptyState,
+} from "@/components/ui/list-view";
+import {
+  ListHeader,
+  ListHeaderTabs,
+} from "@/components/ui/list-header";
+import {
+  ListRow,
+  IconCell,
+  IdCell,
+  TextCell,
+  BadgeCell,
+  TimeCell,
+  LinkCell,
+  ProjectCell,
+  ListRowGroup,
+} from "@/components/ui/list-row";
 import type { MergeQueueEntry, Task, TaskState } from "@/lib/types";
 import { taskStateMeta, stateSortOrder } from "./columns";
 import { SortableTaskList } from "./sortable-task-list";
@@ -185,65 +201,32 @@ function TaskRow({
       : task.id.slice(0, 8);
 
   return (
-    <button
-      onClick={() => navigate(`/tasks/${task.id}`)}
-      className="flex w-full items-center gap-3 px-4 py-2 text-left hover:bg-accent/50 transition-colors border-b border-border last:border-b-0"
-    >
-      {/* Priority */}
-      <PriorityIcon priority={task.priority} />
-
-      {/* ID */}
-      <span className="w-16 shrink-0 font-mono text-xs text-muted-foreground">
-        {idLabel}
-      </span>
-
-      {/* State icon */}
+    <ListRow as="button" onRowClick={() => navigate(`/tasks/${task.id}`)}>
+      <IconCell>
+        <PriorityIcon priority={task.priority} />
+      </IconCell>
+      <IdCell>{idLabel}</IdCell>
       {StateIcon && (
-        <StateIcon className={cn("h-4 w-4 shrink-0", meta.color)} />
+        <IconCell>
+          <StateIcon className={cn("h-4 w-4", meta.color)} />
+        </IconCell>
       )}
-
-      {/* Title */}
-      <span className="flex-1 truncate text-sm">{task.title}</span>
-
-      {/* Labels */}
+      <TextCell>{task.title}</TextCell>
       {task.labels.map((label) => (
-        <Badge key={label} variant="outline" className="text-xs shrink-0">
-          {label}
-        </Badge>
+        <BadgeCell key={label}>
+          <Badge variant="outline" className="text-xs">
+            {label}
+          </Badge>
+        </BadgeCell>
       ))}
-
-      {/* PR link — use span + onPointerUp to avoid invalid nested <a> inside <button> */}
       {prUrl && prNumber(prUrl) && (
-        <span
-          role="link"
-          tabIndex={0}
-          onPointerUp={(e) => {
-            e.stopPropagation();
-            window.open(prUrl, "_blank", "noopener,noreferrer");
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.stopPropagation();
-              window.open(prUrl, "_blank", "noopener,noreferrer");
-            }
-          }}
-          className="inline-flex items-center gap-1 text-blue-400 hover:underline text-xs font-mono shrink-0 cursor-pointer"
-        >
+        <LinkCell href={prUrl} icon={<ExternalLink className="h-3 w-3" />}>
           #{prNumber(prUrl)}
-          <ExternalLink className="h-3 w-3" />
-        </span>
+        </LinkCell>
       )}
-
-      {/* Project */}
-      <span className="shrink-0 text-xs text-muted-foreground">
-        {projectName}
-      </span>
-
-      {/* Updated */}
-      <span className="w-16 shrink-0 text-right text-xs text-muted-foreground">
-        {formatRelativeTime(task.updated_at)}
-      </span>
-    </button>
+      <ProjectCell>{projectName}</ProjectCell>
+      <TimeCell>{formatRelativeTime(task.updated_at)}</TimeCell>
+    </ListRow>
   );
 }
 
@@ -266,37 +249,35 @@ function TaskGroupSection({
   const meta = taskStateMeta[group.state];
   const StateIcon = meta?.icon;
 
-  return (
-    <div>
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="flex w-full items-center gap-2 px-4 py-2 text-sm hover:bg-accent/30 transition-colors"
-      >
-        <ChevronRight
-          className={cn(
-            "h-3.5 w-3.5 text-muted-foreground transition-transform",
-            isOpen && "rotate-90"
-          )}
-        />
-        {StateIcon && (
-          <StateIcon className={cn("h-4 w-4", meta.color)} />
+  const header = (
+    <>
+      <ChevronRight
+        className={cn(
+          "h-3.5 w-3.5 text-muted-foreground transition-transform",
+          isOpen && "rotate-90"
         )}
-        <span className="font-medium">{meta?.label ?? group.state}</span>
-        <span className="text-xs text-muted-foreground">{group.tasks.length}</span>
-      </button>
-      {isOpen && (
-        <div>
-          {group.tasks.map((task) => (
-            <TaskRow
-              key={task.id}
-              task={task}
-              projectName={projectIdToRepo[task.project] ?? task.project}
-              prUrl={taskToPrUrl[task.id]}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+      />
+      {StateIcon && <StateIcon className={cn("h-4 w-4", meta.color)} />}
+      <span className="font-medium">{meta?.label ?? group.state}</span>
+      <span className="text-xs text-muted-foreground">{group.tasks.length}</span>
+    </>
+  );
+
+  return (
+    <ListRowGroup
+      header={header}
+      isOpen={isOpen}
+      onToggle={() => setIsOpen(!isOpen)}
+    >
+      {group.tasks.map((task) => (
+        <TaskRow
+          key={task.id}
+          task={task}
+          projectName={projectIdToRepo[task.project] ?? task.project}
+          prUrl={taskToPrUrl[task.id]}
+        />
+      ))}
+    </ListRowGroup>
   );
 }
 
@@ -432,210 +413,200 @@ export function TasksPage() {
     }
   };
 
-  return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <div className="flex items-center gap-4">
-          <h1 className="text-sm font-semibold">
-            {selectedProject
-              ? projectIdToRepo[selectedProject] ?? "Project"
-              : "Tasks"}
-          </h1>
+  const tabsConfig = [
+    { key: "queue" as const, label: "Queue", count: counts.queue },
+    { key: "active" as const, label: "Active", count: counts.active },
+    { key: "backlog" as const, label: "Backlog", count: counts.backlog },
+    { key: "completed" as const, label: "Completed", count: counts.completed },
+    { key: "all" as const, label: "All", count: counts.all },
+  ];
 
-          <Tabs
-            value={activeTab}
-            onValueChange={(v: string) => setActiveTab(v as TabKey)}
-          >
-            <TabsList className="h-7">
-              <TabsTrigger value="queue" className="text-xs px-2.5 h-6">
-                Queue {counts.queue > 0 && <span className="ml-1 text-muted-foreground">{counts.queue}</span>}
-              </TabsTrigger>
-              <TabsTrigger value="active" className="text-xs px-2.5 h-6">
-                Active {counts.active > 0 && <span className="ml-1 text-muted-foreground">{counts.active}</span>}
-              </TabsTrigger>
-              <TabsTrigger value="backlog" className="text-xs px-2.5 h-6">
-                Backlog {counts.backlog > 0 && <span className="ml-1 text-muted-foreground">{counts.backlog}</span>}
-              </TabsTrigger>
-              <TabsTrigger value="completed" className="text-xs px-2.5 h-6">
-                Completed {counts.completed > 0 && <span className="ml-1 text-muted-foreground">{counts.completed}</span>}
-              </TabsTrigger>
-              <TabsTrigger value="all" className="text-xs px-2.5 h-6">
-                All {counts.all > 0 && <span className="ml-1 text-muted-foreground">{counts.all}</span>}
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
-        </div>
+  const headerTabs = (
+    <ListHeaderTabs
+      tabs={tabsConfig}
+      activeTab={activeTab}
+      onTabChange={setActiveTab}
+    />
+  );
 
-        <div className="flex items-center gap-2">
-          <div className="relative w-48">
-            <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              placeholder="Filter..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="h-7 pl-7 text-xs"
-            />
+  const headerActions = (
+    <Button
+      size="sm"
+      className="h-7 text-xs gap-1"
+      onClick={handleOpenNewTask}
+      disabled={projects.length === 0}
+    >
+      <Plus className="h-3.5 w-3.5" />
+      New Task
+    </Button>
+  );
+
+  const renderContent = () => {
+    if (activeTab === "queue") {
+      if (queueTasks.length === 0) {
+        return (
+          <ListEmptyState
+            message={search ? "No tasks match your search." : "No tasks in queue."}
+          />
+        );
+      }
+      return (
+        <div className="py-2">
+          <div className="px-4 py-2 text-xs text-muted-foreground border-b border-border">
+            Drag tasks to reorder the dispatch queue. Tasks at the top will be picked up first.
           </div>
-          <Button
-            size="sm"
-            className="h-7 text-xs gap-1"
-            onClick={handleOpenNewTask}
-            disabled={projects.length === 0}
-          >
-            <Plus className="h-3.5 w-3.5" />
-            New Task
-          </Button>
+          <SortableTaskList
+            tasks={queueTasks}
+            projectIdToRepo={projectIdToRepo}
+            onReorder={handleReorder}
+          />
         </div>
-      </div>
+      );
+    }
 
-      {/* Task list */}
-      <ScrollArea className="flex-1">
-        {activeTab === "queue" ? (
-          // Queue view - sortable drag-and-drop list
-          <div className="py-2">
-            {queueTasks.length === 0 ? (
-              <div className="flex items-center justify-center py-20">
-                <p className="text-sm text-muted-foreground">
-                  {search ? "No tasks match your search." : "No tasks in queue."}
-                </p>
-              </div>
-            ) : (
-              <>
-                <div className="px-4 py-2 text-xs text-muted-foreground border-b border-border">
-                  Drag tasks to reorder the dispatch queue. Tasks at the top will be picked up first.
-                </div>
-                <SortableTaskList
-                  tasks={queueTasks}
-                  projectIdToRepo={projectIdToRepo}
-                  onReorder={handleReorder}
-                />
-              </>
+    if (groups.length === 0) {
+      return (
+        <ListEmptyState
+          message={search ? "No tasks match your search." : "No tasks."}
+        />
+      );
+    }
+
+    return (
+      <div>
+        {groups.map((group) => (
+          <TaskGroupSection
+            key={group.state}
+            group={group}
+            projectIdToRepo={projectIdToRepo}
+            taskToPrUrl={taskToPrUrl}
+            defaultOpen={!COMPLETED_STATES.includes(group.state)}
+          />
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <>
+    <ListView
+      header={
+        <ListHeader
+          title={selectedProject ? projectIdToRepo[selectedProject] ?? "Project" : "Tasks"}
+          tabs={headerTabs}
+          search={{
+            value: search,
+            onChange: setSearch,
+          }}
+          actions={headerActions}
+        />
+      }
+    >
+      {renderContent()}
+    </ListView>
+
+    {/* New Task Dialog */}
+    <Dialog open={newTaskOpen} onOpenChange={(open) => {
+        if (!creating) setNewTaskOpen(open);
+      }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Create new task</DialogTitle>
+          <DialogDescription>
+            Create a GitHub issue that will become a task. The poller will pick it up on the next cycle.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleCreateTask();
+          }}
+        >
+          <div className="space-y-4 py-3">
+            {/* Project selector */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Project</label>
+              <Select
+                value={newTaskProjectId}
+                onValueChange={setNewTaskProjectId}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select a project" />
+                </SelectTrigger>
+                <SelectContent>
+                  {projects.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.repo}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Title */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Title</label>
+              <Input
+                placeholder="Issue title..."
+                value={newTaskTitle}
+                onChange={(e) => {
+                  setNewTaskTitle(e.target.value);
+                  setCreateError(null);
+                }}
+                disabled={creating}
+                autoFocus
+              />
+            </div>
+
+            {/* Body */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Description (optional)</label>
+              <Textarea
+                placeholder="Issue description in markdown..."
+                value={newTaskBody}
+                onChange={(e) => setNewTaskBody(e.target.value)}
+                disabled={creating}
+                className="min-h-24"
+              />
+            </div>
+
+            {/* Labels */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Labels (optional)</label>
+              <Input
+                placeholder="bug, enhancement, help wanted"
+                value={newTaskLabels}
+                onChange={(e) => setNewTaskLabels(e.target.value)}
+                disabled={creating}
+              />
+              <p className="text-xs text-muted-foreground">
+                Comma-separated list of labels
+              </p>
+            </div>
+
+            {createError && (
+              <p className="text-sm text-red-400">{createError}</p>
             )}
           </div>
-        ) : groups.length === 0 ? (
-          <div className="flex items-center justify-center py-20">
-            <p className="text-sm text-muted-foreground">
-              {search ? "No tasks match your search." : "No tasks."}
-            </p>
-          </div>
-        ) : (
-          <div>
-            {groups.map((group) => (
-              <TaskGroupSection
-                key={group.state}
-                group={group}
-                projectIdToRepo={projectIdToRepo}
-                taskToPrUrl={taskToPrUrl}
-                defaultOpen={!COMPLETED_STATES.includes(group.state)}
-              />
-            ))}
-          </div>
-        )}
-      </ScrollArea>
-
-      {/* New Task Dialog */}
-      <Dialog open={newTaskOpen} onOpenChange={(open) => {
-          if (!creating) setNewTaskOpen(open);
-        }}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Create new task</DialogTitle>
-            <DialogDescription>
-              Create a GitHub issue that will become a task. The poller will pick it up on the next cycle.
-            </DialogDescription>
-          </DialogHeader>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleCreateTask();
-            }}
-          >
-            <div className="space-y-4 py-3">
-              {/* Project selector */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium">Project</label>
-                <Select
-                  value={newTaskProjectId}
-                  onValueChange={setNewTaskProjectId}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="Select a project" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {projects.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.repo}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Title */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium">Title</label>
-                <Input
-                  placeholder="Issue title..."
-                  value={newTaskTitle}
-                  onChange={(e) => {
-                    setNewTaskTitle(e.target.value);
-                    setCreateError(null);
-                  }}
-                  disabled={creating}
-                  autoFocus
-                />
-              </div>
-
-              {/* Body */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium">Description (optional)</label>
-                <Textarea
-                  placeholder="Issue description in markdown..."
-                  value={newTaskBody}
-                  onChange={(e) => setNewTaskBody(e.target.value)}
-                  disabled={creating}
-                  className="min-h-24"
-                />
-              </div>
-
-              {/* Labels */}
-              <div className="space-y-1.5">
-                <label className="text-xs font-medium">Labels (optional)</label>
-                <Input
-                  placeholder="bug, enhancement, help wanted"
-                  value={newTaskLabels}
-                  onChange={(e) => setNewTaskLabels(e.target.value)}
-                  disabled={creating}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Comma-separated list of labels
-                </p>
-              </div>
-
-              {createError && (
-                <p className="text-sm text-red-400">{createError}</p>
-              )}
-            </div>
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setNewTaskOpen(false)}
-                disabled={creating}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                disabled={creating || !newTaskTitle.trim() || !newTaskProjectId}
-              >
-                {creating ? "Creating..." : "Create Task"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-    </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setNewTaskOpen(false)}
+              disabled={creating}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={creating || !newTaskTitle.trim() || !newTaskProjectId}
+            >
+              {creating ? "Creating..." : "Create Task"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+    </>
   );
 }
