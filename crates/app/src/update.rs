@@ -97,7 +97,7 @@ impl RebuildScope {
             (ServerAndFrontend, ServerAndContainer) | (ServerAndContainer, ServerAndFrontend) => {
                 All
             }
-            // Frontend/Container + compound = All
+            // Subset + superset = superset (no escalation needed)
             (Frontend, ServerAndFrontend) | (ServerAndFrontend, Frontend) => ServerAndFrontend,
             (Container, ServerAndContainer) | (ServerAndContainer, Container) => ServerAndContainer,
         }
@@ -196,7 +196,7 @@ fn classify_file(path: &str) -> RebuildScope {
     if path.starts_with("crates/supervisor/")
         || path == "src/runtime/Dockerfile"
         || path == "Makefile"
-        || path.starts_with("scripts/") && path.contains("container")
+        || (path.starts_with("scripts/") && path.contains("container"))
     {
         return RebuildScope::Container;
     }
@@ -324,16 +324,6 @@ pub fn write_update_scope(data_dir: &str, scope: &RebuildScope) -> Result<(), St
         .map_err(|e| format!("Failed to write scope file: {e}"))?;
     info!(scope = ?scope, file = %scope_file, "wrote update scope");
     Ok(())
-}
-
-/// Read the update scope from the file (for the wrapper script).
-#[allow(dead_code)] // Used by wrapper script via CLI (future enhancement)
-pub fn read_update_scope(data_dir: &str) -> RebuildScope {
-    let scope_file = format!("{data_dir}/.update-scope");
-    match std::fs::read_to_string(&scope_file) {
-        Ok(content) => RebuildScope::from_str(&content),
-        Err(_) => RebuildScope::All, // default to full rebuild if file missing
-    }
 }
 
 /// Background update checker task.

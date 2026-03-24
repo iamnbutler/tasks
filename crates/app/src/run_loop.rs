@@ -1997,9 +1997,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     };
 
     // If this is an update restart, we need to:
-    // 1. Lower mode to Stop
-    // 2. Wait for sessions to drain (with timeout)
-    // 3. Write the update scope file
+    // 1. Stop active sessions (with configured timeout)
+    // 2. Write the update scope file
     if shutdown_reason == RunResult::UpdateRestart {
         update_state.set_applying(true);
 
@@ -2010,31 +2009,13 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             update::RebuildScope::All
         };
 
-        // Lower mode to Stop
-        info!("lowering mode to Stop for update");
-        if let Err(e) = server.set_mode(server::Mode::Stop, &events::Actor::System).await {
-            warn!(error = %e, "failed to lower mode to Stop");
-        }
-
-        // Wait for sessions to drain
-        let deadline = tokio::time::Instant::now() + session_timeout;
-        loop {
-            let active = session_manager.active_count().await;
-            if active == 0 {
-                info!("all sessions drained, proceeding with update");
-                break;
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    active_sessions = active,
-                    "session drain timeout reached, proceeding with update anyway"
-                );
-                break;
-            }
-
-            debug!(active_sessions = active, "waiting for sessions to drain...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Stop all sessions directly with the configured timeout.
+        // We bypass set_mode(Stop) because the stop_mode_handle has a hardcoded
+        // 5-second timeout that would race with and override our configured timeout.
+        info!(timeout = ?session_timeout, "stopping sessions for update");
+        let stopped = session_manager.stop_all_with_timeout(session_timeout).await;
+        if stopped > 0 {
+            info!(stopped_sessions = stopped, "sessions stopped for update");
         }
 
         // Write update scope file
