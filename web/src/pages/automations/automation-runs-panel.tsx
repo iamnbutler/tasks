@@ -218,11 +218,14 @@ function RunRow({ run }: { run: AutomationRun }) {
 interface AutomationRunsPanelProps {
   automation: Automation;
   onClose: () => void;
+  /** Increment this to trigger a refresh (e.g., after triggering a run) */
+  refreshKey?: number;
 }
 
 export function AutomationRunsPanel({
   automation,
   onClose,
+  refreshKey,
 }: AutomationRunsPanelProps) {
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [loading, setLoading] = useState(true);
@@ -245,10 +248,10 @@ export function AutomationRunsPanel({
     }
   }, [automation.id]);
 
-  // Initial load
+  // Initial load and refresh when refreshKey changes
   useEffect(() => {
     loadRuns();
-  }, [loadRuns]);
+  }, [loadRuns, refreshKey]);
 
   // Auto-refresh when there are running runs
   useEffect(() => {

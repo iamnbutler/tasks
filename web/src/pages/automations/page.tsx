@@ -97,6 +97,7 @@ function AutomationRow({
   onSelect,
   onEdit,
   onRefresh,
+  onRunTriggered,
 }: {
   automation: Automation;
   projectName: string;
@@ -104,6 +105,7 @@ function AutomationRow({
   onSelect: () => void;
   onEdit: () => void;
   onRefresh: () => Promise<void>;
+  onRunTriggered: () => void;
 }) {
   const [running, setRunning] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -117,6 +119,8 @@ function AutomationRow({
       await onRefresh();
       // Select this automation to show the new run
       onSelect();
+      // Signal that a run was triggered to refresh the runs panel
+      onRunTriggered();
     } catch (error) {
       console.error("Failed to run automation:", error);
     } finally {
@@ -293,6 +297,8 @@ export function AutomationsPage() {
   // State for form dialog
   const [formOpen, setFormOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<Automation | undefined>(undefined);
+  // Key to trigger runs panel refresh after triggering an automation
+  const [runsRefreshKey, setRunsRefreshKey] = useState(0);
 
   // Map project IDs to repo names
   const projectIdToRepo: Record<string, string> = {};
@@ -363,6 +369,7 @@ export function AutomationsPage() {
                   onSelect={() => setSelectedAutomation(automation)}
                   onEdit={() => handleOpenEdit(automation)}
                   onRefresh={refreshAutomations}
+                  onRunTriggered={() => setRunsRefreshKey((k) => k + 1)}
                 />
               ))}
             </div>
@@ -376,6 +383,7 @@ export function AutomationsPage() {
           <AutomationRunsPanel
             automation={currentSelectedAutomation}
             onClose={() => setSelectedAutomation(null)}
+            refreshKey={runsRefreshKey}
           />
         </div>
       )}
