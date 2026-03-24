@@ -26,7 +26,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 
 | Crate | Purpose |
 |-------|---------|
-| `app` | Binary entry point, startup, CLI, component wiring |
+| `app` | Binary entry point, startup, CLI, component wiring, update checker |
 | `server` | HTTP server, run loops, domain logic |
 | `models` | Shared domain types (Task, Project, Mode, etc.) |
 | `store` | SQLite persistence layer |
@@ -118,6 +118,40 @@ Communication uses JSON-line protocol over stdio:
 - `agent:started` - Agent process launched
 - `agent:stdout/stderr` - Agent output
 - `agent:exit` - Agent terminated
+
+## Self-Update
+
+The server monitors the local git repository for new commits and can restart itself to apply updates.
+
+### How It Works
+
+1. **UpdateChecker** runs as a background task in the `app` crate (`update.rs`)
+2. On each check interval, it runs `git diff` against the remote to detect new commits
+3. When an update is found, it sets update state and optionally triggers an auto-apply
+4. On apply, the server drains active sessions (up to `TASKS_UPDATE_SESSION_TIMEOUT`), writes a scope file, and exits with **code 100**
+5. The wrapper script (`scripts/tasks-runner.sh`) detects exit code 100, pulls the latest code, rebuilds the appropriate scope, and restarts the server
+
+### Rebuild Scopes
+
+The update checker classifies changed files into one of three scopes:
+
+| Scope | Triggered By | What Gets Rebuilt |
+|-------|-------------|-------------------|
+| `Full` | Changes to `Cargo.*`, `crates/supervisor/` | Supervisor + container image + server |
+| `ServerOnly` | Changes to any other Rust source | Server binary only |
+| `WebOnly` | Changes to `web/` only | Frontend assets only |
+| `None` | No source changes | No rebuild (e.g. docs-only push) |
+
+### Events
+
+| Event | Description |
+|-------|-------------|
+| `system:update:available` | New commit detected; payload includes commit summary and rebuild scope |
+| `system:update:applying` | Update in progress; sessions draining |
+
+### Configuration
+
+See [Configuration → Self-Update](configuration.md#self-update) for relevant environment variables.
 
 ## Storage
 
