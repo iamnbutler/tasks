@@ -64,10 +64,17 @@ impl OutputInterpreter {
 
         let trimmed = text.trim();
 
-        // Check for question patterns first (highest priority for blocking)
-        if let Some(signal) = self.detect_question(trimmed) {
-            return signal;
-        }
+        // Note: Question detection is disabled (see #415).
+        //
+        // The output-based question detection was producing too many false positives.
+        // Agents frequently use question-like language ("should I...", "please provide...")
+        // while explaining their work, not when actually blocked waiting for input.
+        // Since agents don't have an explicit protocol to signal "I'm blocked", and they
+        // continue working even after outputting question-like text, the pattern matching
+        // approach is fundamentally unreliable.
+        //
+        // The Question state infrastructure is preserved for potential future use
+        // (e.g., if agents gain an explicit "waiting for input" signal).
 
         // Check for failure patterns
         if let Some(signal) = self.detect_failure(trimmed) {
@@ -84,10 +91,18 @@ impl OutputInterpreter {
 
     /// Detect question patterns in output.
     ///
-    /// High-confidence patterns that indicate the agent is waiting for human input:
+    /// NOTE: This method is currently unused (see #415). The output-based question
+    /// detection was producing too many false positives because agents use question-like
+    /// language while working, not when actually blocked waiting for input.
+    ///
+    /// The method is preserved in case a more reliable detection mechanism is developed
+    /// (e.g., combined with agent pause signals or tool calls).
+    ///
+    /// Original design: High-confidence patterns that indicate the agent is waiting for human input:
     /// - Explicit prompts asking for input
     /// - Multiple choice questions
     /// - Permission requests
+    #[allow(dead_code)]
     fn detect_question(&self, text: &str) -> Option<OutputSignal> {
         let lower = text.to_lowercase();
 
@@ -408,50 +423,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detect_explicit_question_prompts() {
+    fn question_patterns_not_detected() {
+        // Question detection is disabled (see #415) because output-based pattern
+        // matching produced too many false positives. Agents use question-like
+        // language while working, not when actually blocked waiting for input.
         let mut interpreter = OutputInterpreter::new();
 
-        let questions = [
+        let question_like_text = [
             "Please provide the path to the config file.",
-            "Please specify which database you want to use.",
-            "Please confirm you want to delete these files.",
-            "Which option would you prefer?",
             "Should I proceed with the refactoring?",
-            "Would you like me to run the tests first?",
+            "What would you like me to do next?",
             "Can you provide more context about the bug?",
-            "I need clarification on the expected behavior.",
         ];
 
-        for q in questions {
+        for q in question_like_text {
             let signal = interpreter.interpret(q);
             assert!(
-                matches!(signal, OutputSignal::Question { .. }),
-                "Should detect question: {}",
+                matches!(signal, OutputSignal::Message),
+                "Question detection is disabled, should return Message: {}",
                 q
             );
         }
-    }
-
-    #[test]
-    fn detect_direct_questions_to_user() {
-        let mut interpreter = OutputInterpreter::new();
-
-        // Questions directed at the user (should detect)
-        let signal = interpreter.interpret("What would you like me to do next?");
-        assert!(matches!(signal, OutputSignal::Question { .. }));
-
-        let signal = interpreter.interpret("Should I push your changes to the remote?");
-        assert!(matches!(signal, OutputSignal::Question { .. }));
-
-        // Reset interpreter for clean test
-        interpreter.clear();
-
-        // Questions not directed at user (should NOT detect)
-        let signal = interpreter.interpret("What is the capital of France?");
-        assert!(matches!(signal, OutputSignal::Message));
-
-        let signal = interpreter.interpret("How does this function work?");
-        assert!(matches!(signal, OutputSignal::Message));
     }
 
     #[test]
@@ -561,12 +553,4 @@ mod tests {
         assert!(matches!(signal, OutputSignal::Message));
     }
 
-    #[test]
-    fn question_priority_over_completion() {
-        let mut interpreter = OutputInterpreter::new();
-
-        // A question about completion should be detected as question
-        let signal = interpreter.interpret("Should I mark this task as complete?");
-        assert!(matches!(signal, OutputSignal::Question { .. }));
-    }
 }
