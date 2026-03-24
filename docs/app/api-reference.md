@@ -214,12 +214,24 @@ GET /api/merge-queue
   {
     "id": "entry-uuid",
     "task_id": "task-uuid",
-    "pr_number": 123,
-    "state": "pending",
-    "created_at": "2024-01-15T12:00:00Z"
+    "pr_url": "https://github.com/owner/repo/pull/123",
+    "status": "pending",
+    "queued_at": "2024-01-15T12:00:00Z"
   }
 ]
 ```
+
+**`status` values:**
+
+| Value | Description |
+|-------|-------------|
+| `pending` | Awaiting review |
+| `approved` | Ready to merge |
+| `merging` | GitHub merge API call in progress |
+| `merged` | Successfully merged |
+| `rejected` | Declined |
+| `conflict` | Has merge conflicts |
+| `changes_requested` | Needs modification; task gets priority re-dispatch |
 
 #### Approve Entry
 
@@ -256,6 +268,54 @@ Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of 
 ```http
 POST /api/merge-queue/flush
 ```
+
+### Self-Update
+
+#### Get Update Status
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "e4d7f4c",
+  "target_commit": "4e61a27",
+  "rebuild_scope": "server",
+  "commit_summary": "Add queue_position field for merge ordering visibility",
+  "last_checked": "2024-01-15T12:00:00Z"
+}
+```
+
+#### Apply Update
+
+Triggers the self-update shutdown path. The server rebuilds and restarts.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+Set `force: true` to skip waiting for active agent sessions to complete.
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update applying..."
+}
+```
+
+**`status` values:** `applying`, `no_update`, `already_applying`
 
 ### Orchestrator
 

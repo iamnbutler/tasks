@@ -34,6 +34,18 @@ The dashboard provides an at-a-glance view of:
 - **Recent Activity** - Latest events across all tasks
 - **Escalations** - Up to 5 recent orchestrator escalation events with task context
 
+### System Status Banner
+
+A contextual banner explains why no work is happening when the system appears idle. It covers scenarios such as:
+
+- System stopped or paused
+- Merge queue entries awaiting approval
+- Tasks awaiting merge decisions
+- PRs with conflicts or changes requested
+- Tasks waiting on user input or blocked by dependencies
+- Failed tasks requiring attention
+- All work completed
+
 ### Changing Mode
 
 Click the mode indicator to switch between:
@@ -79,7 +91,17 @@ A **Properties** sidebar on the right shows metadata (state, project, created da
 
 ## Merge Queue
 
-The merge queue shows PRs awaiting human review.
+The merge queue shows PRs moving through the review and merge pipeline.
+
+### Lifecycle Phases
+
+Entries are grouped into three tabs:
+
+| Tab | Statuses | Description |
+|-----|----------|-------------|
+| **Needs Review** | `pending`, `changes_requested`, `conflict` | Accumulating signal — not yet ready to merge |
+| **Ready to Merge** | `approved`, `merging` | Cleared for merge; `merging` means GitHub API call in progress |
+| **Completed** | `merged`, `rejected` | Terminal entries |
 
 ### Entry States
 
@@ -87,8 +109,11 @@ The merge queue shows PRs awaiting human review.
 |-------|-------------|
 | **Pending** | Awaiting review |
 | **Approved** | Ready to merge |
+| **Merging** | GitHub merge API call actively in progress |
+| **Merged** | Successfully merged |
 | **Rejected** | Declined |
-| **Changes Requested** | Needs modification before merging |
+| **Conflict** | Has merge conflicts requiring resolution |
+| **Changes Requested** | Needs modification before merging; task gets priority re-dispatch |
 
 ### Actions
 
@@ -131,6 +156,7 @@ The Events view shows a real-time stream of system events.
 | `session:started` | Agent session began |
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
+| `merge:merging` | Merge operation started |
 | `merge:completed` | Changes merged |
 
 ### Filtering
