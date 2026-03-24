@@ -1456,6 +1456,11 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     if mode == server::Mode::Play {
                         // Execute the merge on GitHub (Play mode = continuous merge authority)
                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                            // Transition to Merging before the API call for visibility
+                            if let Err(e) = orch_server.mark_entry_merging(&entry_id, &pr_url).await {
+                                error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging");
+                            }
+
                             match merge_github.merge_pull_request(&owner, &repo, number).await {
                                 Ok(true) => {
                                     info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged successfully");

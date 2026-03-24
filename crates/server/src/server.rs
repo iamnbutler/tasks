@@ -1068,6 +1068,34 @@ impl Server {
         Ok(())
     }
 
+    /// Mark a merge queue entry as actively merging (GitHub API call in progress).
+    /// Emits `merge:merging` event.
+    pub async fn mark_entry_merging(
+        &self,
+        entry_id: &str,
+        pr_url: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .mark_merging(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        let event = Event::new(
+            EventType::MergeMerging,
+            &task_id,
+            Actor::System,
+            serde_json::json!({ "entry_id": entry_id, "pr_url": pr_url }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     /// Mark a merge queue entry as merged and transition the linked task
     /// to Completed. Emits `merge:completed` and `task:state:completed`.
     pub async fn mark_entry_merged(

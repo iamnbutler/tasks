@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum MergeStatus {
     Pending,
     Approved,
+    /// Actively being merged — GitHub API call in progress.
+    Merging,
     Rejected,
     Merged,
     Conflict,

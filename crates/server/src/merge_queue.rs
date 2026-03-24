@@ -89,6 +89,15 @@ impl MergeQueue {
         Ok(())
     }
 
+    /// Mark an entry as actively merging (GitHub API call in progress).
+    pub fn mark_merging(&mut self, id: &str) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        entry.status = MergeStatus::Merging;
+        Ok(())
+    }
+
     /// Reject an entry (spec Section 7.1 step 5).
     pub fn reject(&mut self, id: &str) -> Result<(), MergeQueueError> {
         let entry = self

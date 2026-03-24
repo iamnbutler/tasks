@@ -61,6 +61,7 @@ export interface Project {
 export type MergeStatus =
   | "pending"
   | "approved"
+  | "merging"
   | "rejected"
   | "merged"
   | "conflict"
