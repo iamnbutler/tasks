@@ -141,6 +141,7 @@ impl MergeQueue {
             .get_mut(id)
             .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
         entry.status = MergeStatus::Rejected;
+        entry.completed_at = Some(chrono::Utc::now());
         Ok(())
     }
 
@@ -150,6 +151,7 @@ impl MergeQueue {
             .get_mut(id)
             .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
         entry.status = MergeStatus::Merged;
+        entry.completed_at = Some(chrono::Utc::now());
         Ok(())
     }
 
@@ -272,14 +274,34 @@ impl MergeQueue {
 
     /// Remove terminal entries (merged, rejected) from the queue.
     ///
+    /// If `merged_cutoff` is provided, only removes Merged/Rejected entries whose
+    /// `completed_at` is before the cutoff. This implements a cooldown period to
+    /// prevent race conditions where GitHub's merged state hasn't propagated yet,
+    /// causing re-polling to create duplicate entries. See issue #438.
+    ///
     /// If `conflict_cutoff` is provided, also removes conflict entries that have
     /// been in conflict state since before the cutoff time. This prevents stale
     /// conflicts from accumulating indefinitely. See issue #282.
-    pub fn cleanup(&mut self, conflict_cutoff: Option<chrono::DateTime<chrono::Utc>>) {
+    pub fn cleanup(
+        &mut self,
+        merged_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+        conflict_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         self.entries.retain(|e| {
-            // Always remove merged and rejected entries
+            // Remove merged and rejected entries after cooldown period (issue #438)
             if matches!(e.status, MergeStatus::Merged | MergeStatus::Rejected) {
-                return false;
+                match (merged_cutoff, e.completed_at) {
+                    // If we have both a cutoff and a completed_at timestamp,
+                    // only remove if completed before the cutoff
+                    (Some(cutoff), Some(completed)) => {
+                        return completed >= cutoff;
+                    }
+                    // No cutoff provided — remove immediately (legacy behavior)
+                    (None, _) => return false,
+                    // No completed_at but we have a cutoff — retain for safety
+                    // (entry might have been marked merged before the field existed)
+                    (Some(_), None) => return false,
+                }
             }
 
             // Optionally remove stale conflict entries
@@ -420,7 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_terminal() {
+    fn cleanup_removes_terminal_without_cutoff() {
+        // When no merged_cutoff is provided, terminal entries are removed immediately
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
         q.enqueue(entry("m2", "t2"));
@@ -429,9 +452,63 @@ mod tests {
         q.mark_merged("m1").unwrap();
         q.reject("m2").unwrap();
 
-        q.cleanup(None);
+        q.cleanup(None, None);
         assert_eq!(q.entries().len(), 1);
         assert_eq!(q.entries()[0].id, "m3");
+    }
+
+    #[test]
+    fn cleanup_respects_merged_cooldown() {
+        use chrono::{Duration, Utc};
+
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+        q.enqueue(entry("m3", "t3"));
+
+        // Mark m1 as merged (completed_at = now)
+        q.mark_merged("m1").unwrap();
+
+        // Mark m2 as rejected (completed_at = now)
+        q.reject("m2").unwrap();
+
+        // Cleanup with 5-minute cutoff — entries completed after cutoff should be retained
+        let cutoff = Utc::now() - Duration::minutes(5);
+        q.cleanup(Some(cutoff), None);
+
+        // m1 and m2 should still be present (completed within cooldown period)
+        // m3 is pending so always retained
+        assert_eq!(q.entries().len(), 3);
+        assert!(q.get("m1").is_some());
+        assert!(q.get("m2").is_some());
+        assert!(q.get("m3").is_some());
+    }
+
+    #[test]
+    fn cleanup_removes_old_merged_entries() {
+        use chrono::{Duration, Utc};
+
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.enqueue(entry("m2", "t2"));
+
+        // Mark m1 as merged
+        q.mark_merged("m1").unwrap();
+
+        // Manually backdate the completed_at to simulate an old entry
+        if let Some(e) = q.get_mut("m1") {
+            e.completed_at = Some(Utc::now() - Duration::minutes(10));
+        }
+
+        // m2 stays pending
+
+        // Cleanup with 5-minute cutoff — m1 completed 10 min ago, should be removed
+        let cutoff = Utc::now() - Duration::minutes(5);
+        q.cleanup(Some(cutoff), None);
+
+        assert_eq!(q.entries().len(), 1);
+        assert!(q.get("m1").is_none());
+        assert!(q.get("m2").is_some());
     }
 
     #[test]
@@ -463,7 +540,7 @@ mod tests {
 
         // Cleanup with 24-hour cutoff
         let cutoff = Utc::now() - Duration::hours(24);
-        q.cleanup(Some(cutoff));
+        q.cleanup(None, Some(cutoff));
 
         // m1 (stale conflict) should be removed, m2 (recent conflict) and m3 (pending) should remain
         assert_eq!(q.entries().len(), 2);
@@ -495,7 +572,7 @@ mod tests {
 
         // Cleanup with 24-hour cutoff
         let cutoff = Utc::now() - Duration::hours(24);
-        q.cleanup(Some(cutoff));
+        q.cleanup(None, Some(cutoff));
 
         // Both should be retained â no conflict_info means unknown conflict age
         assert_eq!(q.entries().len(), 2);
