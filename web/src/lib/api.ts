@@ -207,11 +207,11 @@ export function summarize(
 // Update API (self-update mechanism)
 
 export function fetchUpdateStatus(): Promise<UpdateStatus> {
-  return request<UpdateStatus>("/api/update/status");
+  return request<UpdateStatus>("/api/self-update");
 }
 
 export function applyUpdate(force?: boolean): Promise<void> {
-  return requestVoid("/api/update/apply", {
+  return requestVoid("/api/self-update/apply", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ force: force ?? false }),

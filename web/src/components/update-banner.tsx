@@ -3,7 +3,6 @@ import { Download, RefreshCw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Spinner } from "@/components/ui/spinner";
 import type { UpdateStatus, RebuildScope } from "@/lib/types";
 import { applyUpdate } from "@/lib/api";
 
@@ -104,37 +103,30 @@ export function UpdateBanner({
       </div>
 
       {/* Actions */}
-      <div className="flex items-center gap-2 shrink-0">
-        {isApplying ? (
-          <div className="flex items-center gap-2 text-xs text-yellow-600">
-            <Spinner className="h-3 w-3" />
-            <span>Updating...</span>
-          </div>
-        ) : (
-          <>
+      {!isApplying && (
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={handleApplyUpdate}
+            disabled={applying}
+            className="border-blue-500/50 text-blue-600 hover:bg-blue-500/20"
+          >
+            Update Now
+          </Button>
+          {onDismiss && (
             <Button
-              size="xs"
-              variant="outline"
-              onClick={handleApplyUpdate}
-              disabled={applying}
-              className="border-blue-500/50 text-blue-600 hover:bg-blue-500/20"
+              size="icon-xs"
+              variant="ghost"
+              onClick={onDismiss}
+              className="text-muted-foreground hover:text-foreground"
+              aria-label="Dismiss"
             >
-              Update Now
+              <X className="h-3 w-3" />
             </Button>
-            {onDismiss && (
-              <Button
-                size="icon-xs"
-                variant="ghost"
-                onClick={onDismiss}
-                className="text-muted-foreground hover:text-foreground"
-                aria-label="Dismiss"
-              >
-                <X className="h-3 w-3" />
-              </Button>
-            )}
-          </>
-        )}
-      </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

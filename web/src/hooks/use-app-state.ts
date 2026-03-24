@@ -19,7 +19,7 @@ const POLL_INTERVAL_MS = 5_000;
 const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
 
 /** Regex matching event types that should trigger an update status refresh. */
-const UPDATE_EVENT = /^system:update_/;
+const UPDATE_EVENT = /^system:update:/;
 
 export interface AppState {
   snapshot: Snapshot | null;
@@ -85,6 +85,7 @@ function useAppStateCore(): AppState {
   // Keep a ref to the latest snapshot-fetch promise so we can avoid races.
   const fetchInFlight = useRef(false);
   const updateFetchInFlight = useRef(false);
+  const prevTargetCommit = useRef<string | undefined>(undefined);
 
   const refreshSnapshot = useCallback(async () => {
     if (fetchInFlight.current) return;
@@ -107,15 +108,16 @@ function useAppStateCore(): AppState {
       const status = await fetchUpdateStatus();
       setUpdateStatus(status);
       // Reset dismissed state when a new update becomes available
-      if (status.available && status.target_commit !== updateStatus?.target_commit) {
+      if (status.available && status.target_commit !== prevTargetCommit.current) {
         setUpdateDismissed(false);
       }
+      prevTargetCommit.current = status.target_commit;
     } catch {
       // Update status endpoint may not exist yet; ignore errors silently
     } finally {
       updateFetchInFlight.current = false;
     }
-  }, [updateStatus?.target_commit]);
+  }, []);
 
   const dismissUpdate = useCallback(() => {
     setUpdateDismissed(true);
