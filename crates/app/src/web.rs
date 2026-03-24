@@ -534,7 +534,7 @@ async fn bootstrap_project(
 
     // Get GitHub token
     let github_token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| ApiError::GitHub("GITHUB_TOKEN not configured on server".to_string()))?;
+        .map_err(|_| ApiError::Config("GITHUB_TOKEN not configured on server".to_string()))?;
 
     let client = tasks_github::GitHubClient::new(&github_token);
 
@@ -563,7 +563,7 @@ async fn bootstrap_project(
     let created_repo = client
         .create_repository(&repo_name, description)
         .await
-        .map_err(|e| ApiError::GitHub(format!("failed to create repository: {e}")))?;
+        .map_err(ApiError::GitHubApi)?;
 
     // Add the project to tracking
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -575,8 +575,8 @@ async fn bootstrap_project(
     let (owner, repo) = if parts.len() == 2 {
         (parts[0], parts[1])
     } else {
-        return Err(ApiError::GitHub(format!(
-            "unexpected full_name format: {}",
+        return Err(ApiError::BadRequest(format!(
+            "unexpected GitHub full_name format: {}",
             created_repo.full_name
         )));
     };
@@ -592,10 +592,7 @@ async fn bootstrap_project(
     let created_issue = client
         .create_issue(owner, repo, &issue_title, Some(&issue_body), None)
         .await
-        .map_err(|e| ApiError::GitHub(format!(
-            "failed to create issue (repo was created at {}): {e}",
-            created_repo.html_url
-        )))?;
+        .map_err(ApiError::GitHubApi)?;
 
     Ok(Json(BootstrapProjectResponse {
         project,
@@ -693,7 +690,7 @@ async fn create_issue(
 
     // Create GitHub client and issue
     let github_token = std::env::var("GITHUB_TOKEN")
-        .map_err(|_| ApiError::GitHub("GITHUB_TOKEN not configured on server".to_string()))?;
+        .map_err(|_| ApiError::Config("GITHUB_TOKEN not configured on server".to_string()))?;
 
     let client = tasks_github::GitHubClient::new(&github_token);
 
@@ -706,7 +703,7 @@ async fn create_issue(
     let created = client
         .create_issue(&owner, &repo, &req.title, req.body.as_deref(), labels)
         .await
-        .map_err(|e| ApiError::GitHub(e.to_string()))?;
+        .map_err(ApiError::GitHubApi)?;
 
     Ok(Json(CreateIssueResponse {
         number: created.number,
@@ -1593,7 +1590,10 @@ enum ApiError {
     NotFound(String),
     CompletionsUnavailable(String),
     CompletionsError(String),
-    GitHub(String),
+    /// Configuration error (e.g., missing GITHUB_TOKEN).
+    Config(String),
+    /// GitHub API error with proper status code mapping.
+    GitHubApi(tasks_github::GitHubError),
 }
 
 impl IntoResponse for ApiError {
@@ -1606,7 +1606,35 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, e),
             ApiError::CompletionsUnavailable(e) => (StatusCode::SERVICE_UNAVAILABLE, e),
             ApiError::CompletionsError(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
-            ApiError::GitHub(e) => (StatusCode::BAD_GATEWAY, e),
+            ApiError::Config(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
+            ApiError::GitHubApi(e) => {
+                use tasks_github::GitHubError;
+                let (status, msg) = match &e {
+                    GitHubError::Auth(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+                    GitHubError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+                    GitHubError::RateLimited { reset_at } => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!("GitHub rate limit exceeded, resets at {reset_at}"),
+                    ),
+                    GitHubError::Validation(msg) => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("GitHub validation error: {msg}"),
+                    ),
+                    GitHubError::GraphQL(errors) => {
+                        let msgs: Vec<_> = errors.iter().map(|e| e.message.clone()).collect();
+                        (StatusCode::BAD_GATEWAY, format!("GitHub API errors: {}", msgs.join(", ")))
+                    }
+                    GitHubError::Network(_) => (
+                        StatusCode::BAD_GATEWAY,
+                        format!("GitHub network error: {e}"),
+                    ),
+                    GitHubError::Decode(msg) => (
+                        StatusCode::BAD_GATEWAY,
+                        format!("GitHub response decode error: {msg}"),
+                    ),
+                };
+                (status, msg)
+            }
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
