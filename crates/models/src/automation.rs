@@ -4,21 +4,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Automation state — whether the automation is currently active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationState {
     /// Automation is active and will trigger on schedule/events.
+    #[default]
     Active,
     /// Automation is paused — will not trigger, but can be resumed.
     Paused,
     /// Automation is disabled — will not trigger until re-enabled.
     Disabled,
-}
-
-impl Default for AutomationState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 /// Trigger type — what causes the automation to run.

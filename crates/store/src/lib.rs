@@ -621,14 +621,14 @@ impl Store {
         Ok(automations)
     }
 
-    /// Delete an automation by ID. Returns true if a row was deleted.
+    /// Delete an automation and its runs by ID. Returns true if a row was deleted.
+    /// Runs in a transaction so partial failures don't leave the store inconsistent.
     pub fn delete_automation(&self, id: &str) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
         // First delete associated runs
-        self.conn
-            .execute("DELETE FROM automation_runs WHERE automation_id = ?1", params![id])?;
-        let affected = self
-            .conn
-            .execute("DELETE FROM automations WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM automation_runs WHERE automation_id = ?1", params![id])?;
+        let affected = tx.execute("DELETE FROM automations WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -852,17 +852,36 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
             let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
             })?;
-            let cron = config["cron"].as_str().unwrap_or_default().to_string();
-            TriggerType::Schedule { cron }
+            let cron = config["cron"].as_str().ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    format!("missing or non-string 'cron' in trigger_config: {trigger_config}").into(),
+                )
+            })?;
+            TriggerType::Schedule { cron: cron.to_string() }
         }
         "event" => {
             let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
             })?;
-            let event_type = config["event_type"].as_str().unwrap_or_default().to_string();
-            TriggerType::Event { event_type }
+            let event_type = config["event_type"].as_str().ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    format!("missing or non-string 'event_type' in trigger_config: {trigger_config}").into(),
+                )
+            })?;
+            TriggerType::Event { event_type: event_type.to_string() }
         }
-        _ => TriggerType::Manual,
+        "manual" => TriggerType::Manual,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                format!("unrecognized trigger_type: {other}").into(),
+            ));
+        }
     };
 
     // Parse state
