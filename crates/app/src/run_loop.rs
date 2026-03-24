@@ -341,7 +341,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // and triggers runs when their schedules match. It ticks every 60 seconds
     // and respects operating mode (no runs in Stop mode).
 
-    let automation_scheduler = AutomationScheduler::new(server.clone());
+    let automation_scheduler = AutomationScheduler::new(server.clone(), Some(session_manager.clone()));
     let automation_scheduler_handle = automation_scheduler.start();
     info!("automation scheduler started");
 
