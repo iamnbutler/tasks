@@ -1856,8 +1856,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 }
             } // end single-entry evaluation block
 
-            // Cleanup terminal merge queue entries (issue #132, #282).
+            // Cleanup terminal merge queue entries (issue #132, #282, #438).
             // This removes Merged, Rejected, and stale Conflict entries to prevent unbounded growth.
+            // Merged entries have a 5-minute cooldown to prevent race conditions with GitHub API
+            // propagation delays (issue #438).
             let chrono_max_age = match chrono::Duration::from_std(conflict_max_age) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1870,7 +1872,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 }
             };
             let conflict_cutoff = chrono::Utc::now() - chrono_max_age;
-            orch_server.cleanup_merge_queue(Some(conflict_cutoff)).await;
+            // 5-minute cooldown for merged entries to handle GitHub API propagation delay
+            let merged_cutoff = chrono::Utc::now() - chrono::Duration::minutes(5);
+            orch_server.cleanup_merge_queue(Some(merged_cutoff), Some(conflict_cutoff)).await;
         }
     });
 

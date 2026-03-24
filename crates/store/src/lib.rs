@@ -213,6 +213,7 @@ impl Store {
                     changes_requested_feedback: None, // TODO: persist to DB
                     head_sha: None,      // Updated from GitHub on reconciliation
                     queue_position: None, // Computed lazily on API read
+                    completed_at: None,  // Not persisted to DB yet
                 }))
             }
             None => Ok(None),
@@ -252,6 +253,7 @@ impl Store {
                 changes_requested_feedback: None, // TODO: persist to DB
                 head_sha: None,      // Updated from GitHub on reconciliation
                 queue_position: None, // Computed lazily on API read
+                completed_at: None,  // Not persisted to DB yet
             });
         }
         Ok(entries)

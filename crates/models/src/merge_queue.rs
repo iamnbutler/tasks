@@ -106,6 +106,11 @@ pub struct MergeQueueEntry {
     /// Only set for Approved/Merging entries to show merge order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<u32>,
+    /// Timestamp when the entry transitioned to a terminal state (Merged/Rejected).
+    /// Used by cleanup to implement a cooldown period before removal, preventing
+    /// race conditions where GitHub's merged state hasn't propagated yet (issue #438).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 impl MergeQueueEntry {
@@ -120,6 +125,7 @@ impl MergeQueueEntry {
             changes_requested_feedback: None,
             head_sha: None,
             queue_position: None,
+            completed_at: None,
         }
     }
 

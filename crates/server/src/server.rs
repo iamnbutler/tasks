@@ -1706,15 +1706,20 @@ impl Server {
     /// Should be called periodically to prevent unbounded queue growth.
     /// See issue #132.
     ///
+    /// If `merged_cutoff` is provided, only removes Merged/Rejected entries that
+    /// were completed before the cutoff. This implements a cooldown period to
+    /// prevent race conditions with GitHub's API propagation. See issue #438.
+    ///
     /// If `conflict_cutoff` is provided, also removes conflict entries that have
     /// been in conflict state since before the cutoff time. This prevents stale
     /// conflicts from accumulating indefinitely. See issue #282.
     pub async fn cleanup_merge_queue(
         &self,
+        merged_cutoff: Option<chrono::DateTime<chrono::Utc>>,
         conflict_cutoff: Option<chrono::DateTime<chrono::Utc>>,
     ) {
         let mut state = self.state.write().await;
-        state.merge_queue.cleanup(conflict_cutoff);
+        state.merge_queue.cleanup(merged_cutoff, conflict_cutoff);
     }
 
     /// Emit an orchestrator:decision event recording an evaluation.
@@ -2908,8 +2913,8 @@ mod tests {
             assert_eq!(state.merge_queue.entries().len(), 3);
         }
 
-        // Run cleanup (without conflict cutoff for this test)
-        server.cleanup_merge_queue(None).await;
+        // Run cleanup (without any cutoffs for this test)
+        server.cleanup_merge_queue(None, None).await;
 
         // After cleanup: only the pending entry remains
         let state = server.state.read().await;
