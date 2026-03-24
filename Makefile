@@ -14,9 +14,21 @@ CONTAINER_IMAGE := tasks-agent:latest
 
 all: container-image
 
-# Build the web frontend and start the server
+# Build the web frontend and start the server.
+# Exit code 100 means "update available" — pull, rebuild, and restart.
 run: web
-	cargo run -- run --web
+	@while true; do \
+		cargo run -- run --web; \
+		EXIT_CODE=$$?; \
+		if [ $$EXIT_CODE -eq 100 ]; then \
+			echo "Update requested (exit 100), pulling and rebuilding..."; \
+			git pull --ff-only && \
+			cd web && bun install && bun run build && cd .. && \
+			echo "Rebuilt. Restarting..."; \
+		else \
+			exit $$EXIT_CODE; \
+		fi; \
+	done
 
 # Build the web frontend
 web:
