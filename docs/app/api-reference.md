@@ -28,6 +28,7 @@ GET /api/snapshot
   "projects": [...],
   "tasks": [...],
   "merge_queue": [...],
+  "automations": [...],
   "slot_utilization": {
     "active": 2,
     "max": 5
@@ -193,6 +194,32 @@ Content-Type: application/json
 }
 ```
 
+#### Bootstrap Project
+
+Create a new private GitHub repository, add it as a project, and open an initial issue. The poller picks up the issue and dispatches an agent automatically.
+
+```http
+POST /api/projects/bootstrap
+Content-Type: application/json
+
+{
+  "prompt": "Build a CLI tool that converts CSV to JSON",
+  "repo_name": "csv-to-json"
+}
+```
+
+`repo_name` is optional — if omitted, a name is derived from the prompt.
+
+**Response:**
+
+```json
+{
+  "project": { "id": "...", "repo": "owner/csv-to-json", "created_at": "..." },
+  "issue": { "number": 1, "url": "https://github.com/owner/csv-to-json/issues/1" },
+  "repo_url": "https://github.com/owner/csv-to-json"
+}
+```
+
 #### Remove Project
 
 ```http
@@ -255,6 +282,29 @@ Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of 
 
 ```http
 POST /api/merge-queue/flush
+```
+
+### Containers
+
+#### List Active Containers
+
+Returns all currently running container sessions.
+
+```http
+GET /api/containers
+```
+
+**Response:**
+
+```json
+[
+  {
+    "container_id": "container-abc123",
+    "task_id": "task-uuid",
+    "started_at": "2024-01-15T10:30:00Z",
+    "uptime_secs": 342
+  }
+]
 ```
 
 ### Orchestrator
@@ -361,6 +411,150 @@ Content-Type: application/json
 
 **Response:** `{ "summary": "..." }`
 
+### Automations
+
+Automations are reusable agent workflows that can be triggered manually, on a schedule, or by events.
+
+#### List Automations
+
+```http
+GET /api/automations
+GET /api/automations?project_id=<project-uuid>
+```
+
+**Response:** Array of `Automation` objects.
+
+#### Create Automation
+
+```http
+POST /api/automations
+Content-Type: application/json
+
+{
+  "project_id": "project-uuid",
+  "name": "Daily dependency audit",
+  "prompt": "Check for outdated dependencies and open an issue if any are found.",
+  "trigger": { "type": "schedule", "cron": "0 9 * * 1-5" }
+}
+```
+
+`trigger` variants:
+- `{ "type": "manual" }` — triggered via API only
+- `{ "type": "schedule", "cron": "0 9 * * *" }` — cron schedule
+- `{ "type": "event", "event_type": "push" }` — fires on a platform event
+
+**Response:** The created `Automation` object.
+
+#### Get Automation
+
+```http
+GET /api/automations/:id
+```
+
+#### Update Automation
+
+```http
+PATCH /api/automations/:id
+Content-Type: application/json
+
+{
+  "name": "New name",
+  "prompt": "Updated prompt",
+  "state": "paused",
+  "trigger": { "type": "manual" }
+}
+```
+
+All fields are optional.
+
+#### Delete Automation
+
+```http
+DELETE /api/automations/:id
+```
+
+#### List Automation Runs
+
+```http
+GET /api/automations/:id/runs
+```
+
+**Response:**
+
+```json
+[
+  {
+    "id": "run-uuid",
+    "automation_id": "automation-uuid",
+    "status": "completed",
+    "started_at": "2024-01-15T09:00:00Z",
+    "completed_at": "2024-01-15T09:04:12Z",
+    "output": "No outdated dependencies found.",
+    "error": null
+  }
+]
+```
+
+**Run statuses:** `pending`, `running`, `completed`, `failed`
+
+#### Trigger Automation Run
+
+Manually start a run for an automation regardless of its trigger type.
+
+```http
+POST /api/automations/:id/run
+```
+
+**Response:** The created `AutomationRun` object.
+
+### Self-Update
+
+#### Get Update Status
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "rebuild_scope": "server",
+  "commit_summary": "Fix merge queue flush race condition",
+  "last_checked": "2024-01-15T12:00:00Z"
+}
+```
+
+`rebuild_scope` is one of `"server"`, `"container"`, or `"frontend"`.
+
+#### Apply Update
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+`force: true` skips waiting for active sessions to complete.
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update is being applied."
+}
+```
+
+`status` values: `"applying"`, `"no_update"`, `"already_applying"`.
+
 ### Events (SSE)
 
 Server-Sent Events stream for real-time updates.
@@ -388,6 +582,23 @@ curl -N http://localhost:4800/api/events?task_id=abc123
 event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
+
+#### Query Historical Events
+
+Query past events from the event log by type prefix.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=50
+```
+
+**Query Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `type_prefix` | Yes | Event type prefix to filter by (e.g. `"task:"`, `"orchestrator:"`) |
+| `limit` | No | Maximum results to return (default: 200) |
+
+**Response:** Array of `Event` objects matching the prefix.
 
 ## Error Responses
 

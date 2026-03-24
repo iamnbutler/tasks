@@ -23,6 +23,8 @@ The main navigation includes:
 | **Merge Queue** | Review and approve pending changes |
 | **Orchestrator** | AI project foreman feed and chat |
 | **Events** | Real-time event log viewer |
+| **Containers** | Active container session monitor |
+| **Automations** | Reusable automation workflows |
 
 ## Dashboard
 
@@ -141,6 +143,60 @@ Filter events by:
 - **Task** - Events for a specific task
 - **Time** - Time range
 
+## Containers
+
+The Containers view shows all active container sessions running agent workloads.
+
+Each row displays:
+
+| Column | Description |
+|--------|-------------|
+| **Container ID** | Runtime container identifier |
+| **Task** | Link to the associated task |
+| **State** | working or idle |
+| **Uptime** | How long the session has been running |
+
+The list auto-refreshes every 5 seconds.
+
+## Automations
+
+Automations are reusable agent workflows that can run on a schedule, in response to events, or manually.
+
+### Automation List
+
+Each row shows the automation name, trigger type, current state (active/paused), and a dropdown menu with **View Runs**, **Edit**, and **Delete** options. A **New Automation** button opens the creation dialog.
+
+### State Badges
+
+| Badge | Description |
+|-------|-------------|
+| **Active** | Automation is enabled and will fire on its trigger |
+| **Paused** | Automation is temporarily disabled |
+| **Disabled** | Automation is fully disabled |
+
+### Creating / Editing an Automation
+
+The automation form dialog collects:
+
+- **Name** — human-readable label
+- **Prompt** — instructions given to the agent when the automation runs
+- **Trigger** — one of:
+  - **Manual** — only runs when triggered via the API or UI
+  - **Schedule** — cron expression (presets: hourly, daily, weekdays daily, custom)
+  - **Event** — fires on a specific platform event type
+- **Active** toggle — enable or pause the automation at creation time
+
+### Runs Panel
+
+Clicking an automation row (or choosing **View Runs**) opens the runs history panel. Each run shows:
+
+- Color-coded status badge: pending (yellow), running (blue, animated), completed (green), failed (red)
+- Relative timestamp with absolute time on hover
+- Duration for completed/failed runs
+- Collapsible output section and error message (if any)
+
+The panel auto-refreshes every 2 seconds while any run is in progress.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -151,6 +207,8 @@ Filter events by:
 | `g m` | Go to Merge Queue |
 | `g o` | Go to Orchestrator |
 | `g e` | Go to Events |
+| `g c` | Go to Containers |
+| `g a` | Go to Automations |
 
 ---
 
