@@ -21,6 +21,8 @@ const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
 export interface AppState {
   snapshot: Snapshot | null;
   events: Event[];
+  /** Orchestrator events (preserved indefinitely, not subject to MAX_EVENTS cap) */
+  orchestratorEvents: Event[];
   connected: boolean;
   error: Error | null;
   refreshSnapshot: () => Promise<void>;
@@ -36,6 +38,7 @@ export interface AppState {
 const defaultState: AppState = {
   snapshot: null,
   events: [],
+  orchestratorEvents: [],
   connected: false,
   error: null,
   refreshSnapshot: async () => {},
@@ -54,9 +57,13 @@ export const AppStateContext = createContext<AppState | null>(null);
 function useAppStateCore(): AppState {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<Event[]>([]);
+  const [orchestratorEvents, setOrchestratorEvents] = useState<Event[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
+
+  // Track seen orchestrator event IDs for deduplication
+  const seenOrchestratorIds = useRef(new Set<string>());
 
   // Keep a ref to the latest snapshot-fetch promise so we can avoid races.
   const fetchInFlight = useRef(false);
@@ -138,6 +145,14 @@ function useAppStateCore(): AppState {
             return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
           });
 
+          // Accumulate orchestrator events separately (no cap, persists across navigation)
+          if (event.type.startsWith("orchestrator:")) {
+            if (!seenOrchestratorIds.current.has(event.id)) {
+              seenOrchestratorIds.current.add(event.id);
+              setOrchestratorEvents((prev) => [...prev, event]);
+            }
+          }
+
           if (STATE_CHANGING_EVENT.test(event.type)) {
             refreshSnapshot();
           }
@@ -172,6 +187,7 @@ function useAppStateCore(): AppState {
   return {
     snapshot,
     events,
+    orchestratorEvents,
     connected,
     error,
     refreshSnapshot,

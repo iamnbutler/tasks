@@ -9,7 +9,7 @@ import {
   Brain,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { fetchEvents, sendOrchestratorChat, subscribeEvents } from "@/lib/api";
+import { sendOrchestratorChat } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -380,9 +380,7 @@ function BlockView({ block }: { block: OrchestratorBlock }) {
 // ---------------------------------------------------------------------------
 
 export function OrchestratorPage() {
-  const { snapshot, events: allEvents } = useAppState();
-  const [localEvents, setLocalEvents] = useState<Event[]>([]);
-  const [historicalEvents, setHistoricalEvents] = useState<Event[]>([]);
+  const { snapshot, orchestratorEvents } = useAppState();
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
@@ -390,48 +388,17 @@ export function OrchestratorPage() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const orchestratorEvents = useMemo(() => {
-    const globalOrchEvents = allEvents.filter((e) => e.type.startsWith("orchestrator:"));
-    const merged = [...historicalEvents, ...globalOrchEvents, ...localEvents];
-    const seen = new Set<string>();
-    return merged
-      .filter((e) => { if (seen.has(e.id)) return false; seen.add(e.id); return true; })
-      .sort((a, b) => a.ts.localeCompare(b.ts));
-  }, [allEvents, localEvents, historicalEvents]);
-
-  // Fetch historical orchestrator events on mount
-  useEffect(() => {
-    let cancelled = false;
-    fetchEvents({ type_prefix: "orchestrator:", limit: 200 })
-      .then((events) => {
-        if (!cancelled) {
-          setHistoricalEvents(events);
-        }
-      })
-      .catch((err) => {
-        console.error("Failed to fetch historical orchestrator events:", err);
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    const source = subscribeEvents({ pattern: "orchestrator:*" });
-    source.onmessage = (msg) => {
-      try {
-        const event: Event = JSON.parse(msg.data);
-        if (event.type.startsWith("orchestrator:")) {
-          setLocalEvents((prev) => [...prev, event]);
-        }
-      } catch { /* ignore */ }
-    };
-    return () => source.close();
-  }, []);
+  // Sort orchestrator events chronologically
+  const sortedOrchestratorEvents = useMemo(
+    () => [...orchestratorEvents].sort((a, b) => a.ts.localeCompare(b.ts)),
+    [orchestratorEvents]
+  );
 
   const tasks = snapshot?.tasks ?? [];
   const projects = snapshot?.projects ?? [];
   const blocks = useMemo(
-    () => parseOrchestratorEvents(orchestratorEvents, tasks, projects),
-    [orchestratorEvents, tasks, projects]
+    () => parseOrchestratorEvents(sortedOrchestratorEvents, tasks, projects),
+    [sortedOrchestratorEvents, tasks, projects]
   );
   const prevBlocksLength = useRef(blocks.length);
 
