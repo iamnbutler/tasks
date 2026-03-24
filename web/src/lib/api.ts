@@ -300,10 +300,18 @@ export function deleteAutomation(id: string): Promise<void> {
   return requestVoid(`/api/automations/${id}`, { method: "DELETE" });
 }
 
+export function fetchAutomation(id: string): Promise<Automation> {
+  return request<Automation>(`/api/automations/${id}`);
+}
+
 export function fetchAutomationRuns(
   automationId: string
 ): Promise<AutomationRun[]> {
   return request<AutomationRun[]>(`/api/automations/${automationId}/runs`);
+}
+
+export function fetchRunEvents(runId: string): Promise<Event[]> {
+  return request<Event[]>(`/api/tasks/${runId}/events`);
 }
 
 export function triggerAutomation(id: string): Promise<AutomationRun> {

@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useImperativeHandle, forwardRef } from "react";
+import { Link } from "react-router-dom";
 import {
   AlertCircle,
   Check,
   ChevronDown,
   ChevronRight,
   Clock,
+  ExternalLink,
   Loader2,
   X,
 } from "lucide-react";
@@ -299,19 +301,37 @@ export const AutomationRunsPanel = forwardRef<AutomationRunsPanelHandle, Automat
       {/* Header */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <h2 className="text-sm font-semibold truncate">{automation.name}</h2>
+          <Link
+            to={`/automations/${automation.id}`}
+            className="text-sm font-semibold truncate hover:underline"
+          >
+            {automation.name}
+          </Link>
           <span className="text-xs text-muted-foreground shrink-0">
             Run History
           </span>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-6 w-6 shrink-0"
-          onClick={onClose}
-        >
-          <X className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-1 shrink-0">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            asChild
+            title="View details"
+          >
+            <Link to={`/automations/${automation.id}`}>
+              <ExternalLink className="h-3.5 w-3.5" />
+            </Link>
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={onClose}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
 
       {/* Content */}
