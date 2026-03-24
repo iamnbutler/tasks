@@ -3,6 +3,7 @@
 //! Constructs all components and runs the platform.
 //! This binary is intentionally thin — logic lives in the library crates.
 
+mod automation_runner;
 mod config;
 mod memory;
 mod problem_tracker;

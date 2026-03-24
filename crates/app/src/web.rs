@@ -1477,10 +1477,37 @@ async fn list_automation_runs(
 }
 
 /// POST /api/automations/:id/run — Manually trigger an automation run.
+///
+/// If a session manager is available, this will start an agent session to
+/// execute the automation. Otherwise, it just creates the run record (for
+/// headless mode or when containers are not available).
 async fn trigger_automation(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<models::automation::AutomationRun>, ApiError> {
+    // If session manager is available, execute the automation fully
+    if let Some(ref session_manager) = state.session_manager {
+        let run = crate::automation_runner::execute_automation_run(
+            &state.server,
+            session_manager,
+            &id,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::automation_runner::AutomationRunnerError::AutomationNotFound(_)
+            | crate::automation_runner::AutomationRunnerError::ProjectNotFound(_) => {
+                ApiError::NotFound(e.to_string())
+            }
+            crate::automation_runner::AutomationRunnerError::SessionError(msg) => {
+                ApiError::SessionManager(msg)
+            }
+            crate::automation_runner::AutomationRunnerError::ServerError(e) => ApiError::Server(e),
+        })?;
+        return Ok(Json(run));
+    }
+
+    // Fallback: just create the run record without execution
+    // This is useful for testing or when running in headless mode
     let run = state
         .server
         .create_automation_run(&id)

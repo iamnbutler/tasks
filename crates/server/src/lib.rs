@@ -14,6 +14,7 @@ pub mod workflow_watcher;
 pub mod dispatcher;
 pub mod scheduler;
 pub mod workspace;
+pub mod automation_executor;
 mod server;
 
 pub use mode::Mode;

@@ -461,6 +461,102 @@ impl Server {
         Ok(run)
     }
 
+    /// Complete an automation run successfully.
+    pub async fn complete_automation_run(
+        &self,
+        run_id: &str,
+        output: Option<String>,
+    ) -> Result<(), ServerError> {
+        // Get automation IDs first (without holding store lock)
+        let automation_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state.automations.keys().cloned().collect()
+        };
+
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+
+        // Search for the run across all automations
+        for automation_id in &automation_ids {
+            if let Ok(runs) = store.list_automation_runs(automation_id) {
+                for mut run in runs {
+                    if run.id == run_id {
+                        run.complete(output.clone());
+                        if let Err(e) = store.save_automation_run(&run) {
+                            tracing::error!(run_id = %run_id, error = %e, "failed to save completed run");
+                            return Err(ServerError::StoreError(e.to_string()));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(ServerError::StoreError(format!("run not found: {}", run_id)))
+    }
+
+    /// Mark an automation run as failed.
+    pub async fn fail_automation_run(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<(), ServerError> {
+        // Get automation IDs first (without holding store lock)
+        let automation_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state.automations.keys().cloned().collect()
+        };
+
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+
+        // Search for the run across all automations
+        for automation_id in &automation_ids {
+            if let Ok(runs) = store.list_automation_runs(automation_id) {
+                for mut run in runs {
+                    if run.id == run_id {
+                        run.fail(error);
+                        if let Err(e) = store.save_automation_run(&run) {
+                            tracing::error!(run_id = %run_id, error = %e, "failed to save failed run");
+                            return Err(ServerError::StoreError(e.to_string()));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(ServerError::StoreError(format!("run not found: {}", run_id)))
+    }
+
+    /// Get an automation run by ID.
+    pub async fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, ServerError> {
+        // Get automation IDs first
+        let automation_ids: Vec<String> = {
+            let state = self.state.read().await;
+            state.automations.keys().cloned().collect()
+        };
+
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        let store = store.lock().unwrap();
+
+        // Search for the run across all automations
+        for automation_id in &automation_ids {
+            if let Ok(runs) = store.list_automation_runs(automation_id) {
+                for run in runs {
+                    if run.id == run_id {
+                        return Ok(Some(run));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     // --- Mode management (spec Section 6) ---
 
     pub async fn mode(&self) -> Mode {

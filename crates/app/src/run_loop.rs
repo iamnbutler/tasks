@@ -837,6 +837,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     }
                 }
             }
+
+            // Handle automation run events (issue #391)
+            // The session manager uses task_id for automation runs in the format
+            // "automation-run:{run_id}". When these sessions emit events, we
+            // translate them to automation run status updates.
+            crate::automation_runner::handle_automation_event(&event_handler_server, &event).await;
         }
     });
 
