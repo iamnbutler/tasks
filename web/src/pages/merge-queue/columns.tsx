@@ -11,7 +11,7 @@ import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
 // Status badge
 // ---------------------------------------------------------------------------
 
-function statusBadge(status: MergeStatus) {
+export function statusBadge(status: MergeStatus) {
   switch (status) {
     case "pending":
       return <Badge variant="outline" className="bg-yellow-500/15 text-yellow-400 border-yellow-500/30">{status}</Badge>;
@@ -84,27 +84,27 @@ export function getLifecyclePhase(status: MergeStatus): LifecyclePhase {
 // ---------------------------------------------------------------------------
 
 /** Extract PR number from a GitHub PR URL. */
-function prNumber(url: string): string | null {
+export function prNumber(url: string): string | null {
   const match = url.match(/\/pull\/(\d+)/);
   return match?.[1] ?? null;
 }
 
 /** Extract owner/repo from a GitHub PR URL. */
-function prRepo(url: string): string | null {
+export function prRepo(url: string): string | null {
   const match = url.match(/github\.com\/([^/]+\/[^/]+)\/pull/);
   return match?.[1] ?? null;
 }
 
 /** Extract just the repo name (no owner) from a GitHub PR URL. */
-function prRepoShort(url: string): string | null {
+export function prRepoShort(url: string): string | null {
   const full = prRepo(url);
   return full?.split("/")[1] ?? null;
 }
 
 /** Get the task from task list. */
-function getTask(taskId: string, meta: { tasks?: Task[] } | undefined): Task | undefined {
+export function getTask(taskId: string, tasks: Task[]): Task | undefined {
   if (!taskId) return undefined;
-  return meta?.tasks?.find((t) => t.id === taskId);
+  return tasks.find((t) => t.id === taskId);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     id: "title",
     header: "Title",
     cell: ({ row, table }) => {
-      const task = getTask(row.original.task_id, table.options.meta as { tasks?: Task[] });
+      const task = getTask(row.original.task_id, (table.options.meta as { tasks?: Task[] })?.tasks ?? []);
       if (task) {
         return (
           <Link
@@ -176,7 +176,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     header: "Project",
     cell: ({ row, table }) => {
       const meta = table.options.meta as { tasks?: Task[]; projects?: Project[] } | undefined;
-      const task = getTask(row.original.task_id, meta);
+      const task = getTask(row.original.task_id, meta?.tasks ?? []);
       const projects = meta?.projects ?? [];
       let name = task?.project ? projectLabel(task.project, projects) : null;
       // Fall back to extracting repo from PR URL
@@ -227,7 +227,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     id: "issue",
     header: "Issue",
     cell: ({ row, table }) => {
-      const task = getTask(row.original.task_id, table.options.meta as { tasks?: Task[] });
+      const task = getTask(row.original.task_id, (table.options.meta as { tasks?: Task[] })?.tasks ?? []);
       if (!task) return <span className="text-muted-foreground">&mdash;</span>;
       const { source } = task;
       if (source.type === "github_issue") {

@@ -3,17 +3,16 @@ import { Pause, Play } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { cn, formatRelativeTime } from "@/lib/utils";
+import { ListView, ListEmptyState } from "@/components/ui/list-view";
+import { ListHeader, ListHeaderTabs } from "@/components/ui/list-header";
+import {
+  ListRow,
+  TimeCell,
+  BadgeCell,
+  TextCell,
+  IdCell,
+} from "@/components/ui/list-row";
 import type { Event } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +57,28 @@ function truncateData(data: Record<string, unknown>, max = 100): string {
 }
 
 // ---------------------------------------------------------------------------
+// Event row component
+// ---------------------------------------------------------------------------
+
+function EventRow({ event }: { event: Event }) {
+  return (
+    <ListRow clickable={false}>
+      <TimeCell width="w-20">{formatRelativeTime(event.ts)}</TimeCell>
+      <BadgeCell>
+        <Badge variant="outline" className={cn("font-mono text-xs", badgeClasses(event.type))}>
+          {event.type}
+        </Badge>
+      </BadgeCell>
+      <TextCell flex={false} size="xs" className="w-28">{event.actor}</TextCell>
+      <IdCell width="w-20">{event.task ? event.task.slice(0, 8) : "\u2014"}</IdCell>
+      <TextCell size="xs" muted mono className="max-w-[400px]">
+        {truncateData(event.data)}
+      </TextCell>
+    </ListRow>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Events page
 // ---------------------------------------------------------------------------
 
@@ -82,91 +103,62 @@ export function EventsPage() {
     [events, activeFilter],
   );
 
+  const tabsConfig = FILTERS.map(({ key, label }) => ({
+    key,
+    label,
+  }));
+
+  const headerTabs = (
+    <ListHeaderTabs
+      tabs={tabsConfig}
+      activeTab={activeFilter}
+      onTabChange={(tab) => setActiveFilter(tab as FilterKey)}
+    />
+  );
+
+  const headerActions = (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={handleTogglePause}
+      className="gap-1.5 h-7 text-xs"
+    >
+      {paused ? (
+        <>
+          <Play className="h-3 w-3" />
+          Resume
+        </>
+      ) : (
+        <>
+          <Pause className="h-3 w-3" />
+          Pause
+        </>
+      )}
+    </Button>
+  );
+
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <div className="flex items-center gap-4">
-          <h1 className="text-sm font-semibold">Events</h1>
-
-          <Tabs
-            value={activeFilter}
-            onValueChange={(v: string) => setActiveFilter(v as FilterKey)}
-          >
-            <TabsList className="h-7">
-              {FILTERS.map(({ key, label }) => (
-                <TabsTrigger key={key} value={key} className="text-xs px-2.5 h-6">
-                  {label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </div>
-
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={handleTogglePause}
-          className="gap-1.5 h-7 text-xs"
-        >
-          {paused ? (
-            <>
-              <Play className="h-3 w-3" />
-              Resume
-            </>
-          ) : (
-            <>
-              <Pause className="h-3 w-3" />
-              Pause
-            </>
-          )}
-        </Button>
+    <ListView
+      header={
+        <ListHeader
+          title="Events"
+          tabs={headerTabs}
+          actions={headerActions}
+        />
+      }
+      isEmpty={filteredEvents.length === 0}
+      emptyState={
+        <ListEmptyState
+          message={paused ? "No events match the current filter (paused)." : "No events yet."}
+        />
+      }
+    >
+      <div>
+        {filteredEvents.map((event) => (
+          <EventRow key={event.id} event={event} />
+        ))}
       </div>
-
-      {/* Events table */}
-      <ScrollArea className="flex-1">
-        {filteredEvents.length === 0 ? (
-          <div className="flex items-center justify-center py-20">
-            <p className="text-muted-foreground text-sm">
-              {paused ? "No events match the current filter (paused)." : "No events yet."}
-            </p>
-          </div>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-[100px]">Time</TableHead>
-                <TableHead className="w-[180px]">Type</TableHead>
-                <TableHead className="w-[110px]">Actor</TableHead>
-                <TableHead className="w-[90px]">Task</TableHead>
-                <TableHead>Data</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filteredEvents.map((event) => (
-                <TableRow key={event.id}>
-                  <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-                    {formatRelativeTime(event.ts)}
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="outline" className={cn("font-mono text-xs", badgeClasses(event.type))}>
-                      {event.type}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-xs">{event.actor}</TableCell>
-                  <TableCell className="font-mono text-xs text-muted-foreground">
-                    {event.task ? event.task.slice(0, 8) : "\u2014"}
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[400px] truncate font-mono">
-                    {truncateData(event.data)}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </ScrollArea>
-    </div>
+    </ListView>
   );
 }
 
