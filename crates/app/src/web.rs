@@ -68,6 +68,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting/tasks", get(list_task_accounting))
         .route("/accounting/tasks/{id}", get(get_task_accounting))
         .route("/events/query", get(query_events))
+        // Self-update endpoints (issue #305, #320)
+        .route("/self-update", get(get_self_update_status))
+        .route("/self-update/apply", post(apply_self_update))
         .route("/events", get(event_stream))
         // Completions endpoints (fast mode with Haiku)
         .route("/completions", post(completions))
@@ -181,6 +184,42 @@ struct QueryEventsParams {
     type_prefix: Option<String>,
     /// Maximum number of events to return (default: 200).
     limit: Option<usize>,
+}
+
+// --- Self-update types (issue #305, #320) ---
+
+/// GET /api/self-update response.
+#[derive(Serialize)]
+struct SelfUpdateStatusResponse {
+    /// Whether an update is available.
+    available: bool,
+    /// Current commit hash (short form).
+    current_commit: Option<String>,
+    /// Target commit hash to update to (short form).
+    target_commit: Option<String>,
+    /// What needs to be rebuilt: "server", "container", or "frontend".
+    rebuild_scope: Option<String>,
+    /// First line of the commit message for the target commit.
+    commit_summary: Option<String>,
+    /// When the update was last checked.
+    last_checked: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// POST /api/self-update/apply request.
+#[derive(Deserialize)]
+struct ApplySelfUpdateRequest {
+    /// If true, skip waiting for active sessions to complete.
+    #[serde(default)]
+    force: bool,
+}
+
+/// POST /api/self-update/apply response.
+#[derive(Serialize)]
+struct ApplySelfUpdateResponse {
+    /// Status of the apply request: "applying", "no_update", "already_applying".
+    status: String,
+    /// Human-readable message about the update status.
+    message: String,
 }
 
 // --- Completions request/response types ---
@@ -763,6 +802,48 @@ async fn get_task_accounting(
         .map_err(ApiError::Server)?
         .ok_or_else(|| ApiError::NotFound(format!("accounting not found for task: {id}")))?;
     Ok(Json(accounting))
+}
+
+// --- Self-update endpoints (issue #305, #320) ---
+
+/// GET /api/self-update — Get current update status.
+///
+/// Returns information about whether an update is available from upstream.
+/// Note: Full functionality requires Phase 1 infrastructure (#319).
+async fn get_self_update_status(
+    State(_state): State<ApiState>,
+) -> Json<SelfUpdateStatusResponse> {
+    // TODO(#319): Integrate with SelfUpdateManager from Phase 1
+    // For now, return a stub response indicating no update mechanism is configured
+    Json(SelfUpdateStatusResponse {
+        available: false,
+        current_commit: None,
+        target_commit: None,
+        rebuild_scope: None,
+        commit_summary: None,
+        last_checked: None,
+    })
+}
+
+/// POST /api/self-update/apply — Trigger a self-update.
+///
+/// Initiates the update process:
+/// 1. Sets mode to Stop to prevent new session launches
+/// 2. Waits for active sessions to complete (unless force=true)
+/// 3. Exits with code 100 for the wrapper script to restart
+///
+/// Note: Full functionality requires Phase 1 infrastructure (#319).
+async fn apply_self_update(
+    State(_state): State<ApiState>,
+    Json(req): Json<ApplySelfUpdateRequest>,
+) -> Result<Json<ApplySelfUpdateResponse>, ApiError> {
+    // TODO(#319): Integrate with SelfUpdateManager from Phase 1
+    tracing::debug!(force = req.force, "self-update apply called (stub, #319 not yet integrated)");
+
+    Ok(Json(ApplySelfUpdateResponse {
+        status: "no_update".to_string(),
+        message: "Self-update infrastructure not yet configured. See issue #319.".to_string(),
+    }))
 }
 
 /// A stream wrapper that holds a presence guard until the stream ends.
