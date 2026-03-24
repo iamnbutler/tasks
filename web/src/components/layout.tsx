@@ -39,6 +39,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { Mode } from "@/lib/types";
@@ -47,18 +52,17 @@ import type { Mode } from "@/lib/types";
 // Mode indicator
 // ---------------------------------------------------------------------------
 
-const modeConfig: Record<Mode, { color: string; label: string; icon: typeof Square }> = {
-  stop: { color: "bg-red-500", label: "Stopped", icon: Square },
-  pause: { color: "bg-yellow-500", label: "Paused", icon: Pause },
-  play: { color: "bg-green-500", label: "Playing", icon: Play },
+const modeConfig: Record<Mode, { label: string; icon: typeof Square }> = {
+  stop: { label: "Stopped", icon: Square },
+  pause: { label: "Paused", icon: Pause },
+  play: { label: "Playing", icon: Play },
 };
 
 const modeOrder: Mode[] = ["stop", "pause", "play"];
 
-function ModeIndicator() {
+function ModeSelector() {
   const { snapshot, refreshSnapshot } = useAppState();
   const currentMode = snapshot?.mode ?? "stop";
-  const config = modeConfig[currentMode];
 
   async function handleSetMode(mode: Mode) {
     try {
@@ -70,30 +74,31 @@ function ModeIndicator() {
   }
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button className="flex items-center gap-2 rounded-md px-2 py-1 text-sm hover:bg-accent transition-colors">
-          <span className={cn("h-2 w-2 rounded-full", config.color)} />
-          <span className="text-muted-foreground">{config.label}</span>
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-36">
-        {modeOrder.map((mode) => {
-          const m = modeConfig[mode];
-          const Icon = m.icon;
-          return (
-            <DropdownMenuItem
-              key={mode}
-              onClick={() => handleSetMode(mode)}
-              className={cn(currentMode === mode && "bg-accent")}
-            >
-              <Icon className="mr-2 h-3.5 w-3.5" />
-              {m.label}
-            </DropdownMenuItem>
-          );
-        })}
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <div className="flex items-center gap-1">
+      {modeOrder.map((mode) => {
+        const config = modeConfig[mode];
+        const Icon = config.icon;
+        const isActive = currentMode === mode;
+        return (
+          <Tooltip key={mode}>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => handleSetMode(mode)}
+                className={cn(
+                  "flex items-center justify-center h-7 w-7 rounded-md transition-colors",
+                  isActive
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                )}
+              >
+                <Icon className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">{config.label}</TooltipContent>
+          </Tooltip>
+        );
+      })}
+    </div>
   );
 }
 
@@ -560,7 +565,6 @@ export function Layout() {
             </div>
             <span className="text-sm font-semibold">Tasks</span>
           </div>
-          <ModeIndicator />
         </div>
 
         {/* Project selector */}
@@ -589,24 +593,24 @@ export function Layout() {
           </div>
         </ScrollArea>
 
-        {/* Footer: connection + slots */}
-        <div className="border-t border-border px-3 py-2 space-y-1">
-          {slotUtil && (
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>Slots</span>
-              <span>
-                {slotUtil.active}/{slotUtil.max}
-              </span>
+        {/* Footer: mode selector + connection + slots */}
+        <div className="border-t border-border px-3 py-2 space-y-2">
+          <ModeSelector />
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <div className="flex items-center gap-1.5">
+              <span
+                className={cn(
+                  "inline-block h-1.5 w-1.5 rounded-full",
+                  connected ? "bg-green-500" : "bg-red-500"
+                )}
+              />
+              {connected ? "Connected" : "Disconnected"}
             </div>
-          )}
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span
-              className={cn(
-                "inline-block h-1.5 w-1.5 rounded-full",
-                connected ? "bg-green-500" : "bg-red-500"
-              )}
-            />
-            {connected ? "Connected" : "Disconnected"}
+            {slotUtil && (
+              <span>
+                {slotUtil.active}/{slotUtil.max} slots
+              </span>
+            )}
           </div>
         </div>
       </aside>
