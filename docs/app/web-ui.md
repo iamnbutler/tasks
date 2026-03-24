@@ -132,6 +132,8 @@ The Events view shows a real-time stream of system events.
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
 | `merge:completed` | Changes merged |
+| `system:update:available` | A new upstream commit is available |
+| `system:update:applying` | An update is being applied |
 
 ### Filtering
 
@@ -140,6 +142,19 @@ Filter events by:
 - **Type** - Specific event type
 - **Task** - Events for a specific task
 - **Time** - Time range
+
+## Update Banner
+
+When a new version is available (a new commit pushed to `origin/main`), a banner appears at the top of the page:
+
+- **Commit summary** - Description of what changed
+- **Rebuild scope** - What will be rebuilt (`frontend`, `server`, or `container`)
+- **Update Now** - Drains active sessions and triggers rebuild/restart via the wrapper script
+- **Dismiss** - Hides the banner until a new target commit is detected
+
+The banner polls `GET /api/self-update` periodically and also responds in real time to `system:update:available` SSE events.
+
+> **Note:** Updating requires the wrapper script (`scripts/tasks-runner.sh`) to be running. See the [Deployment Guide](deployment.md) for setup.
 
 ## Keyboard Shortcuts
 
@@ -154,4 +169,4 @@ Filter events by:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*

@@ -272,6 +272,66 @@ Content-Type: application/json
 }
 ```
 
+### Self-Update
+
+#### Get Update Status
+
+Returns the current self-update status, including whether a new commit is available from upstream.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "rebuild_scope": "server",
+  "commit_summary": "Fix memory leak in session manager",
+  "last_checked": "2026-03-24T10:00:00Z"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `available` | Whether an update is available |
+| `current_commit` | Current running commit (short SHA) |
+| `target_commit` | Upstream commit to update to (short SHA) |
+| `rebuild_scope` | What will be rebuilt: `frontend`, `server`, or `container` |
+| `commit_summary` | Human-readable summary of the update |
+| `last_checked` | When the update check was last performed |
+
+#### Apply Update
+
+Initiates the self-update process. Drains active sessions gracefully, then exits with code 100 for the wrapper script to pull, rebuild, and restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `force` | Skip waiting for active sessions to drain | `false` |
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Draining sessions before applying update..."
+}
+```
+
+**Status values:** `applying`, `no_update`, `already_applying`
+
 ### Accounting
 
 #### Get Accounting Summary
@@ -412,4 +472,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*
