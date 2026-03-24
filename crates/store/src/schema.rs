@@ -52,6 +52,31 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             total_duration_seconds INTEGER NOT NULL DEFAULT 0,
             last_updated TEXT NOT NULL
         );
+
+        -- Automations: reusable workflows triggered by schedule, events, or manual action
+        CREATE TABLE IF NOT EXISTS automations (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            compiled_workflow TEXT,
+            trigger_type TEXT NOT NULL,
+            trigger_config TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        -- Automation runs: history of automation executions
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id TEXT PRIMARY KEY,
+            automation_id TEXT NOT NULL REFERENCES automations(id),
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            output TEXT,
+            error TEXT
+        );
         ",
     )?;
 
