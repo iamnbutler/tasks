@@ -344,7 +344,7 @@ Fields:
 - `id` (string) — queue entry ID
 - `task_id` (string) — the originating task, if any
 - `pr_url` (string) — pull request URL
-- `status` (string) — pending, approved, rejected, merged, conflict, changes_requested
+- `status` (string) — pending, approved, merging, rejected, merged, conflict, changes_requested
 - `queued_at` (timestamp)
 - `changes_requested_feedback` (string or null) — feedback when status is changes_requested
 
@@ -465,7 +465,102 @@ Implications:
 Human chat messages to the orchestrator bypass the evaluation queue and are processed
 immediately (see §4.5).
 
-### 7.2 Merge Authority
+### 7.2 Two-Phase Model
+
+The merge queue operates in two distinct phases. Understanding this split clarifies the lifecycle
+and guides both implementation and UI design.
+
+#### 7.2.1 Review Phase
+
+The review phase encompasses entries that are accumulating signal before a merge decision.
+
+**Statuses in this phase:**
+
+- `pending` — Awaiting evaluation. The orchestrator has not yet reviewed the PR.
+- `changes_requested` — Feedback provided. The entry needs work before re-evaluation.
+- `conflict` — Merge conflict detected. Resolution required before the entry can proceed.
+
+**What happens in this phase:**
+
+- The orchestrator evaluates PRs against associated issues (§7.4).
+- CI checks run and report status.
+- Humans can review, leave feedback, or approve.
+- Entries accumulate signals until a decision is reached.
+
+**Actions available:**
+
+- **Approve** — Move the entry to the merge phase.
+- **Request changes** — Keep the entry in review with actionable feedback.
+- **Reject** — Remove the entry from the queue (terminal).
+
+#### 7.2.2 Merge Phase
+
+The merge phase encompasses entries that have been approved and are ready to merge.
+
+**Statuses in this phase:**
+
+- `approved` — Ready to merge, waiting in line.
+- `merging` — Actively being merged (GitHub API call in progress).
+
+**What happens in this phase:**
+
+- Entries are processed serially — one entry merges at a time.
+- The merge process: checkout branch → check for conflicts → merge to base branch.
+- On success, status transitions to `merged` (terminal).
+- On failure (e.g., conflict detected during merge), the entry returns to the review phase
+  with status `conflict`, not outright rejected. This preserves the work and allows resolution.
+
+**Serial processing rationale:**
+
+Serial merging prevents race conditions where two PRs both pass conflict checks but then
+conflict with each other. By processing one at a time, each merge has a stable base.
+
+#### 7.2.3 Lifecycle Diagram
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                     REVIEW PHASE                        │
+                    │                                                         │
+PR Detected ───────►│  pending ◄───────► changes_requested                    │
+                    │     │                     │                             │
+                    │     │                     │                             │
+                    │     ▼                     ▼                             │
+                    │  conflict ◄─────────────────────────────────────┐       │
+                    │     │                                           │       │
+                    └─────┼───────────────────────────────────────────┼───────┘
+                          │                                           │
+                    ┌─────┼───────────────────────────────────────────┼───────┐
+                    │     │              MERGE PHASE                  │       │
+                    │     ▼                                           │       │
+                    │  approved ──────► merging ──────────────────────┘       │
+                    │                      │         (conflict)               │
+                    └──────────────────────┼──────────────────────────────────┘
+                                           │
+                                           ▼
+                                        merged
+                                       (terminal)
+
+Rejected is also terminal — entries exit the queue entirely.
+```
+
+#### 7.2.4 Operating Mode Behavior by Phase
+
+| Mode  | Review Phase                              | Merge Phase                               |
+|-------|-------------------------------------------|-------------------------------------------|
+| Stop  | Held — no evaluation occurs               | Held — no merging occurs                  |
+| Pause | Orchestrator evaluates, human reviews     | Held — Flush available for approved items |
+| Play  | Continuous evaluation                     | Continuous merging                        |
+
+This table clarifies how operating modes affect each phase independently:
+
+- **Stop**: Both phases are completely paused. The queue is frozen.
+- **Pause**: Review continues (PRs are evaluated, feedback given), but nothing merges
+  automatically. The Flush action allows the human to push approved entries through
+  the merge phase on demand.
+- **Play**: Both phases operate continuously. PRs are evaluated as they arrive, and
+  approved entries merge automatically.
+
+### 7.3 Merge Authority
 
 Merge authority determines who approves merges from the queue.
 
@@ -478,7 +573,7 @@ Merge authority determines who approves merges from the queue.
 The human always has the ability to intervene — reject a merge, pull something out of the queue,
 or drop into a task to give feedback. The mode controls the default flow, not the human's access.
 
-### 7.3 Quality Evaluation
+### 7.4 Quality Evaluation
 
 Before approving a merge, the orchestrator reviews the actual code diff:
 
@@ -506,7 +601,7 @@ If the work isn't ready, the orchestrator rejects the entry with specific, actio
 referencing the actual code. If the PR originated from a task, that task may be re-engaged with
 the feedback rather than queuing a bad merge.
 
-### 7.4 Changes Requested
+### 7.5 Changes Requested
 
 When work needs minor fixes rather than outright rejection, the orchestrator or human can
 request changes instead of rejecting:
@@ -530,7 +625,7 @@ to make targeted fixes. It's appropriate when:
 For major rework or fundamentally incorrect approaches, rejection with a new task is more
 appropriate.
 
-### 7.5 Conflicts
+### 7.6 Conflicts
 
 When a pending merge has conflicts:
 
