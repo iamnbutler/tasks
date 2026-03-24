@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { NavLink, Outlet } from "react-router-dom";
 import {
   LayoutDashboard,
   ListTodo,
@@ -162,7 +162,6 @@ function SidebarNavItem({
 
 function ProjectList() {
   const { snapshot, refreshSnapshot, selectedProject, setSelectedProject } = useAppState();
-  const navigate = useNavigate();
   const [isOpen, setIsOpen] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [newRepo, setNewRepo] = useState("");
@@ -222,7 +221,7 @@ function ProjectList() {
     } else {
       setSelectedProject(projectId);
     }
-    navigate("/tasks");
+    // Don't navigate - let the user filter the current page
   };
 
   const handleBootstrap = async () => {
@@ -309,7 +308,6 @@ function ProjectList() {
           <button
             onClick={() => {
               setSelectedProject(null);
-              navigate("/tasks");
             }}
             className={cn(
               "flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors",
