@@ -24,6 +24,17 @@ The main navigation includes:
 | **Orchestrator** | AI project foreman feed and chat |
 | **Events** | Real-time event log viewer |
 
+## Update Banner
+
+When a new version of Tasks is available, an update banner appears at the top of the UI. The banner displays:
+
+- **Commit summary** — Description of what's new
+- **Rebuild scope** — What will be rebuilt (`server`, `frontend`, or `container`)
+- **Update Now** button — Applies the update immediately, draining active sessions first
+- **Dismiss** button — Hides the banner until a newer target commit is detected
+
+Banner state is driven by SSE events (`system:update:available`, `system:update:applying`) and a periodic poll of `GET /api/self-update`. Requires the wrapper script (`scripts/tasks-runner.sh`) to be running for the update to take effect. See [Deployment](deployment.md) for setup.
+
 ## Dashboard
 
 The dashboard provides an at-a-glance view of:
@@ -132,6 +143,8 @@ The Events view shows a real-time stream of system events.
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
 | `merge:completed` | Changes merged |
+| `system:update:available` | New version available |
+| `system:update:applying` | Update is being applied |
 
 ### Filtering
 
@@ -154,4 +167,4 @@ Filter events by:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*

@@ -36,6 +36,59 @@ GET /api/snapshot
 }
 ```
 
+#### Get Update Status
+
+Check whether a newer version of Tasks is available.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "current_commit": "abc1234",
+  "target_commit": "def5678",
+  "rebuild_scope": "server",
+  "commit_summary": "Fix login bug",
+  "last_checked": "2026-03-24T01:00:00Z"
+}
+```
+
+#### Apply Update
+
+Trigger a self-update. Drains active sessions and exits with code 100 to signal the wrapper script to pull, rebuild, and restart.
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update initiated, draining active sessions..."
+}
+```
+
+**Status values:** `applying`, `no_update`, `already_applying`
+
+#### Rebuild from GitHub
+
+Re-sync tasks and merge queue from live GitHub state.
+
+```http
+POST /api/rebuild
+```
+
 #### Get Current Mode
 
 ```http
@@ -92,6 +145,34 @@ GET /api/tasks
 
 ```http
 GET /api/tasks/:id
+```
+
+#### Update Task
+
+Update task properties (currently priority only).
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+**Response:** The updated task object.
+
+#### Reorder Tasks
+
+Assign sequential priorities to tasks in the given order. Used for drag-and-drop reordering in the UI.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["task-uuid-1", "task-uuid-2", "task-uuid-3"]
+}
 ```
 
 #### Get Task Events
@@ -363,6 +444,23 @@ Content-Type: application/json
 
 ### Events (SSE)
 
+#### Query Historical Events
+
+Query stored events by type prefix.
+
+```http
+GET /api/events/query?type_prefix=orchestrator:&limit=200
+```
+
+**Query Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `type_prefix` | Event type prefix to filter by (required) | — |
+| `limit` | Maximum number of events to return | `200` |
+
+#### Live Event Stream
+
 Server-Sent Events stream for real-time updates.
 
 ```http
@@ -412,4 +510,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-03-24*
