@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
+import { Link } from "react-router-dom";
 import {
   AlertCircle,
   Check,
   ChevronDown,
   ChevronRight,
   Clock,
+  ExternalLink,
   Loader2,
   X,
 } from "lucide-react";
@@ -168,7 +170,7 @@ function RunDetailView({ run }: { run: AutomationRun }) {
 // Run row
 // ---------------------------------------------------------------------------
 
-function RunRow({ run }: { run: AutomationRun }) {
+function RunRow({ run, automationId }: { run: AutomationRun; automationId: string }) {
   const [expanded, setExpanded] = useState(false);
 
   // Auto-expand if this is a running or recently failed run
@@ -181,13 +183,15 @@ function RunRow({ run }: { run: AutomationRun }) {
   return (
     <Collapsible open={expanded} onOpenChange={setExpanded}>
       <div className="border-b border-border last:border-b-0">
-        <CollapsibleTrigger className="flex items-center gap-3 w-full px-3 py-2 hover:bg-accent/30 transition-colors text-left">
-          <ChevronRight
-            className={cn(
-              "h-3.5 w-3.5 text-muted-foreground transition-transform shrink-0",
-              expanded && "rotate-90"
-            )}
-          />
+        <div className="flex items-center gap-3 w-full px-3 py-2 hover:bg-accent/30 transition-colors text-left">
+          <CollapsibleTrigger className="p-0 border-0 bg-transparent">
+            <ChevronRight
+              className={cn(
+                "h-3.5 w-3.5 text-muted-foreground transition-transform shrink-0",
+                expanded && "rotate-90"
+              )}
+            />
+          </CollapsibleTrigger>
           <RunStatusBadge status={run.status} />
           <span
             className="text-xs text-muted-foreground flex-1"
@@ -200,7 +204,14 @@ function RunRow({ run }: { run: AutomationRun }) {
               {formatDuration(run.started_at, run.completed_at)}
             </span>
           )}
-        </CollapsibleTrigger>
+          <Link
+            to={`/automations/${automationId}/runs/${run.id}`}
+            className="p-1 rounded hover:bg-accent/50 transition-colors"
+            title="View run details"
+          >
+            <ExternalLink className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
+          </Link>
+        </div>
         <CollapsibleContent>
           <div className="px-3 pb-2 pl-9">
             <RunDetailView run={run} />
@@ -308,7 +319,7 @@ export function AutomationRunsPanel({
         ) : (
           <div>
             {runs.map((run) => (
-              <RunRow key={run.id} run={run} />
+              <RunRow key={run.id} run={run} automationId={automation.id} />
             ))}
           </div>
         )}

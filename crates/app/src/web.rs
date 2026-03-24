@@ -92,6 +92,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}", axum::routing::patch(update_automation))
         .route("/automations/{id}", axum::routing::delete(delete_automation))
         .route("/automations/{id}/runs", get(list_automation_runs))
+        .route("/automations/{id}/runs/{run_id}", get(get_automation_run))
+        .route("/automations/{id}/runs/{run_id}/events", get(get_automation_run_events))
         .route("/automations/{id}/run", post(trigger_automation));
 
     Router::new()
@@ -1475,6 +1477,68 @@ async fn list_automation_runs(
         .map_err(ApiError::Server)?;
 
     Ok(Json(runs))
+}
+
+/// Path parameters for automation run endpoints.
+#[derive(Deserialize)]
+struct AutomationRunPath {
+    id: String,
+    run_id: String,
+}
+
+/// GET /api/automations/:id/runs/:run_id — Get a specific automation run.
+async fn get_automation_run(
+    State(state): State<ApiState>,
+    Path(params): Path<AutomationRunPath>,
+) -> Result<Json<models::automation::AutomationRun>, ApiError> {
+    // Verify automation exists
+    {
+        let server_state = state.server.state.read().await;
+        if !server_state.automations.contains_key(&params.id) {
+            return Err(ApiError::NotFound(format!("automation not found: {}", params.id)));
+        }
+    }
+
+    // Get all runs and find the requested one
+    let runs = state
+        .server
+        .list_automation_runs(&params.id)
+        .map_err(ApiError::Server)?;
+
+    let run = runs
+        .into_iter()
+        .find(|r| r.id == params.run_id)
+        .ok_or_else(|| ApiError::NotFound(format!("run not found: {}", params.run_id)))?;
+
+    Ok(Json(run))
+}
+
+/// GET /api/automations/:id/runs/:run_id/events — Get events for an automation run.
+///
+/// Returns events from the automation run's session. The session ID uses the
+/// format `automation-run:{run_id}` for container sessions.
+async fn get_automation_run_events(
+    State(state): State<ApiState>,
+    Path(params): Path<AutomationRunPath>,
+) -> Result<Json<Vec<events::Event>>, ApiError> {
+    // Verify automation exists
+    {
+        let server_state = state.server.state.read().await;
+        if !server_state.automations.contains_key(&params.id) {
+            return Err(ApiError::NotFound(format!("automation not found: {}", params.id)));
+        }
+    }
+
+    // For container sessions, the task ID is "automation-run:{run_id}"
+    let session_id = format!("automation-run:{}", params.run_id);
+
+    state
+        .server
+        .event_bus
+        .read_task(&session_id)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))
 }
 
 /// POST /api/automations/:id/run — Manually trigger an automation run.
