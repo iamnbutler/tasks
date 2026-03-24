@@ -221,6 +221,10 @@ GET /api/merge-queue
 ]
 ```
 
+**Entry states:** `pending`, `approved`, `merging`, `merged`, `rejected`, `conflict`, `changes_requested`
+
+> `merging` is a transient state: the entry transitions to it just before the GitHub merge API call and moves to `merged` or an error state when the call completes.
+
 #### Approve Entry
 
 In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
@@ -271,6 +275,68 @@ Content-Type: application/json
   "message": "What tasks are currently being worked on?"
 }
 ```
+
+### Self-Update
+
+#### Get Update Status
+
+Returns the current self-update state from the background checker.
+
+```http
+GET /api/self-update
+```
+
+**Response:**
+
+```json
+{
+  "available": true,
+  "applying": false,
+  "current_commit": "4df757d",
+  "target_commit": "7d66ee7",
+  "rebuild_scope": "server",
+  "commit_summary": "Add Merging status for active merge operations",
+  "last_checked": "2026-03-24T01:57:00Z"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `available` | bool | Whether an update is available |
+| `applying` | bool | Whether an update is currently being applied |
+| `current_commit` | string? | Current commit hash (short) |
+| `target_commit` | string? | Target commit hash to update to (short) |
+| `rebuild_scope` | string? | What needs rebuilding: `"server"`, `"container"`, or `"frontend"` |
+| `commit_summary` | string? | First line of the target commit message |
+| `last_checked` | timestamp? | When the update was last checked |
+
+#### Apply Update
+
+Trigger a self-update (shutdown + pull + rebuild via wrapper script).
+
+```http
+POST /api/self-update/apply
+Content-Type: application/json
+
+{
+  "force": false
+}
+```
+
+Setting `"force": true` skips waiting for active agent sessions to drain before shutdown.
+
+**Response:**
+
+```json
+{
+  "status": "applying",
+  "message": "Update triggered"
+}
+```
+
+**Status values:** `applying` (update queued), `no_update` (nothing to apply), `already_applying` (in progress).
+
+> SSE events `system:update:available` and `system:update:applying` are emitted by the background checker and during the apply sequence respectively.
 
 ### Accounting
 

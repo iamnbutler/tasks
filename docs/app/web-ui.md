@@ -81,26 +81,41 @@ A **Properties** sidebar on the right shows metadata (state, project, created da
 
 The merge queue shows PRs awaiting human review.
 
+### Lifecycle Tabs
+
+Entries are grouped into three tabs by lifecycle phase:
+
+| Tab | Statuses included | Description |
+|-----|-------------------|-------------|
+| **Needs Review** | `pending`, `changes_requested`, `conflict` | Entries awaiting human or orchestrator review |
+| **Ready to Merge** | `approved` | Approved entries ready to be merged |
+| **Completed** | `merged`, `rejected` | Finished entries (terminal states) |
+
+Each tab shows a count of entries in that phase. The **Flush approved** button remains visible in the header when in Pause mode.
+
 ### Entry States
 
 | State | Description |
 |-------|-------------|
 | **Pending** | Awaiting review |
-| **Approved** | Ready to merge |
+| **Approved** | Ready to merge (waiting for flush in Pause mode) |
+| **Merging** | GitHub merge API call in progress (active merge — cyan pulse badge) |
+| **Merged** | Successfully merged |
 | **Rejected** | Declined |
-| **Changes Requested** | Needs modification before merging |
+| **Changes Requested** | Needs modification before merging; task gets priority re-dispatch |
+| **Conflict** | Merge conflict detected |
 
 ### Actions
 
 For each entry:
 
-- **Approve** - Mark ready for merge. In Play mode, triggers an immediate GitHub merge. In Pause mode, entry waits for flush.
+- **Approve** - Mark ready for merge. In Play mode, triggers an immediate GitHub merge (entry briefly shows **Merging** while the API call is in progress). In Pause mode, entry waits for flush.
 - **Reject** - Decline the changes
 - **Request Changes** - Ask for modifications with specific feedback; the task gets priority re-dispatch
 
 ### Flush
 
-In Pause mode, use the **Flush** button to merge all approved entries via the GitHub API.
+In Pause mode, use the **Flush** button to merge all approved entries via the GitHub API. Entries transition to **Merging** while the API calls are in progress.
 
 ## Orchestrator
 
@@ -131,6 +146,7 @@ The Events view shows a real-time stream of system events.
 | `session:started` | Agent session began |
 | `session:ended` | Agent session completed |
 | `merge:approved` | Entry approved in queue |
+| `merge:merging` | Entry actively being merged (GitHub API call in progress) |
 | `merge:completed` | Changes merged |
 
 ### Filtering
