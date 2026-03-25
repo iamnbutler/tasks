@@ -30,6 +30,32 @@ pub struct CreatedIssue {
     pub state: String,
 }
 
+/// Response from GitHub REST API when posting a comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedComment {
+    /// Comment ID.
+    pub id: u64,
+    /// Comment body (markdown).
+    pub body: String,
+    /// Comment URL (HTML).
+    pub html_url: String,
+}
+
+/// Response from GitHub REST API when updating an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatedIssue {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue body (markdown).
+    pub body: Option<String>,
+    /// Issue URL (HTML).
+    pub html_url: String,
+    /// Issue state.
+    pub state: String,
+}
+
 /// Response from GitHub REST API when creating a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatedRepository {
@@ -265,6 +291,7 @@ impl GitHubClient {
         title: &str,
         body: Option<&str>,
         labels: Option<&[String]>,
+        assignees: Option<&[String]>,
     ) -> Result<CreatedIssue, GitHubError> {
         self.wait_for_rate_limit().await;
 
@@ -280,6 +307,10 @@ impl GitHubClient {
 
         if let Some(l) = labels {
             request_body["labels"] = json!(l);
+        }
+
+        if let Some(a) = assignees {
+            request_body["assignees"] = json!(a);
         }
 
         let response = self.http.post(&url).json(&request_body).send().await?;
@@ -323,6 +354,222 @@ impl GitHubClient {
         let text = response.text().await.unwrap_or_default();
         Err(GitHubError::Decode(format!(
             "unexpected create issue status {status}: {text}"
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue write operations (spec github.md §4 — write ops)
+    // -----------------------------------------------------------------------
+
+    /// Post a comment on an issue or pull request.
+    ///
+    /// Uses the GitHub REST API to create a comment. Works for both issues
+    /// and pull requests (they share the issues comments endpoint).
+    pub async fn post_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        body: &str,
+    ) -> Result<CreatedComment, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/comments",
+            self.base_url, owner, repo, issue_number
+        );
+
+        let request_body = json!({ "body": body });
+
+        let response = self.http.post(&url).json(&request_body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::CREATED {
+            let created: CreatedComment = response.json().await.map_err(|e| {
+                GitHubError::Decode(format!("failed to parse created comment: {e}"))
+            })?;
+            return Ok(created);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{issue_number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Validation(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected post comment status {status}: {text}"
+        )))
+    }
+
+    /// Update an existing issue or pull request.
+    ///
+    /// Uses the GitHub REST API to update issue fields. All fields are optional;
+    /// only provided fields will be updated. Pass `None` to leave a field unchanged.
+    pub async fn update_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<&str>,
+        labels: Option<&[String]>,
+    ) -> Result<UpdatedIssue, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}",
+            self.base_url, owner, repo, issue_number
+        );
+
+        let mut request_body = json!({});
+
+        if let Some(t) = title {
+            request_body["title"] = json!(t);
+        }
+        if let Some(b) = body {
+            request_body["body"] = json!(b);
+        }
+        if let Some(s) = state {
+            request_body["state"] = json!(s);
+        }
+        if let Some(l) = labels {
+            request_body["labels"] = json!(l);
+        }
+
+        let response = self.http.patch(&url).json(&request_body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status.is_success() {
+            let updated: UpdatedIssue = response.json().await.map_err(|e| {
+                GitHubError::Decode(format!("failed to parse updated issue: {e}"))
+            })?;
+            return Ok(updated);
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{issue_number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Validation(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected update issue status {status}: {text}"
+        )))
+    }
+
+    /// Add labels to an issue or pull request.
+    ///
+    /// Uses the GitHub REST API to add labels. Labels that don't exist in the
+    /// repository will be created automatically by GitHub. Existing labels on
+    /// the issue are preserved — this only adds new ones.
+    pub async fn add_labels(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        labels: &[String],
+    ) -> Result<(), GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/issues/{}/labels",
+            self.base_url, owner, repo, issue_number
+        );
+
+        let request_body = json!({ "labels": labels });
+
+        let response = self.http.post(&url).json(&request_body).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitHubError::NotFound(format!(
+                "{owner}/{repo}#{issue_number}"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            if let Some(rl) = self.rate_limit() {
+                if rl.remaining == 0 {
+                    return Err(GitHubError::RateLimited {
+                        reset_at: rl.reset_at,
+                    });
+                }
+            }
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(text));
+        }
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Validation(text));
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(GitHubError::Decode(format!(
+            "unexpected add labels status {status}: {text}"
         )))
     }
 
