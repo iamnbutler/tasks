@@ -26,6 +26,10 @@ pub struct AutomationScheduler {
     next_runs: HashMap<String, DateTime<Utc>>,
     /// Track last run time for each automation to prevent double-runs.
     last_runs: HashMap<String, DateTime<Utc>>,
+    /// Automation session soft time limit.
+    automation_soft_limit: Duration,
+    /// Automation session hard time limit.
+    automation_hard_limit: Duration,
 }
 
 impl AutomationScheduler {
@@ -33,12 +37,16 @@ impl AutomationScheduler {
     pub fn new(
         server: Arc<Server>,
         session_manager: Option<Arc<SessionManager<AppleContainerRuntime>>>,
+        automation_soft_limit: Duration,
+        automation_hard_limit: Duration,
     ) -> Self {
         Self {
             server,
             session_manager,
             next_runs: HashMap::new(),
             last_runs: HashMap::new(),
+            automation_soft_limit,
+            automation_hard_limit,
         }
     }
 
@@ -208,9 +216,16 @@ impl AutomationScheduler {
                     let server = self.server.clone();
                     let run_id = run.id.clone();
                     let auto_id = automation_id.to_string();
+                    let soft_limit = self.automation_soft_limit;
+                    let hard_limit = self.automation_hard_limit;
                     tokio::spawn(async move {
                         crate::automation_runner::execute_automation_run(
-                            &sm, &server, &run_id, &auto_id,
+                            &sm,
+                            &server,
+                            &run_id,
+                            &auto_id,
+                            soft_limit,
+                            hard_limit,
                         )
                         .await;
                     });

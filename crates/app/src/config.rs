@@ -55,6 +55,10 @@ pub struct AppConfig {
     pub session_soft_limit: Duration,
     /// Session hard time limit (default: 1h15m).
     pub session_hard_limit: Duration,
+    /// Automation session soft time limit (default: 25m).
+    pub automation_soft_limit: Duration,
+    /// Automation session hard time limit (default: 30m).
+    pub automation_hard_limit: Duration,
     /// Minimum session duration to count as "progress" (default: 60s, spec §13.1).
     pub progress_threshold: Duration,
     /// Memory usage percentage at which to warn (default: 75%).
@@ -208,6 +212,8 @@ impl AppConfig {
             container_memory,
             session_soft_limit: Duration::from_secs(3600),
             session_hard_limit: Duration::from_secs(4500),
+            automation_soft_limit: Duration::from_secs(25 * 60), // 25 minutes
+            automation_hard_limit: Duration::from_secs(30 * 60), // 30 minutes
             progress_threshold: Duration::from_secs(progress_threshold_secs),
             memory_warn_pct,
             memory_soft_limit_pct,

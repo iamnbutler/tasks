@@ -5,6 +5,7 @@
 //! has tool access, git, and a real working directory.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -13,7 +14,7 @@ use uuid::Uuid;
 use events::EventBus;
 use runtime::AppleContainerRuntime;
 use server::Server;
-use tasks_session::SessionManager;
+use tasks_session::{SessionLimits, SessionManager};
 
 /// Prefix used for automation session IDs.
 const SESSION_PREFIX: &str = "automation-run:";
@@ -22,11 +23,17 @@ const SESSION_PREFIX: &str = "automation-run:";
 ///
 /// Creates a session with the ID `automation-run:{run_id}`. If the session
 /// fails to start, the run is marked as failed via `server.fail_automation_run()`.
+///
+/// The `soft_limit` and `hard_limit` parameters allow customization of the
+/// session time limits. Automation sessions typically use shorter limits
+/// (25m soft, 30m hard) than regular task sessions.
 pub async fn execute_automation_run(
     session_manager: &SessionManager<AppleContainerRuntime>,
     server: &Arc<Server>,
     run_id: &str,
     automation_id: &str,
+    soft_limit: Duration,
+    hard_limit: Duration,
 ) {
     // Look up the automation to get its prompt and project.
     let (prompt, project_id) = {
@@ -71,15 +78,38 @@ pub async fn execute_automation_run(
 
     let session_id = format!("{SESSION_PREFIX}{run_id}");
 
+    // Prepend time limit notice to the prompt so agent can plan accordingly
+    let hard_limit_mins = hard_limit.as_secs() / 60;
+    let prompt_with_notice = format!(
+        "[TIME LIMIT] This automation session has a {hard_limit_mins}-minute hard limit. \
+        Plan your work to complete within this time. If you cannot finish, prioritize \
+        the most important changes and commit partial progress.\n\n{prompt}"
+    );
+
     info!(
         run_id = %run_id,
         automation_id = %automation_id,
         session_id = %session_id,
+        soft_limit_secs = soft_limit.as_secs(),
+        hard_limit_secs = hard_limit.as_secs(),
         "starting automation container session"
     );
 
+    let time_limits = SessionLimits {
+        soft_limit: Some(soft_limit),
+        hard_limit: Some(hard_limit),
+    };
+
     if let Err(e) = session_manager
-        .start_session(session_id, repo_url, branch, prompt, None, None)
+        .start_session_with_limits(
+            session_id,
+            repo_url,
+            branch,
+            prompt_with_notice,
+            None,
+            None,
+            time_limits,
+        )
         .await
     {
         error!(
@@ -112,10 +142,12 @@ pub fn run_id_from_session(session_id: &str) -> Option<&str> {
 /// and updates automation run records accordingly.
 ///
 /// When a session with an `automation-run:` prefix reaches a terminal state
-/// (`TaskStateCompleted` or `TaskStateFailed`), this listener calls
-/// `server.complete_automation_run()` or `server.fail_automation_run()`.
-/// We use `TaskStateCompleted` (not `TaskStateAwaitingMerge`) as the
-/// terminal event because automations don't go through the merge queue.
+/// (`TaskStateCompleted`, `TaskStateAwaitingMerge`, or `TaskStateFailed`), this
+/// listener calls `server.complete_automation_run()` or `server.fail_automation_run()`.
+///
+/// Both `TaskStateCompleted` and `TaskStateAwaitingMerge` are treated as successful
+/// completion — the agent may create a PR and wait for merge, which is a valid
+/// successful outcome for an automation run.
 pub fn spawn_automation_event_listener(
     event_bus: &EventBus,
     server: Arc<Server>,
@@ -133,8 +165,9 @@ pub fn spawn_automation_event_listener(
                     };
 
                     match event.event_type {
-                        // Agent exited successfully
-                        events::EventType::TaskStateCompleted => {
+                        // Agent exited successfully (with or without a PR)
+                        events::EventType::TaskStateCompleted
+                        | events::EventType::TaskStateAwaitingMerge => {
                             info!(
                                 run_id = %run_id,
                                 event_type = %event.event_type.as_str(),
