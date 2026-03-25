@@ -818,6 +818,48 @@ impl Server {
         Ok(())
     }
 
+    /// Set rejection feedback on a task (issue #423).
+    ///
+    /// Called when the orchestrator rejects a PR to store feedback that will be
+    /// delivered to the agent when the task is re-dispatched. This feedback helps
+    /// the agent understand what went wrong and what to fix.
+    pub async fn set_task_rejection_feedback(
+        &self,
+        task_id: &str,
+        feedback: Option<String>,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+        task.rejection_feedback = feedback;
+        task.updated_at = chrono::Utc::now();
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Ok(store) = store.lock() {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist rejection feedback to store");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear rejection feedback from a task after dispatch (issue #423).
+    ///
+    /// Called after successfully dispatching a task to prevent stale feedback
+    /// from being repeated on subsequent re-dispatches.
+    pub async fn clear_task_rejection_feedback(
+        &self,
+        task_id: &str,
+    ) -> Result<(), ServerError> {
+        self.set_task_rejection_feedback(task_id, None).await
+    }
+
     /// Reorder tasks by updating their priorities.
     ///
     /// Takes a list of task IDs in the desired order and assigns sequential
@@ -1549,6 +1591,8 @@ impl Server {
     ///
     /// The task transitions back to Waiting so the dispatch loop picks
     /// it up and starts a fresh session with the feedback as context.
+    /// The feedback is stored on the task (issue #423) so it survives
+    /// restarts and is delivered to the agent via the prompt.
     pub async fn reject_merge_entry(
         &self,
         entry_id: &str,
@@ -1565,6 +1609,11 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             entry.task_id.clone()
         };
+
+        // Store rejection feedback on the task for delivery to agent (issue #423)
+        if let Some(fb) = feedback {
+            self.set_task_rejection_feedback(&task_id, Some(fb.to_string())).await?;
+        }
 
         // Emit rejection event
         let event = Event::new(
@@ -2621,6 +2670,43 @@ mod tests {
         // Task should be back to Waiting for re-dispatch
         let task = server.get_task("task-1").await.unwrap();
         assert_eq!(task.state, TaskState::Waiting);
+
+        // Feedback should be set on the task (issue #423)
+        assert_eq!(
+            task.rejection_feedback.as_deref(),
+            Some("add unit tests for the new endpoint")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejection_feedback_cleared_after_set() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Set rejection feedback
+        server
+            .set_task_rejection_feedback("task-1", Some("Fix the error handling".to_string()))
+            .await
+            .unwrap();
+
+        // Verify feedback is set
+        let task = server.get_task("task-1").await.unwrap();
+        assert_eq!(
+            task.rejection_feedback.as_deref(),
+            Some("Fix the error handling")
+        );
+
+        // Clear feedback
+        server.clear_task_rejection_feedback("task-1").await.unwrap();
+
+        // Verify feedback is cleared
+        let task = server.get_task("task-1").await.unwrap();
+        assert!(task.rejection_feedback.is_none());
     }
 
     // --- Progress detection tests (spec §13.1, §13.2) ---

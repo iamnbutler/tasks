@@ -137,6 +137,10 @@ pub struct Task {
     pub last_activity_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Feedback from orchestrator after PR rejection (issue #423).
+    /// Delivered to the agent when the task is re-dispatched.
+    /// Cleared after dispatch so stale feedback isn't repeated.
+    pub rejection_feedback: Option<String>,
 }
 
 impl Task {
@@ -169,6 +173,7 @@ impl Task {
             last_activity_at: None,
             created_at: now,
             updated_at: now,
+            rejection_feedback: None,
         }
     }
 

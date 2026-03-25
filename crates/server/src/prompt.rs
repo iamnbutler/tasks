@@ -38,6 +38,10 @@ pub struct PromptParams<'a> {
     pub related_tasks: &'a [RelatedTaskInfo],
     /// Retry context if this is a retry.
     pub retry: Option<&'a RetryContext>,
+    /// Orchestrator feedback from a previous PR rejection (issue #423).
+    /// This is separate from retry context because it comes from orchestrator
+    /// review, not from a session failure.
+    pub rejection_feedback: Option<&'a str>,
 }
 
 /// A single comment on an issue or PR.
@@ -179,21 +183,27 @@ pub fn build_prompt(params: &PromptParams) -> String {
         writeln!(out, "{system_prompt}\n").unwrap();
     }
 
-    // 2. Retry context (spec §15.2) — prepended before task section
+    // 2. Rejection feedback (issue #423) — prepended before retry/task
+    // This is feedback from the orchestrator about why a previous PR was rejected.
+    if let Some(feedback) = params.rejection_feedback {
+        render_rejection_feedback(&mut out, feedback);
+    }
+
+    // 3. Retry context (spec §15.2) — prepended before task section
     if let Some(retry) = params.retry {
         render_retry(&mut out, retry);
     }
 
-    // 3. Task description — spec §15.1 layer 2
+    // 4. Task description — spec §15.1 layer 2
     render_task(&mut out, params);
 
-    // 4. Comments
+    // 5. Comments
     render_comments(&mut out, params.comments, params.number);
 
-    // 5. Context — spec §15.1 layer 3
+    // 6. Context — spec §15.1 layer 3
     render_context(&mut out, params);
 
-    // 6. Behavioral instructions — spec §15.1 layer 4
+    // 7. Behavioral instructions — spec §15.1 layer 4
     render_instructions(&mut out, params.branch, params.number);
 
     out
@@ -266,6 +276,7 @@ pub fn build_prompt_for_task(
         parent: None,
         related_tasks: &[],
         retry: retry.as_ref(),
+        rejection_feedback: task.rejection_feedback.as_deref(),
     };
 
     build_prompt(&params)
@@ -274,6 +285,21 @@ pub fn build_prompt_for_task(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+fn render_rejection_feedback(out: &mut String, feedback: &str) {
+    writeln!(out, "# Previous PR Rejection\n").unwrap();
+    writeln!(
+        out,
+        "Your previous pull request was rejected by the orchestrator. Please address the following feedback:\n"
+    )
+    .unwrap();
+    writeln!(out, "{feedback}\n").unwrap();
+    writeln!(
+        out,
+        "Review this feedback carefully before starting work. The branch has been reset, so you are starting fresh.\n"
+    )
+    .unwrap();
+}
 
 fn render_retry(out: &mut String, retry: &RetryContext) {
     writeln!(out, "# Retry Information\n").unwrap();
@@ -536,6 +562,7 @@ mod tests {
             parent: None,
             related_tasks: &[],
             retry: None,
+            rejection_feedback: None,
         }
     }
 
@@ -712,6 +739,54 @@ mod tests {
     }
 
     #[test]
+    fn rejection_feedback_prepended() {
+        let feedback = "The PR lacks test coverage for the new endpoint. Please add unit tests for the error cases.";
+        let params = PromptParams {
+            rejection_feedback: Some(feedback),
+            ..minimal_params()
+        };
+        let prompt = build_prompt(&params);
+
+        assert!(prompt.contains("# Previous PR Rejection"));
+        assert!(prompt.contains("rejected by the orchestrator"));
+        assert!(prompt.contains(feedback));
+        assert!(prompt.contains("branch has been reset"));
+
+        // Rejection feedback appears before the task section.
+        let rejection_pos = prompt.find("# Previous PR Rejection").unwrap();
+        let task_pos = prompt.find("# Task").unwrap();
+        assert!(rejection_pos < task_pos);
+    }
+
+    #[test]
+    fn rejection_feedback_with_retry_context() {
+        let feedback = "Missing error handling for edge cases.";
+        let retry = RetryContext {
+            attempt: 2,
+            previous_failure: "Session timeout".to_string(),
+            has_prior_commits: false,
+            failure_details: None,
+        };
+        let params = PromptParams {
+            rejection_feedback: Some(feedback),
+            retry: Some(&retry),
+            ..minimal_params()
+        };
+        let prompt = build_prompt(&params);
+
+        // Both sections should be present.
+        assert!(prompt.contains("# Previous PR Rejection"));
+        assert!(prompt.contains("# Retry Information"));
+
+        // Rejection feedback comes before retry context.
+        let rejection_pos = prompt.find("# Previous PR Rejection").unwrap();
+        let retry_pos = prompt.find("# Retry Information").unwrap();
+        let task_pos = prompt.find("# Task").unwrap();
+        assert!(rejection_pos < retry_pos);
+        assert!(retry_pos < task_pos);
+    }
+
+    #[test]
     fn empty_optionals_omitted() {
         let params = PromptParams {
             system_prompt: None,
@@ -727,6 +802,8 @@ mod tests {
 
         // No system prompt section.
         assert!(!prompt.contains("# Project Context"));
+        // No rejection feedback section.
+        assert!(!prompt.contains("# Previous PR Rejection"));
         // No parent line.
         assert!(!prompt.contains("Parent task"));
         // No related tasks line.

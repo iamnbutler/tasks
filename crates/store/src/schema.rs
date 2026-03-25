@@ -168,5 +168,27 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // Migration: add rejection_feedback column if it doesn't exist (issue #423)
+    // This stores orchestrator feedback from PR rejections for delivery to re-dispatched agents.
+    match conn.execute(
+        "ALTER TABLE tasks ADD COLUMN rejection_feedback TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added rejection_feedback column to tasks table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            // Column already exists — this is expected for existing databases
+            tracing::debug!("rejection_feedback column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add rejection_feedback column");
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
