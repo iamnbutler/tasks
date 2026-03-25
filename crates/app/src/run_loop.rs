@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use std::sync::Mutex as StdMutex;
 
@@ -30,6 +31,63 @@ use crate::memory::{MemoryGate, MemoryThresholds};
 use crate::problem_tracker::ProblemTracker;
 use crate::scheduler::AutomationScheduler;
 use crate::update::{self, UpdateState};
+
+/// Default cooldown duration for rejected PRs (10 minutes).
+///
+/// After a PR is rejected, the poll loop will skip creating new merge queue
+/// entries for the same PR URL + head SHA combination until this duration
+/// has elapsed. This prevents the race condition where cleanup removes the
+/// Rejected entry and the poll loop immediately re-queues the same PR.
+const REJECTED_PR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Tracks recently rejected PRs to prevent immediate re-queuing (issue #439).
+///
+/// When the orchestrator rejects a PR, the rejection is recorded here with the
+/// PR URL, head SHA, and timestamp. The GitHub poll loop checks this before
+/// creating new merge queue entries — if the same PR URL + head SHA was rejected
+/// within the cooldown period, the entry is not created.
+///
+/// This prevents the race condition where:
+/// 1. Orchestrator rejects PR, entry becomes Rejected
+/// 2. Cleanup removes Rejected entry
+/// 3. Poll loop finds open PR, creates new Pending entry
+/// 4. Orchestrator re-evaluates (non-deterministically may approve)
+struct RejectedPrCooldown {
+    /// Map of pr_url -> (head_sha, rejection_time)
+    entries: HashMap<String, (String, Instant)>,
+}
+
+impl RejectedPrCooldown {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Record a rejection for the given PR URL and head SHA.
+    fn record(&mut self, pr_url: String, head_sha: String) {
+        self.entries.insert(pr_url, (head_sha, Instant::now()));
+    }
+
+    /// Check if creating a new entry should be blocked due to recent rejection.
+    ///
+    /// Returns true if the PR was rejected within the cooldown period AND the
+    /// head SHA matches (i.e., no new commits since rejection).
+    fn should_block(&self, pr_url: &str, head_sha: &str, cooldown: Duration) -> bool {
+        if let Some((rejected_sha, rejected_at)) = self.entries.get(pr_url) {
+            // Block if same SHA and within cooldown period
+            rejected_sha == head_sha && rejected_at.elapsed() < cooldown
+        } else {
+            false
+        }
+    }
+
+    /// Remove stale entries older than the cooldown duration.
+    fn cleanup(&mut self, cooldown: Duration) {
+        self.entries
+            .retain(|_, (_, rejected_at)| rejected_at.elapsed() < cooldown);
+    }
+}
 
 /// Result of running the server — indicates how the process should exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +419,13 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     );
     info!("automation event listener started");
 
+    // --- 6d. Create rejected PR cooldown tracker (issue #439) ---
+    //
+    // Shared between the poll loop and orchestrator loop to prevent re-queuing
+    // PRs that were recently rejected with the same head SHA. The orchestrator
+    // records rejections, and the poll loop checks before creating new entries.
+    let rejected_pr_cooldown = Arc::new(StdMutex::new(RejectedPrCooldown::new()));
+
     // --- 7. Spawn GitHub poll loop ---
     //
     // Pollers are rebuilt from the live project list each tick so that
@@ -371,6 +436,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let poll_interval = config.poll_interval;
     let github_token = config.github_token.clone();
     let poll_config_watcher = workflow_config_watcher.clone();
+    let poll_rejected_cooldown = rejected_pr_cooldown.clone();
 
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -564,6 +630,23 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     "https://github.com/{}/{}/pull/{}",
                                     pr.owner, pr.repo, pr.number
                                 );
+
+                                // Check cooldown for recently rejected PRs (issue #439).
+                                // If this PR was rejected with the same head SHA within the cooldown
+                                // period, skip creating a new entry to prevent immediate re-queuing.
+                                let blocked_by_cooldown = {
+                                    let cooldown = poll_rejected_cooldown.lock().unwrap();
+                                    cooldown.should_block(&pr_url, &pr.head_sha, REJECTED_PR_COOLDOWN)
+                                };
+                                if blocked_by_cooldown {
+                                    debug!(
+                                        project = %project_id,
+                                        pr = pr.number,
+                                        head_sha = %pr.head_sha,
+                                        "skipping PR re-queue: recently rejected with same SHA"
+                                    );
+                                    continue;
+                                }
 
                                 if !poll_server.has_merge_entry_for_pr(&pr_url).await {
                                     // Priority 1: Branch name match (existing, fast, precise)
@@ -1112,6 +1195,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let orch = orchestrator.clone();
     let orch_event_bus = server.event_bus.clone();
     let orch_github_token = config.github_token.clone();
+    let orch_rejected_cooldown = rejected_pr_cooldown.clone();
 
     let orchestrator_eval_interval = config.orchestrator_eval_interval;
     let conflict_max_age = config.conflict_max_age;
@@ -1795,6 +1879,19 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         {
                             error!(entry_id = %entry_id, error = %e, "failed to reject merge entry for closed issue");
                         }
+
+                        // Record rejection in cooldown tracker to prevent re-queuing (issue #439)
+                        if let Some(sha) = &entry_head_sha {
+                            let mut cooldown = orch_rejected_cooldown.lock().unwrap();
+                            cooldown.record(pr_url.clone(), sha.clone());
+                            debug!(
+                                pr_url = %pr_url,
+                                head_sha = %sha,
+                                "recorded PR rejection in cooldown tracker (issue closed)"
+                            );
+                        } else {
+                            warn!("Cannot record rejection cooldown for {}: entry has no head_sha", pr_url);
+                        }
                     } else {
                         // Issue is still open — normal rejection with re-dispatch.
                         if let Err(e) = orch_server
@@ -1863,6 +1960,19 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         // TODO: The feedback event is now recorded in the audit trail.
                         // Delivering feedback to the re-dispatched session's prompt
                         // context still needs dispatch loop changes.
+
+                        // Record rejection in cooldown tracker to prevent re-queuing (issue #439)
+                        if let Some(sha) = &entry_head_sha {
+                            let mut cooldown = orch_rejected_cooldown.lock().unwrap();
+                            cooldown.record(pr_url.clone(), sha.clone());
+                            debug!(
+                                pr_url = %pr_url,
+                                head_sha = %sha,
+                                "recorded PR rejection in cooldown tracker"
+                            );
+                        } else {
+                            warn!("Cannot record rejection cooldown for {}: entry has no head_sha", pr_url);
+                        }
                     }
                 }
             } // end single-entry evaluation block
@@ -1886,6 +1996,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             // 5-minute cooldown for merged entries to handle GitHub API propagation delay
             let merged_cutoff = chrono::Utc::now() - chrono::Duration::minutes(5);
             orch_server.cleanup_merge_queue(Some(merged_cutoff), Some(conflict_cutoff)).await;
+
+            // Cleanup stale entries from rejected PR cooldown tracker (issue #439)
+            {
+                let mut cooldown = orch_rejected_cooldown.lock().unwrap();
+                cooldown.cleanup(REJECTED_PR_COOLDOWN);
+            }
         }
     });
 
