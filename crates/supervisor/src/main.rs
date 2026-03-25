@@ -199,7 +199,10 @@ async fn start_agent(
         .current_dir(WORK_DIR)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Place the agent and all its children in a new process group so we
+        // can kill them all together on shutdown (prevents orphaned children).
+        .process_group(0);
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn agent: {e}"))?;
     let pid = child.id().unwrap_or(0);
@@ -235,19 +238,25 @@ async fn start_agent(
 }
 
 /// Stop the agent: SIGTERM → timeout → SIGKILL (spec §4.1 stop command).
+///
+/// Signals are sent to the entire process group (negative PID) so that child
+/// processes spawned by the agent are also terminated, preventing orphans.
 async fn stop_agent(handle: &mut AgentHandle) {
     let pid = match handle.child.id() {
         Some(pid) => pid,
         None => return, // already exited
     };
 
-    // Send SIGTERM (not SIGKILL — the agent gets a grace period).
+    // Send SIGTERM to the entire process group (the agent was started with
+    // process_group(0), so its PID is also the PGID).
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-            log!("failed to send SIGTERM: {e}");
+        log!("sending SIGTERM to agent process group (pgid={pid})");
+        // Negative PID sends the signal to all processes in the group.
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            log!("failed to send SIGTERM to process group: {err}");
             return;
         }
     }
@@ -268,7 +277,13 @@ async fn stop_agent(handle: &mut AgentHandle) {
     {
         Ok(_) => {} // exited gracefully
         Err(_) => {
-            log!("agent did not exit in {KILL_TIMEOUT_SECS}s, sending SIGKILL");
+            log!("agent did not exit in {KILL_TIMEOUT_SECS}s, sending SIGKILL to process group");
+            #[cfg(unix)]
+            {
+                // SIGKILL the entire process group.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            // Also kill via tokio handle to update child state.
             if let Err(e) = handle.child.kill().await {
                 log!("failed to SIGKILL agent: {e}");
             }
@@ -332,6 +347,37 @@ async fn exec_command(id: &str, argv: &[String]) -> Ev {
 
 #[tokio::main]
 async fn main() {
+    // As PID 1, we must reap zombie processes. Spawn a background task that
+    // listens for SIGCHLD and calls waitpid(-1, WNOHANG) to collect zombies.
+    // This prevents accumulation of zombie grandchild processes spawned by the
+    // agent (git, npm, etc.).
+    //
+    // Note: on modern Linux (5.3+), tokio uses pidfd to wait on the agent
+    // child process, so our waitpid(-1) won't race with it. On older kernels,
+    // the reaper may collect the agent's exit status before tokio sees it;
+    // the main loop handles this gracefully via try_wait returning None.
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let mut sigchld = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::child(),
+        )
+        .expect("failed to register SIGCHLD handler");
+
+        loop {
+            sigchld.recv().await;
+            // Reap all available zombie processes.
+            loop {
+                let result = unsafe {
+                    libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG)
+                };
+                if result <= 0 {
+                    break;
+                }
+                log!("reaped zombie process pid={result}");
+            }
+        }
+    });
+
     // Event channel — agent stdout/stderr readers send events here,
     // the main loop emits them to the host.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Ev>();
@@ -395,9 +441,11 @@ async fn main() {
         }
     });
 
-    // Set up SIGTERM handler for graceful shutdown (spec §4.1 stop).
+    // Set up signal handlers for graceful shutdown (spec §4.1 stop).
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to register SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("failed to register SIGINT handler");
 
     let mut agent: Option<AgentHandle> = None;
     let mut pending_chat: Vec<String> = Vec::new();
@@ -482,8 +530,26 @@ async fn main() {
                     emit(&Ev::AgentExit { code, signal });
                 }
             }
-            // SIGTERM — graceful shutdown.
+            // SIGTERM or SIGINT — graceful shutdown.
             _ = sigterm.recv() => {
+                log!("received SIGTERM, shutting down");
+                if let Some(mut handle) = agent.take() {
+                    stop_agent(&mut handle).await;
+                    let status = handle.child.try_wait().ok().flatten();
+                    let code = status.and_then(|s| s.code());
+                    #[cfg(unix)]
+                    let signal = {
+                        use std::os::unix::process::ExitStatusExt;
+                        status.and_then(|s| s.signal()).map(|s| format!("{s}"))
+                    };
+                    #[cfg(not(unix))]
+                    let signal: Option<String> = None;
+                    emit(&Ev::AgentExit { code, signal });
+                }
+                break;
+            }
+            _ = sigint.recv() => {
+                log!("received SIGINT, shutting down");
                 if let Some(mut handle) = agent.take() {
                     stop_agent(&mut handle).await;
                     let status = handle.child.try_wait().ok().flatten();
