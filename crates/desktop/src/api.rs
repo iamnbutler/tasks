@@ -120,6 +120,7 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a new API client with the given base URL.
     pub fn new(base_url: impl Into<String>) -> Self {
+        let _guard = crate::tokio_runtime().enter();
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),

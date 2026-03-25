@@ -1,175 +1,308 @@
-//! Tasks Desktop — Main entry point.
-//!
-//! A GPUI-based native desktop application for the Tasks platform.
+//! Tasks Desktop — GPUI + gpuikit native client.
+
+use std::collections::BTreeMap;
 
 use gpui::{
-    App, AppContext as _, Application, Context, Entity, IntoElement, ParentElement, Render, Styled,
-    Window, WindowOptions, actions, px,
+    actions, div, point, prelude::FluentBuilder, px, size, App, AppContext as _, Application,
+    Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    KeyBinding, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
+    WindowControlArea, WindowOptions,
 };
-use std::sync::Arc;
-use tasks_desktop::{
-    SseClient, SseClientEvent, SseConnectionState, SseFilters, colors, spacing,
-    style_helpers::{StyledExt, container, heading, muted_text, status_dot},
-    typography,
-};
-use tracing_subscriber::EnvFilter;
+use gpuikit::elements::icon_button::icon_button;
+use gpuikit::elements::input::input;
+use gpuikit::elements::scroll_area::scroll_area;
+use gpuikit::icons::Icons;
+use gpuikit::input::InputState;
+use gpuikit::layout::{h_stack, v_stack};
+use gpuikit::theme::{ActiveTheme, Themeable};
+use models::project::Project;
+use tasks_desktop::state::{AppState, create_app_state};
 
-actions!(desktop, [Quit]);
+actions!(tasks_desktop, [Quit]);
 
-/// Default server URL.
-const DEFAULT_SERVER_URL: &str = "http://localhost:4800";
+const TRAFFIC_LIGHT_PADDING: f32 = 71.;
+const TOOLBAR_HEIGHT: f32 = 46.;
+const SIDEBAR_WIDTH: f32 = 220.;
+const LIST_WIDTH: f32 = 280.;
 
 fn main() {
-    // Initialize logging
+    // Install tokio reactor so reqwest works inside GPUI's smol executor.
+    let _tokio_guard = tasks_desktop::install_tokio();
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
-    Application::new().run(|cx: &mut App| {
-        // Register quit action
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+    Application::with_platform(gpui_platform::current_platform(false))
+        .with_assets(gpuikit::assets())
+        .run(|cx: &mut App| {
+            gpuikit::init(cx);
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                    origin: gpui::Point::default(),
-                    size: gpui::Size {
-                        width: px(800.),
-                        height: px(600.),
-                    },
-                })),
-                ..Default::default()
-            },
-            |_window, cx| {
-                let view = cx.new(|cx| TasksApp::new(cx));
-                view
-            },
-        )
-        .unwrap();
+            cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
 
-        cx.activate(true);
-    });
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(SharedString::from("Tasks")),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(9.), px(9.))),
+                    }),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| TasksApp::new(window, cx));
+                    let focus_handle = view.read(cx).focus_handle.clone();
+                    window.focus(&focus_handle, cx);
+                    view
+                },
+            )
+            .unwrap();
+
+            cx.activate(true);
+        });
 }
 
-/// Main application view.
+/// Group projects by owner (the part before `/` in the repo string).
+fn group_projects_by_owner(projects: &[Project]) -> BTreeMap<String, Vec<&Project>> {
+    let mut groups: BTreeMap<String, Vec<&Project>> = BTreeMap::new();
+    for project in projects {
+        let owner = project
+            .repo
+            .split('/')
+            .next()
+            .unwrap_or("Unknown")
+            .to_string();
+        groups.entry(owner).or_default().push(project);
+    }
+    groups
+}
+
 struct TasksApp {
-    #[allow(dead_code)] // Kept for future disconnect functionality
-    sse_client: Entity<SseClient>,
-    connection_state: SseConnectionState,
-    event_count: usize,
-    last_event: Option<Arc<events::Event>>,
+    focus_handle: FocusHandle,
+    app_state: Entity<AppState>,
+    search_input: Entity<InputState>,
 }
 
 impl TasksApp {
-    fn new(cx: &mut Context<Self>) -> Self {
-        // Get server URL from environment or use default
-        let server_url =
-            std::env::var("TASKS_SERVER_URL").unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let app_state = cx.new(|cx| create_app_state(cx));
+        let search_input = cx.new(|cx| InputState::new_singleline(cx));
 
-        // Create SSE client
-        let filters = SseFilters::new();
-        let sse_client = cx.new(|_| SseClient::new(&server_url, filters));
-
-        // Subscribe to SSE events
-        cx.subscribe(
-            &sse_client,
-            |this: &mut Self, _entity, event: &SseClientEvent, cx| match event {
-                SseClientEvent::StateChanged(state) => {
-                    this.connection_state = *state;
-                    cx.notify();
-                }
-                SseClientEvent::EventReceived(event) => {
-                    this.event_count += 1;
-                    this.last_event = Some(event.clone());
-                    cx.notify();
-                }
-                SseClientEvent::Error(err) => {
-                    tracing::error!(error = %err, "SSE error");
-                    cx.notify();
-                }
-            },
-        )
+        // Re-render when app state changes
+        cx.subscribe(&app_state, |_this, _state, _event, cx| {
+            cx.notify();
+        })
         .detach();
 
-        // Start connection
-        sse_client.update(cx, |client: &mut SseClient, cx| {
-            client.connect(cx);
-        });
-
         Self {
-            sse_client,
-            connection_state: SseConnectionState::Connecting,
-            event_count: 0,
-            last_event: None,
+            focus_handle: cx.focus_handle(),
+            app_state,
+            search_input,
         }
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let state = self.app_state.read(cx);
+        let projects = state.projects();
+        let selected_id = state.selected_project().map(|s| s.to_string());
+        let grouped = group_projects_by_owner(projects);
+
+        v_stack()
+            .id("sidebar")
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme.surface())
+            .border_r_1()
+            .border_color(theme.border())
+            // Toolbar: traffic lights left, + button right
+            .child(
+                h_stack()
+                    .id("sidebar-toolbar")
+                    .window_control_area(WindowControlArea::Drag)
+                    .h(px(TOOLBAR_HEIGHT))
+                    .w_full()
+                    .flex_shrink_0()
+                    .pl(px(TRAFFIC_LIGHT_PADDING))
+                    .pr_2()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                        icon_button("add-project", Icons::plus()).on_click(
+                            cx.listener(|_this, _event, _window, _cx| {
+                                // TODO: open add project dialog
+                            }),
+                        ),
+                    ),
+            )
+            // Search input
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .child(input(&self.search_input, cx).placeholder("Search...")),
+            )
+            // Scrollable project list grouped by owner
+            .child(
+                scroll_area("project-list")
+                    .vertical()
+                    .full_width(true)
+                    .full_height(true)
+                    .child(v_stack().w_full().pb_2().children(
+                        grouped.into_iter().map({
+                            let theme = theme.clone();
+                            let selected_id = selected_id.clone();
+                            move |(owner, projects)| {
+                                let theme = theme.clone();
+                                let selected_id = selected_id.clone();
+                                v_stack()
+                                    .w_full()
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .pt_3()
+                                            .pb_1()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.fg_muted())
+                                            .child(owner),
+                                    )
+                                    .children(projects.into_iter().map({
+                                        let theme = theme.clone();
+                                        let selected_id = selected_id.clone();
+                                        move |project| {
+                                            let repo_name = project
+                                                .repo
+                                                .split('/')
+                                                .nth(1)
+                                                .unwrap_or(&project.repo);
+                                            let is_selected =
+                                                selected_id.as_deref() == Some(&project.id);
+
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "project-{}",
+                                                    project.id
+                                                )))
+                                                .mx_2()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .when(is_selected, |el| {
+                                                    el.bg(theme.selection())
+                                                        .text_color(theme.fg())
+                                                })
+                                                .when(!is_selected, |el| {
+                                                    el.text_color(theme.fg()).hover(|style| {
+                                                        style.bg(theme.border_subtle())
+                                                    })
+                                                })
+                                                .child(repo_name.to_string())
+                                        }
+                                    }))
+                            }
+                        }),
+                    )),
+            )
+    }
+
+    fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        v_stack()
+            .id("list")
+            .w(px(LIST_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme.bg())
+            .border_r_1()
+            .border_color(theme.border())
+            .child(
+                h_stack()
+                    .id("list-toolbar")
+                    .window_control_area(WindowControlArea::Drag)
+                    .h(px(TOOLBAR_HEIGHT))
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border()),
+            )
+            .child(
+                v_stack().flex_1().p_2().child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.fg_muted())
+                        .child("TASKS"),
+                ),
+            )
+    }
+
+    fn render_detail(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        v_stack()
+            .id("detail")
+            .flex_1()
+            .h_full()
+            .bg(theme.bg())
+            .child(
+                h_stack()
+                    .id("detail-toolbar")
+                    .window_control_area(WindowControlArea::Drag)
+                    .h(px(TOOLBAR_HEIGHT))
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_3()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border()),
+            )
+            .child(
+                v_stack()
+                    .flex_1()
+                    .p_4()
+                    .justify_center()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(theme.fg_muted())
+                            .child("Select a task"),
+                    ),
+            )
+    }
+}
+
+impl Focusable for TasksApp {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
 impl Render for TasksApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let status_text = match self.connection_state {
-            SseConnectionState::Disconnected => "Disconnected",
-            SseConnectionState::Connecting => "Connecting...",
-            SseConnectionState::Connected => "Connected",
-            SseConnectionState::Reconnecting => "Reconnecting...",
-            SseConnectionState::Failed => "Connection Failed",
-        };
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
 
-        let status_color = match self.connection_state {
-            SseConnectionState::Connected => colors::STATE_COMPLETED,
-            SseConnectionState::Connecting | SseConnectionState::Reconnecting => {
-                colors::STATE_QUESTION
-            }
-            SseConnectionState::Disconnected | SseConnectionState::Failed => colors::STATE_FAILED,
-        };
-
-        let last_event_text = self
-            .last_event
-            .as_ref()
-            .map(|e| format!("{}: {}", e.event_type.as_str(), e.task))
-            .unwrap_or_else(|| "No events yet".to_string());
-
-        container()
-            .p(spacing::SPACE_4)
-            .gap(spacing::SPACE_4)
-            .child(
-                gpui::div()
-                    .flex()
-                    .flex_col()
-                    .gap(spacing::SPACE_2)
-                    .child(
-                        heading(typography::TEXT_XL)
-                            .font_weight(typography::WEIGHT_BOLD)
-                            .child("Tasks Desktop"),
-                    )
-                    .child(muted_text().child("GPUI-based desktop client for the Tasks platform")),
-            )
-            .child(
-                gpui::div()
-                    .flex()
-                    .items_center()
-                    .gap(spacing::SPACE_2)
-                    .child(status_dot(status_color))
-                    .child(
-                        gpui::div()
-                            .text_primary()
-                            .child(format!("Status: {}", status_text)),
-                    ),
-            )
-            .child(
-                gpui::div()
-                    .flex()
-                    .flex_col()
-                    .gap(spacing::SPACE_1)
-                    .child(
-                        gpui::div()
-                            .text_primary()
-                            .child(format!("Events received: {}", self.event_count)),
-                    )
-                    .child(muted_text().child(format!("Last event: {}", last_event_text))),
-            )
+        h_stack()
+            .id("tasks-app")
+            .key_context("TasksApp")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(theme.bg())
+            .text_color(theme.fg())
+            .child(self.render_sidebar(cx))
+            .child(self.render_list(cx))
+            .child(self.render_detail(cx))
     }
 }

@@ -162,7 +162,7 @@ impl SseClient {
 
         let url = self.filters.build_url(&self.base_url);
 
-        cx.spawn(|this, cx| async move {
+        cx.spawn(async move |this, cx| {
             run_sse_loop(url, stop_flag, this, cx).await;
         })
         .detach();
@@ -212,7 +212,7 @@ async fn run_sse_loop(
     url: String,
     stop_flag: Arc<AtomicBool>,
     entity: WeakEntity<SseClient>,
-    mut cx: AsyncApp,
+    cx: &mut AsyncApp,
 ) {
     let mut reconnect_delay = Duration::from_millis(RECONNECT_DELAY_MS);
     let mut consecutive_failures = 0u32;
@@ -227,7 +227,7 @@ async fn run_sse_loop(
         info!(url = %url, "SSE connecting...");
 
         let (was_connected, result) =
-            connect_and_stream(&url, &stop_flag, &entity, &mut cx).await;
+            connect_and_stream(&url, &stop_flag, &entity, cx).await;
 
         // Reset failure counter if we had a successful connection
         if was_connected {
@@ -251,7 +251,7 @@ async fn run_sse_loop(
 
                 // Update state based on failure count
                 let error_msg = e.to_string();
-                if let Err(update_err) = entity.update(&mut cx, |client: &mut SseClient, cx| {
+                if let Err(update_err) = entity.update(cx, |client: &mut SseClient, cx| {
                     if consecutive_failures == 1 {
                         // First failure: enter reconnecting state (grace period)
                         client.set_state(SseConnectionState::Reconnecting, cx);
@@ -279,7 +279,7 @@ async fn run_sse_loop(
                 while elapsed < delay {
                     if stop_flag.load(Ordering::SeqCst) {
                         info!(url = %url, "SSE client stopped during reconnect");
-                        if let Err(e) = entity.update(&mut cx, |client: &mut SseClient, cx| {
+                        if let Err(e) = entity.update(cx, |client: &mut SseClient, cx| {
                             client.stop_flag = None;
                             client.set_state(SseConnectionState::Disconnected, cx);
                         }) {
@@ -298,7 +298,7 @@ async fn run_sse_loop(
         }
     }
 
-    if let Err(e) = entity.update(&mut cx, |client: &mut SseClient, cx| {
+    if let Err(e) = entity.update(cx, |client: &mut SseClient, cx| {
         client.stop_flag = None;
         client.set_state(SseConnectionState::Disconnected, cx);
     }) {

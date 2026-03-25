@@ -341,11 +341,11 @@ impl AppState {
         let api_client = self.api_client.clone();
         let fetch_in_flight = self.fetch_in_flight.clone();
 
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             let result = api_client.fetch_snapshot().await;
             fetch_in_flight.store(false, Ordering::SeqCst);
 
-            if let Err(e) = this.update(&mut cx, |state, cx| {
+            if let Err(e) = this.update(cx, |state, cx| {
                 state.update_snapshot(result, cx);
             }) {
                 warn!(error = %e, "Failed to update snapshot state");
@@ -408,7 +408,7 @@ impl AppState {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_polling = Some(stop_flag.clone());
 
-        cx.spawn(|this, cx| async move {
+        cx.spawn(async move |this, cx| {
             run_polling_loop(stop_flag, this, cx).await;
         })
         .detach();
@@ -473,7 +473,7 @@ impl Drop for AppState {
 async fn run_polling_loop(
     stop_flag: Arc<AtomicBool>,
     entity: WeakEntity<AppState>,
-    mut cx: AsyncApp,
+    cx: &mut AsyncApp,
 ) {
     let interval = Duration::from_millis(POLL_INTERVAL_MS);
 
@@ -488,7 +488,7 @@ async fn run_polling_loop(
         }
 
         // Trigger a snapshot refresh
-        if let Err(e) = entity.update(&mut cx, |state, cx| {
+        if let Err(e) = entity.update(cx, |state, cx| {
             state.refresh_snapshot(cx);
         }) {
             warn!(error = %e, "Failed to trigger snapshot refresh from polling loop");

@@ -23,5 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 bytes = "1.11"
 futures = "0.3"
 sysinfo = "0.33"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "v0.175.5", package = "gpui" }
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
+gpuikit = { path = "../gpuikit" }
 smol = "2.0"
