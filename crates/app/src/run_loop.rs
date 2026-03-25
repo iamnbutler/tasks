@@ -23,7 +23,7 @@ use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
     ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
-    OrchestratorAction, OrchestratorChat, SystemContext,
+    OrchestratorAction, OrchestratorChat, QuestionContext, SystemContext,
 };
 
 use crate::config::AppConfig;
@@ -135,6 +135,16 @@ impl AnyOrchestrator {
         match self {
             Self::Claude(o) => o.think(context).await,
             Self::Mock(o) => o.think(context).await,
+        }
+    }
+
+    async fn answer_question(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<String, tasks_orchestrator::OrchestratorError> {
+        match self {
+            Self::Claude(o) => o.answer_question(context).await,
+            Self::Mock(o) => o.answer_question(context).await,
         }
     }
 }
@@ -1277,6 +1287,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let orch_event_bus = server.event_bus.clone();
     let orch_github_token = config.github_token.clone();
     let orch_rejected_cooldown = rejected_pr_cooldown.clone();
+    let orch_session_mgr = session_manager.clone();
 
     let orchestrator_eval_interval = config.orchestrator_eval_interval;
     let conflict_max_age = config.conflict_max_age;
@@ -1419,6 +1430,163 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             lower_mode(&orch_server, &reason).await;
                         }
                     }
+                    // Handle stuck agents: when a task enters Question state, the
+                    // orchestrator answers the question to unblock the agent (issue #533).
+                    EventType::TaskStateQuestion => {
+                        let task_id = event.task.clone();
+                        let human_present = orch_server.is_human_present();
+
+                        // Extract the question text from event data, or look up
+                        // the most recent agent:question event for this task.
+                        let question = event.data.get("question")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                event.data.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            });
+
+                        // If the question text isn't in the event data, try to
+                        // find it from recent events for this task.
+                        let question = match question {
+                            Some(q) if !q.is_empty() => q,
+                            _ => {
+                                match orch_server.event_bus.read_task(&task_id).await {
+                                    Ok(events) => {
+                                        events.iter().rev()
+                                            .find(|e| e.event_type == EventType::AgentQuestion)
+                                            .and_then(|e| {
+                                                e.data.get("question")
+                                                    .or_else(|| e.data.get("message"))
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                            })
+                                            .unwrap_or_else(|| "(no question text found)".to_string())
+                                    }
+                                    Err(e) => {
+                                        warn!(task_id = %task_id, error = %e, "failed to read task events for question text");
+                                        "(failed to retrieve question)".to_string()
+                                    }
+                                }
+                            }
+                        };
+
+                        // If human is present, surface the question as an escalation
+                        // instead of answering autonomously.
+                        if human_present {
+                            info!(
+                                task_id = %task_id,
+                                "agent stuck with question, human present — surfacing as escalation"
+                            );
+                            let escalation_event = Event::new(
+                                EventType::OrchestratorEscalation,
+                                &task_id,
+                                Actor::Orchestrator,
+                                serde_json::json!({
+                                    "action": "agent_question",
+                                    "message": format!("Agent is stuck and asking: {}", question),
+                                }),
+                            );
+                            if let Err(e) = orch_server.event_bus.publish(escalation_event).await {
+                                error!(error = %e, "failed to emit escalation for agent question");
+                            }
+                            continue;
+                        }
+
+                        // No human present — orchestrator answers autonomously.
+                        // Look up the task and project for context.
+                        let (task, project) = {
+                            let state = orch_server.state.read().await;
+                            let task = state.tasks.get(&task_id).cloned();
+                            let project = task.as_ref().and_then(|t| state.projects.get(&t.project).cloned());
+                            (task, project)
+                        };
+
+                        let (task, project) = match (task, project) {
+                            (Some(t), Some(p)) => (t, p),
+                            _ => {
+                                warn!(task_id = %task_id, "cannot answer question: task or project not found");
+                                continue;
+                            }
+                        };
+
+                        // Spawn LLM call to avoid blocking the event loop
+                        let orch_ref = orch.clone();
+                        let server_ref = orch_server.clone();
+                        let session_mgr_ref = orch_session_mgr.clone();
+                        let question_clone = question.clone();
+                        tokio::spawn(async move {
+                            let context = QuestionContext {
+                                task: task.clone(),
+                                project,
+                                question: question_clone,
+                                human_present: false,
+                            };
+
+                            match orch_ref.answer_question(&context).await {
+                                Ok(answer) => {
+                                    info!(
+                                        task_id = %task_id,
+                                        answer_len = answer.len(),
+                                        "orchestrator answered agent question"
+                                    );
+
+                                    // Emit HumanMessage event BEFORE sending to session.
+                                    // This triggers the dispatcher's pending_answers mechanism,
+                                    // which transitions the task from Question to Running on the
+                                    // next dispatch tick. Without this, the task stays in Question
+                                    // state indefinitely (issue #552 review comment).
+                                    let human_message_event = events::Event::new(
+                                        events::EventType::HumanMessage,
+                                        &task_id,
+                                        events::Actor::Orchestrator,
+                                        serde_json::json!({
+                                            "message": answer.clone(),
+                                            "source": "orchestrator_answer",
+                                        }),
+                                    );
+                                    if let Err(e) = server_ref.event_bus.publish(human_message_event).await {
+                                        error!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to emit HumanMessage event for orchestrator answer"
+                                        );
+                                    }
+
+                                    // Send the answer to the agent session
+                                    if let Err(e) = session_mgr_ref.send_chat(&task_id, answer.clone()).await {
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to send orchestrator answer to session"
+                                        );
+                                    }
+
+                                    // Emit orchestrator:response event so humans can see what was answered
+                                    if let Err(e) = server_ref.emit_orchestrator_feedback(
+                                        &task_id,
+                                        &answer,
+                                        Some("question_answer"),
+                                    ).await {
+                                        error!(
+                                            task_id = %task_id,
+                                            error = %e,
+                                            "failed to emit orchestrator feedback event for question answer"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        task_id = %task_id,
+                                        error = %e,
+                                        "orchestrator failed to answer agent question"
+                                    );
+                                }
+                            }
+                        });
+                        continue;
+                    }
                     // Handle orchestrator chat messages from humans (bypass queue)
                     EventType::OrchestratorMessage => {
                         let message = event
@@ -1445,7 +1613,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         projects: state.projects.values().cloned().collect(),
                                         tasks: state.tasks.values().cloned().collect(),
                                         recent_events: Vec::new(),
-                                        human_present: orch_server.presence.is_present(),
+                                        human_present: orch_server.is_human_present(),
                                     }
                                 };
 
@@ -2253,7 +2421,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     projects: state.projects.values().cloned().collect(),
                     tasks: state.tasks.values().cloned().collect(),
                     merge_queue: state.merge_queue.entries().to_vec(),
-                    human_present: think_server.presence.is_present(),
+                    human_present: think_server.is_human_present(),
                     recent_events: recent_events.clone(),
                     last_think_at,
                 }

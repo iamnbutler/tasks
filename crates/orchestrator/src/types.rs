@@ -154,6 +154,26 @@ impl ConflictResolution {
     }
 }
 
+/// Context for answering a stuck agent's question.
+///
+/// When an agent enters Question state, the orchestrator receives this context
+/// and generates actionable guidance to unblock the agent.
+pub struct QuestionContext {
+    /// The task the agent is working on.
+    pub task: Task,
+    /// The project this task belongs to.
+    pub project: Project,
+    /// The agent's question text (extracted from the most recent agent:question event).
+    pub question: String,
+    /// Whether a human is currently present (GUI connected).
+    ///
+    /// Note: The decision to answer vs escalate is made by the caller (run_loop)
+    /// before calling `answer_question()`. This field is passed for context and
+    /// potential future use in prompt customization, but is not currently read
+    /// by the answer generation logic.
+    pub human_present: bool,
+}
+
 /// Default triage logic for conflicts — spec §7.4.
 ///
 /// This function implements the mode-aware conflict resolution strategy:

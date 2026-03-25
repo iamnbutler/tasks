@@ -11,7 +11,7 @@
 use crate::error::OrchestratorError;
 use crate::types::{
     ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction, QualityEvaluation,
-    SystemContext,
+    QuestionContext, SystemContext,
 };
 use models::task::Task;
 
@@ -69,4 +69,15 @@ pub trait Orchestrator: Sync {
         &self,
         context: &SystemContext,
     ) -> Result<Vec<OrchestratorAction>, OrchestratorError>;
+
+    /// Answer a stuck agent's question.
+    ///
+    /// When an agent session enters the Question state, the orchestrator
+    /// generates actionable guidance based on the task context and the
+    /// agent's question. The answer is sent back to the agent session
+    /// as a chat message.
+    async fn answer_question(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<String, OrchestratorError>;
 }

@@ -11,7 +11,7 @@ use crate::orchestrator::Orchestrator;
 use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, SystemContext,
+    QualityEvaluation, QuestionContext, SystemContext,
 };
 use events::EventType;
 use models::task::{Task, TaskSource};
@@ -445,6 +445,91 @@ impl Orchestrator for ClaudeOrchestrator {
 
         Ok(actions)
     }
+
+    async fn answer_question(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<String, OrchestratorError> {
+        info!(
+            task_id = %context.task.id,
+            question_len = context.question.len(),
+            "Answering stuck agent's question"
+        );
+
+        let system = build_question_answer_system_prompt();
+
+        let user_prompt = build_question_answer_prompt(
+            &context.task.title,
+            context.task.description.as_deref(),
+            &context.question,
+            &context.project.repo,
+        );
+
+        let config = CompletionConfig::new(&self.model).with_max_tokens(4096);
+        let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system);
+
+        let response = self
+            .provider
+            .complete(request)
+            .await
+            .map_err(OrchestratorError::Agent)?;
+
+        let answer = response.text().trim().to_string();
+
+        info!(
+            task_id = %context.task.id,
+            answer_len = answer.len(),
+            "Generated answer for stuck agent"
+        );
+
+        Ok(answer)
+    }
+}
+
+/// Build the system prompt for answering agent questions.
+fn build_question_answer_system_prompt() -> String {
+    r#"You are a project foreman helping an implementor who is stuck on a coding task.
+
+Your role:
+- Give concise, actionable guidance — the agent needs to move forward, not read an essay.
+- Be specific: point to files, functions, patterns, or approaches.
+- If the question reveals a misunderstanding, correct it directly.
+- If the question is about a design decision, make the call — don't equivocate.
+- Keep your answer under 500 words. Shorter is better.
+
+Do NOT:
+- Repeat the question back
+- Give vague advice like "consider the tradeoffs"
+- Suggest the agent ask someone else
+- Write code unless it directly answers the question"#.to_string()
+}
+
+/// Build the user prompt for answering an agent's question.
+fn build_question_answer_prompt(
+    task_title: &str,
+    task_description: Option<&str>,
+    question: &str,
+    repo: &str,
+) -> String {
+    let mut prompt = format!(
+        "## Task\n\
+         **Repository:** {repo}\n\
+         **Title:** {task_title}\n"
+    );
+
+    if let Some(desc) = task_description {
+        prompt.push_str(&format!("**Description:** {desc}\n"));
+    }
+
+    prompt.push_str(&format!(
+        "\n## Agent's Question\n\
+         {question}\n\
+         \n## Instructions\n\
+         Answer the agent's question with specific, actionable guidance so they can continue working."
+    ));
+
+    prompt
 }
 
 /// Extract JSON from a text response.
