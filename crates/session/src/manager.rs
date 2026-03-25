@@ -535,21 +535,35 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     // Rolling stderr buffer for failure diagnosis (spec §13.4)
     let mut stderr_buffer: VecDeque<String> = VecDeque::with_capacity(MAX_STDERR_LINES);
 
-    // Wrap session for shared access between blocking recv thread and async command handler
-    let session = Arc::new(std::sync::Mutex::new(session));
-    let session_recv = session.clone();
-    let session_cmd = session.clone();
-
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionCommand>();
 
-    // Blocking reader thread — reads from the sync transport
+    // Clone task_id for use in the blocking reader thread
+    let task_id_for_reader = task_id.clone();
+
+    // Blocking reader thread — owns the session exclusively.
+    // Reads events from the sync transport and processes commands from async tasks,
+    // avoiding any cross-boundary Mutex contention.
     let reader = tokio::task::spawn_blocking(move || {
+        let mut session = session;
         loop {
-            let result = {
-                let mut sess = session_recv.lock().unwrap();
-                sess.recv_timeout(Duration::from_secs(1))
-            }; // lock released here
-            match result {
+            // Drain any pending commands before reading
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    SessionCommand::Chat(text) => {
+                        if let Err(e) = session.send_chat(text) {
+                            tracing::error!(task_id = %task_id_for_reader, error = %e, "failed to send chat to session");
+                        }
+                    }
+                    SessionCommand::Stop => {
+                        if let Err(e) = session.stop_agent() {
+                            tracing::error!(task_id = %task_id_for_reader, error = %e, "failed to stop agent");
+                        }
+                    }
+                }
+            }
+
+            match session.recv_timeout(Duration::from_secs(1)) {
                 Ok(event) => {
                     if event_tx.blocking_send(event).is_err() {
                         break;
@@ -617,18 +631,8 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
                 }
             }
             Some(cmd) = command_rx.recv() => {
-                let mut sess = session_cmd.lock().unwrap();
-                match cmd {
-                    SessionCommand::Chat(text) => {
-                        if let Err(e) = sess.send_chat(text) {
-                            tracing::error!(task_id = %task_id, error = %e, "failed to send chat to session");
-                        }
-                    }
-                    SessionCommand::Stop => {
-                        if let Err(e) = sess.stop_agent() {
-                            tracing::error!(task_id = %task_id, error = %e, "failed to stop agent");
-                        }
-                    }
+                if cmd_tx.send(cmd).is_err() {
+                    tracing::error!(task_id = %task_id, "session reader thread gone, cannot forward command");
                 }
             }
             // Timeout arm: fires when the next time limit is reached, even if no
@@ -677,9 +681,8 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
             }
 
             // Stop the agent
-            let mut sess = session_cmd.lock().unwrap();
-            if let Err(e) = sess.stop_agent() {
-                tracing::error!(task_id = %task_id, error = %e, "failed to stop agent at hard time limit");
+            if cmd_tx.send(SessionCommand::Stop).is_err() {
+                tracing::error!(task_id = %task_id, "session reader thread gone, cannot send stop at hard time limit");
             }
         } else if elapsed >= soft_limit && !soft_limit_notified {
             soft_limit_notified = true;
