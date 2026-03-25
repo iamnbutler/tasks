@@ -204,26 +204,37 @@ impl Default for ProblemTracker {
 mod tests {
     use super::*;
 
+    // NOTE: should_lower_mode() is currently disabled (always returns None)
+    // because auto mode-lowering fires too aggressively during normal
+    // operation. These tests verify the disabled behavior. When re-enabled
+    // (#536), update these tests to check for Some(...) results.
+
     #[test]
-    fn consecutive_eval_failures_triggers_lowering() {
+    fn should_lower_mode_always_returns_none_while_disabled() {
         let thresholds = ProblemThresholds {
-            eval_failure_threshold: 3,
+            eval_failure_threshold: 1,
+            rejection_threshold: 1,
+            conflict_threshold: 1,
+            agent_error_threshold: 1,
+            task_failure_threshold: 1,
             ..Default::default()
         };
         let mut tracker = ProblemTracker::with_thresholds(thresholds);
 
-        // Two failures: not enough
-        tracker.record_eval_failure();
         tracker.record_eval_failure();
         assert!(tracker.should_lower_mode().is_none());
 
-        // Third failure: should trigger
-        tracker.record_eval_failure();
-        let reason = tracker.should_lower_mode();
-        assert!(matches!(
-            reason,
-            Some(LowerReason::ConsecutiveEvalFailures(3))
-        ));
+        tracker.record_rejection();
+        assert!(tracker.should_lower_mode().is_none());
+
+        tracker.record_conflict();
+        assert!(tracker.should_lower_mode().is_none());
+
+        tracker.record_agent_error();
+        assert!(tracker.should_lower_mode().is_none());
+
+        tracker.record_task_failure();
+        assert!(tracker.should_lower_mode().is_none());
     }
 
     #[test]
@@ -244,26 +255,6 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_rejections_triggers_lowering() {
-        let thresholds = ProblemThresholds {
-            rejection_threshold: 3,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
-
-        tracker.record_rejection();
-        tracker.record_rejection();
-        assert!(tracker.should_lower_mode().is_none());
-
-        tracker.record_rejection();
-        let reason = tracker.should_lower_mode();
-        assert!(matches!(
-            reason,
-            Some(LowerReason::ConsecutiveRejections(3))
-        ));
-    }
-
-    #[test]
     fn approval_resets_rejection_count() {
         let thresholds = ProblemThresholds {
             rejection_threshold: 3,
@@ -281,90 +272,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_errors_trigger_lowering() {
-        let thresholds = ProblemThresholds {
-            agent_error_threshold: 2,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
+    fn reset_clears_all_state() {
+        let mut tracker = ProblemTracker::new();
 
-        tracker.record_agent_error();
-        assert!(tracker.should_lower_mode().is_none());
-
-        tracker.record_agent_error();
-        let reason = tracker.should_lower_mode();
-        assert!(matches!(reason, Some(LowerReason::RepeatedAgentErrors(2))));
-    }
-
-    #[test]
-    fn task_failures_trigger_lowering() {
-        let thresholds = ProblemThresholds {
-            task_failure_threshold: 2,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
-
-        tracker.record_task_failure();
-        assert!(tracker.should_lower_mode().is_none());
-
-        tracker.record_task_failure();
-        let reason = tracker.should_lower_mode();
-        assert!(matches!(reason, Some(LowerReason::RepeatedTaskFailures(2))));
-    }
-
-    #[test]
-    fn conflicts_trigger_lowering() {
-        let thresholds = ProblemThresholds {
-            conflict_threshold: 2,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
-
+        tracker.record_eval_failure();
+        tracker.record_rejection();
         tracker.record_conflict();
-        assert!(tracker.should_lower_mode().is_none());
+        tracker.record_agent_error();
+        tracker.record_task_failure();
 
-        tracker.record_conflict();
-        let reason = tracker.should_lower_mode();
-        assert!(matches!(reason, Some(LowerReason::RepeatedConflicts(2))));
-    }
-
-    #[test]
-    fn mode_lowered_flag_prevents_repeated_lowering() {
-        let thresholds = ProblemThresholds {
-            eval_failure_threshold: 2,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
-
-        tracker.record_eval_failure();
-        tracker.record_eval_failure();
-        assert!(tracker.should_lower_mode().is_some());
-
-        // More failures shouldn't trigger again
-        tracker.record_eval_failure();
-        assert!(tracker.should_lower_mode().is_none());
-        assert!(tracker.is_mode_lowered());
-    }
-
-    #[test]
-    fn reset_allows_new_lowering() {
-        let thresholds = ProblemThresholds {
-            eval_failure_threshold: 2,
-            ..Default::default()
-        };
-        let mut tracker = ProblemTracker::with_thresholds(thresholds);
-
-        tracker.record_eval_failure();
-        tracker.record_eval_failure();
-        assert!(tracker.should_lower_mode().is_some());
-
-        // Reset (human raised mode)
         tracker.reset();
         assert!(!tracker.is_mode_lowered());
-
-        // New failures can trigger again
-        tracker.record_eval_failure();
-        tracker.record_eval_failure();
-        assert!(tracker.should_lower_mode().is_some());
     }
 }
