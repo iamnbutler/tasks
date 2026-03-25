@@ -428,8 +428,24 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         time_limits: SessionLimits,
     ) -> Result<(), SessionManagerError> {
         // Check if session already exists
-        if self.sessions.read().await.contains_key(&task_id) {
-            return Err(SessionManagerError::AlreadyExists(task_id));
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(handle) = sessions.get(&task_id) {
+                if !handle.monitor_handle.is_finished() {
+                    return Err(SessionManagerError::AlreadyExists(task_id));
+                }
+                // Monitor task has finished (panic, OOM-kill, or missed cleanup).
+                // Drop the read lock, remove the stale entry, then proceed.
+                drop(sessions);
+                let removed = self.sessions.write().await.remove(&task_id);
+                if let Some(removed) = removed {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        container_id = %removed.container_id,
+                        "removed stale session entry (monitor task already finished)"
+                    );
+                }
+            }
         }
 
         // Create and start the runtime session
