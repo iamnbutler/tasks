@@ -481,6 +481,16 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
 
+        // If already in a terminal state, skip to avoid overwriting
+        if run.status.is_terminal() {
+            tracing::debug!(
+                run_id = %run_id,
+                status = ?run.status,
+                "automation run already terminal, skipping duplicate complete"
+            );
+            return Ok(run);
+        }
+
         run.complete(output.clone());
 
         // Save to store
@@ -522,6 +532,17 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
+
+        // If already in a terminal state, skip to avoid duplicate events
+        // (e.g. hard time limit emits TaskStateFailed, then handle_exit emits another)
+        if run.status.is_terminal() {
+            tracing::debug!(
+                run_id = %run_id,
+                status = ?run.status,
+                "automation run already terminal, skipping duplicate fail"
+            );
+            return Ok(run);
+        }
 
         run.fail(&error_str);
 
