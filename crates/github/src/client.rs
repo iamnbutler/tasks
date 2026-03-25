@@ -1360,6 +1360,7 @@ impl GitHubClient {
         )))
     }
 
+
     /// Get the login of the authenticated user (`GET /user`).
     pub async fn get_authenticated_user_login(&self) -> Result<String, GitHubError> {
         self.wait_for_rate_limit().await;

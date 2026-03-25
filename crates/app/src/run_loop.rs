@@ -1828,6 +1828,30 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     error!(error = %e, "failed to emit orchestrator decision event");
                 }
 
+                // Post evaluation comment on the GitHub PR (best-effort).
+                // This makes the orchestrator's reasoning visible to the PR author.
+                if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                    let verdict = if evaluation.approved { "Approved" } else { "Rejected" };
+                    let mut comment_body = format!(
+                        "**Orchestrator Evaluation: {}**\n\n{}",
+                        verdict, evaluation.reasoning
+                    );
+                    if let Some(feedback) = &evaluation.feedback {
+                        comment_body.push_str(&format!(
+                            "\n\n---\n**Feedback for agent:**\n{}",
+                            feedback
+                        ));
+                    }
+                    if let Err(e) = merge_github.post_issue_comment(&owner, &repo, number, &comment_body).await {
+                        warn!(
+                            entry_id = %entry_id,
+                            pr_url = %pr_url,
+                            error = %e,
+                            "failed to post evaluation comment on PR (best-effort)"
+                        );
+                    }
+                }
+
                 // Mark this PR as evaluated so we don't re-evaluate until new commits.
                 // Only record the SHA if we actually know it — if head_sha is None,
                 // don't insert so reconciliation can trigger re-evaluation once the
