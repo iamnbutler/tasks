@@ -2,6 +2,8 @@
 
 > **WIP** — This project is under active development. Expect breaking changes.
 
+🚨 Frequent breaking changes happening multiple times a day. This app has zero security or saftey guardrails, and shouldn't be used by anyone! You have been warned 🙂 🚨
+
 A human-in-the-loop platform that orchestrates coding agents to get project work done. It polls GitHub for issues, dispatches isolated agent sessions in lightweight Linux VMs, and routes results through a quality-gated merge queue.
 
 ## Prerequisites
