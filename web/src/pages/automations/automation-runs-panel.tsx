@@ -8,9 +8,11 @@ import {
   Clock,
   ExternalLink,
   Loader2,
+  Square,
   X,
+  XCircle,
 } from "lucide-react";
-import { fetchAutomationRuns } from "@/lib/api";
+import { fetchAutomationRuns, cancelAutomationRun } from "@/lib/api";
 import { cn, formatRelativeTime } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -51,6 +53,11 @@ const runStatusConfig: Record<
     label: "Failed",
     icon: AlertCircle,
     className: "bg-red-500/20 text-red-400 border-red-500/30",
+  },
+  cancelled: {
+    label: "Cancelled",
+    icon: XCircle,
+    className: "bg-gray-500/20 text-gray-400 border-gray-500/30",
   },
 };
 
@@ -170,8 +177,15 @@ function RunDetailView({ run }: { run: AutomationRun }) {
 // Run row
 // ---------------------------------------------------------------------------
 
-function RunRow({ run }: { run: AutomationRun }) {
+interface RunRowProps {
+  run: AutomationRun;
+  automationId: string;
+  onCancelled: () => void;
+}
+
+function RunRow({ run, automationId, onCancelled }: RunRowProps) {
   const [expanded, setExpanded] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   // Auto-expand if this is a running or recently failed run
   useEffect(() => {
@@ -179,6 +193,22 @@ function RunRow({ run }: { run: AutomationRun }) {
       setExpanded(true);
     }
   }, [run.status]);
+
+  const canCancel = run.status === "pending" || run.status === "running";
+
+  const handleCancel = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await cancelAutomationRun(automationId, run.id);
+      onCancelled();
+    } catch (err) {
+      console.error("Failed to cancel run:", err);
+    } finally {
+      setCancelling(false);
+    }
+  };
 
   return (
     <Collapsible open={expanded} onOpenChange={setExpanded}>
@@ -197,10 +227,26 @@ function RunRow({ run }: { run: AutomationRun }) {
           >
             {formatRelativeTime(run.started_at)}
           </span>
-          {(run.status === "completed" || run.status === "failed") && (
+          {(run.status === "completed" || run.status === "failed" || run.status === "cancelled") && (
             <span className="text-xs text-muted-foreground/70">
               {formatDuration(run.started_at, run.completed_at)}
             </span>
+          )}
+          {canCancel && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0"
+              onClick={handleCancel}
+              disabled={cancelling}
+              title="Cancel run"
+            >
+              {cancelling ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Square className="h-3.5 w-3.5" />
+              )}
+            </Button>
           )}
         </CollapsibleTrigger>
         <CollapsibleContent>
@@ -361,7 +407,12 @@ export const AutomationRunsPanel = forwardRef<AutomationRunsPanelHandle, Automat
         ) : (
           <div>
             {runs.map((run) => (
-              <RunRow key={run.id} run={run} />
+              <RunRow
+                key={run.id}
+                run={run}
+                automationId={automation.id}
+                onCancelled={loadRuns}
+              />
             ))}
           </div>
         )}
