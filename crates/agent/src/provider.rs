@@ -17,6 +17,10 @@ pub struct CompletionConfig {
     /// Maximum tokens to generate
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Context window size (input token limit). Messages are truncated to fit.
+    /// Defaults based on model name, or 200k if unknown.
+    #[serde(default = "default_context_window")]
+    pub context_window: u32,
     /// Temperature for sampling (0.0 - 1.0)
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -32,11 +36,27 @@ fn default_max_tokens() -> u32 {
     4096
 }
 
+fn default_context_window() -> u32 {
+    200_000
+}
+
+/// Infer context window size from model name.
+fn context_window_for_model(model: &str) -> u32 {
+    // All current Claude models support 200k context
+    if model.contains("claude") {
+        200_000
+    } else {
+        // Conservative default for unknown models
+        128_000
+    }
+}
+
 impl Default for CompletionConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
             max_tokens: default_max_tokens(),
+            context_window: default_context_window(),
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
@@ -46,7 +66,9 @@ impl Default for CompletionConfig {
 
 impl CompletionConfig {
     pub fn new(model: impl Into<String>) -> Self {
-        Self { model: model.into(), ..Default::default() }
+        let model = model.into();
+        let context_window = context_window_for_model(&model);
+        Self { model, context_window, ..Default::default() }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -54,9 +76,19 @@ impl CompletionConfig {
         self
     }
 
+    pub fn with_context_window(mut self, context_window: u32) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
+    }
+
+    /// Maximum input tokens available after reserving space for the response.
+    pub fn input_budget(&self) -> u32 {
+        self.context_window.saturating_sub(self.max_tokens)
     }
 }
 
