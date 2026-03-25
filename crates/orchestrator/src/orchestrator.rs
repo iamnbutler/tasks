@@ -1,13 +1,18 @@
 //! Orchestrator trait — the core abstraction.
 //!
-//! Spec §4.2: The orchestrator evaluates work quality and provides feedback.
-//! Spec §7.4: The orchestrator triages conflicts with mode-aware resolution.
+//! Spec §4.2: The orchestrator is an AI agent that manages the project.
+//! It evaluates work quality, triages conflicts, and proactively manages
+//! project state through periodic reasoning passes.
 //!
-//! The trait is intentionally narrow — `evaluate` returns a verdict, and the
-//! caller (server run loop) decides whether to act on it based on mode.
+//! The orchestrator is an actor: it periodically surveys system state,
+//! identifies patterns, and returns actions. The event bus is a data
+//! source it can consult, not its driver.
 
 use crate::error::OrchestratorError;
-use crate::types::{ConflictContext, ConflictTriage, EvaluationContext, QualityEvaluation};
+use crate::types::{
+    ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction, QualityEvaluation,
+    SystemContext,
+};
 use models::task::Task;
 
 /// Trait for orchestrator implementations.
@@ -50,4 +55,18 @@ pub trait Orchestrator: Sync {
         &self,
         context: &ConflictContext,
     ) -> Result<ConflictTriage, OrchestratorError>;
+
+    /// Periodic reasoning pass — the orchestrator surveys system state and
+    /// decides what actions to take.
+    ///
+    /// Called on a regular interval (~30s) by the run loop. The orchestrator
+    /// receives a full snapshot of system state and recent events, identifies
+    /// patterns, and returns actions (narration, state changes, priorities).
+    ///
+    /// This is NOT reactive to individual events — the orchestrator stands
+    /// outside the event stream and sees the full picture.
+    async fn think(
+        &self,
+        context: &SystemContext,
+    ) -> Result<Vec<OrchestratorAction>, OrchestratorError>;
 }

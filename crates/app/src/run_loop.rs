@@ -23,7 +23,7 @@ use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
     ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
-    OrchestratorChat,
+    OrchestratorAction, OrchestratorChat, SystemContext,
 };
 
 use crate::config::AppConfig;
@@ -125,6 +125,16 @@ impl AnyOrchestrator {
         match self {
             Self::Claude(o) => o.triage_conflict(context).await,
             Self::Mock(o) => o.triage_conflict(context).await,
+        }
+    }
+
+    async fn think(
+        &self,
+        context: &tasks_orchestrator::SystemContext,
+    ) -> Result<Vec<tasks_orchestrator::OrchestratorAction>, tasks_orchestrator::OrchestratorError> {
+        match self {
+            Self::Claude(o) => o.think(context).await,
+            Self::Mock(o) => o.think(context).await,
         }
     }
 }
@@ -1263,6 +1273,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let orch_server = server.clone();
     let orch = orchestrator.clone();
+    let think_orch = orchestrator.clone();
     let orch_event_bus = server.event_bus.clone();
     let orch_github_token = config.github_token.clone();
     let orch_rejected_cooldown = rejected_pr_cooldown.clone();
@@ -2173,6 +2184,122 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         }
     });
 
+    // --- 8e. Spawn orchestrator think loop ---
+    //
+    // Periodic reasoning pass: the orchestrator surveys system state and
+    // recent events, identifies patterns, and emits narration (thoughts)
+    // plus state change requests. This runs on a fixed interval (~30s),
+    // independent of the evaluation loop.
+    //
+    // The think loop collects events between ticks and passes them to
+    // think() as recent_events so the orchestrator can see what happened.
+
+    let think_server = server.clone();
+    let think_event_bus = server.event_bus.clone();
+
+    let think_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut event_rx = think_event_bus.subscribe();
+        let mut recent_events: Vec<Event> = Vec::new();
+        let mut last_think_at: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        loop {
+            // Wait for next tick, collecting events in between
+            tokio::select! {
+                _ = interval.tick() => {}
+                result = event_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            // Buffer events for the next think() pass.
+                            // Skip high-frequency noise (scheduler ticks, accounting, etc.)
+                            let dominated = event.event_type.matches("system:scheduler:*")
+                                || event.event_type.matches("system:accounting:*")
+                                || event.event_type.matches("automation:run:output");
+                            if !dominated {
+                                recent_events.push((*event).clone());
+                            }
+                            // Cap buffer to prevent unbounded growth
+                            if recent_events.len() > 200 {
+                                recent_events.drain(..100);
+                            }
+                            continue; // Keep collecting until the interval fires
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(skipped = n, "think loop lagged — {n} events dropped");
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // Skip think() in Stop mode
+            let mode = think_server.mode().await;
+            if mode == server::Mode::Stop {
+                recent_events.clear();
+                continue;
+            }
+
+            // Build SystemContext snapshot
+            let context = {
+                let state = think_server.state.read().await;
+                let orch_mode = match state.mode {
+                    server::Mode::Play => OperatingMode::Play,
+                    server::Mode::Pause => OperatingMode::Pause,
+                    server::Mode::Stop => OperatingMode::Stop,
+                };
+                SystemContext {
+                    mode: orch_mode,
+                    projects: state.projects.values().cloned().collect(),
+                    tasks: state.tasks.values().cloned().collect(),
+                    merge_queue: state.merge_queue.entries().to_vec(),
+                    human_present: think_server.presence.is_present(),
+                    recent_events: recent_events.clone(),
+                    last_think_at,
+                }
+            };
+
+            // Run the orchestrator's think pass
+            match think_orch.think(&context).await {
+                Ok(actions) => {
+                    for action in actions {
+                        match action {
+                            OrchestratorAction::EmitThought(message) => {
+                                let event = Event::new(
+                                    EventType::OrchestratorThought,
+                                    "",
+                                    Actor::Orchestrator,
+                                    serde_json::json!({ "message": message }),
+                                );
+                                if let Err(e) = think_server.event_bus.publish(event).await {
+                                    error!(error = %e, "failed to publish orchestrator thought");
+                                }
+                            }
+                            OrchestratorAction::UpdateTaskState { task_id, state } => {
+                                info!(task_id = %task_id, state = ?state, "orchestrator requested task state change");
+                                if let Err(e) = think_server
+                                    .set_task_state(&task_id, state, Actor::Orchestrator)
+                                    .await
+                                {
+                                    error!(task_id = %task_id, error = %e, "failed to update task state from think()");
+                                }
+                            }
+                            OrchestratorAction::PrioritizeTask { task_id, reason } => {
+                                info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "orchestrator think() failed");
+                }
+            }
+
+            last_think_at = Some(chrono::Utc::now());
+            recent_events.clear();
+        }
+    });
+
     // --- 9. Optionally spawn web server ---
 
     // Create update trigger channel (shared between API and auto-apply)
@@ -2324,6 +2451,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     dispatch_handle.abort();
     event_handler_handle.abort();
     orchestrator_handle.abort();
+    think_handle.abort();
     watchdog_handle.abort();
     cleanup_handle.abort();
     stop_mode_handle.abort();

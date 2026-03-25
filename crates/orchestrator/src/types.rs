@@ -3,11 +3,13 @@
 //! EvaluationContext: what the orchestrator receives.
 //! QualityEvaluation: what the orchestrator returns.
 //! ConflictTriage: conflict resolution decision (spec §7.4).
+//! SystemContext: snapshot of current system state for event processing.
+//! OrchestratorAction: actions the orchestrator can request.
 
 use chrono::{DateTime, Utc};
 use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry, MergeStatus};
 use models::project::Project;
-use models::task::Task;
+use models::task::{Task, TaskState};
 use serde::{Deserialize, Serialize};
 
 /// Summary of another merge queue entry for context during evaluation.
@@ -232,4 +234,50 @@ pub fn default_triage(conflict_info: &ConflictInfo, mode: OperatingMode, human_p
             }
         }
     }
+}
+
+/// Snapshot of current system state for the orchestrator's think() pass.
+///
+/// The orchestrator receives the full picture — tasks, merge queue, recent
+/// events — and can identify patterns across them. This is NOT per-event
+/// context; it's a periodic survey of the entire landscape.
+#[derive(Debug, Clone)]
+pub struct SystemContext {
+    /// Current operating mode.
+    pub mode: OperatingMode,
+    /// All projects.
+    pub projects: Vec<Project>,
+    /// All tasks with their current state.
+    pub tasks: Vec<Task>,
+    /// Merge queue entries.
+    pub merge_queue: Vec<MergeQueueEntry>,
+    /// Whether a human is currently connected.
+    pub human_present: bool,
+    /// Recent events since the last think() call (for pattern detection).
+    pub recent_events: Vec<events::Event>,
+    /// When the last think() pass ran (None if this is the first).
+    pub last_think_at: Option<DateTime<Utc>>,
+}
+
+/// Actions the orchestrator can request from its think() pass.
+///
+/// The run loop interprets these and executes them against the server.
+/// This keeps the orchestrator pure — it returns intentions, not side effects.
+#[derive(Debug, Clone)]
+pub enum OrchestratorAction {
+    /// Emit a thought to the orchestrator narration feed (stream of consciousness).
+    EmitThought(String),
+    /// Change a task's state.
+    UpdateTaskState {
+        task_id: String,
+        state: TaskState,
+    },
+    /// Request a task be dispatched with priority.
+    PrioritizeTask {
+        task_id: String,
+        reason: String,
+    },
+    // Future: DispatchAgent { task_id: String, config: DispatchConfig }
+    // Future: CreateIssue { repo: String, title: String, body: String }
+    // Future: CommentOnPr { pr_url: String, body: String }
 }

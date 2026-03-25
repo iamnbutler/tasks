@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, QualityEvaluation,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
+    QualityEvaluation, SystemContext,
 };
 use models::task::Task;
 
@@ -24,6 +25,8 @@ pub struct MockOrchestrator {
     pub feedback_count: Mutex<u32>,
     /// Count of triage_conflict calls (for assertions).
     pub triage_count: Mutex<u32>,
+    /// Count of process_event calls (for assertions).
+    pub think_count: Mutex<u32>,
 }
 
 impl MockOrchestrator {
@@ -39,6 +42,7 @@ impl MockOrchestrator {
             evaluate_count: Mutex::new(0),
             feedback_count: Mutex::new(0),
             triage_count: Mutex::new(0),
+            think_count: Mutex::new(0),
         }
     }
 
@@ -55,6 +59,7 @@ impl MockOrchestrator {
             evaluate_count: Mutex::new(0),
             feedback_count: Mutex::new(0),
             triage_count: Mutex::new(0),
+            think_count: Mutex::new(0),
         }
     }
 
@@ -97,6 +102,15 @@ impl Orchestrator for MockOrchestrator {
         Ok(override_triage.unwrap_or_else(|| {
             default_triage(&context.conflict_info, context.mode, context.human_present)
         }))
+    }
+
+    async fn think(
+        &self,
+        _context: &SystemContext,
+    ) -> Result<Vec<OrchestratorAction>, OrchestratorError> {
+        *self.think_count.lock().unwrap() += 1;
+        // Mock returns no actions — tests can verify call count.
+        Ok(Vec::new())
     }
 }
 

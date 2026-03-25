@@ -22,5 +22,5 @@ pub use orchestrator::Orchestrator;
 pub use prompt::parse_pr_url;
 pub use types::{
     ConflictContext, ConflictResolution, ConflictTriage, EvaluationContext, OperatingMode,
-    QualityEvaluation, QueueEntrySummary,
+    OrchestratorAction, QualityEvaluation, QueueEntrySummary, SystemContext,
 };
