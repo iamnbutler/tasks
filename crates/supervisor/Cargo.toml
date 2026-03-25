@@ -11,4 +11,5 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["full", "process", "signal"] }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nix = { version = "0.29", features = ["signal"] }
