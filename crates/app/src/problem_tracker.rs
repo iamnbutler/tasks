@@ -166,51 +166,12 @@ impl ProblemTracker {
     ///
     /// Returns `None` if no threshold has been exceeded or if mode
     /// has already been lowered (to avoid repeated lowering events).
+    ///
+    /// NOTE: Disabled — auto mode-lowering fires too aggressively during
+    /// normal operation (3 agent errors in 10 min is common). The
+    /// orchestrator should handle this more intelligently once it has
+    /// an event-driven processing loop (#536).
     pub fn should_lower_mode(&mut self) -> Option<LowerReason> {
-        // Don't repeatedly lower
-        if self.mode_lowered {
-            return None;
-        }
-
-        // Prune old entries first
-        self.prune_old_entries();
-
-        // Check thresholds in order of severity
-        if self.consecutive_eval_failures >= self.thresholds.eval_failure_threshold {
-            self.mode_lowered = true;
-            return Some(LowerReason::ConsecutiveEvalFailures(
-                self.consecutive_eval_failures,
-            ));
-        }
-
-        if self.recent_agent_errors.len() as u32 >= self.thresholds.agent_error_threshold {
-            self.mode_lowered = true;
-            return Some(LowerReason::RepeatedAgentErrors(
-                self.recent_agent_errors.len() as u32,
-            ));
-        }
-
-        if self.recent_task_failures.len() as u32 >= self.thresholds.task_failure_threshold {
-            self.mode_lowered = true;
-            return Some(LowerReason::RepeatedTaskFailures(
-                self.recent_task_failures.len() as u32,
-            ));
-        }
-
-        if self.recent_conflicts.len() as u32 >= self.thresholds.conflict_threshold {
-            self.mode_lowered = true;
-            return Some(LowerReason::RepeatedConflicts(
-                self.recent_conflicts.len() as u32
-            ));
-        }
-
-        if self.consecutive_rejections >= self.thresholds.rejection_threshold {
-            self.mode_lowered = true;
-            return Some(LowerReason::ConsecutiveRejections(
-                self.consecutive_rejections,
-            ));
-        }
-
         None
     }
 
