@@ -366,19 +366,30 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         );
     }
 
+    // --- Shutdown broadcast channel ---
+    //
+    // Each spawned task subscribes to this channel. On shutdown, we send a
+    // signal so tasks can finish in-flight work before being aborted.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     let watchdog_gate = memory_gate.clone();
     let watchdog_bus = server.event_bus.clone();
     let watchdog_sessions = session_manager.clone();
+    let mut watchdog_shutdown_rx = shutdown_tx.subscribe();
 
     let watchdog_handle = tokio::spawn(async move {
-        crate::memory::watchdog_loop(
-            watchdog_gate,
-            memory_thresholds,
-            watchdog_bus,
-            watchdog_sessions,
-            std::time::Duration::from_secs(10),
-        )
-        .await;
+        tokio::select! {
+            _ = crate::memory::watchdog_loop(
+                watchdog_gate,
+                memory_thresholds,
+                watchdog_bus,
+                watchdog_sessions,
+                std::time::Duration::from_secs(10),
+            ) => {}
+            _ = watchdog_shutdown_rx.recv() => {
+                info!("watchdog received shutdown signal");
+            }
+        }
     });
 
     // --- 5d. Create update checker ---
@@ -392,6 +403,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         let state = update_state.clone();
         let repo_path = std::env::current_dir().unwrap_or_default();
         let check_interval = config.update_check_interval;
+        let mut update_shutdown_rx = shutdown_tx.subscribe();
 
         info!(
             interval = ?check_interval,
@@ -400,7 +412,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         );
 
         Some(tokio::spawn(async move {
-            update::update_checker_loop(state, repo_path, check_interval).await;
+            tokio::select! {
+                _ = update::update_checker_loop(state, repo_path, check_interval) => {}
+                _ = update_shutdown_rx.recv() => {
+                    info!("update checker received shutdown signal");
+                }
+            }
         }))
     } else {
         info!("update checker disabled");
@@ -425,7 +442,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         config.automation_soft_limit,
         config.automation_hard_limit,
     );
-    let automation_scheduler_handle = automation_scheduler.start();
+    let automation_scheduler_shutdown_rx = shutdown_tx.subscribe();
+    let automation_scheduler_handle = automation_scheduler.start(automation_scheduler_shutdown_rx);
     info!("automation scheduler started");
 
     // --- 6c. Spawn automation event listener ---
@@ -433,9 +451,11 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // Watches for session completion/failure events on automation sessions
     // (task_id starting with "automation-run:") and updates run records.
 
+    let automation_listener_shutdown_rx = shutdown_tx.subscribe();
     let automation_listener_handle = crate::automation_runner::spawn_automation_event_listener(
         &server.event_bus,
         server.clone(),
+        automation_listener_shutdown_rx,
     );
     info!("automation event listener started");
 
@@ -457,6 +477,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let github_token = config.github_token.clone();
     let poll_config_watcher = workflow_config_watcher.clone();
     let poll_rejected_cooldown = rejected_pr_cooldown.clone();
+    let mut poll_shutdown_rx = shutdown_tx.subscribe();
 
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -464,7 +485,13 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         let mut pollers: HashMap<String, RepoPoller> = HashMap::new();
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = poll_shutdown_rx.recv() => {
+                    info!("poll loop received shutdown signal");
+                    break;
+                }
+            }
 
             // Check if rebuild was requested (issue #256)
             // If so, clear all pollers so they're recreated with since=None
@@ -892,78 +919,87 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
     let event_handler_max_retries = config.max_retries;
+    let mut event_handler_shutdown_rx = shutdown_tx.subscribe();
 
     let event_handler_handle = tokio::spawn(async move {
         let mut rx = event_handler_bus.subscribe();
         loop {
-            let event = match rx.recv().await {
-                Ok(e) => e,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    error!(
-                        skipped = n,
-                        "event handler lagged — {n} events dropped from broadcast channel. \
-                         Replaying recent state events from store to recover."
-                    );
-                    // Recovery: replay the latest state event for each task from
-                    // the persistent event store so we don't permanently lose
-                    // state transitions. Events are always persisted before
-                    // broadcast, so the store is the source of truth.
-                    match event_handler_bus.query_by_type_prefix("task:state:", 500).await {
-                        Ok(state_events) => {
-                            // Collect the latest state event per task
-                            let mut latest_per_task: std::collections::HashMap<String, events::Event> =
-                                std::collections::HashMap::new();
-                            for ev in state_events {
-                                latest_per_task
-                                    .entry(ev.task.clone())
-                                    .and_modify(|existing| {
-                                        if ev.ts > existing.ts {
-                                            *existing = ev.clone();
+            let event = tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(e) => e,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!(
+                                skipped = n,
+                                "event handler lagged — {n} events dropped from broadcast channel. \
+                                 Replaying recent state events from store to recover."
+                            );
+                            // Recovery: replay the latest state event for each task from
+                            // the persistent event store so we don't permanently lose
+                            // state transitions. Events are always persisted before
+                            // broadcast, so the store is the source of truth.
+                            match event_handler_bus.query_by_type_prefix("task:state:", 500).await {
+                                Ok(state_events) => {
+                                    // Collect the latest state event per task
+                                    let mut latest_per_task: std::collections::HashMap<String, events::Event> =
+                                        std::collections::HashMap::new();
+                                    for ev in state_events {
+                                        latest_per_task
+                                            .entry(ev.task.clone())
+                                            .and_modify(|existing| {
+                                                if ev.ts > existing.ts {
+                                                    *existing = ev.clone();
+                                                }
+                                            })
+                                            .or_insert(ev);
+                                    }
+                                    let replayed = latest_per_task.len();
+                                    for (_task_id, ev) in &latest_per_task {
+                                        if ev.actor == events::Actor::Scheduler {
+                                            continue;
                                         }
-                                    })
-                                    .or_insert(ev);
-                            }
-                            let replayed = latest_per_task.len();
-                            for (_task_id, ev) in &latest_per_task {
-                                if ev.actor == events::Actor::Scheduler {
-                                    continue;
-                                }
-                                let state = match ev.event_type {
-                                    EventType::TaskStateRunning => Some(models::task::TaskState::Running),
-                                    EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
-                                    EventType::TaskStateWaiting => Some(models::task::TaskState::Waiting),
-                                    EventType::TaskStateBlocked => Some(models::task::TaskState::Blocked),
-                                    EventType::TaskStateTesting => Some(models::task::TaskState::Testing),
-                                    EventType::TaskStateAwaitingMerge => Some(models::task::TaskState::AwaitingMerge),
-                                    EventType::TaskStateConflict => Some(models::task::TaskState::Conflict),
-                                    EventType::TaskStateCompleted => Some(models::task::TaskState::Completed),
-                                    EventType::TaskStateFailed => Some(models::task::TaskState::Failed),
-                                    EventType::TaskStateCancelled => Some(models::task::TaskState::Cancelled),
-                                    _ => None,
-                                };
-                                if let Some(s) = state {
-                                    if let Err(e) = event_handler_server.apply_task_state(&ev.task, s).await {
-                                        if !matches!(e, server::ServerError::TaskNotFound(_)) {
-                                            error!(task_id = %ev.task, error = %e, "failed to replay task state during lag recovery");
+                                        let state = match ev.event_type {
+                                            EventType::TaskStateRunning => Some(models::task::TaskState::Running),
+                                            EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
+                                            EventType::TaskStateWaiting => Some(models::task::TaskState::Waiting),
+                                            EventType::TaskStateBlocked => Some(models::task::TaskState::Blocked),
+                                            EventType::TaskStateTesting => Some(models::task::TaskState::Testing),
+                                            EventType::TaskStateAwaitingMerge => Some(models::task::TaskState::AwaitingMerge),
+                                            EventType::TaskStateConflict => Some(models::task::TaskState::Conflict),
+                                            EventType::TaskStateCompleted => Some(models::task::TaskState::Completed),
+                                            EventType::TaskStateFailed => Some(models::task::TaskState::Failed),
+                                            EventType::TaskStateCancelled => Some(models::task::TaskState::Cancelled),
+                                            _ => None,
+                                        };
+                                        if let Some(s) = state {
+                                            if let Err(e) = event_handler_server.apply_task_state(&ev.task, s).await {
+                                                if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                                                    error!(task_id = %ev.task, error = %e, "failed to replay task state during lag recovery");
+                                                }
+                                            }
                                         }
                                     }
+                                    info!(
+                                        tasks_replayed = replayed,
+                                        "lag recovery complete — replayed latest state for {replayed} tasks"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        error = %e,
+                                        "lag recovery failed — could not read state events from store"
+                                    );
                                 }
                             }
-                            info!(
-                                tasks_replayed = replayed,
-                                "lag recovery complete — replayed latest state for {replayed} tasks"
-                            );
+                            continue;
                         }
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                "lag recovery failed — could not read state events from store"
-                            );
-                        }
+                        Err(_) => break,
                     }
-                    continue;
                 }
-                Err(_) => break,
+                _ = event_handler_shutdown_rx.recv() => {
+                    info!("event handler received shutdown signal");
+                    break;
+                }
             };
 
             let task_id = &event.task;
@@ -1050,6 +1086,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let dispatch_memory_gate = memory_gate.clone();
     let dispatch_github_token = config.github_token.clone();
     let dispatch_config_watcher = workflow_config_watcher.clone();
+    let mut dispatch_shutdown_rx = shutdown_tx.subscribe();
 
     // Debounce interval to coalesce rapid events (100ms)
     let debounce_duration = std::time::Duration::from_millis(100);
@@ -1065,7 +1102,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         let github_client = GitHubClient::new(&dispatch_github_token);
 
         loop {
-            // Wait for either the tick or a dispatch-triggering event
+            // Wait for either the tick, a dispatch-triggering event, or shutdown
             let trigger_event = tokio::select! {
                 _ = interval.tick() => None,
                 result = event_rx.recv() => {
@@ -1077,6 +1114,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         }
                         Err(_) => continue, // channel closed, will be handled by outer loop
                     }
+                }
+                _ = dispatch_shutdown_rx.recv() => {
+                    info!("dispatch loop received shutdown signal");
+                    break;
                 }
             };
 
@@ -1288,6 +1329,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let orch_github_token = config.github_token.clone();
     let orch_rejected_cooldown = rejected_pr_cooldown.clone();
     let orch_session_mgr = session_manager.clone();
+    let mut orch_shutdown_rx = shutdown_tx.subscribe();
 
     let orchestrator_eval_interval = config.orchestrator_eval_interval;
     let conflict_max_age = config.conflict_max_age;
@@ -1337,6 +1379,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         }
                         Err(_) => break, // channel closed, shut down
                     }
+                }
+                _ = orch_shutdown_rx.recv() => {
+                    info!("orchestrator loop received shutdown signal");
+                    break;
                 }
             };
 
@@ -2290,12 +2336,19 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let cleanup_session_mgr = session_manager.clone();
     let cleanup_interval = config.cleanup_interval;
     let stale_threshold = config.workspace_stale_threshold;
+    let mut cleanup_shutdown_rx = shutdown_tx.subscribe();
 
     let cleanup_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(cleanup_interval);
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cleanup_shutdown_rx.recv() => {
+                    info!("cleanup loop received shutdown signal");
+                    break;
+                }
+            }
 
             // Get cleanup candidates
             let candidates = cleanup_server
@@ -2345,20 +2398,29 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let stop_session_mgr = session_manager.clone();
     let stop_event_bus = server.event_bus.clone();
+    let mut stop_mode_shutdown_rx = shutdown_tx.subscribe();
 
     let stop_mode_handle = tokio::spawn(async move {
         let mut rx = stop_event_bus.subscribe();
         loop {
-            let event = match rx.recv().await {
-                Ok(e) => e,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    error!(
-                        skipped = n,
-                        "stop mode listener lagged — {n} events dropped, may miss SystemModeStop event"
-                    );
-                    continue;
+            let event = tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(e) => e,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!(
+                                skipped = n,
+                                "stop mode listener lagged — {n} events dropped, may miss SystemModeStop event"
+                            );
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => break,
+                _ = stop_mode_shutdown_rx.recv() => {
+                    info!("stop mode listener received shutdown signal");
+                    break;
+                }
             };
 
             // Only handle SystemModeStop events
@@ -2388,6 +2450,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let think_server = server.clone();
     let think_event_bus = server.event_bus.clone();
+    let mut think_shutdown_rx = shutdown_tx.subscribe();
 
     let think_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -2399,6 +2462,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             // Wait for next tick, collecting events in between
             tokio::select! {
                 _ = interval.tick() => {}
+                _ = think_shutdown_rx.recv() => {
+                    info!("think loop received shutdown signal");
+                    break;
+                }
                 result = event_rx.recv() => {
                     match result {
                         Ok(event) => {
@@ -2553,8 +2620,15 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{web_port}")).await?;
         info!(port = web_port, "web server started");
+        let mut web_shutdown_rx = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = web_shutdown_rx.recv().await;
+                    info!("web server received shutdown signal");
+                })
+                .await
+                .ok();
         }))
     } else {
         None
@@ -2571,10 +2645,17 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         let state = update_state.clone();
         let tx = update_tx.clone();
         let check_interval = config.update_check_interval;
+        let mut auto_apply_shutdown_rx = shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
             // Wait a bit before first check to let system stabilize
-            tokio::time::sleep(check_interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(check_interval) => {}
+                _ = auto_apply_shutdown_rx.recv() => {
+                    info!("auto-apply received shutdown signal");
+                    return;
+                }
+            }
 
             loop {
                 if state.is_available().await && !state.is_applying() {
@@ -2582,7 +2663,13 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     let _ = tx.send(()).await;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = auto_apply_shutdown_rx.recv() => {
+                        info!("auto-apply received shutdown signal");
+                        return;
+                    }
+                }
             }
         }))
     } else {
@@ -2636,25 +2723,45 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // Stop all sessions and destroy their containers
     session_manager.destroy_all().await;
 
-    // Cancel the loops
-    poll_handle.abort();
-    automation_scheduler_handle.abort();
-    automation_listener_handle.abort();
-    dispatch_handle.abort();
-    event_handler_handle.abort();
-    orchestrator_handle.abort();
-    think_handle.abort();
-    watchdog_handle.abort();
-    cleanup_handle.abort();
-    stop_mode_handle.abort();
+    // Signal all tasks to shut down gracefully
+    info!("sending shutdown signal to all tasks");
+    shutdown_tx.send(()).ok();
+
+    // Collect all handles for the grace period wait
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
+        poll_handle,
+        automation_scheduler_handle,
+        automation_listener_handle,
+        dispatch_handle,
+        event_handler_handle,
+        orchestrator_handle,
+        think_handle,
+        watchdog_handle,
+        cleanup_handle,
+        stop_mode_handle,
+    ];
     if let Some(h) = update_handle {
-        h.abort();
+        handles.push(h);
     }
     if let Some(h) = auto_apply_handle {
-        h.abort();
+        handles.push(h);
     }
     if let Some(h) = web_handle {
-        h.abort();
+        handles.push(h);
+    }
+
+    // Give tasks a grace period to finish in-flight work, then abort stragglers
+    let grace_period = Duration::from_secs(5);
+    match tokio::time::timeout(grace_period, futures::future::join_all(&mut handles)).await {
+        Ok(_) => {
+            info!("all tasks shut down gracefully");
+        }
+        Err(_) => {
+            warn!("grace period expired, aborting remaining tasks");
+            for handle in &handles {
+                handle.abort();
+            }
+        }
     }
 
     info!("shutdown complete");

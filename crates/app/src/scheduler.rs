@@ -54,7 +54,12 @@ impl AutomationScheduler {
     ///
     /// Spawns a background task that ticks every 60 seconds to evaluate
     /// scheduled automations and trigger runs.
-    pub fn start(mut self) -> tokio::task::JoinHandle<()> {
+    ///
+    /// The `shutdown_rx` receiver allows graceful shutdown of the scheduler.
+    pub fn start(
+        mut self,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
 
@@ -62,8 +67,15 @@ impl AutomationScheduler {
             interval.tick().await;
 
             loop {
-                interval.tick().await;
-                self.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        self.tick().await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("automation scheduler received shutdown signal");
+                        break;
+                    }
+                }
             }
         })
     }
