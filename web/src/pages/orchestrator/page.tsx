@@ -7,6 +7,7 @@ import {
   MessageSquare,
   AlertTriangle,
   Brain,
+  Sparkles,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { sendOrchestratorChat } from "@/lib/api";
@@ -61,7 +62,7 @@ function getTaskInfo(taskId: string | undefined, tasks: Task[], projects: Projec
 // ---------------------------------------------------------------------------
 
 interface OrchestratorBlock {
-  kind: "decision" | "feedback" | "escalation" | "message" | "system";
+  kind: "decision" | "feedback" | "escalation" | "message" | "thought" | "system";
   id: string;
   timestamp: string;
   approved?: boolean;
@@ -149,6 +150,14 @@ function parseOrchestratorEvents(
         timestamp: event.ts,
         content: typeof event.data?.message === "string" ? event.data.message : undefined,
         actor: "orchestrator",
+      });
+    } else if (event.type === "orchestrator:thought") {
+      // Stream-of-consciousness narration from the orchestrator
+      blocks.push({
+        kind: "thought",
+        id: event.id,
+        timestamp: event.ts,
+        content: typeof event.data?.message === "string" ? event.data.message : undefined,
       });
     }
   }
@@ -365,12 +374,31 @@ function MessageBlock({ block }: { block: OrchestratorBlock }) {
   );
 }
 
+function ThoughtBlock({ block }: { block: OrchestratorBlock }) {
+  return (
+    <div className="px-4 py-2">
+      <div className="flex items-start gap-2.5">
+        <Sparkles className="h-3.5 w-3.5 text-muted-foreground/50 shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm text-muted-foreground/70 leading-relaxed italic whitespace-pre-wrap">
+            {block.content}
+          </p>
+          <span className="text-[11px] text-muted-foreground/40 mt-0.5 block">
+            {formatRelativeTime(block.timestamp)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BlockView({ block }: { block: OrchestratorBlock }) {
   switch (block.kind) {
     case "decision": return <DecisionBlock block={block} />;
     case "feedback": return <FeedbackBlock block={block} />;
     case "escalation": return <EscalationBlock block={block} />;
     case "message": return <MessageBlock block={block} />;
+    case "thought": return <ThoughtBlock block={block} />;
     default: return null;
   }
 }
