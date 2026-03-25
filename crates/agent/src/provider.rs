@@ -18,7 +18,9 @@ pub struct CompletionConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Context window size (input token limit). Messages are truncated to fit.
-    /// Defaults based on model name, or 200k if unknown.
+    /// When constructed via [`CompletionConfig::new`], inferred from model name
+    /// (200k for Claude models, 128k otherwise). When deserialized without an
+    /// explicit value, falls back to the conservative 128k default.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
     /// Temperature for sampling (0.0 - 1.0)

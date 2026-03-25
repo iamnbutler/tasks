@@ -188,6 +188,7 @@ impl Session {
         // preceded by the assistant message containing the corresponding
         // ToolUse. If the tail starts with an orphaned ToolResult, advance
         // past it to find a safe boundary.
+        let keep_from_before_orphan_skip = keep_from;
         while keep_from < total {
             let msg = &self.messages[keep_from];
             let is_orphan_tool_result = msg.role == Role::User
@@ -200,12 +201,14 @@ impl Session {
             keep_from += 1;
         }
 
-        let dropped = keep_from.saturating_sub(1); // messages between first and tail
-        if dropped > 0 {
+        let budget_dropped = keep_from_before_orphan_skip.saturating_sub(1);
+        let orphan_skipped = keep_from - keep_from_before_orphan_skip;
+        if budget_dropped + orphan_skipped > 0 {
             tracing::warn!(
                 session_id = %self.id,
                 total_messages = total,
-                dropped_messages = dropped,
+                budget_dropped,
+                orphan_skipped,
                 estimated_tokens = total_tokens,
                 budget = available,
                 "truncated conversation history to fit context window"
