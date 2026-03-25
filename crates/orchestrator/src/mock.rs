@@ -6,7 +6,7 @@ use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, SystemContext,
+    QualityEvaluation, QuestionContext, SystemContext,
 };
 use models::task::Task;
 
@@ -25,8 +25,10 @@ pub struct MockOrchestrator {
     pub feedback_count: Mutex<u32>,
     /// Count of triage_conflict calls (for assertions).
     pub triage_count: Mutex<u32>,
-    /// Count of process_event calls (for assertions).
+    /// Count of think calls (for assertions).
     pub think_count: Mutex<u32>,
+    /// Count of answer_question calls (for assertions).
+    pub answer_question_count: Mutex<u32>,
 }
 
 impl MockOrchestrator {
@@ -43,6 +45,7 @@ impl MockOrchestrator {
             feedback_count: Mutex::new(0),
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
+            answer_question_count: Mutex::new(0),
         }
     }
 
@@ -60,6 +63,7 @@ impl MockOrchestrator {
             feedback_count: Mutex::new(0),
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
+            answer_question_count: Mutex::new(0),
         }
     }
 
@@ -111,6 +115,14 @@ impl Orchestrator for MockOrchestrator {
         *self.think_count.lock().unwrap() += 1;
         // Mock returns no actions — tests can verify call count.
         Ok(Vec::new())
+    }
+
+    async fn answer_question(
+        &self,
+        _context: &QuestionContext,
+    ) -> Result<String, OrchestratorError> {
+        *self.answer_question_count.lock().unwrap() += 1;
+        Ok("Mock: proceed with whatever approach you think is best.".to_string())
     }
 }
 
@@ -237,5 +249,19 @@ mod tests {
         // Should use the override, not the default (which would be Rebase)
         assert_eq!(result.resolution, ConflictResolution::SurfaceToHuman);
         assert_eq!(result.reasoning, "custom triage");
+    }
+
+    #[tokio::test]
+    async fn test_answer_question() {
+        let mock = MockOrchestrator::approving();
+        let ctx = QuestionContext {
+            task: Task::new("task-1", TaskSource::Internal, "Test task", "proj-1"),
+            project: Project::new("proj-1", "owner/repo"),
+            question: "How should I structure the database schema?".to_string(),
+            human_present: false,
+        };
+        let result = mock.answer_question(&ctx).await.unwrap();
+        assert!(!result.is_empty());
+        assert_eq!(*mock.answer_question_count.lock().unwrap(), 1);
     }
 }
