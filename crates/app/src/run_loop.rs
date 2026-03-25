@@ -1165,8 +1165,14 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     // When a new entry is queued, add it to the FIFO
                     EventType::MergeQueued => {
                         if let Some(entry_id) = event.data.get("entry_id").and_then(|v| v.as_str()) {
-                            // New entry — always queue it (it's fresh)
-                            if eval_queued.insert(entry_id.to_string()) {
+                            // Look up entry to check if it actually needs evaluation
+                            let skip = {
+                                let state = orch_server.state.read().await;
+                                state.merge_queue.get(entry_id)
+                                    .map(|e| !needs_eval(&evaluated_prs, e))
+                                    .unwrap_or(false)
+                            };
+                            if !skip && eval_queued.insert(entry_id.to_string()) {
                                 eval_queue.push_back(entry_id.to_string());
                                 info!(entry_id = %entry_id, queue_len = eval_queue.len(), "added entry to eval queue");
                             }
