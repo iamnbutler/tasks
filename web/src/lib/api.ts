@@ -318,3 +318,12 @@ export function fetchAutomationRunEvents(
 ): Promise<Event[]> {
   return request<Event[]>(`/api/automations/${automationId}/runs/${runId}/events`);
 }
+
+export function cancelAutomationRun(
+  automationId: string,
+  runId: string
+): Promise<void> {
+  return requestVoid(`/api/automations/${automationId}/runs/${runId}/cancel`, {
+    method: "POST",
+  });
+}

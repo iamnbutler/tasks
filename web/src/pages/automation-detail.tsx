@@ -16,6 +16,7 @@ import {
   Workflow,
   Play,
   RotateCcw,
+  XCircle,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -91,6 +92,11 @@ const runStatusConfig: Record<
     label: "Failed",
     icon: AlertCircle,
     className: "bg-red-500/20 text-red-400 border-red-500/30",
+  },
+  cancelled: {
+    label: "Cancelled",
+    icon: XCircle,
+    className: "bg-gray-500/20 text-gray-400 border-gray-500/30",
   },
 };
 

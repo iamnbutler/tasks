@@ -41,8 +41,12 @@ pub enum ServerError {
     ProjectNotFound(String),
     #[error("task not found: {0}")]
     TaskNotFound(String),
+    #[error("run not found: {0}")]
+    RunNotFound(String),
     #[error("store error: {0}")]
     StoreError(String),
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
 }
 
 /// Statistics from a rebuild operation (issue #256).
@@ -541,6 +545,53 @@ impl Server {
         self.event_bus.publish(event).await?;
 
         tracing::warn!(run_id = %run_id, error = %error_str, "Automation run failed");
+        Ok(run)
+    }
+
+    /// Cancel an automation run.
+    pub async fn cancel_automation_run(
+        &self,
+        run_id: &str,
+    ) -> Result<AutomationRun, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+
+        let mut run = {
+            let store = store.lock().unwrap();
+            store.get_automation_run(run_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?
+                .ok_or_else(|| ServerError::RunNotFound(run_id.to_string()))?
+        };
+
+        // Only allow cancelling runs that are pending or running
+        if run.status.is_terminal() {
+            return Err(ServerError::InvalidOperation(format!(
+                "cannot cancel run in terminal state: {:?}",
+                run.status
+            )));
+        }
+
+        run.cancel();
+
+        // Save to store
+        {
+            let store = store.lock().unwrap();
+            store.save_automation_run(&run)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+        }
+
+        // Emit run cancelled event
+        let event = Event::new(
+            EventType::AutomationRunCancelled,
+            run_id,
+            Actor::Human,
+            serde_json::json!({
+                "automation_id": run.automation_id,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        tracing::info!(run_id = %run_id, "Automation run cancelled");
         Ok(run)
     }
 

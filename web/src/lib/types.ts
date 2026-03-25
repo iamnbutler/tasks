@@ -136,7 +136,7 @@ export interface Automation {
 export interface AutomationRun {
   id: string;
   automation_id: string;
-  status: "pending" | "running" | "completed" | "failed";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
   started_at: string;
   completed_at?: string;
   output?: string;
