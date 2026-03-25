@@ -1133,7 +1133,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 &comments,
                             );
 
-                            if let Err(e) = dispatch_session_mgr
+                            match dispatch_session_mgr
                                 .start_session(
                                     task_id.clone(),
                                     repo_url,
@@ -1144,14 +1144,26 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 )
                                 .await
                             {
-                                error!(task_id = %task_id, error = %e, "failed to start session");
-                                // Treat as a failure with no progress so backoff kicks in.
-                                // This prevents tight retry loops when containers can't start.
-                                if let Err(e2) = dispatch_server
-                                    .handle_task_failure(task_id, false, max_retries, None)
-                                    .await
-                                {
-                                    warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                                Ok(_) => {
+                                    // Clear rejection feedback after successful dispatch (issue #423).
+                                    // This prevents stale feedback from being repeated if the task
+                                    // is rejected and re-dispatched again.
+                                    if task.rejection_feedback.is_some() {
+                                        if let Err(e) = dispatch_server.clear_task_rejection_feedback(task_id).await {
+                                            warn!(task_id = %task_id, error = %e, "failed to clear rejection feedback after dispatch");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(task_id = %task_id, error = %e, "failed to start session");
+                                    // Treat as a failure with no progress so backoff kicks in.
+                                    // This prevents tight retry loops when containers can't start.
+                                    if let Err(e2) = dispatch_server
+                                        .handle_task_failure(task_id, false, max_retries, None)
+                                        .await
+                                    {
+                                        warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                                    }
                                 }
                             }
                         }
@@ -1957,9 +1969,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 error!(error = %e, "failed to emit orchestrator feedback event");
                             }
                         }
-                        // TODO: The feedback event is now recorded in the audit trail.
-                        // Delivering feedback to the re-dispatched session's prompt
-                        // context still needs dispatch loop changes.
+                        // Feedback is now stored on the task (issue #423) and will be
+                        // delivered to the agent via the prompt when re-dispatched.
 
                         // Record rejection in cooldown tracker to prevent re-queuing (issue #439)
                         if let Some(sha) = &entry_head_sha {
