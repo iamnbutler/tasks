@@ -1111,6 +1111,25 @@ impl GitHubClient {
         )))
     }
 
+    /// Get the login of the authenticated user (`GET /user`).
+    pub async fn get_authenticated_user_login(&self) -> Result<String, GitHubError> {
+        self.wait_for_rate_limit().await;
+        let url = format!("{}/user", self.base_url);
+        let response = self.http.get(&url).send().await?;
+        self.update_rate_limit(&response);
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Auth(format!("GET /user failed ({status}): {text}")));
+        }
+        #[derive(Deserialize)]
+        struct UserResponse { login: String }
+        let user: UserResponse = response.json().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to parse user response: {e}"))
+        })?;
+        Ok(user.login)
+    }
+
     // -----------------------------------------------------------------------
     // Nested pagination helpers
     // -----------------------------------------------------------------------

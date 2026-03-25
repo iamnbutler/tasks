@@ -2,6 +2,24 @@
 
 use std::time::Duration;
 
+/// Parse a comma-separated env var into a lowercased, trimmed list of non-empty strings.
+fn parse_csv_env(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Load blocklist from env and check a repo against it.
+/// Returns an error message if blocked, `None` if allowed.
+pub fn check_blocklist(repo: &str) -> Option<String> {
+    let blocked_repos = parse_csv_env("BLOCKED_REPOS");
+    let blocked_orgs = parse_csv_env("BLOCKED_ORGS");
+    AppConfig::check_repo_blocked(&blocked_repos, &blocked_orgs, repo)
+}
+
 /// Top-level app configuration.
 pub struct AppConfig {
     /// Data directory (default: `~/.local/state/tasks`).
@@ -174,19 +192,8 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300u64);
 
-        let blocked_repos = std::env::var("BLOCKED_REPOS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-
-        let blocked_orgs = std::env::var("BLOCKED_ORGS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
+        let blocked_repos = parse_csv_env("BLOCKED_REPOS");
+        let blocked_orgs = parse_csv_env("BLOCKED_ORGS");
 
         Ok(Self {
             data_dir,
@@ -223,11 +230,6 @@ impl AppConfig {
     }
 
     /// Check if a repo (`owner/repo`) is blocked. Returns an error message if blocked.
-    pub fn is_repo_blocked(&self, repo: &str) -> Option<String> {
-        Self::check_repo_blocked(&self.blocked_repos, &self.blocked_orgs, repo)
-    }
-
-    /// Static check against explicit blocklists.
     pub fn check_repo_blocked(blocked_repos: &[String], blocked_orgs: &[String], repo: &str) -> Option<String> {
         let repo_lower = repo.to_lowercase();
         if blocked_repos.contains(&repo_lower) {

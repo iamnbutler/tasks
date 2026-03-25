@@ -557,6 +557,16 @@ async fn bootstrap_project(
         derive_repo_name(prompt)
     };
 
+    // Check blocklist before creating the repo to avoid orphaned repos
+    let owner_login = client
+        .get_authenticated_user_login()
+        .await
+        .map_err(ApiError::GitHubApi)?;
+    let prospective_full_name = format!("{owner_login}/{repo_name}");
+    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &prospective_full_name) {
+        return Err(ApiError::Forbidden(reason));
+    }
+
     // Create the repository
     let description_text;
     let description = if prompt.chars().count() > 200 {
@@ -570,11 +580,6 @@ async fn bootstrap_project(
         .create_repository(&repo_name, description)
         .await
         .map_err(ApiError::GitHubApi)?;
-
-    // Check blocklist against the created repo's full name
-    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &created_repo.full_name) {
-        return Err(ApiError::Forbidden(reason));
-    }
 
     // Add the project to tracking
     let project_id = uuid::Uuid::new_v4().to_string();
