@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["crates/desktop", "crates/gpui-client"]
 default-members = ["crates/app"]
 
 [workspace.package]
