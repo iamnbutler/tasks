@@ -66,6 +66,25 @@ Content-Type: application/json
 
 > **Note:** Transitioning to `stop` mode terminates all running agent sessions (5-second graceful timeout before force-destroy).
 
+#### Rebuild State from GitHub
+
+Clear all tasks and merge queue entries, then let the poller re-fetch everything from GitHub. Useful for recovering from a desync.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3
+}
+```
+
+> Re-population happens asynchronously as the GitHub poller discovers items on its next cycle.
+
 ### Tasks
 
 #### List All Tasks
@@ -340,25 +359,6 @@ GET /api/containers
   }
 ]
 ```
-
-#### Rebuild State from GitHub
-
-Clear all tasks and merge queue entries, then let the poller re-fetch everything from GitHub. Useful for recovering from a desync.
-
-```http
-POST /api/rebuild
-```
-
-**Response:**
-
-```json
-{
-  "tasks_cleared": 12,
-  "merge_entries_cleared": 3
-}
-```
-
-> Re-population happens asynchronously as the GitHub poller discovers items on its next cycle.
 
 ### Orchestrator
 
