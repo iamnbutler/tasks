@@ -52,14 +52,14 @@ cargo run -- run
 ## Development
 
 ```sh
-# Build the web frontend only
-make web
+# Run the backend separately
+cargo run -- run --web
 
 # Frontend dev server (proxies /api to localhost:4800)
 bun web dev
 
-# Run the backend separately
-cargo run -- run --web
+# Build the web frontend only (production)
+make web
 ```
 
 ## Make Targets
