@@ -358,7 +358,7 @@ impl GitHubClient {
     }
 
     // -----------------------------------------------------------------------
-    // Issue write operations (spec github.md §4 — write ops)
+    // Issue write operations
     // -----------------------------------------------------------------------
 
     /// Post a comment on an issue or pull request.
@@ -431,6 +431,8 @@ impl GitHubClient {
     ///
     /// Uses the GitHub REST API to update issue fields. All fields are optional;
     /// only provided fields will be updated. Pass `None` to leave a field unchanged.
+    ///
+    /// `state` — if provided, must be `"open"` or `"closed"` (lowercase).
     pub async fn update_issue(
         &self,
         owner: &str,
@@ -511,9 +513,9 @@ impl GitHubClient {
 
     /// Add labels to an issue or pull request.
     ///
-    /// Uses the GitHub REST API to add labels. Labels that don't exist in the
-    /// repository will be created automatically by GitHub. Existing labels on
-    /// the issue are preserved — this only adds new ones.
+    /// Uses the GitHub REST API to add one or more labels to an issue. Labels
+    /// must already exist in the repository — unknown label names cause a 422.
+    /// Existing labels on the issue are preserved; this only adds new ones.
     pub async fn add_labels(
         &self,
         owner: &str,

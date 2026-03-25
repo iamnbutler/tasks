@@ -8,13 +8,14 @@ Integration, §3.2 Scheduler).
 
 ## 1. Overview
 
-The GitHub crate is the platform's read interface to GitHub. It fetches issues, pull requests, and
+The GitHub crate is the platform's interface to GitHub. It fetches issues, pull requests, and
 their associated metadata from GitHub's GraphQL API, normalizes them into a stable internal model,
 and provides a polling mechanism for discovering new and changed work.
 
-The crate does not write to GitHub. All GitHub mutations (comments, labels, state changes, PR
-creation) are performed by agents working inside their sessions, using the `gh` CLI with
-credentials injected into the container environment (session-runtime.md §3.1).
+The crate also provides write operations for the orchestrator and server to interact with GitHub
+directly (posting comments, updating issues, adding labels, merging PRs, managing branches). Agents
+working inside sessions may also use the `gh` CLI with credentials injected into the container
+environment (session-runtime.md §3.1).
 
 ```
 Server
