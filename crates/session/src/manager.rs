@@ -567,14 +567,13 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     loop {
         // Compute the next time-limit deadline so the select! loop wakes even
         // when both channels are idle (fixes #458).
+        // Only compute a meaningful deadline if we still have limits to enforce.
         let next_deadline = if !soft_limit_notified {
-            soft_deadline
+            Some(soft_deadline)
         } else if !hard_limit_triggered {
-            hard_deadline
+            Some(hard_deadline)
         } else {
-            // Both limits already fired; use a far-future deadline to avoid busy-looping
-            // while we wait for the agent to exit after stop_agent().
-            tokio::time::Instant::now() + Duration::from_secs(60)
+            None
         };
 
         tokio::select! {
@@ -634,8 +633,9 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
             }
             // Timeout arm: fires when the next time limit is reached, even if no
             // events or commands arrive. This ensures hard/soft limits are enforced
-            // when the session stalls (#458).
-            _ = tokio::time::sleep_until(next_deadline) => {
+            // when the session stalls (#458). The branch guard (if next_deadline.is_some())
+            // disables this arm once both limits have been handled, avoiding busy-looping.
+            _ = tokio::time::sleep_until(next_deadline.unwrap_or_else(|| tokio::time::Instant::now())), if next_deadline.is_some() => {
                 tracing::debug!(task_id = %task_id, "time limit check triggered by timeout");
             }
             else => break, // both channels closed
