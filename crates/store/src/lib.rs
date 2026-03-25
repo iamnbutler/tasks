@@ -26,8 +26,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("data version mismatch: stored={stored}, expected={expected}")]
-    VersionMismatch { stored: u32, expected: u32 },
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Persistent storage backed by SQLite (spec §3.5).
@@ -55,21 +55,36 @@ impl Store {
     }
 
     /// Delete the database file and event log directory, then open a fresh store.
+    ///
+    /// Returns an error if the primary database file cannot be removed.
+    /// WAL/SHM files and the events directory are removed on a best-effort basis.
     pub fn clear_and_reopen(db_path: impl AsRef<Path>, data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = db_path.as_ref();
         let data = data_dir.as_ref();
 
-        // Remove the SQLite database and its WAL/SHM files
-        for ext in &["", "-wal", "-shm"] {
-            let mut p = db.as_os_str().to_owned();
-            p.push(ext);
-            let _ = std::fs::remove_file(&p);
+        // Remove the primary SQLite database file (propagate errors)
+        if db.exists() {
+            std::fs::remove_file(db)?;
         }
 
-        // Remove the event log directory
+        // Remove WAL/SHM files on best-effort basis (auxiliary files)
+        for ext in &["-wal", "-shm"] {
+            let mut p = db.as_os_str().to_owned();
+            p.push(ext);
+            let path = std::path::Path::new(&p);
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(path = ?path, error = %e, "failed to remove auxiliary db file");
+                }
+            }
+        }
+
+        // Remove the event log directory on best-effort basis
         let events_dir = data.join("events");
         if events_dir.exists() {
-            let _ = std::fs::remove_dir_all(&events_dir);
+            if let Err(e) = std::fs::remove_dir_all(&events_dir) {
+                tracing::warn!(path = ?events_dir, error = %e, "failed to remove events directory");
+            }
         }
 
         tracing::info!("cleared local data for version upgrade");
