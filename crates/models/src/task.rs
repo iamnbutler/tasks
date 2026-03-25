@@ -92,6 +92,47 @@ impl TaskState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    /// Check whether transitioning from this state to `target` is valid.
+    ///
+    /// The valid transition map encodes the task lifecycle:
+    /// - Tasks start in Waiting and flow through active states toward terminal states.
+    /// - Terminal states (Completed, Cancelled) allow no outbound transitions.
+    /// - Failed allows only a retry back to Waiting.
+    /// - Every non-terminal state can transition to Cancelled (operator abort).
+    pub fn can_transition_to(&self, target: &TaskState) -> bool {
+        use TaskState::*;
+        matches!(
+            (self, target),
+            // Waiting: dispatch to Running, or discover a dependency (Blocked), or cancel
+            (Waiting, Running | Blocked | Cancelled)
+            // Blocked: dependency resolved back to Waiting, or cancel
+            | (Blocked, Waiting | Cancelled)
+            // Running: the richest set — agent can ask a question, finish testing,
+            // submit for merge, hit a conflict, get changes requested, complete,
+            // fail, be cancelled, or retry back to Waiting on session failure (spec §14.3)
+            | (Running, Question | Testing | AwaitingMerge | Conflict
+                      | ChangesRequested | Completed | Failed | Cancelled | Waiting)
+            // Question: answer received returns to Running, or fail/cancel,
+            // or retry to Waiting on restart recovery of orphaned session (spec §14.3)
+            | (Question, Running | Waiting | Failed | Cancelled)
+            // Testing: tests pass (back to Running for more work, or AwaitingMerge),
+            // tests fail, cancel, or retry to Waiting on restart recovery (spec §14.3)
+            | (Testing, Running | AwaitingMerge | Waiting | Failed | Cancelled)
+            // AwaitingMerge: merged (Completed), conflict, changes requested,
+            // fail, or cancel
+            | (AwaitingMerge, Completed | Conflict | ChangesRequested | Failed | Cancelled)
+            // Conflict: agent retries (Running), or reviewer requests changes,
+            // fail, or cancel
+            | (Conflict, Running | ChangesRequested | Failed | Cancelled)
+            // ChangesRequested: agent picks it back up (Running), or park it
+            // (Waiting), fail, or cancel
+            | (ChangesRequested, Running | Waiting | Failed | Cancelled)
+            // Failed: only valid outbound is Waiting (retry)
+            | (Failed, Waiting)
+            // Completed, Cancelled: terminal — no transitions out
+        )
+    }
 }
 
 /// A task — the internal representation of a unit of work.
@@ -179,9 +220,22 @@ impl Task {
 
     /// Transition to a new state, updating the timestamp.
     ///
+    /// Logs a warning when the transition is not in the expected state machine,
+    /// but still allows it — we don't hard-fail because there may be edge cases
+    /// we haven't accounted for yet. The warnings let us identify them.
+    ///
     /// Also updates `last_activity_at` when entering or leaving active states
     /// (Running, Question, Testing) for stale workspace detection (spec §10.3).
     pub fn set_state(&mut self, state: TaskState) {
+        if !self.state.can_transition_to(&state) {
+            tracing::warn!(
+                task_id = %self.id,
+                from = ?self.state,
+                to = ?state,
+                "invalid task state transition"
+            );
+        }
+
         let now = Utc::now();
 
         // Update last_activity_at when entering/leaving active states
@@ -333,5 +387,278 @@ impl FailureInfo {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All states in the enum, used for exhaustive testing.
+    const ALL_STATES: [TaskState; 11] = [
+        TaskState::Waiting,
+        TaskState::Blocked,
+        TaskState::Running,
+        TaskState::Question,
+        TaskState::Testing,
+        TaskState::AwaitingMerge,
+        TaskState::Conflict,
+        TaskState::ChangesRequested,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Cancelled,
+    ];
+
+    // ---- is_terminal ----
+
+    #[test]
+    fn terminal_states() {
+        assert!(TaskState::Completed.is_terminal());
+        assert!(TaskState::Failed.is_terminal());
+        assert!(TaskState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn non_terminal_states() {
+        let non_terminal = [
+            TaskState::Waiting,
+            TaskState::Blocked,
+            TaskState::Running,
+            TaskState::Question,
+            TaskState::Testing,
+            TaskState::AwaitingMerge,
+            TaskState::Conflict,
+            TaskState::ChangesRequested,
+        ];
+        for state in non_terminal {
+            assert!(!state.is_terminal(), "{state:?} should not be terminal");
+        }
+    }
+
+    // ---- can_transition_to: valid transitions ----
+
+    #[test]
+    fn waiting_valid_transitions() {
+        let valid = [TaskState::Running, TaskState::Blocked, TaskState::Cancelled];
+        for target in valid {
+            assert!(
+                TaskState::Waiting.can_transition_to(&target),
+                "Waiting -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_valid_transitions() {
+        let valid = [TaskState::Waiting, TaskState::Cancelled];
+        for target in valid {
+            assert!(
+                TaskState::Blocked.can_transition_to(&target),
+                "Blocked -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn running_valid_transitions() {
+        let valid = [
+            TaskState::Question,
+            TaskState::Testing,
+            TaskState::AwaitingMerge,
+            TaskState::Conflict,
+            TaskState::ChangesRequested,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::Waiting, // session retry (spec §14.3)
+        ];
+        for target in valid {
+            assert!(
+                TaskState::Running.can_transition_to(&target),
+                "Running -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn question_valid_transitions() {
+        let valid = [
+            TaskState::Running,
+            TaskState::Waiting, // restart recovery of orphaned session (spec §14.3)
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        for target in valid {
+            assert!(
+                TaskState::Question.can_transition_to(&target),
+                "Question -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn testing_valid_transitions() {
+        let valid = [
+            TaskState::Running,
+            TaskState::AwaitingMerge,
+            TaskState::Waiting, // restart recovery of orphaned session (spec §14.3)
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        for target in valid {
+            assert!(
+                TaskState::Testing.can_transition_to(&target),
+                "Testing -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn awaiting_merge_valid_transitions() {
+        let valid = [
+            TaskState::Completed,
+            TaskState::Conflict,
+            TaskState::ChangesRequested,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        for target in valid {
+            assert!(
+                TaskState::AwaitingMerge.can_transition_to(&target),
+                "AwaitingMerge -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_valid_transitions() {
+        let valid = [
+            TaskState::Running,
+            TaskState::ChangesRequested,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        for target in valid {
+            assert!(
+                TaskState::Conflict.can_transition_to(&target),
+                "Conflict -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn changes_requested_valid_transitions() {
+        let valid = [
+            TaskState::Running,
+            TaskState::Waiting,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ];
+        for target in valid {
+            assert!(
+                TaskState::ChangesRequested.can_transition_to(&target),
+                "ChangesRequested -> {target:?} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_valid_transitions() {
+        assert!(
+            TaskState::Failed.can_transition_to(&TaskState::Waiting),
+            "Failed -> Waiting (retry) should be valid"
+        );
+    }
+
+    // ---- can_transition_to: terminal states reject all outbound ----
+
+    #[test]
+    fn completed_has_no_outbound_transitions() {
+        for target in ALL_STATES {
+            assert!(
+                !TaskState::Completed.can_transition_to(&target),
+                "Completed -> {target:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_has_no_outbound_transitions() {
+        for target in ALL_STATES {
+            assert!(
+                !TaskState::Cancelled.can_transition_to(&target),
+                "Cancelled -> {target:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_rejects_all_except_waiting() {
+        for target in ALL_STATES {
+            if target == TaskState::Waiting {
+                continue;
+            }
+            assert!(
+                !TaskState::Failed.can_transition_to(&target),
+                "Failed -> {target:?} should be invalid"
+            );
+        }
+    }
+
+    // ---- can_transition_to: specific invalid transitions ----
+
+    #[test]
+    fn waiting_cannot_go_to_completed() {
+        assert!(!TaskState::Waiting.can_transition_to(&TaskState::Completed));
+    }
+
+    #[test]
+    fn blocked_cannot_go_to_running() {
+        assert!(!TaskState::Blocked.can_transition_to(&TaskState::Running));
+    }
+
+    #[test]
+    fn self_transitions_are_invalid() {
+        // No state should transition to itself
+        for state in ALL_STATES {
+            assert!(
+                !state.can_transition_to(&state),
+                "{state:?} -> {state:?} (self-transition) should be invalid"
+            );
+        }
+    }
+
+    // ---- set_state integration ----
+
+    #[test]
+    fn set_state_updates_state_and_timestamp() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        let before = task.updated_at;
+
+        // Small delay not needed — Utc::now() has sub-microsecond resolution
+        task.set_state(TaskState::Running);
+
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.updated_at >= before);
+    }
+
+    #[test]
+    fn set_state_updates_last_activity_on_active_transition() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        assert!(task.last_activity_at.is_none());
+
+        task.set_state(TaskState::Running);
+        assert!(task.last_activity_at.is_some());
+    }
+
+    #[test]
+    fn set_state_allows_invalid_transition_without_panic() {
+        // set_state should warn but not panic on invalid transitions
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        task.state = TaskState::Completed;
+
+        // Completed -> Running is invalid, but should not panic
+        task.set_state(TaskState::Running);
+        assert_eq!(task.state, TaskState::Running);
     }
 }
