@@ -1679,6 +1679,14 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            // Persist rejected status to SQLite (issue #463)
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_merge_entry(entry) {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
+                    }
+                }
+            }
             entry.task_id.clone()
         };
 
@@ -1729,6 +1737,14 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            // Persist rejected status to SQLite (issue #463)
+            if let Some(ref store) = self.store {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_merge_entry(entry) {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
+                    }
+                }
+            }
             entry.task_id.clone()
         };
 
