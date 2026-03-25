@@ -16,10 +16,10 @@ use crate::model::automation::Automation;
 use crate::model::project::Project;
 
 /// Default model for automation execution.
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 /// Maximum tokens for automation response.
-const MAX_TOKENS: u32 = 8192;
+const MAX_TOKENS: u32 = 32_000;
 
 /// Error type for automation execution.
 #[derive(Debug, thiserror::Error)]

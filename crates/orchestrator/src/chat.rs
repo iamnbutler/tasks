@@ -38,7 +38,7 @@ fn task_state_str(state: &TaskState) -> &'static str {
 }
 
 /// Maximum tokens for chat response.
-const MAX_TOKENS: u32 = 2048;
+const MAX_TOKENS: u32 = 32_000;
 
 /// Context for orchestrator chat — snapshot of current system state.
 #[derive(Debug, Clone)]

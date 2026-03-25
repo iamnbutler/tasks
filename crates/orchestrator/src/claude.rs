@@ -18,7 +18,7 @@ use tasks_github::GitHubClient;
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 /// Maximum tokens for evaluation response.
-const MAX_TOKENS: u32 = 50_000;
+const MAX_TOKENS: u32 = 32_000;
 
 /// Orchestrator implementation backed by Claude.
 ///
