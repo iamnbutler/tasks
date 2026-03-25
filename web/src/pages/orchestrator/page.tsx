@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   Brain,
   Sparkles,
+  HelpCircle,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
 import { sendOrchestratorChat } from "@/lib/api";
@@ -62,7 +63,7 @@ function getTaskInfo(taskId: string | undefined, tasks: Task[], projects: Projec
 // ---------------------------------------------------------------------------
 
 interface OrchestratorBlock {
-  kind: "decision" | "feedback" | "escalation" | "message" | "thought" | "system";
+  kind: "decision" | "feedback" | "escalation" | "message" | "thought" | "question_answer" | "system";
   id: string;
   timestamp: string;
   approved?: boolean;
@@ -75,7 +76,7 @@ interface OrchestratorBlock {
   /** Resolved task info for richer display */
   taskInfo?: TaskInfo;
   /** Escalation-specific fields */
-  escalationAction?: "conflict_needs_human" | "mode_lowered" | string;
+  escalationAction?: "conflict_needs_human" | "mode_lowered" | "agent_question" | string;
   prUrl?: string;
   fromMode?: string;
   toMode?: string;
@@ -102,14 +103,16 @@ function parseOrchestratorEvents(
       });
     } else if (event.type === "orchestrator:feedback") {
       const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
+      const context = typeof event.data?.context === "string" ? event.data.context : undefined;
+      // Distinguish question answers from regular feedback
       blocks.push({
-        kind: "feedback",
+        kind: context === "question_answer" ? "question_answer" : "feedback",
         id: event.id,
         timestamp: event.ts,
         feedback: typeof event.data?.feedback === "string" ? event.data.feedback : undefined,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        content: typeof event.data?.context === "string" ? event.data.context : undefined,
+        content: context,
       });
     } else if (event.type === "orchestrator:escalation") {
       const action = typeof event.data?.action === "string" ? event.data.action : undefined;
@@ -119,12 +122,14 @@ function parseOrchestratorEvents(
         typeof event.data?.reason === "string" ? event.data.reason :
         undefined;
       const taskId = event.task;
+      // For agent_question escalations, the message field contains the question
+      const message = typeof event.data?.message === "string" ? event.data.message : undefined;
 
       blocks.push({
         kind: "escalation",
         id: event.id,
         timestamp: event.ts,
-        content: reasoning,
+        content: action === "agent_question" ? message : reasoning,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
         entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
@@ -282,6 +287,14 @@ function EscalationBlock({ block }: { block: OrchestratorBlock }) {
     } else {
       actionHint = "Review recent activity and raise the mode when ready to continue.";
     }
+  } else if (block.escalationAction === "agent_question") {
+    // Agent is stuck with a question, human is present
+    if (info) {
+      headerText = `Agent working on "${info.title}" (${info.number}) in ${info.repoName} is stuck and needs your input.`;
+    } else {
+      headerText = "An agent is stuck and needs your input.";
+    }
+    actionHint = "Check the task detail view to respond to the agent.";
   } else if (block.escalationAction === "conflict_needs_human") {
     // Conflict needs human review
     if (info) {
@@ -325,7 +338,7 @@ function EscalationBlock({ block }: { block: OrchestratorBlock }) {
           {actionHint && (
             <p className="mt-1 text-sm text-muted-foreground leading-relaxed">{actionHint}</p>
           )}
-          {block.content && block.escalationAction !== "mode_lowered" && (
+          {block.content && block.escalationAction !== "mode_lowered" && block.escalationAction !== "agent_question" && (
             <>
               <button
                 onClick={() => setCollapsed(!collapsed)}
@@ -392,6 +405,47 @@ function ThoughtBlock({ block }: { block: OrchestratorBlock }) {
   );
 }
 
+function QuestionAnswerBlock({ block }: { block: OrchestratorBlock }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const info = block.taskInfo;
+
+  const headerText = info
+    ? `Answered a question from "${info.title}" (${info.number}) in ${info.repoName}.`
+    : "Answered an agent's question.";
+
+  return (
+    <div className="rounded-md border border-violet-500/30 bg-violet-500/5 p-4">
+      <div className="flex items-start gap-3">
+        <div className="rounded-full p-1.5 bg-violet-500/20 shrink-0">
+          <HelpCircle className="h-4 w-4 text-violet-500" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs text-muted-foreground">{formatRelativeTime(block.timestamp)}</span>
+          </div>
+          <p className="mt-1 text-sm leading-relaxed">{headerText}</p>
+          {block.feedback && (
+            <>
+              <button
+                onClick={() => setCollapsed(!collapsed)}
+                className="mt-2 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+              >
+                <ChevronDown className={cn("h-3 w-3 transition-transform", collapsed && "-rotate-90")} />
+                {collapsed ? "Show" : "Hide"} answer
+              </button>
+              {!collapsed && (
+                <p className="mt-2 text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                  {block.feedback}
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BlockView({ block }: { block: OrchestratorBlock }) {
   switch (block.kind) {
     case "decision": return <DecisionBlock block={block} />;
@@ -399,6 +453,7 @@ function BlockView({ block }: { block: OrchestratorBlock }) {
     case "escalation": return <EscalationBlock block={block} />;
     case "message": return <MessageBlock block={block} />;
     case "thought": return <ThoughtBlock block={block} />;
+    case "question_answer": return <QuestionAnswerBlock block={block} />;
     default: return null;
   }
 }

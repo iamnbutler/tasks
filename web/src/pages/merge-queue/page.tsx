@@ -107,6 +107,11 @@ function MergeQueueRow({
             {prRepo(entry.pr_url)}#{num}
           </a>
         )}
+        {entry.changes_requested_feedback && (
+          <p className="text-xs text-muted-foreground truncate mt-0.5" title={entry.changes_requested_feedback}>
+            {entry.changes_requested_feedback}
+          </p>
+        )}
       </TextCell>
 
       {/* Project */}
