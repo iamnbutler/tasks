@@ -1,12 +1,22 @@
 //! Append-only event storage.
 //!
 //! Events are stored per-task as JSONL files: `<task-id>/events.jsonl`
+//!
+//! ## Reliability
+//!
+//! - **Corrupted line resilience (#469):** `read_task()` skips malformed JSON
+//!   lines with a warning instead of failing the entire read.
+//! - **Concurrent write protection (#468):** Writes to the same task file are
+//!   serialized via a per-task `tokio::sync::Mutex` to prevent byte interleaving.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 
 use crate::Event;
 
@@ -22,8 +32,13 @@ pub enum StoreError {
 ///
 /// Events are stored per-task in JSONL format. Each task gets its own
 /// directory with an `events.jsonl` file.
+///
+/// Concurrent writes to the same task file are serialized via a per-task
+/// mutex to prevent byte interleaving.
 pub struct EventStore {
     root: PathBuf,
+    /// Per-task write locks to serialize concurrent appends to the same file.
+    write_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl EventStore {
@@ -31,7 +46,17 @@ impl EventStore {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            write_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get or create the write lock for a given task ID.
+    async fn task_lock(&self, task_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.write_locks.lock().await;
+        locks
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Path to a task's event log file.
@@ -41,9 +66,18 @@ impl EventStore {
 
     /// Append an event to the store.
     ///
-    /// Creates the task directory if it doesn't exist.
+    /// Creates the task directory if it doesn't exist. Concurrent writes to
+    /// the same task file are serialized via a per-task mutex to prevent byte
+    /// interleaving.
     pub async fn append(&self, event: &Event) -> Result<(), StoreError> {
         let path = self.task_log_path(&event.task);
+        let lock = self.task_lock(&event.task).await;
+
+        // Serialize the JSON before acquiring the lock to minimize hold time.
+        let mut line = serde_json::to_string(event)?;
+        line.push('\n');
+
+        let _guard = lock.lock().await;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -55,8 +89,6 @@ impl EventStore {
             .open(&path)
             .await?;
 
-        let mut line = serde_json::to_string(event)?;
-        line.push('\n');
         file.write_all(line.as_bytes()).await?;
         file.flush().await?;
 
@@ -64,6 +96,9 @@ impl EventStore {
     }
 
     /// Read all events for a task.
+    ///
+    /// Malformed JSON lines are skipped with a warning instead of failing
+    /// the entire read. Empty lines are silently skipped.
     pub async fn read_task(&self, task_id: &str) -> Result<Vec<Event>, StoreError> {
         let path = self.task_log_path(task_id);
 
@@ -75,13 +110,42 @@ impl EventStore {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let mut events = Vec::new();
+        let mut line_number: usize = 0;
+        let mut skipped: usize = 0;
 
         while let Some(line) = lines.next_line().await? {
+            line_number += 1;
+
             if line.is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(&line)?;
-            events.push(event);
+
+            match serde_json::from_str::<Event>(&line) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    skipped += 1;
+                    let truncated: String = line.chars().take(200).collect();
+                    tracing::warn!(
+                        task_id,
+                        line_number,
+                        error = %err,
+                        raw_line = truncated,
+                        "skipping corrupted JSONL line"
+                    );
+                }
+            }
+        }
+
+        if skipped > 0 {
+            tracing::warn!(
+                task_id,
+                total_events = events.len(),
+                skipped,
+                "read {} events for task {} ({} lines skipped due to corruption)",
+                events.len(),
+                task_id,
+                skipped,
+            );
         }
 
         Ok(events)
@@ -171,6 +235,7 @@ impl EventStore {
 mod tests {
     use super::*;
     use crate::{Actor, EventType};
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -312,5 +377,123 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn read_task_skips_corrupted_lines() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Write two valid events through the store.
+        let event1 = Event::new(
+            EventType::TaskCreated,
+            "task-corrupt",
+            Actor::System,
+            serde_json::json!({"title": "First"}),
+        );
+        let event2 = Event::new(
+            EventType::TaskUpdated,
+            "task-corrupt",
+            Actor::System,
+            serde_json::json!({"title": "Second"}),
+        );
+        store.append(&event1).await.unwrap();
+        store.append(&event2).await.unwrap();
+
+        // Now inject a corrupted line directly into the JSONL file between
+        // existing events and an additional valid event.
+        let log_path = dir.path().join("task-corrupt").join("events.jsonl");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            // Corrupted line (not valid JSON)
+            writeln!(file, "{{this is not valid json}}").unwrap();
+            // Another valid event
+            let event3 = Event::new(
+                EventType::AgentMessage,
+                "task-corrupt",
+                Actor::Agent,
+                serde_json::json!({"message": "Third"}),
+            );
+            let json = serde_json::to_string(&event3).unwrap();
+            writeln!(file, "{}", json).unwrap();
+        }
+
+        // read_task should return the 3 valid events, skipping the corrupted line.
+        let events = store.read_task("task-corrupt").await.unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "expected 3 valid events, got {}",
+            events.len()
+        );
+        assert_eq!(events[0].id, event1.id);
+        assert_eq!(events[1].id, event2.id);
+        // The third event was written directly, so we just verify its type.
+        assert_eq!(events[2].event_type, EventType::AgentMessage);
+    }
+
+    #[tokio::test]
+    async fn read_task_skips_corrupted_but_not_empty_lines() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        let event = Event::new(
+            EventType::TaskCreated,
+            "task-empty",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        store.append(&event).await.unwrap();
+
+        // Inject empty lines and a corrupted line.
+        let log_path = dir.path().join("task-empty").join("events.jsonl");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            writeln!(file).unwrap(); // empty line
+            writeln!(file).unwrap(); // empty line
+            writeln!(file, "CORRUPTED").unwrap(); // bad line
+            writeln!(file).unwrap(); // empty line
+        }
+
+        let events = store.read_task("task-empty").await.unwrap();
+        assert_eq!(events.len(), 1, "expected 1 valid event");
+        assert_eq!(events[0].id, event.id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_do_not_corrupt() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(EventStore::new(dir.path()));
+        let task_id = "task-concurrent";
+
+        // Spawn many concurrent appends to the same task.
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let store = Arc::clone(&store);
+            let task_id = task_id.to_string();
+            handles.push(tokio::spawn(async move {
+                let event = Event::new(
+                    EventType::AgentMessage,
+                    &task_id,
+                    Actor::Agent,
+                    serde_json::json!({"index": i}),
+                );
+                store.append(&event).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // All 20 events should be readable without corruption.
+        let events = store.read_task(task_id).await.unwrap();
+        assert_eq!(events.len(), 20, "expected 20 events, got {}", events.len());
     }
 }
