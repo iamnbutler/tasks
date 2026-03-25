@@ -77,6 +77,22 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             output TEXT,
             error TEXT
         );
+
+        -- Indexes for common query patterns (issue #465)
+        -- tasks: lookup by project, filter by state, find by source
+        CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
+        CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
+        CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_json);
+
+        -- merge_queue: dedup by pr_url, lookup by task_id
+        CREATE INDEX IF NOT EXISTS idx_merge_queue_pr_url ON merge_queue(pr_url);
+        CREATE INDEX IF NOT EXISTS idx_merge_queue_task_id ON merge_queue(task_id);
+
+        -- automations: lookup by project
+        CREATE INDEX IF NOT EXISTS idx_automations_project_id ON automations(project_id);
+
+        -- automation_runs: lookup by automation_id
+        CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_id ON automation_runs(automation_id);
         ",
     )?;
 
