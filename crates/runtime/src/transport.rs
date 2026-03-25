@@ -55,14 +55,21 @@ impl StdioTransport {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             match line {
-                Ok(line) => {
-                    if let Some(event) = decode_line(&line) {
+                Ok(line) => match decode_line(&line) {
+                    Ok(Some(event)) => {
                         if event_tx.send(event).is_err() {
                             break;
                         }
                     }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, line = %line, "malformed JSON from supervisor, discarding");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "IO error reading from supervisor stdout");
+                    break;
                 }
-                Err(_) => break,
             }
         }
     }
