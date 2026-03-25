@@ -9,7 +9,11 @@ use tracing::{info, warn};
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
-use crate::types::{default_triage, ConflictContext, ConflictTriage, EvaluationContext, QualityEvaluation};
+use crate::types::{
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
+    QualityEvaluation, SystemContext,
+};
+use events::EventType;
 use models::task::{Task, TaskSource};
 use tasks_agent::{AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider};
 use tasks_github::GitHubClient;
@@ -331,6 +335,115 @@ impl Orchestrator for ClaudeOrchestrator {
         );
 
         Ok(triage)
+    }
+
+    async fn think(
+        &self,
+        context: &SystemContext,
+    ) -> Result<Vec<OrchestratorAction>, OrchestratorError> {
+        // Rule-based reasoning pass — no LLM calls.
+        // Survey system state and recent events, identify patterns, narrate.
+        let mut actions = Vec::new();
+
+        // Narrate recent events the human should know about
+        for event in &context.recent_events {
+            match &event.event_type {
+                EventType::TaskStateFailed => {
+                    let reason = event
+                        .data
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown reason");
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Task {} failed: {}",
+                        event.task, reason
+                    )));
+                }
+                EventType::TaskStateCompleted => {
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Task {} completed.",
+                        event.task
+                    )));
+                }
+                EventType::MergeCompleted => {
+                    let task_id = event
+                        .data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&event.task);
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Merged PR for task {}.",
+                        task_id
+                    )));
+                }
+                EventType::MergeConflict => {
+                    let task_id = event
+                        .data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&event.task);
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Conflict detected on task {}.",
+                        task_id
+                    )));
+                }
+                EventType::SystemModePlay => {
+                    actions.push(OrchestratorAction::EmitThought(
+                        "Mode changed to Play — fully autonomous.".to_string(),
+                    ));
+                }
+                EventType::SystemModePause => {
+                    actions.push(OrchestratorAction::EmitThought(
+                        "Mode changed to Pause — holding approved merges.".to_string(),
+                    ));
+                }
+                EventType::SystemModeStop => {
+                    actions.push(OrchestratorAction::EmitThought(
+                        "Mode changed to Stop — idle.".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // Pattern detection: multiple failures in the same area
+        let recent_failures: Vec<&events::Event> = context
+            .recent_events
+            .iter()
+            .filter(|e| e.event_type == EventType::TaskStateFailed)
+            .collect();
+        if recent_failures.len() >= 3 {
+            actions.push(OrchestratorAction::EmitThought(format!(
+                "{} tasks failed recently — possible systemic issue.",
+                recent_failures.len()
+            )));
+        }
+
+        // Surface long-running sessions
+        use models::task::TaskState;
+        let long_running: Vec<&Task> = context
+            .tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Running)
+            .filter(|t| {
+                t.last_activity_at
+                    .map(|at| (chrono::Utc::now() - at).num_minutes() > 30)
+                    .unwrap_or(false)
+            })
+            .collect();
+        for task in &long_running {
+            let mins = task
+                .last_activity_at
+                .map(|at| (chrono::Utc::now() - at).num_minutes())
+                .unwrap_or(0);
+            actions.push(OrchestratorAction::EmitThought(format!(
+                "Task {} has been running with no activity for {}m.",
+                &task.id[..8.min(task.id.len())],
+                mins
+            )));
+        }
+
+        Ok(actions)
     }
 }
 

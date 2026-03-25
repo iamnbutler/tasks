@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+events = { path = "../events" }
 models = { path = "../models" }
 tasks-agent = { path = "../agent" }
 tasks-github = { path = "../github" }
