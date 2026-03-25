@@ -32,7 +32,7 @@ rustup target add aarch64-unknown-linux-gnu
 make container-image
 
 # Build the web frontend
-bun install && bun web build
+make web
 ```
 
 ## Running
@@ -41,22 +41,37 @@ bun install && bun web build
 # Add a project to track
 cargo run -- add-project owner/repo
 
-# Run with web UI (serves on :4800)
-cargo run -- run --web
+# Build web frontend + start server on :4800
+# Auto-restarts on exit code 100 (self-update: pulls, rebuilds, restarts)
+make run
 
-# Headless mode
+# Headless mode (no web UI)
 cargo run -- run
 ```
 
 ## Development
 
 ```sh
+# Run the backend separately
+cargo run -- run --web
+
 # Frontend dev server (proxies /api to localhost:4800)
 bun web dev
 
-# Run the backend separately
-cargo run -- run --web
+# Build the web frontend only (production)
+make web
 ```
+
+## Make Targets
+
+| Target | Description |
+|---|---|
+| `make run` | Build web frontend + start server (auto-restarts on update) |
+| `make web` | Build the web frontend |
+| `make container-image` | Cross-compile supervisor + build container image |
+| `make supervisor` | Build the supervisor binary only |
+| `make check-linker` | Verify cross-compilation toolchain is installed |
+| `make clean` | Clean build artifacts |
 
 ## Environment Variables
 
