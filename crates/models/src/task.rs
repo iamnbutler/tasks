@@ -110,14 +110,15 @@ impl TaskState {
             | (Blocked, Waiting | Cancelled)
             // Running: the richest set — agent can ask a question, finish testing,
             // submit for merge, hit a conflict, get changes requested, complete,
-            // fail, or be cancelled
+            // fail, be cancelled, or retry back to Waiting on session failure (spec §14.3)
             | (Running, Question | Testing | AwaitingMerge | Conflict
-                      | ChangesRequested | Completed | Failed | Cancelled)
-            // Question: answer received returns to Running, or fail/cancel
-            | (Question, Running | Failed | Cancelled)
+                      | ChangesRequested | Completed | Failed | Cancelled | Waiting)
+            // Question: answer received returns to Running, or fail/cancel,
+            // or retry to Waiting on restart recovery of orphaned session (spec §14.3)
+            | (Question, Running | Waiting | Failed | Cancelled)
             // Testing: tests pass (back to Running for more work, or AwaitingMerge),
-            // tests fail, or cancel
-            | (Testing, Running | AwaitingMerge | Failed | Cancelled)
+            // tests fail, cancel, or retry to Waiting on restart recovery (spec §14.3)
+            | (Testing, Running | AwaitingMerge | Waiting | Failed | Cancelled)
             // AwaitingMerge: merged (Completed), conflict, changes requested,
             // fail, or cancel
             | (AwaitingMerge, Completed | Conflict | ChangesRequested | Failed | Cancelled)
@@ -469,6 +470,7 @@ mod tests {
             TaskState::Completed,
             TaskState::Failed,
             TaskState::Cancelled,
+            TaskState::Waiting, // session retry (spec §14.3)
         ];
         for target in valid {
             assert!(
@@ -482,6 +484,7 @@ mod tests {
     fn question_valid_transitions() {
         let valid = [
             TaskState::Running,
+            TaskState::Waiting, // restart recovery of orphaned session (spec §14.3)
             TaskState::Failed,
             TaskState::Cancelled,
         ];
@@ -498,6 +501,7 @@ mod tests {
         let valid = [
             TaskState::Running,
             TaskState::AwaitingMerge,
+            TaskState::Waiting, // restart recovery of orphaned session (spec §14.3)
             TaskState::Failed,
             TaskState::Cancelled,
         ];
@@ -606,11 +610,6 @@ mod tests {
     #[test]
     fn waiting_cannot_go_to_completed() {
         assert!(!TaskState::Waiting.can_transition_to(&TaskState::Completed));
-    }
-
-    #[test]
-    fn running_cannot_go_to_waiting() {
-        assert!(!TaskState::Running.can_transition_to(&TaskState::Waiting));
     }
 
     #[test]
