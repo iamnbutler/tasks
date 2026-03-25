@@ -64,6 +64,7 @@ pub enum EventType {
     AutomationRunOutput,
     AutomationRunCompleted,
     AutomationRunFailed,
+    AutomationRunCancelled,
 
     // Workspace events
     /// Workspace cleaned up (spec §10.3).
@@ -145,6 +146,7 @@ impl EventType {
             Self::AutomationRunOutput => "automation:run:output",
             Self::AutomationRunCompleted => "automation:run:completed",
             Self::AutomationRunFailed => "automation:run:failed",
+            Self::AutomationRunCancelled => "automation:run:cancelled",
             Self::WorkspaceCleaned => "workspace:cleaned",
             Self::OrchestratorFeedback => "orchestrator:feedback",
             Self::OrchestratorEscalation => "orchestrator:escalation",
@@ -235,6 +237,7 @@ impl TryFrom<String> for EventType {
             "automation:run:output" => Ok(Self::AutomationRunOutput),
             "automation:run:completed" => Ok(Self::AutomationRunCompleted),
             "automation:run:failed" => Ok(Self::AutomationRunFailed),
+            "automation:run:cancelled" => Ok(Self::AutomationRunCancelled),
             "workspace:cleaned" => Ok(Self::WorkspaceCleaned),
             "orchestrator:feedback" => Ok(Self::OrchestratorFeedback),
             "orchestrator:escalation" => Ok(Self::OrchestratorEscalation),

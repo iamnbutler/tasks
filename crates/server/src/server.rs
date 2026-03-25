@@ -41,6 +41,8 @@ pub enum ServerError {
     ProjectNotFound(String),
     #[error("task not found: {0}")]
     TaskNotFound(String),
+    #[error("run not found: {0}")]
+    RunNotFound(String),
     #[error("store error: {0}")]
     StoreError(String),
     #[error("invalid operation: {0}")]
@@ -558,7 +560,7 @@ impl Server {
             let store = store.lock().unwrap();
             store.get_automation_run(run_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
-                .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
+                .ok_or_else(|| ServerError::RunNotFound(run_id.to_string()))?
         };
 
         // Only allow cancelling runs that are pending or running
@@ -578,14 +580,13 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
-        // Emit run cancelled event (using AutomationRunFailed with cancelled context)
+        // Emit run cancelled event
         let event = Event::new(
-            EventType::AutomationRunFailed,
+            EventType::AutomationRunCancelled,
             run_id,
             Actor::Human,
             serde_json::json!({
                 "automation_id": run.automation_id,
-                "cancelled": true,
             }),
         );
         self.event_bus.publish(event).await?;

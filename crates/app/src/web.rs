@@ -1635,7 +1635,7 @@ async fn cancel_automation_run(
         .await
         .map_err(ApiError::Server)?;
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /api/automations/:id/runs/:run_id/events — Get events for a specific automation run.
