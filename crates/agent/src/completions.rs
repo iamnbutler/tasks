@@ -10,7 +10,7 @@ use crate::providers::AnthropicProvider;
 use crate::Provider;
 
 /// The Haiku model ID for fast completions.
-pub(crate) const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+pub(crate) const HAIKU_MODEL: &str = "claude-haiku-4-5";
 
 /// Service for lightweight LLM completions using Claude Haiku.
 #[derive(Debug, Clone)]
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_haiku_model_constant() {
-        assert_eq!(HAIKU_MODEL, "claude-haiku-4-5-20251001");
+        assert_eq!(HAIKU_MODEL, "claude-haiku-4-5");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use tasks_agent::{
 use crate::error::OrchestratorError;
 
 /// Model for orchestrator chat.
-const CHAT_MODEL: &str = "claude-opus-4-5";
+const CHAT_MODEL: &str = "claude-opus-4-6";
 
 /// Convert TaskState to a string representation.
 fn task_state_str(state: &TaskState) -> &'static str {

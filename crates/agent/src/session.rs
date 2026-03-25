@@ -401,12 +401,12 @@ mod tests {
 
     #[test]
     fn test_session_builder() {
-        let session = SessionBuilder::new("claude-sonnet-4-20250514")
+        let session = SessionBuilder::new("claude-sonnet-4-6")
             .system_prompt("be helpful")
             .max_tokens(1024)
             .temperature(0.7)
             .build();
-        assert_eq!(session.config.model, "claude-sonnet-4-20250514");
+        assert_eq!(session.config.model, "claude-sonnet-4-6");
         assert_eq!(session.system_prompt, Some("be helpful".to_string()));
         assert_eq!(session.config.max_tokens, 1024);
         assert_eq!(session.config.temperature, Some(0.7));

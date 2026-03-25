@@ -12,7 +12,7 @@ use crate::message::{Message, Response, Tool, ToolResult};
 /// Configuration for a completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionConfig {
-    /// Model identifier (e.g., "claude-sonnet-4-20250514")
+    /// Model identifier (e.g., "claude-sonnet-4-6")
     pub model: String,
     /// Maximum tokens to generate
     #[serde(default = "default_max_tokens")]
@@ -185,30 +185,30 @@ mod tests {
 
     #[test]
     fn completion_config_new() {
-        let config = CompletionConfig::new("claude-sonnet-4-20250514");
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        let config = CompletionConfig::new("claude-sonnet-4-6");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.max_tokens, 4096);
     }
 
     #[test]
     fn completion_config_builder_pattern() {
-        let config = CompletionConfig::new("claude-sonnet-4-20250514")
+        let config = CompletionConfig::new("claude-sonnet-4-6")
             .with_max_tokens(8192)
             .with_temperature(0.7);
 
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.max_tokens, 8192);
         assert_eq!(config.temperature, Some(0.7));
     }
 
     #[test]
     fn completion_config_serialization() {
-        let config = CompletionConfig::new("claude-sonnet-4-20250514")
+        let config = CompletionConfig::new("claude-sonnet-4-6")
             .with_max_tokens(2048)
             .with_temperature(0.5);
 
         let json = serde_json::to_string(&config).unwrap();
-        assert!(json.contains("\"model\":\"claude-sonnet-4-20250514\""));
+        assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
         assert!(json.contains("\"max_tokens\":2048"));
         assert!(json.contains("\"temperature\":0.5"));
     }
@@ -216,13 +216,13 @@ mod tests {
     #[test]
     fn completion_config_deserialization() {
         let json = r#"{
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 1024,
             "temperature": 0.8
         }"#;
 
         let config: CompletionConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        assert_eq!(config.model, "claude-sonnet-4-6");
         assert_eq!(config.max_tokens, 1024);
         assert_eq!(config.temperature, Some(0.8));
     }

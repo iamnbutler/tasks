@@ -410,7 +410,7 @@ mod tests {
             serde_json::json!({
                 "input_tokens": 1500,
                 "output_tokens": 800,
-                "model": "claude-3-opus",
+                "model": "claude-opus-4-6",
             }),
         );
         let json = serde_json::to_string(&e).unwrap();
