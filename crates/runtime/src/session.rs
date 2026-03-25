@@ -1,5 +1,6 @@
 //! Session wrapper — high-level API for managing a session.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -45,6 +46,8 @@ pub struct Session<R: ContainerRuntime> {
     container_id: Option<String>,
     transport: Option<StdioTransport>,
     state: SessionState,
+    /// Events buffered during wait_ready() that arrived before SystemReady.
+    buffered_events: VecDeque<Event>,
 }
 
 impl<R: ContainerRuntime> Session<R> {
@@ -56,6 +59,7 @@ impl<R: ContainerRuntime> Session<R> {
             container_id: None,
             transport: None,
             state: SessionState::Created,
+            buffered_events: VecDeque::new(),
         }
     }
 
@@ -87,13 +91,13 @@ impl<R: ContainerRuntime> Session<R> {
         Ok(())
     }
 
-    fn wait_ready(&self, timeout: Duration) -> Result<(), SessionError> {
+    fn wait_ready(&mut self, timeout: Duration) -> Result<(), SessionError> {
         let transport = self.transport.as_ref().ok_or(SessionError::NotStarted)?;
 
         loop {
             match transport.recv_timeout(timeout) {
                 Ok(event) if event.is_ready() => return Ok(()),
-                Ok(_) => continue, // Ignore other events while waiting
+                Ok(event) => self.buffered_events.push_back(event),
                 Err(_) => return Err(SessionError::ReadyTimeout),
             }
         }
@@ -140,13 +144,19 @@ impl<R: ContainerRuntime> Session<R> {
     }
 
     /// Receive an event, blocking until available.
-    pub fn recv(&self) -> Result<Event, SessionError> {
+    pub fn recv(&mut self) -> Result<Event, SessionError> {
+        if let Some(event) = self.buffered_events.pop_front() {
+            return Ok(event);
+        }
         let transport = self.transport.as_ref().ok_or(SessionError::NotStarted)?;
         Ok(transport.recv()?)
     }
 
     /// Receive an event with timeout.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Event, SessionError> {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Event, SessionError> {
+        if let Some(event) = self.buffered_events.pop_front() {
+            return Ok(event);
+        }
         let transport = self.transport.as_ref().ok_or(SessionError::NotStarted)?;
         Ok(transport.recv_timeout(timeout)?)
     }

@@ -530,7 +530,7 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     let reader = tokio::task::spawn_blocking(move || {
         loop {
             let result = {
-                let sess = session_recv.lock().unwrap();
+                let mut sess = session_recv.lock().unwrap();
                 sess.recv_timeout(Duration::from_secs(1))
             }; // lock released here
             match result {
