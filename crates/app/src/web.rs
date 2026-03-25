@@ -45,6 +45,10 @@ pub struct ApiState {
     pub update_tx: tokio::sync::mpsc::Sender<()>,
     pub blocked_repos: Vec<String>,
     pub blocked_orgs: Vec<String>,
+    /// Automation session soft time limit.
+    pub automation_soft_limit: std::time::Duration,
+    /// Automation session hard time limit.
+    pub automation_hard_limit: std::time::Duration,
 }
 
 /// Build the API router.
@@ -1528,9 +1532,18 @@ async fn trigger_automation(
         let automation_id = automation.id.clone();
         let server = state.server.clone();
         let sm = session_manager.clone();
+        let soft_limit = state.automation_soft_limit;
+        let hard_limit = state.automation_hard_limit;
         tokio::spawn(async move {
-            crate::automation_runner::execute_automation_run(&sm, &server, &run_id, &automation_id)
-                .await;
+            crate::automation_runner::execute_automation_run(
+                &sm,
+                &server,
+                &run_id,
+                &automation_id,
+                soft_limit,
+                hard_limit,
+            )
+            .await;
         });
     } else if let Some(executor) = &state.automation_executor {
         // Fall back to direct LLM streaming execution

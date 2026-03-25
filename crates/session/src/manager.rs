@@ -58,6 +58,18 @@ pub(crate) enum SessionCommand {
     Stop,
 }
 
+/// Per-session time limit overrides.
+///
+/// Used to customize time limits for specific session types (e.g., automation runs
+/// have shorter limits than regular task sessions).
+#[derive(Debug, Clone, Default)]
+pub struct SessionLimits {
+    /// Override for soft time limit. If `None`, uses manager's default.
+    pub soft_limit: Option<Duration>,
+    /// Override for hard time limit. If `None`, uses manager's default.
+    pub hard_limit: Option<Duration>,
+}
+
 /// Handle for a running session — tracks metadata and communication channel.
 pub struct SessionHandle {
     /// The task this session is executing.
@@ -376,6 +388,9 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
     ///
     /// The optional `progress_threshold` allows per-project customization
     /// (spec §13.1, §14.2). If not provided, uses the manager's default.
+    ///
+    /// The optional `time_limits` allows per-session time limit overrides
+    /// (e.g., automation sessions use shorter limits than regular tasks).
     pub async fn start_session(
         &self,
         task_id: String,
@@ -384,6 +399,33 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         prompt: String,
         config: Option<ContainerConfig>,
         progress_threshold: Option<Duration>,
+    ) -> Result<(), SessionManagerError> {
+        self.start_session_with_limits(
+            task_id,
+            repo_url,
+            branch,
+            prompt,
+            config,
+            progress_threshold,
+            SessionLimits::default(),
+        )
+        .await
+    }
+
+    /// Start a new session with custom time limits.
+    ///
+    /// Like `start_session`, but accepts `SessionLimits` to override the
+    /// manager's default soft/hard time limits. Used for automation runs
+    /// which have shorter time limits than regular task sessions.
+    pub async fn start_session_with_limits(
+        &self,
+        task_id: String,
+        repo_url: String,
+        branch: String,
+        prompt: String,
+        config: Option<ContainerConfig>,
+        progress_threshold: Option<Duration>,
+        time_limits: SessionLimits,
     ) -> Result<(), SessionManagerError> {
         // Check if session already exists
         if self.sessions.read().await.contains_key(&task_id) {
@@ -408,6 +450,10 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         // Use per-project progress threshold if provided, else manager's default (spec §14.2)
         let effective_progress_threshold = progress_threshold.unwrap_or(self.progress_threshold);
 
+        // Use per-session time limits if provided, else manager's defaults
+        let effective_soft_limit = time_limits.soft_limit.unwrap_or(self.soft_time_limit);
+        let effective_hard_limit = time_limits.hard_limit.unwrap_or(self.hard_time_limit);
+
         // Spawn the monitoring task
         let monitor = tokio::spawn(monitor_session(
             task_id.clone(),
@@ -417,8 +463,8 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
             self.sessions.clone(),
             self.runtime.clone(),
             container_id.clone(),
-            self.soft_time_limit,
-            self.hard_time_limit,
+            effective_soft_limit,
+            effective_hard_limit,
             effective_progress_threshold,
         ));
 
