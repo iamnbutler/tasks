@@ -52,7 +52,6 @@ const REJECTED_PR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 2. Cleanup removes Rejected entry
 /// 3. Poll loop finds open PR, creates new Pending entry
 /// 4. Orchestrator re-evaluates (non-deterministically may approve)
-#[derive(Default)]
 struct RejectedPrCooldown {
     /// Map of pr_url -> (head_sha, rejection_time)
     entries: HashMap<String, (String, Instant)>,
@@ -1879,6 +1878,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 head_sha = %sha,
                                 "recorded PR rejection in cooldown tracker (issue closed)"
                             );
+                        } else {
+                            warn!("Cannot record rejection cooldown for {}: entry has no head_sha", pr_url);
                         }
                     } else {
                         // Issue is still open — normal rejection with re-dispatch.
@@ -1958,6 +1959,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 head_sha = %sha,
                                 "recorded PR rejection in cooldown tracker"
                             );
+                        } else {
+                            warn!("Cannot record rejection cooldown for {}: entry has no head_sha", pr_url);
                         }
                     }
                 }
