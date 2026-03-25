@@ -11,13 +11,16 @@ pub fn encode<T: Serialize>(msg: &T) -> String {
     s
 }
 
-/// Parse a single JSON line. Returns None on empty or invalid input.
-pub fn decode_line<T: DeserializeOwned>(line: &str) -> Option<T> {
+/// Parse a single JSON line.
+///
+/// Returns `Ok(None)` for empty/whitespace-only lines, `Ok(Some(T))` on
+/// successful decode, or `Err` when the line contains invalid JSON.
+pub fn decode_line<T: DeserializeOwned>(line: &str) -> Result<Option<T>, serde_json::Error> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_str(trimmed).ok()
+    serde_json::from_str(trimmed).map(Some)
 }
 
 /// Line-buffered reader that yields complete messages.
@@ -50,8 +53,12 @@ where
             let line = self.buffer[..newline_pos].to_string();
             self.buffer = self.buffer[newline_pos + 1..].to_string();
 
-            if let Some(msg) = decode_line(&line) {
-                (self.callback)(msg);
+            match decode_line(&line) {
+                Ok(Some(msg)) => (self.callback)(msg),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, line = %line, "malformed JSON line, discarding");
+                }
             }
         }
     }
@@ -59,8 +66,12 @@ where
     /// Flush any remaining data in the buffer.
     pub fn flush(&mut self) {
         if !self.buffer.trim().is_empty() {
-            if let Some(msg) = decode_line(&self.buffer) {
-                (self.callback)(msg);
+            match decode_line(&self.buffer) {
+                Ok(Some(msg)) => (self.callback)(msg),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, line = %self.buffer, "malformed JSON in buffer on flush, discarding");
+                }
             }
         }
         self.buffer.clear();
@@ -83,15 +94,21 @@ mod tests {
     #[test]
     fn decode_event() {
         let line = r#"{"ev":"system:ready"}"#;
-        let event: Option<Event> = decode_line(line);
-        assert!(event.is_some());
-        assert!(event.unwrap().is_ready());
+        let event: Result<Option<Event>, _> = decode_line(line);
+        let event = event.expect("should parse").expect("should not be empty");
+        assert!(event.is_ready());
     }
 
     #[test]
     fn decode_empty() {
-        let event: Option<Event> = decode_line("");
-        assert!(event.is_none());
+        let result: Result<Option<Event>, _> = decode_line("");
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn decode_malformed() {
+        let result: Result<Option<Event>, _> = decode_line("{bad json}");
+        assert!(result.is_err());
     }
 
     #[test]
