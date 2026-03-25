@@ -108,6 +108,10 @@ impl Session {
     ///
     /// Consumes pending_tool_results — they are added to message history
     /// as a user message with ToolResult content blocks, then cleared.
+    ///
+    /// If the conversation exceeds the model's context window, older messages
+    /// are dropped (keeping the first user message for task context and recent
+    /// messages for continuity). A warning is logged when truncation occurs.
     pub fn build_request(&mut self) -> CompletionRequest {
         if !self.pending_tool_results.is_empty() {
             let tool_result_content: Vec<Content> = std::mem::take(&mut self.pending_tool_results)
@@ -117,7 +121,9 @@ impl Session {
             self.messages.push(Message::new(Role::User, tool_result_content));
         }
 
-        let mut request = CompletionRequest::new(self.config.clone(), self.messages.clone());
+        let messages = self.truncate_to_budget();
+
+        let mut request = CompletionRequest::new(self.config.clone(), messages);
 
         if let Some(ref system) = self.system_prompt {
             request = request.with_system(system.clone());
@@ -128,6 +134,93 @@ impl Session {
         }
 
         request
+    }
+
+    /// Truncate messages to fit within the context window budget.
+    ///
+    /// Strategy: keep the first user message (task context) and as many
+    /// recent messages as fit. Drop from the middle when over budget.
+    fn truncate_to_budget(&self) -> Vec<Message> {
+        let budget = self.config.input_budget();
+
+        // Account for system prompt and tool definitions
+        let mut overhead: u32 = 0;
+        if let Some(ref system) = self.system_prompt {
+            overhead += (system.len() as u32) / 4 + 10;
+        }
+        for tool in &self.tools {
+            overhead += (tool.description.len() as u32 + tool.parameters.to_string().len() as u32) / 4 + 20;
+        }
+
+        let available = budget.saturating_sub(overhead);
+
+        // Fast path: estimate total and skip truncation if under budget
+        let total_tokens: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        if total_tokens <= available {
+            return self.messages.clone();
+        }
+
+        // Need to truncate. Keep first message (task context) + recent messages.
+        let total = self.messages.len();
+        if total <= 2 {
+            // Too few messages to truncate meaningfully
+            return self.messages.clone();
+        }
+
+        // Reserve first message
+        let first_tokens = self.messages[0].estimate_tokens();
+        let remaining_budget = available.saturating_sub(first_tokens);
+
+        // Walk backwards from the end, accumulating messages that fit
+        let mut tail_tokens: u32 = 0;
+        let mut keep_from = total; // exclusive start of tail
+        for i in (1..total).rev() {
+            let msg_tokens = self.messages[i].estimate_tokens();
+            if tail_tokens + msg_tokens > remaining_budget {
+                break;
+            }
+            tail_tokens += msg_tokens;
+            keep_from = i;
+        }
+
+        // Ensure we don't break ToolUse/ToolResult pairing.
+        // The Anthropic API requires every ToolResult user message to be
+        // preceded by the assistant message containing the corresponding
+        // ToolUse. If the tail starts with an orphaned ToolResult, advance
+        // past it to find a safe boundary.
+        let keep_from_before_orphan_skip = keep_from;
+        while keep_from < total {
+            let msg = &self.messages[keep_from];
+            let is_orphan_tool_result = msg.role == Role::User
+                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+            if !is_orphan_tool_result {
+                break;
+            }
+            // Drop the orphaned ToolResult and reclaim its tokens
+            tail_tokens = tail_tokens.saturating_sub(msg.estimate_tokens());
+            keep_from += 1;
+        }
+
+        let budget_dropped = keep_from_before_orphan_skip.saturating_sub(1);
+        let orphan_skipped = keep_from - keep_from_before_orphan_skip;
+        if budget_dropped + orphan_skipped > 0 {
+            tracing::warn!(
+                session_id = %self.id,
+                total_messages = total,
+                budget_dropped,
+                orphan_skipped,
+                estimated_tokens = total_tokens,
+                budget = available,
+                "truncated conversation history to fit context window"
+            );
+        }
+
+        let mut result = Vec::with_capacity(1 + (total - keep_from));
+        result.push(self.messages[0].clone());
+        if keep_from < total {
+            result.extend_from_slice(&self.messages[keep_from..]);
+        }
+        result
     }
 
     /// Apply a response to the session, updating state.
@@ -451,5 +544,122 @@ mod tests {
         let last_msg = request.messages.last().unwrap();
         assert_eq!(last_msg.role, Role::User);
         assert!(matches!(&last_msg.content[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tc-1"));
+    }
+
+    #[test]
+    fn test_truncation_under_budget_no_change() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        session.add_user_message("hello");
+        session.add_assistant_message("hi");
+        session.add_user_message("how are you?");
+        let request = session.build_request();
+        assert_eq!(request.messages.len(), 3);
+    }
+
+    #[test]
+    fn test_truncation_over_budget_drops_middle() {
+        // Create a session with a tiny context window
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100) // ~100 tokens total
+            .with_max_tokens(20);     // 80 tokens for input
+        let mut session = Session::new(config);
+
+        // First message (kept as task context)
+        session.add_user_message("task: implement feature X");
+        // Middle messages (candidates for dropping)
+        for i in 0..20 {
+            session.add_assistant_message(&format!("working on step {} of the implementation with lots of detail", i));
+            session.add_user_message(&format!("continue with step {}", i + 1));
+        }
+        // The conversation is now much larger than 80 tokens
+
+        let request = session.build_request();
+        // Should be truncated: first message + recent messages
+        assert!(request.messages.len() < session.messages.len());
+        // First message preserved
+        assert_eq!(request.messages[0].text(), "task: implement feature X");
+        // Last message preserved
+        let last = request.messages.last().unwrap();
+        assert!(last.text().contains("continue with step"));
+    }
+
+    #[test]
+    fn test_truncation_preserves_first_and_last() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(60)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+
+        session.add_user_message("initial task context");
+        session.add_assistant_message("understood, I'll start working");
+        session.add_user_message("great, proceed");
+        session.add_assistant_message("done with part 1, here are the results of my work so far");
+        session.add_user_message("looks good, continue");
+
+        let request = session.build_request();
+        // First message must be the initial context
+        assert_eq!(request.messages[0].text(), "initial task context");
+        // Last message must be the most recent
+        assert_eq!(request.messages.last().unwrap().text(), "looks good, continue");
+    }
+
+    #[test]
+    fn test_context_window_inferred_from_model() {
+        let config = CompletionConfig::new("claude-sonnet-4-6");
+        assert_eq!(config.context_window, 200_000);
+
+        let config = CompletionConfig::new("unknown-model");
+        assert_eq!(config.context_window, 128_000);
+    }
+
+    #[test]
+    fn test_input_budget() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200_000)
+            .with_max_tokens(4096);
+        assert_eq!(config.input_budget(), 200_000 - 4096);
+    }
+
+    #[test]
+    fn test_truncation_skips_orphaned_tool_results() {
+        // Use a very small context window to force truncation
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(50)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+
+        // [0] User: task context (kept)
+        session.add_user_message("implement feature X");
+        // [1] Assistant with ToolUse (will be dropped — middle)
+        session.messages.push(Message::new(Role::Assistant, vec![
+            Content::ToolUse {
+                id: "tc-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/foo.rs"}),
+            },
+        ]));
+        // [2] User with ToolResult (orphaned if [1] is dropped)
+        session.messages.push(Message::new(Role::User, vec![
+            Content::tool_result("tc-1", "lots of file contents here that take up space in the context", false),
+        ]));
+        // [3] Assistant: normal text
+        session.add_assistant_message("ok, I see the file and will proceed");
+        // [4] User: normal text
+        session.add_user_message("great, continue with the implementation");
+
+        let request = session.build_request();
+
+        // The tail should NOT start with the orphaned ToolResult [2].
+        // It should skip it and start at [3] or [4].
+        for msg in &request.messages[1..] {
+            let is_tool_result_only = msg.role == Role::User
+                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+            assert!(
+                !is_tool_result_only,
+                "tail contains orphaned ToolResult message"
+            );
+        }
+        // First message preserved
+        assert_eq!(request.messages[0].text(), "implement feature X");
     }
 }

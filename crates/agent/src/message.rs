@@ -61,6 +61,20 @@ impl Content {
             _ => None,
         }
     }
+
+    /// Rough token estimate (chars / 4). Good enough for context window budgeting.
+    pub fn estimate_tokens(&self) -> u32 {
+        let chars = match self {
+            Content::Text { text } => text.len(),
+            Content::Thinking { thinking } => thinking.len(),
+            Content::Image { data, .. } => data.len() / 3, // base64 → ~tokens
+            Content::ToolUse { name, input, .. } => {
+                name.len() + input.to_string().len()
+            }
+            Content::ToolResult { content, .. } => content.len(),
+        };
+        (chars as u32 / 4).max(1)
+    }
 }
 
 /// A message in the conversation.
@@ -90,6 +104,12 @@ impl Message {
     /// Get the text content of this message, concatenating all text blocks.
     pub fn text(&self) -> String {
         self.content.iter().filter_map(|c| c.as_text()).collect::<Vec<_>>().join("")
+    }
+
+    /// Rough token estimate for this message (sum of content block estimates + overhead).
+    pub fn estimate_tokens(&self) -> u32 {
+        // ~4 tokens overhead per message for role/formatting
+        4 + self.content.iter().map(|c| c.estimate_tokens()).sum::<u32>()
     }
 }
 
