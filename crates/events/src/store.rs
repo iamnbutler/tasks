@@ -20,12 +20,21 @@ use tokio::sync::Mutex;
 
 use crate::Event;
 
+/// Current event log format version. Bump when the Event serialization
+/// format changes in an incompatible way.
+pub const EVENT_FORMAT_VERSION: u32 = 1;
+
+/// Name of the version marker file inside the event store root.
+const VERSION_FILE: &str = "format_version";
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("event format version mismatch: found v{found}, expected v{expected}")]
+    FormatMismatch { found: u32, expected: u32 },
 }
 
 /// Append-only event store backed by the filesystem.
@@ -48,6 +57,38 @@ impl EventStore {
             root: root.as_ref().to_path_buf(),
             write_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Check the event format version and stamp it for new stores.
+    ///
+    /// Call this once at startup after creating the store. Returns
+    /// [`StoreError::FormatMismatch`] if an existing store has a
+    /// different version.
+    pub fn check_version(&self) -> Result<(), StoreError> {
+        let path = self.root.join(VERSION_FILE);
+
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            let stored: u32 = contents.trim().parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid event format version file: {contents:?}"),
+                )
+            })?;
+
+            if stored != EVENT_FORMAT_VERSION {
+                return Err(StoreError::FormatMismatch {
+                    found: stored,
+                    expected: EVENT_FORMAT_VERSION,
+                });
+            }
+        } else {
+            // New store — create the version file.
+            std::fs::create_dir_all(&self.root)?;
+            std::fs::write(&path, format!("{EVENT_FORMAT_VERSION}\n"))?;
+        }
+
+        Ok(())
     }
 
     /// Get or create the write lock for a given task ID.
