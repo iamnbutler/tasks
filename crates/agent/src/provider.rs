@@ -37,7 +37,9 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_context_window() -> u32 {
-    200_000
+    // Conservative default for deserialization (non-Claude models).
+    // CompletionConfig::new() overrides this via context_window_for_model().
+    128_000
 }
 
 /// Infer context window size from model name.

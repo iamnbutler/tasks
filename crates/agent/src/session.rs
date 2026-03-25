@@ -183,6 +183,23 @@ impl Session {
             keep_from = i;
         }
 
+        // Ensure we don't break ToolUse/ToolResult pairing.
+        // The Anthropic API requires every ToolResult user message to be
+        // preceded by the assistant message containing the corresponding
+        // ToolUse. If the tail starts with an orphaned ToolResult, advance
+        // past it to find a safe boundary.
+        while keep_from < total {
+            let msg = &self.messages[keep_from];
+            let is_orphan_tool_result = msg.role == Role::User
+                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+            if !is_orphan_tool_result {
+                break;
+            }
+            // Drop the orphaned ToolResult and reclaim its tokens
+            tail_tokens = tail_tokens.saturating_sub(msg.estimate_tokens());
+            keep_from += 1;
+        }
+
         let dropped = keep_from.saturating_sub(1); // messages between first and tail
         if dropped > 0 {
             tracing::warn!(
@@ -598,5 +615,48 @@ mod tests {
             .with_context_window(200_000)
             .with_max_tokens(4096);
         assert_eq!(config.input_budget(), 200_000 - 4096);
+    }
+
+    #[test]
+    fn test_truncation_skips_orphaned_tool_results() {
+        // Use a very small context window to force truncation
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(50)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+
+        // [0] User: task context (kept)
+        session.add_user_message("implement feature X");
+        // [1] Assistant with ToolUse (will be dropped — middle)
+        session.messages.push(Message::new(Role::Assistant, vec![
+            Content::ToolUse {
+                id: "tc-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/foo.rs"}),
+            },
+        ]));
+        // [2] User with ToolResult (orphaned if [1] is dropped)
+        session.messages.push(Message::new(Role::User, vec![
+            Content::tool_result("tc-1", "lots of file contents here that take up space in the context", false),
+        ]));
+        // [3] Assistant: normal text
+        session.add_assistant_message("ok, I see the file and will proceed");
+        // [4] User: normal text
+        session.add_user_message("great, continue with the implementation");
+
+        let request = session.build_request();
+
+        // The tail should NOT start with the orphaned ToolResult [2].
+        // It should skip it and start at [3] or [4].
+        for msg in &request.messages[1..] {
+            let is_tool_result_only = msg.role == Role::User
+                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+            assert!(
+                !is_tool_result_only,
+                "tail contains orphaned ToolResult message"
+            );
+        }
+        // First message preserved
+        assert_eq!(request.messages[0].text(), "implement feature X");
     }
 }
