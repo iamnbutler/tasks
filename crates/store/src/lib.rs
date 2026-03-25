@@ -93,6 +93,9 @@ impl Store {
     }
 
     /// Open or create a store at the given path.
+    ///
+    /// Version checking should be done before calling this method using
+    /// [`Store::check_version`] in `main.rs`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;

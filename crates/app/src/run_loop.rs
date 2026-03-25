@@ -250,6 +250,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let event_dir = format!("{}/events", config.data_dir);
     std::fs::create_dir_all(&event_dir)?;
     let event_store = EventStore::new(&event_dir);
+    event_store.check_version()?;
     let bus = EventBus::new(event_store, 1024);
 
     // --- 2. Create server ---
