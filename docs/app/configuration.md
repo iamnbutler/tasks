@@ -55,6 +55,20 @@ Tasks is configured through environment variables and a `.env` file.
 
 > Memory thresholds must be ordered: `WARN < SOFT < HARD`, or the server will refuse to start.
 
+### Access Control
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BLOCKED_REPOS` | Comma-separated list of `owner/repo` patterns to block | _(none)_ |
+| `BLOCKED_ORGS` | Comma-separated list of organization names to block | _(none)_ |
+
+Blocked repos and orgs cannot be added as projects and will be rejected by the API. Values are case-insensitive and trimmed.
+
+```env
+BLOCKED_REPOS=example/private-repo,example/other-repo
+BLOCKED_ORGS=competitor-org
+```
+
 ### Desktop App
 
 | Variable | Description | Default |

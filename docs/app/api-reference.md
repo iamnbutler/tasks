@@ -115,6 +115,40 @@ GET /api/tasks/:id/events
 ]
 ```
 
+#### Update Task
+
+Update task metadata. All fields are optional.
+
+```http
+PATCH /api/tasks/:id
+Content-Type: application/json
+
+{
+  "priority": 1
+}
+```
+
+Lower priority values are dispatched first.
+
+**Response:** The updated `Task` object.
+
+#### Reorder Tasks
+
+Assign sequential priorities to tasks in the given order. Used for drag-and-drop reordering in the UI.
+
+```http
+POST /api/tasks/reorder
+Content-Type: application/json
+
+{
+  "task_ids": ["task-uuid-1", "task-uuid-2", "task-uuid-3"]
+}
+```
+
+Tasks are assigned priorities 1, 2, 3… in the provided order.
+
+**Response:** `200 OK`
+
 #### Send Chat Message
 
 Send a message to an active agent session.
@@ -307,6 +341,25 @@ GET /api/containers
 ]
 ```
 
+#### Rebuild State from GitHub
+
+Clear all tasks and merge queue entries, then let the poller re-fetch everything from GitHub. Useful for recovering from a desync.
+
+```http
+POST /api/rebuild
+```
+
+**Response:**
+
+```json
+{
+  "tasks_cleared": 12,
+  "merge_entries_cleared": 3
+}
+```
+
+> Re-population happens asynchronously as the GitHub poller discovers items on its next cycle.
+
 ### Orchestrator
 
 #### Chat with Orchestrator
@@ -496,6 +549,16 @@ GET /api/automations/:id/runs
 ```
 
 **Run statuses:** `pending`, `running`, `completed`, `failed`, `cancelled`
+
+#### Get Automation Run Events
+
+Returns the event stream for a specific automation run (agent output, tool calls, etc.).
+
+```http
+GET /api/automations/:id/runs/:run_id/events
+```
+
+**Response:** Array of `Event` objects for the run.
 
 #### Trigger Automation Run
 

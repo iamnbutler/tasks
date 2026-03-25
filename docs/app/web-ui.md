@@ -14,7 +14,9 @@ Open your browser to `http://localhost:4800`.
 
 ## Navigation
 
-The main navigation includes:
+The sidebar includes a **project selector dropdown** at the top that scopes all views (Tasks, Merge Queue, Automations) to a single project. Selecting **All Projects** shows combined data across all tracked repos. The dropdown also provides quick access to **Add Project** and **Bootstrap Project** actions.
+
+The main navigation sections are:
 
 | Section | Description |
 |---------|-------------|
@@ -25,6 +27,8 @@ The main navigation includes:
 | **Events** | Real-time event log viewer |
 | **Containers** | Active container session monitor |
 | **Automations** | Reusable automation workflows |
+
+Mode controls (Stop / Pause / Play icon buttons) are in the nav footer.
 
 ## Dashboard
 
@@ -38,11 +42,13 @@ The dashboard provides an at-a-glance view of:
 
 ### Changing Mode
 
-Click the mode indicator to switch between:
+Mode controls are located in the nav footer as three icon buttons (Stop / Pause / Play). The active mode is highlighted; hover over any icon for a tooltip.
 
-- **Play** - Full autonomy
-- **Pause** - Agents work, merges paused
-- **Stop** - All activity halted
+| Icon | Mode | Description |
+|------|------|-------------|
+| Square | **Stop** | All activity halted |
+| Pause | **Pause** | Agents work, merges paused |
+| Play | **Play** | Full autonomy |
 
 ## Tasks View
 
@@ -164,7 +170,9 @@ Automations are reusable agent workflows that can run on a schedule, in response
 
 ### Automation List
 
-Each row shows the automation name, trigger type, current state (active/paused), and a dropdown menu with **View Runs**, **Edit**, and **Delete** options. A **New Automation** button opens the creation dialog.
+Each row shows the automation name, trigger type, current state (active/paused), and a dropdown menu with **View Runs**, **Edit**, **Duplicate to Project**, and **Delete** options. A **New Automation** button opens the creation dialog.
+
+**Duplicate to Project** — opens a dialog to copy the automation to another tracked project. You can rename the duplicate before saving; the prompt, trigger type, and state are preserved.
 
 ### State Badges
 
@@ -194,8 +202,13 @@ Clicking an automation row (or choosing **View Runs**) opens the runs history pa
 - Relative timestamp with absolute time on hover
 - Duration for completed/failed runs
 - Collapsible output section and error message (if any)
+- **Cancel** button for runs that are pending or running
 
 The panel auto-refreshes every 2 seconds while any run is in progress.
+
+### Automation Detail View
+
+Clicking a run row opens the automation detail view, which shows a live chat-style feed of the agent's output as the run executes. This is equivalent to the task chat view but for automation runs.
 
 ## Keyboard Shortcuts
 
