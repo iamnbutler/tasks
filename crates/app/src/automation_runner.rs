@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use events::EventBus;
@@ -209,9 +209,9 @@ pub fn spawn_automation_event_listener(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(
+                    error!(
                         skipped = n,
-                        "automation event listener lagged, skipped {n} events"
+                        "automation event listener lagged — {n} events dropped from broadcast channel"
                     );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {

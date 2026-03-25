@@ -230,7 +230,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let event_dir = format!("{}/events", config.data_dir);
     std::fs::create_dir_all(&event_dir)?;
     let event_store = EventStore::new(&event_dir);
-    let bus = EventBus::new(event_store, 256);
+    let bus = EventBus::new(event_store, 1024);
 
     // --- 2. Create server ---
 
@@ -879,10 +879,68 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             let event = match rx.recv().await {
                 Ok(e) => e,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(
+                    error!(
                         skipped = n,
-                        "event handler lagged, some events may not update state"
+                        "event handler lagged — {n} events dropped from broadcast channel. \
+                         Replaying recent state events from store to recover."
                     );
+                    // Recovery: replay the latest state event for each task from
+                    // the persistent event store so we don't permanently lose
+                    // state transitions. Events are always persisted before
+                    // broadcast, so the store is the source of truth.
+                    match event_handler_bus.query_by_type_prefix("task:state:", 500).await {
+                        Ok(state_events) => {
+                            // Collect the latest state event per task
+                            let mut latest_per_task: std::collections::HashMap<String, events::Event> =
+                                std::collections::HashMap::new();
+                            for ev in state_events {
+                                latest_per_task
+                                    .entry(ev.task.clone())
+                                    .and_modify(|existing| {
+                                        if ev.ts > existing.ts {
+                                            *existing = ev.clone();
+                                        }
+                                    })
+                                    .or_insert(ev);
+                            }
+                            let replayed = latest_per_task.len();
+                            for (_task_id, ev) in &latest_per_task {
+                                if ev.actor == events::Actor::Scheduler {
+                                    continue;
+                                }
+                                let state = match ev.event_type {
+                                    EventType::TaskStateRunning => Some(models::task::TaskState::Running),
+                                    EventType::TaskStateQuestion => Some(models::task::TaskState::Question),
+                                    EventType::TaskStateWaiting => Some(models::task::TaskState::Waiting),
+                                    EventType::TaskStateBlocked => Some(models::task::TaskState::Blocked),
+                                    EventType::TaskStateTesting => Some(models::task::TaskState::Testing),
+                                    EventType::TaskStateAwaitingMerge => Some(models::task::TaskState::AwaitingMerge),
+                                    EventType::TaskStateConflict => Some(models::task::TaskState::Conflict),
+                                    EventType::TaskStateCompleted => Some(models::task::TaskState::Completed),
+                                    EventType::TaskStateFailed => Some(models::task::TaskState::Failed),
+                                    EventType::TaskStateCancelled => Some(models::task::TaskState::Cancelled),
+                                    _ => None,
+                                };
+                                if let Some(s) = state {
+                                    if let Err(e) = event_handler_server.apply_task_state(&ev.task, s).await {
+                                        if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                                            error!(task_id = %ev.task, error = %e, "failed to replay task state during lag recovery");
+                                        }
+                                    }
+                                }
+                            }
+                            info!(
+                                tasks_replayed = replayed,
+                                "lag recovery complete — replayed latest state for {replayed} tasks"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "lag recovery failed — could not read state events from store"
+                            );
+                        }
+                    }
                     continue;
                 }
                 Err(_) => break,
@@ -994,7 +1052,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     match result {
                         Ok(event) => Some(event),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "dispatch loop lagged, some events may not trigger dispatch");
+                            warn!(skipped = n, "dispatch loop lagged — {n} events dropped, next reconciliation tick will catch up");
                             None
                         }
                         Err(_) => continue, // channel closed, will be handled by outer loop
@@ -1252,7 +1310,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     match result {
                         Ok(event) => Some(event),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "orchestrator loop lagged");
+                            warn!(skipped = n, "orchestrator loop lagged — {n} events dropped, next eval tick will catch up");
                             continue;
                         }
                         Err(_) => break, // channel closed, shut down
@@ -2091,9 +2149,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             let event = match rx.recv().await {
                 Ok(e) => e,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(
+                    error!(
                         skipped = n,
-                        "stop mode listener lagged, some events may be missed"
+                        "stop mode listener lagged — {n} events dropped, may miss SystemModeStop event"
                     );
                     continue;
                 }
