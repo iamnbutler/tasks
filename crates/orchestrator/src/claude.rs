@@ -15,10 +15,10 @@ use tasks_agent::{AnthropicProvider, CompletionConfig, CompletionRequest, Messag
 use tasks_github::GitHubClient;
 
 /// Default model for orchestrator evaluation.
-const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+const DEFAULT_MODEL: &str = "claude-opus-4-5";
 
 /// Maximum tokens for evaluation response.
-const MAX_TOKENS: u32 = 2048;
+const MAX_TOKENS: u32 = 50_000;
 
 /// Orchestrator implementation backed by Claude.
 ///

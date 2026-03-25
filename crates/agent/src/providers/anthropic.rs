@@ -403,9 +403,9 @@ impl Provider for AnthropicProvider {
 
     fn models(&self) -> &[&str] {
         &[
+            "claude-opus-4-5",
             "claude-sonnet-4-20250514",
-            "claude-opus-4-0-20250514",
-            "claude-3-5-haiku-20241022",
+            "claude-haiku-4-5-20251001",
         ]
     }
 
