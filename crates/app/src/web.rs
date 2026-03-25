@@ -45,6 +45,10 @@ pub struct ApiState {
     pub update_tx: tokio::sync::mpsc::Sender<()>,
     pub blocked_repos: Vec<String>,
     pub blocked_orgs: Vec<String>,
+    /// Automation session soft time limit.
+    pub automation_soft_limit: std::time::Duration,
+    /// Automation session hard time limit.
+    pub automation_hard_limit: std::time::Duration,
 }
 
 /// Build the API router.
@@ -95,6 +99,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}", axum::routing::delete(delete_automation))
         .route("/automations/{id}/runs", get(list_automation_runs))
         .route("/automations/{id}/runs/{run_id}/events", get(list_automation_run_events))
+        .route("/automations/{id}/runs/{run_id}/cancel", post(cancel_automation_run))
         .route("/automations/{id}/run", post(trigger_automation));
 
     Router::new()
@@ -1528,9 +1533,18 @@ async fn trigger_automation(
         let automation_id = automation.id.clone();
         let server = state.server.clone();
         let sm = session_manager.clone();
+        let soft_limit = state.automation_soft_limit;
+        let hard_limit = state.automation_hard_limit;
         tokio::spawn(async move {
-            crate::automation_runner::execute_automation_run(&sm, &server, &run_id, &automation_id)
-                .await;
+            crate::automation_runner::execute_automation_run(
+                &sm,
+                &server,
+                &run_id,
+                &automation_id,
+                soft_limit,
+                hard_limit,
+            )
+            .await;
         });
     } else if let Some(executor) = &state.automation_executor {
         // Fall back to direct LLM streaming execution
@@ -1594,6 +1608,47 @@ async fn trigger_automation(
     }
 
     Ok(Json(run))
+}
+
+/// POST /api/automations/:id/runs/:run_id/cancel — Cancel a running automation run.
+async fn cancel_automation_run(
+    State(state): State<ApiState>,
+    Path((automation_id, run_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    // Verify automation exists
+    {
+        let server_state = state.server.state.read().await;
+        if !server_state.automations.contains_key(&automation_id) {
+            return Err(ApiError::NotFound(format!("automation not found: {}", automation_id)));
+        }
+    }
+
+    // Verify run exists and belongs to this automation
+    let runs = state
+        .server
+        .list_automation_runs(&automation_id)
+        .map_err(ApiError::Server)?;
+
+    if !runs.iter().any(|r| r.id == run_id) {
+        return Err(ApiError::NotFound(format!("run not found: {}", run_id)));
+    }
+
+    // Stop the container session if running
+    if let Some(sm) = &state.session_manager {
+        let session_id = format!("automation-run:{}", run_id);
+        if let Err(e) = sm.stop_session(&session_id).await {
+            tracing::warn!(run_id = %run_id, error = %e, "Failed to stop automation session (may not be running)");
+        }
+    }
+
+    // Update the run status to cancelled
+    state
+        .server
+        .cancel_automation_run(&run_id)
+        .await
+        .map_err(ApiError::Server)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// GET /api/automations/:id/runs/:run_id/events — Get events for a specific automation run.

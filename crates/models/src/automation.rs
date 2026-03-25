@@ -40,12 +40,14 @@ pub enum RunStatus {
     Completed,
     /// Run failed with an error.
     Failed,
+    /// Run was cancelled by user.
+    Cancelled,
 }
 
 impl RunStatus {
     /// Whether this is a terminal state (no further transitions expected).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
@@ -151,5 +153,11 @@ impl AutomationRun {
         self.status = RunStatus::Failed;
         self.completed_at = Some(Utc::now());
         self.error = Some(error.into());
+    }
+
+    /// Mark the run as cancelled.
+    pub fn cancel(&mut self) {
+        self.status = RunStatus::Cancelled;
+        self.completed_at = Some(Utc::now());
     }
 }
