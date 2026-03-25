@@ -148,74 +148,85 @@ pub fn run_id_from_session(session_id: &str) -> Option<&str> {
 /// Both `TaskStateCompleted` and `TaskStateAwaitingMerge` are treated as successful
 /// completion — the agent may create a PR and wait for merge, which is a valid
 /// successful outcome for an automation run.
+///
+/// The `shutdown_rx` receiver allows graceful shutdown of the listener.
 pub fn spawn_automation_event_listener(
     event_bus: &EventBus,
     server: Arc<Server>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = event_bus.subscribe();
 
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Only care about automation sessions
-                    let run_id = match run_id_from_session(&event.task) {
-                        Some(id) => id.to_string(),
-                        None => continue,
-                    };
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            // Only care about automation sessions
+                            let run_id = match run_id_from_session(&event.task) {
+                                Some(id) => id.to_string(),
+                                None => continue,
+                            };
 
-                    match event.event_type {
-                        // Agent exited successfully (with or without a PR)
-                        events::EventType::TaskStateCompleted
-                        | events::EventType::TaskStateAwaitingMerge => {
-                            info!(
-                                run_id = %run_id,
-                                event_type = %event.event_type.as_str(),
-                                "automation session completed, marking run as complete"
-                            );
-                            if let Err(e) = server.complete_automation_run(&run_id, None).await {
-                                error!(
-                                    run_id = %run_id,
-                                    error = %e,
-                                    "failed to complete automation run"
-                                );
+                            match event.event_type {
+                                // Agent exited successfully (with or without a PR)
+                                events::EventType::TaskStateCompleted
+                                | events::EventType::TaskStateAwaitingMerge => {
+                                    info!(
+                                        run_id = %run_id,
+                                        event_type = %event.event_type.as_str(),
+                                        "automation session completed, marking run as complete"
+                                    );
+                                    if let Err(e) = server.complete_automation_run(&run_id, None).await {
+                                        error!(
+                                            run_id = %run_id,
+                                            error = %e,
+                                            "failed to complete automation run"
+                                        );
+                                    }
+                                }
+                                // Agent exited with failure
+                                events::EventType::TaskStateFailed => {
+                                    let reason = event
+                                        .data
+                                        .get("reason")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("session failed");
+                                    info!(
+                                        run_id = %run_id,
+                                        reason = %reason,
+                                        "automation session failed, marking run as failed"
+                                    );
+                                    if let Err(e) = server
+                                        .fail_automation_run(&run_id, reason.to_string())
+                                        .await
+                                    {
+                                        error!(
+                                            run_id = %run_id,
+                                            error = %e,
+                                            "failed to mark automation run as failed"
+                                        );
+                                    }
+                                }
+                                // Ignore all other event types
+                                _ => {}
                             }
                         }
-                        // Agent exited with failure
-                        events::EventType::TaskStateFailed => {
-                            let reason = event
-                                .data
-                                .get("reason")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("session failed");
-                            info!(
-                                run_id = %run_id,
-                                reason = %reason,
-                                "automation session failed, marking run as failed"
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!(
+                                skipped = n,
+                                "automation event listener lagged — {n} events dropped from broadcast channel"
                             );
-                            if let Err(e) = server
-                                .fail_automation_run(&run_id, reason.to_string())
-                                .await
-                            {
-                                error!(
-                                    run_id = %run_id,
-                                    error = %e,
-                                    "failed to mark automation run as failed"
-                                );
-                            }
                         }
-                        // Ignore all other event types
-                        _ => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            info!("event bus closed, automation event listener shutting down");
+                            break;
+                        }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    error!(
-                        skipped = n,
-                        "automation event listener lagged — {n} events dropped from broadcast channel"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!("event bus closed, automation event listener shutting down");
+                _ = shutdown_rx.recv() => {
+                    info!("automation event listener received shutdown signal");
                     break;
                 }
             }
