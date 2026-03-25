@@ -66,7 +66,10 @@ impl StdioTransport {
                         tracing::warn!(error = %e, line = %line, "malformed JSON from supervisor, discarding");
                     }
                 },
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(error = %e, "IO error reading from supervisor stdout");
+                    break;
+                }
             }
         }
     }
