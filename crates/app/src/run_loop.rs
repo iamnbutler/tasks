@@ -2194,7 +2194,6 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // The think loop collects events between ticks and passes them to
     // think() as recent_events so the orchestrator can see what happened.
 
-    let think_orch = orchestrator.clone();
     let think_server = server.clone();
     let think_event_bus = server.event_bus.clone();
 
