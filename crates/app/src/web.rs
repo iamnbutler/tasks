@@ -43,6 +43,8 @@ pub struct ApiState {
     pub automation_executor: Option<Arc<server::AutomationExecutor>>,
     pub update_state: Arc<UpdateState>,
     pub update_tx: tokio::sync::mpsc::Sender<()>,
+    pub blocked_repos: Vec<String>,
+    pub blocked_orgs: Vec<String>,
 }
 
 /// Build the API router.
@@ -499,6 +501,9 @@ async fn add_project(
             req.repo
         )));
     }
+    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &req.repo) {
+        return Err(ApiError::Forbidden(reason));
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let project = models::project::Project::new(&id, &req.repo);
     state.server.add_project(project.clone()).await;
@@ -551,6 +556,16 @@ async fn bootstrap_project(
         // Derive from prompt: take first few words, sanitize
         derive_repo_name(prompt)
     };
+
+    // Check blocklist before creating the repo to avoid orphaned repos
+    let owner_login = client
+        .get_authenticated_user_login()
+        .await
+        .map_err(ApiError::GitHubApi)?;
+    let prospective_full_name = format!("{owner_login}/{repo_name}");
+    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &prospective_full_name) {
+        return Err(ApiError::Forbidden(reason));
+    }
 
     // Create the repository
     let description_text;
@@ -1624,6 +1639,7 @@ async fn list_automation_run_events(
 enum ApiError {
     Server(server::ServerError),
     BadRequest(String),
+    Forbidden(String),
     MergeQueue(String),
     SessionManager(String),
     NotFound(String),
@@ -1640,6 +1656,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::Server(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::Forbidden(e) => (StatusCode::FORBIDDEN, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, e),

@@ -37,6 +37,12 @@ fn cmd_add_project(repo: &str) -> Result<(), String> {
         return Err(format!("Invalid repo format: {repo} (expected owner/repo)"));
     }
 
+    // Check blocklist (.env may not be loaded yet for CLI commands)
+    dotenvy::dotenv().ok();
+    if let Some(reason) = config::check_blocklist(repo) {
+        return Err(reason);
+    }
+
     let store = open_store()?;
     let project = Project::new(repo, repo);
     store

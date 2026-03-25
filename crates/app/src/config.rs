@@ -2,6 +2,24 @@
 
 use std::time::Duration;
 
+/// Parse a comma-separated env var into a lowercased, trimmed list of non-empty strings.
+fn parse_csv_env(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Load blocklist from env and check a repo against it.
+/// Returns an error message if blocked, `None` if allowed.
+pub fn check_blocklist(repo: &str) -> Option<String> {
+    let blocked_repos = parse_csv_env("BLOCKED_REPOS");
+    let blocked_orgs = parse_csv_env("BLOCKED_ORGS");
+    AppConfig::check_repo_blocked(&blocked_repos, &blocked_orgs, repo)
+}
+
 /// Top-level app configuration.
 pub struct AppConfig {
     /// Data directory (default: `~/.local/state/tasks`).
@@ -57,6 +75,10 @@ pub struct AppConfig {
     pub web: bool,
     /// Web server port (default: 4800).
     pub web_port: u16,
+    /// Blocked repositories (`owner/repo` patterns, from `BLOCKED_REPOS`).
+    pub blocked_repos: Vec<String>,
+    /// Blocked organizations (from `BLOCKED_ORGS`).
+    pub blocked_orgs: Vec<String>,
 }
 
 impl AppConfig {
@@ -170,6 +192,9 @@ impl AppConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300u64);
 
+        let blocked_repos = parse_csv_env("BLOCKED_REPOS");
+        let blocked_orgs = parse_csv_env("BLOCKED_ORGS");
+
         Ok(Self {
             data_dir,
             github_token,
@@ -199,6 +224,22 @@ impl AppConfig {
             update_check_interval: Duration::from_secs(update_check_interval_secs),
             update_auto_apply,
             update_session_timeout: Duration::from_secs(update_session_timeout_secs),
+            blocked_repos,
+            blocked_orgs,
         })
+    }
+
+    /// Check if a repo (`owner/repo`) is blocked. Returns an error message if blocked.
+    pub fn check_repo_blocked(blocked_repos: &[String], blocked_orgs: &[String], repo: &str) -> Option<String> {
+        let repo_lower = repo.to_lowercase();
+        if blocked_repos.contains(&repo_lower) {
+            return Some(format!("repository '{repo}' is blocked"));
+        }
+        if let Some(org) = repo_lower.split('/').next() {
+            if blocked_orgs.iter().any(|o| o == &org) {
+                return Some(format!("organization '{org}' is blocked"));
+            }
+        }
+        None
     }
 }

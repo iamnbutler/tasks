@@ -2011,6 +2011,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             automation_executor,
             update_state: update_state.clone(),
             update_tx: update_tx.clone(),
+            blocked_repos: config.blocked_repos.clone(),
+            blocked_orgs: config.blocked_orgs.clone(),
         };
         let web_port = config.web_port;
 
