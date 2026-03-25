@@ -611,7 +611,7 @@ async fn bootstrap_project(
     );
 
     let created_issue = client
-        .create_issue(owner, repo, &issue_title, Some(&issue_body), None)
+        .create_issue(owner, repo, &issue_title, Some(&issue_body), None, None)
         .await
         .map_err(ApiError::GitHubApi)?;
 
@@ -722,7 +722,7 @@ async fn create_issue(
     };
 
     let created = client
-        .create_issue(&owner, &repo, &req.title, req.body.as_deref(), labels)
+        .create_issue(&owner, &repo, &req.title, req.body.as_deref(), labels, None)
         .await
         .map_err(ApiError::GitHubApi)?;
 

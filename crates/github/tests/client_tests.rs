@@ -930,3 +930,327 @@ async fn get_pr_diff_truncates_large_diffs() {
     assert!(diff.len() < 150_000);
     assert!(diff.contains("[diff truncated"));
 }
+
+// ---------------------------------------------------------------------------
+// Post issue comment tests (#478 — write operations)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn post_issue_comment_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/comments"))
+        .and(body_string_contains("\"body\":\"Hello from the orchestrator\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 100,
+            "body": "Hello from the orchestrator",
+            "html_url": "https://github.com/owner/repo/issues/42#issuecomment-100"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let comment = client
+        .post_issue_comment("owner", "repo", 42, "Hello from the orchestrator")
+        .await
+        .unwrap();
+
+    assert_eq!(comment.id, 100);
+    assert_eq!(comment.body, "Hello from the orchestrator");
+    assert!(comment.html_url.contains("issuecomment-100"));
+}
+
+#[tokio::test]
+async fn post_issue_comment_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/999/comments"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .post_issue_comment("owner", "repo", 999, "test")
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn post_issue_comment_auth_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/comments"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .post_issue_comment("owner", "repo", 42, "test")
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn post_issue_comment_validation_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/comments"))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_string("Validation Failed: body is too long"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .post_issue_comment("owner", "repo", 42, "test")
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Validation(_))));
+}
+
+// ---------------------------------------------------------------------------
+// Update issue tests (#478 — write operations)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn update_issue_all_fields() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/42"))
+        .and(body_string_contains("\"title\":\"Updated title\""))
+        .and(body_string_contains("\"state\":\"closed\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Updated title",
+            "body": "Updated body",
+            "html_url": "https://github.com/owner/repo/issues/42",
+            "state": "closed"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string(), "urgent".to_string()];
+    let updated = client
+        .update_issue(
+            "owner",
+            "repo",
+            42,
+            Some("Updated title"),
+            Some("Updated body"),
+            Some("closed"),
+            Some(&labels),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.number, 42);
+    assert_eq!(updated.title, "Updated title");
+    assert_eq!(updated.state, "closed");
+}
+
+#[tokio::test]
+async fn update_issue_partial_fields() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/42"))
+        .and(body_string_contains("\"state\":\"closed\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 42,
+            "title": "Original title",
+            "body": null,
+            "html_url": "https://github.com/owner/repo/issues/42",
+            "state": "closed"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let updated = client
+        .update_issue("owner", "repo", 42, None, None, Some("closed"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(updated.number, 42);
+    assert_eq!(updated.state, "closed");
+}
+
+#[tokio::test]
+async fn update_issue_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/999"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .update_issue("owner", "repo", 999, Some("title"), None, None, None)
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn update_issue_auth_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/42"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .update_issue("owner", "repo", 42, Some("title"), None, None, None)
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn update_issue_validation_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/42"))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_string("Validation Failed"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let result = client
+        .update_issue("owner", "repo", 42, Some(""), None, None, None)
+        .await;
+
+    assert!(matches!(result, Err(GitHubError::Validation(_))));
+}
+
+// ---------------------------------------------------------------------------
+// Add labels tests (#478 — write operations)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn add_labels_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/labels"))
+        .and(body_string_contains("\"labels\""))
+        .and(body_string_contains("\"bug\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "name": "bug", "color": "d73a4a" },
+            { "name": "enhancement", "color": "a2eeef" }
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string(), "enhancement".to_string()];
+    let result = client.add_labels("owner", "repo", 42, &labels).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn add_labels_not_found() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/999/labels"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string()];
+    let result = client.add_labels("owner", "repo", 999, &labels).await;
+
+    assert!(matches!(result, Err(GitHubError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn add_labels_auth_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/labels"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string()];
+    let result = client.add_labels("owner", "repo", 42, &labels).await;
+
+    assert!(matches!(result, Err(GitHubError::Auth(_))));
+}
+
+#[tokio::test]
+async fn add_labels_validation_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/42/labels"))
+        .respond_with(
+            ResponseTemplate::new(422).set_body_string("Validation Failed"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string()];
+    let result = client.add_labels("owner", "repo", 42, &labels).await;
+
+    assert!(matches!(result, Err(GitHubError::Validation(_))));
+}
+
+// ---------------------------------------------------------------------------
+// Create issue with assignees tests (#478 — write operations)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_issue_with_assignees() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues"))
+        .and(body_string_contains("\"assignees\""))
+        .and(body_string_contains("\"alice\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "number": 99,
+            "title": "New issue",
+            "body": "Issue body",
+            "html_url": "https://github.com/owner/repo/issues/99",
+            "state": "open"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = mock_client(&server.uri());
+    let labels = vec!["bug".to_string()];
+    let assignees = vec!["alice".to_string()];
+    let created = client
+        .create_issue("owner", "repo", "New issue", Some("Issue body"), Some(&labels), Some(&assignees))
+        .await
+        .unwrap();
+
+    assert_eq!(created.number, 99);
+    assert_eq!(created.title, "New issue");
+}

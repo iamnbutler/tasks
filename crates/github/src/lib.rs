@@ -14,6 +14,6 @@ pub mod poller;
 mod queries;
 mod response;
 
-pub use client::{CreatedIssue, GitHubClient};
+pub use client::{CreatedComment, CreatedIssue, GitHubClient, UpdatedIssue};
 pub use error::GitHubError;
 pub use poller::{PollResult, RepoPoller};
