@@ -14,6 +14,8 @@ import {
   Clock,
   Activity,
   MessageSquare,
+  HelpCircle,
+  Brain,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -100,7 +102,7 @@ function sourceDisplay(task: Task) {
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "session_boundary";
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "agent_question" | "orchestrator_answer" | "session_boundary";
   content: string;
   toolName?: string;
   filePath?: string;
@@ -145,10 +147,24 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       continue;
     }
 
+    if (event.type === "agent:question") {
+      const question = (event.data?.question ?? event.data?.message ?? event.data?.text) as string | undefined;
+      if (question) {
+        blocks.push({ kind: "agent_question", content: question, timestamp: event.ts });
+      }
+      continue;
+    }
+
     if (event.type === "human:message") {
       const message = event.data?.message as string | undefined;
+      const source = event.data?.source as string | undefined;
       if (message) {
-        blocks.push({ kind: "human_message", content: message, timestamp: event.ts });
+        // Orchestrator answers come as human:message with source "orchestrator_answer"
+        blocks.push({
+          kind: source === "orchestrator_answer" ? "orchestrator_answer" : "human_message",
+          content: message,
+          timestamp: event.ts,
+        });
       }
       continue;
     }
@@ -291,6 +307,32 @@ function BlockView({ block }: { block: ParsedBlock }) {
     );
   }
 
+  if (block.kind === "agent_question") {
+    return (
+      <div className="rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2">
+        <div className="flex items-center gap-2 text-xs text-violet-400 mb-1">
+          <HelpCircle className="h-3 w-3" />
+          <span className="font-medium">Agent is asking a question</span>
+          {timestamp && <span className="text-muted-foreground ml-auto">{timestamp}</span>}
+        </div>
+        <p className="text-sm text-violet-300">{block.content}</p>
+      </div>
+    );
+  }
+
+  if (block.kind === "orchestrator_answer") {
+    return (
+      <div className="rounded-md border border-orange-500/30 bg-orange-500/10 px-3 py-2">
+        <div className="flex items-center gap-2 text-xs text-orange-400 mb-1">
+          <Brain className="h-3 w-3" />
+          <span className="font-medium">Orchestrator answered</span>
+          {timestamp && <span className="text-muted-foreground ml-auto">{timestamp}</span>}
+        </div>
+        <p className="text-sm text-orange-300/90 whitespace-pre-wrap">{block.content}</p>
+      </div>
+    );
+  }
+
   if (block.kind === "session_boundary") {
     return (
       <div className="flex items-center gap-2 py-3 text-sm text-yellow-500">
@@ -370,6 +412,7 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       e.type === "agent:question" ||
       e.type === "agent:error" ||
       e.type === "human:message" ||
+      e.type === "orchestrator:feedback" ||
       e.type.startsWith("task:");
 
     fetchTaskEvents(taskId).then((events) => {
