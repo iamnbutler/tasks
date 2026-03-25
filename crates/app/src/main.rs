@@ -37,6 +37,24 @@ fn cmd_add_project(repo: &str) -> Result<(), String> {
         return Err(format!("Invalid repo format: {repo} (expected owner/repo)"));
     }
 
+    // Check blocklist (load env vars; .env may not be loaded yet for CLI commands)
+    dotenvy::dotenv().ok();
+    let blocked_repos: Vec<String> = std::env::var("BLOCKED_REPOS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let blocked_orgs: Vec<String> = std::env::var("BLOCKED_ORGS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(reason) = AppConfig::check_repo_blocked(&blocked_repos, &blocked_orgs, repo) {
+        return Err(reason);
+    }
+
     let store = open_store()?;
     let project = Project::new(repo, repo);
     store

@@ -43,6 +43,8 @@ pub struct ApiState {
     pub automation_executor: Option<Arc<server::AutomationExecutor>>,
     pub update_state: Arc<UpdateState>,
     pub update_tx: tokio::sync::mpsc::Sender<()>,
+    pub blocked_repos: Vec<String>,
+    pub blocked_orgs: Vec<String>,
 }
 
 /// Build the API router.
@@ -499,6 +501,9 @@ async fn add_project(
             req.repo
         )));
     }
+    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &req.repo) {
+        return Err(ApiError::Forbidden(reason));
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let project = models::project::Project::new(&id, &req.repo);
     state.server.add_project(project.clone()).await;
@@ -565,6 +570,11 @@ async fn bootstrap_project(
         .create_repository(&repo_name, description)
         .await
         .map_err(ApiError::GitHubApi)?;
+
+    // Check blocklist against the created repo's full name
+    if let Some(reason) = crate::config::AppConfig::check_repo_blocked(&state.blocked_repos, &state.blocked_orgs, &created_repo.full_name) {
+        return Err(ApiError::Forbidden(reason));
+    }
 
     // Add the project to tracking
     let project_id = uuid::Uuid::new_v4().to_string();
@@ -1624,6 +1634,7 @@ async fn list_automation_run_events(
 enum ApiError {
     Server(server::ServerError),
     BadRequest(String),
+    Forbidden(String),
     MergeQueue(String),
     SessionManager(String),
     NotFound(String),
@@ -1640,6 +1651,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::Server(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
+            ApiError::Forbidden(e) => (StatusCode::FORBIDDEN, e),
             ApiError::MergeQueue(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::SessionManager(e) => (StatusCode::BAD_REQUEST, e),
             ApiError::NotFound(e) => (StatusCode::NOT_FOUND, e),
