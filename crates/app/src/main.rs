@@ -24,11 +24,60 @@ fn data_dir() -> String {
     })
 }
 
+fn db_path() -> String {
+    format!("{}/db.sqlite", data_dir())
+}
+
 fn open_store() -> Result<Store, String> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create data dir: {e}"))?;
-    let db_path = format!("{dir}/db.sqlite");
-    Store::open(&db_path).map_err(|e| format!("Failed to open store: {e}"))
+    Store::open(db_path()).map_err(|e| format!("Failed to open store: {e}"))
+}
+
+/// Check whether the stored data version matches the expected version.
+/// If there is a mismatch, prompt the user to clear and rebuild local data.
+/// Returns the opened store on success.
+fn open_store_with_version_check() -> Result<Store, String> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create data dir: {e}"))?;
+    let db = db_path();
+
+    // Only check version if the database file already exists
+    if std::path::Path::new(&db).exists() {
+        if let Some((stored, expected)) = Store::check_version(&db)
+            .map_err(|e| format!("Failed to check data version: {e}"))?
+        {
+            eprintln!(
+                "Local data version mismatch: stored v{stored}, expected v{expected}."
+            );
+            eprintln!(
+                "The data format has changed and local data needs to be cleared."
+            );
+            eprintln!(
+                "This will remove cached tasks, merge queue entries, and event logs."
+            );
+            eprintln!("Projects will be re-imported from GitHub on the next poll cycle.");
+            eprintln!();
+
+            if std::env::var("TASKS_CLEAR_DATA").as_deref() == Ok("1") {
+                eprintln!("TASKS_CLEAR_DATA=1 detected — clearing automatically.");
+            } else {
+                eprint!("Clear local data and continue? [y/N] ");
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| format!("Failed to read input: {e}"))?;
+                if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
+                    return Err("Aborted. Local data was not modified.".to_string());
+                }
+            }
+
+            return Store::clear_and_reopen(&db, &dir)
+                .map_err(|e| format!("Failed to clear and reopen store: {e}"));
+        }
+    }
+
+    Store::open(&db).map_err(|e| format!("Failed to open store: {e}"))
 }
 
 fn cmd_add_project(repo: &str) -> Result<(), String> {
@@ -326,6 +375,12 @@ async fn main() {
             };
             if args.iter().any(|a| a == "--web") {
                 config.web = true;
+            }
+            // Check data version before starting the run loop (issue #452).
+            // This prompts the user if a version mismatch is detected.
+            if let Err(e) = open_store_with_version_check() {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
             match run_loop::run(config).await {
                 Ok(run_loop::RunResult::Normal) => Ok(()),

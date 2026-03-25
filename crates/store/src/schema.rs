@@ -2,6 +2,22 @@
 
 use rusqlite::Connection;
 
+/// Current data schema version. Bump this when making incompatible schema changes
+/// that require a full data reset rather than an incremental migration.
+pub const DATA_VERSION: u32 = 1;
+
+/// Read the stored data version from SQLite's `user_version` pragma.
+/// Returns 0 if no version has been set (fresh database).
+pub fn read_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+/// Write the data version to SQLite's `user_version` pragma.
+pub fn write_version(conn: &Connection, version: u32) -> Result<(), rusqlite::Error> {
+    conn.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
+
 /// Create tables if they don't exist.
 pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -205,6 +221,9 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             return Err(e);
         }
     }
+
+    // Stamp the current data version so future runs can detect mismatches.
+    write_version(conn, DATA_VERSION)?;
 
     Ok(())
 }

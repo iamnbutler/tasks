@@ -8,6 +8,7 @@ mod accounting;
 mod schema;
 
 pub use accounting::{AccountingSummary, TaskAccounting};
+pub use schema::DATA_VERSION;
 
 use std::path::Path;
 
@@ -25,6 +26,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Persistent storage backed by SQLite (spec §3.5).
@@ -36,6 +39,59 @@ pub struct Store {
 }
 
 impl Store {
+    /// Check the stored data version without fully initializing the schema.
+    ///
+    /// Returns `Ok(None)` if the database is new (version 0).
+    /// Returns `Ok(Some((stored, expected)))` if there is a mismatch.
+    /// Returns `Ok(None)` if versions match.
+    pub fn check_version(path: impl AsRef<Path>) -> Result<Option<(u32, u32)>, StoreError> {
+        let conn = Connection::open(path)?;
+        let stored = schema::read_version(&conn)?;
+        if stored == 0 || stored == schema::DATA_VERSION {
+            Ok(None)
+        } else {
+            Ok(Some((stored, schema::DATA_VERSION)))
+        }
+    }
+
+    /// Delete the database file and event log directory, then open a fresh store.
+    ///
+    /// Returns an error if the primary database file cannot be removed.
+    /// WAL/SHM files and the events directory are removed on a best-effort basis.
+    pub fn clear_and_reopen(db_path: impl AsRef<Path>, data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let db = db_path.as_ref();
+        let data = data_dir.as_ref();
+
+        // Remove the primary SQLite database file (propagate errors)
+        if db.exists() {
+            std::fs::remove_file(db)?;
+        }
+
+        // Remove WAL/SHM files on best-effort basis (auxiliary files)
+        for ext in &["-wal", "-shm"] {
+            let mut p = db.as_os_str().to_owned();
+            p.push(ext);
+            let path = std::path::Path::new(&p);
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(path = ?path, error = %e, "failed to remove auxiliary db file");
+                }
+            }
+        }
+
+        // Remove the event log directory on best-effort basis
+        let events_dir = data.join("events");
+        if events_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&events_dir) {
+                tracing::warn!(path = ?events_dir, error = %e, "failed to remove events directory");
+            }
+        }
+
+        tracing::info!("cleared local data for version upgrade");
+
+        Self::open(db)
+    }
+
     /// Open or create a store at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
@@ -1628,5 +1684,73 @@ mod tests {
         let updated = store.get_automation_run("r1").unwrap().unwrap();
         assert_eq!(updated.status, RunStatus::Completed);
         assert_eq!(updated.output, Some("Output text".to_string()));
+    }
+
+    #[test]
+    fn test_data_version_stamped_on_init() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        // Before init, version is 0
+        assert_eq!(schema::read_version(&conn).unwrap(), 0);
+        schema::initialize(&conn).unwrap();
+        // After init, version matches DATA_VERSION
+        assert_eq!(schema::read_version(&conn).unwrap(), schema::DATA_VERSION);
+    }
+
+    #[test]
+    fn test_check_version_fresh_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.sqlite");
+        // Fresh DB (doesn't exist yet) — no mismatch
+        assert!(Store::check_version(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_check_version_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.sqlite");
+        // Create and initialize
+        Store::open(&db).unwrap();
+        // Version should match
+        assert!(Store::check_version(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_check_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.sqlite");
+        // Create DB with a different version
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 999u32).unwrap();
+        }
+        let result = Store::check_version(&db).unwrap();
+        assert_eq!(result, Some((999, schema::DATA_VERSION)));
+    }
+
+    #[test]
+    fn test_clear_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.sqlite");
+
+        // Create a store with some data
+        {
+            let store = Store::open(&db).unwrap();
+            let project = models::project::Project::new("test/repo", "test/repo");
+            store.save_project(&project).unwrap();
+            assert_eq!(store.list_projects().unwrap().len(), 1);
+        }
+
+        // Create events dir to verify it gets cleaned up
+        let events = dir.path().join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        std::fs::write(events.join("dummy.jsonl"), "{}").unwrap();
+
+        // Clear and reopen
+        let store = Store::clear_and_reopen(&db, dir.path()).unwrap();
+        // Data should be gone
+        assert_eq!(store.list_projects().unwrap().len(), 0);
+        // Events dir should be gone
+        assert!(!events.exists());
     }
 }
