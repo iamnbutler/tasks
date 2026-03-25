@@ -141,10 +141,7 @@ impl EventStore {
                 task_id,
                 total_events = events.len(),
                 skipped,
-                "read {} events for task {} ({} lines skipped due to corruption)",
-                events.len(),
-                task_id,
-                skipped,
+                "completed read with corrupted lines skipped"
             );
         }
 
