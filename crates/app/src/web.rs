@@ -791,7 +791,10 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
                     }
                 }
                 Err(e) => {
-                    tracing::error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR during flush");
+                    tracing::error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR during flush, reverting to Approved for retry");
+                    if let Err(e) = state.server.revert_entry_to_approved(entry_id, pr_url).await {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to revert entry to Approved after flush failure");
+                    }
                 }
             }
         }
@@ -857,7 +860,10 @@ async fn approve_merge(
                         }
                     }
                     Err(e) => {
-                        tracing::error!(entry_id = %id, pr_url = %pr_url, error = %e, "failed to merge PR after approval");
+                        tracing::error!(entry_id = %id, pr_url = %pr_url, error = %e, "failed to merge PR after approval, reverting to Approved for retry");
+                        if let Err(e) = state.server.revert_entry_to_approved(&id, &pr_url).await {
+                            tracing::error!(entry_id = %id, error = %e, "failed to revert entry to Approved");
+                        }
                     }
                 }
             }

@@ -1524,6 +1524,55 @@ impl Server {
         Ok(())
     }
 
+    /// Revert a merge queue entry from Merging back to Approved after a transient
+    /// GitHub API failure. This preserves the approval intent so the reconciliation
+    /// loop or next eval tick can retry the merge.
+    pub async fn revert_entry_to_approved(
+        &self,
+        entry_id: &str,
+        pr_url: &str,
+    ) -> Result<(), ServerError> {
+        let task_id = {
+            let mut state = self.state.write().await;
+            state
+                .merge_queue
+                .revert_to_approved(entry_id)
+                .map_err(|e| ServerError::StoreError(e.to_string()))?;
+            let entry = state.merge_queue.get(entry_id)
+                .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            entry.task_id.clone()
+        };
+
+        // Persist status change (clone entry to avoid holding store lock across await)
+        if let Some(ref store) = self.store {
+            let entry_clone = {
+                let state = self.state.read().await;
+                state.merge_queue.get(entry_id).cloned()
+            };
+            if let Some(entry) = entry_clone {
+                if let Ok(store) = store.lock() {
+                    if let Err(e) = store.save_merge_entry(&entry) {
+                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
+                    }
+                }
+            }
+        }
+
+        let event = Event::new(
+            EventType::MergeApproved,
+            &task_id,
+            Actor::System,
+            serde_json::json!({
+                "entry_id": entry_id,
+                "pr_url": pr_url,
+                "retry": true,
+                "reason": "reverted from Merging after transient GitHub API failure",
+            }),
+        );
+        self.event_bus.publish(event).await?;
+        Ok(())
+    }
+
     /// Mark a merge queue entry as merged and transition the linked task
     /// to Completed. Emits `merge:completed` and `task:state:completed`.
     pub async fn mark_entry_merged(

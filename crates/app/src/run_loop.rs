@@ -720,6 +720,57 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             _ => {} // No changes
                         }
 
+                        // --- Retry approved merges (issue #467) ---
+                        //
+                        // In Play mode, pick up any Approved entries that haven't
+                        // transitioned to Merging/Merged yet. This handles the case
+                        // where a merge was reverted to Approved after a transient
+                        // GitHub API failure.
+                        if poll_server.mode().await == server::Mode::Play {
+                            let approved_entries: Vec<(String, String)> = {
+                                let state = poll_server.state.read().await;
+                                state.merge_queue.approved().iter().map(|e| {
+                                    (e.id.clone(), e.pr_url.clone())
+                                }).collect()
+                            };
+
+                            if !approved_entries.is_empty() {
+                                let retry_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+                                if !retry_token.is_empty() {
+                                    let retry_client = GitHubClient::new(&retry_token);
+                                    for (entry_id, pr_url) in &approved_entries {
+                                        if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+                                            info!(entry_id = %entry_id, pr_url = %pr_url, "retrying merge for approved entry");
+                                            if let Err(e) = poll_server.mark_entry_merging(entry_id, pr_url).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging for retry");
+                                                continue;
+                                            }
+                                            match retry_client.merge_pull_request(&owner, &repo, number).await {
+                                                Ok(true) => {
+                                                    info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged on retry");
+                                                    if let Err(e) = poll_server.mark_entry_merged(entry_id, pr_url).await {
+                                                        error!(entry_id = %entry_id, error = %e, "failed to mark entry merged on retry");
+                                                    }
+                                                }
+                                                Ok(false) => {
+                                                    warn!(entry_id = %entry_id, pr_url = %pr_url, "PR not mergeable on retry");
+                                                    if let Err(e) = poll_server.mark_entry_conflict(entry_id, pr_url, None).await {
+                                                        error!(entry_id = %entry_id, error = %e, "failed to mark entry conflict on retry");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "merge retry failed, will retry next poll cycle");
+                                                    if let Err(e) = poll_server.revert_entry_to_approved(entry_id, pr_url).await {
+                                                        error!(entry_id = %entry_id, error = %e, "failed to revert entry to Approved on retry failure");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // --- PR closure: transition linked tasks (spec §11.3) ---
                         //
                         // When a PR is merged/closed externally, transition the linked
@@ -2077,7 +2128,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     }
                                 }
                                 Err(e) => {
-                                    error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR on GitHub");
+                                    error!(entry_id = %entry_id, pr_url = %pr_url, error = %e, "failed to merge PR on GitHub, reverting to Approved for retry");
+                                    if let Err(e) = orch_server.revert_entry_to_approved(&entry_id, &pr_url).await {
+                                        error!(entry_id = %entry_id, error = %e, "failed to revert entry to Approved");
+                                    }
                                 }
                             }
                         } else {

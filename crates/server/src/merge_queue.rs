@@ -135,6 +135,15 @@ impl MergeQueue {
         Ok(())
     }
 
+    /// Revert a Merging entry back to Approved (for retry after transient failures).
+    pub fn revert_to_approved(&mut self, id: &str) -> Result<(), MergeQueueError> {
+        let entry = self
+            .get_mut(id)
+            .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
+        entry.status = MergeStatus::Approved;
+        Ok(())
+    }
+
     /// Reject an entry (spec Section 7.1 step 5).
     pub fn reject(&mut self, id: &str) -> Result<(), MergeQueueError> {
         let entry = self
@@ -391,6 +400,26 @@ mod tests {
         assert!(q.collect_approved_for_flush(Mode::Stop).is_err());
         assert!(q.collect_approved_for_flush(Mode::Play).is_err());
         assert!(q.collect_approved_for_flush(Mode::Pause).is_ok());
+    }
+
+    #[test]
+    fn revert_merging_to_approved() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.approve("m1").unwrap();
+        q.mark_merging("m1").unwrap();
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Merging);
+
+        // Revert to Approved after transient failure
+        q.revert_to_approved("m1").unwrap();
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Approved);
+        assert_eq!(q.approved().len(), 1);
+    }
+
+    #[test]
+    fn revert_not_found() {
+        let mut q = MergeQueue::new();
+        assert!(q.revert_to_approved("nonexistent").is_err());
     }
 
     #[test]
