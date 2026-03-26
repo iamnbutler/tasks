@@ -213,7 +213,10 @@ impl Orchestrator for ClaudeOrchestrator {
         let pass1 = self.parse_evaluation_response(&response_text)?;
 
         // If pass 1 is decisive (no deeper review needed), return immediately
-        if !pass1.needs_deeper_review || pass1.files_to_review.is_none() {
+        if !pass1.needs_deeper_review
+            || pass1.files_to_review.is_none()
+            || pass1.files_to_review.as_ref().is_some_and(|f| f.is_empty())
+        {
             info!(
                 approved = pass1.approved,
                 has_feedback = pass1.feedback.is_some(),
