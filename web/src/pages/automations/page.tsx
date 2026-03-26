@@ -16,6 +16,7 @@ import {
   Workflow,
   Zap,
 } from "lucide-react";
+import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
 import { deleteAutomation, triggerAutomation, updateAutomation } from "@/lib/api";
 import { cn, formatRelativeTime } from "@/lib/utils";
@@ -143,8 +144,8 @@ function AutomationRow({
       // Immediately refresh the runs panel to show the new running state
       // Use a small delay to ensure the panel has mounted if it wasn't selected before
       setTimeout(() => onRefreshRuns(), 50);
-    } catch (error) {
-      console.error("Failed to run automation:", error);
+    } catch {
+      toast.error("Failed to run automation");
     } finally {
       setRunning(false);
     }
@@ -155,8 +156,8 @@ function AutomationRow({
       const newState: AutomationState = automation.state === "active" ? "paused" : "active";
       await updateAutomation(automation.id, { state: newState });
       await onRefresh();
-    } catch (error) {
-      console.error("Failed to toggle automation state:", error);
+    } catch {
+      toast.error("Failed to toggle automation state");
     }
   }
 
@@ -166,8 +167,8 @@ function AutomationRow({
       await deleteAutomation(automation.id);
       await onRefresh();
       setDeleteOpen(false);
-    } catch (error) {
-      console.error("Failed to delete automation:", error);
+    } catch {
+      toast.error("Failed to delete automation");
     } finally {
       setDeleting(false);
     }

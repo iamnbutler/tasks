@@ -1,4 +1,5 @@
 import { Routes, Route } from "react-router-dom";
+import { Toaster } from "sonner";
 import { AppStateProvider } from "@/hooks/use-app-state";
 import { Layout } from "@/components/layout";
 import { DashboardPage } from "@/pages/dashboard/page";
@@ -14,6 +15,7 @@ import { EventsPage } from "@/pages/events/page";
 export function App() {
   return (
     <AppStateProvider>
+      <Toaster theme="dark" position="bottom-right" />
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<DashboardPage />} />

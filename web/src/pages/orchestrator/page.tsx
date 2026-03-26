@@ -10,6 +10,7 @@ import {
   Sparkles,
   HelpCircle,
 } from "lucide-react";
+import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
 import { sendOrchestratorChat } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
@@ -521,8 +522,9 @@ export function OrchestratorPage() {
     setChatInput("");
     try {
       await sendOrchestratorChat(text);
-    } catch (e) {
-      console.error("Failed to send orchestrator message:", e);
+    } catch {
+      setChatInput(text);
+      toast.error("Failed to send message to orchestrator");
     } finally {
       setSending(false);
     }

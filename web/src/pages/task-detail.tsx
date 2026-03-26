@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
 import { cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
@@ -473,7 +474,8 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
     try {
       await sendChat(taskId, text);
     } catch {
-      // Message will show via SSE if it worked
+      setChatInput(text);
+      toast.error("Failed to send message to agent");
     } finally {
       setSending(false);
     }
@@ -843,7 +845,7 @@ export function TaskDetailPage() {
     try {
       await cancelTask(id);
     } catch {
-      // Error will be reflected in task state change via SSE
+      toast.error("Failed to cancel task");
     } finally {
       setCancelling(false);
     }
