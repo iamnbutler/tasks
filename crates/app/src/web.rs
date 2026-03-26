@@ -874,11 +874,11 @@ async fn reject_merge(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let mut server_state = state.server.state.write().await;
-    server_state
-        .merge_queue
-        .reject(&id)
-        .map_err(|e| ApiError::MergeQueue(e.to_string()))?;
+    state
+        .server
+        .reject_merge_entry(&id, "Rejected via API", None)
+        .await
+        .map_err(ApiError::Server)?;
     Ok(StatusCode::OK)
 }
 
