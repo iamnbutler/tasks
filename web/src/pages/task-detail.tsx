@@ -16,6 +16,7 @@ import {
   MessageSquare,
   HelpCircle,
   Brain,
+  AlertTriangle,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -404,6 +405,7 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
   const [sending, setSending] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [hasNewMessages, setHasNewMessages] = useState(false);
+  const [parseErrors, setParseErrors] = useState(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -427,8 +429,9 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
         if (isRelevant(event)) {
           setRawEvents((prev) => [...prev, event]);
         }
-      } catch {
-        // ignore
+      } catch (err) {
+        console.warn("[SSE] Failed to parse event:", msg.data, err);
+        setParseErrors((n) => n + 1);
       }
     };
     return () => source.close();
@@ -498,6 +501,16 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
           {blocks.map((block, i) => (
             <BlockView key={i} block={block} />
           ))}
+          {parseErrors > 0 && (
+            <div className="flex items-center gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-400">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>
+                {parseErrors === 1
+                  ? "1 event could not be loaded"
+                  : `${parseErrors} events could not be loaded`}
+              </span>
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
         {hasNewMessages && (
@@ -637,6 +650,7 @@ function formatTimelineTime(ts: string): string {
 function EventTimeline({ taskId }: { taskId: string }) {
   const [events, setEvents] = useState<Event[]>([]);
   const [isOpen, setIsOpen] = useState(false);
+  const [parseErrors, setParseErrors] = useState(0);
 
   useEffect(() => {
     fetchTaskEvents(taskId).then((allEvents) => {
@@ -648,8 +662,9 @@ function EventTimeline({ taskId }: { taskId: string }) {
       try {
         const event: Event = JSON.parse(msg.data);
         setEvents((prev) => [...prev, event]);
-      } catch {
-        // ignore
+      } catch (err) {
+        console.warn("[SSE] Failed to parse timeline event:", msg.data, err);
+        setParseErrors((n) => n + 1);
       }
     };
     return () => source.close();
@@ -696,6 +711,16 @@ function EventTimeline({ taskId }: { taskId: string }) {
               </div>
             </div>
           ))}
+          {parseErrors > 0 && (
+            <div className="flex items-center gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-400 mt-2">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>
+                {parseErrors === 1
+                  ? "1 event could not be loaded"
+                  : `${parseErrors} events could not be loaded`}
+              </span>
+            </div>
+          )}
         </div>
       </CollapsibleContent>
     </Collapsible>
