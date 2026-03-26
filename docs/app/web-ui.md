@@ -85,6 +85,19 @@ Click a task to view its detail page. The detail view is split into tabs:
 
 A **Properties** sidebar on the right shows metadata (state, project, created date) and the task event timeline.
 
+#### Chat Block Types
+
+The Chat tab renders different block styles for different message sources:
+
+| Block | Appearance | Description |
+|-------|-----------|-------------|
+| Agent text | Default | Normal agent output |
+| Human message | Default | Messages you sent |
+| **Agent question** | Violet border | Agent paused and asked a question (needs your response) |
+| **Orchestrator answer** | Orange border | Orchestrator answered the agent's question automatically |
+| Tool use / result | Monospace | Tool calls and their outputs |
+| Session boundary | Divider | Marks start of a new agent session |
+
 ## Merge Queue
 
 The merge queue shows PRs awaiting human review.
@@ -104,7 +117,7 @@ For each entry:
 
 - **Approve** - Mark ready for merge. In Play mode, triggers an immediate GitHub merge. In Pause mode, entry waits for flush.
 - **Reject** - Decline the changes
-- **Request Changes** - Ask for modifications with specific feedback; the task gets priority re-dispatch
+- **Request Changes** - Ask for modifications with specific feedback; the task gets priority re-dispatch. The feedback text is shown inline under the PR link in the queue row.
 
 ### Flush
 
@@ -121,6 +134,16 @@ Events appear as context-rich messages including:
 - **Decisions** - e.g., "Approving 'Fix login bug' (#42) in owner/repo"
 - **Feedback** - Orchestrator comments on work quality
 - **Escalations** - Issues requiring human intervention, with actionable context and PR links
+- **Thoughts** - Stream-of-consciousness narration from the orchestrator's periodic reasoning loop
+- **Question Answers** - Responses the orchestrator sent to a stuck agent
+
+#### Escalation Types
+
+| Action | Description |
+|--------|-------------|
+| `conflict_needs_human` | A merge conflict requires human resolution |
+| `mode_lowered` | Mode was reduced due to repeated failures |
+| `agent_question` | An agent is stuck and needs human input; check the task detail view to respond |
 
 ### Chat
 

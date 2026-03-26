@@ -69,6 +69,14 @@ BLOCKED_REPOS=example/private-repo,example/other-repo
 BLOCKED_ORGS=competitor-org
 ```
 
+### Data Management
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_CLEAR_DATA` | Set to `1` to automatically clear local data on startup when a version mismatch is detected, without prompting | _(unset)_ |
+
+When the stored database version does not match the expected version, `cargo run -- run` will prompt interactively. Setting `TASKS_CLEAR_DATA=1` suppresses the prompt and clears automatically — useful in CI or unattended environments.
+
 ### Desktop App
 
 | Variable | Description | Default |
