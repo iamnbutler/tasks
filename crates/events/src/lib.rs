@@ -8,5 +8,5 @@ mod store;
 mod bus;
 
 pub use event::{Event, EventType, Actor};
-pub use store::{EventStore, StoreError, EVENT_FORMAT_VERSION};
+pub use store::{EventStore, RetentionPolicy, StoreError, EVENT_FORMAT_VERSION};
 pub use bus::{EventBus, matches_pattern, matches_task};

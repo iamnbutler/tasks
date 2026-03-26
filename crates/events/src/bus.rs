@@ -77,6 +77,20 @@ impl EventBus {
     pub async fn list_tasks(&self) -> Result<Vec<String>, StoreError> {
         self.store.list_tasks().await
     }
+
+    /// Compact all task event logs according to the retention policy.
+    ///
+    /// Returns the total number of events removed.
+    pub async fn compact(&self) -> Result<usize, StoreError> {
+        self.store.compact_all().await
+    }
+
+    /// Remove orphaned (empty) task directories.
+    ///
+    /// Returns the number of directories removed.
+    pub async fn cleanup_orphaned_tasks(&self) -> Result<usize, StoreError> {
+        self.store.cleanup_orphaned_tasks().await
+    }
 }
 
 /// Filter events by pattern.
