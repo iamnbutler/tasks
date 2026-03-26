@@ -13,7 +13,9 @@ pub use schema::DATA_VERSION;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::params;
 use models::automation::{Automation, AutomationRun, AutomationState, RunStatus, TriggerType};
 use models::merge_queue::{MergeQueueEntry, MergeStatus};
 use models::project::Project;
@@ -28,14 +30,17 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("pool error: {0}")]
+    Pool(#[from] r2d2::Error),
 }
 
 /// Persistent storage backed by SQLite (spec §3.5).
 ///
-/// Stores projects, tasks, and merge queue entries. The event log
-/// is stored separately as JSONL files (handled by the events crate).
+/// Uses a connection pool (r2d2) with WAL mode so reads don't block
+/// each other and aren't blocked by writes. Thread-safe without
+/// external synchronization.
 pub struct Store {
-    conn: Connection,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl Store {
@@ -45,7 +50,7 @@ impl Store {
     /// Returns `Ok(Some((stored, expected)))` if there is a mismatch.
     /// Returns `Ok(None)` if versions match.
     pub fn check_version(path: impl AsRef<Path>) -> Result<Option<(u32, u32)>, StoreError> {
-        let conn = Connection::open(path)?;
+        let conn = rusqlite::Connection::open(path)?;
         let stored = schema::read_version(&conn)?;
         if stored == 0 || stored == schema::DATA_VERSION {
             Ok(None)
@@ -92,29 +97,55 @@ impl Store {
         Self::open(db)
     }
 
+    /// Build a connection pool for the given SQLiteConnectionManager.
+    fn build_pool(manager: SqliteConnectionManager) -> Result<Pool<SqliteConnectionManager>, StoreError> {
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)?;
+        // Initialize schema using a single connection from the pool.
+        let conn = pool.get()?;
+        schema::initialize(&conn)?;
+        Ok(pool)
+    }
+
     /// Open or create a store at the given path.
     ///
     /// Version checking should be done before calling this method using
     /// [`Store::check_version`] in `main.rs`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        schema::initialize(&conn)?;
-        Ok(Self { conn })
+        let manager = SqliteConnectionManager::file(path.as_ref())
+            .with_init(|conn| {
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+            });
+        let pool = Self::build_pool(manager)?;
+        Ok(Self { pool })
     }
 
     /// Open an in-memory store (for testing).
     pub fn open_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let manager = SqliteConnectionManager::memory()
+            .with_init(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=ON;")
+            });
+        // In-memory databases are per-connection, so use a single connection
+        // to ensure all operations share the same database.
+        let pool = Pool::builder()
+            .max_size(1)
+            .build(manager)?;
+        let conn = pool.get()?;
         schema::initialize(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { pool })
+    }
+
+    /// Get a connection from the pool.
+    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, StoreError> {
+        Ok(self.pool.get()?)
     }
 
     /// Insert or replace a project.
     pub fn save_project(&self, project: &Project) -> Result<(), StoreError> {
         let config = serde_json::to_string(&project.config)?;
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT OR REPLACE INTO projects (id, repo, default_branch, config) VALUES (?1, ?2, ?3, ?4)",
             params![project.id, project.repo, project.default_branch, config],
         )?;
@@ -123,8 +154,8 @@ impl Store {
 
     /// Get a project by ID.
     pub fn get_project(&self, id: &str) -> Result<Option<Project>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn()?;
+        let mut stmt = conn
             .prepare("SELECT id, repo, default_branch, config FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok((
@@ -151,8 +182,8 @@ impl Store {
 
     /// List all projects.
     pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn()?;
+        let mut stmt = conn
             .prepare("SELECT id, repo, default_branch, config FROM projects")?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -179,7 +210,7 @@ impl Store {
     /// Delete a project by ID. Returns true if a row was deleted.
     pub fn delete_project(&self, id: &str) -> Result<bool, StoreError> {
         let affected = self
-            .conn
+            .conn()?
             .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
@@ -189,8 +220,8 @@ impl Store {
     /// Returns `None` if the project doesn't exist or hasn't been polled yet.
     /// Used to initialize the poller after server restarts (spec github.md §5.3).
     pub fn get_last_polled_at(&self, id: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn()?;
+        let mut stmt = conn
             .prepare("SELECT last_polled_at FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![id], |row| row.get::<_, Option<String>>(0))?;
         match rows.next() {
@@ -216,7 +247,7 @@ impl Store {
     /// On restart, this value is used to avoid re-fetching all open items.
     pub fn set_last_polled_at(&self, id: &str, timestamp: DateTime<Utc>) -> Result<(), StoreError> {
         let ts_str = timestamp.to_rfc3339();
-        self.conn.execute(
+        self.conn()?.execute(
             "UPDATE projects SET last_polled_at = ?1 WHERE id = ?2",
             params![ts_str, id],
         )?;
@@ -232,7 +263,7 @@ impl Store {
             .unwrap()
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at",
             params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
@@ -242,7 +273,8 @@ impl Store {
 
     /// Get a merge queue entry by ID.
     pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -282,8 +314,8 @@ impl Store {
 
     /// List all merge queue entries.
     pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.conn()?;
+        let mut stmt = conn
             .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -322,7 +354,7 @@ impl Store {
     /// Delete a merge queue entry by ID. Returns true if a row was deleted.
     pub fn delete_merge_entry(&self, id: &str) -> Result<bool, StoreError> {
         let affected = self
-            .conn
+            .conn()?
             .execute("DELETE FROM merge_queue WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
@@ -346,7 +378,7 @@ impl Store {
         let created_at = task.created_at.to_rfc3339();
         let updated_at = task.updated_at.to_rfc3339();
 
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT OR REPLACE INTO tasks (
                 id, source_json, title, description, state,
                 parent_id, blocked_by_json, project, labels_json, priority,
@@ -389,7 +421,8 @@ impl Store {
 
     /// Get a task by ID.
     pub fn get_task(&self, id: &str) -> Result<Option<Task>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
@@ -409,7 +442,8 @@ impl Store {
 
     /// List all tasks.
     pub fn list_tasks(&self) -> Result<Vec<Task>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
@@ -427,7 +461,8 @@ impl Store {
 
     /// List tasks for a specific project.
     pub fn list_tasks_by_project(&self, project: &str) -> Result<Vec<Task>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
@@ -446,7 +481,8 @@ impl Store {
     /// List tasks in a specific state.
     pub fn list_tasks_by_state(&self, state: TaskState) -> Result<Vec<Task>, StoreError> {
         let state_json = serde_json::to_string(&state).map_err(StoreError::Json)?;
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, source_json, title, description, state,
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
@@ -465,7 +501,7 @@ impl Store {
     /// Delete a task by ID. Returns true if a row was deleted.
     pub fn delete_task(&self, id: &str) -> Result<bool, StoreError> {
         let affected = self
-            .conn
+            .conn()?
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
@@ -473,14 +509,14 @@ impl Store {
     /// Delete all tasks from the database (for rebuild command, issue #256).
     /// Returns the number of rows deleted.
     pub fn clear_tasks(&self) -> Result<usize, StoreError> {
-        let affected = self.conn.execute("DELETE FROM tasks", [])?;
+        let affected = self.conn()?.execute("DELETE FROM tasks", [])?;
         Ok(affected)
     }
 
     /// Delete all merge queue entries from the database (for rebuild command, issue #256).
     /// Returns the number of rows deleted.
     pub fn clear_merge_queue(&self) -> Result<usize, StoreError> {
-        let affected = self.conn.execute("DELETE FROM merge_queue", [])?;
+        let affected = self.conn()?.execute("DELETE FROM merge_queue", [])?;
         Ok(affected)
     }
 
@@ -488,7 +524,8 @@ impl Store {
     /// accounting, then tasks. Runs in a transaction so partial failures
     /// don't leave the store inconsistent.
     pub fn delete_project_data(&self, project: &str, task_ids: &[String]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
 
         // Delete merge queue entries and accounting for each task
         for task_id in task_ids {
@@ -517,7 +554,8 @@ impl Store {
 
     /// Get accounting data for a task, if it exists.
     pub fn get_accounting(&self, task_id: &str) -> Result<Option<TaskAccounting>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT task_id, total_input_tokens, total_output_tokens, session_count,
                     total_duration_seconds, last_updated
              FROM task_accounting WHERE task_id = ?1",
@@ -532,7 +570,7 @@ impl Store {
     /// Save accounting data for a task.
     pub fn save_accounting(&self, accounting: &TaskAccounting) -> Result<(), StoreError> {
         let last_updated = accounting.last_updated.to_rfc3339();
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT OR REPLACE INTO task_accounting
              (task_id, total_input_tokens, total_output_tokens, session_count,
               total_duration_seconds, last_updated)
@@ -576,7 +614,8 @@ impl Store {
 
     /// List all accounting records.
     pub fn list_accounting(&self) -> Result<Vec<TaskAccounting>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT task_id, total_input_tokens, total_output_tokens, session_count,
                     total_duration_seconds, last_updated
              FROM task_accounting",
@@ -591,7 +630,8 @@ impl Store {
 
     /// Get global accounting summary across all tasks.
     pub fn get_accounting_summary(&self) -> Result<AccountingSummary, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT COALESCE(SUM(total_input_tokens), 0),
                     COALESCE(SUM(total_output_tokens), 0),
                     COALESCE(SUM(session_count), 0),
@@ -614,7 +654,7 @@ impl Store {
     /// Delete accounting data for a task.
     pub fn delete_accounting(&self, task_id: &str) -> Result<bool, StoreError> {
         let affected = self
-            .conn
+            .conn()?
             .execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
         Ok(affected > 0)
     }
@@ -640,7 +680,7 @@ impl Store {
         let created_at = automation.created_at.to_rfc3339();
         let updated_at = automation.updated_at.to_rfc3339();
 
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT OR REPLACE INTO automations (
                 id, project_id, name, prompt, compiled_workflow,
                 trigger_type, trigger_config, state, created_at, updated_at
@@ -663,7 +703,8 @@ impl Store {
 
     /// Get an automation by ID.
     pub fn get_automation(&self, id: &str) -> Result<Option<Automation>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, project_id, name, prompt, compiled_workflow,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations WHERE id = ?1",
@@ -677,7 +718,8 @@ impl Store {
 
     /// List all automations for a project.
     pub fn list_automations_for_project(&self, project_id: &str) -> Result<Vec<Automation>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, project_id, name, prompt, compiled_workflow,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations WHERE project_id = ?1",
@@ -693,7 +735,8 @@ impl Store {
     /// Delete an automation and its runs by ID. Returns true if a row was deleted.
     /// Runs in a transaction so partial failures don't leave the store inconsistent.
     pub fn delete_automation(&self, id: &str) -> Result<bool, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
         // First delete associated runs
         tx.execute("DELETE FROM automation_runs WHERE automation_id = ?1", params![id])?;
         let affected = tx.execute("DELETE FROM automations WHERE id = ?1", params![id])?;
@@ -712,7 +755,7 @@ impl Store {
         let started_at = run.started_at.to_rfc3339();
         let completed_at = run.completed_at.map(|dt| dt.to_rfc3339());
 
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT OR REPLACE INTO automation_runs (
                 id, automation_id, status, started_at, completed_at, output, error
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -731,7 +774,8 @@ impl Store {
 
     /// List all automations across all projects.
     pub fn list_automations(&self) -> Result<Vec<Automation>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, project_id, name, prompt, compiled_workflow,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations",
@@ -746,7 +790,8 @@ impl Store {
 
     /// Delete all automations (and their runs) for a project.
     pub fn delete_automations_for_project(&self, project_id: &str) -> Result<usize, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM automation_runs WHERE automation_id IN (SELECT id FROM automations WHERE project_id = ?1)",
             params![project_id],
@@ -763,7 +808,8 @@ impl Store {
 
     /// Get a single automation run by ID.
     pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, automation_id, status, started_at, completed_at, output, error
              FROM automation_runs WHERE id = ?1",
         )?;
@@ -777,7 +823,8 @@ impl Store {
 
     /// List all runs for an automation.
     pub fn list_runs_for_automation(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
             "SELECT id, automation_id, status, started_at, completed_at, output, error
              FROM automation_runs WHERE automation_id = ?1 ORDER BY started_at DESC",
         )?;
@@ -1080,21 +1127,19 @@ mod tests {
     fn open_memory_creates_tables() {
         let store = Store::open_memory().unwrap();
         // Verify tables exist by querying them
-        let count: i64 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        let conn = store.conn().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |row: &rusqlite::Row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
-        let count: i64 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row: &rusqlite::Row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
-        let count: i64 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM merge_queue", [], |row| row.get(0))
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM merge_queue", [], |row: &rusqlite::Row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -1722,7 +1767,7 @@ mod tests {
 
     #[test]
     fn test_data_version_stamped_on_init() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         // Before init, version is 0
         assert_eq!(schema::read_version(&conn).unwrap(), 0);
@@ -1755,7 +1800,7 @@ mod tests {
         let db = dir.path().join("test.sqlite");
         // Create DB with a different version
         {
-            let conn = Connection::open(&db).unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
             conn.pragma_update(None, "user_version", 999u32).unwrap();
         }
         let result = Store::check_version(&db).unwrap();

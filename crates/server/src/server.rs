@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
@@ -109,7 +108,7 @@ pub struct Server {
     pub state: Arc<RwLock<ServerState>>,
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
-    pub(crate) store: Option<Arc<StdMutex<tasks_store::Store>>>,
+    pub(crate) store: Option<Arc<tasks_store::Store>>,
     /// Flag to signal the poll loop to reset pollers (issue #256).
     rebuild_requested: AtomicBool,
 }
@@ -131,7 +130,7 @@ impl Server {
             state: Arc::new(RwLock::new(ServerState::new())),
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
-            store: Some(Arc::new(StdMutex::new(store))),
+            store: Some(Arc::new(store)),
             rebuild_requested: AtomicBool::new(false),
         }
     }
@@ -144,8 +143,7 @@ impl Server {
             None => return Ok(()),
         };
 
-        let store = store.lock().unwrap();
-        let mut state = self.state.write().await;
+                let mut state = self.state.write().await;
 
         // Load projects
         let projects = store
@@ -186,11 +184,9 @@ impl Server {
 
     pub async fn add_project(&self, project: Project) {
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_project(&project) {
                     tracing::error!(project_id = %project.id, error = %e, "failed to persist project to store");
                 }
-            }
         }
         let mut state = self.state.write().await;
         state.projects.insert(project.id.clone(), project);
@@ -231,7 +227,6 @@ impl Server {
 
             // Cascade delete in persistent store (transactional)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
                     if let Err(e) = store.delete_project_data(id, &task_ids) {
                         tracing::error!(project_id = %id, error = %e, "failed to cascade-delete project data from store");
                     }
@@ -241,7 +236,6 @@ impl Server {
                     if let Err(e) = store.delete_project(id) {
                         tracing::error!(project_id = %id, error = %e, "failed to delete project from store");
                     }
-                }
             }
 
             tracing::info!(
@@ -265,8 +259,7 @@ impl Server {
     pub fn get_last_polled_at(&self, id: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.get_last_polled_at(id)
+                store.get_last_polled_at(id)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -276,8 +269,7 @@ impl Server {
     pub fn set_last_polled_at(&self, id: &str, timestamp: chrono::DateTime<chrono::Utc>) -> Result<(), ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.set_last_polled_at(id, timestamp)
+                store.set_last_polled_at(id, timestamp)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -298,11 +290,9 @@ impl Server {
 
         // Write-through to store
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_automation(&automation) {
                     tracing::error!(automation_id = %automation_id, error = %e, "failed to persist automation to store");
                 }
-            }
         }
 
         {
@@ -363,11 +353,9 @@ impl Server {
 
         // Write-through to store
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_automation(&automation) {
                     tracing::error!(automation_id = %id, error = %e, "failed to persist automation update to store");
                 }
-            }
         }
 
         {
@@ -397,11 +385,9 @@ impl Server {
         if removed {
             // Delete from store
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
                     if let Err(e) = store.delete_automation(id) {
                         tracing::error!(automation_id = %id, error = %e, "failed to delete automation from store");
                     }
-                }
             }
 
             // Emit automation deleted event
@@ -425,8 +411,7 @@ impl Server {
     pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<AutomationRun>, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.list_automation_runs(automation_id)
+                store.list_automation_runs(automation_id)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -446,11 +431,9 @@ impl Server {
 
         // Save to store
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_automation_run(&run) {
                     tracing::error!(run_id = %run_id, error = %e, "failed to persist automation run to store");
                 }
-            }
         }
 
         // Emit run started event
@@ -475,8 +458,7 @@ impl Server {
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
         let mut run = {
-            let store = store.lock().unwrap();
-            store.get_automation_run(run_id)
+                        store.get_automation_run(run_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
@@ -495,8 +477,7 @@ impl Server {
 
         // Save to store
         {
-            let store = store.lock().unwrap();
-            store.save_automation_run(&run)
+                        store.save_automation_run(&run)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
@@ -527,8 +508,7 @@ impl Server {
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
         let mut run = {
-            let store = store.lock().unwrap();
-            store.get_automation_run(run_id)
+                        store.get_automation_run(run_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
                 .ok_or_else(|| ServerError::StoreError(format!("run not found: {}", run_id)))?
         };
@@ -548,8 +528,7 @@ impl Server {
 
         // Save to store
         {
-            let store = store.lock().unwrap();
-            store.save_automation_run(&run)
+                        store.save_automation_run(&run)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
@@ -578,8 +557,7 @@ impl Server {
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
         let mut run = {
-            let store = store.lock().unwrap();
-            store.get_automation_run(run_id)
+                        store.get_automation_run(run_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
                 .ok_or_else(|| ServerError::RunNotFound(run_id.to_string()))?
         };
@@ -596,8 +574,7 @@ impl Server {
 
         // Save to store
         {
-            let store = store.lock().unwrap();
-            store.save_automation_run(&run)
+                        store.save_automation_run(&run)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
         }
 
@@ -622,8 +599,7 @@ impl Server {
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
 
         let run = {
-            let store = store.lock().unwrap();
-            store.get_automation_run(run_id)
+                        store.get_automation_run(run_id)
                 .map_err(|e| ServerError::StoreError(e.to_string()))?
         };
 
@@ -704,11 +680,9 @@ impl Server {
 
         // Write-through to store before inserting into HashMap
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_task(&task) {
                     tracing::error!(task_id = %task_id, error = %e, "failed to persist task to store");
                 }
-            }
         }
 
         {
@@ -840,11 +814,9 @@ impl Server {
 
         // Write-through to store
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_task(task) {
                     tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
                 }
-            }
         }
         Ok(true)
     }
@@ -871,11 +843,9 @@ impl Server {
 
             // Write-through to store
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
                     if let Err(e) = store.save_task(task) {
                         tracing::error!(task_id = %task_id, error = %e, "failed to persist task priority to store");
                     }
-                }
             }
         }
 
@@ -911,11 +881,9 @@ impl Server {
 
         // Write-through to store
         if let Some(ref store) = self.store {
-            if let Ok(store) = store.lock() {
                 if let Err(e) = store.save_task(task) {
                     tracing::error!(task_id = %task_id, error = %e, "failed to persist rejection feedback to store");
                 }
-            }
         }
 
         Ok(())
@@ -953,11 +921,9 @@ impl Server {
 
                     // Write-through to store
                     if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
                             if let Err(e) = store.save_task(task) {
                                 tracing::error!(task_id = %task_id, error = %e, "failed to persist task priority to store");
                             }
-                        }
                     }
                 }
             }
@@ -996,11 +962,9 @@ impl Server {
                 return Ok(());
             }
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
                     if let Err(e) = store.save_merge_entry(&entry) {
                         tracing::error!(entry_id = %entry_id, error = %e, "failed to persist merge queue entry");
                     }
-                }
             }
             state.merge_queue.enqueue(entry);
         }
@@ -1109,11 +1073,9 @@ impl Server {
             if result.has_changes() {
                 // Write-through to store
                 if let Some(ref store) = self.store {
-                    if let Ok(store) = store.lock() {
                         if let Err(e) = store.save_task(task) {
                             tracing::error!(task_id = %task_id, error = %e, "failed to persist reconciled task");
                         }
-                    }
                 }
             }
 
@@ -1249,11 +1211,9 @@ impl Server {
                         state.merge_queue.remove_by_pr_url(&pr_url);
                         // Also remove from store
                         if let Some(ref store) = self.store {
-                            if let Ok(store) = store.lock() {
                                 if let Err(e) = store.delete_merge_entry(&entry_id) {
                                     tracing::error!(entry_id = %entry_id, error = %e, "failed to delete merge entry from store");
                                 }
-                            }
                         }
                         changes += 1;
                     }
@@ -2027,7 +1987,6 @@ impl Server {
 
                 // Write-through to store
                 if let Some(ref store) = self.store {
-                    if let Ok(store) = store.lock() {
                         if let Err(e) = store.save_task(task) {
                             tracing::error!(
                                 task_id = %task_id,
@@ -2035,7 +1994,6 @@ impl Server {
                                 "failed to persist workspace cleanup to store"
                             );
                         }
-                    }
                 }
 
                 tracing::info!(
@@ -2108,8 +2066,7 @@ impl Server {
 
         // Clear database tables
         let (db_tasks, db_merge) = if let Some(ref store) = self.store {
-            let store = store.lock().unwrap();
-            let tasks = store.clear_tasks()
+                        let tasks = store.clear_tasks()
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let merge = store.clear_merge_queue()
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
@@ -2201,7 +2158,6 @@ impl Server {
 
                 // Write-through to store
                 if let Some(ref store) = self.store {
-                    if let Ok(store) = store.lock() {
                         if let Err(e) = store.save_task(task) {
                             tracing::error!(
                                 task_id = %task_id,
@@ -2209,7 +2165,6 @@ impl Server {
                                 "failed to persist task retry state to store"
                             );
                         }
-                    }
                 }
 
                 (
@@ -2234,7 +2189,6 @@ impl Server {
 
                     // Write-through to store
                     if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
                             if let Err(e) = store.save_task(task) {
                                 tracing::error!(
                                     task_id = %task_id,
@@ -2242,7 +2196,6 @@ impl Server {
                                     "failed to persist task retry state to store"
                                 );
                             }
-                        }
                     }
 
                     (
@@ -2261,7 +2214,6 @@ impl Server {
 
                     // Write-through to store
                     if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
                             if let Err(e) = store.save_task(task) {
                                 tracing::error!(
                                     task_id = %task_id,
@@ -2269,7 +2221,6 @@ impl Server {
                                     "failed to persist task failure to store"
                                 );
                             }
-                        }
                     }
 
                     (
@@ -2332,7 +2283,6 @@ impl Server {
 
                     // Write-through to store
                     if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
                             if let Err(e) = store.save_task(task) {
                                 tracing::error!(
                                     task_id = %task_id,
@@ -2340,7 +2290,6 @@ impl Server {
                                     "failed to persist task recovery to store"
                                 );
                             }
-                        }
                     }
                 }
             }
@@ -2369,7 +2318,6 @@ impl Server {
 
                     // Write-through to store
                     if let Some(ref store) = self.store {
-                        if let Ok(store) = store.lock() {
                             if let Err(e) = store.save_task(task) {
                                 tracing::error!(
                                     task_id = %task_id,
@@ -2377,7 +2325,6 @@ impl Server {
                                     "failed to persist task failure to store"
                                 );
                             }
-                        }
                     }
                 }
             }
@@ -2404,8 +2351,7 @@ impl Server {
     pub fn get_accounting_summary(&self) -> Result<tasks_store::AccountingSummary, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.get_accounting_summary()
+                store.get_accounting_summary()
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -2413,8 +2359,7 @@ impl Server {
     pub fn list_task_accounting(&self) -> Result<Vec<tasks_store::TaskAccounting>, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.list_accounting()
+                store.list_accounting()
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -2422,8 +2367,7 @@ impl Server {
     pub fn get_task_accounting(&self, task_id: &str) -> Result<Option<tasks_store::TaskAccounting>, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.get_accounting(task_id)
+                store.get_accounting(task_id)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -2436,8 +2380,7 @@ impl Server {
     ) -> Result<tasks_store::TaskAccounting, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.add_token_usage(task_id, input_tokens, output_tokens)
+                store.add_token_usage(task_id, input_tokens, output_tokens)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
@@ -2449,8 +2392,7 @@ impl Server {
     ) -> Result<tasks_store::TaskAccounting, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
-        let store = store.lock().unwrap();
-        store.record_session_end(task_id, duration_seconds)
+                store.record_session_end(task_id, duration_seconds)
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 }
