@@ -17,8 +17,8 @@ use tasks_agent::{
 
 use crate::error::OrchestratorError;
 
-/// Model for orchestrator chat.
-const CHAT_MODEL: &str = "claude-opus-4-6";
+/// Default model for orchestrator chat.
+const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-6";
 
 /// Convert TaskState to a string representation.
 fn task_state_str(state: &TaskState) -> &'static str {
@@ -37,8 +37,8 @@ fn task_state_str(state: &TaskState) -> &'static str {
     }
 }
 
-/// Maximum tokens for chat response.
-const MAX_TOKENS: u32 = 32_000;
+/// Default maximum tokens for chat response.
+const DEFAULT_CHAT_MAX_TOKENS: u32 = 32_000;
 
 /// Context for orchestrator chat — snapshot of current system state.
 #[derive(Debug, Clone)]
@@ -73,18 +73,51 @@ pub struct ChatResponse {
 /// Handler for orchestrator chat interactions.
 pub struct OrchestratorChat {
     provider: AnthropicProvider,
+    model: String,
+    max_tokens: u32,
 }
 
 impl OrchestratorChat {
     /// Create a new orchestrator chat handler.
     pub fn new(provider: AnthropicProvider) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            model: DEFAULT_CHAT_MODEL.to_string(),
+            max_tokens: DEFAULT_CHAT_MAX_TOKENS,
+        }
     }
 
     /// Create from environment (ANTHROPIC_API_KEY).
+    ///
+    /// Optional env vars for LLM configuration:
+    /// - `TASKS_CHAT_MODEL` — model name (default: `claude-opus-4-6`)
+    /// - `TASKS_CHAT_MAX_TOKENS` — max response tokens (default: 32000)
     pub fn from_env() -> Result<Self, OrchestratorError> {
         let provider = AnthropicProvider::from_env().map_err(OrchestratorError::Agent)?;
-        Ok(Self::new(provider))
+        let mut instance = Self::new(provider);
+
+        if let Ok(model) = std::env::var("TASKS_CHAT_MODEL") {
+            instance.model = model;
+        }
+        if let Ok(max_tokens) = std::env::var("TASKS_CHAT_MAX_TOKENS") {
+            if let Ok(val) = max_tokens.parse::<u32>() {
+                instance.max_tokens = val;
+            }
+        }
+
+        Ok(instance)
+    }
+
+    /// Set a custom model for chat.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Set custom max tokens for chat responses.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// Process a human message and generate a response.
@@ -109,7 +142,7 @@ impl OrchestratorChat {
         let mut messages = conversation_history.to_vec();
         messages.push(Message::user(message));
 
-        let config = CompletionConfig::new(CHAT_MODEL).with_max_tokens(MAX_TOKENS);
+        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
         let request = CompletionRequest::new(config, messages)
             .with_system(system_prompt);
 

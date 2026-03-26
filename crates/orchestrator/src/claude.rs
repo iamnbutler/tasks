@@ -21,8 +21,8 @@ use tasks_github::GitHubClient;
 /// Default model for orchestrator evaluation.
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
-/// Maximum tokens for evaluation response.
-const MAX_TOKENS: u32 = 32_000;
+/// Default maximum tokens for evaluation response.
+const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 /// Orchestrator implementation backed by Claude.
 ///
@@ -32,6 +32,7 @@ pub struct ClaudeOrchestrator {
     provider: AnthropicProvider,
     github: GitHubClient,
     model: String,
+    max_tokens: u32,
 }
 
 impl ClaudeOrchestrator {
@@ -41,10 +42,15 @@ impl ClaudeOrchestrator {
             provider,
             github,
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
     /// Create from environment variables (ANTHROPIC_API_KEY, GITHUB_TOKEN).
+    ///
+    /// Optional env vars for LLM configuration:
+    /// - `TASKS_ORCHESTRATOR_MODEL` — model name (default: `claude-opus-4-6`)
+    /// - `TASKS_ORCHESTRATOR_MAX_TOKENS` — max response tokens (default: 32000)
     pub fn from_env() -> Result<Self, OrchestratorError> {
         let provider =
             AnthropicProvider::from_env().map_err(OrchestratorError::Agent)?;
@@ -54,12 +60,29 @@ impl ClaudeOrchestrator {
         })?;
         let github = GitHubClient::new(github_token);
 
-        Ok(Self::new(provider, github))
+        let mut instance = Self::new(provider, github);
+
+        if let Ok(model) = std::env::var("TASKS_ORCHESTRATOR_MODEL") {
+            instance.model = model;
+        }
+        if let Ok(max_tokens) = std::env::var("TASKS_ORCHESTRATOR_MAX_TOKENS") {
+            if let Ok(val) = max_tokens.parse::<u32>() {
+                instance.max_tokens = val;
+            }
+        }
+
+        Ok(instance)
     }
 
     /// Set a custom model for evaluation.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    /// Set custom max tokens for evaluation responses.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -197,7 +220,7 @@ impl Orchestrator for ClaudeOrchestrator {
             &context.queue_context,
         );
 
-        let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);
+        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
         let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
             .with_system(system.clone());
 
@@ -270,7 +293,7 @@ impl Orchestrator for ClaudeOrchestrator {
             &context.queue_context,
         );
 
-        let config = CompletionConfig::new(&self.model).with_max_tokens(MAX_TOKENS);
+        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
         let request = CompletionRequest::new(config, vec![Message::user(deep_prompt)])
             .with_system(system);
 
