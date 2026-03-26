@@ -65,4 +65,52 @@ impl AgentError {
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         AgentError::InvalidRequest(msg.into())
     }
+
+    /// Returns true if this error is transient and the request may succeed on retry.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            AgentError::RateLimited { .. } => true,
+            AgentError::Network(_) => true,
+            AgentError::Api { status, .. } => matches!(status, 500 | 502 | 503 | 529),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_is_retryable() {
+        let err = AgentError::RateLimited { retry_after: Some(5) };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn server_errors_are_retryable() {
+        for status in [500, 502, 503, 529] {
+            let err = AgentError::api(status, "server error");
+            assert!(err.is_retryable(), "status {} should be retryable", status);
+        }
+    }
+
+    #[test]
+    fn client_errors_are_not_retryable() {
+        for status in [400, 401, 403, 404, 422] {
+            let err = AgentError::api(status, "client error");
+            assert!(!err.is_retryable(), "status {} should not be retryable", status);
+        }
+    }
+
+    #[test]
+    fn auth_error_is_not_retryable() {
+        let err = AgentError::Auth("bad key".into());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn cancelled_is_not_retryable() {
+        assert!(!AgentError::Cancelled.is_retryable());
+    }
 }
