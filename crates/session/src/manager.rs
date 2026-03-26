@@ -4,6 +4,7 @@
 //! output, maps supervisor events to platform events, and enforces time limits.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,9 @@ pub struct SessionHandle {
     pub(crate) command_tx: tokio::sync::mpsc::Sender<SessionCommand>,
     /// Handle for the monitoring task.
     pub(crate) monitor_handle: JoinHandle<()>,
+    /// Flag shared with the monitor task to prevent double-destroy.
+    /// Whichever side sets this first is responsible for destroying the container.
+    pub(crate) destroyed: Arc<AtomicBool>,
 }
 
 /// Manages active container sessions (spec §9).
@@ -216,17 +220,27 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
     /// Drains the sessions map under a brief write lock, then aborts monitor
     /// tasks and destroys containers without holding the lock.
     pub async fn destroy_all(&self) {
-        let entries: Vec<(String, String, JoinHandle<()>)> = {
+        let entries: Vec<(String, String, JoinHandle<()>, Arc<AtomicBool>)> = {
             let mut sessions = self.sessions.write().await;
             sessions
                 .drain()
-                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle))
+                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle, h.destroyed))
                 .collect()
         };
 
-        for (task_id, container_id, monitor_handle) in entries {
-            // Abort the monitor task so it doesn't double-destroy
+        for (task_id, container_id, monitor_handle, destroyed) in entries {
+            // Abort the monitor task first
             monitor_handle.abort();
+
+            // Atomically claim destroy responsibility; skip if the monitor already destroyed it
+            if destroyed.swap(true, Ordering::AcqRel) {
+                tracing::debug!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    "container already destroyed by monitor task, skipping"
+                );
+                continue;
+            }
 
             if let Err(e) = self.runtime.destroy(&container_id).await {
                 tracing::error!(
@@ -339,23 +353,33 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
         }
 
         // Phase 3: Force-destroy any remaining sessions
-        let remaining_entries: Vec<(String, String, JoinHandle<()>)> = {
+        let remaining_entries: Vec<(String, String, JoinHandle<()>, Arc<AtomicBool>)> = {
             let mut sessions = self.sessions.write().await;
             sessions
                 .drain()
-                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle))
+                .map(|(_, h)| (h.task_id, h.container_id, h.monitor_handle, h.destroyed))
                 .collect()
         };
 
-        for (task_id, container_id, monitor_handle) in remaining_entries {
+        for (task_id, container_id, monitor_handle, destroyed) in remaining_entries {
+            // Abort the monitor task first
+            monitor_handle.abort();
+
+            // Atomically claim destroy responsibility; skip if the monitor already destroyed it
+            if destroyed.swap(true, Ordering::AcqRel) {
+                tracing::debug!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    "container already destroyed by monitor task, skipping"
+                );
+                continue;
+            }
+
             tracing::warn!(
                 task_id = %task_id,
                 container_id = %container_id,
                 "forcibly destroying container after timeout"
             );
-
-            // Abort the monitor task so it doesn't double-destroy
-            monitor_handle.abort();
 
             // TaskStateWaiting was already emitted in Phase 0 for all sessions.
             // Just force-destroy the container here.
@@ -470,6 +494,9 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         let effective_soft_limit = time_limits.soft_limit.unwrap_or(self.soft_time_limit);
         let effective_hard_limit = time_limits.hard_limit.unwrap_or(self.hard_time_limit);
 
+        // Shared flag to prevent double-destroy between monitor task and destroy_all/stop_all
+        let destroyed = Arc::new(AtomicBool::new(false));
+
         // Spawn the monitoring task
         let monitor = tokio::spawn(monitor_session(
             task_id.clone(),
@@ -482,6 +509,7 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
             effective_soft_limit,
             effective_hard_limit,
             effective_progress_threshold,
+            destroyed.clone(),
         ));
 
         // Insert handle into sessions map
@@ -491,6 +519,7 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
             started_at: Instant::now(),
             command_tx,
             monitor_handle: monitor,
+            destroyed,
         };
         self.sessions.write().await.insert(task_id, handle);
 
@@ -515,6 +544,7 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     soft_limit: Duration,
     hard_limit: Duration,
     progress_threshold: Duration,
+    destroyed: Arc<AtomicBool>,
 ) {
     let started_at = Instant::now();
     let mut soft_limit_notified = false;
@@ -726,24 +756,32 @@ async fn monitor_session<R: ContainerRuntime + Send + 'static>(
     // Abort the reader thread
     reader.abort();
 
-    // Destroy the container to reclaim disk and memory.
-    // Log at debug on failure — the container may already be gone if destroy_all ran first.
-    match runtime.destroy(&container_id).await {
-        Ok(()) => {
-            tracing::info!(
-                task_id = %task_id,
-                container_id = %container_id,
-                "destroyed container after session ended"
-            );
+    // Atomically claim destroy responsibility.
+    // If destroy_all or stop_all_with_timeout already set the flag, skip destruction.
+    if !destroyed.swap(true, Ordering::AcqRel) {
+        match runtime.destroy(&container_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    "destroyed container after session ended"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    task_id = %task_id,
+                    container_id = %container_id,
+                    error = %e,
+                    "container destroy failed"
+                );
+            }
         }
-        Err(e) => {
-            tracing::debug!(
-                task_id = %task_id,
-                container_id = %container_id,
-                error = %e,
-                "container destroy failed (may already be cleaned up)"
-            );
-        }
+    } else {
+        tracing::debug!(
+            task_id = %task_id,
+            container_id = %container_id,
+            "container already claimed for destruction by shutdown, skipping"
+        );
     }
 }
 
