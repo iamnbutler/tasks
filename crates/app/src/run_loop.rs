@@ -2391,7 +2391,50 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         }
     });
 
-    // --- 8d. Spawn stop mode listener (spec §6.1) ---
+    // --- 8d. Event log compaction loop (#470) ---
+    //
+    // Periodically compact event logs to enforce retention limits and clean up
+    // orphaned task directories, preventing unbounded storage growth.
+
+    let compaction_event_bus = server.event_bus.clone();
+    let mut compaction_shutdown_rx = shutdown_tx.subscribe();
+
+    let compaction_handle = tokio::spawn(async move {
+        // Run compaction every hour.
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = compaction_shutdown_rx.recv() => {
+                    info!("compaction loop received shutdown signal");
+                    break;
+                }
+            }
+
+            match compaction_event_bus.compact().await {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "event log compaction removed events");
+                }
+                Err(e) => {
+                    warn!(error = %e, "event log compaction failed");
+                }
+                _ => {}
+            }
+
+            match compaction_event_bus.cleanup_orphaned_tasks().await {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "cleaned up orphaned task directories");
+                }
+                Err(e) => {
+                    warn!(error = %e, "orphaned task cleanup failed");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // --- 8e. Spawn stop mode listener (spec §6.1) ---
     //
     // When mode changes to Stop, terminate all running sessions.
     // This is event-driven so that any mode change source (web, CLI, orchestrator)
@@ -2739,6 +2782,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         think_handle,
         watchdog_handle,
         cleanup_handle,
+        compaction_handle,
         stop_mode_handle,
     ];
     if let Some(h) = update_handle {
