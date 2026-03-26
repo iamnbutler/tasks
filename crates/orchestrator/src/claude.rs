@@ -76,6 +76,12 @@ impl ClaudeOrchestrator {
             OrchestratorError::Evaluation(format!("Failed to parse evaluation JSON: {}", e))
         })?;
 
+        if parsed.reasoning.trim().is_empty() {
+            return Err(OrchestratorError::Evaluation(
+                "Evaluation reasoning must not be empty".to_string(),
+            ));
+        }
+
         Ok(ParsedEvaluation {
             approved: parsed.approved,
             needs_deeper_review: parsed.needs_deeper_review,
@@ -99,6 +105,7 @@ struct EvaluationResponse {
 }
 
 /// Internal parsed result from the LLM (includes triage fields not in QualityEvaluation).
+#[derive(Debug)]
 struct ParsedEvaluation {
     approved: bool,
     needs_deeper_review: bool,
@@ -605,6 +612,15 @@ fn truncate(text: &str, max_len: usize) -> &str {
 mod tests {
     use super::*;
 
+    /// Create a ClaudeOrchestrator for unit tests (no real API calls needed).
+    fn make_test_orchestrator() -> ClaudeOrchestrator {
+        ClaudeOrchestrator {
+            provider: AnthropicProvider::new("test-key"),
+            github: GitHubClient::new("test-token"),
+            model: DEFAULT_MODEL.to_string(),
+        }
+    }
+
     #[test]
     fn test_extract_json_raw() {
         let text = r#"Here is my evaluation:
@@ -650,6 +666,35 @@ That's all."#;
         let text = r#"{"reasoning": "The PR has { braces } in description", "approved": true}"#;
         let json = extract_json(text).unwrap();
         assert_eq!(json, text);
+    }
+
+    #[test]
+    fn test_parse_evaluation_rejects_empty_reasoning() {
+        let orchestrator = make_test_orchestrator();
+        let text = r#"{"approved": true, "reasoning": "", "feedback": null}"#;
+        let result = orchestrator.parse_evaluation_response(text);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("reasoning must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_evaluation_rejects_whitespace_reasoning() {
+        let orchestrator = make_test_orchestrator();
+        let text = r#"{"approved": true, "reasoning": "   ", "feedback": null}"#;
+        let result = orchestrator.parse_evaluation_response(text);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_evaluation_accepts_valid_reasoning() {
+        let orchestrator = make_test_orchestrator();
+        let text = r#"{"approved": true, "reasoning": "Changes look correct", "feedback": null}"#;
+        let result = orchestrator.parse_evaluation_response(text);
+        assert!(result.is_ok());
+        let eval = result.unwrap();
+        assert!(eval.approved);
+        assert_eq!(eval.reasoning, "Changes look correct");
     }
 
     #[test]
