@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ExternalLink, Check, X } from "lucide-react";
+import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
 import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
@@ -66,13 +67,21 @@ function MergeQueueRow({
   }
 
   async function handleApprove() {
-    await approveMerge(entry.id);
-    onRefresh();
+    try {
+      await approveMerge(entry.id);
+      onRefresh();
+    } catch {
+      toast.error("Failed to approve merge entry");
+    }
   }
 
   async function handleReject() {
-    await rejectMerge(entry.id);
-    onRefresh();
+    try {
+      await rejectMerge(entry.id);
+      onRefresh();
+    } catch {
+      toast.error("Failed to reject merge entry");
+    }
   }
 
   return (
@@ -283,6 +292,8 @@ export function MergeQueuePage() {
     try {
       await flushMergeQueue();
       await refreshSnapshot();
+    } catch {
+      toast.error("Failed to flush merge queue");
     } finally {
       setFlushing(false);
     }
