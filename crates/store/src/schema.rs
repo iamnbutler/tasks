@@ -54,7 +54,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS merge_queue (
             id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
-            pr_url TEXT,
+            pr_url TEXT UNIQUE,
             status TEXT NOT NULL DEFAULT 'pending',
             queued_at TEXT NOT NULL
         );
@@ -100,8 +100,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
         CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_json);
 
-        -- merge_queue: dedup by pr_url, lookup by task_id
-        CREATE INDEX IF NOT EXISTS idx_merge_queue_pr_url ON merge_queue(pr_url);
+        -- merge_queue: lookup by task_id (pr_url already has a UNIQUE index)
         CREATE INDEX IF NOT EXISTS idx_merge_queue_task_id ON merge_queue(task_id);
 
         -- automations: lookup by project
@@ -219,6 +218,23 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         Err(e) => {
             tracing::error!(error = %e, "failed to add rejection_feedback column");
             return Err(e);
+        }
+    }
+
+    // Migration: add UNIQUE constraint on merge_queue.pr_url (issue #464)
+    // SQLite cannot add constraints to existing columns, so we create the unique index
+    // if it doesn't already exist. The column-level UNIQUE in CREATE TABLE handles new DBs;
+    // this handles existing DBs that already have the table.
+    match conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_queue_pr_url_unique ON merge_queue(pr_url)",
+        [],
+    ) {
+        Ok(_) => {
+            // Also drop the old non-unique index if it exists
+            let _ = conn.execute("DROP INDEX IF EXISTS idx_merge_queue_pr_url", []);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not create unique index on merge_queue.pr_url (duplicates may exist)");
         }
     }
 

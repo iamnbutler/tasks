@@ -233,7 +233,8 @@ impl Store {
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
         self.conn.execute(
-            "INSERT OR REPLACE INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at",
             params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
         )?;
         Ok(())
@@ -1190,15 +1191,15 @@ mod tests {
     fn merge_status_roundtrip() {
         let store = Store::open_memory().unwrap();
 
-        for (id, status) in [
-            ("m1", MergeStatus::Pending),
-            ("m2", MergeStatus::Approved),
-            ("m3", MergeStatus::Merging),
-            ("m4", MergeStatus::Rejected),
-            ("m5", MergeStatus::Merged),
-            ("m6", MergeStatus::Conflict),
+        for (id, pr_num, status) in [
+            ("m1", 1, MergeStatus::Pending),
+            ("m2", 2, MergeStatus::Approved),
+            ("m3", 3, MergeStatus::Merging),
+            ("m4", 4, MergeStatus::Rejected),
+            ("m5", 5, MergeStatus::Merged),
+            ("m6", 6, MergeStatus::Conflict),
         ] {
-            let mut entry = MergeQueueEntry::new(id, "t1", "https://github.com/test/repo/pull/1");
+            let mut entry = MergeQueueEntry::new(id, "t1", &format!("https://github.com/test/repo/pull/{pr_num}"));
             entry.status = status;
             store.save_merge_entry(&entry).unwrap();
 
@@ -1215,6 +1216,36 @@ mod tests {
 
         let loaded = store.get_merge_entry("m1").unwrap().unwrap();
         assert_eq!(loaded.pr_url, "https://github.com/owner/repo/pull/1");
+    }
+
+    #[test]
+    fn merge_entry_duplicate_pr_url_rejected() {
+        let store = Store::open_memory().unwrap();
+        let entry1 = MergeQueueEntry::new("m1", "t1", "https://github.com/owner/repo/pull/1");
+        store.save_merge_entry(&entry1).unwrap();
+
+        // Different id, same pr_url — should fail with UNIQUE constraint violation
+        let entry2 = MergeQueueEntry::new("m2", "t2", "https://github.com/owner/repo/pull/1");
+        assert!(store.save_merge_entry(&entry2).is_err());
+
+        // Only one entry should exist
+        let entries = store.list_merge_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "m1");
+    }
+
+    #[test]
+    fn merge_entry_same_id_update_allowed() {
+        let store = Store::open_memory().unwrap();
+        let mut entry = MergeQueueEntry::new("m1", "t1", "https://github.com/owner/repo/pull/1");
+        store.save_merge_entry(&entry).unwrap();
+
+        // Same id, updated status — should succeed (upsert)
+        entry.status = MergeStatus::Approved;
+        store.save_merge_entry(&entry).unwrap();
+
+        let loaded = store.get_merge_entry("m1").unwrap().unwrap();
+        assert_eq!(loaded.status, MergeStatus::Approved);
     }
 
     // ── Task tests ───────────────────────────────────────────────
