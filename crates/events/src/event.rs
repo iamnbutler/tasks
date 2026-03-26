@@ -271,10 +271,34 @@ impl TryFrom<String> for EventType {
     }
 }
 
+/// Current event schema version.
+///
+/// Bump this when the `Event` serialization format changes (new required
+/// fields, renamed fields, type changes). Each bump must have a
+/// corresponding migration arm in [`Event::migrate`].
+///
+/// History:
+/// - **0** — Pre-versioning events (no `schema_version` field present).
+/// - **1** — Added `schema_version` field. No structural changes.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Default used by serde when deserializing events that predate schema
+/// versioning (i.e. they have no `schema_version` field at all).
+fn default_schema_version() -> u32 {
+    0
+}
+
 /// An event in the system.
 ///
 /// Events are immutable once created. They form an append-only log
 /// that provides a complete audit trail of all activity.
+///
+/// ## Schema versioning
+///
+/// The `schema_version` field tracks which schema produced the event.
+/// Old logs written before versioning was added will deserialize with
+/// version `0`. Use [`Event::migrate`] to upgrade an event to the
+/// current schema version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Unique event ID.
@@ -290,10 +314,14 @@ pub struct Event {
     pub ts: DateTime<Utc>,
     /// Event-type-specific payload.
     pub data: serde_json::Value,
+    /// Schema version of this event. Defaults to `0` for events written
+    /// before versioning was introduced.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
 }
 
 impl Event {
-    /// Create a new event with the current timestamp.
+    /// Create a new event with the current timestamp and current schema version.
     pub fn new(
         event_type: EventType,
         task: impl Into<String>,
@@ -307,6 +335,38 @@ impl Event {
             actor,
             ts: Utc::now(),
             data,
+            schema_version: CURRENT_SCHEMA_VERSION,
+        }
+    }
+
+    /// Migrate this event to the current schema version, applying any
+    /// necessary transformations in sequence.
+    ///
+    /// Returns `Ok(())` if the event was already current or was
+    /// successfully migrated. Returns `Err` with a description if the
+    /// event has an unrecognized future version.
+    ///
+    /// When adding a new schema version N, add a migration arm that
+    /// transforms version N-1 → N (adjusting fields / data as needed)
+    /// and bumps `schema_version` to N.
+    pub fn migrate(&mut self) -> Result<(), String> {
+        loop {
+            match self.schema_version {
+                // v0 → v1: Pre-versioning events. No structural changes
+                // needed — just stamp the version.
+                0 => {
+                    self.schema_version = 1;
+                }
+                // Already at current version — done.
+                v if v == CURRENT_SCHEMA_VERSION => return Ok(()),
+                // Future version we don't know how to handle.
+                v => {
+                    return Err(format!(
+                        "event schema version {v} is newer than supported version \
+                         {CURRENT_SCHEMA_VERSION}; upgrade your binary"
+                    ));
+                }
+            }
         }
     }
 }
@@ -334,6 +394,87 @@ mod tests {
     fn event_type_matches_star() {
         let t = EventType::AgentMessage;
         assert!(t.matches("*"));
+    }
+
+    #[test]
+    fn new_event_has_current_schema_version() {
+        let e = Event::new(
+            EventType::TaskCreated,
+            "task-123",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        assert_eq!(e.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn deserialize_legacy_event_without_schema_version() {
+        // Simulate a pre-versioning event (no schema_version field).
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "type": "task:created",
+            "task": "task-1",
+            "actor": "system",
+            "ts": "2025-01-01T00:00:00Z",
+            "data": {}
+        }"#;
+        let event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(event.schema_version, 0);
+    }
+
+    #[test]
+    fn migrate_v0_to_current() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "type": "task:created",
+            "task": "task-1",
+            "actor": "system",
+            "ts": "2025-01-01T00:00:00Z",
+            "data": {}
+        }"#;
+        let mut event: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(event.schema_version, 0);
+        event.migrate().unwrap();
+        assert_eq!(event.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_current_is_noop() {
+        let mut e = Event::new(
+            EventType::TaskCreated,
+            "task-123",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let original_version = e.schema_version;
+        e.migrate().unwrap();
+        assert_eq!(e.schema_version, original_version);
+    }
+
+    #[test]
+    fn migrate_future_version_returns_error() {
+        let mut e = Event::new(
+            EventType::TaskCreated,
+            "task-123",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        e.schema_version = CURRENT_SCHEMA_VERSION + 99;
+        let result = e.migrate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("newer than supported"));
+    }
+
+    #[test]
+    fn schema_version_included_in_serialized_json() {
+        let e = Event::new(
+            EventType::TaskCreated,
+            "task-123",
+            Actor::System,
+            serde_json::json!({}),
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"schema_version\":1"));
     }
 
     #[test]

@@ -201,7 +201,19 @@ impl EventStore {
             }
 
             match serde_json::from_str::<Event>(&line) {
-                Ok(event) => events.push(event),
+                Ok(mut event) => {
+                    if let Err(err) = event.migrate() {
+                        skipped += 1;
+                        tracing::warn!(
+                            task_id,
+                            line_number,
+                            error = %err,
+                            "skipping event with unsupported schema version"
+                        );
+                        continue;
+                    }
+                    events.push(event);
+                }
                 Err(err) => {
                     skipped += 1;
                     let truncated: String = line.chars().take(200).collect();
