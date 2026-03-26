@@ -1,4 +1,9 @@
 //! Anthropic Claude provider implementation with streaming support.
+//!
+//! Includes automatic retry with exponential backoff for transient failures
+//! (rate limits, server errors, network errors).
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -12,6 +17,13 @@ use crate::provider::{CompletionRequest, Provider, StreamChunk};
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Maximum number of retry attempts for transient failures.
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (doubled each retry).
+const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Maximum delay cap for backoff.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Anthropic Claude provider.
 #[derive(Debug, Clone)]
@@ -41,6 +53,26 @@ impl AnthropicProvider {
         );
         headers.insert("anthropic-version", HeaderValue::from_static(ANTHROPIC_VERSION));
         Ok(headers)
+    }
+
+    /// Parse the Retry-After header from a response, returning seconds to wait.
+    fn parse_retry_after(response: &reqwest::Response) -> Option<u64> {
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    /// Compute the delay before retrying. Uses `Retry-After` if available,
+    /// otherwise exponential backoff: base * 2^attempt, capped at MAX_RETRY_DELAY.
+    fn retry_delay(attempt: u32, retry_after: Option<u64>) -> Duration {
+        if let Some(secs) = retry_after {
+            Duration::from_secs(secs)
+        } else {
+            let backoff = BASE_RETRY_DELAY.saturating_mul(1 << attempt);
+            backoff.min(MAX_RETRY_DELAY)
+        }
     }
 }
 
@@ -441,64 +473,97 @@ impl Provider for AnthropicProvider {
             stream: false,
         };
 
-        let response = self.client
-            .post(ANTHROPIC_API_URL)
-            .headers(headers)
-            .json(&anthropic_request)
-            .send()
-            .await?;
+        let mut last_error = None;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body: AnthropicError = response.json().await.map_err(|e| {
-                AgentError::api(status.as_u16(), format!("Failed to parse error response: {}", e))
-            })?;
-            return match status.as_u16() {
-                401 => Err(AgentError::Auth(error_body.error.message)),
-                429 => Err(AgentError::RateLimited { retry_after: None }),
-                _ => Err(AgentError::api(status.as_u16(), error_body.error.message)),
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = Self::retry_delay(attempt - 1, last_error.as_ref().and_then(|e| {
+                    if let AgentError::RateLimited { retry_after } = e { *retry_after } else { None }
+                }));
+                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "Retrying Anthropic API request");
+                tokio::time::sleep(delay).await;
+            }
+
+            let response = match self.client
+                .post(ANTHROPIC_API_URL)
+                .headers(headers.clone())
+                .json(&anthropic_request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = AgentError::Network(e);
+                    if err.is_retryable() && attempt < MAX_RETRIES {
+                        tracing::warn!(error = %err, "Transient network error");
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
             };
-        }
 
-        let anthropic_response: AnthropicResponse = response.json().await?;
-
-        let mut content = Vec::new();
-        let mut tool_calls = Vec::new();
-
-        for item in anthropic_response.content {
-            match item {
-                AnthropicResponseContent::Text { text } => {
-                    content.push(Content::text(text));
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after = Self::parse_retry_after(&response);
+                let error_body: AnthropicError = response.json().await.map_err(|e| {
+                    AgentError::api(status.as_u16(), format!("Failed to parse error response: {}", e))
+                })?;
+                let err = match status.as_u16() {
+                    401 => AgentError::Auth(error_body.error.message),
+                    429 => AgentError::RateLimited { retry_after },
+                    _ => AgentError::api(status.as_u16(), error_body.error.message),
+                };
+                if err.is_retryable() && attempt < MAX_RETRIES {
+                    tracing::warn!(error = %err, "Transient API error");
+                    last_error = Some(err);
+                    continue;
                 }
-                AnthropicResponseContent::Thinking { thinking } => {
-                    content.push(Content::thinking(thinking));
-                }
-                AnthropicResponseContent::ToolUse { id, name, input } => {
-                    content.push(Content::ToolUse {
-                        id: id.clone(), name: name.clone(), input: input.clone(),
-                    });
-                    tool_calls.push(ToolCall { id, name, arguments: input });
+                return Err(err);
+            }
+
+            let anthropic_response: AnthropicResponse = response.json().await?;
+
+            let mut content = Vec::new();
+            let mut tool_calls = Vec::new();
+
+            for item in anthropic_response.content {
+                match item {
+                    AnthropicResponseContent::Text { text } => {
+                        content.push(Content::text(text));
+                    }
+                    AnthropicResponseContent::Thinking { thinking } => {
+                        content.push(Content::thinking(thinking));
+                    }
+                    AnthropicResponseContent::ToolUse { id, name, input } => {
+                        content.push(Content::ToolUse {
+                            id: id.clone(), name: name.clone(), input: input.clone(),
+                        });
+                        tool_calls.push(ToolCall { id, name, arguments: input });
+                    }
                 }
             }
+
+            let stop_reason = anthropic_response.stop_reason.map(|r| match r.as_str() {
+                "end_turn" => StopReason::EndTurn,
+                "max_tokens" => StopReason::MaxTokens,
+                "tool_use" => StopReason::ToolUse,
+                "stop_sequence" => StopReason::StopSequence,
+                _ => StopReason::EndTurn,
+            });
+
+            return Ok(Response {
+                content,
+                tool_calls,
+                stop_reason,
+                usage: Some(Usage {
+                    input_tokens: anthropic_response.usage.input_tokens,
+                    output_tokens: anthropic_response.usage.output_tokens,
+                }),
+            });
         }
 
-        let stop_reason = anthropic_response.stop_reason.map(|r| match r.as_str() {
-            "end_turn" => StopReason::EndTurn,
-            "max_tokens" => StopReason::MaxTokens,
-            "tool_use" => StopReason::ToolUse,
-            "stop_sequence" => StopReason::StopSequence,
-            _ => StopReason::EndTurn,
-        });
-
-        Ok(Response {
-            content,
-            tool_calls,
-            stop_reason,
-            usage: Some(Usage {
-                input_tokens: anthropic_response.usage.input_tokens,
-                output_tokens: anthropic_response.usage.output_tokens,
-            }),
-        })
+        Err(last_error.unwrap_or_else(|| AgentError::provider("Retry loop exhausted")))
     }
 
     async fn complete_streaming(
@@ -532,33 +597,67 @@ impl Provider for AnthropicProvider {
             stream: true,
         };
 
-        let response = self.client
-            .post(ANTHROPIC_API_URL)
-            .headers(headers)
-            .json(&anthropic_request)
-            .send()
-            .await?;
+        let mut last_error = None;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            if let Ok(error_body) = serde_json::from_str::<AnthropicError>(&error_text) {
-                return match status.as_u16() {
-                    401 => Err(AgentError::Auth(error_body.error.message)),
-                    429 => Err(AgentError::RateLimited { retry_after: None }),
-                    _ => Err(AgentError::api(status.as_u16(), error_body.error.message)),
-                };
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = Self::retry_delay(attempt - 1, last_error.as_ref().and_then(|e| {
+                    if let AgentError::RateLimited { retry_after } = e { *retry_after } else { None }
+                }));
+                tracing::warn!(attempt, delay_ms = delay.as_millis() as u64, "Retrying Anthropic streaming API request");
+                tokio::time::sleep(delay).await;
             }
-            return Err(AgentError::api(status.as_u16(), error_text));
+
+            let response = match self.client
+                .post(ANTHROPIC_API_URL)
+                .headers(headers.clone())
+                .json(&anthropic_request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = AgentError::Network(e);
+                    if err.is_retryable() && attempt < MAX_RETRIES {
+                        tracing::warn!(error = %err, "Transient network error");
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after = Self::parse_retry_after(&response);
+                let error_text = response.text().await.unwrap_or_default();
+                let err = if let Ok(error_body) = serde_json::from_str::<AnthropicError>(&error_text) {
+                    match status.as_u16() {
+                        401 => AgentError::Auth(error_body.error.message),
+                        429 => AgentError::RateLimited { retry_after },
+                        _ => AgentError::api(status.as_u16(), error_body.error.message),
+                    }
+                } else {
+                    AgentError::api(status.as_u16(), error_text)
+                };
+                if err.is_retryable() && attempt < MAX_RETRIES {
+                    tracing::warn!(error = %err, "Transient API error");
+                    last_error = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+
+            let (tx, rx) = mpsc::unbounded_channel();
+            let byte_stream = response.bytes_stream();
+            tokio::spawn(async move {
+                process_sse_stream(byte_stream, tx).await;
+            });
+
+            return Ok(rx);
         }
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let byte_stream = response.bytes_stream();
-        tokio::spawn(async move {
-            process_sse_stream(byte_stream, tx).await;
-        });
-
-        Ok(rx)
+        Err(last_error.unwrap_or_else(|| AgentError::provider("Retry loop exhausted")))
     }
 }
 
@@ -615,5 +714,29 @@ mod tests {
         if std::env::var("ANTHROPIC_API_KEY").is_err() {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn test_retry_delay_exponential_backoff() {
+        // attempt 0: 1s * 2^0 = 1s
+        assert_eq!(AnthropicProvider::retry_delay(0, None), Duration::from_secs(1));
+        // attempt 1: 1s * 2^1 = 2s
+        assert_eq!(AnthropicProvider::retry_delay(1, None), Duration::from_secs(2));
+        // attempt 2: 1s * 2^2 = 4s
+        assert_eq!(AnthropicProvider::retry_delay(2, None), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_retry_delay_capped_at_max() {
+        // Very high attempt should be capped at MAX_RETRY_DELAY (30s)
+        let delay = AnthropicProvider::retry_delay(10, None);
+        assert!(delay <= MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn test_retry_delay_respects_retry_after() {
+        // When retry_after is provided, it takes precedence over backoff
+        assert_eq!(AnthropicProvider::retry_delay(0, Some(10)), Duration::from_secs(10));
+        assert_eq!(AnthropicProvider::retry_delay(5, Some(3)), Duration::from_secs(3));
     }
 }
