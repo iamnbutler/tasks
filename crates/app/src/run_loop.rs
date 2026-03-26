@@ -98,56 +98,6 @@ pub enum RunResult {
     UpdateRestart,
 }
 
-/// Enum wrapper for orchestrator implementations.
-///
-/// `trait_variant::make(Send)` generates non-dyn-compatible traits, so we
-/// use an enum to dispatch instead of `Arc<dyn Orchestrator>`.
-enum AnyOrchestrator {
-    Claude(tasks_orchestrator::ClaudeOrchestrator),
-    Mock(tasks_orchestrator::MockOrchestrator),
-}
-
-impl AnyOrchestrator {
-    async fn evaluate(
-        &self,
-        context: &tasks_orchestrator::EvaluationContext,
-    ) -> Result<tasks_orchestrator::QualityEvaluation, tasks_orchestrator::OrchestratorError> {
-        match self {
-            Self::Claude(o) => o.evaluate(context).await,
-            Self::Mock(o) => o.evaluate(context).await,
-        }
-    }
-
-    async fn triage_conflict(
-        &self,
-        context: &ConflictContext,
-    ) -> Result<tasks_orchestrator::ConflictTriage, tasks_orchestrator::OrchestratorError> {
-        match self {
-            Self::Claude(o) => o.triage_conflict(context).await,
-            Self::Mock(o) => o.triage_conflict(context).await,
-        }
-    }
-
-    async fn think(
-        &self,
-        context: &tasks_orchestrator::SystemContext,
-    ) -> Result<Vec<tasks_orchestrator::OrchestratorAction>, tasks_orchestrator::OrchestratorError> {
-        match self {
-            Self::Claude(o) => o.think(context).await,
-            Self::Mock(o) => o.think(context).await,
-        }
-    }
-
-    async fn answer_question(
-        &self,
-        context: &QuestionContext,
-    ) -> Result<String, tasks_orchestrator::OrchestratorError> {
-        match self {
-            Self::Claude(o) => o.answer_question(context).await,
-            Self::Mock(o) => o.answer_question(context).await,
-        }
-    }
-}
 
 /// Lower operating mode from Play to Pause (spec §6.4).
 ///
@@ -317,18 +267,14 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     // --- 5b. Create orchestrator ---
 
-    let orchestrator = Arc::new(match tasks_orchestrator::ClaudeOrchestrator::from_env() {
-        Ok(o) => {
-            info!("orchestrator initialized (Claude-backed)");
-            AnyOrchestrator::Claude(o)
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to initialize Claude orchestrator, using mock (always rejects)");
-            AnyOrchestrator::Mock(tasks_orchestrator::MockOrchestrator::rejecting(
-                "orchestrator not configured",
-            ))
-        }
-    });
+    let orchestrator = Arc::new(tasks_orchestrator::ClaudeOrchestrator::from_env().map_err(
+        |e| {
+            format!(
+                "failed to initialize orchestrator: {e}. Set ANTHROPIC_API_KEY in .env to fix."
+            )
+        },
+    )?);
+    info!("orchestrator initialized (Claude-backed)");
 
     // --- 5b2. Create orchestrator chat handler ---
 
