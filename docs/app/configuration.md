@@ -69,6 +69,15 @@ BLOCKED_REPOS=example/private-repo,example/other-repo
 BLOCKED_ORGS=competitor-org
 ```
 
+### LLM Model <!-- LAST_UPDATED: 2026-03-27 -->
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TASKS_ORCHESTRATOR_MODEL` | Model used by the orchestrator for task evaluation | `claude-opus-4-6` |
+| `TASKS_ORCHESTRATOR_MAX_TOKENS` | Max response tokens for orchestrator evaluation | `32000` |
+| `TASKS_CHAT_MODEL` | Model used by the orchestrator for agent question answering | `claude-opus-4-6` |
+| `TASKS_CHAT_MAX_TOKENS` | Max response tokens for orchestrator chat | `32000` |
+
 ### Data Management
 
 | Variable | Description | Default |
