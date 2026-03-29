@@ -681,17 +681,20 @@ impl Store {
         let created_at = automation.created_at.to_rfc3339();
         let updated_at = automation.updated_at.to_rfc3339();
 
+        let compiled_at = automation.compiled_at.map(|dt| dt.to_rfc3339());
+
         self.conn()?.execute(
             "INSERT OR REPLACE INTO automations (
-                id, project_id, name, prompt, compiled_workflow,
+                id, project_id, name, prompt, compiled_workflow, compiled_at,
                 trigger_type, trigger_config, state, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 automation.id,
                 automation.project_id,
                 automation.name,
                 automation.prompt,
                 automation.compiled_workflow,
+                compiled_at,
                 trigger_type,
                 trigger_config,
                 state,
@@ -706,7 +709,7 @@ impl Store {
     pub fn get_automation(&self, id: &str) -> Result<Option<Automation>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, name, prompt, compiled_workflow,
+            "SELECT id, project_id, name, prompt, compiled_workflow, compiled_at,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations WHERE id = ?1",
         )?;
@@ -721,7 +724,7 @@ impl Store {
     pub fn list_automations_for_project(&self, project_id: &str) -> Result<Vec<Automation>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, name, prompt, compiled_workflow,
+            "SELECT id, project_id, name, prompt, compiled_workflow, compiled_at,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations WHERE project_id = ?1",
         )?;
@@ -777,7 +780,7 @@ impl Store {
     pub fn list_automations(&self) -> Result<Vec<Automation>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, name, prompt, compiled_workflow,
+            "SELECT id, project_id, name, prompt, compiled_workflow, compiled_at,
                     trigger_type, trigger_config, state, created_at, updated_at
              FROM automations",
         )?;
@@ -1006,21 +1009,33 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
     let name: String = row.get(2)?;
     let prompt: String = row.get(3)?;
     let compiled_workflow: Option<String> = row.get(4)?;
-    let trigger_type: String = row.get(5)?;
-    let trigger_config: String = row.get(6)?;
-    let state_str: String = row.get(7)?;
-    let created_at_str: String = row.get(8)?;
-    let updated_at_str: String = row.get(9)?;
+    let compiled_at_str: Option<String> = row.get(5)?;
+    let trigger_type: String = row.get(6)?;
+    let trigger_config: String = row.get(7)?;
+    let state_str: String = row.get(8)?;
+    let created_at_str: String = row.get(9)?;
+    let updated_at_str: String = row.get(10)?;
+
+    // Parse compiled_at
+    let compiled_at = compiled_at_str
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+                })
+        })
+        .transpose()?;
 
     // Parse trigger
     let trigger = match trigger_type.as_str() {
         "schedule" => {
             let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
             })?;
             let cron = config["cron"].as_str().ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    6,
+                    7,
                     rusqlite::types::Type::Text,
                     format!("missing or non-string 'cron' in trigger_config: {trigger_config}").into(),
                 )
@@ -1029,11 +1044,11 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
         }
         "event" => {
             let config: serde_json::Value = serde_json::from_str(&trigger_config).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
             })?;
             let event_type = config["event_type"].as_str().ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    6,
+                    7,
                     rusqlite::types::Type::Text,
                     format!("missing or non-string 'event_type' in trigger_config: {trigger_config}").into(),
                 )
@@ -1043,7 +1058,7 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
         "manual" => TriggerType::Manual,
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
-                5,
+                6,
                 rusqlite::types::Type::Text,
                 format!("unrecognized trigger_type: {other}").into(),
             ));
@@ -1052,18 +1067,18 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
 
     // Parse state
     let state: AutomationState = serde_json::from_str(&format!("\"{state_str}\"")).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
     Ok(Automation {
@@ -1072,6 +1087,7 @@ fn row_to_automation(row: &rusqlite::Row) -> Result<Automation, rusqlite::Error>
         name,
         prompt,
         compiled_workflow,
+        compiled_at,
         trigger,
         state,
         created_at,
