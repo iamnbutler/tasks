@@ -61,8 +61,6 @@ pub struct RebuildStats {
 ///
 /// This is the core of the platform. All subsystems operate on this state.
 pub struct ServerState {
-    /// Current operating mode (spec Section 6).
-    pub mode: Mode,
     /// All managed projects (spec Section 3.3).
     pub projects: HashMap<String, Project>,
     /// All tasks indexed by ID.
@@ -76,7 +74,6 @@ pub struct ServerState {
 impl ServerState {
     fn new() -> Self {
         Self {
-            mode: Mode::Pause,
             projects: HashMap::new(),
             tasks: HashMap::new(),
             merge_queue: MergeQueue::new(),
@@ -106,6 +103,9 @@ impl ServerState {
 /// - Orchestrator integration (Section 4.2)
 pub struct Server {
     pub state: Arc<RwLock<ServerState>>,
+    /// Operating mode, isolated from `state` so transitions can hold the lock
+    /// across event publication without blocking reads to tasks/projects/merge queue.
+    pub mode: tokio::sync::Mutex<Mode>,
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
     pub(crate) store: Option<Arc<tasks_store::Store>>,
@@ -117,6 +117,7 @@ impl Server {
     pub fn new(event_bus: EventBus) -> Self {
         Self {
             state: Arc::new(RwLock::new(ServerState::new())),
+            mode: tokio::sync::Mutex::new(Mode::Pause),
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: None,
@@ -128,6 +129,7 @@ impl Server {
     pub fn with_store(event_bus: EventBus, store: Arc<tasks_store::Store>) -> Self {
         Self {
             state: Arc::new(RwLock::new(ServerState::new())),
+            mode: tokio::sync::Mutex::new(Mode::Pause),
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
             store: Some(store),
@@ -615,7 +617,7 @@ impl Server {
     // --- Mode management (spec Section 6) ---
 
     pub async fn mode(&self) -> Mode {
-        self.state.read().await.mode
+        *self.mode.lock().await
     }
 
     /// Transition the operating mode.
@@ -624,15 +626,20 @@ impl Server {
     /// - Human can change in any direction
     /// - Orchestrator can only lower
     /// - Takes effect immediately
+    ///
+    /// The mode lock is held across the event publish so that no observer can
+    /// see the new mode before the mode-change event is persisted and broadcast.
+    /// This lock is separate from `self.state`, so reads of tasks/projects/merge
+    /// queue are never blocked by a mode transition.
     pub async fn set_mode(
         &self,
         target: Mode,
         actor: &Actor,
     ) -> Result<Mode, ServerError> {
-        let mut state = self.state.write().await;
-        let new_mode = state.mode.transition(target, actor)?;
-        let old_mode = state.mode;
-        state.mode = new_mode;
+        let mut mode_guard = self.mode.lock().await;
+        let new_mode = mode_guard.transition(target, actor)?;
+        let old_mode = *mode_guard;
+        *mode_guard = new_mode;
 
         // Emit the appropriate mode event
         let event_type = match new_mode {
@@ -641,9 +648,9 @@ impl Server {
             Mode::Play => EventType::SystemModePlay,
         };
 
-        drop(state);
-
-        // Use "system" as the task ID for system events
+        // Use "system" as the task ID for system events.
+        // The mode lock is held so observers cannot read the new mode until
+        // the event has been published.
         let event = Event::new(
             event_type,
             "system",
@@ -1345,14 +1352,11 @@ impl Server {
         per_project_limits: Option<&HashMap<String, u32>>,
     ) -> Result<DispatchPlan, ServerError> {
         // 1. Read current mode — if Stop, return empty plan.
-        {
-            let state = self.state.read().await;
-            if !state.mode.allows_dispatch() {
-                return Ok(DispatchPlan {
-                    resume: Vec::new(),
-                    new_work: Vec::new(),
-                });
-            }
+        if !self.mode().await.allows_dispatch() {
+            return Ok(DispatchPlan {
+                resume: Vec::new(),
+                new_work: Vec::new(),
+            });
         }
 
         // 2. Unblock tasks: find tasks in Blocked state where all blocked_by
@@ -1442,8 +1446,8 @@ impl Server {
     /// as merged - the caller must call mark_entry_merged() or mark_entry_conflict()
     /// based on the result of the GitHub API call.
     pub async fn collect_entries_for_flush(&self) -> Result<Vec<(String, String)>, ServerError> {
+        let mode = self.mode().await;
         let state = self.state.read().await;
-        let mode = state.mode;
         state
             .merge_queue
             .collect_approved_for_flush(mode)
