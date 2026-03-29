@@ -489,6 +489,13 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         let label_config = server::workflow::LabelConfig::default();
         let mut pollers: HashMap<String, RepoPoller> = HashMap::new();
 
+        // Exponential backoff state for GitHub API failures (issue #510).
+        // Tracks consecutive failure count and the earliest time each project
+        // is eligible for the next poll attempt.
+        let mut poll_failures: HashMap<String, u32> = HashMap::new();
+        let mut poll_backoff_until: HashMap<String, Instant> = HashMap::new();
+        const MAX_BACKOFF_EXPONENT: u32 = 6; // cap at 2^6 * base = 64× base interval
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -607,8 +614,25 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             }
 
             for (project_id, poller) in pollers.iter_mut() {
+                // Skip projects in backoff (issue #510)
+                if let Some(&until) = poll_backoff_until.get(project_id.as_str()) {
+                    if Instant::now() < until {
+                        debug!(
+                            project = %project_id,
+                            backoff_remaining_secs = until.duration_since(Instant::now()).as_secs(),
+                            "skipping poll, in backoff after consecutive failures"
+                        );
+                        continue;
+                    }
+                }
+
                 match poller.poll().await {
                     Ok(result) => {
+                        // Reset backoff on success (issue #510)
+                        if poll_failures.remove(project_id.as_str()).is_some() {
+                            poll_backoff_until.remove(project_id.as_str());
+                            info!(project = %project_id, "poll succeeded, backoff reset");
+                        }
                         // --- Issue processing: create or reconcile (issue #254) ---
                         for issue in &result.issues {
                             let source = TaskSource::GithubIssue {
@@ -944,7 +968,21 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         }
                     }
                     Err(e) => {
-                        error!(project = %project_id, error = %e, "poll failed");
+                        let failures = poll_failures
+                            .entry(project_id.clone())
+                            .and_modify(|c| *c = c.saturating_add(1))
+                            .or_insert(1);
+                        let exponent = (*failures).min(MAX_BACKOFF_EXPONENT);
+                        let backoff = poll_interval * 2u32.pow(exponent);
+                        poll_backoff_until
+                            .insert(project_id.clone(), Instant::now() + backoff);
+                        error!(
+                            project = %project_id,
+                            error = %e,
+                            consecutive_failures = *failures,
+                            backoff_secs = backoff.as_secs(),
+                            "poll failed, backing off"
+                        );
                     }
                 }
             }
