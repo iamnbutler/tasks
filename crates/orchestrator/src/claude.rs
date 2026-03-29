@@ -7,11 +7,15 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
+use crate::investigation::run_investigations;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{
+    build_deep_review_prompt, build_evaluation_prompt, build_investigation_review_prompt,
+    parse_pr_url, system_prompt,
+};
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, InvestigationRequest,
+    OrchestratorAction, QualityEvaluation, QuestionContext, SystemContext,
 };
 use events::EventType;
 use models::task::{Task, TaskSource};
@@ -105,12 +109,20 @@ impl ClaudeOrchestrator {
             ));
         }
 
+        let investigations = parsed
+            .investigations
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.into_request())
+            .collect();
+
         Ok(ParsedEvaluation {
             approved: parsed.approved,
             needs_deeper_review: parsed.needs_deeper_review,
             reasoning: parsed.reasoning,
             feedback: parsed.feedback,
             files_to_review: parsed.files_to_review,
+            investigations,
         })
     }
 }
@@ -125,6 +137,27 @@ struct EvaluationResponse {
     feedback: Option<String>,
     #[serde(default)]
     files_to_review: Option<Vec<String>>,
+    #[serde(default)]
+    investigations: Option<Vec<InvestigationRequestResponse>>,
+}
+
+/// Internal struct for parsing investigation requests from LLM response.
+#[derive(Deserialize)]
+struct InvestigationRequestResponse {
+    title: String,
+    question: String,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+impl InvestigationRequestResponse {
+    fn into_request(self) -> InvestigationRequest {
+        InvestigationRequest {
+            title: self.title,
+            question: self.question,
+            files: self.files,
+        }
+    }
 }
 
 /// Internal parsed result from the LLM (includes triage fields not in QualityEvaluation).
@@ -135,6 +168,7 @@ struct ParsedEvaluation {
     reasoning: String,
     feedback: Option<String>,
     files_to_review: Option<Vec<String>>,
+    investigations: Vec<InvestigationRequest>,
 }
 
 impl Orchestrator for ClaudeOrchestrator {
@@ -235,11 +269,15 @@ impl Orchestrator for ClaudeOrchestrator {
 
         let pass1 = self.parse_evaluation_response(&response_text)?;
 
-        // If pass 1 is decisive (no deeper review needed), return immediately
-        if !pass1.needs_deeper_review
-            || pass1.files_to_review.is_none()
-            || pass1.files_to_review.as_ref().is_some_and(|f| f.is_empty())
-        {
+        let has_investigations = !pass1.investigations.is_empty();
+        let has_deeper_review = pass1.needs_deeper_review
+            && pass1
+                .files_to_review
+                .as_ref()
+                .is_some_and(|f| !f.is_empty());
+
+        // If pass 1 is decisive (no deeper review needed, no investigations), return immediately
+        if !has_deeper_review && !has_investigations {
             info!(
                 approved = pass1.approved,
                 has_feedback = pass1.feedback.is_some(),
@@ -249,18 +287,22 @@ impl Orchestrator for ClaudeOrchestrator {
                 approved: pass1.approved,
                 reasoning: pass1.reasoning,
                 feedback: pass1.feedback,
+                investigations: Vec::new(),
             });
         }
 
-        // --- Pass 2: Deep review ---
+        // --- Run investigations and/or deep review in parallel ---
         let files_requested = pass1.files_to_review.unwrap_or_default();
+        let investigation_requests = pass1.investigations;
+
         info!(
             files = ?files_requested,
-            "Pass 1 requested deeper review, fetching files"
+            investigation_count = investigation_requests.len(),
+            "Pass 1 requested deeper review and/or investigations"
         );
 
-        // Fetch requested files from the PR branch
-        let mut files: Vec<(String, String)> = Vec::new();
+        // Fetch files for deep review (if any)
+        let mut deep_review_files: Vec<(String, String)> = Vec::new();
         for file_path in files_requested.iter().take(5) {
             match self
                 .github
@@ -269,56 +311,136 @@ impl Orchestrator for ClaudeOrchestrator {
             {
                 Ok(Some(content)) => {
                     info!(path = %file_path, len = content.len(), "Fetched file for deep review");
-                    files.push((file_path.clone(), content));
+                    deep_review_files.push((file_path.clone(), content));
                 }
                 Ok(None) => {
                     info!(path = %file_path, "File not found on PR branch");
-                    files.push((file_path.clone(), "(file not found)".to_string()));
+                    deep_review_files.push((file_path.clone(), "(file not found)".to_string()));
                 }
                 Err(e) => {
                     warn!(path = %file_path, error = %e, "Failed to fetch file for deep review");
-                    files.push((file_path.clone(), format!("(fetch error: {e})")));
+                    deep_review_files.push((file_path.clone(), format!("(fetch error: {e})")));
                 }
             }
         }
 
-        let deep_prompt = build_deep_review_prompt(
-            &pr,
-            issue.as_ref(),
-            &context.task.title,
-            context.task.description.as_deref(),
-            diff.as_deref().unwrap_or("(no diff available)"),
-            &pass1.reasoning,
-            &files,
-            &context.queue_context,
-        );
-
-        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
-        let request = CompletionRequest::new(config, vec![Message::user(deep_prompt)])
-            .with_system(system);
-
-        let response = self
-            .provider
-            .complete(request)
+        // Run investigation agents in parallel
+        let investigation_results = if !investigation_requests.is_empty() {
+            info!(
+                count = investigation_requests.len(),
+                "Spawning investigation agents"
+            );
+            run_investigations(
+                &self.provider,
+                &self.github,
+                &self.model,
+                &owner,
+                &repo,
+                &pr.head_ref,
+                diff.as_deref(),
+                investigation_requests,
+            )
             .await
-            .map_err(OrchestratorError::Agent)?;
+        } else {
+            Vec::new()
+        };
 
-        let response_text = response.text();
-        info!(response_len = response_text.len(), "Pass 2 evaluation response");
+        if !investigation_results.is_empty() {
+            let concerns = investigation_results.iter().filter(|r| r.concern).count();
+            info!(
+                total = investigation_results.len(),
+                concerns,
+                "Investigation agents completed"
+            );
+        }
 
-        let pass2 = self.parse_evaluation_response(&response_text)?;
+        // --- Final evaluation pass: includes investigation results and/or deep review files ---
+        if has_investigations {
+            // Use the investigation review prompt that includes findings
+            let final_prompt = build_investigation_review_prompt(
+                &pr,
+                issue.as_ref(),
+                &context.task.title,
+                context.task.description.as_deref(),
+                diff.as_deref().unwrap_or("(no diff available)"),
+                &pass1.reasoning,
+                &investigation_results,
+                &deep_review_files,
+                &context.queue_context,
+            );
 
-        info!(
-            approved = pass2.approved,
-            has_feedback = pass2.feedback.is_some(),
-            "Evaluation complete (pass 2 — deep review)"
-        );
+            let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
+            let request = CompletionRequest::new(config, vec![Message::user(final_prompt)])
+                .with_system(system);
 
-        Ok(QualityEvaluation {
-            approved: pass2.approved,
-            reasoning: pass2.reasoning,
-            feedback: pass2.feedback,
-        })
+            let response = self
+                .provider
+                .complete(request)
+                .await
+                .map_err(OrchestratorError::Agent)?;
+
+            let response_text = response.text();
+            info!(
+                response_len = response_text.len(),
+                "Final evaluation response (with investigations)"
+            );
+
+            let final_eval = self.parse_evaluation_response(&response_text)?;
+
+            info!(
+                approved = final_eval.approved,
+                has_feedback = final_eval.feedback.is_some(),
+                investigation_count = investigation_results.len(),
+                "Evaluation complete (with investigations)"
+            );
+
+            Ok(QualityEvaluation {
+                approved: final_eval.approved,
+                reasoning: final_eval.reasoning,
+                feedback: final_eval.feedback,
+                investigations: investigation_results,
+            })
+        } else {
+            // Deep review only (no investigations) — original pass 2 flow
+            let deep_prompt = build_deep_review_prompt(
+                &pr,
+                issue.as_ref(),
+                &context.task.title,
+                context.task.description.as_deref(),
+                diff.as_deref().unwrap_or("(no diff available)"),
+                &pass1.reasoning,
+                &deep_review_files,
+                &context.queue_context,
+            );
+
+            let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
+            let request = CompletionRequest::new(config, vec![Message::user(deep_prompt)])
+                .with_system(system);
+
+            let response = self
+                .provider
+                .complete(request)
+                .await
+                .map_err(OrchestratorError::Agent)?;
+
+            let response_text = response.text();
+            info!(response_len = response_text.len(), "Pass 2 evaluation response");
+
+            let pass2 = self.parse_evaluation_response(&response_text)?;
+
+            info!(
+                approved = pass2.approved,
+                has_feedback = pass2.feedback.is_some(),
+                "Evaluation complete (pass 2 — deep review)"
+            );
+
+            Ok(QualityEvaluation {
+                approved: pass2.approved,
+                reasoning: pass2.reasoning,
+                feedback: pass2.feedback,
+                investigations: Vec::new(),
+            })
+        }
     }
 
     async fn feedback(
@@ -644,6 +766,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 

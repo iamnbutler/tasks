@@ -6,7 +6,7 @@
 //! - Conflicts: Are there merge conflicts?
 //! - Conventions: Does the change meet project standards?
 
-use crate::types::QueueEntrySummary;
+use crate::types::{InvestigationResult, QueueEntrySummary};
 use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
 
 /// Build the system prompt for quality evaluation.
@@ -37,7 +37,8 @@ After reading the diff, decide:
   "needs_deeper_review": false,
   "reasoning": "Explanation based on what you see in the diff",
   "feedback": "Specific feedback if rejected, or null if approved",
-  "files_to_review": null
+  "files_to_review": null,
+  "investigations": null
 }
 
 If you need deeper review:
@@ -46,10 +47,36 @@ If you need deeper review:
   "needs_deeper_review": true,
   "reasoning": "What concerns you and why you need more context",
   "feedback": null,
-  "files_to_review": ["path/to/file1.rs", "path/to/file2.rs"]
+  "files_to_review": ["path/to/file1.rs", "path/to/file2.rs"],
+  "investigations": null
 }
 
-Request at most 5 files. Pick the ones most relevant to your concern.
+If you want to investigate specific concerns before deciding:
+{
+  "approved": false,
+  "needs_deeper_review": false,
+  "reasoning": "I have concerns that need investigation before I can decide",
+  "feedback": null,
+  "files_to_review": null,
+  "investigations": [
+    {
+      "title": "Short label for this investigation",
+      "question": "Specific question to investigate (e.g., 'Do the tests in src/rate_limiter_test.rs cover the timeout edge case added in this PR?')",
+      "files": ["path/to/relevant/file.rs"]
+    }
+  ]
+}
+
+You can combine deeper review with investigations — they'll run in parallel.
+
+Request at most 5 files for review and at most 5 investigations. Pick the ones most relevant to your concerns.
+
+**Investigations:** When you identify a concern that needs deeper analysis, request an investigation instead of trying to guess. Good investigations are:
+- "This PR changes the rate limiter — do the tests cover the edge cases?" → files: test files
+- "This pattern could cause a memory leak in long-running sessions" → files: lifecycle code
+- "The PR claims to fix #42 but I'm not sure it addresses the root cause" → files: related source
+
+Each investigation spawns a focused read-only agent that examines the specified files and answers your question. Their findings feed back into your final decision.
 
 **Pass 2 — Deep review (if requested):**
 You'll receive the full content of the files you requested. Now evaluate with full context:
@@ -251,6 +278,73 @@ pub fn build_deep_review_prompt(
     prompt.push_str("You now have the file context you requested. ");
     prompt.push_str("Make your final evaluation — approve or reject. ");
     prompt.push_str("You cannot request more files. Respond with your evaluation JSON.");
+
+    prompt
+}
+
+/// Build the final evaluation prompt that includes investigation results.
+///
+/// This is used when the triage pass requested investigations. The orchestrator
+/// now has concrete findings to incorporate into its final decision.
+pub fn build_investigation_review_prompt(
+    pr: &PullRequest,
+    issue: Option<&Issue>,
+    task_title: &str,
+    task_description: Option<&str>,
+    diff: &str,
+    triage_reasoning: &str,
+    investigations: &[InvestigationResult],
+    deep_review_files: &[(String, String)],
+    queue_context: &[QueueEntrySummary],
+) -> String {
+    let mut prompt = build_evaluation_prompt(
+        pr,
+        issue,
+        task_title,
+        task_description,
+        Some(diff),
+        queue_context,
+    );
+
+    // Add the triage reasoning
+    prompt.push_str("\n## Previous Review Notes\n\n");
+    prompt.push_str(triage_reasoning);
+    prompt.push_str("\n\n");
+
+    // Add deep review files if any
+    if !deep_review_files.is_empty() {
+        prompt.push_str("## Requested Files\n\n");
+        for (path, content) in deep_review_files {
+            prompt.push_str(&format!("### `{}`\n\n", path));
+            prompt.push_str("```\n");
+            prompt.push_str(&truncate_text(content, 10_000));
+            prompt.push_str("\n```\n\n");
+        }
+    }
+
+    // Add investigation findings
+    prompt.push_str("## Investigation Results\n\n");
+    prompt.push_str("The following investigations were run to address your concerns:\n\n");
+    for (i, result) in investigations.iter().enumerate() {
+        prompt.push_str(&format!(
+            "### Investigation {}: {}\n\n",
+            i + 1,
+            result.request.title
+        ));
+        prompt.push_str(&format!("**Question:** {}\n\n", result.request.question));
+        prompt.push_str(&format!(
+            "**Concern found:** {}\n\n",
+            if result.concern { "Yes" } else { "No" }
+        ));
+        prompt.push_str(&format!("**Findings:**\n{}\n\n", result.finding));
+    }
+
+    prompt.push_str("## Final Evaluation Request\n\n");
+    prompt.push_str("You now have the investigation results addressing your concerns. ");
+    prompt.push_str("Make your final evaluation — approve or reject. ");
+    prompt.push_str("Factor in all investigation findings. ");
+    prompt.push_str("You cannot request more investigations. Respond with your evaluation JSON ");
+    prompt.push_str("(with `needs_deeper_review` false and `investigations` null).");
 
     prompt
 }

@@ -79,6 +79,10 @@ pub enum EventType {
     OrchestratorResponse,
     /// Orchestrator stream-of-consciousness narration of system events.
     OrchestratorThought,
+    /// Orchestrator spawned an investigation agent during PR evaluation.
+    OrchestratorInvestigationStarted,
+    /// Orchestrator investigation agent completed with findings.
+    OrchestratorInvestigationCompleted,
 
     // System events
     SystemStarted,
@@ -156,6 +160,8 @@ impl EventType {
             Self::OrchestratorMessage => "orchestrator:message",
             Self::OrchestratorResponse => "orchestrator:response",
             Self::OrchestratorThought => "orchestrator:thought",
+            Self::OrchestratorInvestigationStarted => "orchestrator:investigation:started",
+            Self::OrchestratorInvestigationCompleted => "orchestrator:investigation:completed",
             Self::SystemStarted => "system:started",
             Self::SystemModePlay => "system:mode:play",
             Self::SystemModePause => "system:mode:pause",
@@ -248,6 +254,8 @@ impl TryFrom<String> for EventType {
             "orchestrator:message" => Ok(Self::OrchestratorMessage),
             "orchestrator:response" => Ok(Self::OrchestratorResponse),
             "orchestrator:thought" => Ok(Self::OrchestratorThought),
+            "orchestrator:investigation:started" => Ok(Self::OrchestratorInvestigationStarted),
+            "orchestrator:investigation:completed" => Ok(Self::OrchestratorInvestigationCompleted),
             "system:started" => Ok(Self::SystemStarted),
             "system:mode:play" => Ok(Self::SystemModePlay),
             "system:mode:pause" => Ok(Self::SystemModePause),

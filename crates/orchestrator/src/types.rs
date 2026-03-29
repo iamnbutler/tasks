@@ -86,6 +86,37 @@ pub struct QualityEvaluation {
     /// Specific feedback for the implementor, if the PR needs work.
     /// Used to re-engage the task's agent session.
     pub feedback: Option<String>,
+    /// Investigations that were run during evaluation.
+    /// Empty if no investigations were needed.
+    #[serde(default)]
+    pub investigations: Vec<InvestigationResult>,
+}
+
+/// A request to investigate a specific concern during PR evaluation.
+///
+/// The orchestrator's triage pass can identify concerns that need deeper
+/// investigation. Each request becomes a lightweight, read-only LLM call
+/// that runs in parallel with other investigations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestigationRequest {
+    /// Short label for what's being investigated (e.g., "test coverage for rate limiter").
+    pub title: String,
+    /// The specific question the investigation should answer.
+    pub question: String,
+    /// Files to fetch and include as context for the investigation.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// Result of a single investigation agent run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestigationResult {
+    /// The original request that triggered this investigation.
+    pub request: InvestigationRequest,
+    /// The investigation agent's findings.
+    pub finding: String,
+    /// Whether the investigation found a concern that should block merge.
+    pub concern: bool,
 }
 
 /// Context for conflict triage — spec §7.4.

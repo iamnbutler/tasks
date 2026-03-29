@@ -9,6 +9,7 @@
 pub mod chat;
 pub mod error;
 mod claude;
+pub mod investigation;
 pub mod mock;
 mod orchestrator;
 mod prompt;
@@ -21,6 +22,7 @@ pub use mock::MockOrchestrator;
 pub use orchestrator::Orchestrator;
 pub use prompt::parse_pr_url;
 pub use types::{
-    ConflictContext, ConflictResolution, ConflictTriage, EvaluationContext, OperatingMode,
-    OrchestratorAction, QualityEvaluation, QuestionContext, QueueEntrySummary, SystemContext,
+    ConflictContext, ConflictResolution, ConflictTriage, EvaluationContext, InvestigationRequest,
+    InvestigationResult, OperatingMode, OrchestratorAction, QualityEvaluation, QuestionContext,
+    QueueEntrySummary, SystemContext,
 };
