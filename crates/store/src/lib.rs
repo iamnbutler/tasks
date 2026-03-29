@@ -10,6 +10,7 @@ mod schema;
 pub use accounting::{AccountingSummary, TaskAccounting};
 pub use schema::DATA_VERSION;
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -32,6 +33,31 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("pool error: {0}")]
     Pool(#[from] r2d2::Error),
+}
+
+/// Maximum size in bytes for automation run output/error stored in SQLite (issue #486).
+/// Outputs exceeding this limit are truncated with a notice appended.
+const MAX_AUTOMATION_OUTPUT_BYTES: usize = 1_024 * 1_024; // 1 MB
+
+/// Truncate a string to at most `max_bytes`, splitting on a valid UTF-8 char boundary.
+/// If truncated, appends a notice indicating the original size.
+fn truncate_text(s: &str, max_bytes: usize) -> Cow<'_, str> {
+    if s.len() <= max_bytes {
+        return Cow::Borrowed(s);
+    }
+    // Find the last valid char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let notice = format!(
+        "\n\n[truncated: output was {} bytes, limit is {} bytes]",
+        s.len(),
+        max_bytes
+    );
+    let mut truncated = s[..end].to_string();
+    truncated.push_str(&notice);
+    Cow::Owned(truncated)
 }
 
 /// Persistent storage backed by SQLite (spec §3.5).
@@ -755,6 +781,10 @@ impl Store {
         let started_at = run.started_at.to_rfc3339();
         let completed_at = run.completed_at.map(|dt| dt.to_rfc3339());
 
+        // Truncate output and error to prevent unbounded TEXT storage (issue #486).
+        let output = run.output.as_deref().map(|s| truncate_text(s, MAX_AUTOMATION_OUTPUT_BYTES));
+        let error = run.error.as_deref().map(|s| truncate_text(s, MAX_AUTOMATION_OUTPUT_BYTES));
+
         self.conn()?.execute(
             "INSERT OR REPLACE INTO automation_runs (
                 id, automation_id, status, started_at, completed_at, output, error
@@ -765,8 +795,8 @@ impl Store {
                 status,
                 started_at,
                 completed_at,
-                run.output,
-                run.error,
+                output,
+                error,
             ],
         )?;
         Ok(())
@@ -1831,5 +1861,49 @@ mod tests {
         assert_eq!(store.list_projects().unwrap().len(), 0);
         // Events dir should be gone
         assert!(!events.exists());
+    }
+
+    #[test]
+    fn truncate_text_under_limit() {
+        let s = "hello world";
+        let result = truncate_text(s, 100);
+        assert_eq!(&*result, s);
+    }
+
+    #[test]
+    fn truncate_text_over_limit() {
+        let s = "x".repeat(200);
+        let result = truncate_text(&s, 100);
+        assert!(result.starts_with(&"x".repeat(100)));
+        assert!(result.contains("[truncated: output was 200 bytes, limit is 100 bytes]"));
+    }
+
+    #[test]
+    fn truncate_text_utf8_boundary() {
+        // Multi-byte chars: each '€' is 3 bytes
+        let s = "€€€€€"; // 15 bytes
+        let result = truncate_text(s, 7); // between 2nd and 3rd '€'
+        // Should truncate to 6 bytes (2 complete '€' chars)
+        assert!(result.starts_with("€€"));
+        assert!(result.contains("[truncated:"));
+    }
+
+    #[test]
+    fn automation_run_output_truncated_on_save() {
+        let store = Store::open_memory().unwrap();
+        store.save_project(&Project::new("p1", "o/r")).unwrap();
+        store.save_automation(&Automation::new("a1", "p1", "Auto", "Prompt", TriggerType::Manual)).unwrap();
+
+        // Create a run with output exceeding the limit
+        let large_output = "x".repeat(MAX_AUTOMATION_OUTPUT_BYTES + 5000);
+        let mut run = AutomationRun::new("r1", "a1");
+        run.complete(Some(large_output));
+        store.save_automation_run(&run).unwrap();
+
+        let loaded = store.get_automation_run("r1").unwrap().unwrap();
+        let output = loaded.output.unwrap();
+        // Should be truncated
+        assert!(output.len() < MAX_AUTOMATION_OUTPUT_BYTES + 5000);
+        assert!(output.contains("[truncated:"));
     }
 }

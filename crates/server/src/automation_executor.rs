@@ -21,6 +21,10 @@ const DEFAULT_MODEL: &str = "claude-opus-4-6";
 /// Maximum tokens for automation response.
 const MAX_TOKENS: u32 = 32_000;
 
+/// Maximum output size in bytes. Outputs exceeding this are truncated before
+/// being returned to callers (issue #486).
+const MAX_OUTPUT_BYTES: usize = 1_024 * 1_024; // 1 MB
+
 /// Error type for automation execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -106,7 +110,7 @@ impl AutomationExecutor {
             .await
             .map_err(ExecutionError::Provider)?;
 
-        let output = response.text();
+        let output = truncate_output(response.text());
         let (input_tokens, output_tokens) = extract_usage(&response);
 
         info!(
@@ -192,11 +196,29 @@ impl AutomationExecutor {
         );
 
         Ok(ExecutionResult {
-            output,
+            output: truncate_output(output),
             input_tokens,
             output_tokens,
         })
     }
+}
+
+/// Truncate output to `MAX_OUTPUT_BYTES`, appending a notice if truncated.
+fn truncate_output(s: String) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s;
+    }
+    let mut end = MAX_OUTPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str(&format!(
+        "\n\n[truncated: output was {} bytes, limit is {} bytes]",
+        s.len(),
+        MAX_OUTPUT_BYTES
+    ));
+    truncated
 }
 
 /// Build the system prompt for automation execution.
@@ -322,5 +344,21 @@ mod tests {
         assert!(prompt.contains("All documentation is up to date."));
         assert!(prompt.contains("## Additional Context"));
         assert!(prompt.contains("Focus on API docs"));
+    }
+
+    #[test]
+    fn test_truncate_output_under_limit() {
+        let small = "hello world".to_string();
+        let result = truncate_output(small.clone());
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn test_truncate_output_over_limit() {
+        let large = "x".repeat(MAX_OUTPUT_BYTES + 1000);
+        let result = truncate_output(large.clone());
+        assert!(result.len() < large.len());
+        assert!(result.contains("[truncated:"));
+        assert!(result.contains(&format!("{} bytes", large.len())));
     }
 }
