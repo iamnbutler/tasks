@@ -641,9 +641,10 @@ impl Server {
             Mode::Play => EventType::SystemModePlay,
         };
 
-        drop(state);
-
-        // Use "system" as the task ID for system events
+        // Publish the event while still holding the write lock so that no
+        // other request can observe the new mode before the event is emitted.
+        // This is safe because event_bus uses its own internal locks and
+        // tokio::sync::RwLock supports holding guards across .await points.
         let event = Event::new(
             event_type,
             "system",
@@ -651,6 +652,8 @@ impl Server {
             serde_json::json!({ "from": format!("{:?}", old_mode) }),
         );
         self.event_bus.publish(event).await?;
+
+        drop(state);
 
         Ok(new_mode)
     }
