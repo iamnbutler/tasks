@@ -1,6 +1,7 @@
 //! GitHub GraphQL client — spec github.md §4.
 
 use std::sync::RwLock;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
@@ -136,6 +137,8 @@ impl GitHubClientBuilder {
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
 

@@ -33,6 +33,14 @@ use crate::problem_tracker::ProblemTracker;
 use crate::scheduler::AutomationScheduler;
 use crate::update::{self, UpdateState};
 
+/// Timeout for a single GitHub poll operation.
+///
+/// Prevents a slow or unresponsive GitHub API from blocking the entire
+/// poll loop. If a poll exceeds this duration, it is cancelled and the
+/// next tick will retry. This is a safety net on top of the per-request
+/// timeouts configured on the HTTP client.
+const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Default cooldown duration for rejected PRs (10 minutes).
 ///
 /// After a PR is rejected, the poll loop will skip creating new merge queue
@@ -573,15 +581,24 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 let token = github_token.clone();
                 let pid = project_id.clone();
 
-                let result = poll_config_watcher
-                    .refresh(&pid, || async {
+                let result = match tokio::time::timeout(
+                    POLL_TIMEOUT,
+                    poll_config_watcher.refresh(&pid, || async {
                         let client = GitHubClient::new(&token);
                         client
                             .get_file_content(&owner, &repo_name, "workflow.toml")
                             .await
                             .map_err(|e| e.to_string())
-                    })
-                    .await;
+                    }),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        warn!(project = %pid, "workflow config refresh timed out");
+                        continue;
+                    }
+                };
 
                 // Emit event if config changed
                 if let RefreshResult::Changed(config) = result {
@@ -626,7 +643,16 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     }
                 }
 
-                match poller.poll().await {
+                // Wrap poll in timeout to prevent stalls (issue #574)
+                let poll_result = tokio::time::timeout(POLL_TIMEOUT, poller.poll()).await;
+                let poll_result = match poll_result {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        error!(project = %project_id, "poll timed out after {}s", POLL_TIMEOUT.as_secs());
+                        continue;
+                    }
+                };
+                match poll_result {
                     Ok(result) => {
                         // Reset backoff on success (issue #510)
                         if poll_failures.remove(project_id.as_str()).is_some() {
