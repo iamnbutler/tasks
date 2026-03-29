@@ -974,6 +974,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
+    let event_handler_work_queue = work_queue.clone();
     let event_handler_max_retries = config.max_retries;
     let mut event_handler_shutdown_rx = shutdown_tx.subscribe();
 
@@ -1114,6 +1115,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         if !matches!(e, server::ServerError::TaskNotFound(_)) {
                             error!(task_id = %task_id, error = %e, "failed to update task state from event");
                         }
+                    }
+                }
+
+                // Complete the work item when task reaches terminal state
+                if state.is_terminal() {
+                    let work_id = format!("task:{}", task_id);
+                    let mut queue = event_handler_work_queue.write().await;
+                    if let Err(e) = queue.complete(&work_id) {
+                        warn!(work_id = %work_id, error = %e, "failed to complete work item");
+                    }
+
+                    // Clear the session_id
+                    if let Err(e) = event_handler_server.clear_task_session_id(task_id).await {
+                        warn!(task_id = %task_id, error = %e, "failed to clear session_id");
                     }
                 }
             }
