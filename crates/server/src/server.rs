@@ -818,6 +818,47 @@ impl Server {
                     tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
                 }
         }
+
+        // Cascade terminal task states to linked merge queue entries (issue #500).
+        // When a task completes/fails/is cancelled, its merge queue entry should
+        // be cleaned up immediately rather than waiting for the next poll cycle.
+        if new_state.is_terminal() {
+            if let Some(entry) = state.merge_queue.get_by_task(task_id) {
+                let entry_id = entry.id.clone();
+                let is_already_terminal =
+                    matches!(entry.status, MergeStatus::Merged | MergeStatus::Rejected);
+                if !is_already_terminal {
+                    tracing::info!(
+                        task_id = %task_id,
+                        entry_id = %entry_id,
+                        task_state = ?new_state,
+                        "cascading terminal task state to merge queue entry"
+                    );
+                    // For Completed tasks whose PR was merged, the entry is already
+                    // handled by mark_entry_merged. For all other terminal states
+                    // (Failed, Cancelled, or Completed without merge), reject the entry.
+                    if let Err(e) = state.merge_queue.reject(&entry_id) {
+                        tracing::error!(
+                            entry_id = %entry_id,
+                            error = %e,
+                            "failed to reject merge queue entry during task terminal cascade"
+                        );
+                    } else if let Some(ref store) = self.store {
+                        // Persist the rejected entry to the store
+                        if let Some(updated_entry) = state.merge_queue.get(&entry_id) {
+                            if let Err(e) = store.save_merge_entry(updated_entry) {
+                                tracing::error!(
+                                    entry_id = %entry_id,
+                                    error = %e,
+                                    "failed to persist rejected merge entry to store"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(true)
     }
 
@@ -1510,10 +1551,8 @@ impl Server {
                 state.merge_queue.get(entry_id).cloned()
             };
             if let Some(entry) = entry_clone {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(&entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
-                    }
+                if let Err(e) = store.save_merge_entry(&entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
                 }
             }
         }
@@ -1690,10 +1729,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -1748,10 +1785,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -2629,7 +2664,7 @@ mod tests {
         server.add_task(task).await.unwrap();
 
         // Verify data is in the store
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         assert!(store_ref.get_project("p1").unwrap().is_some());
         assert!(store_ref.get_task("t1").unwrap().is_some());
     }
@@ -2654,7 +2689,7 @@ mod tests {
             .unwrap();
 
         // Verify the store has the updated state
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         let stored_task = store_ref.get_task("t1").unwrap().unwrap();
         assert_eq!(stored_task.state, TaskState::Running);
     }
@@ -3278,5 +3313,158 @@ mod tests {
 
         // Merge queue entries for proj-1 tasks removed
         assert_eq!(state.merge_queue.entries().len(), 0);
+    }
+
+    // --- Terminal task state cascades to merge queue (issue #500) ---
+
+    #[tokio::test]
+    async fn terminal_task_state_rejects_linked_merge_entry() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Add a merge queue entry linked to the task
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "t1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Verify the entry is Pending
+        {
+            let state = server.state.read().await;
+            let mq_entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(mq_entry.status, MergeStatus::Pending);
+        }
+
+        // Transition the task to Completed (terminal)
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+
+        // The merge queue entry should now be Rejected
+        {
+            let state = server.state.read().await;
+            let mq_entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(mq_entry.status, MergeStatus::Rejected);
+            assert!(mq_entry.completed_at.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_task_state_does_not_double_reject_merged_entry() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // Add a merge queue entry and mark it as already Merged
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "t1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+        {
+            let mut state = server.state.write().await;
+            state.merge_queue.mark_merged("mq-1").unwrap();
+        }
+
+        // Transition the task to Completed
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+
+        // Entry should remain Merged, not downgraded to Rejected
+        {
+            let state = server.state.read().await;
+            let mq_entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(mq_entry.status, MergeStatus::Merged);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_task_rejects_linked_merge_entry() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "t1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Transition the task to Failed (terminal)
+        server
+            .set_task_state("t1", TaskState::Failed, Actor::System)
+            .await
+            .unwrap();
+
+        // The merge queue entry should be Rejected
+        {
+            let state = server.state.read().await;
+            let mq_entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(mq_entry.status, MergeStatus::Rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_rejects_linked_merge_entry() {
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "t1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Transition the task to Cancelled (terminal)
+        server
+            .set_task_state("t1", TaskState::Cancelled, Actor::System)
+            .await
+            .unwrap();
+
+        // The merge queue entry should be Rejected
+        {
+            let state = server.state.read().await;
+            let mq_entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(mq_entry.status, MergeStatus::Rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_task_without_merge_entry_is_fine() {
+        // Ensure no panic when a task transitions to terminal without a merge entry
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        // No merge entry — should not panic or error
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+
+        let task = server.get_task("t1").await.unwrap();
+        assert_eq!(task.state, TaskState::Completed);
     }
 }
