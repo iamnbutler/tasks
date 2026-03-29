@@ -26,6 +26,12 @@ const MAX_EVENTS: usize = 200;
 /// Polling interval for snapshot refresh (milliseconds).
 const POLL_INTERVAL_MS: u64 = 5_000;
 
+/// Initial retry delay for snapshot fetch (milliseconds).
+const INITIAL_RETRY_DELAY_MS: u64 = 1_000;
+
+/// Maximum retry delay (milliseconds).
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
+
 /// Check whether an event type string should trigger a snapshot refresh.
 /// Matches: task:*, merge:*, system:mode*
 fn is_state_changing_event(event_type: &str) -> bool {
@@ -118,6 +124,8 @@ pub struct AppState {
     stop_polling: Option<Arc<AtomicBool>>,
     /// Whether a fetch is currently in flight.
     fetch_in_flight: Arc<AtomicBool>,
+    /// Current retry attempt for initial snapshot fetch (0 = no retries yet).
+    initial_retry_attempt: u32,
 }
 
 impl AppState {
@@ -158,6 +166,7 @@ impl AppState {
             sse_client: Some(sse_client),
             stop_polling: None,
             fetch_in_flight: Arc::new(AtomicBool::new(false)),
+            initial_retry_attempt: 0,
         };
 
         // Start polling loop
@@ -360,9 +369,12 @@ impl AppState {
             Ok(snapshot) => {
                 self.snapshot = Some(snapshot);
                 self.last_error = None;
+                self.initial_retry_attempt = 0;
                 // Update connection status if we were previously disconnected
                 if self.connection_status == ConnectionStatus::Disconnected
                     || self.connection_status == ConnectionStatus::Failed
+                    || self.connection_status == ConnectionStatus::Connecting
+                    || self.connection_status == ConnectionStatus::Reconnecting
                 {
                     self.connection_status = ConnectionStatus::Connected;
                     cx.emit(AppStateEvent::ConnectionStatusChanged(
@@ -373,9 +385,67 @@ impl AppState {
                 cx.notify();
             }
             Err(e) => {
+                let had_no_snapshot = self.snapshot.is_none();
                 self.set_error(e.to_string(), cx);
+
+                // If we've never loaded a snapshot, schedule retry with backoff
+                if had_no_snapshot {
+                    self.connection_status = ConnectionStatus::Reconnecting;
+                    cx.emit(AppStateEvent::ConnectionStatusChanged(
+                        self.connection_status,
+                    ));
+                    cx.notify();
+                    self.schedule_initial_retry(cx);
+                }
             }
         }
+    }
+
+    /// Schedule a retry for the initial snapshot fetch with exponential backoff.
+    fn schedule_initial_retry(&mut self, cx: &mut Context<Self>) {
+        let attempt = self.initial_retry_attempt;
+        self.initial_retry_attempt = attempt.saturating_add(1);
+
+        let delay_ms = INITIAL_RETRY_DELAY_MS.saturating_mul(1u64.saturating_shl(attempt.min(5)));
+        let delay_ms = delay_ms.min(MAX_RETRY_DELAY_MS);
+        let delay = Duration::from_millis(delay_ms);
+
+        info!(attempt = attempt + 1, delay_ms, "Scheduling initial snapshot retry");
+
+        let api_client = self.api_client.clone();
+        let fetch_in_flight = self.fetch_in_flight.clone();
+
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(delay).await;
+
+            // Skip if a fetch is already in flight
+            if fetch_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+
+            let result = api_client.fetch_snapshot().await;
+            fetch_in_flight.store(false, Ordering::SeqCst);
+
+            if let Err(e) = this.update(cx, |state, cx| {
+                state.update_snapshot(result, cx);
+            }) {
+                warn!(error = %e, "Failed to update snapshot state during retry");
+            }
+        })
+        .detach();
+    }
+
+    /// Manually retry connecting to the server.
+    pub fn retry_connect(&mut self, cx: &mut Context<Self>) {
+        self.initial_retry_attempt = 0;
+        self.connection_status = ConnectionStatus::Connecting;
+        self.last_error = None;
+        cx.emit(AppStateEvent::ConnectionStatusChanged(self.connection_status));
+        cx.notify();
+        self.refresh_snapshot(cx);
     }
 
     /// Set an error state.

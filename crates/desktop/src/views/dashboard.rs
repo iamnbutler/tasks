@@ -6,11 +6,11 @@
 //! - Recent events list
 
 use chrono::{DateTime, Utc};
-use gpui::{div, prelude::*, Entity, FontWeight, Styled, Window};
+use gpui::{div, prelude::*, Entity, FontWeight, InteractiveElement, Styled, Window};
 
 use crate::api::{self, TaskState};
 use crate::components::{Badge, BadgeVariant, Card, CardContent, CardHeader};
-use crate::state::AppState;
+use crate::state::{AppState, ConnectionStatus};
 use crate::theme::{colors, radius, rgb, spacing, style_helpers::StyledExt, typography, ComponentTheme};
 
 /// Maximum number of recent events to display.
@@ -37,18 +37,75 @@ impl Render for Dashboard {
 
         // Check if we have data
         let Some(snapshot) = state.snapshot() else {
-            return div()
+            let connection_status = state.connection_status();
+            let last_error = state.last_error().map(|s| s.to_string());
+            let app_state = self.state.clone();
+
+            let status_text = match connection_status {
+                ConnectionStatus::Connecting => "Connecting to server...",
+                ConnectionStatus::Reconnecting => "Reconnecting to server...",
+                ConnectionStatus::Failed => "Connection failed",
+                ConnectionStatus::Disconnected => "Disconnected from server",
+                _ => "Connecting to server...",
+            };
+
+            let show_retry = matches!(
+                connection_status,
+                ConnectionStatus::Failed
+                    | ConnectionStatus::Disconnected
+                    | ConnectionStatus::Reconnecting
+            );
+
+            let mut container = div()
                 .size_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap(spacing::SPACE_2)
                 .child(
                     div()
                         .text_muted()
                         .text_size(typography::TEXT_SM)
-                        .child("No data yet"),
-                )
-                .into_any_element();
+                        .child(status_text.to_string()),
+                );
+
+            if let Some(error) = last_error {
+                container = container.child(
+                    div()
+                        .text_size(typography::TEXT_XS)
+                        .text_color(rgb(colors::DESTRUCTIVE))
+                        .max_w(gpui::px(400.0))
+                        .text_ellipsis()
+                        .overflow_hidden()
+                        .child(error),
+                );
+            }
+
+            if show_retry {
+                container = container.child(
+                    div()
+                        .id("retry-button")
+                        .mt(spacing::SPACE_2)
+                        .px(spacing::SPACE_4)
+                        .py(spacing::SPACE_1)
+                        .rounded(radius::MD)
+                        .border_1()
+                        .border_color(rgb(colors::BORDER))
+                        .bg(rgb(colors::CARD))
+                        .text_size(typography::TEXT_SM)
+                        .text_primary()
+                        .cursor_pointer()
+                        .child("Retry")
+                        .on_click(move |_event, _window, cx| {
+                            app_state.update(cx, |state, cx| {
+                                state.retry_connect(cx);
+                            });
+                        }),
+                );
+            }
+
+            return container.into_any_element();
         };
 
         // Calculate stats
