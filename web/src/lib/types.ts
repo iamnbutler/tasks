@@ -103,6 +103,10 @@ export interface Snapshot {
   merge_queue: MergeQueueEntry[];
   slot_utilization: SlotUtilization;
   human_present: boolean;
+  /** Cargo package version of the server binary. */
+  server_version: string;
+  /** Current data schema version (bumped on incompatible changes). */
+  data_version: number;
 }
 
 /** Rebuild scope for self-update mechanism */
