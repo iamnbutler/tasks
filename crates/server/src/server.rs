@@ -1510,10 +1510,8 @@ impl Server {
                 state.merge_queue.get(entry_id).cloned()
             };
             if let Some(entry) = entry_clone {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(&entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
-                    }
+                if let Err(e) = store.save_merge_entry(&entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
                 }
             }
         }
@@ -1690,10 +1688,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -1748,10 +1744,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -2629,7 +2623,7 @@ mod tests {
         server.add_task(task).await.unwrap();
 
         // Verify data is in the store
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         assert!(store_ref.get_project("p1").unwrap().is_some());
         assert!(store_ref.get_task("t1").unwrap().is_some());
     }
@@ -2654,7 +2648,7 @@ mod tests {
             .unwrap();
 
         // Verify the store has the updated state
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         let stored_task = store_ref.get_task("t1").unwrap().unwrap();
         assert_eq!(stored_task.state, TaskState::Running);
     }
