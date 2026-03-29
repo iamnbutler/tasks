@@ -91,53 +91,48 @@ function parseOrchestratorEvents(
   const blocks: OrchestratorBlock[] = [];
   for (const event of events) {
     if (event.type === "orchestrator:decision") {
-      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
+      const { data } = event;
+      const taskId = data.task_id ?? event.task;
       blocks.push({
         kind: "decision",
         id: event.id,
         timestamp: event.ts,
-        approved: event.data?.approved === true,
-        reasoning: typeof event.data?.reasoning === "string" ? event.data.reasoning : undefined,
+        approved: data.approved,
+        reasoning: data.reasoning,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
+        entryId: data.entry_id,
       });
     } else if (event.type === "orchestrator:feedback") {
-      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
-      const context = typeof event.data?.context === "string" ? event.data.context : undefined;
+      const { data } = event;
+      const taskId = data.task_id ?? event.task;
       // Distinguish question answers from regular feedback
       blocks.push({
-        kind: context === "question_answer" ? "question_answer" : "feedback",
+        kind: data.context === "question_answer" ? "question_answer" : "feedback",
         id: event.id,
         timestamp: event.ts,
-        feedback: typeof event.data?.feedback === "string" ? event.data.feedback : undefined,
+        feedback: data.feedback,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        content: context,
+        content: data.context,
       });
     } else if (event.type === "orchestrator:escalation") {
-      const action = typeof event.data?.action === "string" ? event.data.action : undefined;
+      const { data } = event;
       // Extract reasoning - backend sends "reasoning" for conflicts, "reason" for mode changes
-      const reasoning =
-        typeof event.data?.reasoning === "string" ? event.data.reasoning :
-        typeof event.data?.reason === "string" ? event.data.reason :
-        undefined;
-      const taskId = event.task;
+      const reasoning = data.reasoning ?? data.reason;
       // For agent_question escalations, the message field contains the question
-      const message = typeof event.data?.message === "string" ? event.data.message : undefined;
-
       blocks.push({
         kind: "escalation",
         id: event.id,
         timestamp: event.ts,
-        content: action === "agent_question" ? message : reasoning,
-        taskId,
-        taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
-        escalationAction: action,
-        prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
-        fromMode: typeof event.data?.from === "string" ? event.data.from : undefined,
-        toMode: typeof event.data?.to === "string" ? event.data.to : undefined,
+        content: data.action === "agent_question" ? data.message : reasoning,
+        taskId: event.task,
+        taskInfo: getTaskInfo(event.task, tasks, projects) ?? undefined,
+        entryId: data.entry_id,
+        escalationAction: data.action,
+        prUrl: data.pr_url,
+        fromMode: data.from,
+        toMode: data.to,
       });
     } else if (event.type === "orchestrator:message") {
       // Human message to orchestrator
@@ -145,7 +140,7 @@ function parseOrchestratorEvents(
         kind: "message",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
         actor: "human",
       });
     } else if (event.type === "orchestrator:response") {
@@ -154,7 +149,7 @@ function parseOrchestratorEvents(
         kind: "message",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
         actor: "orchestrator",
       });
     } else if (event.type === "orchestrator:thought") {
@@ -163,7 +158,7 @@ function parseOrchestratorEvents(
         kind: "thought",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
       });
     }
   }

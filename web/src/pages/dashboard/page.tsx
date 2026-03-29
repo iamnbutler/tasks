@@ -640,19 +640,18 @@ interface EscalationAlert {
 
 function parseEscalationEvents(events: Event[]): EscalationAlert[] {
   return events
-    .filter((e) => e.type === "orchestrator:escalation")
+    .filter((e): e is Extract<Event, { type: "orchestrator:escalation" }> =>
+      e.type === "orchestrator:escalation"
+    )
     .map((event) => ({
       id: event.id,
       timestamp: event.ts,
-      action: typeof event.data?.action === "string" ? event.data.action : "unknown",
-      reasoning:
-        typeof event.data?.reasoning === "string" ? event.data.reasoning :
-        typeof event.data?.reason === "string" ? event.data.reason :
-        undefined,
-      prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
+      action: event.data.action ?? "unknown",
+      reasoning: event.data.reasoning ?? event.data.reason,
+      prUrl: event.data.pr_url,
       taskId: event.task,
-      fromMode: typeof event.data?.from === "string" ? event.data.from : undefined,
-      toMode: typeof event.data?.to === "string" ? event.data.to : undefined,
+      fromMode: event.data.from,
+      toMode: event.data.to,
     }))
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp)); // Most recent first
 }

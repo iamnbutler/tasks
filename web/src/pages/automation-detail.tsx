@@ -39,7 +39,15 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
-import type { Automation, AutomationRun, AutomationState, Event } from "@/lib/types";
+import type {
+  Automation,
+  AutomationRun,
+  AutomationState,
+  Event,
+  ClaudeProtocolMessage,
+  ClaudeContentBlock,
+  ClaudeToolInput,
+} from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // State badge configuration
@@ -188,15 +196,20 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
 
   for (const event of events) {
     // Handle automation lifecycle events
-    if (event.type.startsWith("automation:run:")) {
-      if (event.type === "automation:run:output") {
-        // Streaming output chunk
-        const chunk = event.data?.chunk as string | undefined;
-        if (chunk) {
-          blocks.push({ kind: "output_chunk", content: chunk, timestamp: event.ts });
-        }
-        continue;
+    if (event.type === "automation:run:output") {
+      // Streaming output chunk
+      const chunk = event.data.chunk;
+      if (chunk) {
+        blocks.push({ kind: "output_chunk", content: chunk, timestamp: event.ts });
       }
+      continue;
+    }
+
+    if (
+      event.type === "automation:run:started" ||
+      event.type === "automation:run:completed" ||
+      event.type === "automation:run:failed"
+    ) {
       const label = lifecycleLabels[event.type];
       if (label) {
         blocks.push({ kind: "lifecycle", content: label, timestamp: event.ts });
@@ -208,19 +221,21 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
     if (event.type === "agent:error") {
       blocks.push({
         kind: "error",
-        content: typeof event.data?.text === "string" ? event.data.text : JSON.stringify(event.data),
+        content: typeof event.data.text === "string" ? event.data.text : JSON.stringify(event.data),
         timestamp: event.ts,
       });
       continue;
     }
 
     // Handle agent messages (same parsing as task-detail)
-    const raw = event.data?.text;
+    if (event.type !== "agent:message") continue;
+
+    const raw = event.data.text;
     if (typeof raw !== "string") continue;
 
-    let msg: Record<string, unknown>;
+    let msg: ClaudeProtocolMessage;
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(raw) as ClaudeProtocolMessage;
     } catch {
       if (raw.trim()) blocks.push({ kind: "text", content: raw });
       continue;
@@ -229,24 +244,21 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
     if (msg.type === "system") continue;
 
     if (msg.type === "result") {
-      const result = msg.result as Record<string, unknown> | undefined;
-      if (typeof result?.text === "string" && result.text) {
-        blocks.push({ kind: "text", content: result.text });
+      const text = msg.result?.text;
+      if (text) {
+        blocks.push({ kind: "text", content: text });
       }
       continue;
     }
 
-    const message = msg.message as Record<string, unknown> | undefined;
-    const contentBlocks = (message?.content ?? msg.content) as unknown[] | undefined;
+    const contentBlocks: ClaudeContentBlock[] | undefined =
+      msg.message?.content ?? msg.content;
     if (!Array.isArray(contentBlocks)) continue;
 
-    for (const block of contentBlocks) {
-      if (typeof block !== "object" || block === null) continue;
-      const b = block as Record<string, unknown>;
-
+    for (const b of contentBlocks) {
       if (b.type === "thinking") continue;
 
-      if (b.type === "text" && typeof b.text === "string") {
+      if (b.type === "text") {
         if (b.text.trim()) {
           blocks.push({ kind: "text", content: b.text, timestamp: event.ts });
         }
@@ -254,8 +266,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       }
 
       if (b.type === "tool_use") {
-        const name = typeof b.name === "string" ? b.name : "tool";
-        const input = (b.input ?? {}) as Record<string, unknown>;
+        const input: ClaudeToolInput = b.input ?? {};
         const filePath = input.file_path ?? input.filePath ?? input.path ?? input.pattern;
         const command = input.command;
         const description = input.description;
@@ -263,7 +274,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
         blocks.push({
           kind: "tool_use",
           content: detail ? String(detail) : "",
-          toolName: name,
+          toolName: b.name,
           filePath: filePath ? String(filePath) : undefined,
           timestamp: event.ts,
         });
@@ -271,7 +282,7 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       }
 
       if (b.type === "tool_result") {
-        const content = typeof b.content === "string" ? b.content : "";
+        const content = b.content ?? "";
         if (!content) continue;
         const lines = content.split("\n");
         const preview =

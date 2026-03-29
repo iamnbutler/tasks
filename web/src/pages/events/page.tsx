@@ -51,7 +51,7 @@ function matchesFilter(event: Event, filter: FilterKey): boolean {
   return event.type.startsWith(`${filter}:`);
 }
 
-function truncateData(data: Record<string, unknown>, max = 100): string {
+function truncateData(data: object, max = 100): string {
   const raw = JSON.stringify(data);
   return raw.length > max ? `${raw.slice(0, max)}...` : raw;
 }
