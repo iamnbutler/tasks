@@ -384,6 +384,7 @@ struct UpdateAutomationRequest {
 
 /// GET /api/snapshot — Full system state (spec §16.3).
 async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
+    let mode = state.server.mode().await;
     let server_state = state.server.state.read().await;
     let active = server_state
         .tasks
@@ -399,7 +400,7 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         .count() as u32;
 
     Json(SnapshotResponse {
-        mode: server_state.mode,
+        mode,
         projects: server_state.projects.values().cloned().collect(),
         tasks: server_state.tasks.values().cloned().collect(),
         merge_queue: server_state.merge_queue.entries_with_positions(),
@@ -819,13 +820,14 @@ async fn approve_merge(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     // Get entry details and current mode before modifying state
-    let (pr_url, mode) = {
+    let mode = state.server.mode().await;
+    let pr_url = {
         let server_state = state.server.state.read().await;
         let entry = server_state
             .merge_queue
             .get(&id)
             .ok_or_else(|| ApiError::MergeQueue(format!("entry not found: {}", id)))?;
-        (entry.pr_url.clone(), server_state.mode)
+        entry.pr_url.clone()
     };
 
     // Approve the entry using the server method (emits merge:approved event)

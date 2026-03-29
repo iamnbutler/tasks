@@ -1765,12 +1765,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
                                 // Build context from current state
                                 let context = {
-                                    let state = orch_server.state.read().await;
-                                    let mode = match state.mode {
+                                    let mode = match orch_server.mode().await {
                                         server::Mode::Play => "Play",
                                         server::Mode::Pause => "Pause",
                                         server::Mode::Stop => "Stop",
                                     };
+                                    let state = orch_server.state.read().await;
                                     ChatContext {
                                         mode: mode.to_string(),
                                         projects: state.projects.values().cloned().collect(),
@@ -2711,12 +2711,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
             // Build SystemContext snapshot
             let context = {
-                let state = think_server.state.read().await;
-                let orch_mode = match state.mode {
+                let orch_mode = match think_server.mode().await {
                     server::Mode::Play => OperatingMode::Play,
                     server::Mode::Pause => OperatingMode::Pause,
                     server::Mode::Stop => OperatingMode::Stop,
                 };
+                let state = think_server.state.read().await;
                 SystemContext {
                     mode: orch_mode,
                     projects: state.projects.values().cloned().collect(),
