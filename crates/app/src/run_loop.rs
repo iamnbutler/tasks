@@ -236,6 +236,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 .unwrap_or(30),
         ),
     };
+    let health_check_interval = work_queue_config.health_check_interval;
     let work_queue = Arc::new(RwLock::new(WorkQueue::new(store.clone(), work_queue_config)));
 
     // --- 2b. Create workflow config watcher (spec §14.3) ---
@@ -2397,7 +2398,54 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         }
     });
 
-    // --- 8c. Spawn workspace cleanup loop (spec §10.3) ---
+    // --- 8c. Spawn work queue health check loop ---
+    //
+    // Periodically checks for stale work claims (dead or timed-out containers)
+    // and reclaims them so the work can be re-dispatched.
+
+    let health_work_queue = work_queue.clone();
+    let health_session_mgr = session_manager.clone();
+    let mut health_shutdown_rx = shutdown_tx.subscribe();
+
+    let health_check_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(health_check_interval);
+
+        loop {
+            tokio::select! {
+                _ = health_shutdown_rx.recv() => {
+                    info!("health check loop received shutdown signal");
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            let mut queue = health_work_queue.write().await;
+
+            // Use sync version that won't block if lock is held
+            let session_mgr = health_session_mgr.clone();
+            let is_alive = |container_id: &str| -> bool {
+                session_mgr.has_container_sync(container_id)
+            };
+
+            match queue.health_check(is_alive) {
+                Ok(reclaimed) => {
+                    for item in reclaimed {
+                        info!(
+                            work_id = %item.work_id,
+                            previous_container = %item.previous_container_id,
+                            reason = %item.reason,
+                            "reclaimed stale work"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "health check failed");
+                }
+            }
+        }
+    });
+
+    // --- 8d. Spawn workspace cleanup loop (spec §10.3) ---
     //
     // Periodically scans for workspaces eligible for cleanup:
     // - Tasks in terminal states (Completed, Failed, Cancelled)
@@ -2464,7 +2512,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         }
     });
 
-    // --- 8d. Event log compaction loop (#470) ---
+    // --- 8e. Event log compaction loop (#470) ---
     //
     // Periodically compact event logs to enforce retention limits and clean up
     // orphaned task directories, preventing unbounded storage growth.
@@ -2507,7 +2555,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         }
     });
 
-    // --- 8e. Spawn stop mode listener (spec §6.1) ---
+    // --- 8f. Spawn stop mode listener (spec §6.1) ---
     //
     // When mode changes to Stop, terminate all running sessions.
     // This is event-driven so that any mode change source (web, CLI, orchestrator)
@@ -2854,6 +2902,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         orchestrator_handle,
         think_handle,
         watchdog_handle,
+        health_check_handle,
         cleanup_handle,
         compaction_handle,
         stop_mode_handle,

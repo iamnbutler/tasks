@@ -159,6 +159,19 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
         self.sessions.read().await.contains_key(task_id)
     }
 
+    /// Check if a session exists by container_id (sync version for health checks).
+    ///
+    /// Uses `try_read()` to avoid blocking. If the lock cannot be acquired,
+    /// returns `true` to be conservative (assume container exists).
+    pub fn has_container_sync(&self, container_id: &str) -> bool {
+        if let Ok(sessions) = self.sessions.try_read() {
+            sessions.values().any(|h| h.container_id == container_id)
+        } else {
+            // If we can't get the lock, assume container exists to be safe
+            true
+        }
+    }
+
     /// Get the task IDs of all active sessions.
     pub async fn session_ids(&self) -> Vec<String> {
         self.sessions.read().await.keys().cloned().collect()
