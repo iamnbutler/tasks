@@ -19,7 +19,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use models::automation::{Automation, AutomationRun, AutomationState, RunStatus, TriggerType};
 use models::merge_queue::{MergeQueueEntry, MergeStatus};
-use models::project::Project;
+use models::project::{Project, ProjectConfig};
 use models::task::{FailureInfo, Task, TaskSource, TaskState};
 use thiserror::Error;
 
@@ -169,7 +169,7 @@ impl Store {
         match rows.next() {
             Some(row) => {
                 let (id, repo, default_branch, config_str) = row?;
-                let config: serde_json::Value = serde_json::from_str(&config_str)?;
+                let config: ProjectConfig = serde_json::from_str(&config_str)?;
                 Ok(Some(Project {
                     id,
                     repo,
@@ -197,7 +197,7 @@ impl Store {
         let mut projects = Vec::new();
         for row in rows {
             let (id, repo, default_branch, config_str) = row?;
-            let config: serde_json::Value = serde_json::from_str(&config_str)?;
+            let config: ProjectConfig = serde_json::from_str(&config_str)?;
             projects.push(Project {
                 id,
                 repo,
