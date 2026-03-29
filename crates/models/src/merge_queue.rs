@@ -19,6 +19,13 @@ pub enum MergeStatus {
     ChangesRequested,
 }
 
+impl MergeStatus {
+    /// Whether this is a terminal state (no further transitions expected).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Merged | Self::Rejected)
+    }
+}
+
 /// Type of merge conflict — spec Section 7.4.
 ///
 /// The orchestrator uses this to decide resolution strategy:
@@ -139,6 +146,17 @@ impl MergeQueueEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_status_is_terminal() {
+        assert!(MergeStatus::Merged.is_terminal());
+        assert!(MergeStatus::Rejected.is_terminal());
+        assert!(!MergeStatus::Pending.is_terminal());
+        assert!(!MergeStatus::Approved.is_terminal());
+        assert!(!MergeStatus::Merging.is_terminal());
+        assert!(!MergeStatus::Conflict.is_terminal());
+        assert!(!MergeStatus::ChangesRequested.is_terminal());
+    }
 
     #[test]
     fn conflict_type_is_mechanical() {

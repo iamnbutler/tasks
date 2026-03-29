@@ -298,7 +298,7 @@ impl MergeQueue {
     ) {
         self.entries.retain(|e| {
             // Remove merged and rejected entries after cooldown period (issue #438)
-            if matches!(e.status, MergeStatus::Merged | MergeStatus::Rejected) {
+            if e.status.is_terminal() {
                 match (merged_cutoff, e.completed_at) {
                     // If we have both a cutoff and a completed_at timestamp,
                     // only remove if completed before the cutoff
