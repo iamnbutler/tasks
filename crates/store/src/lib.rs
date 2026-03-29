@@ -821,6 +821,21 @@ impl Store {
         }
     }
 
+    /// List all automation runs currently in `Running` state (across all automations).
+    pub fn list_running_automation_runs(&self) -> Result<Vec<AutomationRun>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, automation_id, status, started_at, completed_at, output, error
+             FROM automation_runs WHERE status = 'running'",
+        )?;
+        let rows = stmt.query_map([], row_to_automation_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
     /// List all runs for an automation.
     pub fn list_runs_for_automation(&self, automation_id: &str) -> Result<Vec<AutomationRun>, StoreError> {
         let conn = self.conn()?;

@@ -415,6 +415,22 @@ impl Server {
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 
+    /// Get a single automation run by ID.
+    pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        store.get_automation_run(run_id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// List all automation runs currently in `Running` state.
+    pub fn list_running_automation_runs(&self) -> Result<Vec<AutomationRun>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        store.list_running_automation_runs()
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
     /// Create a new automation run.
     pub async fn create_automation_run(&self, automation_id: &str) -> Result<AutomationRun, ServerError> {
         // Verify automation exists
