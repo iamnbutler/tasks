@@ -121,6 +121,11 @@ function MergeQueueRow({
             {entry.changes_requested_feedback}
           </p>
         )}
+        {entry.status === "rejected" && task?.rejection_feedback && (
+          <p className="text-xs text-orange-400/80 truncate mt-0.5" title={task.rejection_feedback}>
+            {task.rejection_feedback}
+          </p>
+        )}
       </TextCell>
 
       {/* Project */}
