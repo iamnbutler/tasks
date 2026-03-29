@@ -94,6 +94,26 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             error TEXT
         );
 
+        -- Work claims: tracks claimed work items for the centralized queue (#658)
+        -- The queue itself is derived from source systems; this table persists
+        -- claim status so restarts don't re-dispatch in-progress work.
+        CREATE TABLE IF NOT EXISTS work_claims (
+            work_id TEXT PRIMARY KEY,
+            work_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            container_id TEXT,
+            claimed_at TEXT,
+            released_at TEXT,
+            release_note TEXT,
+            completed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_work_claims_active
+            ON work_claims(container_id) WHERE completed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_work_claims_source
+            ON work_claims(source_id);
+
         -- Indexes for common query patterns (issue #465)
         -- tasks: lookup by project, filter by state, find by source
         CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
