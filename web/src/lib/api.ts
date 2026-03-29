@@ -6,6 +6,7 @@ import type {
   MergeQueueEntry,
   Mode,
   Project,
+  RebuildStats,
   Snapshot,
   Task,
   TriggerConfig,
@@ -317,6 +318,10 @@ export function fetchAutomationRunEvents(
   runId: string
 ): Promise<Event[]> {
   return request<Event[]>(`/api/automations/${automationId}/runs/${runId}/events`);
+}
+
+export function rebuildFromGithub(): Promise<RebuildStats> {
+  return request<RebuildStats>("/api/rebuild", { method: "POST" });
 }
 
 export function cancelAutomationRun(

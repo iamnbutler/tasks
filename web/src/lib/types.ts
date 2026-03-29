@@ -154,6 +154,12 @@ export interface UpdateStatus {
   applying?: boolean;
 }
 
+/** Stats returned after a rebuild-from-GitHub operation */
+export interface RebuildStats {
+  tasks_cleared: number;
+  merge_entries_cleared: number;
+}
+
 /** Information about an active container session */
 export interface ContainerInfo {
   container_id: string;

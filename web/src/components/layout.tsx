@@ -17,9 +17,11 @@ import {
   Rocket,
   Workflow,
   Check,
+  RefreshCw,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { addProject, deleteProject, setMode, bootstrapProject } from "@/lib/api";
+import { addProject, deleteProject, setMode, bootstrapProject, rebuildFromGithub } from "@/lib/api";
+import type { RebuildStats } from "@/lib/types";
 import { UpdateBanner } from "@/components/update-banner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -150,6 +152,99 @@ function SidebarNavItem({
         <span className="ml-auto text-xs text-muted-foreground">{badge}</span>
       )}
     </NavLink>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild from GitHub
+// ---------------------------------------------------------------------------
+
+function RebuildButton() {
+  const { refreshSnapshot } = useAppState();
+  const [open, setOpen] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<RebuildStats | null>(null);
+
+  const handleRebuild = async () => {
+    setRebuilding(true);
+    setError(null);
+    try {
+      const stats = await rebuildFromGithub();
+      setResult(stats);
+      await refreshSnapshot();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Rebuild failed");
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
+  const reset = () => {
+    setOpen(false);
+    setError(null);
+    setResult(null);
+  };
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={() => setOpen(true)}
+            className="flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors"
+          >
+            <RefreshCw className="h-4 w-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">Rebuild from GitHub</TooltipContent>
+      </Tooltip>
+
+      <Dialog open={open} onOpenChange={(o) => !o && reset()}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Rebuild from GitHub</DialogTitle>
+            <DialogDescription>
+              This will clear all local tasks and merge queue entries, then
+              re-fetch everything from GitHub. Event logs and projects are
+              preserved.
+            </DialogDescription>
+          </DialogHeader>
+          {result ? (
+            <div className="space-y-4 py-2">
+              <div className="rounded-md bg-green-500/10 border border-green-500/20 p-4 space-y-1 text-sm">
+                <p className="font-medium text-green-400">Rebuild complete</p>
+                <p className="text-muted-foreground">
+                  Tasks cleared: <span className="text-foreground">{result.tasks_cleared}</span>
+                </p>
+                <p className="text-muted-foreground">
+                  Merge entries cleared: <span className="text-foreground">{result.merge_entries_cleared}</span>
+                </p>
+              </div>
+              <DialogFooter>
+                <Button onClick={reset}>Done</Button>
+              </DialogFooter>
+            </div>
+          ) : (
+            <>
+              {error && <p className="text-sm text-red-400">{error}</p>}
+              <DialogFooter>
+                <Button variant="outline" onClick={reset} disabled={rebuilding}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={handleRebuild}
+                  disabled={rebuilding}
+                >
+                  {rebuilding ? "Rebuilding..." : "Rebuild"}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
@@ -595,7 +690,10 @@ export function Layout() {
 
         {/* Footer: mode selector + connection + slots */}
         <div className="border-t border-border px-3 py-2 space-y-2">
-          <ModeSelector />
+          <div className="flex items-center justify-between">
+            <ModeSelector />
+            <RebuildButton />
+          </div>
           <div className="flex items-center justify-between text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5">
               <span
