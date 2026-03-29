@@ -38,7 +38,7 @@ use crate::update::{self, UpdateState};
 /// entries for the same PR URL + head SHA combination until this duration
 /// has elapsed. This prevents the race condition where cleanup removes the
 /// Rejected entry and the poll loop immediately re-queues the same PR.
-const REJECTED_PR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+pub const REJECTED_PR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// Tracks recently rejected PRs to prevent immediate re-queuing (issue #439).
 ///
@@ -52,7 +52,7 @@ const REJECTED_PR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 2. Cleanup removes Rejected entry
 /// 3. Poll loop finds open PR, creates new Pending entry
 /// 4. Orchestrator re-evaluates (non-deterministically may approve)
-struct RejectedPrCooldown {
+pub struct RejectedPrCooldown {
     /// Map of pr_url -> (head_sha, rejection_time)
     entries: HashMap<String, (String, Instant)>,
 }
@@ -86,6 +86,31 @@ impl RejectedPrCooldown {
     fn cleanup(&mut self, cooldown: Duration) {
         self.entries
             .retain(|_, (_, rejected_at)| rejected_at.elapsed() < cooldown);
+    }
+
+    /// Export active cooldown entries as wall-clock expiry times.
+    ///
+    /// Returns a list of `(pr_url, head_sha, expires_at)` for entries
+    /// still within the cooldown window.
+    fn active_cooldowns(
+        &self,
+        cooldown: Duration,
+    ) -> Vec<(String, String, chrono::DateTime<chrono::Utc>)> {
+        let now_instant = Instant::now();
+        let now_utc = chrono::Utc::now();
+        self.entries
+            .iter()
+            .filter_map(|(pr_url, (head_sha, rejected_at))| {
+                let elapsed = rejected_at.elapsed();
+                if elapsed < cooldown {
+                    let remaining = cooldown - elapsed;
+                    let expires_at = now_utc + chrono::Duration::from_std(remaining).ok()?;
+                    Some((pr_url.clone(), head_sha.clone(), expires_at))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -2641,6 +2666,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             blocked_orgs: config.blocked_orgs.clone(),
             automation_soft_limit: config.automation_soft_limit,
             automation_hard_limit: config.automation_hard_limit,
+            rejected_pr_cooldown: Some(rejected_pr_cooldown.clone()),
         };
         let web_port = config.web_port;
 

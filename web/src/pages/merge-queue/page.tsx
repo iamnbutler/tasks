@@ -27,11 +27,23 @@ import {
   prRepoShort,
   getTask,
 } from "./columns";
-import type { MergeQueueEntry, Project, Task } from "@/lib/types";
+import type { MergeQueueEntry, Project, Task, RejectedCooldown } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Merge Queue Row
 // ---------------------------------------------------------------------------
+
+function formatCooldownTime(expiresAt: string): string {
+  const expires = new Date(expiresAt);
+  const now = new Date();
+  const remainMs = expires.getTime() - now.getTime();
+  if (remainMs <= 0) return "expiring...";
+  const mins = Math.ceil(remainMs / 60000);
+  if (mins >= 60) {
+    return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+  }
+  return `${mins}m`;
+}
 
 function MergeQueueRow({
   entry,
@@ -39,12 +51,14 @@ function MergeQueueRow({
   projects,
   showProject,
   onRefresh,
+  cooldown,
 }: {
   entry: MergeQueueEntry;
   tasks: Task[];
   projects: Project[];
   showProject: boolean;
   onRefresh: () => Promise<void>;
+  cooldown?: RejectedCooldown;
 }) {
   const task = getTask(entry.task_id, tasks);
   const num = prNumber(entry.pr_url);
@@ -127,7 +141,19 @@ function MergeQueueRow({
       {showProject && <ProjectCell>{shortProject}</ProjectCell>}
 
       {/* Status */}
-      <BadgeCell>{statusBadge(entry.status)}</BadgeCell>
+      <BadgeCell>
+        <div className="flex items-center gap-1.5">
+          {statusBadge(entry.status)}
+          {cooldown && (
+            <span
+              className="text-[10px] text-orange-400 whitespace-nowrap"
+              title="In cooldown — won't be re-evaluated until timer expires or new commits are pushed"
+            >
+              cooldown {formatCooldownTime(cooldown.expires_at)}
+            </span>
+          )}
+        </div>
+      </BadgeCell>
 
       {/* Queue position */}
       <IdCell width="w-12">
@@ -199,6 +225,15 @@ function MergeList({
   const projects = snapshot.projects ?? [];
   const showProject = !selectedProject;
 
+  // Build a lookup of active cooldowns by pr_url
+  const cooldownMap = useMemo(() => {
+    const map = new Map<string, RejectedCooldown>();
+    for (const c of snapshot.rejected_cooldowns ?? []) {
+      map.set(c.pr_url, c);
+    }
+    return map;
+  }, [snapshot.rejected_cooldowns]);
+
   // Simple pagination
   const totalPages = Math.ceil(entries.length / pageSize);
   const paginatedEntries = entries.slice(page * pageSize, (page + 1) * pageSize);
@@ -220,6 +255,7 @@ function MergeList({
             projects={projects}
             showProject={showProject}
             onRefresh={refreshSnapshot}
+            cooldown={entry.status === "rejected" ? cooldownMap.get(entry.pr_url) : undefined}
           />
         ))}
       </div>

@@ -77,6 +77,15 @@ export interface MergeQueueEntry {
   changes_requested_feedback?: string;
   /** Position in merge queue (1-indexed). Only set for approved/merging entries. */
   queue_position?: number;
+  /** Current head commit SHA of the PR branch. */
+  head_sha?: string;
+}
+
+/** A rejected PR that is in cooldown (won't be re-evaluated until expiry or new commits). */
+export interface RejectedCooldown {
+  pr_url: string;
+  head_sha: string;
+  expires_at: string;
 }
 
 export type Actor = "human" | "orchestrator" | "scheduler" | "agent" | "system";
@@ -102,6 +111,8 @@ export interface Snapshot {
   merge_queue: MergeQueueEntry[];
   slot_utilization: SlotUtilization;
   human_present: boolean;
+  /** Active rejected-PR cooldowns. */
+  rejected_cooldowns?: RejectedCooldown[];
 }
 
 /** Rebuild scope for self-update mechanism */

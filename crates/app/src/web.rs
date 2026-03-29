@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 
 use axum::{
@@ -31,6 +31,7 @@ use server::Server;
 use server::presence::OwnedConnectionGuard;
 use models::Mode;
 
+use crate::run_loop::RejectedPrCooldown;
 use crate::update::UpdateState;
 
 /// Shared state for API handlers.
@@ -49,6 +50,8 @@ pub struct ApiState {
     pub automation_soft_limit: std::time::Duration,
     /// Automation session hard time limit.
     pub automation_hard_limit: std::time::Duration,
+    /// Rejected PR cooldown tracker (shared with poll/orchestrator loops).
+    pub rejected_pr_cooldown: Option<Arc<StdMutex<RejectedPrCooldown>>>,
 }
 
 /// Build the API router.
@@ -119,6 +122,16 @@ struct SnapshotResponse {
     automations: Vec<models::automation::Automation>,
     slot_utilization: SlotUtilization,
     human_present: bool,
+    /// Active rejected-PR cooldowns: pr_url -> (head_sha, expires_at).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rejected_cooldowns: Vec<RejectedCooldownEntry>,
+}
+
+#[derive(Serialize)]
+struct RejectedCooldownEntry {
+    pr_url: String,
+    head_sha: String,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize)]
@@ -398,6 +411,23 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         })
         .count() as u32;
 
+    let rejected_cooldowns = state
+        .rejected_pr_cooldown
+        .as_ref()
+        .map(|cooldown| {
+            let cooldown = cooldown.lock().unwrap();
+            cooldown
+                .active_cooldowns(crate::run_loop::REJECTED_PR_COOLDOWN)
+                .into_iter()
+                .map(|(pr_url, head_sha, expires_at)| RejectedCooldownEntry {
+                    pr_url,
+                    head_sha,
+                    expires_at,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Json(SnapshotResponse {
         mode: server_state.mode,
         projects: server_state.projects.values().cloned().collect(),
@@ -409,6 +439,7 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
             max: state.max_sessions,
         },
         human_present: state.server.is_human_present(),
+        rejected_cooldowns,
     })
 }
 
