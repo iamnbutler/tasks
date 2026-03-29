@@ -245,6 +245,11 @@ mod tests {
             reviews: vec![],
             comments: vec![],
             linked_issues: vec![],
+            ci_status: None,
+            check_runs: vec![],
+            status_contexts: vec![],
+            latest_reviews: vec![],
+            reaction_count: 0,
             author: User {
                 login: "u".into(),
                 node_id: "u1".into(),
