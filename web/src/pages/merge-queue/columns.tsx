@@ -1,11 +1,33 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, Timer } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { approveMerge, rejectMerge } from "@/lib/api";
 import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
+
+// ---------------------------------------------------------------------------
+// Cooldown helpers
+// ---------------------------------------------------------------------------
+
+/** Cooldown duration in milliseconds (matches backend REJECTED_PR_COOLDOWN = 10 min). */
+const COOLDOWN_DURATION_MS = 10 * 60 * 1000;
+
+/** Get remaining cooldown time for a rejected entry. Returns null if not in cooldown. */
+export function getCooldownRemaining(entry: MergeQueueEntry): { remainingMs: number; cooldownUntil: Date } | null {
+  if (entry.status !== "rejected" || !entry.completed_at) return null;
+  const completedAt = new Date(entry.completed_at).getTime();
+  const cooldownUntil = new Date(completedAt + COOLDOWN_DURATION_MS);
+  const remainingMs = cooldownUntil.getTime() - Date.now();
+  if (remainingMs <= 0) return null;
+  return { remainingMs, cooldownUntil };
+}
+
+/** Format a cooldown time as "HH:MM". */
+function formatCooldownTime(date: Date): string {
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
 
 // ---------------------------------------------------------------------------
 // Status badge
@@ -30,6 +52,21 @@ export function statusBadge(status: MergeStatus) {
     default:
       return <Badge variant="outline">{status}</Badge>;
   }
+}
+
+/** Cooldown badge shown next to rejected entries that are still in cooldown. */
+export function CooldownBadge({ entry }: { entry: MergeQueueEntry }) {
+  const cooldown = getCooldownRemaining(entry);
+  if (!cooldown) return null;
+  return (
+    <span
+      className="inline-flex items-center gap-1 text-xs text-red-400/70"
+      title="This PR is in a 10-minute cooldown period and won't be re-evaluated until the timer expires. Pushing new commits will bypass the cooldown."
+    >
+      <Timer className="h-3 w-3" />
+      until {formatCooldownTime(cooldown.cooldownUntil)}
+    </span>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +229,12 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
   {
     accessorKey: "status",
     header: "Status",
-    cell: ({ row }) => statusBadge(row.original.status),
+    cell: ({ row }) => (
+      <span className="inline-flex items-center gap-1.5">
+        {statusBadge(row.original.status)}
+        <CooldownBadge entry={row.original} />
+      </span>
+    ),
     sortingFn: (rowA, rowB) => {
       const a = statusSortOrder[rowA.original.status] ?? 99;
       const b = statusSortOrder[rowB.original.status] ?? 99;

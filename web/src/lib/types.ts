@@ -77,6 +77,8 @@ export interface MergeQueueEntry {
   changes_requested_feedback?: string;
   /** Position in merge queue (1-indexed). Only set for approved/merging entries. */
   queue_position?: number;
+  /** Timestamp when entry reached terminal state (merged/rejected). Used for cooldown display. */
+  completed_at?: string;
 }
 
 export type Actor = "human" | "orchestrator" | "scheduler" | "agent" | "system";

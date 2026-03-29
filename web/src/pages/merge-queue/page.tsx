@@ -22,6 +22,7 @@ import {
   lifecyclePhases,
   type LifecyclePhase,
   statusBadge,
+  CooldownBadge,
   prNumber,
   prRepo,
   prRepoShort,
@@ -127,7 +128,12 @@ function MergeQueueRow({
       {showProject && <ProjectCell>{shortProject}</ProjectCell>}
 
       {/* Status */}
-      <BadgeCell>{statusBadge(entry.status)}</BadgeCell>
+      <BadgeCell>
+        <span className="inline-flex items-center gap-1.5">
+          {statusBadge(entry.status)}
+          <CooldownBadge entry={entry} />
+        </span>
+      </BadgeCell>
 
       {/* Queue position */}
       <IdCell width="w-12">
