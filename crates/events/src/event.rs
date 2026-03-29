@@ -79,6 +79,12 @@ pub enum EventType {
     OrchestratorResponse,
     /// Orchestrator stream-of-consciousness narration of system events.
     OrchestratorThought,
+    /// Orchestrator dispatched a one-off agent session.
+    OrchestratorDispatchStarted,
+    /// Orchestrator-dispatched agent session completed successfully.
+    OrchestratorDispatchCompleted,
+    /// Orchestrator-dispatched agent session failed.
+    OrchestratorDispatchFailed,
 
     // System events
     SystemStarted,
@@ -156,6 +162,9 @@ impl EventType {
             Self::OrchestratorMessage => "orchestrator:message",
             Self::OrchestratorResponse => "orchestrator:response",
             Self::OrchestratorThought => "orchestrator:thought",
+            Self::OrchestratorDispatchStarted => "orchestrator:dispatch:started",
+            Self::OrchestratorDispatchCompleted => "orchestrator:dispatch:completed",
+            Self::OrchestratorDispatchFailed => "orchestrator:dispatch:failed",
             Self::SystemStarted => "system:started",
             Self::SystemModePlay => "system:mode:play",
             Self::SystemModePause => "system:mode:pause",
@@ -248,6 +257,9 @@ impl TryFrom<String> for EventType {
             "orchestrator:message" => Ok(Self::OrchestratorMessage),
             "orchestrator:response" => Ok(Self::OrchestratorResponse),
             "orchestrator:thought" => Ok(Self::OrchestratorThought),
+            "orchestrator:dispatch:started" => Ok(Self::OrchestratorDispatchStarted),
+            "orchestrator:dispatch:completed" => Ok(Self::OrchestratorDispatchCompleted),
+            "orchestrator:dispatch:failed" => Ok(Self::OrchestratorDispatchFailed),
             "system:started" => Ok(Self::SystemStarted),
             "system:mode:play" => Ok(Self::SystemModePlay),
             "system:mode:pause" => Ok(Self::SystemModePause),

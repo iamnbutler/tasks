@@ -5,6 +5,7 @@
 
 mod automation_runner;
 mod config;
+mod dispatch_runner;
 mod memory;
 mod problem_tracker;
 mod run_loop;

@@ -297,7 +297,45 @@ pub enum OrchestratorAction {
         task_id: String,
         reason: String,
     },
-    // Future: DispatchAgent { task_id: String, config: DispatchConfig }
+    /// Dispatch a one-off agent session to perform a task on behalf of the orchestrator.
+    ///
+    /// The run loop starts a short-lived container session with the given prompt
+    /// and reports results back via events. These are NOT full task sessions —
+    /// they're lightweight, orchestrator-directed agents that report back.
+    DispatchAgent {
+        /// The request describing what the agent should do.
+        request: DispatchRequest,
+    },
     // Future: CreateIssue { repo: String, title: String, body: String }
     // Future: CommentOnPr { pr_url: String, body: String }
+}
+
+/// Intent for a dispatched agent session — controls access level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchIntent {
+    /// Read-only investigation (e.g., "is this pattern used elsewhere?").
+    ReadOnly,
+    /// Read-write access (e.g., "fix this lint warning", "create an issue").
+    ReadWrite,
+}
+
+/// Request to dispatch a one-off agent session.
+///
+/// The orchestrator returns this as part of a `DispatchAgent` action from `think()`.
+/// The run loop executes it by starting a short-lived container session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchRequest {
+    /// The prompt/instructions for the agent.
+    pub prompt: String,
+    /// The project ID this dispatch relates to (determines repo + credentials).
+    pub project_id: String,
+    /// What the agent is allowed to do.
+    pub intent: DispatchIntent,
+    /// Human-readable reason for this dispatch (shown in events).
+    pub reason: String,
+    /// Soft time limit in seconds (default: 300 = 5 minutes).
+    pub soft_limit_secs: Option<u64>,
+    /// Hard time limit in seconds (default: 600 = 10 minutes).
+    pub hard_limit_secs: Option<u64>,
 }

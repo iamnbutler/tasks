@@ -406,6 +406,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     );
     info!("automation event listener started");
 
+    // --- 6b. Spawn orchestrator dispatch event listener ---
+    //
+    // Watches for session completion/failure events on orchestrator dispatch
+    // sessions (task_id starting with "orchestrator-dispatch:") and emits
+    // the corresponding orchestrator:dispatch:completed/failed events.
+
+    let dispatch_listener_shutdown_rx = shutdown_tx.subscribe();
+    let dispatch_listener_handle = crate::dispatch_runner::spawn_dispatch_event_listener(
+        &server.event_bus,
+        server.clone(),
+        dispatch_listener_shutdown_rx,
+    );
+    info!("orchestrator dispatch event listener started");
+
     // --- 6d. Create rejected PR cooldown tracker (issue #439) ---
     //
     // Shared between the poll loop and orchestrator loop to prevent re-queuing
@@ -2493,6 +2507,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // think() as recent_events so the orchestrator can see what happened.
 
     let think_server = server.clone();
+    let think_session_mgr = session_manager.clone();
     let think_event_bus = server.event_bus.clone();
     let mut think_shutdown_rx = shutdown_tx.subscribe();
 
@@ -2589,6 +2604,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             }
                             OrchestratorAction::PrioritizeTask { task_id, reason } => {
                                 info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            }
+                            OrchestratorAction::DispatchAgent { request } => {
+                                info!(
+                                    project_id = %request.project_id,
+                                    intent = ?request.intent,
+                                    reason = %request.reason,
+                                    "orchestrator dispatching one-off agent session"
+                                );
+                                crate::dispatch_runner::execute_dispatch(
+                                    &think_session_mgr,
+                                    &think_server,
+                                    &request,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -2776,6 +2805,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         poll_handle,
         automation_scheduler_handle,
         automation_listener_handle,
+        dispatch_listener_handle,
         dispatch_handle,
         event_handler_handle,
         orchestrator_handle,
