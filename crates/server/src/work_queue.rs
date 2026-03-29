@@ -653,4 +653,91 @@ mod tests {
         queue.claim_next(10, 0, "container-1").unwrap();
         assert_eq!(queue.unclaimed_count(), 1);
     }
+
+    // ---- integration tests (database verification) ----
+
+    #[test]
+    fn full_dispatch_cycle_with_database_verification() {
+        // This test verifies the full lifecycle: claim persisted to DB, complete persisted to DB
+        let store = setup_store();
+        let config = WorkQueueConfig {
+            work_queue_timeout: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut queue = WorkQueue::new(store.clone(), config);
+
+        // 1. Add tasks via rebuild
+        let tasks = make_tasks(&[("t1", "proj", TaskState::Waiting)]);
+        queue.rebuild(&tasks).unwrap();
+        assert_eq!(queue.len(), 1);
+
+        // 2. Claim work
+        let claimed = queue.claim_next(10, 0, "container-1").unwrap().unwrap();
+        assert_eq!(claimed.source_id, "t1");
+
+        // 3. Verify claim persisted in database
+        let conn = store.conn().unwrap();
+        let db_claim = tasks_store::work_claims::get_claim(&conn, &claimed.id)
+            .unwrap()
+            .expect("claim should exist in database");
+        assert_eq!(db_claim.container_id, Some("container-1".to_string()));
+        assert!(db_claim.claimed_at.is_some());
+        assert!(db_claim.completed_at.is_none());
+        drop(conn);
+
+        // 4. Complete work
+        queue.complete(&claimed.id).unwrap();
+
+        // 5. Verify completed in database
+        let conn = store.conn().unwrap();
+        let db_claim = tasks_store::work_claims::get_claim(&conn, &claimed.id)
+            .unwrap()
+            .expect("claim should still exist after completion");
+        assert!(db_claim.completed_at.is_some());
+
+        // 6. Verify removed from queue
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn duplicate_prevention_across_containers() {
+        // Verifies that once container A claims work, container B cannot claim it
+        let store = setup_store();
+        let config = WorkQueueConfig {
+            work_queue_timeout: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut queue = WorkQueue::new(store.clone(), config);
+
+        // Add one task
+        let tasks = make_tasks(&[("t1", "proj", TaskState::Waiting)]);
+        queue.rebuild(&tasks).unwrap();
+
+        // Container A claims the work
+        let claimed = queue.claim_next(10, 0, "container-A").unwrap().unwrap();
+        assert_eq!(claimed.source_id, "t1");
+
+        // Verify database has container A's claim
+        let conn = store.conn().unwrap();
+        let db_claim = tasks_store::work_claims::get_claim(&conn, &claimed.id)
+            .unwrap()
+            .expect("claim should exist");
+        assert_eq!(db_claim.container_id, Some("container-A".to_string()));
+        drop(conn);
+
+        // Container B tries to claim - should get None (already claimed)
+        let result = queue.claim_next(10, 1, "container-B").unwrap();
+        assert!(result.is_none(), "container B should not get work already claimed by A");
+
+        // Verify database still shows container A's claim (not overwritten)
+        let conn = store.conn().unwrap();
+        let db_claim = tasks_store::work_claims::get_claim(&conn, &claimed.id)
+            .unwrap()
+            .expect("claim should still exist");
+        assert_eq!(
+            db_claim.container_id,
+            Some("container-A".to_string()),
+            "claim should still belong to container A"
+        );
+    }
 }
