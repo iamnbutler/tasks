@@ -21,6 +21,9 @@ const DEFAULT_MODEL: &str = "claude-opus-4-6";
 /// Maximum tokens for automation response.
 const MAX_TOKENS: u32 = 32_000;
 
+/// Maximum output size in bytes. Matches the limit in [`tasks_models::automation`].
+const MAX_OUTPUT_BYTES: usize = 1_024 * 1_024; // 1 MB
+
 /// Error type for automation execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -106,8 +109,18 @@ impl AutomationExecutor {
             .await
             .map_err(ExecutionError::Provider)?;
 
-        let output = response.text();
+        let mut output = response.text();
         let (input_tokens, output_tokens) = extract_usage(&response);
+
+        if output.len() > MAX_OUTPUT_BYTES {
+            warn!(
+                automation_id = %automation.id,
+                output_len = output.len(),
+                limit = MAX_OUTPUT_BYTES,
+                "Automation output exceeds size limit, truncating"
+            );
+            output = truncate_output(output);
+        }
 
         info!(
             automation_id = %automation.id,
@@ -160,12 +173,25 @@ impl AutomationExecutor {
         let mut output = String::new();
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut truncated = false;
 
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 tasks_agent::StreamChunk::Text(text) => {
                     on_chunk(&text);
-                    output.push_str(&text);
+                    if !truncated {
+                        output.push_str(&text);
+                        if output.len() > MAX_OUTPUT_BYTES {
+                            warn!(
+                                automation_id = %automation.id,
+                                output_len = output.len(),
+                                limit = MAX_OUTPUT_BYTES,
+                                "Streaming automation output exceeds size limit, truncating"
+                            );
+                            output = truncate_output(output);
+                            truncated = true;
+                        }
+                    }
                 }
                 tasks_agent::StreamChunk::Thinking(_) => {
                     // Skip thinking chunks — don't emit to callback or output
@@ -253,6 +279,20 @@ fn build_user_prompt(automation: &Automation, context: &ExecutionContext) -> Str
     }
 
     out
+}
+
+/// Truncate a string to fit within `MAX_OUTPUT_BYTES`, appending a truncation notice.
+fn truncate_output(s: String) -> String {
+    if s.len() <= MAX_OUTPUT_BYTES {
+        return s;
+    }
+    let notice = "\n\n[truncated — output exceeded 1 MB limit]";
+    let budget = MAX_OUTPUT_BYTES - notice.len();
+    let end = s.floor_char_boundary(budget);
+    let mut truncated = s;
+    truncated.truncate(end);
+    truncated.push_str(notice);
+    truncated
 }
 
 /// Extract token usage from a response.
