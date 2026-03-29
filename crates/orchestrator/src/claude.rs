@@ -172,6 +172,9 @@ impl Orchestrator for ClaudeOrchestrator {
             "Fetched PR details"
         );
 
+        // Track any context we fail to fetch
+        let mut missing_context: Vec<String> = Vec::new();
+
         // Fetch the actual diff
         let diff = match self.github.get_pr_diff(&owner, &repo, pr_number).await {
             Ok(d) => {
@@ -180,6 +183,7 @@ impl Orchestrator for ClaudeOrchestrator {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to fetch PR diff, continuing without it");
+                missing_context.push("pr_diff".to_string());
                 None
             }
         };
@@ -202,6 +206,7 @@ impl Orchestrator for ClaudeOrchestrator {
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to fetch associated issue, continuing without it");
+                        missing_context.push("linked_issue".to_string());
                         None
                     }
                 }
@@ -249,6 +254,7 @@ impl Orchestrator for ClaudeOrchestrator {
                 approved: pass1.approved,
                 reasoning: pass1.reasoning,
                 feedback: pass1.feedback,
+                missing_context: missing_context.clone(),
             });
         }
 
@@ -318,6 +324,7 @@ impl Orchestrator for ClaudeOrchestrator {
             approved: pass2.approved,
             reasoning: pass2.reasoning,
             feedback: pass2.feedback,
+            missing_context,
         })
     }
 

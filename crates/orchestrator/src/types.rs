@@ -86,6 +86,10 @@ pub struct QualityEvaluation {
     /// Specific feedback for the implementor, if the PR needs work.
     /// Used to re-engage the task's agent session.
     pub feedback: Option<String>,
+    /// Context that was unavailable during evaluation (e.g. "pr_diff", "linked_issue").
+    /// Empty means the evaluation had full context.
+    #[serde(default)]
+    pub missing_context: Vec<String>,
 }
 
 /// Context for conflict triage — spec §7.4.
