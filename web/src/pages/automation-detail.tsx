@@ -637,7 +637,7 @@ function RunListItem({
 
 export function AutomationDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { snapshot, automations } = useAppState();
+  const { snapshot, automations, error, refreshSnapshot } = useAppState();
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loadingRuns, setLoadingRuns] = useState(true);
@@ -704,7 +704,19 @@ export function AutomationDetailPage() {
   if (!snapshot) {
     return (
       <div className="flex items-center justify-center h-full py-32">
-        <p className="text-muted-foreground text-sm">Loading...</p>
+        {error ? (
+          <div className="flex flex-col items-center gap-3">
+            <p className="text-destructive text-sm">Failed to load data: {error.message}</p>
+            <button
+              onClick={() => refreshSnapshot()}
+              className="text-sm text-muted-foreground hover:text-foreground underline"
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
+          <p className="text-muted-foreground text-sm">Loading...</p>
+        )}
       </div>
     );
   }
