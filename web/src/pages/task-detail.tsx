@@ -17,6 +17,7 @@ import {
   HelpCircle,
   Brain,
   AlertTriangle,
+  GitMerge,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -104,11 +105,15 @@ function sourceDisplay(task: Task) {
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "agent_question" | "orchestrator_answer" | "session_boundary";
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "agent_question" | "orchestrator_answer" | "session_boundary" | "github_action";
   content: string;
   toolName?: string;
   filePath?: string;
   timestamp?: string;
+  /** URL to the GitHub resource (comment, issue, PR) */
+  url?: string;
+  /** Whether this is an error event */
+  isError?: boolean;
 }
 
 const lifecycleLabels: Record<string, string> = {
@@ -123,6 +128,13 @@ const lifecycleLabels: Record<string, string> = {
   "task:state:completed": "Task completed",
   "task:state:failed": "Task failed",
   "task:state:cancelled": "Task cancelled",
+  "github:comment:posted": "Comment posted on GitHub",
+  "github:pr:merged": "PR merged on GitHub",
+  "github:branch:deleted": "Branch deleted on GitHub",
+  "github:branch:updated": "Branch updated on GitHub",
+  "github:issue:created": "Issue created on GitHub",
+  "github:labels:added": "Labels added on GitHub",
+  "github:error": "GitHub operation failed",
 };
 
 function parseAgentEvents(events: Event[]): ParsedBlock[] {
@@ -165,6 +177,76 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
         blocks.push({
           kind: source === "orchestrator_answer" ? "orchestrator_answer" : "human_message",
           content: message,
+          timestamp: event.ts,
+        });
+      }
+      continue;
+    }
+
+    if (event.type.startsWith("github:")) {
+      const data = event.data ?? {};
+      if (event.type === "github:comment:posted") {
+        const url = data.comment_url as string | undefined;
+        const prUrl = data.pr_url as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Posted comment on ${prUrl ?? "PR"}`,
+          url,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:pr:merged") {
+        const prUrl = data.pr_url as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Merged PR ${prUrl ?? ""}`,
+          url: prUrl,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:branch:deleted") {
+        const branch = data.branch as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Deleted branch ${branch ?? ""}`,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:branch:updated") {
+        const prUrl = data.pr_url as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Updated branch for ${prUrl ?? "PR"}`,
+          url: prUrl,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:issue:created") {
+        const url = data.url as string | undefined;
+        const title = data.title as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Created issue: ${title ?? `#${data.number ?? ""}`}`,
+          url,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:labels:added") {
+        const labels = data.labels as string[] | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `Added labels: ${labels?.join(", ") ?? ""}`,
+          timestamp: event.ts,
+        });
+      } else if (event.type === "github:error") {
+        const operation = data.operation as string | undefined;
+        const error = data.error as string | undefined;
+        blocks.push({
+          kind: "github_action",
+          content: `GitHub ${operation ?? "operation"} failed: ${error ?? "unknown error"}`,
+          isError: true,
+          timestamp: event.ts,
+        });
+      } else {
+        // Generic github event
+        blocks.push({
+          kind: "github_action",
+          content: `GitHub: ${event.type.replace("github:", "")}`,
           timestamp: event.ts,
         });
       }
@@ -346,6 +428,36 @@ function BlockView({ block }: { block: ParsedBlock }) {
     );
   }
 
+  if (block.kind === "github_action") {
+    const isError = block.isError;
+    const borderClass = isError ? "border-red-500/30 bg-red-500/10" : "border-sky-500/30 bg-sky-500/10";
+    const textClass = isError ? "text-red-400" : "text-sky-400";
+    const contentClass = isError ? "text-red-300/90" : "text-sky-300/90";
+    return (
+      <div className={cn("rounded-md border px-3 py-2", borderClass)}>
+        <div className={cn("flex items-center gap-2 text-xs", textClass)}>
+          {isError ? <AlertTriangle className="h-3 w-3" /> : <GitMerge className="h-3 w-3" />}
+          <span className="font-medium">GitHub</span>
+          {timestamp && <span className="text-muted-foreground ml-auto">{timestamp}</span>}
+        </div>
+        <p className={cn("text-sm mt-1", contentClass)}>
+          {block.content}
+          {block.url && (
+            <a
+              href={block.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cn("inline-flex items-center gap-1 ml-2 hover:underline", textClass)}
+            >
+              View on GitHub
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+        </p>
+      </div>
+    );
+  }
+
   if (block.kind === "tool_use") {
     return (
       <div className="flex items-center gap-2 py-1 text-muted-foreground text-sm">
@@ -416,7 +528,8 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       e.type === "agent:error" ||
       e.type === "human:message" ||
       e.type === "orchestrator:feedback" ||
-      e.type.startsWith("task:");
+      e.type.startsWith("task:") ||
+      e.type.startsWith("github:");
 
     fetchTaskEvents(taskId).then((events) => {
       setRawEvents(events.filter(isRelevant).sort((a, b) => a.ts.localeCompare(b.ts)));
@@ -615,8 +728,8 @@ function parseTimelineEvents(events: Event[]): TimelineEvent[] {
   const timelineEvents: TimelineEvent[] = [];
 
   for (const event of events) {
-    // Only include lifecycle/state events in timeline
-    if (event.type.startsWith("task:")) {
+    // Include lifecycle/state events and GitHub write operations in timeline
+    if (event.type.startsWith("task:") || event.type.startsWith("github:")) {
       const label = lifecycleLabels[event.type];
       if (label) {
         timelineEvents.push({

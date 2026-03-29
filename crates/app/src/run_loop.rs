@@ -727,10 +727,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         // where a merge was reverted to Approved after a transient
                         // GitHub API failure.
                         if poll_server.mode().await == server::Mode::Play {
-                            let approved_entries: Vec<(String, String)> = {
+                            let approved_entries: Vec<(String, String, String)> = {
                                 let state = poll_server.state.read().await;
                                 state.merge_queue.approved().iter().map(|e| {
-                                    (e.id.clone(), e.pr_url.clone())
+                                    (e.id.clone(), e.pr_url.clone(), e.task_id.clone())
                                 }).collect()
                             };
 
@@ -738,7 +738,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 let retry_token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
                                 if !retry_token.is_empty() {
                                     let retry_client = GitHubClient::new(&retry_token);
-                                    for (entry_id, pr_url) in &approved_entries {
+                                    for (entry_id, pr_url, retry_task_id) in &approved_entries {
                                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
                                             info!(entry_id = %entry_id, pr_url = %pr_url, "retrying merge for approved entry");
                                             if let Err(e) = poll_server.mark_entry_merging(entry_id, pr_url).await {
@@ -750,6 +750,21 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                                     info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged on retry");
                                                     if let Err(e) = poll_server.mark_entry_merged(entry_id, pr_url).await {
                                                         error!(entry_id = %entry_id, error = %e, "failed to mark entry merged on retry");
+                                                    }
+                                                    let event = Event::new(
+                                                        EventType::GitHubPrMerged,
+                                                        retry_task_id,
+                                                        Actor::System,
+                                                        serde_json::json!({
+                                                            "pr_url": pr_url,
+                                                            "owner": owner,
+                                                            "repo": repo,
+                                                            "number": number,
+                                                            "retry": true,
+                                                        }),
+                                                    );
+                                                    if let Err(e) = poll_server.event_bus.publish(event).await {
+                                                        error!(error = %e, "failed to emit github:pr:merged event");
                                                     }
                                                 }
                                                 Ok(false) => {
@@ -1886,13 +1901,45 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             feedback
                         ));
                     }
-                    if let Err(e) = merge_github.post_issue_comment(&owner, &repo, number, &comment_body).await {
-                        warn!(
-                            entry_id = %entry_id,
-                            pr_url = %pr_url,
-                            error = %e,
-                            "failed to post evaluation comment on PR (best-effort)"
-                        );
+                    match merge_github.post_issue_comment(&owner, &repo, number, &comment_body).await {
+                        Ok(created) => {
+                            let event = Event::new(
+                                EventType::GitHubCommentPosted,
+                                &task_id,
+                                Actor::Orchestrator,
+                                serde_json::json!({
+                                    "pr_url": pr_url,
+                                    "comment_url": created.html_url,
+                                    "owner": owner,
+                                    "repo": repo,
+                                    "number": number,
+                                }),
+                            );
+                            if let Err(e) = orch_server.event_bus.publish(event).await {
+                                error!(error = %e, "failed to emit github:comment:posted event");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                entry_id = %entry_id,
+                                pr_url = %pr_url,
+                                error = %e,
+                                "failed to post evaluation comment on PR (best-effort)"
+                            );
+                            let event = Event::new(
+                                EventType::GitHubError,
+                                &task_id,
+                                Actor::Orchestrator,
+                                serde_json::json!({
+                                    "operation": "post_comment",
+                                    "pr_url": pr_url,
+                                    "error": e.to_string(),
+                                }),
+                            );
+                            if let Err(e) = orch_server.event_bus.publish(event).await {
+                                error!(error = %e, "failed to emit github:error event");
+                            }
+                        }
                     }
                 }
 
@@ -1936,6 +1983,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged successfully");
                                     if let Err(e) = orch_server.mark_entry_merged(&entry_id, &pr_url).await {
                                         error!(entry_id = %entry_id, error = %e, "failed to mark entry as merged");
+                                    }
+                                    let event = Event::new(
+                                        EventType::GitHubPrMerged,
+                                        &task_id,
+                                        Actor::Orchestrator,
+                                        serde_json::json!({
+                                            "pr_url": pr_url,
+                                            "owner": owner,
+                                            "repo": repo,
+                                            "number": number,
+                                        }),
+                                    );
+                                    if let Err(e) = orch_server.event_bus.publish(event).await {
+                                        error!(error = %e, "failed to emit github:pr:merged event");
                                     }
                                 }
                                 Ok(false) => {
@@ -2238,6 +2299,19 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         branch = %branch,
                                         "deleted remote branch for re-dispatch"
                                     );
+                                    let event = Event::new(
+                                        EventType::GitHubBranchDeleted,
+                                        &task_id,
+                                        Actor::Orchestrator,
+                                        serde_json::json!({
+                                            "branch": branch,
+                                            "repo": context.project.repo,
+                                            "reason": "re-dispatch after rejection",
+                                        }),
+                                    );
+                                    if let Err(e) = orch_server.event_bus.publish(event).await {
+                                        error!(error = %e, "failed to emit github:branch:deleted event");
+                                    }
                                 }
                                 Ok(false) => {
                                     // Branch didn't exist — that's fine

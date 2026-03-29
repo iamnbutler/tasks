@@ -80,6 +80,24 @@ pub enum EventType {
     /// Orchestrator stream-of-consciousness narration of system events.
     OrchestratorThought,
 
+    // GitHub write operation events (issue #560)
+    /// Comment posted on a GitHub issue/PR.
+    GitHubCommentPosted,
+    /// Labels added to a GitHub issue/PR.
+    GitHubLabelsAdded,
+    /// GitHub issue created.
+    GitHubIssueCreated,
+    /// GitHub issue updated.
+    GitHubIssueUpdated,
+    /// GitHub PR merged.
+    GitHubPrMerged,
+    /// GitHub branch updated (rebase).
+    GitHubBranchUpdated,
+    /// GitHub branch deleted.
+    GitHubBranchDeleted,
+    /// GitHub write operation failed.
+    GitHubError,
+
     // System events
     SystemStarted,
     SystemModePlay,
@@ -156,6 +174,14 @@ impl EventType {
             Self::OrchestratorMessage => "orchestrator:message",
             Self::OrchestratorResponse => "orchestrator:response",
             Self::OrchestratorThought => "orchestrator:thought",
+            Self::GitHubCommentPosted => "github:comment:posted",
+            Self::GitHubLabelsAdded => "github:labels:added",
+            Self::GitHubIssueCreated => "github:issue:created",
+            Self::GitHubIssueUpdated => "github:issue:updated",
+            Self::GitHubPrMerged => "github:pr:merged",
+            Self::GitHubBranchUpdated => "github:branch:updated",
+            Self::GitHubBranchDeleted => "github:branch:deleted",
+            Self::GitHubError => "github:error",
             Self::SystemStarted => "system:started",
             Self::SystemModePlay => "system:mode:play",
             Self::SystemModePause => "system:mode:pause",
@@ -248,6 +274,14 @@ impl TryFrom<String> for EventType {
             "orchestrator:message" => Ok(Self::OrchestratorMessage),
             "orchestrator:response" => Ok(Self::OrchestratorResponse),
             "orchestrator:thought" => Ok(Self::OrchestratorThought),
+            "github:comment:posted" => Ok(Self::GitHubCommentPosted),
+            "github:labels:added" => Ok(Self::GitHubLabelsAdded),
+            "github:issue:created" => Ok(Self::GitHubIssueCreated),
+            "github:issue:updated" => Ok(Self::GitHubIssueUpdated),
+            "github:pr:merged" => Ok(Self::GitHubPrMerged),
+            "github:branch:updated" => Ok(Self::GitHubBranchUpdated),
+            "github:branch:deleted" => Ok(Self::GitHubBranchDeleted),
+            "github:error" => Ok(Self::GitHubError),
             "system:started" => Ok(Self::SystemStarted),
             "system:mode:play" => Ok(Self::SystemModePlay),
             "system:mode:pause" => Ok(Self::SystemModePause),
