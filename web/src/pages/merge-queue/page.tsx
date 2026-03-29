@@ -105,6 +105,16 @@ function MergeQueueRow({
           >
             {task.title}
           </Link>
+        ) : entry.title ? (
+          <a
+            href={entry.pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:underline truncate block"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {entry.title}
+          </a>
         ) : (
           <a
             href={entry.pr_url}

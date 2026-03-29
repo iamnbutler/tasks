@@ -1123,15 +1123,15 @@ impl Server {
         &self,
         prs: &[tasks_github::model::PullRequest],
     ) -> Result<u32, ServerError> {
-        // Build a HashMap index of pr_url -> (entry_id, task_id, status) in one read pass.
+        // Build a HashMap index of pr_url -> (entry_id, task_id, status, title) in one read pass.
         // This avoids O(N*M) from acquiring a lock and linear scanning for each PR.
-        let entry_index: HashMap<String, (String, String, MergeStatus)> = {
+        let entry_index: HashMap<String, (String, String, MergeStatus, Option<String>)> = {
             let state = self.state.read().await;
             state
                 .merge_queue
                 .entries()
                 .iter()
-                .map(|e| (e.pr_url.clone(), (e.id.clone(), e.task_id.clone(), e.status)))
+                .map(|e| (e.pr_url.clone(), (e.id.clone(), e.task_id.clone(), e.status, e.title.clone())))
                 .collect()
         };
 
@@ -1143,11 +1143,17 @@ impl Server {
                 pr.owner, pr.repo, pr.number
             );
 
-            let Some((entry_id, task_id, current_status)) = entry_index.get(&pr_url) else {
+            let Some((entry_id, task_id, current_status, current_title)) = entry_index.get(&pr_url) else {
                 continue;
             };
             let entry_id = entry_id.clone();
             let task_id = task_id.clone();
+
+            // Check if title needs updating from GitHub PR data
+            let needs_title_update = current_title.as_deref() != Some(&pr.title);
+
+            // Check if orphaned entry (empty task_id) can be re-linked to a task
+            let needs_task_relink = task_id.is_empty();
 
             let (action, entry_id_for_sha_update) = match pr.state {
                 tasks_github::model::PullRequestState::Merged => {
@@ -1180,12 +1186,16 @@ impl Server {
                     (conflict_action, Some(sha_update_id))
                 }
             };
-            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
+            // Collect linked issue numbers (using PR's owner/repo) for re-linking
+            let relink_issue_numbers: Option<Vec<u64>> = needs_task_relink.then(|| {
+                pr.linked_issues.iter().map(|li| li.number).collect()
+            });
+            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone(), needs_title_update.then(|| pr.title.clone()), needs_task_relink.then(|| pr.head_ref.clone()), relink_issue_numbers, pr.owner.clone(), pr.repo.clone()));
         }
 
         // Execute all actions
         let mut changes = 0u32;
-        for (action, entry_id_for_sha_update, head_sha) in actions {
+        for (action, entry_id_for_sha_update, head_sha, new_title, relink_branch, relink_issue_numbers, pr_owner, pr_repo) in actions {
             if let Some(action) = action {
                 match action {
                     MqAction::MarkMerged { entry_id, pr_url, .. } => {
@@ -1247,9 +1257,9 @@ impl Server {
             }
 
             // Update head_sha for open PRs to detect new commits
-            if let Some(entry_id) = entry_id_for_sha_update {
+            if let Some(ref entry_id) = entry_id_for_sha_update {
                 let mut state = self.state.write().await;
-                match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
+                match state.merge_queue.update_head_sha(entry_id, &head_sha) {
                     Ok(true) => {
                         tracing::debug!(
                             entry_id = %entry_id,
@@ -1260,6 +1270,62 @@ impl Server {
                     Ok(false) => {} // No change
                     Err(e) => {
                         tracing::warn!(entry_id = %entry_id, error = %e, "failed to update head_sha during reconciliation");
+                    }
+                }
+            }
+
+            // Update title from GitHub PR data (issue #589)
+            if let Some(ref title) = new_title {
+                let entry_id = entry_id_for_sha_update.as_deref().unwrap_or_default();
+                if !entry_id.is_empty() {
+                    let mut state = self.state.write().await;
+                    if let Some(entry) = state.merge_queue.get_mut(entry_id) {
+                        entry.title = Some(title.clone());
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            title = %title,
+                            "reconciliation: updated title for merge entry"
+                        );
+                    }
+                }
+            }
+
+            // Re-link orphaned entries to tasks (issue #589)
+            // If an entry was created before its task existed, try to find the task now.
+            if let Some(ref branch) = relink_branch {
+                let entry_id_str = entry_id_for_sha_update.as_deref().unwrap_or_default();
+                if !entry_id_str.is_empty() {
+                    let mut found_task_id = self.find_task_by_branch(branch).await;
+                    if found_task_id.is_none() {
+                        if let Some(ref issue_numbers) = relink_issue_numbers {
+                            for &number in issue_numbers {
+                                if let Some(tid) = self.find_task_by_github_issue(
+                                    &pr_owner,
+                                    &pr_repo,
+                                    number,
+                                ).await {
+                                    found_task_id = Some(tid);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref new_task_id) = found_task_id {
+                        let mut state = self.state.write().await;
+                        if let Some(entry) = state.merge_queue.get_mut(entry_id_str) {
+                            entry.task_id = new_task_id.clone();
+                            tracing::info!(
+                                entry_id = %entry_id_str,
+                                task_id = %new_task_id,
+                                "reconciliation: re-linked orphaned merge entry to task"
+                            );
+                            // Persist updated entry
+                            if let Some(ref store) = self.store {
+                                if let Err(e) = store.save_merge_entry(entry) {
+                                    tracing::error!(entry_id = %entry_id_str, error = %e, "failed to persist re-linked merge entry");
+                                }
+                            }
+                        }
                     }
                 }
             }

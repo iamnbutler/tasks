@@ -137,7 +137,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
     },
   },
 
-  // PR title (from linked task, or fallback to PR link)
+  // PR title (from linked task, entry title, or fallback to PR link)
   {
     id: "title",
     header: "Title",
@@ -153,7 +153,20 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           </Link>
         );
       }
-      // No linked task — show PR repo/number as fallback
+      // Use PR title from entry if available (issue #589)
+      if (row.original.title) {
+        return (
+          <a
+            href={row.original.pr_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm hover:underline truncate max-w-[400px] block"
+          >
+            {row.original.title}
+          </a>
+        );
+      }
+      // No linked task or title — show PR repo/number as fallback
       const repo = prRepo(row.original.pr_url);
       const num = prNumber(row.original.pr_url);
       const label = repo && num ? `${repo}#${num}` : row.original.pr_url;
