@@ -900,6 +900,46 @@ impl Server {
         self.set_task_rejection_feedback(task_id, None).await
     }
 
+    /// Set the session_id for a task.
+    ///
+    /// Called when a container claims work to link the task to its session.
+    /// Silent no-op if task not found (task may have been cleaned up between
+    /// session end and this call, which is fine).
+    pub async fn set_task_session_id(
+        &self,
+        task_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+
+        if let Some(task) = state.tasks.get_mut(task_id) {
+            task.session_id = session_id.map(|s| s.to_string());
+            task.updated_at = chrono::Utc::now();
+
+            // Write-through to store
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(task_id = %task_id, error = %e, "failed to persist task session_id to store");
+                }
+            }
+
+            tracing::debug!(
+                task_id = %task_id,
+                session_id = ?session_id,
+                "updated task session_id"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Clear the session_id for a task.
+    ///
+    /// Called when a session ends (completion or failure).
+    pub async fn clear_task_session_id(&self, task_id: &str) -> Result<(), ServerError> {
+        self.set_task_session_id(task_id, None).await
+    }
+
     /// Reorder tasks by updating their priorities.
     ///
     /// Takes a list of task IDs in the desired order and assigns sequential
