@@ -870,7 +870,14 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         );
                                     }
                                 }
-                                PullRequestState::Open => unreachable!(),
+                                PullRequestState::Open => {
+                                    warn!(
+                                        project = %project_id,
+                                        pr = pr.number,
+                                        task_id = %task_id,
+                                        "unexpected Open PR in merge status classification, skipping"
+                                    );
+                                }
                             }
                         }
 
