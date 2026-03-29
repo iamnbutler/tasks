@@ -63,11 +63,25 @@ pub struct ChatEvent {
     pub summary: String,
 }
 
+/// An action the orchestrator chat wants the system to execute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ChatAction {
+    /// Set a task's dispatch priority. Lower numbers are higher priority.
+    SetTaskPriority {
+        task_id: String,
+        priority: i32,
+        reason: String,
+    },
+}
+
 /// Result of a chat interaction.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     /// The orchestrator's response text.
     pub message: String,
+    /// Structured actions to execute (e.g., priority overrides from human direction).
+    pub actions: Vec<ChatAction>,
 }
 
 /// Handler for orchestrator chat interactions.
@@ -155,9 +169,10 @@ impl OrchestratorChat {
         let response_text = response.text();
         info!(response_len = response_text.len(), "Chat response generated");
 
-        Ok(ChatResponse {
-            message: response_text,
-        })
+        // Parse structured actions from the response (if any)
+        let (message, actions) = parse_chat_actions(&response_text, &context.tasks);
+
+        Ok(ChatResponse { message, actions })
     }
 
     /// Build the system prompt with current context.
@@ -189,10 +204,29 @@ impl OrchestratorChat {
 ### Recent Activity
 {events_summary}
 
+## Priority Management
+You can change task dispatch priority when the user asks. To do so, include an
+ACTION block at the end of your response (after your conversational reply):
+
+```action
+{{"action": "set_task_priority", "task_id": "<full-task-id>", "priority": <number>, "reason": "<why>"}}
+```
+
+Priority rules:
+- Lower numbers = higher priority (dispatched first)
+- Use priority 1-10 for urgent human-directed overrides
+- Use priority 50 for moderate bumps
+- Default computed priority is around 100
+- Multiple ACTION blocks are allowed (one per line inside the block)
+
+Only include ACTION blocks when the user explicitly asks to change priority,
+reorder tasks, or focus on specific work. Do NOT include them for status queries.
+
 ## Guidelines
 - Be concise but informative
 - Proactively mention relevant system state when helpful
-- If asked to take an action, explain how the user can do it through the UI"#,
+- When asked to prioritize or reorder tasks, use ACTION blocks to make it happen
+- Reference tasks by their short ID (first 8 chars) in conversation but use full IDs in ACTION blocks"#,
             mode = context.mode,
             human_present = if context.human_present { "Yes" } else { "No" },
             projects_summary = projects_summary,
@@ -216,12 +250,22 @@ impl OrchestratorChat {
         let mut lines = Vec::new();
         for (state, tasks) in &by_state {
             lines.push(format!("- **{}**: {} task(s)", state, tasks.len()));
-            // Show up to 3 tasks per state
-            for task in tasks.iter().take(3) {
-                lines.push(format!("  - {}: {}", &task.id[..8], task.title));
+            // Show up to 5 tasks per state with full IDs for action targeting
+            for task in tasks.iter().take(5) {
+                let priority_str = task
+                    .priority
+                    .map(|p| format!(" [pri={}]", p))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  - `{}` ({}): {}{}",
+                    task.id,
+                    &task.id[..8.min(task.id.len())],
+                    task.title,
+                    priority_str,
+                ));
             }
-            if tasks.len() > 3 {
-                lines.push(format!("  - ... and {} more", tasks.len() - 3));
+            if tasks.len() > 5 {
+                lines.push(format!("  - ... and {} more", tasks.len() - 5));
             }
         }
 
@@ -301,6 +345,62 @@ pub fn event_to_chat_event(event_type: &str, data: &serde_json::Value, timestamp
     }
 }
 
+/// Parse structured actions from an LLM chat response.
+///
+/// Looks for an ```action code block at the end of the response. Each line
+/// inside the block is parsed as a JSON `ChatAction`. The conversational
+/// text before the block is returned as the message.
+///
+/// `tasks` is used to validate that referenced task IDs actually exist.
+fn parse_chat_actions(response: &str, tasks: &[Task]) -> (String, Vec<ChatAction>) {
+    let task_ids: std::collections::HashSet<&str> =
+        tasks.iter().map(|t| t.id.as_str()).collect();
+
+    // Look for ```action block
+    let action_marker = "```action";
+    let Some(block_start) = response.find(action_marker) else {
+        return (response.to_string(), Vec::new());
+    };
+
+    let message = response[..block_start].trim().to_string();
+    let after_marker = block_start + action_marker.len();
+
+    // Find closing ```
+    let block_content = if let Some(end) = response[after_marker..].find("```") {
+        &response[after_marker..after_marker + end]
+    } else {
+        &response[after_marker..]
+    };
+
+    let mut actions = Vec::new();
+    for line in block_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        match serde_json::from_str::<ChatAction>(line) {
+            Ok(action) => {
+                // Validate task ID exists
+                let valid = match &action {
+                    ChatAction::SetTaskPriority { task_id, .. } => {
+                        task_ids.contains(task_id.as_str())
+                    }
+                };
+                if valid {
+                    actions.push(action);
+                } else {
+                    info!("Ignoring chat action with unknown task ID: {}", line);
+                }
+            }
+            Err(e) => {
+                info!("Failed to parse chat action: {} — {}", line, e);
+            }
+        }
+    }
+
+    (message, actions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +453,83 @@ mod tests {
         let chat = OrchestratorChat::new(AnthropicProvider::new("test"));
         let summary = chat.summarize_events(&[]);
         assert_eq!(summary, "No recent activity.");
+    }
+
+    // --- Chat action parsing tests ---
+
+    use models::task::TaskSource;
+
+    fn make_task(id: &str) -> Task {
+        Task::new(id.to_string(), TaskSource::Internal, id, "proj".to_string())
+    }
+
+    #[test]
+    fn test_parse_chat_actions_no_block() {
+        let tasks = vec![make_task("t1")];
+        let (message, actions) = parse_chat_actions("Just a normal response.", &tasks);
+        assert_eq!(message, "Just a normal response.");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_chat_actions_with_priority() {
+        let tasks = vec![make_task("task-abc-123")];
+        let response = r#"I'll prioritize that task for you.
+
+```action
+{"action": "set_task_priority", "task_id": "task-abc-123", "priority": 1, "reason": "human requested"}
+```"#;
+        let (message, actions) = parse_chat_actions(response, &tasks);
+        assert_eq!(message, "I'll prioritize that task for you.");
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ChatAction::SetTaskPriority {
+                task_id,
+                priority,
+                reason,
+            } => {
+                assert_eq!(task_id, "task-abc-123");
+                assert_eq!(*priority, 1);
+                assert_eq!(reason, "human requested");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_actions_multiple() {
+        let tasks = vec![make_task("t1"), make_task("t2")];
+        let response = r#"Done.
+
+```action
+{"action": "set_task_priority", "task_id": "t1", "priority": 1, "reason": "urgent"}
+{"action": "set_task_priority", "task_id": "t2", "priority": 2, "reason": "next"}
+```"#;
+        let (_, actions) = parse_chat_actions(response, &tasks);
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_chat_actions_unknown_task_id_rejected() {
+        let tasks = vec![make_task("t1")];
+        let response = r#"Done.
+
+```action
+{"action": "set_task_priority", "task_id": "nonexistent", "priority": 1, "reason": "test"}
+```"#;
+        let (_, actions) = parse_chat_actions(response, &tasks);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_chat_actions_malformed_json_skipped() {
+        let tasks = vec![make_task("t1")];
+        let response = r#"Done.
+
+```action
+{not valid json}
+{"action": "set_task_priority", "task_id": "t1", "priority": 5, "reason": "ok"}
+```"#;
+        let (_, actions) = parse_chat_actions(response, &tasks);
+        assert_eq!(actions.len(), 1);
     }
 }

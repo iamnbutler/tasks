@@ -14,8 +14,8 @@ mod orchestrator;
 mod prompt;
 pub mod types;
 
-pub use chat::{ChatContext, ChatEvent, ChatResponse, OrchestratorChat, event_to_chat_event};
-pub use claude::ClaudeOrchestrator;
+pub use chat::{ChatAction, ChatContext, ChatEvent, ChatResponse, OrchestratorChat, event_to_chat_event};
+pub use claude::{ClaudeOrchestrator, compute_priority_adjustments};
 pub use error::OrchestratorError;
 pub use mock::MockOrchestrator;
 pub use orchestrator::Orchestrator;

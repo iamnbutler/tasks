@@ -476,6 +476,12 @@ impl Orchestrator for ClaudeOrchestrator {
             )));
         }
 
+        // --- Priority scoring for dispatch-eligible tasks ---
+        // Compute priorities based on dependency chains and failure history.
+        // Only adjust tasks in Waiting or ChangesRequested state.
+        let priority_actions = compute_priority_adjustments(&context.tasks);
+        actions.extend(priority_actions);
+
         Ok(actions)
     }
 
@@ -565,6 +571,96 @@ fn build_question_answer_prompt(
     prompt
 }
 
+/// Compute priority adjustments for dispatch-eligible tasks.
+///
+/// Scoring rules (lower = higher priority):
+/// - Base priority: 100
+/// - Unblocking bonus: -10 per task blocked (tasks that unblock others are urgent)
+/// - Failure penalty: +20 per retry (repeatedly failing tasks should yield slots)
+/// - ChangesRequested bonus: -30 (rework is cheaper than new work, finish it)
+///
+/// Only emits PrioritizeTask actions when the computed priority differs from
+/// the task's current priority, to avoid redundant updates.
+pub fn compute_priority_adjustments(tasks: &[Task]) -> Vec<OrchestratorAction> {
+    use models::task::TaskState;
+    use std::collections::HashMap;
+
+    const BASE_PRIORITY: i32 = 100;
+    const UNBLOCK_BONUS_PER_TASK: i32 = -10;
+    const FAILURE_PENALTY_PER_RETRY: i32 = 20;
+    const CHANGES_REQUESTED_BONUS: i32 = -30;
+
+    // Count how many tasks each task unblocks
+    let mut unblock_count: HashMap<&str, u32> = HashMap::new();
+    for task in tasks {
+        if task.state == TaskState::Blocked {
+            for blocked_by_id in &task.blocked_by {
+                *unblock_count.entry(blocked_by_id.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut actions = Vec::new();
+
+    for task in tasks {
+        // Only adjust dispatch-eligible tasks
+        if task.state != TaskState::Waiting && task.state != TaskState::ChangesRequested {
+            continue;
+        }
+
+        let mut score = BASE_PRIORITY;
+
+        // Unblocking bonus: tasks that unblock others are urgent
+        let blocked_count = unblock_count.get(task.id.as_str()).copied().unwrap_or(0);
+        if blocked_count > 0 {
+            score += UNBLOCK_BONUS_PER_TASK * blocked_count as i32;
+        }
+
+        // Failure penalty: repeatedly failing tasks yield to fresh work
+        if task.retry_count > 0 {
+            score += FAILURE_PENALTY_PER_RETRY * task.retry_count.min(5) as i32;
+        }
+
+        // ChangesRequested bonus: rework is cheaper, finish it
+        if task.state == TaskState::ChangesRequested {
+            score += CHANGES_REQUESTED_BONUS;
+        }
+
+        // Clamp to valid range
+        score = score.clamp(1, 1000);
+
+        // Only emit if priority actually changed
+        if task.priority != Some(score) {
+            let short_id = &task.id[..8.min(task.id.len())];
+            let mut reasons = Vec::new();
+
+            if blocked_count > 0 {
+                reasons.push(format!("unblocks {} task(s)", blocked_count));
+            }
+            if task.retry_count > 0 {
+                reasons.push(format!("{} prior failure(s)", task.retry_count));
+            }
+            if task.state == TaskState::ChangesRequested {
+                reasons.push("has changes requested".to_string());
+            }
+
+            let reason = if reasons.is_empty() {
+                format!("base priority for {}", short_id)
+            } else {
+                reasons.join(", ")
+            };
+
+            actions.push(OrchestratorAction::PrioritizeTask {
+                task_id: task.id.clone(),
+                priority: score,
+                reason,
+            });
+        }
+    }
+
+    actions
+}
+
 /// Extract JSON from a text response.
 ///
 /// Looks for content between `{` and `}` braces, handling potential
@@ -637,6 +733,7 @@ fn truncate(text: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use models::task::{TaskSource, TaskState};
 
     /// Create a ClaudeOrchestrator for unit tests (no real API calls needed).
     fn make_test_orchestrator() -> ClaudeOrchestrator {
@@ -644,6 +741,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -727,5 +825,181 @@ That's all."#;
     fn test_extract_json_none() {
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("incomplete { json").is_none());
+    }
+
+    // --- Priority scoring tests ---
+
+    fn make_task(id: &str, project: &str) -> Task {
+        Task::new(id.to_string(), TaskSource::Internal, id, project.to_string())
+    }
+
+    fn extract_priorities(actions: &[OrchestratorAction]) -> Vec<(&str, i32)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                OrchestratorAction::PrioritizeTask {
+                    task_id, priority, ..
+                } => Some((task_id.as_str(), *priority)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_priority_base_score_for_waiting_task() {
+        let tasks = vec![make_task("t1", "proj")];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+        assert_eq!(priorities.len(), 1);
+        assert_eq!(priorities[0], ("t1", 100)); // base priority
+    }
+
+    #[test]
+    fn test_priority_unblocking_bonus() {
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::Waiting;
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::Blocked;
+        t2.blocked_by = vec!["t1".to_string()];
+
+        let tasks = vec![t1, t2];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // t1 unblocks t2: base(100) + unblock(-10) = 90
+        let t1_pri = priorities.iter().find(|(id, _)| *id == "t1").unwrap().1;
+        assert_eq!(t1_pri, 90);
+    }
+
+    #[test]
+    fn test_priority_multiple_unblocks() {
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::Waiting;
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::Blocked;
+        t2.blocked_by = vec!["t1".to_string()];
+
+        let mut t3 = make_task("t3", "proj");
+        t3.state = TaskState::Blocked;
+        t3.blocked_by = vec!["t1".to_string()];
+
+        let tasks = vec![t1, t2, t3];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // t1 unblocks 2 tasks: base(100) + 2*(-10) = 80
+        let t1_pri = priorities.iter().find(|(id, _)| *id == "t1").unwrap().1;
+        assert_eq!(t1_pri, 80);
+    }
+
+    #[test]
+    fn test_priority_failure_penalty() {
+        let mut t1 = make_task("t1", "proj");
+        t1.retry_count = 3;
+
+        let tasks = vec![t1];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // base(100) + 3*20 = 160
+        assert_eq!(priorities[0].1, 160);
+    }
+
+    #[test]
+    fn test_priority_failure_penalty_capped() {
+        let mut t1 = make_task("t1", "proj");
+        t1.retry_count = 100; // extreme, capped at 5 retries
+
+        let tasks = vec![t1];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // base(100) + 5*20 = 200
+        assert_eq!(priorities[0].1, 200);
+    }
+
+    #[test]
+    fn test_priority_changes_requested_bonus() {
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::ChangesRequested;
+
+        let tasks = vec![t1];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // base(100) + CR(-30) = 70
+        assert_eq!(priorities[0].1, 70);
+    }
+
+    #[test]
+    fn test_priority_combined_scoring() {
+        // A ChangesRequested task that unblocks 2 tasks and has 1 failure
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::ChangesRequested;
+        t1.retry_count = 1;
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::Blocked;
+        t2.blocked_by = vec!["t1".to_string()];
+
+        let mut t3 = make_task("t3", "proj");
+        t3.state = TaskState::Blocked;
+        t3.blocked_by = vec!["t1".to_string()];
+
+        let tasks = vec![t1, t2, t3];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+
+        // t1: base(100) + unblock(-20) + failure(+20) + CR(-30) = 70
+        let t1_pri = priorities.iter().find(|(id, _)| *id == "t1").unwrap().1;
+        assert_eq!(t1_pri, 70);
+    }
+
+    #[test]
+    fn test_priority_skips_non_dispatch_states() {
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::Running;
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::Completed;
+
+        let tasks = vec![t1, t2];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+        assert!(priorities.is_empty());
+    }
+
+    #[test]
+    fn test_priority_no_change_when_already_set() {
+        let mut t1 = make_task("t1", "proj");
+        t1.priority = Some(100); // already at base priority
+
+        let tasks = vec![t1];
+        let actions = compute_priority_adjustments(&tasks);
+        let priorities = extract_priorities(&actions);
+        assert!(priorities.is_empty()); // no change needed
+    }
+
+    #[test]
+    fn test_priority_reason_includes_unblock_info() {
+        let mut t1 = make_task("t1", "proj");
+        t1.state = TaskState::Waiting;
+
+        let mut t2 = make_task("t2", "proj");
+        t2.state = TaskState::Blocked;
+        t2.blocked_by = vec!["t1".to_string()];
+
+        let tasks = vec![t1, t2];
+        let actions = compute_priority_adjustments(&tasks);
+
+        let reason = actions.iter().find_map(|a| match a {
+            OrchestratorAction::PrioritizeTask { task_id, reason, .. } if task_id == "t1" => {
+                Some(reason.as_str())
+            }
+            _ => None,
+        });
+        assert!(reason.unwrap().contains("unblocks 1 task(s)"));
     }
 }

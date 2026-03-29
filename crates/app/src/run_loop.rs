@@ -22,7 +22,7 @@ use tasks_github::model::{IssueState, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
-    ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
+    ChatAction, ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
     OrchestratorAction, OrchestratorChat, QuestionContext, SystemContext,
 };
 
@@ -1665,6 +1665,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 let chat = Arc::clone(chat);
                                 let history = Arc::clone(&chat_history);
                                 let bus = orch_server.event_bus.clone();
+                                let chat_server = Arc::clone(&orch_server);
                                 tokio::spawn(async move {
                                     tracing::info!("Spawned orchestrator chat task, calling LLM...");
                                     let history_snapshot = history.lock().await.clone();
@@ -1689,9 +1690,24 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                                     "message": response.message,
                                                 }),
                                             );
-                                            tracing::info!(response_len = response.message.len(), "Orchestrator chat response ready, publishing...");
+                                            tracing::info!(response_len = response.message.len(), actions = response.actions.len(), "Orchestrator chat response ready, publishing...");
                                             if let Err(e) = bus.publish(resp_event).await {
                                                 tracing::error!(error = %e, "Failed to publish orchestrator response");
+                                            }
+
+                                            // Execute chat actions (priority overrides from human direction)
+                                            for action in &response.actions {
+                                                match action {
+                                                    ChatAction::SetTaskPriority { task_id, priority, reason } => {
+                                                        tracing::info!(task_id = %task_id, priority = priority, reason = %reason, "Chat action: setting task priority");
+                                                        if let Err(e) = chat_server
+                                                            .set_task_priority(task_id, Some(*priority), Actor::Orchestrator)
+                                                            .await
+                                                        {
+                                                            tracing::error!(task_id = %task_id, error = %e, "Failed to set task priority from chat action");
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -2587,8 +2603,27 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     error!(task_id = %task_id, error = %e, "failed to update task state from think()");
                                 }
                             }
-                            OrchestratorAction::PrioritizeTask { task_id, reason } => {
-                                info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            OrchestratorAction::PrioritizeTask { task_id, priority, reason } => {
+                                info!(task_id = %task_id, priority = priority, reason = %reason, "orchestrator requested task prioritization");
+                                if let Err(e) = think_server
+                                    .set_task_priority(&task_id, Some(priority), Actor::Orchestrator)
+                                    .await
+                                {
+                                    error!(task_id = %task_id, error = %e, "failed to set task priority from think()");
+                                } else {
+                                    // Emit a thought explaining the priority change
+                                    let thought = Event::new(
+                                        EventType::OrchestratorThought,
+                                        &task_id,
+                                        Actor::Orchestrator,
+                                        serde_json::json!({
+                                            "message": format!("Prioritized task {} (priority {}): {}", &task_id[..8.min(task_id.len())], priority, reason)
+                                        }),
+                                    );
+                                    if let Err(e) = think_server.event_bus.publish(thought).await {
+                                        error!(error = %e, "failed to publish priority thought");
+                                    }
+                                }
                             }
                         }
                     }
