@@ -263,10 +263,15 @@ impl Store {
             .unwrap()
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
+        let consumed_at = entry
+            .changes_requested_feedback_consumed_at
+            .map(|dt| dt.to_rfc3339());
         self.conn()?.execute(
-            "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at",
-            params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
+            "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at, changes_requested_feedback, changes_requested_feedback_consumed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at,
+             changes_requested_feedback=excluded.changes_requested_feedback, changes_requested_feedback_consumed_at=excluded.changes_requested_feedback_consumed_at",
+            params![entry.id, entry.task_id, entry.pr_url, status, queued_at, entry.changes_requested_feedback, consumed_at],
         )?;
         Ok(())
     }
@@ -275,39 +280,11 @@ impl Store {
     pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
+            "SELECT id, task_id, pr_url, status, queued_at, changes_requested_feedback, changes_requested_feedback_consumed_at FROM merge_queue WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let mut rows = stmt.query_map(params![id], row_to_merge_entry)?;
         match rows.next() {
-            Some(row) => {
-                let (id, task_id, pr_url, status_str, queued_at_str) = row?;
-                let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
-                let queued_at: DateTime<Utc> = queued_at_str
-                    .parse()
-                    .map_err(|e: chrono::ParseError| {
-                        serde_json::from_str::<()>(&e.to_string()).unwrap_err()
-                    })?;
-                Ok(Some(MergeQueueEntry {
-                    id,
-                    task_id,
-                    pr_url,
-                    status,
-                    queued_at,
-                    conflict_info: None, // Not persisted to DB yet
-                    changes_requested_feedback: None, // TODO: persist to DB
-                    head_sha: None,      // Updated from GitHub on reconciliation
-                    queue_position: None, // Computed lazily on API read
-                    completed_at: None,  // Not persisted to DB yet
-                }))
-            }
+            Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
     }
@@ -316,37 +293,11 @@ impl Store {
     pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn
-            .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+            .prepare("SELECT id, task_id, pr_url, status, queued_at, changes_requested_feedback, changes_requested_feedback_consumed_at FROM merge_queue")?;
+        let rows = stmt.query_map([], row_to_merge_entry)?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, task_id, pr_url, status_str, queued_at_str) = row?;
-            let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
-            let queued_at: DateTime<Utc> = queued_at_str
-                .parse()
-                .map_err(|e: chrono::ParseError| {
-                    serde_json::from_str::<()>(&e.to_string()).unwrap_err()
-                })?;
-            entries.push(MergeQueueEntry {
-                id,
-                task_id,
-                pr_url,
-                status,
-                queued_at,
-                conflict_info: None, // Not persisted to DB yet
-                changes_requested_feedback: None, // TODO: persist to DB
-                head_sha: None,      // Updated from GitHub on reconciliation
-                queue_position: None, // Computed lazily on API read
-                completed_at: None,  // Not persisted to DB yet
-            });
+            entries.push(row?);
         }
         Ok(entries)
     }
@@ -378,19 +329,23 @@ impl Store {
         let created_at = task.created_at.to_rfc3339();
         let updated_at = task.updated_at.to_rfc3339();
 
+        let rejection_feedback_consumed_at = task
+            .rejection_feedback_consumed_at
+            .map(|dt| dt.to_rfc3339());
+
         self.conn()?.execute(
             "INSERT OR REPLACE INTO tasks (
                 id, source_json, title, description, state,
                 parent_id, blocked_by_json, project, labels_json, priority,
                 session_id, workspace_id, retry_count, last_failure_at,
                 last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at,
-                rejection_feedback
+                rejection_feedback, rejection_feedback_consumed_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14,
                 ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21
+                ?21, ?22
             )",
             params![
                 task.id,
@@ -414,6 +369,7 @@ impl Store {
                 created_at,
                 updated_at,
                 task.rejection_feedback,
+                rejection_feedback_consumed_at,
             ],
         )?;
         Ok(())
@@ -427,7 +383,7 @@ impl Store {
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
                     last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at,
-                    rejection_feedback
+                    rejection_feedback, rejection_feedback_consumed_at
              FROM tasks WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_task)?;
@@ -448,7 +404,7 @@ impl Store {
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
                     last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at,
-                    rejection_feedback
+                    rejection_feedback, rejection_feedback_consumed_at
              FROM tasks",
         )?;
         let rows = stmt.query_map([], row_to_task)?;
@@ -467,7 +423,7 @@ impl Store {
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
                     last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at,
-                    rejection_feedback
+                    rejection_feedback, rejection_feedback_consumed_at
              FROM tasks WHERE project = ?1",
         )?;
         let rows = stmt.query_map(params![project], row_to_task)?;
@@ -487,7 +443,7 @@ impl Store {
                     parent_id, blocked_by_json, project, labels_json, priority,
                     session_id, workspace_id, retry_count, last_failure_at,
                     last_failure_json, source_created_at, source_number, last_activity_at, created_at, updated_at,
-                    rejection_feedback
+                    rejection_feedback, rejection_feedback_consumed_at
              FROM tasks WHERE state = ?1",
         )?;
         let rows = stmt.query_map(params![state_json], row_to_task)?;
@@ -890,6 +846,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
     let created_at_str: String = row.get(18)?;
     let updated_at_str: String = row.get(19)?;
     let rejection_feedback: Option<String> = row.get(20)?;
+    let rejection_feedback_consumed_at_str: Option<String> = row.get(21)?;
 
     let source: TaskSource = serde_json::from_str(&source_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
@@ -973,6 +930,20 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
             )
         })?;
 
+    let rejection_feedback_consumed_at = rejection_feedback_consumed_at_str
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        21,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+        })
+        .transpose()?;
+
     Ok(Task {
         id,
         source,
@@ -995,6 +966,52 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         created_at,
         updated_at,
         rejection_feedback,
+        rejection_feedback_consumed_at,
+    })
+}
+
+/// Map a rusqlite Row to a MergeQueueEntry.
+fn row_to_merge_entry(row: &rusqlite::Row) -> Result<MergeQueueEntry, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let task_id: String = row.get(1)?;
+    let pr_url: String = row.get(2)?;
+    let status_str: String = row.get(3)?;
+    let queued_at_str: String = row.get(4)?;
+    let changes_requested_feedback: Option<String> = row.get(5)?;
+    let consumed_at_str: Option<String> = row.get(6)?;
+
+    let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\"")).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let queued_at: DateTime<Utc> = queued_at_str.parse().map_err(|e: chrono::ParseError| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let changes_requested_feedback_consumed_at = consumed_at_str
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+        })
+        .transpose()?;
+
+    Ok(MergeQueueEntry {
+        id,
+        task_id,
+        pr_url,
+        status,
+        queued_at,
+        conflict_info: None,  // Not persisted to DB yet
+        changes_requested_feedback,
+        changes_requested_feedback_consumed_at,
+        head_sha: None,       // Updated from GitHub on reconciliation
+        queue_position: None,  // Computed lazily on API read
+        completed_at: None,   // Not persisted to DB yet
     })
 }
 
@@ -1291,6 +1308,37 @@ mod tests {
 
         let loaded = store.get_merge_entry("m1").unwrap().unwrap();
         assert_eq!(loaded.status, MergeStatus::Approved);
+    }
+
+    #[test]
+    fn merge_entry_persists_changes_requested_feedback() {
+        let store = Store::open_memory().unwrap();
+        let mut entry =
+            MergeQueueEntry::new("m1", "t1", "https://github.com/owner/repo/pull/1");
+        entry.status = MergeStatus::ChangesRequested;
+        entry.changes_requested_feedback = Some("fix linting errors".to_string());
+        store.save_merge_entry(&entry).unwrap();
+
+        let loaded = store.get_merge_entry("m1").unwrap().unwrap();
+        assert_eq!(loaded.status, MergeStatus::ChangesRequested);
+        assert_eq!(
+            loaded.changes_requested_feedback.as_deref(),
+            Some("fix linting errors")
+        );
+        assert!(loaded.changes_requested_feedback_consumed_at.is_none());
+    }
+
+    #[test]
+    fn merge_entry_persists_consumed_at() {
+        let store = Store::open_memory().unwrap();
+        let mut entry =
+            MergeQueueEntry::new("m1", "t1", "https://github.com/owner/repo/pull/1");
+        entry.changes_requested_feedback = Some("fix tests".to_string());
+        entry.changes_requested_feedback_consumed_at = Some(Utc::now());
+        store.save_merge_entry(&entry).unwrap();
+
+        let loaded = store.get_merge_entry("m1").unwrap().unwrap();
+        assert!(loaded.changes_requested_feedback_consumed_at.is_some());
     }
 
     // ── Task tests ───────────────────────────────────────────────

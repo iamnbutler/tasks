@@ -877,6 +877,9 @@ impl Server {
             .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
 
         task.rejection_feedback = feedback;
+        // Reset consumed_at when new feedback is set so it gets delivered (issue #505).
+        // When clearing (feedback=None), also clear consumed_at.
+        task.rejection_feedback_consumed_at = None;
         task.updated_at = chrono::Utc::now();
 
         // Write-through to store
@@ -889,15 +892,41 @@ impl Server {
         Ok(())
     }
 
-    /// Clear rejection feedback from a task after dispatch (issue #423).
-    ///
-    /// Called after successfully dispatching a task to prevent stale feedback
-    /// from being repeated on subsequent re-dispatches.
+    /// Clear rejection feedback from a task (issue #423).
     pub async fn clear_task_rejection_feedback(
         &self,
         task_id: &str,
     ) -> Result<(), ServerError> {
         self.set_task_rejection_feedback(task_id, None).await
+    }
+
+    /// Mark rejection feedback as consumed after successful dispatch (issue #505).
+    ///
+    /// Sets `rejection_feedback_consumed_at` instead of clearing the feedback text.
+    /// This way, if the session crashes before the agent processes the prompt,
+    /// the feedback is still available for the next dispatch attempt.
+    /// The prompt builder checks `consumed_at` to avoid re-delivering stale feedback.
+    pub async fn mark_rejection_feedback_consumed(
+        &self,
+        task_id: &str,
+    ) -> Result<(), ServerError> {
+        let mut state = self.state.write().await;
+        let task = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+        task.rejection_feedback_consumed_at = Some(chrono::Utc::now());
+        task.updated_at = chrono::Utc::now();
+
+        // Write-through to store
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.save_task(task) {
+                tracing::error!(task_id = %task_id, error = %e, "failed to persist rejection feedback consumed_at to store");
+            }
+        }
+
+        Ok(())
     }
 
     /// Reorder tasks by updating their priorities.
@@ -1503,17 +1532,15 @@ impl Server {
             entry.task_id.clone()
         };
 
-        // Persist status change (clone entry to avoid holding store lock across await)
+        // Persist status change
         if let Some(ref store) = self.store {
             let entry_clone = {
                 let state = self.state.read().await;
                 state.merge_queue.get(entry_id).cloned()
             };
             if let Some(entry) = entry_clone {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(&entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
-                    }
+                if let Err(e) = store.save_merge_entry(&entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist revert-to-approved");
                 }
             }
         }
@@ -1690,10 +1717,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -1748,10 +1773,8 @@ impl Server {
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
             // Persist rejected status to SQLite (issue #463)
             if let Some(ref store) = self.store {
-                if let Ok(store) = store.lock() {
-                    if let Err(e) = store.save_merge_entry(entry) {
-                        tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
-                    }
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist rejected merge queue entry");
                 }
             }
             entry.task_id.clone()
@@ -1799,6 +1822,12 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            // Persist changes_requested_feedback to SQLite (issue #505)
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist changes requested feedback");
+                }
+            }
             entry.task_id.clone()
         };
 
@@ -1837,6 +1866,12 @@ impl Server {
                 .map_err(|e| ServerError::StoreError(e.to_string()))?;
             let entry = state.merge_queue.get(entry_id)
                 .ok_or_else(|| ServerError::StoreError(format!("entry not found: {}", entry_id)))?;
+            // Persist cleared feedback to SQLite (issue #505)
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save_merge_entry(entry) {
+                    tracing::error!(entry_id = %entry_id, error = %e, "failed to persist cleared changes requested");
+                }
+            }
             entry.task_id.clone()
         };
 
@@ -2629,7 +2664,7 @@ mod tests {
         server.add_task(task).await.unwrap();
 
         // Verify data is in the store
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         assert!(store_ref.get_project("p1").unwrap().is_some());
         assert!(store_ref.get_task("t1").unwrap().is_some());
     }
@@ -2654,7 +2689,7 @@ mod tests {
             .unwrap();
 
         // Verify the store has the updated state
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         let stored_task = store_ref.get_task("t1").unwrap().unwrap();
         assert_eq!(stored_task.state, TaskState::Running);
     }

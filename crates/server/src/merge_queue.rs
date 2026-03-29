@@ -204,6 +204,7 @@ impl MergeQueue {
             .ok_or_else(|| MergeQueueError::NotFound(id.to_string()))?;
         entry.status = MergeStatus::ChangesRequested;
         entry.changes_requested_feedback = Some(feedback.into());
+        entry.changes_requested_feedback_consumed_at = None; // Reset for new feedback (issue #505)
         Ok(())
     }
 
@@ -224,6 +225,7 @@ impl MergeQueue {
         if entry.status == MergeStatus::ChangesRequested {
             entry.status = MergeStatus::Pending;
             entry.changes_requested_feedback = None;
+            entry.changes_requested_feedback_consumed_at = None;
         }
         Ok(())
     }

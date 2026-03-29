@@ -180,8 +180,14 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
     /// Feedback from orchestrator after PR rejection (issue #423).
     /// Delivered to the agent when the task is re-dispatched.
-    /// Cleared after dispatch so stale feedback isn't repeated.
+    /// Not cleared until new feedback replaces it — see `rejection_feedback_consumed_at`.
     pub rejection_feedback: Option<String>,
+    /// Tracks when rejection feedback was included in a dispatch (issue #505).
+    /// Set when a session is successfully started with the feedback in the prompt.
+    /// Prevents re-delivering stale feedback on subsequent dispatches.
+    /// Reset to None when new feedback is set, ensuring fresh feedback is always delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_feedback_consumed_at: Option<DateTime<Utc>>,
 }
 
 impl Task {
@@ -215,6 +221,7 @@ impl Task {
             created_at: now,
             updated_at: now,
             rejection_feedback: None,
+            rejection_feedback_consumed_at: None,
         }
     }
 
@@ -250,6 +257,18 @@ impl Task {
 
         if was_active || is_active {
             self.last_activity_at = Some(now);
+        }
+
+        // Reset feedback consumed tracking when returning to dispatch-eligible states
+        // (issue #505). If the task is back in Waiting/ChangesRequested/Failed, the
+        // previous session didn't reach a productive state, so the agent may not have
+        // seen the feedback — make it available for the next dispatch.
+        if matches!(
+            state,
+            TaskState::Waiting | TaskState::ChangesRequested | TaskState::Failed
+        ) && self.rejection_feedback_consumed_at.is_some()
+        {
+            self.rejection_feedback_consumed_at = None;
         }
 
         self.state = state;
@@ -660,5 +679,55 @@ mod tests {
         // Completed -> Running is invalid, but should not panic
         task.set_state(TaskState::Running);
         assert_eq!(task.state, TaskState::Running);
+    }
+
+    // ---- feedback consumption tracking (issue #505) ----
+
+    #[test]
+    fn rejection_feedback_consumed_at_resets_on_waiting() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        task.rejection_feedback = Some("fix the tests".to_string());
+        task.rejection_feedback_consumed_at = Some(Utc::now());
+
+        // Simulate session failure: Running -> Failed -> Waiting
+        task.state = TaskState::Running;
+        task.set_state(TaskState::Failed);
+        assert!(
+            task.rejection_feedback_consumed_at.is_none(),
+            "consumed_at should reset when entering Failed"
+        );
+        assert!(
+            task.rejection_feedback.is_some(),
+            "feedback text should be preserved"
+        );
+    }
+
+    #[test]
+    fn rejection_feedback_consumed_at_resets_on_changes_requested() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        task.rejection_feedback = Some("fix the tests".to_string());
+        task.rejection_feedback_consumed_at = Some(Utc::now());
+
+        task.state = TaskState::Running;
+        task.set_state(TaskState::ChangesRequested);
+        assert!(
+            task.rejection_feedback_consumed_at.is_none(),
+            "consumed_at should reset when entering ChangesRequested"
+        );
+    }
+
+    #[test]
+    fn rejection_feedback_consumed_at_preserved_on_productive_state() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        task.rejection_feedback = Some("fix the tests".to_string());
+        task.rejection_feedback_consumed_at = Some(Utc::now());
+
+        // Running -> AwaitingMerge means agent did productive work
+        task.state = TaskState::Running;
+        task.set_state(TaskState::AwaitingMerge);
+        assert!(
+            task.rejection_feedback_consumed_at.is_some(),
+            "consumed_at should be preserved when agent reached productive state"
+        );
     }
 }

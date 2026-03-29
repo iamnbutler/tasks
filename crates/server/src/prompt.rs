@@ -276,7 +276,17 @@ pub fn build_prompt_for_task(
         parent: None,
         related_tasks: &[],
         retry: retry.as_ref(),
-        rejection_feedback: task.rejection_feedback.as_deref(),
+        // Only include rejection feedback if it hasn't been consumed yet (issue #505).
+        // consumed_at is set when the feedback was included in a previous dispatch;
+        // if the task is back for dispatch, it means that session failed, so we
+        // re-deliver the feedback (consumed_at would have been set but the session
+        // didn't make progress). The consumed_at check prevents re-delivering when
+        // a successful session completes and the task cycles back for a new reason.
+        rejection_feedback: if task.rejection_feedback_consumed_at.is_none() {
+            task.rejection_feedback.as_deref()
+        } else {
+            None
+        },
     };
 
     build_prompt(&params)

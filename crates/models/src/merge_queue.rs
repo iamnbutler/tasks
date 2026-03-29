@@ -98,6 +98,10 @@ pub struct MergeQueueEntry {
     /// Set when status is ChangesRequested to guide the agent on what to fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes_requested_feedback: Option<String>,
+    /// Tracks when changes_requested_feedback was included in a dispatch (issue #505).
+    /// Prevents re-delivering stale feedback. Reset when new feedback is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes_requested_feedback_consumed_at: Option<DateTime<Utc>>,
     /// Current head commit SHA of the PR branch.
     /// Used to detect new commits for re-evaluation (spec Section 7.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +127,7 @@ impl MergeQueueEntry {
             queued_at: Utc::now(),
             conflict_info: None,
             changes_requested_feedback: None,
+            changes_requested_feedback_consumed_at: None,
             head_sha: None,
             queue_position: None,
             completed_at: None,

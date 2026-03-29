@@ -1262,12 +1262,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                 .await
                             {
                                 Ok(_) => {
-                                    // Clear rejection feedback after successful dispatch (issue #423).
-                                    // This prevents stale feedback from being repeated if the task
-                                    // is rejected and re-dispatched again.
+                                    // Mark rejection feedback as consumed after successful dispatch (issue #505).
+                                    // Uses consumed_at timestamp instead of clearing the text, so feedback
+                                    // survives if the session crashes before the agent processes it.
                                     if task.rejection_feedback.is_some() {
-                                        if let Err(e) = dispatch_server.clear_task_rejection_feedback(task_id).await {
-                                            warn!(task_id = %task_id, error = %e, "failed to clear rejection feedback after dispatch");
+                                        if let Err(e) = dispatch_server.mark_rejection_feedback_consumed(task_id).await {
+                                            warn!(task_id = %task_id, error = %e, "failed to mark rejection feedback as consumed after dispatch");
                                         }
                                     }
                                 }

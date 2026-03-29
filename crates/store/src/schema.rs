@@ -238,6 +238,67 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // Migration: add rejection_feedback_consumed_at column (issue #505)
+    // Tracks when rejection feedback was dispatched to an agent session.
+    match conn.execute(
+        "ALTER TABLE tasks ADD COLUMN rejection_feedback_consumed_at TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added rejection_feedback_consumed_at column to tasks table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            tracing::debug!("rejection_feedback_consumed_at column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add rejection_feedback_consumed_at column");
+            return Err(e);
+        }
+    }
+
+    // Migration: add changes_requested_feedback column to merge_queue (issue #505)
+    match conn.execute(
+        "ALTER TABLE merge_queue ADD COLUMN changes_requested_feedback TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added changes_requested_feedback column to merge_queue table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            tracing::debug!("changes_requested_feedback column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add changes_requested_feedback column");
+            return Err(e);
+        }
+    }
+
+    // Migration: add changes_requested_feedback_consumed_at column to merge_queue (issue #505)
+    match conn.execute(
+        "ALTER TABLE merge_queue ADD COLUMN changes_requested_feedback_consumed_at TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added changes_requested_feedback_consumed_at column to merge_queue table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            tracing::debug!("changes_requested_feedback_consumed_at column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add changes_requested_feedback_consumed_at column");
+            return Err(e);
+        }
+    }
+
     // Stamp the current data version so future runs can detect mismatches.
     write_version(conn, DATA_VERSION)?;
 
