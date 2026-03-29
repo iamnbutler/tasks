@@ -239,6 +239,36 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let health_check_interval = work_queue_config.health_check_interval;
     let work_queue = Arc::new(RwLock::new(WorkQueue::new(store.clone(), work_queue_config)));
 
+    // --- 2d. Recover orphaned work claims from previous run ---
+    //
+    // Since we just started, no containers exist yet — any active claims are orphaned.
+    // Release them so the work can be re-dispatched to new containers.
+    {
+        info!("checking for orphaned work claims from previous run");
+        let conn = store.conn()?;
+        let active_claims = tasks_store::work_claims::get_active_claims(&conn)?;
+        drop(conn);
+
+        let mut recovered = 0;
+        for claim in active_claims {
+            // Since we just started, no containers exist yet — release all active claims
+            if claim.container_id.is_some() {
+                let conn = store.conn()?;
+                tasks_store::work_claims::release_claim(
+                    &conn,
+                    &claim.work_id,
+                    Some("server restart - container no longer exists"),
+                )?;
+                drop(conn);
+                recovered += 1;
+            }
+        }
+
+        if recovered > 0 {
+            info!(count = recovered, "released orphaned work claims from previous run");
+        }
+    }
+
     // --- 2b. Create workflow config watcher (spec §14.3) ---
     //
     // Watches workflow.toml in project repositories and caches configs.
