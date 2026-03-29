@@ -254,6 +254,12 @@ impl Task {
             self.last_activity_at = Some(now);
         }
 
+        // Clear stale failure info on success (issue #506)
+        if state == TaskState::Completed {
+            self.last_failure = None;
+            self.last_failure_at = None;
+        }
+
         self.state = state;
         self.updated_at = now;
     }
@@ -729,6 +735,30 @@ mod tests {
 
         task.set_state(TaskState::Running);
         assert!(task.last_activity_at.is_some());
+    }
+
+    #[test]
+    fn set_state_clears_failure_info_on_completion() {
+        let mut task = Task::new("t1", TaskSource::Internal, "test task", "proj1");
+        task.state = TaskState::Running;
+        task.last_failure = Some(FailureInfo {
+            exit_code: Some(1),
+            signal: None,
+            duration_secs: 10,
+            stderr_tail: vec![],
+            failure_type: FailureType::Transient,
+            summary: "oops".into(),
+        });
+        task.last_failure_at = Some(Utc::now());
+
+        // Simulate: Running -> AwaitingMerge -> Completed
+        task.set_state(TaskState::AwaitingMerge);
+        // Failure info still present before completion
+        assert!(task.last_failure.is_some());
+
+        task.set_state(TaskState::Completed);
+        assert!(task.last_failure.is_none());
+        assert!(task.last_failure_at.is_none());
     }
 
     #[test]
