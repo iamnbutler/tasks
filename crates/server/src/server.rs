@@ -407,11 +407,36 @@ impl Server {
         removed
     }
 
+    /// Get a single automation run by ID.
+    pub fn get_automation_run(&self, run_id: &str) -> Result<Option<AutomationRun>, ServerError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        store
+            .get_automation_run(run_id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
     /// List runs for an automation.
     pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<AutomationRun>, ServerError> {
         let store = self.store.as_ref()
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
                 store.list_automation_runs(automation_id)
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    /// List automation runs stuck in `Running` state past the given cutoff time.
+    pub fn list_stuck_automation_runs(
+        &self,
+        started_before: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<AutomationRun>, ServerError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        store
+            .list_stuck_automation_runs(&started_before.to_rfc3339())
             .map_err(|e| ServerError::StoreError(e.to_string()))
     }
 

@@ -836,6 +836,27 @@ impl Store {
         Ok(runs)
     }
 
+    /// List all runs in the `Running` state that started before a given cutoff.
+    ///
+    /// Used by the stuck-run watchdog to find automation runs that have exceeded
+    /// their time limit without transitioning to a terminal state.
+    pub fn list_stuck_automation_runs(
+        &self,
+        started_before: &str,
+    ) -> Result<Vec<AutomationRun>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, automation_id, status, started_at, completed_at, output, error
+             FROM automation_runs WHERE status = 'running' AND started_at < ?1",
+        )?;
+        let rows = stmt.query_map(params![started_before], row_to_automation_run)?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    }
+
 }
 
 /// Map a rusqlite Row to a TaskAccounting.

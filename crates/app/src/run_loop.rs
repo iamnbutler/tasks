@@ -406,7 +406,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     );
     info!("automation event listener started");
 
-    // --- 6d. Create rejected PR cooldown tracker (issue #439) ---
+    // --- 6d. Spawn stuck-run watchdog (issue #496) ---
+    //
+    // Periodically scans for automation runs stuck in Running state past
+    // hard_limit + buffer and forcibly fails them. Safety net for missed events.
+
+    let stuck_run_watchdog_shutdown_rx = shutdown_tx.subscribe();
+    let stuck_run_watchdog_handle = crate::automation_runner::spawn_stuck_run_watchdog(
+        server.clone(),
+        config.automation_hard_limit,
+        stuck_run_watchdog_shutdown_rx,
+    );
+    info!("stuck-run watchdog started");
+
+    // --- 6e. Create rejected PR cooldown tracker (issue #439) ---
     //
     // Shared between the poll loop and orchestrator loop to prevent re-queuing
     // PRs that were recently rejected with the same head SHA. The orchestrator
@@ -2776,6 +2789,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         poll_handle,
         automation_scheduler_handle,
         automation_listener_handle,
+        stuck_run_watchdog_handle,
         dispatch_handle,
         event_handler_handle,
         orchestrator_handle,
