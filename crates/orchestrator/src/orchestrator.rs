@@ -10,8 +10,8 @@
 
 use crate::error::OrchestratorError;
 use crate::types::{
-    ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction, QualityEvaluation,
-    QuestionContext, SystemContext,
+    ConflictContext, ConflictTriage, EvaluationContext, FailureContext, FailureDiagnosis,
+    OrchestratorAction, QualityEvaluation, QuestionContext, SystemContext,
 };
 use models::task::Task;
 
@@ -80,4 +80,19 @@ pub trait Orchestrator: Sync {
         &self,
         context: &QuestionContext,
     ) -> Result<String, OrchestratorError>;
+
+    /// Diagnose a task failure and suggest recovery — spec §14.4.
+    ///
+    /// Called when a task reaches terminal Failed state (retries exhausted).
+    /// The orchestrator examines the failure context (exit code, stderr,
+    /// failure classification) and returns a diagnosis with a concrete
+    /// recovery action.
+    ///
+    /// The caller (run loop) decides whether to execute the recovery
+    /// automatically (Play mode + high confidence) or present it to
+    /// the human.
+    async fn diagnose_failure(
+        &self,
+        context: &FailureContext,
+    ) -> Result<FailureDiagnosis, OrchestratorError>;
 }

@@ -255,6 +255,112 @@ pub fn build_deep_review_prompt(
     prompt
 }
 
+/// Build the system prompt for failure diagnosis (spec §14.4).
+pub fn failure_diagnosis_system_prompt() -> String {
+    r#"You are an engineering manager diagnosing why a coding task failed.
+
+A task was assigned to an AI coding agent. The agent attempted the task (possibly multiple times) but ultimately failed. Your job is to analyze the failure evidence and recommend a concrete recovery action.
+
+## Failure categories
+
+Classify the failure into exactly one:
+- **environment**: Container, network, or resource issues (OOM, disk full, rate limits, DNS failures, timeouts). These are infrastructure problems, not code problems.
+- **task_too_complex**: The task is too large or ambiguous for a single agent session. The agent made partial progress but couldn't complete everything.
+- **missing_context**: The agent lacked necessary context — unclear requirements, missing information about the codebase, or ambiguous acceptance criteria.
+- **code_bug**: The agent's implementation approach was wrong — compilation errors, test failures from incorrect logic, wrong API usage.
+- **flaky**: The failure appears intermittent — the agent made progress on some attempts but not others, or the error is non-deterministic.
+
+## Recovery actions
+
+Recommend exactly one:
+- **retry**: Retry with specific guidance. Provide clear, actionable instructions that address the root cause. Good for: environment issues (with workaround), code bugs (with correction), flaky failures.
+- **escalate**: Surface to the human. Provide a clear summary of what went wrong and what the human should look at. Good for: complex tasks that need decomposition, missing context that only a human can provide, repeated failures with no clear fix.
+
+## Confidence
+
+Rate your confidence 0.0–1.0:
+- **0.8–1.0**: Root cause is clear from the evidence. Recovery action is specific and likely to work.
+- **0.5–0.7**: Probable cause identified but some uncertainty. Recovery might work.
+- **0.0–0.4**: Unclear what went wrong. Leaning toward escalation.
+
+## Response format (JSON)
+
+```json
+{
+  "category": "environment|task_too_complex|missing_context|code_bug|flaky",
+  "reasoning": "Analysis of the failure evidence",
+  "recovery": {
+    "action": "retry|escalate",
+    "guidance": "Specific instructions for retry (required if action=retry)",
+    "summary": "What to tell the human (required if action=escalate)"
+  },
+  "confidence": 0.75
+}
+```
+
+## Key principles
+
+- Be specific. "Retry with different parameters" is useless. "The OOM kill suggests the container needs more memory, but since we can't change that, retry with guidance to process files in smaller batches" is useful.
+- If the task failed 3+ times with no progress, lean toward escalation unless the failure is clearly environmental.
+- Look at the stderr output — it often contains the actual error.
+- Short sessions (< 30s) that fail usually indicate setup/environment problems. Longer sessions that fail usually indicate task complexity or code issues.
+- If multiple retry attempts all failed the same way, a retry with the same approach won't help. Either suggest a fundamentally different approach or escalate."#.to_string()
+}
+
+/// Build the user prompt for failure diagnosis.
+pub fn build_failure_diagnosis_prompt(
+    task_title: &str,
+    task_description: Option<&str>,
+    repo: &str,
+    failure_info: Option<&models::task::FailureInfo>,
+    retry_count: u32,
+) -> String {
+    let mut prompt = format!(
+        "## Failed Task\n\
+         **Repository:** {repo}\n\
+         **Title:** {task_title}\n"
+    );
+
+    if let Some(desc) = task_description {
+        prompt.push_str(&format!("**Description:** {}\n", truncate_text(desc, 2000)));
+    }
+
+    prompt.push_str(&format!("**Retry count:** {retry_count}\n\n"));
+
+    if let Some(info) = failure_info {
+        prompt.push_str("## Failure Details\n\n");
+        prompt.push_str(&format!("**Summary:** {}\n", info.summary));
+        prompt.push_str(&format!("**Type:** {:?}\n", info.failure_type));
+        prompt.push_str(&format!("**Duration:** {}s\n", info.duration_secs));
+
+        if let Some(code) = info.exit_code {
+            prompt.push_str(&format!("**Exit code:** {code}\n"));
+        }
+        if let Some(ref signal) = info.signal {
+            prompt.push_str(&format!("**Signal:** {signal}\n"));
+        }
+
+        if !info.stderr_tail.is_empty() {
+            prompt.push_str("\n### stderr (last lines)\n\n```\n");
+            // Include up to 50 lines of stderr, truncated to 5000 chars total
+            let stderr_text = info.stderr_tail.join("\n");
+            prompt.push_str(&truncate_text(&stderr_text, 5000));
+            prompt.push_str("\n```\n");
+        }
+    } else {
+        prompt.push_str("## Failure Details\n\n");
+        prompt.push_str("No detailed failure information available.\n");
+    }
+
+    prompt.push_str(
+        "\n## Instructions\n\n\
+         Diagnose the failure and recommend a recovery action. \
+         Respond with your diagnosis in the JSON format specified in your instructions."
+    );
+
+    prompt
+}
+
 /// Truncate text to a maximum length, adding ellipsis if truncated.
 fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
@@ -580,5 +686,63 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_failure_diagnosis_system_prompt() {
+        let prompt = failure_diagnosis_system_prompt();
+        assert!(prompt.contains("environment"));
+        assert!(prompt.contains("task_too_complex"));
+        assert!(prompt.contains("missing_context"));
+        assert!(prompt.contains("code_bug"));
+        assert!(prompt.contains("retry"));
+        assert!(prompt.contains("escalate"));
+        assert!(prompt.contains("confidence"));
+    }
+
+    #[test]
+    fn test_build_failure_diagnosis_prompt_basic() {
+        let prompt = build_failure_diagnosis_prompt(
+            "Fix auth bug",
+            Some("The login flow is broken"),
+            "owner/repo",
+            None,
+            3,
+        );
+        assert!(prompt.contains("Fix auth bug"));
+        assert!(prompt.contains("login flow is broken"));
+        assert!(prompt.contains("owner/repo"));
+        assert!(prompt.contains("**Retry count:** 3"));
+        assert!(prompt.contains("No detailed failure information"));
+    }
+
+    #[test]
+    fn test_build_failure_diagnosis_prompt_with_failure_info() {
+        use models::task::{FailureInfo, FailureType};
+
+        let failure_info = FailureInfo {
+            exit_code: Some(1),
+            signal: None,
+            duration_secs: 45,
+            stderr_tail: vec![
+                "error[E0308]: mismatched types".to_string(),
+                "  --> src/main.rs:42:5".to_string(),
+            ],
+            failure_type: FailureType::Deterministic,
+            summary: "Process exited with code 1 (error)".to_string(),
+        };
+
+        let prompt = build_failure_diagnosis_prompt(
+            "Fix auth bug",
+            None,
+            "owner/repo",
+            Some(&failure_info),
+            1,
+        );
+        assert!(prompt.contains("**Exit code:** 1"));
+        assert!(prompt.contains("**Duration:** 45s"));
+        assert!(prompt.contains("Deterministic"));
+        assert!(prompt.contains("mismatched types"));
+        assert!(prompt.contains("src/main.rs:42:5"));
     }
 }

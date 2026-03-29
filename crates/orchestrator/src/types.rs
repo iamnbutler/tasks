@@ -297,7 +297,78 @@ pub enum OrchestratorAction {
         task_id: String,
         reason: String,
     },
+    /// Retry a failed task with additional guidance for the agent.
+    ///
+    /// The run loop transitions the task to Waiting and stores the guidance
+    /// so it's included in the agent's prompt on re-dispatch.
+    RetryWithGuidance {
+        task_id: String,
+        guidance: String,
+    },
     // Future: DispatchAgent { task_id: String, config: DispatchConfig }
     // Future: CreateIssue { repo: String, title: String, body: String }
     // Future: CommentOnPr { pr_url: String, body: String }
+}
+
+/// Context for diagnosing a task failure — spec §14.4.
+///
+/// Provided to the orchestrator when a task reaches terminal Failed state
+/// (retries exhausted) so it can analyze the failure and suggest recovery.
+pub struct FailureContext {
+    /// The failed task (in Failed state).
+    pub task: Task,
+    /// The project this task belongs to.
+    pub project: Project,
+    /// Current operating mode.
+    pub mode: OperatingMode,
+    /// Whether a human is currently connected.
+    pub human_present: bool,
+}
+
+/// Classification of why a task failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    /// Container, network, or resource issues (OOM, disk, rate limits).
+    Environment,
+    /// Task is too large or complex for a single agent session.
+    TaskTooComplex,
+    /// Agent lacked necessary context (unclear requirements, missing info).
+    MissingContext,
+    /// Implementation bug — the agent's approach was wrong.
+    CodeBug,
+    /// Intermittent issue that may resolve on a simple retry.
+    Flaky,
+}
+
+/// A concrete recovery action suggested by the orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum RecoveryAction {
+    /// Retry the task with specific guidance to avoid the same failure.
+    Retry {
+        /// Guidance to include in the agent's prompt on retry.
+        guidance: String,
+    },
+    /// Escalate to the human with a specific question or summary.
+    Escalate {
+        /// Summary of what went wrong and what the human should look at.
+        summary: String,
+    },
+}
+
+/// Orchestrator's diagnosis of a task failure — spec §14.4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureDiagnosis {
+    /// What category of failure this is.
+    pub category: FailureCategory,
+    /// Explanation of the diagnosis.
+    pub reasoning: String,
+    /// Suggested recovery action.
+    pub recovery: RecoveryAction,
+    /// Confidence in the diagnosis (0.0–1.0).
+    /// Higher confidence means the orchestrator is more sure about the
+    /// root cause and recovery. In Play mode, high confidence (≥0.7)
+    /// enables automatic recovery execution.
+    pub confidence: f32,
 }

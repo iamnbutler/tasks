@@ -2251,6 +2251,60 @@ impl Server {
         Ok(will_retry)
     }
 
+    /// Retry a failed task with orchestrator guidance (spec §14.4).
+    ///
+    /// Transitions the task from Failed to Waiting and stores the guidance
+    /// as `rejection_feedback` so it's included in the agent's prompt on
+    /// re-dispatch. Also resets retry_count to allow fresh attempts.
+    pub async fn retry_failed_task_with_guidance(
+        &self,
+        task_id: &str,
+        guidance: &str,
+    ) -> Result<(), ServerError> {
+        {
+            let mut state = self.state.write().await;
+            let task = state
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ServerError::TaskNotFound(task_id.to_string()))?;
+
+            if task.state != TaskState::Failed {
+                return Err(ServerError::InvalidOperation(format!(
+                    "cannot retry task {} in state {:?} (expected Failed)",
+                    task_id, task.state
+                )));
+            }
+
+            task.retry_count = 0;
+            task.last_failure_at = None;
+            task.rejection_feedback = Some(guidance.to_string());
+            task.set_state(TaskState::Waiting);
+
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save_task(task) {
+                    tracing::error!(
+                        task_id = %task_id,
+                        error = %e,
+                        "failed to persist guided retry state to store"
+                    );
+                }
+            }
+        }
+
+        let event = Event::new(
+            EventType::TaskStateWaiting,
+            task_id,
+            Actor::Orchestrator,
+            serde_json::json!({
+                "reason": "orchestrator_guided_retry",
+                "has_guidance": true,
+            }),
+        );
+        self.event_bus.publish(event).await?;
+
+        Ok(())
+    }
+
     // --- Restart recovery (spec §13.3) ---
 
     /// Apply the results of orphan detection to task state.

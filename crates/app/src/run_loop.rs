@@ -22,8 +22,8 @@ use tasks_github::model::{IssueState, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
-    ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
-    OrchestratorAction, OrchestratorChat, QuestionContext, SystemContext,
+    ChatContext, ConflictContext, ConflictResolution, FailureContext, OperatingMode, Orchestrator,
+    OrchestratorAction, OrchestratorChat, QuestionContext, RecoveryAction, SystemContext,
 };
 
 use crate::config::AppConfig;
@@ -917,6 +917,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let event_handler_server = server.clone();
     let event_handler_bus = server.event_bus.clone();
     let event_handler_max_retries = config.max_retries;
+    let event_handler_orch = orchestrator.clone();
     let mut event_handler_shutdown_rx = shutdown_tx.subscribe();
 
     let event_handler_handle = tokio::spawn(async move {
@@ -1017,17 +1018,35 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 let failure_info = event.data.get("failure_info")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-                if let Err(e) = event_handler_server
+                match event_handler_server
                     .handle_task_failure(task_id, made_progress, event_handler_max_retries, failure_info)
                     .await
                 {
-                    if !matches!(e, server::ServerError::TaskNotFound(_)) {
-                        error!(
-                            task_id = %task_id,
-                            made_progress = made_progress,
-                            error = %e,
-                            "failed to handle task failure"
-                        );
+                    Ok(will_retry) => {
+                        if !will_retry {
+                            // Retries exhausted — ask orchestrator to diagnose (spec §14.4)
+                            let task_id_owned = task_id.to_string();
+                            let diag_server = event_handler_server.clone();
+                            let diag_orch = event_handler_orch.clone();
+                            tokio::spawn(async move {
+                                diagnose_and_act(
+                                    &diag_server,
+                                    diag_orch.as_ref(),
+                                    &task_id_owned,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        if !matches!(e, server::ServerError::TaskNotFound(_)) {
+                            error!(
+                                task_id = %task_id,
+                                made_progress = made_progress,
+                                error = %e,
+                                "failed to handle task failure"
+                            );
+                        }
                     }
                 }
                 continue;
@@ -2590,6 +2609,15 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             OrchestratorAction::PrioritizeTask { task_id, reason } => {
                                 info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
                             }
+                            OrchestratorAction::RetryWithGuidance { task_id, guidance } => {
+                                info!(task_id = %task_id, "orchestrator requested retry with guidance");
+                                if let Err(e) = think_server
+                                    .retry_failed_task_with_guidance(&task_id, &guidance)
+                                    .await
+                                {
+                                    error!(task_id = %task_id, error = %e, "failed to retry task with guidance from think()");
+                                }
+                            }
                         }
                     }
                 }
@@ -2919,5 +2947,143 @@ async fn load_workflow_settings_for_project(
     ProjectWorkflowSettings {
         system_prompt,
         progress_threshold,
+    }
+}
+
+/// Diagnose a failed task and take recovery action (spec §14.4).
+///
+/// Called asynchronously when a task reaches terminal Failed state (retries
+/// exhausted). The orchestrator analyzes the failure and suggests a recovery.
+/// In Play mode with high confidence, the recovery is executed automatically.
+/// Otherwise, the diagnosis is emitted as narration for the human.
+async fn diagnose_and_act(
+    server: &Server,
+    orchestrator: &(dyn Orchestrator + Send + Sync),
+    task_id: &str,
+) {
+    // Fetch task and project
+    let (task, project) = {
+        let state = server.state.read().await;
+        let Some(task) = state.tasks.get(task_id).cloned() else {
+            return;
+        };
+        let Some(project) = state.projects.get(&task.project).cloned() else {
+            return;
+        };
+        (task, project)
+    };
+
+    let mode = match server.mode().await {
+        server::Mode::Play => OperatingMode::Play,
+        server::Mode::Pause => OperatingMode::Pause,
+        server::Mode::Stop => return, // No diagnosis in Stop mode
+    };
+
+    let context = FailureContext {
+        task: task.clone(),
+        project,
+        mode,
+        human_present: server.is_human_present(),
+    };
+
+    let diagnosis = match orchestrator.diagnose_failure(&context).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                task_id = %task_id,
+                error = %e,
+                "failed to diagnose task failure"
+            );
+            return;
+        }
+    };
+
+    info!(
+        task_id = %task_id,
+        category = ?diagnosis.category,
+        confidence = diagnosis.confidence,
+        "failure diagnosis complete"
+    );
+
+    // Emit the diagnosis as an orchestrator thought
+    let thought = format!(
+        "Diagnosed failure for task {}: {:?} (confidence: {:.0}%). {}",
+        &task_id[..8.min(task_id.len())],
+        diagnosis.category,
+        diagnosis.confidence * 100.0,
+        diagnosis.reasoning,
+    );
+    let event = Event::new(
+        EventType::OrchestratorThought,
+        task_id,
+        Actor::Orchestrator,
+        serde_json::json!({
+            "message": thought,
+            "diagnosis": diagnosis,
+        }),
+    );
+    if let Err(e) = server.event_bus.publish(event).await {
+        error!(error = %e, "failed to publish diagnosis thought");
+    }
+
+    // In Play mode with high confidence, execute recovery automatically
+    let auto_confidence_threshold = 0.7;
+    let should_auto_recover =
+        mode == OperatingMode::Play && diagnosis.confidence >= auto_confidence_threshold;
+
+    match &diagnosis.recovery {
+        RecoveryAction::Retry { guidance } if should_auto_recover => {
+            info!(
+                task_id = %task_id,
+                "auto-recovering: retry with guidance"
+            );
+            // Store guidance as rejection_feedback (reuses existing mechanism
+            // for delivering orchestrator feedback to re-dispatched agents)
+            if let Err(e) = server
+                .retry_failed_task_with_guidance(task_id, guidance)
+                .await
+            {
+                error!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to retry task with guidance"
+                );
+            }
+        }
+        RecoveryAction::Retry { guidance } => {
+            // Not auto-recovering — emit suggestion for the human
+            let suggestion = Event::new(
+                EventType::OrchestratorThought,
+                task_id,
+                Actor::Orchestrator,
+                serde_json::json!({
+                    "message": format!(
+                        "Suggested recovery for task {}: retry with guidance — {}",
+                        &task_id[..8.min(task_id.len())],
+                        guidance,
+                    ),
+                }),
+            );
+            if let Err(e) = server.event_bus.publish(suggestion).await {
+                error!(error = %e, "failed to publish recovery suggestion");
+            }
+        }
+        RecoveryAction::Escalate { summary } => {
+            let escalation = Event::new(
+                EventType::OrchestratorThought,
+                task_id,
+                Actor::Orchestrator,
+                serde_json::json!({
+                    "message": format!(
+                        "Escalating task {} to human: {}",
+                        &task_id[..8.min(task_id.len())],
+                        summary,
+                    ),
+                }),
+            );
+            if let Err(e) = server.event_bus.publish(escalation).await {
+                error!(error = %e, "failed to publish escalation");
+            }
+        }
     }
 }

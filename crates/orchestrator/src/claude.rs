@@ -8,10 +8,14 @@ use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{
+    build_evaluation_prompt, build_deep_review_prompt, build_failure_diagnosis_prompt,
+    failure_diagnosis_system_prompt, parse_pr_url, system_prompt,
+};
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, FailureCategory,
+    FailureContext, FailureDiagnosis, OrchestratorAction, QualityEvaluation, QuestionContext,
+    RecoveryAction, SystemContext,
 };
 use events::EventType;
 use models::task::{Task, TaskSource};
@@ -518,6 +522,116 @@ impl Orchestrator for ClaudeOrchestrator {
 
         Ok(answer)
     }
+
+    async fn diagnose_failure(
+        &self,
+        context: &FailureContext,
+    ) -> Result<FailureDiagnosis, OrchestratorError> {
+        info!(
+            task_id = %context.task.id,
+            retry_count = context.task.retry_count,
+            "Diagnosing task failure"
+        );
+
+        let system = failure_diagnosis_system_prompt();
+
+        let user_prompt = build_failure_diagnosis_prompt(
+            &context.task.title,
+            context.task.description.as_deref(),
+            &context.project.repo,
+            context.task.last_failure.as_ref(),
+            context.task.retry_count,
+        );
+
+        // Use a smaller max_tokens — diagnosis responses are concise
+        let config = CompletionConfig::new(&self.model).with_max_tokens(4096);
+        let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system);
+
+        let response = self
+            .provider
+            .complete(request)
+            .await
+            .map_err(OrchestratorError::Agent)?;
+
+        let response_text = response.text();
+        info!(
+            task_id = %context.task.id,
+            response_len = response_text.len(),
+            "Received failure diagnosis response"
+        );
+
+        parse_diagnosis_response(&response_text)
+    }
+}
+
+/// Parse the LLM's failure diagnosis JSON response.
+fn parse_diagnosis_response(text: &str) -> Result<FailureDiagnosis, OrchestratorError> {
+    let json_str = extract_json(text).ok_or_else(|| {
+        OrchestratorError::Evaluation(format!(
+            "Could not find JSON in diagnosis response: {}",
+            truncate(text, 200)
+        ))
+    })?;
+
+    let parsed: DiagnosisResponse = serde_json::from_str(json_str).map_err(|e| {
+        OrchestratorError::Evaluation(format!("Failed to parse diagnosis JSON: {}", e))
+    })?;
+
+    if parsed.reasoning.trim().is_empty() {
+        return Err(OrchestratorError::Evaluation(
+            "Diagnosis reasoning must not be empty".to_string(),
+        ));
+    }
+
+    let confidence = parsed.confidence.clamp(0.0, 1.0);
+
+    let recovery = match parsed.recovery.action.as_str() {
+        "retry" => RecoveryAction::Retry {
+            guidance: parsed.recovery.guidance.unwrap_or_else(|| {
+                "Retry the task with a different approach.".to_string()
+            }),
+        },
+        "escalate" => RecoveryAction::Escalate {
+            summary: parsed.recovery.summary.unwrap_or_else(|| {
+                parsed.reasoning.clone()
+            }),
+        },
+        other => {
+            warn!(action = %other, "Unknown recovery action, defaulting to escalate");
+            RecoveryAction::Escalate {
+                summary: parsed.reasoning.clone(),
+            }
+        }
+    };
+
+    Ok(FailureDiagnosis {
+        category: parsed.category,
+        reasoning: parsed.reasoning,
+        recovery,
+        confidence,
+    })
+}
+
+/// Internal struct for parsing the LLM's diagnosis JSON response.
+#[derive(Deserialize)]
+struct DiagnosisResponse {
+    category: FailureCategory,
+    reasoning: String,
+    recovery: DiagnosisRecovery,
+    #[serde(default = "default_confidence")]
+    confidence: f32,
+}
+
+#[derive(Deserialize)]
+struct DiagnosisRecovery {
+    action: String,
+    guidance: Option<String>,
+    summary: Option<String>,
+}
+
+fn default_confidence() -> f32 {
+    0.5
 }
 
 /// Build the system prompt for answering agent questions.
@@ -644,6 +758,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -727,5 +842,82 @@ That's all."#;
     fn test_extract_json_none() {
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("incomplete { json").is_none());
+    }
+
+    #[test]
+    fn test_parse_diagnosis_retry() {
+        let text = r#"```json
+{
+  "category": "code_bug",
+  "reasoning": "The agent used the wrong API endpoint",
+  "recovery": {
+    "action": "retry",
+    "guidance": "Use /api/v2/users instead of /api/v1/users"
+  },
+  "confidence": 0.85
+}
+```"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert_eq!(result.category, FailureCategory::CodeBug);
+        assert!(result.reasoning.contains("wrong API endpoint"));
+        assert!(matches!(result.recovery, RecoveryAction::Retry { .. }));
+        assert!((result.confidence - 0.85).abs() < f32::EPSILON);
+        if let RecoveryAction::Retry { guidance } = &result.recovery {
+            assert!(guidance.contains("/api/v2/users"));
+        }
+    }
+
+    #[test]
+    fn test_parse_diagnosis_escalate() {
+        let text = r#"{
+  "category": "task_too_complex",
+  "reasoning": "The task requires changes across 15 files",
+  "recovery": {
+    "action": "escalate",
+    "summary": "Break this task into smaller subtasks"
+  },
+  "confidence": 0.6
+}"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert_eq!(result.category, FailureCategory::TaskTooComplex);
+        assert!(matches!(result.recovery, RecoveryAction::Escalate { .. }));
+        assert!((result.confidence - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_diagnosis_environment() {
+        let text = r#"{"category": "environment", "reasoning": "OOM kill", "recovery": {"action": "retry", "guidance": "Process files in smaller batches"}, "confidence": 0.9}"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert_eq!(result.category, FailureCategory::Environment);
+        assert!((result.confidence - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_diagnosis_missing_confidence_defaults() {
+        let text = r#"{"category": "flaky", "reasoning": "Intermittent failure", "recovery": {"action": "retry", "guidance": "Just retry"}}"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert_eq!(result.category, FailureCategory::Flaky);
+        assert!((result.confidence - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_diagnosis_clamps_confidence() {
+        let text = r#"{"category": "code_bug", "reasoning": "Bug", "recovery": {"action": "escalate", "summary": "Help"}, "confidence": 1.5}"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert!((result.confidence - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_diagnosis_unknown_action_defaults_to_escalate() {
+        let text = r#"{"category": "code_bug", "reasoning": "Bug", "recovery": {"action": "break_down"}, "confidence": 0.5}"#;
+        let result = parse_diagnosis_response(text).unwrap();
+        assert!(matches!(result.recovery, RecoveryAction::Escalate { .. }));
+    }
+
+    #[test]
+    fn test_parse_diagnosis_empty_reasoning_rejected() {
+        let text = r#"{"category": "flaky", "reasoning": "", "recovery": {"action": "retry", "guidance": "Try again"}, "confidence": 0.8}"#;
+        let result = parse_diagnosis_response(text);
+        assert!(result.is_err());
     }
 }

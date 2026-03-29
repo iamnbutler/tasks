@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, FailureCategory,
+    FailureContext, FailureDiagnosis, OrchestratorAction, QualityEvaluation, QuestionContext,
+    RecoveryAction, SystemContext,
 };
 use models::task::Task;
 
@@ -29,6 +30,10 @@ pub struct MockOrchestrator {
     pub think_count: Mutex<u32>,
     /// Count of answer_question calls (for assertions).
     pub answer_question_count: Mutex<u32>,
+    /// Count of diagnose_failure calls (for assertions).
+    pub diagnose_failure_count: Mutex<u32>,
+    /// Optional failure diagnosis override.
+    failure_diagnosis: Mutex<Option<FailureDiagnosis>>,
 }
 
 impl MockOrchestrator {
@@ -46,6 +51,8 @@ impl MockOrchestrator {
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
             answer_question_count: Mutex::new(0),
+            diagnose_failure_count: Mutex::new(0),
+            failure_diagnosis: Mutex::new(None),
         }
     }
 
@@ -64,6 +71,8 @@ impl MockOrchestrator {
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
             answer_question_count: Mutex::new(0),
+            diagnose_failure_count: Mutex::new(0),
+            failure_diagnosis: Mutex::new(None),
         }
     }
 
@@ -75,6 +84,11 @@ impl MockOrchestrator {
     /// Set what conflict triage to return next.
     pub fn set_conflict_triage(&self, triage: ConflictTriage) {
         *self.conflict_triage.lock().unwrap() = Some(triage);
+    }
+
+    /// Set what failure diagnosis to return next.
+    pub fn set_failure_diagnosis(&self, diagnosis: FailureDiagnosis) {
+        *self.failure_diagnosis.lock().unwrap() = Some(diagnosis);
     }
 }
 
@@ -123,6 +137,22 @@ impl Orchestrator for MockOrchestrator {
     ) -> Result<String, OrchestratorError> {
         *self.answer_question_count.lock().unwrap() += 1;
         Ok("Mock: proceed with whatever approach you think is best.".to_string())
+    }
+
+    async fn diagnose_failure(
+        &self,
+        _context: &FailureContext,
+    ) -> Result<FailureDiagnosis, OrchestratorError> {
+        *self.diagnose_failure_count.lock().unwrap() += 1;
+        let override_diagnosis = self.failure_diagnosis.lock().unwrap().clone();
+        Ok(override_diagnosis.unwrap_or_else(|| FailureDiagnosis {
+            category: FailureCategory::CodeBug,
+            reasoning: "Mock: default diagnosis".to_string(),
+            recovery: RecoveryAction::Escalate {
+                summary: "Mock: task failed, needs human review".to_string(),
+            },
+            confidence: 0.5,
+        }))
     }
 }
 
@@ -263,5 +293,45 @@ mod tests {
         let result = mock.answer_question(&ctx).await.unwrap();
         assert!(!result.is_empty());
         assert_eq!(*mock.answer_question_count.lock().unwrap(), 1);
+    }
+
+    fn test_failure_context() -> FailureContext {
+        let mut task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        task.state = models::task::TaskState::Failed;
+        task.retry_count = 3;
+        FailureContext {
+            task,
+            project: Project::new("proj-1", "owner/repo"),
+            mode: OperatingMode::Play,
+            human_present: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_failure_default() {
+        let mock = MockOrchestrator::approving();
+        let ctx = test_failure_context();
+        let result = mock.diagnose_failure(&ctx).await.unwrap();
+        assert_eq!(result.category, FailureCategory::CodeBug);
+        assert!(matches!(result.recovery, RecoveryAction::Escalate { .. }));
+        assert_eq!(*mock.diagnose_failure_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_failure_override() {
+        let mock = MockOrchestrator::approving();
+        mock.set_failure_diagnosis(FailureDiagnosis {
+            category: FailureCategory::Environment,
+            reasoning: "OOM kill".to_string(),
+            recovery: RecoveryAction::Retry {
+                guidance: "Use smaller batch size".to_string(),
+            },
+            confidence: 0.9,
+        });
+        let ctx = test_failure_context();
+        let result = mock.diagnose_failure(&ctx).await.unwrap();
+        assert_eq!(result.category, FailureCategory::Environment);
+        assert!(matches!(result.recovery, RecoveryAction::Retry { .. }));
+        assert!((result.confidence - 0.9).abs() < f32::EPSILON);
     }
 }
