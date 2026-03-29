@@ -244,14 +244,14 @@ function computeStatusMessages(
         type: "warning",
         message: `Paused: ${parts.join(", ")}`,
         detail: dispatchable > 0
-          ? `${dispatchable} ${dispatchable === 1 ? "task" : "tasks"} ready to dispatch. Approve entries or switch to Play.`
-          : "Review and approve entries, then use Flush or switch to Play.",
+          ? `${dispatchable} ${dispatchable === 1 ? "task" : "tasks"} ready to dispatch. Rejections, conflicts, and change requests still process automatically. Approve entries or switch to Play.`
+          : "Approved PRs are held for manual flush. Rejections, conflicts, and change requests still process automatically.",
       });
     } else if (activeWork === 0 && dispatchable === 0 && nonTerminalTasks > 0) {
       messages.push({
         type: "warning",
         message: "Paused with no dispatchable work",
-        detail: "All active tasks are awaiting merge decisions or blocked.",
+        detail: "All active tasks are awaiting merge decisions or blocked. Rejections, conflicts, and change requests still process automatically.",
       });
     }
   }

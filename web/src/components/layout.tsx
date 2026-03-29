@@ -52,10 +52,10 @@ import type { Mode } from "@/lib/types";
 // Mode indicator
 // ---------------------------------------------------------------------------
 
-const modeConfig: Record<Mode, { label: string; icon: typeof Square }> = {
-  stop: { label: "Stopped", icon: Square },
-  pause: { label: "Paused", icon: Pause },
-  play: { label: "Playing", icon: Play },
+const modeConfig: Record<Mode, { label: string; description: string; icon: typeof Square }> = {
+  stop: { label: "Stopped", description: "All activity halted. No new work will be started.", icon: Square },
+  pause: { label: "Paused", description: "Approved PRs are held for manual flush. Rejections, conflicts, and change requests continue automatically.", icon: Pause },
+  play: { label: "Playing", description: "Fully automatic. Work is dispatched and merged without intervention.", icon: Play },
 };
 
 const modeOrder: Mode[] = ["stop", "pause", "play"];
@@ -94,7 +94,10 @@ function ModeSelector() {
                 <Icon className="h-4 w-4" />
               </button>
             </TooltipTrigger>
-            <TooltipContent side="top">{config.label}</TooltipContent>
+            <TooltipContent side="top" className="max-w-64">
+              <p className="font-medium">{config.label}</p>
+              <p className="text-muted-foreground font-normal">{config.description}</p>
+            </TooltipContent>
           </Tooltip>
         );
       })}
