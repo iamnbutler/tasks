@@ -1109,9 +1109,23 @@ impl Server {
             };
 
             let result = crate::scheduler::reconcile_task(task, issue, label_config);
+            // Drop the mutable borrow on `task` so we can immutably borrow the map.
+            drop(task);
+
+            // Validate blocked_by: reject self-refs, nonexistent tasks, and cycles.
+            if result.updated_fields.contains(&"blocked_by") {
+                let proposed = state.tasks[task_id].blocked_by.clone();
+                let validated = crate::model::task::validate_blocked_by(
+                    task_id,
+                    &proposed,
+                    &state.tasks,
+                );
+                state.tasks.get_mut(task_id).unwrap().blocked_by = validated;
+            }
 
             if result.has_changes() {
                 // Write-through to store
+                let task = state.tasks.get(task_id).unwrap();
                 if let Some(ref store) = self.store {
                         if let Err(e) = store.save_task(task) {
                             tracing::error!(task_id = %task_id, error = %e, "failed to persist reconciled task");
@@ -1368,7 +1382,8 @@ impl Server {
                         state
                             .tasks
                             .get(dep_id)
-                            .is_some_and(|dep| dep.state.is_terminal())
+                            // Nonexistent deps are treated as resolved to prevent deadlock.
+                            .map_or(true, |dep| dep.state.is_terminal())
                     })
                 })
                 .map(|t| t.id.clone())
