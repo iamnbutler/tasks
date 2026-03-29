@@ -4,6 +4,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Task ID used for system-wide events not tied to any specific task
+/// (e.g. orchestrator decisions, system updates, task reordering).
+pub const SYSTEM_TASK_ID: &str = "__system__";
+
 /// Who produced this event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -611,7 +615,7 @@ mod tests {
     fn update_available_event_serializes() {
         let e = Event::new(
             EventType::SystemUpdateAvailable,
-            "",
+            SYSTEM_TASK_ID,
             Actor::System,
             serde_json::json!({
                 "target_commit": "def5678",
@@ -628,7 +632,7 @@ mod tests {
     fn update_applying_event_serializes() {
         let e = Event::new(
             EventType::SystemUpdateApplying,
-            "",
+            SYSTEM_TASK_ID,
             Actor::System,
             serde_json::json!({
                 "target_commit": "def5678",

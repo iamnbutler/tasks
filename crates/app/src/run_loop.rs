@@ -10,7 +10,7 @@ use std::sync::Mutex as StdMutex;
 
 use tracing::{debug, error, info, warn};
 
-use events::{Actor, Event, EventBus, EventStore, EventType};
+use events::{Actor, Event, EventBus, EventStore, EventType, SYSTEM_TASK_ID};
 use uuid::Uuid;
 use runtime::{AppleContainerRuntime, ContainerConfig, ContainerRuntime};
 use server::Server;
@@ -1872,7 +1872,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                             }
                                             let resp_event = Event::new(
                                                 EventType::OrchestratorResponse,
-                                                "",
+                                                SYSTEM_TASK_ID,
                                                 Actor::Orchestrator,
                                                 serde_json::json!({
                                                     "message": response.message,
@@ -1887,7 +1887,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                             tracing::error!(error = %e, "Failed to process orchestrator chat message");
                                             let err_event = Event::new(
                                                 EventType::OrchestratorResponse,
-                                                "",
+                                                SYSTEM_TASK_ID,
                                                 Actor::Orchestrator,
                                                 serde_json::json!({
                                                     "message": format!("I encountered an error processing your message: {}", e),
@@ -2806,7 +2806,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             OrchestratorAction::EmitThought(message) => {
                                 let event = Event::new(
                                     EventType::OrchestratorThought,
-                                    "",
+                                    SYSTEM_TASK_ID,
                                     Actor::Orchestrator,
                                     serde_json::json!({ "message": message }),
                                 );
