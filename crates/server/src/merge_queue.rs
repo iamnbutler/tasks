@@ -316,15 +316,19 @@ impl MergeQueue {
             // Optionally remove stale conflict entries
             if let Some(cutoff) = conflict_cutoff {
                 if e.status == MergeStatus::Conflict {
-                    // If we have conflict_info with a timestamp, use it
                     if let Some(ref info) = e.conflict_info {
+                        // Use the precise conflict detection timestamp
                         if info.detected_at < cutoff {
                             return false;
                         }
+                    } else {
+                        // No conflict_info — fall back to queued_at as a max-age bound.
+                        // The entry can't be older than when it was queued, so this
+                        // prevents legacy entries from accumulating indefinitely (#518).
+                        if e.queued_at < cutoff {
+                            return false;
+                        }
                     }
-                    // No conflict_info means we don't know when the conflict started.
-                    // Retain unknown-age conflicts rather than risk premature removal
-                    // (e.g., entry queued 30h ago but conflicted 1 minute ago).
                 }
             }
 
@@ -579,21 +583,19 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_retains_conflicts_without_info() {
+    fn cleanup_removes_old_conflicts_without_info() {
         use chrono::{Duration, Utc};
 
         let mut q = MergeQueue::new();
 
         // Create an entry with an old queued_at time but no conflict_info.
-        // Without conflict_info we don't know when the conflict actually started,
-        // so cleanup must retain it to avoid premature removal.
+        // Falls back to queued_at as a max-age bound (#518).
         let mut old_entry = MergeQueueEntry::new("m1", "t1", "https://github.com/test/repo/pull/1");
         old_entry.queued_at = Utc::now() - Duration::hours(48);
         old_entry.status = MergeStatus::Conflict;
-        // No conflict_info — falls back to queued_at
         q.enqueue(old_entry);
 
-        // Create another conflict entry without info
+        // Create another conflict entry without info but recently queued
         let mut recent_entry = MergeQueueEntry::new("m2", "t2", "https://github.com/test/repo/pull/2");
         recent_entry.queued_at = Utc::now() - Duration::hours(1);
         recent_entry.status = MergeStatus::Conflict;
@@ -603,9 +605,9 @@ mod tests {
         let cutoff = Utc::now() - Duration::hours(24);
         q.cleanup(None, Some(cutoff));
 
-        // Both should be retained â no conflict_info means unknown conflict age
-        assert_eq!(q.entries().len(), 2);
-        assert!(q.get("m1").is_some());
+        // m1 (queued 48h ago) should be removed, m2 (queued 1h ago) retained
+        assert_eq!(q.entries().len(), 1);
+        assert!(q.get("m1").is_none());
         assert!(q.get("m2").is_some());
     }
 
