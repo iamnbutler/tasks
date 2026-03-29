@@ -1180,12 +1180,12 @@ impl Server {
                     (conflict_action, Some(sha_update_id))
                 }
             };
-            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
+            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone(), *current_status));
         }
 
         // Execute all actions
         let mut changes = 0u32;
-        for (action, entry_id_for_sha_update, head_sha) in actions {
+        for (action, entry_id_for_sha_update, head_sha, current_status) in actions {
             if let Some(action) = action {
                 match action {
                     MqAction::MarkMerged { entry_id, pr_url, .. } => {
@@ -1246,16 +1246,43 @@ impl Server {
                 }
             }
 
-            // Update head_sha for open PRs to detect new commits
+            // Update head_sha for open PRs to detect new commits.
+            // When new commits are detected on an Approved entry, reset to Pending
+            // so the orchestrator re-evaluates the new code (issue #504).
             if let Some(entry_id) = entry_id_for_sha_update {
                 let mut state = self.state.write().await;
                 match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
                     Ok(true) => {
-                        tracing::debug!(
-                            entry_id = %entry_id,
-                            head_sha = %head_sha,
-                            "reconciliation: updated head_sha for PR"
-                        );
+                        if current_status == MergeStatus::Approved {
+                            if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                                entry.status = MergeStatus::Pending;
+                                tracing::info!(
+                                    entry_id = %entry_id,
+                                    head_sha = %head_sha,
+                                    "reconciliation: new commits detected on approved PR, resetting to Pending for re-evaluation"
+                                );
+                                // Persist the status change
+                                if let Some(ref store) = self.store {
+                                    if let Some(entry) = state.merge_queue.get(&entry_id) {
+                                        let entry_clone = entry.clone();
+                                        drop(state);
+                                        if let Err(e) = store.save_merge_entry(&entry_clone) {
+                                            tracing::warn!(entry_id = %entry_id, error = %e, "failed to persist status reset during reconciliation");
+                                        }
+                                        // Re-acquire to keep borrow checker happy for the rest of the loop
+                                        changes += 1;
+                                        continue;
+                                    }
+                                }
+                                changes += 1;
+                            }
+                        } else {
+                            tracing::debug!(
+                                entry_id = %entry_id,
+                                head_sha = %head_sha,
+                                "reconciliation: updated head_sha for PR"
+                            );
+                        }
                     }
                     Ok(false) => {} // No change
                     Err(e) => {
