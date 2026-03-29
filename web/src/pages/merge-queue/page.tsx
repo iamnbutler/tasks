@@ -1,11 +1,21 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
-import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
+import { flushMergeQueue, approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
 import { ListView, ListEmptyState } from "@/components/ui/list-view";
 import { ListHeader, ListHeaderTabs } from "@/components/ui/list-header";
 import {
@@ -81,6 +91,25 @@ function MergeQueueRow({
       onRefresh();
     } catch {
       toast.error("Failed to reject merge entry");
+    }
+  }
+
+  const [requestChangesOpen, setRequestChangesOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleRequestChanges() {
+    if (!feedback.trim()) return;
+    setSubmitting(true);
+    try {
+      await requestChanges(entry.id, feedback.trim(), feedback.trim());
+      setRequestChangesOpen(false);
+      setFeedback("");
+      onRefresh();
+    } catch {
+      toast.error("Failed to request changes");
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -164,6 +193,15 @@ function MergeQueueRow({
             <Button
               variant="ghost"
               size="sm"
+              className="h-7 gap-1 border-r border-border rounded-none"
+              onClick={() => setRequestChangesOpen(true)}
+            >
+              <MessageSquare className="h-3.5 w-3.5" />
+              Changes
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
               className="h-7 gap-1 rounded-l-none"
               onClick={handleReject}
             >
@@ -171,6 +209,34 @@ function MergeQueueRow({
               Reject
             </Button>
           </div>
+          <Dialog open={requestChangesOpen} onOpenChange={setRequestChangesOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Request Changes</DialogTitle>
+                <DialogDescription>
+                  Describe what changes are needed. This feedback will be sent back to the agent.
+                </DialogDescription>
+              </DialogHeader>
+              <Textarea
+                placeholder="Describe the changes needed..."
+                value={feedback}
+                onChange={(e) => setFeedback(e.target.value)}
+                rows={4}
+              />
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button variant="outline" size="sm">Cancel</Button>
+                </DialogClose>
+                <Button
+                  size="sm"
+                  onClick={handleRequestChanges}
+                  disabled={!feedback.trim() || submitting}
+                >
+                  {submitting ? "Submitting..." : "Request Changes"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </ActionsCell>
       )}
     </ListRow>

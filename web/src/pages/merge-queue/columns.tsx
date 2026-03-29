@@ -1,10 +1,21 @@
+import { useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, MessageSquare } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogClose,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
-import { approveMerge, rejectMerge } from "@/lib/api";
+import { approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -105,6 +116,77 @@ export function prRepoShort(url: string): string | null {
 export function getTask(taskId: string, tasks: Task[]): Task | undefined {
   if (!taskId) return undefined;
   return tasks.find((t) => t.id === taskId);
+}
+
+// ---------------------------------------------------------------------------
+// Request Changes action (needs state for dialog)
+// ---------------------------------------------------------------------------
+
+function RequestChangesAction({
+  entryId,
+  onDone,
+}: {
+  entryId: string;
+  onDone?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleSubmit() {
+    if (!feedback.trim()) return;
+    setSubmitting(true);
+    try {
+      await requestChanges(entryId, feedback.trim(), feedback.trim());
+      setOpen(false);
+      setFeedback("");
+      onDone?.();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1 border-r border-border rounded-none"
+        onClick={() => setOpen(true)}
+      >
+        <MessageSquare className="h-3.5 w-3.5" />
+        Changes
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Request Changes</DialogTitle>
+            <DialogDescription>
+              Describe what changes are needed. This feedback will be sent back to the agent.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            placeholder="Describe the changes needed..."
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+            rows={4}
+          />
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" size="sm">Cancel</Button>
+            </DialogClose>
+            <Button
+              size="sm"
+              onClick={handleSubmit}
+              disabled={!feedback.trim() || submitting}
+            >
+              {submitting ? "Submitting..." : "Request Changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +373,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
             <Check className="h-3.5 w-3.5" />
             Approve
           </Button>
+          <RequestChangesAction entryId={entry.id} onDone={refresh} />
           <Button
             variant="ghost"
             size="sm"
