@@ -234,6 +234,17 @@ export function summarize(
   });
 }
 
+// Rebuild API (re-fetch state from GitHub)
+
+export interface RebuildStats {
+  tasks_cleared: number;
+  merge_entries_cleared: number;
+}
+
+export function rebuildFromGitHub(): Promise<RebuildStats> {
+  return request<RebuildStats>("/api/rebuild", { method: "POST" });
+}
+
 // Update API (self-update mechanism)
 
 export function fetchUpdateStatus(): Promise<UpdateStatus> {

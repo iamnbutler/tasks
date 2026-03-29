@@ -17,9 +17,11 @@ import {
   Rocket,
   Workflow,
   Check,
+  RefreshCw,
 } from "lucide-react";
 import { useAppState } from "@/hooks/use-app-state";
-import { addProject, deleteProject, setMode, bootstrapProject } from "@/lib/api";
+import { addProject, deleteProject, setMode, bootstrapProject, rebuildFromGitHub } from "@/lib/api";
+import type { RebuildStats } from "@/lib/api";
 import { UpdateBanner } from "@/components/update-banner";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -99,6 +101,117 @@ function ModeSelector() {
         );
       })}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild from GitHub
+// ---------------------------------------------------------------------------
+
+function RebuildButton() {
+  const { refreshSnapshot } = useAppState();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<RebuildStats | null>(null);
+
+  const handleRebuild = async () => {
+    setRebuilding(true);
+    setError(null);
+    try {
+      const stats = await rebuildFromGitHub();
+      setResult(stats);
+      await refreshSnapshot();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Rebuild failed");
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
+  const resetDialog = () => {
+    setConfirmOpen(false);
+    setError(null);
+    setResult(null);
+  };
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={() => setConfirmOpen(true)}
+            className="flex items-center justify-center h-7 w-7 rounded-md transition-colors text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+          >
+            <RefreshCw className="h-4 w-4" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">Rebuild from GitHub</TooltipContent>
+      </Tooltip>
+
+      <Dialog open={confirmOpen} onOpenChange={(open) => !open && resetDialog()}>
+        <DialogContent className="sm:max-w-sm">
+          {result ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>Rebuild complete</DialogTitle>
+                <DialogDescription>
+                  State has been cleared and GitHub data is being re-fetched.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="rounded-md bg-green-500/10 border border-green-500/20 p-4 space-y-1 text-sm">
+                <p>
+                  <span className="text-muted-foreground">Tasks cleared: </span>
+                  <span className="font-medium">{result.tasks_cleared}</span>
+                </p>
+                <p>
+                  <span className="text-muted-foreground">Merge entries cleared: </span>
+                  <span className="font-medium">{result.merge_entries_cleared}</span>
+                </p>
+              </div>
+              <DialogFooter>
+                <Button onClick={resetDialog}>Done</Button>
+              </DialogFooter>
+            </>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>Rebuild from GitHub</DialogTitle>
+                <DialogDescription>
+                  This will clear all local tasks and merge queue entries, then
+                  re-fetch everything from GitHub. Event logs, projects, and
+                  accounting data are preserved.
+                </DialogDescription>
+              </DialogHeader>
+              {error && <p className="text-sm text-red-400">{error}</p>}
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={resetDialog}
+                  disabled={rebuilding}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={handleRebuild}
+                  disabled={rebuilding}
+                >
+                  {rebuilding ? (
+                    <>
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                      Rebuilding...
+                    </>
+                  ) : (
+                    "Rebuild"
+                  )}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
@@ -595,7 +708,10 @@ export function Layout() {
 
         {/* Footer: mode selector + connection + slots */}
         <div className="border-t border-border px-3 py-2 space-y-2">
-          <ModeSelector />
+          <div className="flex items-center justify-between">
+            <ModeSelector />
+            <RebuildButton />
+          </div>
           <div className="flex items-center justify-between text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5">
               <span
