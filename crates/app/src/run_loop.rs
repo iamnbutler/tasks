@@ -2587,8 +2587,14 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     error!(task_id = %task_id, error = %e, "failed to update task state from think()");
                                 }
                             }
-                            OrchestratorAction::PrioritizeTask { task_id, reason } => {
-                                info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            OrchestratorAction::PrioritizeTask { task_id, priority, reason } => {
+                                info!(task_id = %task_id, priority = ?priority, reason = %reason, "orchestrator setting task priority");
+                                if let Err(e) = think_server
+                                    .set_task_priority(&task_id, priority)
+                                    .await
+                                {
+                                    error!(task_id = %task_id, error = %e, "failed to set task priority from think()");
+                                }
                             }
                         }
                     }

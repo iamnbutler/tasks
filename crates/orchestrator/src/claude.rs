@@ -452,8 +452,59 @@ impl Orchestrator for ClaudeOrchestrator {
             )));
         }
 
-        // Surface long-running sessions
+        // --- Priority management ---
         use models::task::TaskState;
+
+        // Build a map of task_id -> number of tasks it unblocks (transitively).
+        // Tasks that unblock deeper dependency chains get higher priority.
+        let mut unblock_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for task in &context.tasks {
+            for blocked_by_id in &task.blocked_by {
+                *unblock_count.entry(blocked_by_id.as_str()).or_insert(0) += 1;
+            }
+        }
+
+        // Collect dispatchable tasks (Waiting or ChangesRequested)
+        let dispatchable: Vec<&Task> = context
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.state, TaskState::Waiting | TaskState::ChangesRequested))
+            .collect();
+
+        for task in &dispatchable {
+            let count = unblock_count.get(task.id.as_str()).copied().unwrap_or(0);
+
+            // Compute desired priority:
+            // - Base priority 100 (default)
+            // - Subtract 20 per task unblocked (lower = higher priority)
+            // - Add 10 per retry (deprioritize repeated failures)
+            // - ChangesRequested gets a small boost (already handled by dispatcher,
+            //   but explicit priority makes it visible in UI)
+            let mut computed: i32 = 100;
+            computed -= (count as i32) * 20;
+            computed += (task.retry_count as i32) * 10;
+            if task.state == TaskState::ChangesRequested {
+                computed -= 10;
+            }
+            // Clamp to reasonable range
+            computed = computed.clamp(1, 1000);
+
+            // Only emit a PrioritizeTask if the computed priority differs from current
+            let current = task.priority.unwrap_or(100);
+            if current != computed {
+                actions.push(OrchestratorAction::PrioritizeTask {
+                    task_id: task.id.clone(),
+                    priority: Some(computed),
+                    reason: format!(
+                        "Computed priority {computed}: unblocks {count} task(s), {retries} retries{cr}",
+                        retries = task.retry_count,
+                        cr = if task.state == TaskState::ChangesRequested { ", has requested changes" } else { "" },
+                    ),
+                });
+            }
+        }
+
+        // Surface long-running sessions
         let long_running: Vec<&Task> = context
             .tasks
             .iter()

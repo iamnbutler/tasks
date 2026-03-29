@@ -292,9 +292,13 @@ pub enum OrchestratorAction {
         task_id: String,
         state: TaskState,
     },
-    /// Request a task be dispatched with priority.
+    /// Set a task's dispatch priority. Lower values = higher priority.
+    /// The orchestrator computes priority based on dependency chains,
+    /// retry history, and human direction.
     PrioritizeTask {
         task_id: String,
+        /// Priority value: lower number = dispatched first. None clears explicit priority.
+        priority: Option<i32>,
         reason: String,
     },
     // Future: DispatchAgent { task_id: String, config: DispatchConfig }

@@ -158,6 +158,12 @@ pub fn evaluate(
             return unblock_cmp;
         }
 
+        // Retry count: fewer retries first (deprioritize repeatedly-failed tasks).
+        let retry_cmp = a.retry_count.cmp(&b.retry_count);
+        if retry_cmp != std::cmp::Ordering::Equal {
+            return retry_cmp;
+        }
+
         // Source number: lower issue/PR numbers first (ascending), but only
         // compared within the same project. Issue numbers are per-repo, so
         // comparing across projects has no semantic meaning.
@@ -679,5 +685,30 @@ mod tests {
         let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 1);
         assert_eq!(plan.new_work.len(), 1);
         assert_eq!(plan.new_work[0], "t1"); // ChangesRequested gets priority
+    }
+
+    #[test]
+    fn retry_count_deprioritizes_failed_tasks() {
+        let mut tasks = HashMap::new();
+
+        // t1 has failed twice (higher retry count)
+        let mut t1 = make_task("t1", "proj");
+        t1.priority = Some(1);
+        t1.retry_count = 2;
+        // Set last_failure_at far enough in the past so backoff has elapsed
+        t1.last_failure_at = Some(Utc::now() - Duration::seconds(600));
+        insert(&mut tasks, t1);
+
+        // t2 has never failed
+        let mut t2 = make_task("t2", "proj");
+        t2.priority = Some(1);
+        t2.retry_count = 0;
+        insert(&mut tasks, t2);
+
+        let plan = evaluate(&tasks, &[], &no_active_prs(), &HashMap::new(), 10);
+        // t2 (0 retries) should sort before t1 (2 retries)
+        assert_eq!(plan.new_work.len(), 2);
+        assert_eq!(plan.new_work[0], "t2");
+        assert_eq!(plan.new_work[1], "t1");
     }
 }
