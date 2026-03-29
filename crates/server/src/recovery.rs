@@ -159,6 +159,10 @@ mod tests {
     }
 
     impl ContainerRuntime for MockRuntime {
+        async fn health_check(&self) -> Result<(), ContainerError> {
+            Ok(())
+        }
+
         async fn create(
             &self,
             _config: &runtime::ContainerConfig,
