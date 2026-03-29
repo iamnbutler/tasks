@@ -1,5 +1,7 @@
 //! Task model — spec Section 5.1, 5.2, 5.3.
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -255,6 +257,84 @@ impl Task {
         self.state = state;
         self.updated_at = now;
     }
+}
+
+/// Validate a `blocked_by` list for a given task against the full task set.
+///
+/// Returns a filtered list with invalid entries removed:
+/// - Self-references (task blocking itself)
+/// - References to nonexistent tasks
+/// - References that would create circular dependency chains
+///
+/// Warnings are logged for each removed entry.
+pub fn validate_blocked_by(
+    task_id: &str,
+    proposed: &[String],
+    tasks: &HashMap<String, Task>,
+) -> Vec<String> {
+    let mut valid = Vec::with_capacity(proposed.len());
+
+    for dep_id in proposed {
+        // Reject self-references.
+        if dep_id == task_id {
+            tracing::warn!(
+                task_id = %task_id,
+                dep_id = %dep_id,
+                "blocked_by: removing self-reference"
+            );
+            continue;
+        }
+
+        // Reject references to nonexistent tasks.
+        if !tasks.contains_key(dep_id.as_str()) {
+            tracing::warn!(
+                task_id = %task_id,
+                dep_id = %dep_id,
+                "blocked_by: removing reference to nonexistent task"
+            );
+            continue;
+        }
+
+        // Reject if adding this dependency would create a cycle.
+        // Walk the blocked_by chain from dep_id; if we reach task_id, it's circular.
+        if creates_cycle(task_id, dep_id, tasks) {
+            tracing::warn!(
+                task_id = %task_id,
+                dep_id = %dep_id,
+                "blocked_by: removing dependency that would create a cycle"
+            );
+            continue;
+        }
+
+        valid.push(dep_id.clone());
+    }
+
+    valid
+}
+
+/// Check whether adding an edge task_id → dep_id would create a cycle.
+///
+/// Performs a DFS from `dep_id` following each task's `blocked_by` edges.
+/// If we can reach `task_id`, the new edge would close a cycle.
+fn creates_cycle(task_id: &str, dep_id: &str, tasks: &HashMap<String, Task>) -> bool {
+    let mut visited = HashSet::new();
+    let mut stack = vec![dep_id];
+
+    while let Some(current) = stack.pop() {
+        if current == task_id {
+            return true;
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(task) = tasks.get(current) {
+            for next in &task.blocked_by {
+                stack.push(next.as_str());
+            }
+        }
+    }
+
+    false
 }
 
 impl FailureInfo {
@@ -660,5 +740,67 @@ mod tests {
         // Completed -> Running is invalid, but should not panic
         task.set_state(TaskState::Running);
         assert_eq!(task.state, TaskState::Running);
+    }
+
+    // ---- validate_blocked_by ----
+
+    fn make_tasks(ids: &[&str]) -> HashMap<String, Task> {
+        ids.iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    Task::new(*id, TaskSource::Internal, "task", "proj"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validate_rejects_self_reference() {
+        let tasks = make_tasks(&["t1", "t2"]);
+        let result = validate_blocked_by("t1", &["t1".into(), "t2".into()], &tasks);
+        assert_eq!(result, vec!["t2"]);
+    }
+
+    #[test]
+    fn validate_rejects_nonexistent_task() {
+        let tasks = make_tasks(&["t1", "t2"]);
+        let result = validate_blocked_by("t1", &["t2".into(), "t99".into()], &tasks);
+        assert_eq!(result, vec!["t2"]);
+    }
+
+    #[test]
+    fn validate_rejects_direct_cycle() {
+        // t1 blocked_by t2, t2 blocked_by t1 → adding t2 to t1 creates cycle
+        let mut tasks = make_tasks(&["t1", "t2"]);
+        tasks.get_mut("t2").unwrap().blocked_by = vec!["t1".into()];
+
+        let result = validate_blocked_by("t1", &["t2".into()], &tasks);
+        assert!(result.is_empty(), "cycle through t2→t1 should be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_transitive_cycle() {
+        // t3 → t2 → t1 (existing), adding t1 blocked_by t3 would close the cycle
+        let mut tasks = make_tasks(&["t1", "t2", "t3"]);
+        tasks.get_mut("t2").unwrap().blocked_by = vec!["t1".into()];
+        tasks.get_mut("t3").unwrap().blocked_by = vec!["t2".into()];
+
+        let result = validate_blocked_by("t1", &["t3".into()], &tasks);
+        assert!(result.is_empty(), "transitive cycle t3→t2→t1 should be rejected");
+    }
+
+    #[test]
+    fn validate_accepts_valid_dependency() {
+        let tasks = make_tasks(&["t1", "t2", "t3"]);
+        let result = validate_blocked_by("t1", &["t2".into(), "t3".into()], &tasks);
+        assert_eq!(result, vec!["t2", "t3"]);
+    }
+
+    #[test]
+    fn validate_empty_blocked_by() {
+        let tasks = make_tasks(&["t1"]);
+        let result = validate_blocked_by("t1", &[], &tasks);
+        assert!(result.is_empty());
     }
 }
