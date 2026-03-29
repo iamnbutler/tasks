@@ -288,6 +288,91 @@ pub fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     Some((owner, repo, number))
 }
 
+/// Build the system prompt for triage and decomposition.
+pub fn triage_system_prompt() -> String {
+    r#"You are a project foreman decomposing work into well-formed GitHub issues.
+
+## Your Role
+
+The human has described work in natural language. Your job is to:
+1. Analyze the request and understand its scope
+2. Decompose it into concrete, actionable issues
+3. Define clear acceptance criteria for each issue
+4. Identify dependencies between issues
+5. Reference relevant code when possible
+
+## Output Format
+
+Respond with JSON:
+```json
+{
+  "analysis": "Brief analysis of the request — what it entails, key considerations, estimated complexity",
+  "issues": [
+    {
+      "title": "Short, actionable title (imperative mood, e.g., 'Add rate limiting middleware')",
+      "body": "Markdown body with:\n## Context\nWhy this is needed.\n\n## Requirements\n- Bullet list of specific requirements\n\n## Acceptance Criteria\n- [ ] Checkboxes for done criteria\n\n## Notes\nRelevant code paths, files, or architectural considerations.",
+      "labels": ["enhancement"],
+      "blocked_by": []
+    }
+  ]
+}
+```
+
+## Decomposition Principles
+
+- **Right-sized issues**: Each issue should be completable by a single agent session (a few hours of focused work). If something is too big, split it.
+- **Clear boundaries**: Each issue should have a clear scope — no ambiguity about what "done" looks like.
+- **Dependency ordering**: Use `blocked_by` to reference other issues in the batch by their zero-based index. Issue 0 is the first in the array. Only add dependencies when there's a true ordering constraint (e.g., API must exist before UI can call it).
+- **No unnecessary decomposition**: If the work is simple and fits in one issue, return one issue. Don't split for the sake of splitting.
+- **Actionable titles**: Use imperative mood ("Add X", "Fix Y", "Refactor Z"), not descriptions ("X should be added").
+- **Reference code**: When you know which files, modules, or functions are involved, mention them in the issue body.
+- **Labels**: Use standard labels — "enhancement", "bug", "refactor", "documentation", "testing". Only include labels that genuinely apply.
+
+## Existing Issues
+
+You'll receive a list of existing open issues for context. Avoid creating duplicates. If an existing issue already covers part of the request, reference it instead of creating a new one.
+
+## Key Rules
+
+- Respond ONLY with the JSON object — no prose before or after.
+- The `blocked_by` field uses zero-based indices into the `issues` array.
+- Every issue must have a non-empty title and body.
+- Keep analysis concise (2-4 sentences)."#.to_string()
+}
+
+/// Build the user prompt for triage decomposition.
+pub fn build_triage_prompt(
+    description: &str,
+    repo: &str,
+    existing_issues: &[crate::types::TriageIssueSummary],
+) -> String {
+    let mut prompt = format!(
+        "## Work Request\n\n\
+         **Repository:** {repo}\n\n\
+         {description}\n\n"
+    );
+
+    if !existing_issues.is_empty() {
+        prompt.push_str("## Existing Open Issues\n\n");
+        for issue in existing_issues.iter().take(30) {
+            let labels = if issue.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", issue.labels.join(", "))
+            };
+            prompt.push_str(&format!("- #{}: {}{}\n", issue.number, issue.title, labels));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("## Instructions\n\n\
+         Decompose the work request above into well-formed GitHub issues. \
+         Consider the existing issues to avoid duplicates. \
+         Respond with your JSON decomposition.");
+
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +665,56 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_triage_system_prompt_contains_key_instructions() {
+        let prompt = triage_system_prompt();
+        assert!(prompt.contains("decompos"));
+        assert!(prompt.contains("blocked_by"));
+        assert!(prompt.contains("acceptance criteria"));
+        assert!(prompt.contains("JSON"));
+        assert!(prompt.contains("zero-based"));
+    }
+
+    #[test]
+    fn test_build_triage_prompt_basic() {
+        let prompt = build_triage_prompt(
+            "Add rate limiting to the API",
+            "owner/repo",
+            &[],
+        );
+        assert!(prompt.contains("Add rate limiting to the API"));
+        assert!(prompt.contains("owner/repo"));
+        assert!(prompt.contains("Decompose"));
+    }
+
+    #[test]
+    fn test_build_triage_prompt_with_existing_issues() {
+        use crate::types::TriageIssueSummary;
+
+        let existing = vec![
+            TriageIssueSummary {
+                number: 10,
+                title: "Add auth middleware".to_string(),
+                labels: vec!["enhancement".to_string()],
+            },
+            TriageIssueSummary {
+                number: 11,
+                title: "Fix rate limit header".to_string(),
+                labels: vec!["bug".to_string()],
+            },
+        ];
+
+        let prompt = build_triage_prompt(
+            "Add rate limiting to the API",
+            "owner/repo",
+            &existing,
+        );
+        assert!(prompt.contains("#10: Add auth middleware"));
+        assert!(prompt.contains("[enhancement]"));
+        assert!(prompt.contains("#11: Fix rate limit header"));
+        assert!(prompt.contains("[bug]"));
+        assert!(prompt.contains("avoid duplicates"));
     }
 }

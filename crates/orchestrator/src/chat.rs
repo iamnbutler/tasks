@@ -16,6 +16,8 @@ use tasks_agent::{
 };
 
 use crate::error::OrchestratorError;
+use crate::prompt::{build_triage_prompt, triage_system_prompt};
+use crate::types::{TriageIssueSummary, TriageResult};
 
 /// Default model for orchestrator chat.
 const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-6";
@@ -68,6 +70,9 @@ pub struct ChatEvent {
 pub struct ChatResponse {
     /// The orchestrator's response text.
     pub message: String,
+    /// If the orchestrator performed triage decomposition, the result is here.
+    /// The caller should present this to the user for review.
+    pub triage_result: Option<TriageResult>,
 }
 
 /// Handler for orchestrator chat interactions.
@@ -157,6 +162,55 @@ impl OrchestratorChat {
 
         Ok(ChatResponse {
             message: response_text,
+            triage_result: None,
+        })
+    }
+
+    /// Triage and decompose a natural language work description into issues.
+    ///
+    /// This is the "project foreman" flow from spec §4.2. The human describes
+    /// work, and the orchestrator produces a set of draft issues for review.
+    pub async fn triage(
+        &self,
+        description: &str,
+        project: &Project,
+        existing_issues: &[TriageIssueSummary],
+    ) -> Result<ChatResponse, OrchestratorError> {
+        info!(
+            project = %project.repo,
+            description_len = description.len(),
+            "Triaging work request via chat"
+        );
+
+        let system = triage_system_prompt();
+        let user_prompt = build_triage_prompt(description, &project.repo, existing_issues);
+
+        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
+        let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system);
+
+        let response = self
+            .provider
+            .complete(request)
+            .await
+            .map_err(OrchestratorError::Agent)?;
+
+        let response_text = response.text();
+        info!(response_len = response_text.len(), "Triage response received");
+
+        // Try to parse as TriageResult
+        let triage_result = crate::claude::extract_json_from_text(&response_text)
+            .and_then(|json_str| serde_json::from_str::<TriageResult>(json_str).ok());
+
+        let message = if let Some(ref result) = triage_result {
+            format_triage_result(result)
+        } else {
+            response_text
+        };
+
+        Ok(ChatResponse {
+            message,
+            triage_result,
         })
     }
 
@@ -173,6 +227,7 @@ impl OrchestratorChat {
 - You help users understand system status and make decisions
 - You can explain system status and help users make decisions
 - You provide updates on merges, conflicts, and agent progress
+- You decompose work requests into well-formed GitHub issues (triage)
 - You are helpful, concise, and action-oriented
 
 ## Current System State
@@ -254,6 +309,50 @@ impl OrchestratorChat {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// Format a triage result as a human-readable chat message.
+fn format_triage_result(result: &TriageResult) -> String {
+    let mut msg = String::new();
+    msg.push_str("## Triage Result\n\n");
+    msg.push_str(&result.analysis);
+    msg.push_str("\n\n");
+
+    if result.issues.is_empty() {
+        msg.push_str("No issues to create — the request may already be covered by existing issues.\n");
+        return msg;
+    }
+
+    msg.push_str(&format!("### {} Issue(s) to Create\n\n", result.issues.len()));
+
+    for (i, issue) in result.issues.iter().enumerate() {
+        msg.push_str(&format!("**{}. {}**", i + 1, issue.title));
+
+        if !issue.labels.is_empty() {
+            msg.push_str(&format!(" [{}]", issue.labels.join(", ")));
+        }
+
+        if !issue.blocked_by.is_empty() {
+            let deps: Vec<String> = issue.blocked_by.iter().map(|d| format!("#{}", d + 1)).collect();
+            msg.push_str(&format!(" (blocked by: {})", deps.join(", ")));
+        }
+
+        msg.push('\n');
+
+        // Show a preview of the body (first few lines)
+        let preview_lines: Vec<&str> = issue.body.lines().take(4).collect();
+        for line in &preview_lines {
+            msg.push_str(&format!("  > {}\n", line));
+        }
+        let total_lines = issue.body.lines().count();
+        if total_lines > 4 {
+            msg.push_str(&format!("  > ... ({} more lines)\n", total_lines - 4));
+        }
+        msg.push('\n');
+    }
+
+    msg.push_str("Review and confirm to create these issues on GitHub.");
+    msg
 }
 
 /// Convert an event to a chat event summary.

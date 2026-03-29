@@ -11,7 +11,7 @@
 use crate::error::OrchestratorError;
 use crate::types::{
     ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction, QualityEvaluation,
-    QuestionContext, SystemContext,
+    QuestionContext, SystemContext, TriageContext, TriageResult,
 };
 use models::task::Task;
 
@@ -80,4 +80,18 @@ pub trait Orchestrator: Sync {
         &self,
         context: &QuestionContext,
     ) -> Result<String, OrchestratorError>;
+
+    /// Triage and decompose natural language into actionable issues.
+    ///
+    /// Spec §4.2: When the human describes work in natural language, the
+    /// orchestrator turns it into well-formed issues — organized, contextualized,
+    /// and split into sub-issues as needed.
+    ///
+    /// Returns a `TriageResult` with draft issues for human review. The caller
+    /// is responsible for presenting these to the human and creating them on
+    /// GitHub after approval.
+    async fn triage(
+        &self,
+        context: &TriageContext,
+    ) -> Result<TriageResult, OrchestratorError>;
 }

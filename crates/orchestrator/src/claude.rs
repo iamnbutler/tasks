@@ -8,10 +8,10 @@ use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, build_triage_prompt, parse_pr_url, system_prompt, triage_system_prompt};
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    QualityEvaluation, QuestionContext, SystemContext, TriageContext, TriageResult,
 };
 use events::EventType;
 use models::task::{Task, TaskSource};
@@ -518,6 +518,74 @@ impl Orchestrator for ClaudeOrchestrator {
 
         Ok(answer)
     }
+
+    async fn triage(
+        &self,
+        context: &TriageContext,
+    ) -> Result<TriageResult, OrchestratorError> {
+        info!(
+            project = %context.project.repo,
+            description_len = context.description.len(),
+            existing_issues = context.existing_issues.len(),
+            "Triaging work request into issues"
+        );
+
+        let system = triage_system_prompt();
+        let user_prompt = build_triage_prompt(
+            &context.description,
+            &context.project.repo,
+            &context.existing_issues,
+        );
+
+        let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
+        let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system);
+
+        let response = self
+            .provider
+            .complete(request)
+            .await
+            .map_err(OrchestratorError::Agent)?;
+
+        let response_text = response.text();
+        info!(response_len = response_text.len(), "Triage response received");
+
+        let json_str = extract_json(&response_text).ok_or_else(|| {
+            OrchestratorError::Evaluation(format!(
+                "Could not find JSON in triage response: {}",
+                truncate(&response_text, 200)
+            ))
+        })?;
+
+        let result: TriageResult = serde_json::from_str(json_str).map_err(|e| {
+            OrchestratorError::Evaluation(format!("Failed to parse triage JSON: {}", e))
+        })?;
+
+        // Validate: all blocked_by indices must be in range
+        for (i, issue) in result.issues.iter().enumerate() {
+            for &dep in &issue.blocked_by {
+                if dep >= result.issues.len() {
+                    return Err(OrchestratorError::Evaluation(format!(
+                        "Issue {} references blocked_by index {} but only {} issues exist",
+                        i, dep, result.issues.len()
+                    )));
+                }
+                if dep == i {
+                    return Err(OrchestratorError::Evaluation(format!(
+                        "Issue {} references itself in blocked_by",
+                        i
+                    )));
+                }
+            }
+        }
+
+        info!(
+            issue_count = result.issues.len(),
+            "Triage decomposition complete"
+        );
+
+        Ok(result)
+    }
 }
 
 /// Build the system prompt for answering agent questions.
@@ -563,6 +631,11 @@ fn build_question_answer_prompt(
     ));
 
     prompt
+}
+
+/// Public wrapper for extract_json, used by chat module.
+pub fn extract_json_from_text(text: &str) -> Option<&str> {
+    extract_json(text)
 }
 
 /// Extract JSON from a text response.
@@ -644,6 +717,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -727,5 +801,41 @@ That's all."#;
     fn test_extract_json_none() {
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("incomplete { json").is_none());
+    }
+
+    #[test]
+    fn test_parse_triage_result_valid() {
+        let json_val = serde_json::json!({
+            "analysis": "Need to add rate limiting",
+            "issues": [
+                {
+                    "title": "Add rate limiting middleware",
+                    "body": "We need rate limiting.\n\n- [ ] Middleware works",
+                    "labels": ["enhancement"],
+                    "blocked_by": []
+                },
+                {
+                    "title": "Add rate limit configuration",
+                    "body": "Config for rate limits.\n\n- [ ] Config loads",
+                    "labels": ["enhancement"],
+                    "blocked_by": [0]
+                }
+            ]
+        });
+        let json = json_val.to_string();
+        let result: TriageResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.issues.len(), 2);
+        assert_eq!(result.issues[0].title, "Add rate limiting middleware");
+        assert_eq!(result.issues[1].blocked_by, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_json_from_text_public() {
+        let text = r#"```json
+{"analysis": "test", "issues": []}
+```"#;
+        let result = extract_json_from_text(text);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("analysis"));
     }
 }

@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, IssueDraft,
+    OrchestratorAction, QualityEvaluation, QuestionContext, SystemContext, TriageContext,
+    TriageResult,
 };
 use models::task::Task;
 
@@ -29,6 +30,10 @@ pub struct MockOrchestrator {
     pub think_count: Mutex<u32>,
     /// Count of answer_question calls (for assertions).
     pub answer_question_count: Mutex<u32>,
+    /// Count of triage calls (for assertions).
+    pub triage_decompose_count: Mutex<u32>,
+    /// Optional triage result override.
+    triage_result: Mutex<Option<TriageResult>>,
 }
 
 impl MockOrchestrator {
@@ -46,6 +51,8 @@ impl MockOrchestrator {
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
             answer_question_count: Mutex::new(0),
+            triage_decompose_count: Mutex::new(0),
+            triage_result: Mutex::new(None),
         }
     }
 
@@ -64,6 +71,8 @@ impl MockOrchestrator {
             triage_count: Mutex::new(0),
             think_count: Mutex::new(0),
             answer_question_count: Mutex::new(0),
+            triage_decompose_count: Mutex::new(0),
+            triage_result: Mutex::new(None),
         }
     }
 
@@ -75,6 +84,11 @@ impl MockOrchestrator {
     /// Set what conflict triage to return next.
     pub fn set_conflict_triage(&self, triage: ConflictTriage) {
         *self.conflict_triage.lock().unwrap() = Some(triage);
+    }
+
+    /// Set what triage decomposition to return next.
+    pub fn set_triage_result(&self, result: TriageResult) {
+        *self.triage_result.lock().unwrap() = Some(result);
     }
 }
 
@@ -123,6 +137,23 @@ impl Orchestrator for MockOrchestrator {
     ) -> Result<String, OrchestratorError> {
         *self.answer_question_count.lock().unwrap() += 1;
         Ok("Mock: proceed with whatever approach you think is best.".to_string())
+    }
+
+    async fn triage(
+        &self,
+        _context: &TriageContext,
+    ) -> Result<TriageResult, OrchestratorError> {
+        *self.triage_decompose_count.lock().unwrap() += 1;
+        let override_result = self.triage_result.lock().unwrap().clone();
+        Ok(override_result.unwrap_or_else(|| TriageResult {
+            analysis: "Mock: single issue created from request.".to_string(),
+            issues: vec![IssueDraft {
+                title: "Mock issue".to_string(),
+                body: "Created by mock orchestrator.".to_string(),
+                labels: vec![],
+                blocked_by: vec![],
+            }],
+        }))
     }
 }
 
@@ -263,5 +294,49 @@ mod tests {
         let result = mock.answer_question(&ctx).await.unwrap();
         assert!(!result.is_empty());
         assert_eq!(*mock.answer_question_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_triage_default() {
+        let mock = MockOrchestrator::approving();
+        let ctx = TriageContext {
+            description: "Add rate limiting to the API".to_string(),
+            project: Project::new("proj-1", "owner/repo"),
+            existing_issues: vec![],
+        };
+        let result = mock.triage(&ctx).await.unwrap();
+        assert!(!result.issues.is_empty());
+        assert_eq!(*mock.triage_decompose_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_triage_custom_result() {
+        let mock = MockOrchestrator::approving();
+        mock.set_triage_result(TriageResult {
+            analysis: "Custom analysis".to_string(),
+            issues: vec![
+                IssueDraft {
+                    title: "First issue".to_string(),
+                    body: "Body 1".to_string(),
+                    labels: vec!["enhancement".to_string()],
+                    blocked_by: vec![],
+                },
+                IssueDraft {
+                    title: "Second issue".to_string(),
+                    body: "Body 2".to_string(),
+                    labels: vec![],
+                    blocked_by: vec![0],
+                },
+            ],
+        });
+        let ctx = TriageContext {
+            description: "Something".to_string(),
+            project: Project::new("proj-1", "owner/repo"),
+            existing_issues: vec![],
+        };
+        let result = mock.triage(&ctx).await.unwrap();
+        assert_eq!(result.analysis, "Custom analysis");
+        assert_eq!(result.issues.len(), 2);
+        assert_eq!(result.issues[1].blocked_by, vec![0]);
     }
 }

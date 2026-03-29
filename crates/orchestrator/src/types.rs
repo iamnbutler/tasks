@@ -279,6 +279,62 @@ pub struct SystemContext {
     pub last_think_at: Option<DateTime<Utc>>,
 }
 
+/// A draft issue produced by triage decomposition.
+///
+/// The orchestrator generates these from natural language input. They are
+/// presented to the human for review before being created on GitHub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueDraft {
+    /// Issue title — concise, actionable.
+    pub title: String,
+    /// Issue body — context, acceptance criteria, references to code.
+    pub body: String,
+    /// Labels to apply (e.g., "enhancement", "bug").
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// IDs (indices) of other drafts in the same batch that this depends on.
+    /// Uses zero-based indices into the `issues` vec of `TriageResult`.
+    #[serde(default)]
+    pub blocked_by: Vec<usize>,
+}
+
+/// Context for triage and decomposition — spec §4.2.
+///
+/// When the human describes work in natural language, the orchestrator
+/// decomposes it into concrete, actionable issues.
+pub struct TriageContext {
+    /// The human's natural language description of work to be done.
+    pub description: String,
+    /// The project this work is for.
+    pub project: Project,
+    /// Existing open issues (for dedup and context).
+    pub existing_issues: Vec<TriageIssueSummary>,
+}
+
+/// Summary of an existing issue for triage context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageIssueSummary {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Labels on the issue.
+    pub labels: Vec<String>,
+}
+
+/// Result of triage decomposition.
+///
+/// Contains the orchestrator's analysis and a set of draft issues
+/// ready for human review and GitHub creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageResult {
+    /// High-level analysis of the request.
+    pub analysis: String,
+    /// Draft issues to create, ordered by suggested execution sequence.
+    /// Dependencies reference indices within this vec.
+    pub issues: Vec<IssueDraft>,
+}
+
 /// Actions the orchestrator can request from its think() pass.
 ///
 /// The run loop interprets these and executes them against the server.
@@ -297,7 +353,11 @@ pub enum OrchestratorAction {
         task_id: String,
         reason: String,
     },
-    // Future: DispatchAgent { task_id: String, config: DispatchConfig }
-    // Future: CreateIssue { repo: String, title: String, body: String }
-    // Future: CommentOnPr { pr_url: String, body: String }
+    /// Create a GitHub issue from a draft produced by triage.
+    CreateIssue {
+        /// Repository in "owner/repo" format.
+        repo: String,
+        /// The issue draft to create.
+        draft: IssueDraft,
+    },
 }
