@@ -26,7 +26,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
 use tasks_agent::CompletionsService;
-use events::Actor;
+use events::{Actor, Event, EventType};
 use server::Server;
 use server::presence::OwnedConnectionGuard;
 use models::Mode;
@@ -726,6 +726,22 @@ async fn create_issue(
         .await
         .map_err(ApiError::GitHubApi)?;
 
+    // Emit github:issue:created event
+    let event = Event::new(
+        EventType::GitHubIssueCreated,
+        "",
+        Actor::Human,
+        serde_json::json!({
+            "issue_number": created.number,
+            "issue_url": created.html_url,
+            "title": req.title,
+            "project_id": req.project_id,
+        }),
+    );
+    if let Err(e) = state.server.event_bus.publish(event).await {
+        tracing::error!(error = %e, "failed to emit github:issue:created event");
+    }
+
     Ok(Json(CreateIssueResponse {
         number: created.number,
         url: created.html_url,
@@ -775,6 +791,12 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
                 tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging");
             }
 
+            // Look up associated task_id for event emission
+            let flush_task_id = {
+                let server_state = state.server.state.read().await;
+                server_state.merge_queue.get(entry_id).map(|e| e.task_id.clone()).unwrap_or_default()
+            };
+
             match client.merge_pull_request(&owner, &repo, number).await {
                 Ok(true) => {
                     tracing::info!(entry_id = %entry_id, pr_url = %pr_url, "PR merged via flush");
@@ -782,6 +804,19 @@ async fn flush_merge_queue(State(state): State<ApiState>) -> Result<Json<Vec<Str
                         tracing::error!(entry_id = %entry_id, error = %e, "failed to mark entry merged after flush");
                     } else {
                         merged_ids.push(entry_id.clone());
+                    }
+                    let event = Event::new(
+                        EventType::GitHubPrMerged,
+                        &flush_task_id,
+                        Actor::Human,
+                        serde_json::json!({
+                            "pr_url": pr_url,
+                            "entry_id": entry_id,
+                            "trigger": "flush",
+                        }),
+                    );
+                    if let Err(e) = state.server.event_bus.publish(event).await {
+                        tracing::error!(error = %e, "failed to emit github:pr:merged event");
                     }
                 }
                 Ok(false) => {
@@ -845,12 +880,31 @@ async fn approve_merge(
                     tracing::error!(entry_id = %id, error = %e, "failed to mark entry as merging");
                 }
 
+                // Look up task_id for event emission
+                let approve_task_id = {
+                    let server_state = state.server.state.read().await;
+                    server_state.merge_queue.get(&id).map(|e| e.task_id.clone()).unwrap_or_default()
+                };
+
                 let client = tasks_github::client::GitHubClient::new(&github_token);
                 match client.merge_pull_request(&owner, &repo, number).await {
                     Ok(true) => {
                         tracing::info!(entry_id = %id, pr_url = %pr_url, "PR merged after manual approval (Play mode)");
                         if let Err(e) = state.server.mark_entry_merged(&id, &pr_url).await {
                             tracing::error!(entry_id = %id, error = %e, "failed to mark entry merged");
+                        }
+                        let event = Event::new(
+                            EventType::GitHubPrMerged,
+                            &approve_task_id,
+                            Actor::Human,
+                            serde_json::json!({
+                                "pr_url": pr_url,
+                                "entry_id": id,
+                                "trigger": "manual_approval",
+                            }),
+                        );
+                        if let Err(e) = state.server.event_bus.publish(event).await {
+                            tracing::error!(error = %e, "failed to emit github:pr:merged event");
                         }
                     }
                     Ok(false) => {

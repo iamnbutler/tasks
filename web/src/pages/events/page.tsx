@@ -25,6 +25,7 @@ const FILTERS = [
   { key: "task", label: "Task" },
   { key: "agent", label: "Agent" },
   { key: "merge", label: "Merge" },
+  { key: "github", label: "GitHub" },
   { key: "system", label: "System" },
   { key: "orchestrator", label: "Orchestrator" },
   { key: "automation", label: "Automation" },
@@ -42,6 +43,7 @@ function badgeClasses(type: string): string {
   if (type.startsWith("system:")) return "bg-gray-500/15 text-gray-400 border-gray-500/30";
   if (type.startsWith("orchestrator:")) return "bg-orange-500/15 text-orange-400 border-orange-500/30";
   if (type.startsWith("automation:")) return "bg-teal-500/15 text-teal-400 border-teal-500/30";
+  if (type.startsWith("github:")) return "bg-sky-500/15 text-sky-400 border-sky-500/30";
   return "bg-muted text-muted-foreground";
 }
 

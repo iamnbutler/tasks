@@ -17,6 +17,7 @@ import {
   HelpCircle,
   Brain,
   AlertTriangle,
+  GitBranch,
 } from "lucide-react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -104,11 +105,13 @@ function sourceDisplay(task: Task) {
 // ---------------------------------------------------------------------------
 
 interface ParsedBlock {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "agent_question" | "orchestrator_answer" | "session_boundary";
+  kind: "text" | "thinking" | "tool_use" | "tool_result" | "error" | "system" | "lifecycle" | "human_message" | "agent_question" | "orchestrator_answer" | "session_boundary" | "github_action";
   content: string;
   toolName?: string;
   filePath?: string;
   timestamp?: string;
+  /** URL linking to the GitHub resource (comment, PR, issue) */
+  url?: string;
 }
 
 const lifecycleLabels: Record<string, string> = {
@@ -146,6 +149,27 @@ function parseAgentEvents(events: Event[]): ParsedBlock[] {
       if (label) {
         blocks.push({ kind: "lifecycle", content: label, timestamp: event.ts });
       }
+      continue;
+    }
+
+    if (event.type.startsWith("github:")) {
+      const data = event.data ?? {};
+      const url = (data.comment_url ?? data.pr_url ?? data.issue_url) as string | undefined;
+      const githubLabels: Record<string, string> = {
+        "github:comment:posted": "Posted comment on GitHub",
+        "github:labels:added": "Added labels on GitHub",
+        "github:branch:deleted": `Deleted branch${data.branch ? ` ${data.branch}` : ""}`,
+        "github:branch:updated": `Updated branch${data.action === "mechanical_rebase" ? " (rebase)" : data.action === "auto_resolve" ? " (auto-resolve)" : ""}`,
+        "github:pr:merged": "Merged pull request",
+        "github:issue:created": `Created issue${data.title ? `: ${data.title}` : ""}`,
+        "github:issue:updated": "Updated issue on GitHub",
+      };
+      blocks.push({
+        kind: "github_action",
+        content: githubLabels[event.type] ?? event.type,
+        timestamp: event.ts,
+        url,
+      });
       continue;
     }
 
@@ -360,6 +384,26 @@ function BlockView({ block }: { block: ParsedBlock }) {
     return <ToolResultBlock block={block} />;
   }
 
+  if (block.kind === "github_action") {
+    return (
+      <div className="flex items-center gap-2 py-1.5 text-sm text-sky-400">
+        <GitBranch className="h-3.5 w-3.5 shrink-0" />
+        <span>{block.content}</span>
+        {block.url && (
+          <a
+            href={block.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-sky-400 hover:underline"
+          >
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        )}
+        {timestamp && <span className="text-muted-foreground ml-auto text-xs">{timestamp}</span>}
+      </div>
+    );
+  }
+
   if (block.kind === "lifecycle") {
     return (
       <div className="flex items-center gap-2 py-1.5 text-sm text-muted-foreground">
@@ -416,7 +460,8 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
       e.type === "agent:error" ||
       e.type === "human:message" ||
       e.type === "orchestrator:feedback" ||
-      e.type.startsWith("task:");
+      e.type.startsWith("task:") ||
+      e.type.startsWith("github:");
 
     fetchTaskEvents(taskId).then((events) => {
       setRawEvents(events.filter(isRelevant).sort((a, b) => a.ts.localeCompare(b.ts)));
@@ -611,11 +656,21 @@ interface TimelineEvent {
   description: string;
 }
 
+const githubTimelineLabels: Record<string, (data: Record<string, unknown>) => string> = {
+  "github:comment:posted": () => "Posted comment on GitHub",
+  "github:labels:added": () => "Added labels on GitHub",
+  "github:branch:deleted": (d) => `Deleted branch${d.branch ? ` ${d.branch}` : ""}`,
+  "github:branch:updated": (d) => `Updated branch${d.action === "mechanical_rebase" ? " (rebase)" : ""}`,
+  "github:pr:merged": () => "Merged pull request",
+  "github:issue:created": (d) => `Created issue${d.title ? `: ${d.title}` : ""}`,
+  "github:issue:updated": () => "Updated issue on GitHub",
+};
+
 function parseTimelineEvents(events: Event[]): TimelineEvent[] {
   const timelineEvents: TimelineEvent[] = [];
 
   for (const event of events) {
-    // Only include lifecycle/state events in timeline
+    // Include lifecycle/state events in timeline
     if (event.type.startsWith("task:")) {
       const label = lifecycleLabels[event.type];
       if (label) {
@@ -625,6 +680,20 @@ function parseTimelineEvents(events: Event[]): TimelineEvent[] {
           ts: event.ts,
           actor: event.actor,
           description: label,
+        });
+      }
+    }
+
+    // Include GitHub write actions in timeline
+    if (event.type.startsWith("github:")) {
+      const labelFn = githubTimelineLabels[event.type];
+      if (labelFn) {
+        timelineEvents.push({
+          id: event.id,
+          type: event.type,
+          ts: event.ts,
+          actor: event.actor,
+          description: labelFn(event.data ?? {}),
         });
       }
     }

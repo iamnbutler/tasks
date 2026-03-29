@@ -111,6 +111,22 @@ pub enum EventType {
     SystemUpdateAvailable,
     /// Update is being applied (graceful shutdown in progress).
     SystemUpdateApplying,
+
+    // GitHub write operation events (issue #560)
+    /// A comment was posted to a GitHub issue/PR.
+    GitHubCommentPosted,
+    /// Labels were added to a GitHub issue/PR.
+    GitHubLabelsAdded,
+    /// A GitHub branch was deleted.
+    GitHubBranchDeleted,
+    /// A GitHub branch was updated (rebase via update-branch API).
+    GitHubBranchUpdated,
+    /// A GitHub PR was merged.
+    GitHubPrMerged,
+    /// A GitHub issue was created.
+    GitHubIssueCreated,
+    /// A GitHub issue was updated.
+    GitHubIssueUpdated,
 }
 
 impl EventType {
@@ -174,6 +190,13 @@ impl EventType {
             Self::SystemAccountingSession => "system:accounting:session",
             Self::SystemUpdateAvailable => "system:update:available",
             Self::SystemUpdateApplying => "system:update:applying",
+            Self::GitHubCommentPosted => "github:comment:posted",
+            Self::GitHubLabelsAdded => "github:labels:added",
+            Self::GitHubBranchDeleted => "github:branch:deleted",
+            Self::GitHubBranchUpdated => "github:branch:updated",
+            Self::GitHubPrMerged => "github:pr:merged",
+            Self::GitHubIssueCreated => "github:issue:created",
+            Self::GitHubIssueUpdated => "github:issue:updated",
         }
     }
 
@@ -266,6 +289,13 @@ impl TryFrom<String> for EventType {
             "system:accounting:session" => Ok(Self::SystemAccountingSession),
             "system:update:available" => Ok(Self::SystemUpdateAvailable),
             "system:update:applying" => Ok(Self::SystemUpdateApplying),
+            "github:comment:posted" => Ok(Self::GitHubCommentPosted),
+            "github:labels:added" => Ok(Self::GitHubLabelsAdded),
+            "github:branch:deleted" => Ok(Self::GitHubBranchDeleted),
+            "github:branch:updated" => Ok(Self::GitHubBranchUpdated),
+            "github:pr:merged" => Ok(Self::GitHubPrMerged),
+            "github:issue:created" => Ok(Self::GitHubIssueCreated),
+            "github:issue:updated" => Ok(Self::GitHubIssueUpdated),
             _ => Err(format!("unknown event type: {}", s)),
         }
     }
