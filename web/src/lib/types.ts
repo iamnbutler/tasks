@@ -73,6 +73,10 @@ export interface MergeQueueEntry {
   pr_url: string;
   status: MergeStatus;
   queued_at: string;
+  /** PR title from GitHub (issue #589). */
+  pr_title?: string;
+  /** PR number from GitHub (issue #589). */
+  pr_number?: number;
   /** Feedback when status is changes_requested */
   changes_requested_feedback?: string;
   /** Position in merge queue (1-indexed). Only set for approved/merging entries. */

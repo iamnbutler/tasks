@@ -113,7 +113,7 @@ function MergeQueueRow({
             className="text-muted-foreground hover:underline truncate block"
             onClick={(e) => e.stopPropagation()}
           >
-            {prRepo(entry.pr_url)}#{num}
+            {entry.pr_title ?? `${prRepo(entry.pr_url)}#${num}`}
           </a>
         )}
         {entry.changes_requested_feedback && (

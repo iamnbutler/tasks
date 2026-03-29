@@ -264,9 +264,9 @@ impl Store {
             .to_string();
         let queued_at = entry.queued_at.to_rfc3339();
         self.conn()?.execute(
-            "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at",
-            params![entry.id, entry.task_id, entry.pr_url, status, queued_at],
+            "INSERT INTO merge_queue (id, task_id, pr_url, status, queued_at, pr_title, pr_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, pr_url=excluded.pr_url, status=excluded.status, queued_at=excluded.queued_at, pr_title=excluded.pr_title, pr_number=excluded.pr_number",
+            params![entry.id, entry.task_id, entry.pr_url, status, queued_at, entry.pr_title, entry.pr_number.map(|n| n as i64)],
         )?;
         Ok(())
     }
@@ -275,7 +275,7 @@ impl Store {
     pub fn get_merge_entry(&self, id: &str) -> Result<Option<MergeQueueEntry>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, pr_url, status, queued_at FROM merge_queue WHERE id = ?1",
+            "SELECT id, task_id, pr_url, status, queued_at, pr_title, pr_number FROM merge_queue WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok((
@@ -284,11 +284,13 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
         match rows.next() {
             Some(row) => {
-                let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+                let (id, task_id, pr_url, status_str, queued_at_str, pr_title, pr_number) = row?;
                 let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
                 let queued_at: DateTime<Utc> = queued_at_str
                     .parse()
@@ -301,6 +303,8 @@ impl Store {
                     pr_url,
                     status,
                     queued_at,
+                    pr_title,
+                    pr_number: pr_number.map(|n| n as u64),
                     conflict_info: None, // Not persisted to DB yet
                     changes_requested_feedback: None, // TODO: persist to DB
                     head_sha: None,      // Updated from GitHub on reconciliation
@@ -316,7 +320,7 @@ impl Store {
     pub fn list_merge_entries(&self) -> Result<Vec<MergeQueueEntry>, StoreError> {
         let conn = self.conn()?;
         let mut stmt = conn
-            .prepare("SELECT id, task_id, pr_url, status, queued_at FROM merge_queue")?;
+            .prepare("SELECT id, task_id, pr_url, status, queued_at, pr_title, pr_number FROM merge_queue")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -324,11 +328,13 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, task_id, pr_url, status_str, queued_at_str) = row?;
+            let (id, task_id, pr_url, status_str, queued_at_str, pr_title, pr_number) = row?;
             let status: MergeStatus = serde_json::from_str(&format!("\"{status_str}\""))?;
             let queued_at: DateTime<Utc> = queued_at_str
                 .parse()
@@ -341,6 +347,8 @@ impl Store {
                 pr_url,
                 status,
                 queued_at,
+                pr_title,
+                pr_number: pr_number.map(|n| n as u64),
                 conflict_info: None, // Not persisted to DB yet
                 changes_requested_feedback: None, // TODO: persist to DB
                 head_sha: None,      // Updated from GitHub on reconciliation

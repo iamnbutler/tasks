@@ -679,7 +679,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         task_id.clone(),
                                         &pr_url,
                                     )
-                                    .with_head_sha(&pr.head_sha);
+                                    .with_head_sha(&pr.head_sha)
+                                    .with_pr_title(&pr.title)
+                                    .with_pr_number(pr.number);
 
                                     if let Err(e) = poll_server.add_to_merge_queue(entry).await {
                                         warn!(

@@ -241,6 +241,13 @@ impl MergeQueue {
         Ok(changed)
     }
 
+    /// Update the pr_title on an entry (issue #589).
+    pub fn update_pr_title(&mut self, id: &str, title: &str) {
+        if let Some(entry) = self.get_mut(id) {
+            entry.pr_title = Some(title.to_string());
+        }
+    }
+
     /// Get all entries with conflicts.
     pub fn conflicting(&self) -> Vec<&MergeQueueEntry> {
         self.entries

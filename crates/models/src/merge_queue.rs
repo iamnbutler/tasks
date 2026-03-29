@@ -91,6 +91,13 @@ pub struct MergeQueueEntry {
     pub pr_url: String,
     pub status: MergeStatus,
     pub queued_at: DateTime<Utc>,
+    /// PR title from GitHub. Stored directly so the UI can display it
+    /// even when no task is linked (issue #589).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_title: Option<String>,
+    /// PR number from GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
     /// Conflict details when status is Conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_info: Option<ConflictInfo>,
@@ -121,6 +128,8 @@ impl MergeQueueEntry {
             pr_url: pr_url.into(),
             status: MergeStatus::Pending,
             queued_at: Utc::now(),
+            pr_title: None,
+            pr_number: None,
             conflict_info: None,
             changes_requested_feedback: None,
             head_sha: None,
@@ -132,6 +141,18 @@ impl MergeQueueEntry {
     /// Set the head SHA for this entry (builder pattern).
     pub fn with_head_sha(mut self, sha: impl Into<String>) -> Self {
         self.head_sha = Some(sha.into());
+        self
+    }
+
+    /// Set the PR title for this entry (builder pattern).
+    pub fn with_pr_title(mut self, title: impl Into<String>) -> Self {
+        self.pr_title = Some(title.into());
+        self
+    }
+
+    /// Set the PR number for this entry (builder pattern).
+    pub fn with_pr_number(mut self, number: u64) -> Self {
+        self.pr_number = Some(number);
         self
     }
 }

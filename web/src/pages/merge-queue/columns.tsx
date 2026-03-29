@@ -153,10 +153,10 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           </Link>
         );
       }
-      // No linked task — show PR repo/number as fallback
+      // No linked task — show PR title or repo/number as fallback
       const repo = prRepo(row.original.pr_url);
       const num = prNumber(row.original.pr_url);
-      const label = repo && num ? `${repo}#${num}` : row.original.pr_url;
+      const label = row.original.pr_title ?? (repo && num ? `${repo}#${num}` : row.original.pr_url);
       return (
         <a
           href={row.original.pr_url}

@@ -1180,12 +1180,12 @@ impl Server {
                     (conflict_action, Some(sha_update_id))
                 }
             };
-            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
+            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone(), pr.title.clone()));
         }
 
         // Execute all actions
         let mut changes = 0u32;
-        for (action, entry_id_for_sha_update, head_sha) in actions {
+        for (action, entry_id_for_sha_update, head_sha, pr_title) in actions {
             if let Some(action) = action {
                 match action {
                     MqAction::MarkMerged { entry_id, pr_url, .. } => {
@@ -1246,9 +1246,11 @@ impl Server {
                 }
             }
 
-            // Update head_sha for open PRs to detect new commits
+            // Update head_sha and pr_title for open PRs
             if let Some(entry_id) = entry_id_for_sha_update {
                 let mut state = self.state.write().await;
+                // Always refresh pr_title from GitHub (issue #589)
+                state.merge_queue.update_pr_title(&entry_id, &pr_title);
                 match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
                     Ok(true) => {
                         tracing::debug!(

@@ -221,6 +221,29 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // Migration: add pr_title and pr_number columns to merge_queue (issue #589)
+    // These store PR metadata directly so the UI can display titles even without a linked task.
+    for (col, col_type) in &[("pr_title", "TEXT"), ("pr_number", "INTEGER")] {
+        match conn.execute(
+            &format!("ALTER TABLE merge_queue ADD COLUMN {} {}", col, col_type),
+            [],
+        ) {
+            Ok(_) => {
+                tracing::info!("added {} column to merge_queue table", col);
+            }
+            Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+                if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                    && msg.contains("duplicate column name") =>
+            {
+                tracing::debug!("{} column already exists in merge_queue", col);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to add {} column to merge_queue", col);
+                return Err(e);
+            }
+        }
+    }
+
     // Migration: add UNIQUE constraint on merge_queue.pr_url (issue #464)
     // SQLite cannot add constraints to existing columns, so we create the unique index
     // if it doesn't already exist. The column-level UNIQUE in CREATE TABLE handles new DBs;
