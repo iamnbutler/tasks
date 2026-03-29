@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use events::{Actor, Event, EventBus, EventStore, EventType};
 use uuid::Uuid;
-use runtime::{AppleContainerRuntime, ContainerConfig};
+use runtime::{AppleContainerRuntime, ContainerConfig, ContainerRuntime};
 use server::Server;
 use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
@@ -278,6 +278,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     // --- 3. Create container runtime ---
 
     let container_runtime = AppleContainerRuntime::new();
+    container_runtime.health_check().await.map_err(|e| {
+        format!("container runtime is not available: {e}")
+    })?;
 
     // --- 4. Restart recovery (spec §13.3) ---
     //

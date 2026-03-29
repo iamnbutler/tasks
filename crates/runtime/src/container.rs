@@ -58,6 +58,8 @@ impl ContainerConfig {
 /// Implementations can use different container runtimes (apple/container, Docker, etc.)
 #[trait_variant::make(Send)]
 pub trait ContainerRuntime {
+    /// Verify the container runtime is available and functional.
+    async fn health_check(&self) -> Result<(), ContainerError>;
     /// Create a container from the given config. Returns the container ID.
     async fn create(&self, config: &ContainerConfig) -> Result<String, ContainerError>;
     /// Start a container and attach to its stdio. Returns the transport.
@@ -89,6 +91,27 @@ impl Default for AppleContainerRuntime {
 }
 
 impl ContainerRuntime for AppleContainerRuntime {
+    async fn health_check(&self) -> Result<(), ContainerError> {
+        let output = Command::new("container")
+            .arg("list")
+            .output()
+            .await
+            .map_err(|e| {
+                ContainerError::CommandFailed(format!(
+                    "`container` CLI not found or not executable: {e}"
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ContainerError::CommandFailed(format!(
+                "container runtime health check failed: {stderr}"
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn create(&self, config: &ContainerConfig) -> Result<String, ContainerError> {
         let mut cmd = Command::new("container");
         cmd.arg("create");
