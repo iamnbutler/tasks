@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, Info } from "lucide-react";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
 import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
@@ -344,6 +344,15 @@ export function MergeQueuePage() {
             countLabel="entries"
             actions={headerActions}
           />
+          {isPaused && (
+            <div className="mx-4 mb-2 flex items-start gap-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 px-3 py-2 text-xs text-yellow-200">
+              <Info className="h-3.5 w-3.5 shrink-0 mt-0.5 text-yellow-400" />
+              <span>
+                <strong>Pause mode:</strong> Approved PRs are held for manual flush.
+                Rejections, conflicts, and change requests continue to be processed automatically.
+              </span>
+            </div>
+          )}
           <div className="px-4 pb-1">
             {headerTabs}
           </div>
