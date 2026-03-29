@@ -125,12 +125,12 @@ impl Server {
     }
 
     /// Create a server with persistent storage (spec Section 3.5).
-    pub fn with_store(event_bus: EventBus, store: tasks_store::Store) -> Self {
+    pub fn with_store(event_bus: EventBus, store: Arc<tasks_store::Store>) -> Self {
         Self {
             state: Arc::new(RwLock::new(ServerState::new())),
             event_bus: Arc::new(event_bus),
             presence: Arc::new(PresenceTracker::new()),
-            store: Some(Arc::new(store)),
+            store: Some(store),
             rebuild_requested: AtomicBool::new(false),
         }
     }
@@ -2609,7 +2609,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_persists_projects_and_tasks() {
-        let store = tasks_store::Store::open_memory().unwrap();
+        let store = Arc::new(tasks_store::Store::open_memory().unwrap());
         let dir = tempdir().unwrap();
         let event_store = EventStore::new(dir.path());
         let bus = EventBus::new(event_store, 64);
@@ -2630,7 +2630,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_persists_state_changes() {
-        let store = tasks_store::Store::open_memory().unwrap();
+        let store = Arc::new(tasks_store::Store::open_memory().unwrap());
         let dir = tempdir().unwrap();
         let event_store = EventStore::new(dir.path());
         let bus = EventBus::new(event_store, 64);
@@ -2667,7 +2667,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let event_store = EventStore::new(dir.path());
         let bus = EventBus::new(event_store, 64);
-        let server = Server::with_store(bus, store);
+        let server = Server::with_store(bus, Arc::new(store));
 
         // State should be empty before load
         assert!(server.get_project("p1").await.is_none());

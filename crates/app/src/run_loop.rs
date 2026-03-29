@@ -16,7 +16,8 @@ use runtime::{AppleContainerRuntime, ContainerConfig};
 use server::Server;
 use server::model::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry};
 use server::model::task::{TaskSource, TaskState};
-use server::{WorkflowConfigWatcher, RefreshResult};
+use server::{WorkflowConfigWatcher, RefreshResult, WorkQueue, WorkQueueConfig};
+use tokio::sync::RwLock;
 use tasks_github::client::GitHubClient;
 use tasks_github::model::{IssueState, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
@@ -195,7 +196,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     std::fs::create_dir_all(&config.data_dir)?;
 
     let db_path = format!("{}/db.sqlite", config.data_dir);
-    let store = tasks_store::Store::open(&db_path)?;
+    let store = Arc::new(tasks_store::Store::open(&db_path)?);
 
     let event_dir = format!("{}/events", config.data_dir);
     std::fs::create_dir_all(&event_dir)?;
@@ -205,11 +206,37 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     // --- 2. Create server ---
 
-    let server = Arc::new(Server::with_store(bus, store));
+    let server = Arc::new(Server::with_store(bus, store.clone()));
     server
         .load_from_store()
         .await
         .map_err(|e| format!("Failed to load state: {e}"))?;
+
+    // --- 2c. Create work queue ---
+    //
+    // The centralized work queue replaces the racey dispatch evaluation.
+    // All dispatchable work (tasks, PR feedback, conflicts) flows through here.
+    let work_queue_config = WorkQueueConfig {
+        work_queue_timeout: Duration::from_secs(
+            std::env::var("WORK_QUEUE_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+        ),
+        container_timeout: Duration::from_secs(
+            std::env::var("CONTAINER_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2 * 60 * 60),
+        ),
+        health_check_interval: Duration::from_secs(
+            std::env::var("HEALTH_CHECK_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+        ),
+    };
+    let work_queue = Arc::new(RwLock::new(WorkQueue::new(store.clone(), work_queue_config)));
 
     // --- 2b. Create workflow config watcher (spec §14.3) ---
     //
@@ -1076,9 +1103,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let dispatch_server = server.clone();
     let dispatch_session_mgr = session_manager.clone();
+    let dispatch_work_queue = work_queue.clone();
     let dispatch_interval = config.dispatch_interval;
     let max_sessions = config.max_sessions;
-    let max_sessions_per_project = config.max_sessions_per_project;
+    let _max_sessions_per_project = config.max_sessions_per_project; // TODO: wire into work queue per-project limits
     let max_retries = config.max_retries;
     let dispatch_event_bus = server.event_bus.clone();
     let dispatch_memory_gate = memory_gate.clone();
@@ -1195,109 +1223,154 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 max_sessions
             };
 
-            // Run dispatch with pending answers
+            // --- Handle pending answers (resume Question-state tasks) ---
+            // Process pending answers first — these are tasks that were in Question
+            // state and received a HumanMessage. The message was already sent to
+            // the session, so we just need to track that the answer was processed.
             let answers_vec: Vec<String> = pending_answers.iter().cloned().collect();
-            // Build per-project session limits: workflow.toml override > env default
-            let per_project_limits = {
-                let state = dispatch_server.state.read().await;
-                let mut limits = std::collections::HashMap::new();
-                for project_id in state.projects.keys() {
-                    let config = dispatch_config_watcher.get_config(project_id).await;
-                    let limit = config.project.max_sessions.unwrap_or(max_sessions_per_project);
-                    limits.insert(project_id.clone(), limit);
-                }
-                limits
-            };
-
-            match dispatch_server
-                .run_dispatch_with_limits(&answers_vec, effective_max, Some(&per_project_limits))
-                .await
-            {
-                Ok(plan) => {
-                    // Start new sessions for dispatched tasks
-                    for task_id in &plan.new_work {
-                        if let Some(task) = dispatch_server.get_task(task_id).await {
-                            let project = dispatch_server.get_project(&task.project).await;
-                            let repo_url = project
-                                .as_ref()
-                                .map(|p| format!("https://github.com/{}.git", p.repo))
-                                .unwrap_or_default();
-                            // Include unique suffix to prevent branch name clashes on task
-                            // retry and to prevent agents from rediscovering past attempts.
-                            let unique_suffix = &Uuid::new_v4().to_string()[..8];
-                            let branch = format!("tasks/{}--{}", task.id, unique_suffix);
-
-                            // Load workflow settings (spec §14, §15)
-                            // Uses cached config from the workflow watcher (spec §14.3)
-                            let workflow_settings = load_workflow_settings_for_project(
-                                project.as_ref(),
-                                &dispatch_github_token,
-                                &dispatch_config_watcher,
-                            )
-                            .await;
-
-                            // Fetch comments from GitHub at dispatch time (spec §15.2)
-                            let comments = server::prompt::fetch_comments_for_task(
-                                &github_client,
-                                &task.source,
-                            )
-                            .await;
-
-                            let prompt = server::prompt::build_prompt_for_task(
-                                &task,
-                                &branch,
-                                workflow_settings.system_prompt.as_deref(),
-                                &comments,
-                            );
-
-                            match dispatch_session_mgr
-                                .start_session(
-                                    task_id.clone(),
-                                    repo_url,
-                                    branch,
-                                    prompt,
-                                    None,
-                                    workflow_settings.progress_threshold,
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    // Clear rejection feedback after successful dispatch (issue #423).
-                                    // This prevents stale feedback from being repeated if the task
-                                    // is rejected and re-dispatched again.
-                                    if task.rejection_feedback.is_some() {
-                                        if let Err(e) = dispatch_server.clear_task_rejection_feedback(task_id).await {
-                                            warn!(task_id = %task_id, error = %e, "failed to clear rejection feedback after dispatch");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(task_id = %task_id, error = %e, "failed to start session");
-                                    // Treat as a failure with no progress so backoff kicks in.
-                                    // This prevents tight retry loops when containers can't start.
-                                    if let Err(e2) = dispatch_server
-                                        .handle_task_failure(task_id, false, max_retries, None)
-                                        .await
-                                    {
-                                        warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
-                                    }
-                                }
-                            }
+            if !answers_vec.is_empty() {
+                // Use the old dispatcher for resume logic (pending answers)
+                // This is separate from new work dispatch and doesn't have the race condition
+                match dispatch_server.run_dispatch_with_limits(&answers_vec, 0, None).await {
+                    Ok(plan) => {
+                        for task_id in &plan.resume {
+                            info!(task_id = %task_id, "resumed session with pending answer");
+                            pending_answers.remove(task_id);
                         }
                     }
+                    Err(e) => {
+                        error!(error = %e, "dispatch (resume) failed");
+                    }
+                }
+            }
 
-                    // Resume sessions with pending answers — the message was already
-                    // sent to the session when the HumanMessage event was emitted,
-                    // so we just transition the task state here. The session manager
-                    // handles delivering the message to the agent.
-                    for task_id in &plan.resume {
-                        info!(task_id = %task_id, "resumed session with pending answer");
-                        // Remove from pending answers set — it's been processed
-                        pending_answers.remove(task_id);
+            // --- Rebuild work queue from current state ---
+            {
+                let state = dispatch_server.state.read().await;
+                let mut queue = dispatch_work_queue.write().await;
+                if let Err(e) = queue.rebuild(&state.tasks) {
+                    error!(error = %e, "failed to rebuild work queue");
+                    continue;
+                }
+            }
+
+            // --- Claim next work item ---
+            let active_count = dispatch_session_mgr.active_count().await;
+            let container_id = Uuid::new_v4().to_string();
+
+            let claimed = {
+                let mut queue = dispatch_work_queue.write().await;
+                queue.claim_next(effective_max as usize, active_count, &container_id)
+            };
+
+            let work_item = match claimed {
+                Ok(Some(item)) => item,
+                Ok(None) => continue, // No work available or rate limited
+                Err(e) => {
+                    error!(error = %e, "failed to claim work");
+                    continue;
+                }
+            };
+
+            // --- Start session for the claimed work ---
+            let task_id = work_item.source_id.clone();
+            let Some(task) = dispatch_server.get_task(&task_id).await else {
+                warn!(task_id = %task_id, "claimed work item has no corresponding task");
+                // Release the claim since we can't process it
+                let mut queue = dispatch_work_queue.write().await;
+                if let Err(e) = queue.release(&work_item.id, Some("task not found")) {
+                    warn!(work_id = %work_item.id, error = %e, "failed to release claim");
+                }
+                continue;
+            };
+
+            let project = dispatch_server.get_project(&task.project).await;
+            let repo_url = project
+                .as_ref()
+                .map(|p| format!("https://github.com/{}.git", p.repo))
+                .unwrap_or_default();
+
+            // Include unique suffix to prevent branch name clashes on task
+            // retry and to prevent agents from rediscovering past attempts.
+            let unique_suffix = &Uuid::new_v4().to_string()[..8];
+            let branch = format!("tasks/{}--{}", task.id, unique_suffix);
+
+            // Load workflow settings (spec §14, §15)
+            // Uses cached config from the workflow watcher (spec §14.3)
+            let workflow_settings = load_workflow_settings_for_project(
+                project.as_ref(),
+                &dispatch_github_token,
+                &dispatch_config_watcher,
+            )
+            .await;
+
+            // Fetch comments from GitHub at dispatch time (spec §15.2)
+            let comments = server::prompt::fetch_comments_for_task(
+                &github_client,
+                &task.source,
+            )
+            .await;
+
+            let prompt = server::prompt::build_prompt_for_task(
+                &task,
+                &branch,
+                workflow_settings.system_prompt.as_deref(),
+                &comments,
+            );
+
+            // Transition task to Running before starting session
+            if let Err(e) = dispatch_server
+                .set_task_state(&task_id, TaskState::Running, Actor::Scheduler)
+                .await
+            {
+                error!(task_id = %task_id, error = %e, "failed to transition task to Running");
+                // Release the claim
+                let mut queue = dispatch_work_queue.write().await;
+                if let Err(e2) = queue.release(&work_item.id, Some(&format!("state transition failed: {}", e))) {
+                    warn!(work_id = %work_item.id, error = %e2, "failed to release claim");
+                }
+                continue;
+            }
+
+            match dispatch_session_mgr
+                .start_session(
+                    task_id.clone(),
+                    repo_url,
+                    branch,
+                    prompt,
+                    None,
+                    workflow_settings.progress_threshold,
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!(task_id = %task_id, work_id = %work_item.id, "session started for claimed work");
+                    // Clear rejection feedback after successful dispatch (issue #423).
+                    // This prevents stale feedback from being repeated if the task
+                    // is rejected and re-dispatched again.
+                    if task.rejection_feedback.is_some() {
+                        if let Err(e) = dispatch_server.clear_task_rejection_feedback(&task_id).await {
+                            warn!(task_id = %task_id, error = %e, "failed to clear rejection feedback after dispatch");
+                        }
                     }
                 }
                 Err(e) => {
-                    error!(error = %e, "dispatch failed");
+                    error!(task_id = %task_id, error = %e, "failed to start session");
+
+                    // Release the claim
+                    let mut queue = dispatch_work_queue.write().await;
+                    if let Err(e2) = queue.release(&work_item.id, Some(&format!("session start failed: {}", e))) {
+                        warn!(work_id = %work_item.id, error = %e2, "failed to release claim");
+                    }
+
+                    // Handle failure for backoff — treat as no progress so backoff kicks in.
+                    // This prevents tight retry loops when containers can't start.
+                    if let Err(e2) = dispatch_server
+                        .handle_task_failure(&task_id, false, max_retries, None)
+                        .await
+                    {
+                        warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                    }
                 }
             }
         }
