@@ -218,7 +218,8 @@ impl OrchestratorChat {
             lines.push(format!("- **{}**: {} task(s)", state, tasks.len()));
             // Show up to 3 tasks per state
             for task in tasks.iter().take(3) {
-                lines.push(format!("  - {}: {}", &task.id[..8], task.title));
+                let short_id = &task.id[..task.id.floor_char_boundary(8)];
+                lines.push(format!("  - {}: {}", short_id, task.title));
             }
             if tasks.len() > 3 {
                 lines.push(format!("  - ... and {} more", tasks.len() - 3));

@@ -374,11 +374,16 @@ impl Orchestrator for ClaudeOrchestrator {
         &self,
         context: &SystemContext,
     ) -> Result<Vec<OrchestratorAction>, OrchestratorError> {
+        use crate::prompt::truncate_text;
+        use models::task::TaskState;
+
         // Rule-based reasoning pass — no LLM calls.
         // Survey system state and recent events, identify patterns, narrate.
+        // This is the orchestrator's stream of consciousness: it narrates what
+        // it sees so the human can glance at the feed and understand the pulse.
         let mut actions = Vec::new();
 
-        // Narrate recent events the human should know about
+        // --- Narrate recent events the human should know about ---
         for event in &context.recent_events {
             match &event.event_type {
                 EventType::TaskStateFailed => {
@@ -387,16 +392,120 @@ impl Orchestrator for ClaudeOrchestrator {
                         .get("reason")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown reason");
-                    actions.push(OrchestratorAction::EmitThought(format!(
-                        "Task {} failed: {}",
-                        event.task, reason
-                    )));
+                    let task_title = event
+                        .data
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    if task_title.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Task {short_id} failed: {reason}"
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Task {short_id} ({}) failed: {reason}",
+                            truncate_text(task_title, 60)
+                        )));
+                    }
                 }
                 EventType::TaskStateCompleted => {
+                    let task_title = event
+                        .data
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    if task_title.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Task {short_id} completed."
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Task {short_id} ({}) completed.",
+                            truncate_text(task_title, 60)
+                        )));
+                    }
+                }
+                EventType::TaskStateRunning => {
+                    let task_title = event
+                        .data
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    if !task_title.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Task {short_id} started: {}",
+                            truncate_text(task_title, 80)
+                        )));
+                    }
+                }
+                EventType::TaskStateQuestion => {
+                    let question = event
+                        .data
+                        .get("question")
+                        .or_else(|| event.data.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    if question.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Agent on task {short_id} is stuck and asking for help."
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Agent on task {short_id} is stuck: {}",
+                            truncate_text(question, 120)
+                        )));
+                    }
+                }
+                EventType::TaskStateConflict => {
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
                     actions.push(OrchestratorAction::EmitThought(format!(
-                        "Task {} completed.",
-                        event.task
+                        "Task {short_id} hit a merge conflict — investigating resolution strategy."
                     )));
+                }
+                EventType::TaskStateAwaitingMerge => {
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Task {short_id} is ready — PR queued for merge evaluation."
+                    )));
+                }
+                EventType::TaskStateChangesRequested => {
+                    let short_id = &event.task[..event.task.floor_char_boundary(8)];
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Sent changes back to task {short_id} — agent should address feedback."
+                    )));
+                }
+                EventType::MergeQueued => {
+                    let task_id = event
+                        .data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&event.task);
+                    let short_id = &task_id[..task_id.floor_char_boundary(8)];
+                    let pr_url = event
+                        .data
+                        .get("pr_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    // Extract PR number from URL if possible
+                    let pr_label = pr_url
+                        .rsplit('/')
+                        .next()
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .map(|n| format!("PR #{n}"))
+                        .unwrap_or_default();
+                    if pr_label.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "New PR from task {short_id} entered the merge queue."
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "{pr_label} from task {short_id} entered the merge queue — will evaluate shortly."
+                        )));
+                    }
                 }
                 EventType::MergeCompleted => {
                     let task_id = event
@@ -404,9 +513,9 @@ impl Orchestrator for ClaudeOrchestrator {
                         .get("task_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&event.task);
+                    let short_id = &task_id[..task_id.floor_char_boundary(8)];
                     actions.push(OrchestratorAction::EmitThought(format!(
-                        "Merged PR for task {}.",
-                        task_id
+                        "Merged PR for task {short_id} into main."
                     )));
                 }
                 EventType::MergeConflict => {
@@ -415,45 +524,167 @@ impl Orchestrator for ClaudeOrchestrator {
                         .get("task_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&event.task);
+                    let short_id = &task_id[..task_id.floor_char_boundary(8)];
                     actions.push(OrchestratorAction::EmitThought(format!(
-                        "Conflict detected on task {}.",
-                        task_id
+                        "Merge conflict detected on task {short_id} — triaging resolution."
                     )));
+                }
+                EventType::MergeRejected => {
+                    let task_id = event
+                        .data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&event.task);
+                    let short_id = &task_id[..task_id.floor_char_boundary(8)];
+                    let reason = event
+                        .data
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if reason.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Rejected PR for task {short_id}."
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Rejected PR for task {short_id}: {}",
+                            truncate_text(reason, 150)
+                        )));
+                    }
+                }
+                EventType::OrchestratorDecision => {
+                    // Narrate our own evaluation decisions with reasoning
+                    let approved = event
+                        .data
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let reasoning = event
+                        .data
+                        .get("reasoning")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let entry_id = event
+                        .data
+                        .get("entry_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let short_entry = &entry_id[..entry_id.floor_char_boundary(8)];
+                    let verdict = if approved { "Approved" } else { "Rejected" };
+                    if reasoning.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "{verdict} merge entry {short_entry}."
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "{verdict} merge entry {short_entry} — {}",
+                            truncate_text(reasoning, 150)
+                        )));
+                    }
+                }
+                EventType::OrchestratorFeedback => {
+                    let task_id = event
+                        .data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&event.task);
+                    let short_id = &task_id[..task_id.floor_char_boundary(8)];
+                    let context_str = event
+                        .data
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    match context_str {
+                        "question_answer" => {
+                            actions.push(OrchestratorAction::EmitThought(format!(
+                                "Answered stuck agent on task {short_id} — unblocking."
+                            )));
+                        }
+                        _ => {
+                            actions.push(OrchestratorAction::EmitThought(format!(
+                                "Sent feedback to agent on task {short_id}."
+                            )));
+                        }
+                    }
                 }
                 EventType::SystemModePlay => {
                     actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Play — fully autonomous.".to_string(),
+                        "Mode changed to Play — fully autonomous. I'll evaluate and merge PRs as they come in.".to_string(),
                     ));
                 }
                 EventType::SystemModePause => {
                     actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Pause — holding approved merges.".to_string(),
+                        "Mode changed to Pause — I'll evaluate PRs but hold merges for your approval.".to_string(),
                     ));
                 }
                 EventType::SystemModeStop => {
                     actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Stop — idle.".to_string(),
+                        "Mode changed to Stop — going idle. No evaluations or merges until resumed.".to_string(),
                     ));
+                }
+                EventType::OrchestratorEscalation => {
+                    let action = event
+                        .data
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("escalation");
+                    let message = event
+                        .data
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if message.is_empty() {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Escalating: {action}"
+                        )));
+                    } else {
+                        actions.push(OrchestratorAction::EmitThought(format!(
+                            "Escalating — {}",
+                            truncate_text(message, 150)
+                        )));
+                    }
                 }
                 _ => {}
             }
         }
 
-        // Pattern detection: multiple failures in the same area
+        // --- Pattern detection: multiple failures ---
         let recent_failures: Vec<&events::Event> = context
             .recent_events
             .iter()
             .filter(|e| e.event_type == EventType::TaskStateFailed)
             .collect();
         if recent_failures.len() >= 3 {
-            actions.push(OrchestratorAction::EmitThought(format!(
-                "{} tasks failed recently — possible systemic issue.",
-                recent_failures.len()
-            )));
+            // Check if failures share error patterns
+            let reasons: Vec<&str> = recent_failures
+                .iter()
+                .filter_map(|e| e.data.get("reason").and_then(|v| v.as_str()))
+                .collect();
+            let has_common_pattern = reasons.len() >= 2 && {
+                // Simple heuristic: check if any two reasons share a common substring
+                reasons.windows(2).any(|w| {
+                    let a = w[0].to_lowercase();
+                    let b = w[1].to_lowercase();
+                    a.contains("timeout") && b.contains("timeout")
+                        || a.contains("connection") && b.contains("connection")
+                        || a.contains("permission") && b.contains("permission")
+                        || a.contains("memory") && b.contains("memory")
+                })
+            };
+            if has_common_pattern {
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "{} tasks failed with a similar pattern — likely a systemic issue, not individual task problems.",
+                    recent_failures.len()
+                )));
+            } else {
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "{} tasks failed recently — watching for patterns.",
+                    recent_failures.len()
+                )));
+            }
         }
 
-        // Surface long-running sessions
-        use models::task::TaskState;
+        // --- Surface long-running sessions ---
         let long_running: Vec<&Task> = context
             .tasks
             .iter()
@@ -469,11 +700,45 @@ impl Orchestrator for ClaudeOrchestrator {
                 .last_activity_at
                 .map(|at| (chrono::Utc::now() - at).num_minutes())
                 .unwrap_or(0);
+            let short_id = &task.id[..task.id.floor_char_boundary(8)];
             actions.push(OrchestratorAction::EmitThought(format!(
-                "Task {} has been running with no activity for {}m.",
-                &task.id[..8.min(task.id.len())],
-                mins
+                "Task {short_id} has been running with no activity for {mins}m — may be stuck."
             )));
+        }
+
+        // --- Periodic project health summary ---
+        // Emit a brief status summary when there's been a meaningful
+        // amount of activity (first think after startup, or enough events).
+        let is_first_think = context.last_think_at.is_none();
+        let had_significant_activity = context.recent_events.len() >= 5;
+
+        if is_first_think || had_significant_activity {
+            let total = context.tasks.len();
+            if total > 0 {
+                let running = context.tasks.iter().filter(|t| t.state == TaskState::Running).count();
+                let completed = context.tasks.iter().filter(|t| t.state == TaskState::Completed).count();
+                let failed = context.tasks.iter().filter(|t| t.state == TaskState::Failed).count();
+                let waiting = context.tasks.iter().filter(|t| t.state == TaskState::Waiting).count();
+                let stuck = context.tasks.iter().filter(|t| {
+                    matches!(t.state, TaskState::Question | TaskState::Conflict | TaskState::Blocked)
+                }).count();
+                let queue_len = context.merge_queue.len();
+
+                let mut parts = Vec::new();
+                if running > 0 { parts.push(format!("{running} running")); }
+                if waiting > 0 { parts.push(format!("{waiting} waiting")); }
+                if stuck > 0 { parts.push(format!("{stuck} stuck")); }
+                if completed > 0 { parts.push(format!("{completed} completed")); }
+                if failed > 0 { parts.push(format!("{failed} failed")); }
+
+                let mut summary = format!("Project pulse: {}", parts.join(", "));
+                if queue_len > 0 {
+                    summary.push_str(&format!(". Merge queue: {queue_len} pending."));
+                } else {
+                    summary.push_str(". Merge queue clear.");
+                }
+                actions.push(OrchestratorAction::EmitThought(summary));
+            }
         }
 
         Ok(actions)
@@ -625,12 +890,13 @@ fn extract_json(text: &str) -> Option<&str> {
     None
 }
 
-/// Truncate text for logging.
+/// Truncate text for logging (UTF-8 safe).
 fn truncate(text: &str, max_len: usize) -> &str {
     if text.len() <= max_len {
         text
     } else {
-        &text[..max_len]
+        let boundary = text.floor_char_boundary(max_len);
+        &text[..boundary]
     }
 }
 
@@ -644,6 +910,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 

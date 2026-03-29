@@ -256,11 +256,14 @@ pub fn build_deep_review_prompt(
 }
 
 /// Truncate text to a maximum length, adding ellipsis if truncated.
-fn truncate_text(text: &str, max_len: usize) -> String {
+///
+/// Uses `floor_char_boundary` to avoid panicking on multi-byte UTF-8 characters.
+pub(crate) fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
+        let boundary = text.floor_char_boundary(max_len.saturating_sub(3));
+        format!("{}...", &text[..boundary])
     }
 }
 
@@ -402,6 +405,25 @@ mod tests {
         let truncated = truncate_text(&long, 50);
         assert!(truncated.ends_with("..."));
         assert_eq!(truncated.len(), 50);
+    }
+
+    #[test]
+    fn test_truncate_text_multibyte_utf8() {
+        // "héllo" has a multi-byte 'é' — slicing at an arbitrary byte index would panic.
+        let text = "héllo world, this is a longer string for testing";
+        let truncated = truncate_text(text, 10);
+        assert!(truncated.ends_with("..."));
+        // Must not panic and must be valid UTF-8
+        assert!(truncated.len() <= 10);
+    }
+
+    #[test]
+    fn test_truncate_text_emoji() {
+        // Emojis are 4 bytes each — raw slicing would panic mid-character.
+        let text = "🎉🎊🎈🎆🎇 celebration time";
+        let truncated = truncate_text(text, 12);
+        assert!(truncated.ends_with("..."));
+        // Should not panic
     }
 
     #[test]
