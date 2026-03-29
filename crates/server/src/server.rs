@@ -2623,7 +2623,7 @@ mod tests {
         server.add_task(task).await.unwrap();
 
         // Verify data is in the store
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         assert!(store_ref.get_project("p1").unwrap().is_some());
         assert!(store_ref.get_task("t1").unwrap().is_some());
     }
@@ -2648,7 +2648,7 @@ mod tests {
             .unwrap();
 
         // Verify the store has the updated state
-        let store_ref = server.store.as_ref().unwrap().lock().unwrap();
+        let store_ref = server.store.as_ref().unwrap();
         let stored_task = store_ref.get_task("t1").unwrap().unwrap();
         assert_eq!(stored_task.state, TaskState::Running);
     }

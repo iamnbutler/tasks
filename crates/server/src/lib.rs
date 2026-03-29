@@ -15,6 +15,7 @@ pub mod dispatcher;
 pub mod scheduler;
 pub mod workspace;
 pub mod automation_executor;
+pub mod work_queue;
 mod server;
 
 pub use mode::Mode;
@@ -27,3 +28,4 @@ pub use workspace::{
     DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_CONFLICT_MAX_AGE_SECS, DEFAULT_STALE_THRESHOLD_SECS,
 };
 pub use automation_executor::{AutomationExecutor, ExecutionContext, ExecutionError, ExecutionResult};
+pub use work_queue::{WorkQueue, WorkQueueConfig, WorkQueueError};
