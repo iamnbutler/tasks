@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::warn;
 
 use crate::error::GitHubError;
 use crate::model::{
@@ -1181,13 +1182,59 @@ impl GitHubClient {
         )))
     }
 
+    /// Fetch a PR's current head SHA via the REST API (lightweight, no GraphQL).
+    async fn get_pr_head_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<String, GitHubError> {
+        self.wait_for_rate_limit().await;
+
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}",
+            self.base_url, owner, repo, number
+        );
+
+        let response = self.http.get(&url).send().await?;
+        self.update_rate_limit(&response);
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(GitHubError::Decode(format!(
+                "failed to fetch PR head SHA ({status}): {text}"
+            )));
+        }
+
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            GitHubError::Decode(format!("failed to parse PR response: {e}"))
+        })?;
+
+        body.get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(|s| s.as_str())
+            .map(String::from)
+            .ok_or_else(|| GitHubError::Decode("missing head.sha in PR response".into()))
+    }
+
+    /// Maximum time to wait for an update-branch operation to complete.
+    const UPDATE_BRANCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Interval between polls when waiting for update-branch completion.
+    const UPDATE_BRANCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Update a PR's head branch with the base branch (spec §7.4).
     ///
     /// Uses GitHub's "Update Branch" API to bring the head branch up to date
     /// with the base branch. This can resolve simple conflicts by rebasing.
     ///
+    /// The API returns 202 Accepted when the update is queued but not yet
+    /// complete. This method polls the PR's head SHA until it changes,
+    /// confirming the update has landed before returning success.
+    ///
     /// Returns:
-    /// - `Ok(true)` if updated successfully
+    /// - `Ok(true)` if updated successfully (head SHA changed)
     /// - `Ok(false)` if update failed (e.g., conflicts that can't be auto-resolved)
     /// - `Err` for API errors
     pub async fn update_branch(
@@ -1196,6 +1243,9 @@ impl GitHubClient {
         repo: &str,
         number: u64,
     ) -> Result<bool, GitHubError> {
+        // Capture the current head SHA before requesting the update
+        let original_sha = self.get_pr_head_sha(owner, repo, number).await?;
+
         self.wait_for_rate_limit().await;
 
         // GitHub REST API: PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch
@@ -1209,9 +1259,45 @@ impl GitHubClient {
 
         let status = response.status();
 
-        // 202 Accepted = update started successfully
+        // 202 Accepted = update queued, need to poll for completion
         if status == reqwest::StatusCode::ACCEPTED {
-            return Ok(true);
+            let deadline =
+                tokio::time::Instant::now() + Self::UPDATE_BRANCH_TIMEOUT;
+
+            loop {
+                tokio::time::sleep(Self::UPDATE_BRANCH_POLL_INTERVAL).await;
+
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        pr = %format!("{owner}/{repo}#{number}"),
+                        "update-branch timed out waiting for head SHA to change"
+                    );
+                    // Timed out — the update may still land, but we can't
+                    // confirm it. Return true since GitHub accepted the request
+                    // and the caller should re-check merge status anyway.
+                    return Ok(true);
+                }
+
+                match self.get_pr_head_sha(owner, repo, number).await {
+                    Ok(current_sha) if current_sha != original_sha => {
+                        return Ok(true);
+                    }
+                    Ok(_) => {
+                        // SHA hasn't changed yet, keep polling
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            pr = %format!("{owner}/{repo}#{number}"),
+                            error = %e,
+                            "failed to poll PR head SHA during update-branch wait"
+                        );
+                        // Polling failed but the update was accepted — continue
+                        // polling rather than failing the whole operation.
+                        continue;
+                    }
+                }
+            }
         }
 
         // 422 = can't update (conflicts, protected branch rules, etc.)
