@@ -6,6 +6,7 @@
 
 mod accounting;
 mod schema;
+pub mod work_claims;
 
 pub use accounting::{AccountingSummary, TaskAccounting};
 pub use schema::DATA_VERSION;
