@@ -7,6 +7,7 @@ import {
   Box,
   Radio,
   Brain,
+  MessageSquareText,
   ChevronDown,
   FolderGit2,
   Plus,
@@ -580,6 +581,7 @@ export function Layout() {
               <SidebarNavItem to="/merge-queue" icon={GitMerge} label="Merge Queue" />
               <SidebarNavItem to="/containers" icon={Box} label="Containers" />
               <SidebarNavItem to="/automations" icon={Workflow} label="Automations" />
+              <SidebarNavItem to="/reflections" icon={MessageSquareText} label="Reflections" />
             </div>
 
             {/* System */}

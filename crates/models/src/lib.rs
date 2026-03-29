@@ -8,5 +8,6 @@ pub mod session;
 pub mod merge_queue;
 pub mod mode;
 pub mod project;
+pub mod reflection;
 
 pub use mode::Mode;

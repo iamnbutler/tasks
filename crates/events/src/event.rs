@@ -106,6 +106,14 @@ pub enum EventType {
     /// Session duration and total token accounting.
     SystemAccountingSession,
 
+    // Reflection events (spec §8.6)
+    /// New reflection issue detected.
+    ReflectionCreated,
+    /// Comment added to a reflection.
+    ReflectionComment,
+    /// Reflection resolved/closed.
+    ReflectionClosed,
+
     // Self-update events (issue #305)
     /// New update is available from upstream.
     SystemUpdateAvailable,
@@ -172,6 +180,9 @@ impl EventType {
             Self::SystemAccountingTokens => "system:accounting:tokens",
             Self::SystemAccountingApiCall => "system:accounting:api_call",
             Self::SystemAccountingSession => "system:accounting:session",
+            Self::ReflectionCreated => "reflection:created",
+            Self::ReflectionComment => "reflection:comment",
+            Self::ReflectionClosed => "reflection:closed",
             Self::SystemUpdateAvailable => "system:update:available",
             Self::SystemUpdateApplying => "system:update:applying",
         }
@@ -264,6 +275,9 @@ impl TryFrom<String> for EventType {
             "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
             "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
             "system:accounting:session" => Ok(Self::SystemAccountingSession),
+            "reflection:created" => Ok(Self::ReflectionCreated),
+            "reflection:comment" => Ok(Self::ReflectionComment),
+            "reflection:closed" => Ok(Self::ReflectionClosed),
             "system:update:available" => Ok(Self::SystemUpdateAvailable),
             "system:update:applying" => Ok(Self::SystemUpdateApplying),
             _ => Err(format!("unknown event type: {}", s)),

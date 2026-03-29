@@ -9,6 +9,7 @@
 use chrono::{DateTime, Utc};
 use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry, MergeStatus};
 use models::project::Project;
+use models::reflection::Reflection;
 use models::task::{Task, TaskState};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,10 @@ pub struct EvaluationContext {
     /// Summaries of other PRs in the queue (for context).
     /// Sorted by queue position (PRs ahead of current entry come first).
     pub queue_context: Vec<QueueEntrySummary>,
+    /// Relevant past reflections for this project (spec §8).
+    /// The orchestrator references these during evaluation to incorporate
+    /// human feedback patterns from previous reviews.
+    pub reflections: Vec<Reflection>,
 }
 
 /// Verdict from the orchestrator's quality evaluation.

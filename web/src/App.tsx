@@ -10,6 +10,7 @@ import { ContainersPage } from "@/pages/containers/page";
 import { AutomationsPage } from "@/pages/automations/page";
 import { AutomationDetailPage } from "@/pages/automation-detail";
 import { OrchestratorPage } from "@/pages/orchestrator/page";
+import { ReflectionsPage } from "@/pages/reflections/page";
 import { EventsPage } from "@/pages/events/page";
 
 export function App() {
@@ -25,6 +26,7 @@ export function App() {
           <Route path="/containers" element={<ContainersPage />} />
           <Route path="/automations" element={<AutomationsPage />} />
           <Route path="/automations/:id" element={<AutomationDetailPage />} />
+          <Route path="/reflections" element={<ReflectionsPage />} />
           <Route path="/orchestrator" element={<OrchestratorPage />} />
           <Route path="/events" element={<EventsPage />} />
         </Route>

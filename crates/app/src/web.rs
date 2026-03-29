@@ -100,7 +100,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}/runs", get(list_automation_runs))
         .route("/automations/{id}/runs/{run_id}/events", get(list_automation_run_events))
         .route("/automations/{id}/runs/{run_id}/cancel", post(cancel_automation_run))
-        .route("/automations/{id}/run", post(trigger_automation));
+        .route("/automations/{id}/run", post(trigger_automation))
+        // Reflection endpoints (spec §8)
+        .route("/reflections", get(list_reflections))
+        .route("/reflections/{id}", get(get_reflection));
 
     Router::new()
         .nest("/api", api)
@@ -117,6 +120,7 @@ struct SnapshotResponse {
     tasks: Vec<models::task::Task>,
     merge_queue: Vec<models::merge_queue::MergeQueueEntry>,
     automations: Vec<models::automation::Automation>,
+    reflections: Vec<models::reflection::Reflection>,
     slot_utilization: SlotUtilization,
     human_present: bool,
 }
@@ -404,6 +408,7 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
         tasks: server_state.tasks.values().cloned().collect(),
         merge_queue: server_state.merge_queue.entries_with_positions(),
         automations: server_state.automations.values().cloned().collect(),
+        reflections: server_state.reflections.values().cloned().collect(),
         slot_utilization: SlotUtilization {
             active,
             max: state.max_sessions,
@@ -1693,6 +1698,38 @@ async fn list_automation_run_events(
         .map_err(|e| ApiError::Server(server::ServerError::EventStore(e)))?;
 
     Ok(Json(events))
+}
+
+// --- Reflections (spec §8) ---
+
+#[derive(Deserialize)]
+struct ListReflectionsQuery {
+    project_id: Option<String>,
+}
+
+/// GET /api/reflections — List all reflections.
+async fn list_reflections(
+    State(state): State<ApiState>,
+    Query(query): Query<ListReflectionsQuery>,
+) -> Json<Vec<models::reflection::Reflection>> {
+    let reflections = state
+        .server
+        .list_reflections(query.project_id.as_deref())
+        .await;
+    Json(reflections)
+}
+
+/// GET /api/reflections/:id — Get a single reflection.
+async fn get_reflection(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<models::reflection::Reflection>, StatusCode> {
+    state
+        .server
+        .get_reflection(&id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 // --- Error handling ---

@@ -429,6 +429,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         let label_config = server::workflow::LabelConfig::default();
+        let reflection_config = server::workflow::ReflectionConfig::default();
         let mut pollers: HashMap<String, RepoPoller> = HashMap::new();
 
         loop {
@@ -553,6 +554,20 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     Ok(result) => {
                         // --- Issue processing: create or reconcile (issue #254) ---
                         for issue in &result.issues {
+                            // Check if this is a reflection issue (spec §8)
+                            if server::scheduler::is_reflection_issue(issue, &reflection_config.label) {
+                                let reflection = server::scheduler::issue_to_reflection(issue, project_id);
+                                if let Err(e) = poll_server.upsert_reflection(reflection).await {
+                                    warn!(
+                                        project = %project_id,
+                                        issue = issue.number,
+                                        error = %e,
+                                        "failed to upsert reflection"
+                                    );
+                                }
+                                continue;
+                            }
+
                             let source = TaskSource::GithubIssue {
                                 owner: issue.owner.clone(),
                                 repo: issue.repo.clone(),
@@ -1823,11 +1838,15 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     (entry, entry_head_sha, queue_context)
                 };
 
+                // Get reflections for this project to include in evaluation context
+                let reflections = orch_server.list_reflections(Some(&task.project)).await;
+
                 let context = tasks_orchestrator::EvaluationContext {
                     entry,
                     task: task.clone(),
                     project,
                     queue_context,
+                    reflections,
                 };
 
                 // Evaluate

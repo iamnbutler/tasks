@@ -140,6 +140,7 @@ mod tests {
             task: Task::new("task-1", TaskSource::Internal, "Test task", "proj-1"),
             project: Project::new("proj-1", "owner/repo"),
             queue_context: Vec::new(),
+            reflections: Vec::new(),
         }
     }
 

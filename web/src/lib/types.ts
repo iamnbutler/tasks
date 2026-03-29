@@ -95,11 +95,41 @@ export interface SlotUtilization {
   max: number;
 }
 
+// ---------------------------------------------------------------------------
+// Reflections
+// ---------------------------------------------------------------------------
+
+export type ReflectionState = "open" | "closed";
+
+export interface ReflectionComment {
+  author: string;
+  body: string;
+  created_at: string;
+}
+
+export interface Reflection {
+  id: string;
+  number: number;
+  owner: string;
+  repo: string;
+  title: string;
+  body: string | null;
+  state: ReflectionState;
+  labels: string[];
+  comments: ReflectionComment[];
+  project: string;
+  url: string;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+}
+
 export interface Snapshot {
   mode: Mode;
   projects: Project[];
   tasks: Task[];
   merge_queue: MergeQueueEntry[];
+  reflections: Reflection[];
   slot_utilization: SlotUtilization;
   human_present: boolean;
 }

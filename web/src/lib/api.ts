@@ -6,6 +6,7 @@ import type {
   MergeQueueEntry,
   Mode,
   Project,
+  Reflection,
   Snapshot,
   Task,
   TriggerConfig,
@@ -246,6 +247,22 @@ export function applyUpdate(force?: boolean): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ force: force ?? false }),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Reflections API
+// ---------------------------------------------------------------------------
+
+export function fetchReflections(projectId?: string): Promise<Reflection[]> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  const query = params.toString();
+  const url = query ? `/api/reflections?${query}` : "/api/reflections";
+  return request<Reflection[]>(url);
+}
+
+export function fetchReflection(id: string): Promise<Reflection> {
+  return request<Reflection>(`/api/reflections/${id}`);
 }
 
 // ---------------------------------------------------------------------------

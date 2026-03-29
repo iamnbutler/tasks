@@ -18,6 +18,7 @@ use crate::mode::{Mode, ModeTransitionError};
 use crate::model::automation::{Automation, AutomationRun, AutomationState, TriggerType};
 use crate::model::project::Project;
 use crate::model::task::{FailureInfo, Task, TaskSource, TaskState};
+use models::reflection::Reflection;
 use crate::dispatcher::{self, DispatchPlan};
 use crate::presence::PresenceTracker;
 
@@ -71,6 +72,8 @@ pub struct ServerState {
     pub merge_queue: MergeQueue,
     /// All automations indexed by ID (spec Section 5.7).
     pub automations: HashMap<String, Automation>,
+    /// Reflections indexed by ID (spec §8).
+    pub reflections: HashMap<String, Reflection>,
 }
 
 impl ServerState {
@@ -81,6 +84,7 @@ impl ServerState {
             tasks: HashMap::new(),
             merge_queue: MergeQueue::new(),
             automations: HashMap::new(),
+            reflections: HashMap::new(),
         }
     }
 }
@@ -2394,6 +2398,73 @@ impl Server {
             .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
                 store.record_session_end(task_id, duration_seconds)
             .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
+    // --- Reflections (spec §8) ---
+
+    /// Upsert a reflection into in-memory state and emit events as needed.
+    pub async fn upsert_reflection(&self, reflection: Reflection) -> Result<(), ServerError> {
+        let id = reflection.id.clone();
+        let mut state = self.state.write().await;
+
+        let is_new = !state.reflections.contains_key(&id);
+        state.reflections.insert(id.clone(), reflection.clone());
+
+        // Don't hold the write lock across the event publish
+        drop(state);
+
+        let event_type = if is_new {
+            EventType::ReflectionCreated
+        } else {
+            // Check if it was just closed
+            if reflection.state == models::reflection::ReflectionState::Closed {
+                EventType::ReflectionClosed
+            } else {
+                // Updated — treat as a comment event (comments are the main update vector)
+                EventType::ReflectionComment
+            }
+        };
+
+        let event = Event::new(
+            event_type,
+            &id,
+            Actor::System,
+            serde_json::json!({
+                "title": reflection.title,
+                "project": reflection.project,
+                "state": reflection.state,
+            }),
+        );
+
+        if let Err(e) = self.event_bus.publish(event).await {
+            tracing::warn!(reflection_id = %id, error = %e, "failed to publish reflection event");
+        }
+
+        Ok(())
+    }
+
+    /// List all reflections, optionally filtered by project.
+    pub async fn list_reflections(&self, project_id: Option<&str>) -> Vec<Reflection> {
+        let state = self.state.read().await;
+        let mut reflections: Vec<Reflection> = if let Some(pid) = project_id {
+            state.reflections.values().filter(|r| r.project == pid).cloned().collect()
+        } else {
+            state.reflections.values().cloned().collect()
+        };
+        reflections.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        reflections
+    }
+
+    /// Get a single reflection by ID.
+    pub async fn get_reflection(&self, id: &str) -> Option<Reflection> {
+        let state = self.state.read().await;
+        state.reflections.get(id).cloned()
+    }
+
+    /// Remove reflections belonging to a project (used when removing a project).
+    pub async fn remove_reflections_for_project(&self, project_id: &str) {
+        let mut state = self.state.write().await;
+        state.reflections.retain(|_, r| r.project != project_id);
     }
 }
 

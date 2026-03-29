@@ -13,6 +13,7 @@ pub struct WorkflowConfig {
     pub dispatch: DispatchConfig,
     pub labels: LabelConfig,
     pub prompt: PromptConfig,
+    pub reflections: ReflectionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +44,22 @@ pub struct LabelConfig {
     pub ignore: Vec<String>,
     /// Issues with these labels start in blocked state (spec §14.2).
     pub blocked: Vec<String>,
+}
+
+/// Reflection configuration (spec §8).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReflectionConfig {
+    /// Label that identifies reflection issues (spec §8.2). Default: "reflection".
+    pub label: String,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            label: "reflection".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

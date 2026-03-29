@@ -16,7 +16,7 @@ const MAX_EVENTS = 200;
 const POLL_INTERVAL_MS = 5_000;
 
 /** Regex matching event types that should trigger a snapshot refresh. */
-const STATE_CHANGING_EVENT = /^(task:|merge:|system:mode)/;
+const STATE_CHANGING_EVENT = /^(task:|merge:|reflection:|system:mode)/;
 
 /** Regex matching event types that should trigger an automations refresh. */
 const AUTOMATION_EVENT = /^automation:/;

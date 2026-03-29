@@ -9,6 +9,7 @@ use thiserror::Error;
 use tasks_github::model::{Issue, PullRequest};
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::workflow::LabelConfig;
+use models::reflection::{Reflection, ReflectionComment, ReflectionState};
 
 /// Canonical label that always causes an issue/PR to be skipped, regardless of
 /// project configuration. This label is checked in addition to the configurable
@@ -21,8 +22,51 @@ pub enum SchedulerError {
     GitHub(#[from] tasks_github::GitHubError),
 }
 
+/// Check if a GitHub issue is a reflection (has the reflection label).
+pub fn is_reflection_issue(issue: &Issue, reflection_label: &str) -> bool {
+    issue
+        .labels
+        .iter()
+        .any(|l| l.name.eq_ignore_ascii_case(reflection_label))
+}
+
+/// Convert a GitHub issue with a reflection label into a Reflection.
+pub fn issue_to_reflection(issue: &Issue, project_id: &str) -> Reflection {
+    let state = match issue.state {
+        tasks_github::model::IssueState::Open => ReflectionState::Open,
+        tasks_github::model::IssueState::Closed => ReflectionState::Closed,
+    };
+
+    let comments = issue
+        .comments
+        .iter()
+        .map(|c| ReflectionComment {
+            author: c.author.login.clone(),
+            body: c.body.clone(),
+            created_at: c.created_at,
+        })
+        .collect();
+
+    Reflection {
+        id: Reflection::make_id(&issue.owner, &issue.repo, issue.number),
+        number: issue.number,
+        owner: issue.owner.clone(),
+        repo: issue.repo.clone(),
+        title: issue.title.clone(),
+        body: issue.body.clone(),
+        state,
+        labels: issue.labels.iter().map(|l| l.name.clone()).collect(),
+        comments,
+        project: project_id.to_string(),
+        url: Reflection::make_url(&issue.owner, &issue.repo, issue.number),
+        created_at: issue.created_at,
+        updated_at: issue.updated_at,
+        closed_at: issue.closed_at,
+    }
+}
+
 /// Convert a GitHub issue into a Task, if it should be imported.
-/// Returns None if the issue should be ignored (matches ignore labels or canonical skip label).
+/// Returns None if the issue should be ignored (matches ignore labels, canonical skip label, or reflection label).
 pub fn issue_to_task(
     issue: &Issue,
     project_id: &str,
