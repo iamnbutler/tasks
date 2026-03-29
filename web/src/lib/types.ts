@@ -47,6 +47,7 @@ export interface Task {
   retry_count: number;
   last_failure_at: string | null;
   last_failure: FailureInfo | null;
+  rejection_feedback: string | null;
   created_at: string;
   updated_at: string;
 }

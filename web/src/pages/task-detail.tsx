@@ -832,6 +832,17 @@ function PropertiesSidebar({ task, projectName }: { task: Task; projectName: str
         </PropertyRow>
       )}
 
+      {/* Rejection feedback */}
+      {task.rejection_feedback && (
+        <>
+          <Separator className="my-3" />
+          <div className="text-xs font-medium text-amber-400 mb-2">Rejection Feedback</div>
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+            <p className="text-xs text-amber-300/90 whitespace-pre-wrap">{task.rejection_feedback}</p>
+          </div>
+        </>
+      )}
+
       {/* Failure info */}
       {task.last_failure && (
         <>

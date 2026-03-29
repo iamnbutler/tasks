@@ -22,6 +22,7 @@ import {
   ArrowRight,
   ArrowUp,
   GripVertical,
+  MessageSquareWarning,
   Minus,
 } from "lucide-react";
 import { cn, formatRelativeTime } from "@/lib/utils";
@@ -130,6 +131,13 @@ function SortableTaskItem({ task, projectName }: SortableTaskItemProps) {
 
         {/* Title */}
         <span className="flex-1 truncate text-sm">{task.title}</span>
+
+        {/* Rejection feedback indicator */}
+        {task.rejection_feedback && (
+          <span title="Has rejection feedback">
+            <MessageSquareWarning className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+          </span>
+        )}
 
         {/* Labels */}
         {task.labels.map((label) => (
