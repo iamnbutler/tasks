@@ -24,6 +24,9 @@ pub enum SessionState {
     Cancelled,
 }
 
+/// Number of recent messages always kept verbatim (ground truth anchor).
+const RECENT_VERBATIM_COUNT: usize = 6;
+
 /// A conversation session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -38,6 +41,12 @@ pub struct Session {
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Actual input token count from the last API response, used to calibrate
+    /// the chars/4 heuristic for more accurate budget estimation.
+    last_input_tokens: Option<u32>,
+    /// Number of messages that were sent in the last request (used with
+    /// `last_input_tokens` to compute a correction factor).
+    last_request_estimated_tokens: Option<u32>,
 }
 
 impl Session {
@@ -54,6 +63,8 @@ impl Session {
             total_usage: Usage::default(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
+            last_input_tokens: None,
+            last_request_estimated_tokens: None,
         }
     }
 
@@ -136,12 +147,195 @@ impl Session {
         request
     }
 
+    /// Compute a correction factor for the chars/4 heuristic using actual API
+    /// token counts from the previous turn. Returns 1.0 if no data is available.
+    fn token_correction_factor(&self) -> f32 {
+        match (self.last_input_tokens, self.last_request_estimated_tokens) {
+            (Some(actual), Some(estimated)) if estimated > 0 => {
+                let factor = actual as f32 / estimated as f32;
+                // Clamp to avoid wild swings from outliers
+                factor.clamp(0.5, 2.0)
+            }
+            _ => 1.0,
+        }
+    }
+
+    /// Score messages by retention priority. Lower scores are dropped first.
+    ///
+    /// Detects superseded tool results: when a later tool call targets the same
+    /// resource as an earlier one (e.g., reading the same file twice), the earlier
+    /// tool call and its result get a reduced score.
+    fn score_messages(&self) -> Vec<f32> {
+        let total = self.messages.len();
+        let mut scores = vec![1.0_f32; total];
+
+        if total == 0 {
+            return scores;
+        }
+
+        // First message (task context) is always pinned
+        scores[0] = f32::MAX;
+
+        // Pin the last RECENT_VERBATIM_COUNT messages as ground truth
+        let pin_start = total.saturating_sub(RECENT_VERBATIM_COUNT);
+        for score in scores.iter_mut().skip(pin_start) {
+            *score = f32::MAX;
+        }
+
+        // Build a map of (tool_name, resource_key) -> last message index containing that tool use.
+        // Then mark earlier uses of the same resource as superseded (lower priority).
+        let mut resource_last_use: HashMap<(String, String), usize> = HashMap::new();
+
+        for (i, msg) in self.messages.iter().enumerate() {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            for content in &msg.content {
+                if let Content::ToolUse { name, input, .. } = content {
+                    if let Some(key) = Self::extract_resource_key(name, input) {
+                        resource_last_use.insert((name.clone(), key), i);
+                    }
+                }
+            }
+        }
+
+        // Mark earlier (superseded) tool calls and their paired results
+        for (i, msg) in self.messages.iter().enumerate() {
+            if msg.role != Role::Assistant || scores[i] == f32::MAX {
+                continue;
+            }
+            for content in &msg.content {
+                if let Content::ToolUse { name, input, .. } = content {
+                    if let Some(key) = Self::extract_resource_key(name, input) {
+                        if let Some(&last_idx) = resource_last_use.get(&(name.clone(), key)) {
+                            if last_idx > i {
+                                // This tool call was superseded by a later one
+                                scores[i] = scores[i].min(0.3);
+                                // Also reduce score of the paired ToolResult (next message)
+                                if i + 1 < total && scores[i + 1] != f32::MAX {
+                                    let next = &self.messages[i + 1];
+                                    if next.role == Role::User
+                                        && next.content.iter().all(|c| matches!(c, Content::ToolResult { .. }))
+                                    {
+                                        scores[i + 1] = scores[i + 1].min(0.3);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        scores
+    }
+
+    /// Extract a resource key from tool arguments for superseding detection.
+    /// Returns None if the tool doesn't have a recognizable resource identifier.
+    fn extract_resource_key(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+        // Common patterns for file/resource-based tools
+        if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+            return Some(path.to_string());
+        }
+        if let Some(file) = input.get("file").and_then(|v| v.as_str()) {
+            return Some(file.to_string());
+        }
+        if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
+            return Some(file_path.to_string());
+        }
+        if let Some(url) = input.get("url").and_then(|v| v.as_str()) {
+            return Some(url.to_string());
+        }
+        // For commands like bash, use the tool name + command as a very rough key.
+        // Only exact command matches are treated as superseding.
+        if tool_name == "bash" || tool_name == "execute" {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                return Some(cmd.to_string());
+            }
+        }
+        None
+    }
+
+    /// Generate a deterministic summary of dropped messages.
+    ///
+    /// Produces factual bullet points (not narrative) so the model knows what
+    /// context was lost and can ask clarifying questions if needed.
+    fn summarize_dropped(dropped: &[&Message]) -> String {
+        if dropped.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "[Context compacted: {} messages summarized]",
+            dropped.len()
+        ));
+
+        for msg in dropped {
+            match msg.role {
+                Role::Assistant => {
+                    let tool_uses: Vec<&str> = msg.content.iter().filter_map(|c| {
+                        if let Content::ToolUse { name, .. } = c { Some(name.as_str()) } else { None }
+                    }).collect();
+
+                    if !tool_uses.is_empty() {
+                        lines.push(format!("- Assistant called: {}", tool_uses.join(", ")));
+                    } else {
+                        let text = msg.text();
+                        if !text.is_empty() {
+                            let truncated: String = text.chars().take(100).collect();
+                            if text.len() > 100 {
+                                lines.push(format!("- Assistant: {}...", truncated));
+                            } else {
+                                lines.push(format!("- Assistant: {}", truncated));
+                            }
+                        }
+                    }
+                }
+                Role::User => {
+                    let is_tool_result = msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+                    if is_tool_result {
+                        let count = msg.content.len();
+                        let had_error = msg.content.iter().any(|c| {
+                            matches!(c, Content::ToolResult { is_error: true, .. })
+                        });
+                        if had_error {
+                            lines.push(format!("- Tool result ({} results, had errors)", count));
+                        } else {
+                            lines.push(format!("- Tool result ({} results)", count));
+                        }
+                    } else {
+                        let text = msg.text();
+                        if !text.is_empty() {
+                            let truncated: String = text.chars().take(80).collect();
+                            if text.len() > 80 {
+                                lines.push(format!("- User: {}...", truncated));
+                            } else {
+                                lines.push(format!("- User: {}", truncated));
+                            }
+                        }
+                    }
+                }
+                Role::System => {
+                    lines.push("- System message".to_string());
+                }
+            }
+        }
+
+        lines.join("\n")
+    }
+
     /// Truncate messages to fit within the context window budget.
     ///
-    /// Strategy: keep the first user message (task context) and as many
-    /// recent messages as fit. Drop from the middle when over budget.
-    fn truncate_to_budget(&self) -> Vec<Message> {
+    /// Strategy:
+    /// 1. Score messages by importance (superseded tool results get lower scores).
+    /// 2. Pin the first message (task context) and recent messages (ground truth).
+    /// 3. Drop lowest-scored middle messages first until under budget.
+    /// 4. Insert a deterministic summary of dropped messages after the first message.
+    /// 5. Skip orphaned ToolResult messages at the truncation boundary.
+    fn truncate_to_budget(&mut self) -> Vec<Message> {
         let budget = self.config.input_budget();
+        let correction = self.token_correction_factor();
 
         // Account for system prompt and tool definitions
         let mut overhead: u32 = 0;
@@ -151,75 +345,140 @@ impl Session {
         for tool in &self.tools {
             overhead += (tool.description.len() as u32 + tool.parameters.to_string().len() as u32) / 4 + 20;
         }
+        let overhead = (overhead as f32 * correction) as u32;
 
         let available = budget.saturating_sub(overhead);
 
-        // Fast path: estimate total and skip truncation if under budget
-        let total_tokens: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        // Estimate total tokens with correction factor
+        let raw_total: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        let total_tokens = (raw_total as f32 * correction) as u32;
+
+        // Fast path: skip truncation if under budget
         if total_tokens <= available {
+            // Save estimated tokens for next calibration cycle
+            self.last_request_estimated_tokens = Some(raw_total);
             return self.messages.clone();
         }
 
-        // Need to truncate. Keep first message (task context) + recent messages.
         let total = self.messages.len();
         if total <= 2 {
-            // Too few messages to truncate meaningfully
+            self.last_request_estimated_tokens = Some(raw_total);
             return self.messages.clone();
         }
 
-        // Reserve first message
-        let first_tokens = self.messages[0].estimate_tokens();
-        let remaining_budget = available.saturating_sub(first_tokens);
+        // Score all messages
+        let scores = self.score_messages();
 
-        // Walk backwards from the end, accumulating messages that fit
-        let mut tail_tokens: u32 = 0;
-        let mut keep_from = total; // exclusive start of tail
-        for i in (1..total).rev() {
-            let msg_tokens = self.messages[i].estimate_tokens();
-            if tail_tokens + msg_tokens > remaining_budget {
+        // Build list of droppable message indices sorted by priority.
+        // First: non-pinned messages sorted by score ascending.
+        // Fallback: if that's not enough, also include pinned middle messages
+        // (indices 1..pin_start) sorted by their token estimate descending
+        // to maximize space reclaimed per drop.
+        let mut droppable: Vec<(usize, f32, u32)> = Vec::new();
+        for i in 1..total {  // never drop index 0
+            let tokens = (self.messages[i].estimate_tokens() as f32 * correction) as u32;
+            if scores[i] < f32::MAX {
+                droppable.push((i, scores[i], tokens));
+            }
+        }
+
+        // Sort by score ascending (drop lowest priority first)
+        droppable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // If droppable messages aren't enough, allow dropping pinned messages
+        // (everything except first and last message). Walk from oldest to newest
+        // so the most recent messages survive longest.
+        let droppable_tokens: u32 = droppable.iter().map(|&(_, _, t)| t).sum();
+        if total_tokens.saturating_sub(droppable_tokens) > available {
+            let mut pinned_fallback: Vec<(usize, f32, u32)> = Vec::new();
+            for i in 1..total.saturating_sub(1) {
+                if scores[i] == f32::MAX {
+                    let tokens = (self.messages[i].estimate_tokens() as f32 * correction) as u32;
+                    // Use a priority slightly above non-pinned (1.5) so they're dropped last
+                    pinned_fallback.push((i, 1.5, tokens));
+                }
+            }
+            // Already in oldest-first order, which is what we want for dropping
+            droppable.extend(pinned_fallback);
+        }
+
+        // Drop messages until we're under budget
+        let mut drop_set = std::collections::HashSet::new();
+        let mut current_tokens = total_tokens;
+        for &(idx, _score, tokens) in &droppable {
+            if current_tokens <= available {
                 break;
             }
-            tail_tokens += msg_tokens;
-            keep_from = i;
+            drop_set.insert(idx);
+            current_tokens = current_tokens.saturating_sub(tokens);
         }
 
-        // Ensure we don't break ToolUse/ToolResult pairing.
-        // The Anthropic API requires every ToolResult user message to be
-        // preceded by the assistant message containing the corresponding
-        // ToolUse. If the tail starts with an orphaned ToolResult, advance
-        // past it to find a safe boundary.
-        let keep_from_before_orphan_skip = keep_from;
-        while keep_from < total {
-            let msg = &self.messages[keep_from];
-            let is_orphan_tool_result = msg.role == Role::User
-                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
-            if !is_orphan_tool_result {
-                break;
-            }
-            // Drop the orphaned ToolResult and reclaim its tokens
-            tail_tokens = tail_tokens.saturating_sub(msg.estimate_tokens());
-            keep_from += 1;
+        if drop_set.is_empty() {
+            self.last_request_estimated_tokens = Some(raw_total);
+            return self.messages.clone();
         }
 
-        let budget_dropped = keep_from_before_orphan_skip.saturating_sub(1);
-        let orphan_skipped = keep_from - keep_from_before_orphan_skip;
-        if budget_dropped + orphan_skipped > 0 {
-            tracing::warn!(
-                session_id = %self.id,
-                total_messages = total,
-                budget_dropped,
-                orphan_skipped,
-                estimated_tokens = total_tokens,
-                budget = available,
-                "truncated conversation history to fit context window"
-            );
-        }
+        // Collect dropped messages for summarization
+        let dropped_msgs: Vec<&Message> = drop_set.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|i| &self.messages[i])
+            .collect();
 
-        let mut result = Vec::with_capacity(1 + (total - keep_from));
+        // Generate summary
+        let summary_text = Self::summarize_dropped(&dropped_msgs);
+        let has_summary = !summary_text.is_empty();
+
+        // Build result: first message, summary, then non-dropped messages
+        let mut result = Vec::with_capacity(total - drop_set.len() + 2);
         result.push(self.messages[0].clone());
-        if keep_from < total {
-            result.extend_from_slice(&self.messages[keep_from..]);
+
+        if has_summary {
+            result.push(Message::user(summary_text));
         }
+
+        // Add kept messages (skip first, skip dropped)
+        let mut i = 1;
+        while i < total {
+            if drop_set.contains(&i) {
+                i += 1;
+                continue;
+            }
+
+            // Check for orphaned ToolResult: a user ToolResult message
+            // whose preceding assistant ToolUse was dropped
+            let msg = &self.messages[i];
+            let is_tool_result_only = msg.role == Role::User
+                && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
+
+            if is_tool_result_only && i > 0 && drop_set.contains(&(i - 1)) {
+                // The paired ToolUse was dropped, skip this orphan too
+                i += 1;
+                continue;
+            }
+
+            result.push(self.messages[i].clone());
+            i += 1;
+        }
+
+        let dropped_count = total - (result.len() - if has_summary { 1 } else { 0 });
+        let superseded_count = droppable.iter().filter(|(_, s, _)| *s <= 0.3).count();
+        tracing::warn!(
+            session_id = %self.id,
+            total_messages = total,
+            dropped = dropped_count,
+            superseded = superseded_count,
+            estimated_tokens = total_tokens,
+            budget = available,
+            correction_factor = %format!("{:.2}", correction),
+            "compacted conversation history to fit context window"
+        );
+
+        // Save estimated tokens for calibration
+        let result_tokens: u32 = result.iter().map(|m| m.estimate_tokens()).sum();
+        self.last_request_estimated_tokens = Some(result_tokens);
+
         result
     }
 
@@ -240,6 +499,8 @@ impl Session {
         if let Some(usage) = response.usage {
             self.total_usage.input_tokens += usage.input_tokens;
             self.total_usage.output_tokens += usage.output_tokens;
+            // Track actual input tokens for calibration
+            self.last_input_tokens = Some(usage.input_tokens);
         }
     }
 
@@ -574,7 +835,7 @@ mod tests {
         // The conversation is now much larger than 80 tokens
 
         let request = session.build_request();
-        // Should be truncated: first message + recent messages
+        // Should be truncated: first message + summary + recent messages
         assert!(request.messages.len() < session.messages.len());
         // First message preserved
         assert_eq!(request.messages[0].text(), "task: implement feature X");
@@ -601,6 +862,31 @@ mod tests {
         assert_eq!(request.messages[0].text(), "initial task context");
         // Last message must be the most recent
         assert_eq!(request.messages.last().unwrap().text(), "looks good, continue");
+    }
+
+    #[test]
+    fn test_truncation_inserts_summary() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        session.add_user_message("task: implement feature X");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("working on step {} with lots of detail in the implementation", i));
+            session.add_user_message(&format!("continue with step {}", i + 1));
+        }
+
+        let request = session.build_request();
+        // Second message should be the summary (starts with [Context compacted:)
+        assert!(request.messages.len() >= 2);
+        let summary = &request.messages[1];
+        assert_eq!(summary.role, Role::User);
+        assert!(
+            summary.text().starts_with("[Context compacted:"),
+            "Expected summary message, got: {}",
+            summary.text()
+        );
     }
 
     #[test]
@@ -649,17 +935,170 @@ mod tests {
 
         let request = session.build_request();
 
-        // The tail should NOT start with the orphaned ToolResult [2].
-        // It should skip it and start at [3] or [4].
-        for msg in &request.messages[1..] {
+        // No message after the first (and possible summary) should be an orphaned ToolResult
+        for (idx, msg) in request.messages.iter().enumerate() {
+            if idx == 0 { continue; }
+            // Skip the summary message
+            if msg.text().starts_with("[Context compacted:") { continue; }
             let is_tool_result_only = msg.role == Role::User
                 && msg.content.iter().all(|c| matches!(c, Content::ToolResult { .. }));
             assert!(
                 !is_tool_result_only,
-                "tail contains orphaned ToolResult message"
+                "tail contains orphaned ToolResult message at index {}",
+                idx,
             );
         }
         // First message preserved
         assert_eq!(request.messages[0].text(), "implement feature X");
+    }
+
+    #[test]
+    fn test_superseded_tool_results_dropped_first() {
+        // Context window large enough to keep some but not all messages
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        // [0] User: task context
+        session.add_user_message("implement feature X");
+
+        // [1] First read of /tmp/foo.rs (will be superseded by [5])
+        session.messages.push(Message::new(Role::Assistant, vec![
+            Content::ToolUse {
+                id: "tc-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/foo.rs"}),
+            },
+        ]));
+        // [2] First read result
+        session.messages.push(Message::new(Role::User, vec![
+            Content::tool_result("tc-1", "original file contents that are quite long and take up tokens", false),
+        ]));
+        // [3] Normal conversation
+        session.add_assistant_message("I see, let me edit the file");
+        // [4] Normal conversation
+        session.add_user_message("ok go ahead");
+        // [5] Second read of the same file (supersedes [1])
+        session.messages.push(Message::new(Role::Assistant, vec![
+            Content::ToolUse {
+                id: "tc-2".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/foo.rs"}),
+            },
+        ]));
+        // [6] Second read result
+        session.messages.push(Message::new(Role::User, vec![
+            Content::tool_result("tc-2", "updated file contents", false),
+        ]));
+        // [7-10] Recent conversation
+        session.add_assistant_message("file updated successfully");
+        session.add_user_message("great");
+
+        let scores = session.score_messages();
+
+        // The first read (index 1) and its result (index 2) should have low scores
+        assert!(scores[1] <= 0.3, "superseded tool call should have low score, got {}", scores[1]);
+        assert!(scores[2] <= 0.3, "superseded tool result should have low score, got {}", scores[2]);
+
+        // The second read (index 5) should not be penalized (it's the latest)
+        // (It may be pinned by RECENT_VERBATIM_COUNT depending on total message count)
+        assert!(scores[5] >= 1.0, "latest tool call should not be penalized, got {}", scores[5]);
+    }
+
+    #[test]
+    fn test_correction_factor_defaults_to_one() {
+        let session = Session::new(CompletionConfig::new("test-model"));
+        assert_eq!(session.token_correction_factor(), 1.0);
+    }
+
+    #[test]
+    fn test_correction_factor_from_usage() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        session.last_input_tokens = Some(200);
+        session.last_request_estimated_tokens = Some(100);
+        // Actual was 2x our estimate
+        assert!((session.token_correction_factor() - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_correction_factor_clamped() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        // Wildly off estimate — should be clamped to 2.0
+        session.last_input_tokens = Some(10000);
+        session.last_request_estimated_tokens = Some(100);
+        assert!((session.token_correction_factor() - 2.0).abs() < f32::EPSILON);
+
+        // Very low actual — should be clamped to 0.5
+        session.last_input_tokens = Some(1);
+        session.last_request_estimated_tokens = Some(100);
+        assert!((session.token_correction_factor() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_summarize_dropped_messages() {
+        let msgs = vec![
+            Message::assistant("I'll help you with that"),
+            Message::new(Role::Assistant, vec![
+                Content::ToolUse {
+                    id: "tc-1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "/tmp/foo.rs"}),
+                },
+            ]),
+            Message::new(Role::User, vec![
+                Content::tool_result("tc-1", "file contents", false),
+            ]),
+            Message::user("thanks, continue"),
+        ];
+        let refs: Vec<&Message> = msgs.iter().collect();
+        let summary = Session::summarize_dropped(&refs);
+
+        assert!(summary.contains("[Context compacted: 4 messages summarized]"));
+        assert!(summary.contains("- Assistant: I'll help you with that"));
+        assert!(summary.contains("- Assistant called: read_file"));
+        assert!(summary.contains("- Tool result (1 results)"));
+        assert!(summary.contains("- User: thanks, continue"));
+    }
+
+    #[test]
+    fn test_cached_tokens_used_in_estimation() {
+        let msg = Message::user("hello").with_tokens(42);
+        assert_eq!(msg.estimate_tokens(), 42);
+
+        // Without cached tokens, uses heuristic
+        let msg = Message::user("hello");
+        assert_ne!(msg.estimate_tokens(), 42);
+    }
+
+    #[test]
+    fn test_extract_resource_key() {
+        // path-based tool
+        let key = Session::extract_resource_key(
+            "read_file",
+            &serde_json::json!({"path": "/tmp/foo.rs"}),
+        );
+        assert_eq!(key, Some("/tmp/foo.rs".to_string()));
+
+        // file_path variant
+        let key = Session::extract_resource_key(
+            "edit",
+            &serde_json::json!({"file_path": "/tmp/bar.rs"}),
+        );
+        assert_eq!(key, Some("/tmp/bar.rs".to_string()));
+
+        // bash command
+        let key = Session::extract_resource_key(
+            "bash",
+            &serde_json::json!({"command": "ls -la"}),
+        );
+        assert_eq!(key, Some("ls -la".to_string()));
+
+        // no recognizable resource
+        let key = Session::extract_resource_key(
+            "think",
+            &serde_json::json!({"text": "hmm"}),
+        );
+        assert_eq!(key, None);
     }
 }

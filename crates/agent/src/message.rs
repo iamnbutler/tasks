@@ -82,23 +82,33 @@ impl Content {
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
+    /// Actual token count from API usage, if known. When set, `estimate_tokens()`
+    /// returns this value instead of the chars/4 heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 impl Message {
     pub fn new(role: Role, content: Vec<Content>) -> Self {
-        Self { role, content }
+        Self { role, content, cached_tokens: None }
     }
 
     pub fn system(text: impl Into<String>) -> Self {
-        Self { role: Role::System, content: vec![Content::text(text)] }
+        Self { role: Role::System, content: vec![Content::text(text)], cached_tokens: None }
     }
 
     pub fn user(text: impl Into<String>) -> Self {
-        Self { role: Role::User, content: vec![Content::text(text)] }
+        Self { role: Role::User, content: vec![Content::text(text)], cached_tokens: None }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: vec![Content::text(text)] }
+        Self { role: Role::Assistant, content: vec![Content::text(text)], cached_tokens: None }
+    }
+
+    /// Set the cached token count (from API usage data).
+    pub fn with_tokens(mut self, tokens: u32) -> Self {
+        self.cached_tokens = Some(tokens);
+        self
     }
 
     /// Get the text content of this message, concatenating all text blocks.
@@ -106,8 +116,12 @@ impl Message {
         self.content.iter().filter_map(|c| c.as_text()).collect::<Vec<_>>().join("")
     }
 
-    /// Rough token estimate for this message (sum of content block estimates + overhead).
+    /// Token count for this message. Returns the cached API value if available,
+    /// otherwise falls back to a rough estimate (sum of content blocks + overhead).
     pub fn estimate_tokens(&self) -> u32 {
+        if let Some(tokens) = self.cached_tokens {
+            return tokens;
+        }
         // ~4 tokens overhead per message for role/formatting
         4 + self.content.iter().map(|c| c.estimate_tokens()).sum::<u32>()
     }

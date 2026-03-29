@@ -207,7 +207,7 @@ pub fn streaming_from_complete(response: Response) -> mpsc::UnboundedReceiver<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Content, Role, StopReason, Usage};
+    use crate::message::{Content, StopReason, Usage};
 
     #[test]
     fn completion_config_default() {
@@ -276,10 +276,7 @@ mod tests {
     #[test]
     fn completion_request_new() {
         let config = CompletionConfig::new("test-model");
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![Content::text("Hello")],
-        }];
+        let messages = vec![Message::user("Hello")];
 
         let request = CompletionRequest::new(config, messages);
         assert_eq!(request.config.model, "test-model");
@@ -291,10 +288,7 @@ mod tests {
     #[test]
     fn completion_request_builder_pattern() {
         let config = CompletionConfig::new("test-model");
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![Content::text("Hello")],
-        }];
+        let messages = vec![Message::user("Hello")];
 
         let request = CompletionRequest::new(config, messages)
             .with_system("You are a helpful assistant.")
