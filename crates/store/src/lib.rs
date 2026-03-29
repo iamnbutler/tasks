@@ -306,6 +306,7 @@ impl Store {
                     head_sha: None,      // Updated from GitHub on reconciliation
                     queue_position: None, // Computed lazily on API read
                     completed_at: None,  // Not persisted to DB yet
+                    mergeable_unknown: false, // Transient, updated from GitHub on reconciliation
                 }))
             }
             None => Ok(None),
@@ -346,6 +347,7 @@ impl Store {
                 head_sha: None,      // Updated from GitHub on reconciliation
                 queue_position: None, // Computed lazily on API read
                 completed_at: None,  // Not persisted to DB yet
+                mergeable_unknown: false, // Transient, updated from GitHub on reconciliation
             });
         }
         Ok(entries)

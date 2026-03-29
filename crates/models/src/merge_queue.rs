@@ -111,6 +111,11 @@ pub struct MergeQueueEntry {
     /// race conditions where GitHub's merged state hasn't propagated yet (issue #438).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// True when GitHub's `mergeable` field is Unknown (computation pending).
+    /// Entries with this flag set are skipped during orchestrator evaluation to
+    /// avoid approving PRs whose conflict status hasn't been determined yet (issue #503).
+    #[serde(default)]
+    pub mergeable_unknown: bool,
 }
 
 impl MergeQueueEntry {
@@ -126,6 +131,7 @@ impl MergeQueueEntry {
             head_sha: None,
             queue_position: None,
             completed_at: None,
+            mergeable_unknown: false,
         }
     }
 

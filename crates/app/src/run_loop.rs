@@ -1341,6 +1341,11 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         evaluated_prs: &std::collections::HashMap<String, String>,
         entry: &server::model::merge_queue::MergeQueueEntry,
     ) -> bool {
+        // Skip entries where GitHub hasn't resolved mergeability yet (issue #503).
+        // These will be re-checked on the next poll cycle when mergeable resolves.
+        if entry.mergeable_unknown {
+            return false;
+        }
         match evaluated_prs.get(&entry.pr_url) {
             None => true,
             Some(last_sha) => entry.head_sha.as_ref().is_some_and(|sha| sha != last_sha),

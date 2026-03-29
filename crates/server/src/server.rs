@@ -28,6 +28,7 @@ enum MqAction {
     Remove { entry_id: String, pr_url: String },
     MarkConflict { entry_id: String, pr_url: String },
     ClearConflict { entry_id: String },
+    SetMergeableUnknown { entry_id: String, unknown: bool },
 }
 
 #[derive(Debug, Error)]
@@ -1125,13 +1126,13 @@ impl Server {
     ) -> Result<u32, ServerError> {
         // Build a HashMap index of pr_url -> (entry_id, task_id, status) in one read pass.
         // This avoids O(N*M) from acquiring a lock and linear scanning for each PR.
-        let entry_index: HashMap<String, (String, String, MergeStatus)> = {
+        let entry_index: HashMap<String, (String, String, MergeStatus, bool)> = {
             let state = self.state.read().await;
             state
                 .merge_queue
                 .entries()
                 .iter()
-                .map(|e| (e.pr_url.clone(), (e.id.clone(), e.task_id.clone(), e.status)))
+                .map(|e| (e.pr_url.clone(), (e.id.clone(), e.task_id.clone(), e.status, e.mergeable_unknown)))
                 .collect()
         };
 
@@ -1143,27 +1144,32 @@ impl Server {
                 pr.owner, pr.repo, pr.number
             );
 
-            let Some((entry_id, task_id, current_status)) = entry_index.get(&pr_url) else {
+            let Some((entry_id, task_id, current_status, current_mergeable_unknown)) = entry_index.get(&pr_url) else {
                 continue;
             };
             let entry_id = entry_id.clone();
             let task_id = task_id.clone();
+            let current_mergeable_unknown = *current_mergeable_unknown;
 
-            let (action, entry_id_for_sha_update) = match pr.state {
+            let (action, entry_id_for_sha_update, mergeable_unknown_action) = match pr.state {
                 tasks_github::model::PullRequestState::Merged => {
                     if *current_status != MergeStatus::Merged {
-                        (Some(MqAction::MarkMerged { entry_id, task_id, pr_url }), None)
+                        (Some(MqAction::MarkMerged { entry_id, task_id, pr_url }), None, None)
                     } else {
                         continue;
                     }
                 }
                 tasks_github::model::PullRequestState::Closed => {
-                    (Some(MqAction::Remove { entry_id, pr_url }), None)
+                    (Some(MqAction::Remove { entry_id, pr_url }), None, None)
                 }
                 tasks_github::model::PullRequestState::Open => {
                     // For open PRs, always update head_sha to detect new commits
                     let sha_update_id = entry_id.clone();
                     // Update conflict status from GitHub's mergeable field
+                    let is_unknown = matches!(
+                        pr.mergeable,
+                        None | Some(tasks_github::model::MergeableState::Unknown)
+                    );
                     let conflict_action = match pr.mergeable {
                         Some(tasks_github::model::MergeableState::Conflicting)
                             if *current_status != MergeStatus::Conflict =>
@@ -1177,15 +1183,26 @@ impl Server {
                         }
                         _ => None,
                     };
-                    (conflict_action, Some(sha_update_id))
+                    // Track whether mergeability is unknown (issue #503).
+                    // When Unknown, defer orchestrator evaluation to avoid
+                    // approving PRs whose conflict status hasn't been determined.
+                    let mergeable_unknown_action = if is_unknown != current_mergeable_unknown {
+                        Some(MqAction::SetMergeableUnknown {
+                            entry_id: sha_update_id.clone(),
+                            unknown: is_unknown,
+                        })
+                    } else {
+                        None
+                    };
+                    (conflict_action, Some(sha_update_id), mergeable_unknown_action)
                 }
             };
-            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
+            actions.push((action, entry_id_for_sha_update, pr.head_sha.clone(), mergeable_unknown_action));
         }
 
         // Execute all actions
         let mut changes = 0u32;
-        for (action, entry_id_for_sha_update, head_sha) in actions {
+        for (action, entry_id_for_sha_update, head_sha, mergeable_unknown_action) in actions {
             if let Some(action) = action {
                 match action {
                     MqAction::MarkMerged { entry_id, pr_url, .. } => {
@@ -1243,6 +1260,29 @@ impl Server {
                             changes += 1;
                         }
                     }
+                    MqAction::SetMergeableUnknown { .. } => {
+                        // Handled below with mergeable_unknown_action
+                    }
+                }
+            }
+
+            // Update mergeable_unknown flag for open PRs (issue #503)
+            if let Some(MqAction::SetMergeableUnknown { entry_id, unknown }) = mergeable_unknown_action {
+                let mut state = self.state.write().await;
+                if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                    if unknown {
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            "reconciliation: GitHub mergeable is Unknown, deferring evaluation"
+                        );
+                    } else {
+                        tracing::debug!(
+                            entry_id = %entry_id,
+                            "reconciliation: GitHub mergeable resolved, enabling evaluation"
+                        );
+                    }
+                    entry.mergeable_unknown = unknown;
+                    changes += 1;
                 }
             }
 
