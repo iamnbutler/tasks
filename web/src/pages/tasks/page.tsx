@@ -6,6 +6,7 @@ import {
   ArrowUp,
   ChevronRight,
   ExternalLink,
+  MessageSquareWarning,
   Minus,
   Plus,
 } from "lucide-react";
@@ -212,6 +213,13 @@ function TaskRow({
         </IconCell>
       )}
       <TextCell>{task.title}</TextCell>
+      {task.rejection_feedback && (
+        <IconCell>
+          <span title="Has rejection feedback">
+            <MessageSquareWarning className="h-3.5 w-3.5 text-amber-500" />
+          </span>
+        </IconCell>
+      )}
       {task.labels.map((label) => (
         <BadgeCell key={label}>
           <Badge variant="outline" className="text-xs">
