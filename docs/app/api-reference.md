@@ -301,15 +301,17 @@ GET /api/merge-queue
 ]
 ```
 
-#### Approve Entry
+#### Approve Entry <!-- LAST_UPDATED: 2026-03-27 -->
 
-In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
+In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush. If the GitHub merge fails transiently, the entry reverts to Approved and will be retried automatically on the next poll cycle.
 
 ```http
 POST /api/merge-queue/:id/approve
 ```
 
 #### Reject Entry
+
+Permanently rejects the entry and persists the rejection to the database.
 
 ```http
 POST /api/merge-queue/:id/reject
@@ -331,7 +333,7 @@ Content-Type: application/json
 
 #### Flush Approved Entries
 
-Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of successfully merged entries.
+Merge all approved entries via GitHub API (Pause mode only). Returns the IDs of successfully merged entries. Entries that fail to merge transiently are reverted to Approved and will be retried on the next flush or poll cycle.
 
 ```http
 POST /api/merge-queue/flush

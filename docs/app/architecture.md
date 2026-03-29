@@ -66,7 +66,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 5. **Session** bridges events between agent and server
 6. **Merge Queue** receives completed work for review
 7. **Human** approves/rejects in merge queue
-8. **Merger** lands approved changes
+8. **Merger** lands approved changes; transient GitHub API failures revert the entry to Approved for automatic retry on the next poll cycle
 
 ### Event System
 
@@ -121,18 +121,20 @@ Communication uses JSON-line protocol over stdio:
 
 ## Storage
 
-### SQLite Database
+### SQLite Database <!-- LAST_UPDATED: 2026-03-27 -->
 
-Located at `~/.local/state/tasks/db.sqlite`:
+Located at `~/.local/state/tasks/db.sqlite`. Uses an r2d2 connection pool with WAL mode so reads don't block writes:
 
 - Projects - Tracked repositories
 - Tasks - Work items with state
 - Merge Queue - Pending approvals
 - Configuration - System settings
 
-### Event Logs
+### Event Logs <!-- LAST_UPDATED: 2026-03-27 -->
 
 Per-task event logs at `~/.local/state/tasks/events/{task-id}/events.jsonl`.
+
+Event logs are compacted hourly according to a configurable retention policy. Compaction trims old events per-task and removes orphaned task directories that no longer have corresponding database entries.
 
 ## Configuration
 
