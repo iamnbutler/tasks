@@ -22,8 +22,9 @@ use tasks_github::model::{IssueState, MergeableState, PullRequestState};
 use tasks_github::poller::RepoPoller;
 
 use tasks_orchestrator::{
-    ChatContext, ConflictContext, ConflictResolution, OperatingMode, Orchestrator,
-    OrchestratorAction, OrchestratorChat, QuestionContext, SystemContext,
+    AnswerConfidence, AwaySummary, ChatContext, ConflictContext, ConflictResolution,
+    OperatingMode, Orchestrator, OrchestratorAction, OrchestratorChat, QuestionContext,
+    SystemContext,
 };
 
 use crate::config::AppConfig;
@@ -1474,6 +1475,100 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             lower_mode(&orch_server, &reason).await;
                         }
                     }
+                    // Handle human reconnection — generate away summary (spec §4.1, issue #534).
+                    EventType::SystemHumanConnected => {
+                        info!("human reconnected — generating away summary");
+                        let summary_orch = orch.clone();
+                        let summary_server = orch_server.clone();
+                        tokio::spawn(async move {
+                            // Determine how long the human was away
+                            let last_disconnect = summary_server.presence.last_disconnect_at();
+                            let away_seconds = last_disconnect
+                                .map(|dt| (chrono::Utc::now() - dt).num_seconds())
+                                .unwrap_or(0);
+
+                            // Only generate summary if away for more than 30 seconds
+                            if away_seconds < 30 {
+                                debug!("human was away for less than 30s, skipping summary");
+                                return;
+                            }
+
+                            // Gather recent orchestrator and merge events to build summary.
+                            // We query key event types and filter by timestamp.
+                            let mut events_while_away = Vec::new();
+                            for prefix in &["merge:", "orchestrator:"] {
+                                match summary_server
+                                    .event_bus
+                                    .query_by_type_prefix(prefix, 200)
+                                    .await
+                                {
+                                    Ok(events) => {
+                                        for ev in events {
+                                            if let Some(dt) = last_disconnect {
+                                                if ev.ts >= dt {
+                                                    events_while_away.push(ev);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(prefix = prefix, error = %e, "failed to query events for away summary");
+                                    }
+                                }
+                            }
+
+                            // Get parked questions
+                            let parked = match &summary_server.store {
+                                Some(store) => match store.list_pending_parked_questions() {
+                                    Ok(q) => q,
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to read parked questions");
+                                        Vec::new()
+                                    }
+                                },
+                                None => Vec::new(),
+                            };
+
+                            // Generate summary
+                            match summary_orch
+                                .generate_away_summary(&events_while_away, parked, away_seconds)
+                                .await
+                            {
+                                Ok(summary) => {
+                                    info!(
+                                        message = %summary.message,
+                                        prs_merged = summary.prs_merged,
+                                        questions_parked = summary.questions_parked,
+                                        "away summary generated"
+                                    );
+
+                                    // Emit away summary event
+                                    let event = events::Event::new(
+                                        events::EventType::OrchestratorAwaySummary,
+                                        "",
+                                        events::Actor::Orchestrator,
+                                        serde_json::json!({
+                                            "message": summary.message,
+                                            "away_duration_seconds": summary.away_duration_seconds,
+                                            "prs_merged": summary.prs_merged,
+                                            "prs_rejected": summary.prs_rejected,
+                                            "questions_answered": summary.questions_answered,
+                                            "questions_parked": summary.questions_parked,
+                                            "conflicts_resolved": summary.conflicts_resolved,
+                                            "parked_questions": summary.parked_questions,
+                                        }),
+                                    );
+                                    if let Err(e) = summary_server.event_bus.publish(event).await {
+                                        error!(error = %e, "failed to emit away summary event");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "failed to generate away summary");
+                                }
+                            }
+                        });
+                        continue;
+                    }
                     // Handle stuck agents: when a task enters Question state, the
                     // orchestrator answers the question to unblock the agent (issue #533).
                     EventType::TaskStateQuestion => {
@@ -1538,8 +1633,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             continue;
                         }
 
-                        // No human present — orchestrator answers autonomously.
-                        // Look up the task and project for context.
+                        // No human present — orchestrator answers autonomously
+                        // with confidence assessment. Low-confidence answers are
+                        // parked for the human (spec §4.1, issue #534).
                         let (task, project) = {
                             let state = orch_server.state.read().await;
                             let task = state.tasks.get(&task_id).cloned();
@@ -1564,15 +1660,57 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             let context = QuestionContext {
                                 task: task.clone(),
                                 project,
-                                question: question_clone,
+                                question: question_clone.clone(),
                                 human_present: false,
                             };
 
-                            match orch_ref.answer_question(&context).await {
-                                Ok(answer) => {
+                            match orch_ref.answer_question_with_confidence(&context).await {
+                                Ok(result) => {
+                                    // If low confidence, park the question for human
+                                    if result.confidence == AnswerConfidence::Low {
+                                        info!(
+                                            task_id = %task_id,
+                                            "orchestrator parking question (low confidence)"
+                                        );
+
+                                        let parked = models::parked_question::ParkedQuestion::new(
+                                            uuid::Uuid::new_v4().to_string(),
+                                            &task_id,
+                                            &question_clone,
+                                            result.park_reason.as_deref().unwrap_or(
+                                                "Orchestrator wasn't confident enough to answer autonomously"
+                                            ),
+                                        );
+
+                                        // Persist the parked question
+                                        if let Some(store) = &server_ref.store {
+                                            if let Err(e) = store.save_parked_question(&parked) {
+                                                error!(task_id = %task_id, error = %e, "failed to save parked question");
+                                            }
+                                        }
+
+                                        // Emit parked question event
+                                        let park_event = events::Event::new(
+                                            events::EventType::OrchestratorQuestionParked,
+                                            &task_id,
+                                            events::Actor::Orchestrator,
+                                            serde_json::json!({
+                                                "question": question_clone,
+                                                "reason": parked.reason,
+                                                "parked_question_id": parked.id,
+                                            }),
+                                        );
+                                        if let Err(e) = server_ref.event_bus.publish(park_event).await {
+                                            error!(task_id = %task_id, error = %e, "failed to emit parked question event");
+                                        }
+                                        return;
+                                    }
+
+                                    let answer = result.answer;
                                     info!(
                                         task_id = %task_id,
                                         answer_len = answer.len(),
+                                        confidence = ?result.confidence,
                                         "orchestrator answered agent question"
                                     );
 
@@ -1588,6 +1726,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         serde_json::json!({
                                             "message": answer.clone(),
                                             "source": "orchestrator_answer",
+                                            "confidence": format!("{:?}", result.confidence).to_lowercase(),
                                         }),
                                     );
                                     if let Err(e) = server_ref.event_bus.publish(human_message_event).await {
@@ -2589,6 +2728,27 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             }
                             OrchestratorAction::PrioritizeTask { task_id, reason } => {
                                 info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            }
+                            OrchestratorAction::EmitAwaySummary(summary) => {
+                                info!(message = %summary.message, "emitting away summary from think()");
+                                let event = Event::new(
+                                    EventType::OrchestratorAwaySummary,
+                                    "",
+                                    Actor::Orchestrator,
+                                    serde_json::json!({
+                                        "message": summary.message,
+                                        "away_duration_seconds": summary.away_duration_seconds,
+                                        "prs_merged": summary.prs_merged,
+                                        "prs_rejected": summary.prs_rejected,
+                                        "questions_answered": summary.questions_answered,
+                                        "questions_parked": summary.questions_parked,
+                                        "conflicts_resolved": summary.conflicts_resolved,
+                                        "parked_questions": summary.parked_questions,
+                                    }),
+                                );
+                                if let Err(e) = think_server.event_bus.publish(event).await {
+                                    error!(error = %e, "failed to publish away summary");
+                                }
                             }
                         }
                     }

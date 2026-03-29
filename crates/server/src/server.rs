@@ -108,7 +108,7 @@ pub struct Server {
     pub state: Arc<RwLock<ServerState>>,
     pub event_bus: Arc<EventBus>,
     pub presence: Arc<PresenceTracker>,
-    pub(crate) store: Option<Arc<tasks_store::Store>>,
+    pub store: Option<Arc<tasks_store::Store>>,
     /// Flag to signal the poll loop to reset pollers (issue #256).
     rebuild_requested: AtomicBool,
 }
@@ -2492,7 +2492,7 @@ mod tests {
         let server = test_server().await;
         assert!(!server.is_human_present());
 
-        let _guard = server.presence.connect();
+        let (_guard, _) = server.presence.connect();
         assert!(server.is_human_present());
     }
 

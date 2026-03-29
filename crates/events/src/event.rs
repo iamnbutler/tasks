@@ -106,6 +106,18 @@ pub enum EventType {
     /// Session duration and total token accounting.
     SystemAccountingSession,
 
+    // Presence events (spec §4.1, issue #534)
+    /// Human connected (GUI client established SSE connection).
+    SystemHumanConnected,
+    /// Human disconnected (all GUI connections closed).
+    SystemHumanDisconnected,
+
+    // Autonomous mode events (spec §4.1, issue #534)
+    /// Orchestrator parked a question it wasn't confident enough to answer.
+    OrchestratorQuestionParked,
+    /// Summary of orchestrator actions while the human was away.
+    OrchestratorAwaySummary,
+
     // Self-update events (issue #305)
     /// New update is available from upstream.
     SystemUpdateAvailable,
@@ -172,6 +184,10 @@ impl EventType {
             Self::SystemAccountingTokens => "system:accounting:tokens",
             Self::SystemAccountingApiCall => "system:accounting:api_call",
             Self::SystemAccountingSession => "system:accounting:session",
+            Self::SystemHumanConnected => "system:human:connected",
+            Self::SystemHumanDisconnected => "system:human:disconnected",
+            Self::OrchestratorQuestionParked => "orchestrator:question_parked",
+            Self::OrchestratorAwaySummary => "orchestrator:away_summary",
             Self::SystemUpdateAvailable => "system:update:available",
             Self::SystemUpdateApplying => "system:update:applying",
         }
@@ -264,6 +280,10 @@ impl TryFrom<String> for EventType {
             "system:accounting:tokens" => Ok(Self::SystemAccountingTokens),
             "system:accounting:api_call" => Ok(Self::SystemAccountingApiCall),
             "system:accounting:session" => Ok(Self::SystemAccountingSession),
+            "system:human:connected" => Ok(Self::SystemHumanConnected),
+            "system:human:disconnected" => Ok(Self::SystemHumanDisconnected),
+            "orchestrator:question_parked" => Ok(Self::OrchestratorQuestionParked),
+            "orchestrator:away_summary" => Ok(Self::OrchestratorAwaySummary),
             "system:update:available" => Ok(Self::SystemUpdateAvailable),
             "system:update:applying" => Ok(Self::SystemUpdateApplying),
             _ => Err(format!("unknown event type: {}", s)),

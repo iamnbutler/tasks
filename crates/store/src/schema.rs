@@ -94,6 +94,18 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             error TEXT
         );
 
+        -- Parked questions: questions the orchestrator wasn't confident
+        -- enough to answer autonomously (spec §4.1, issue #534)
+        CREATE TABLE IF NOT EXISTS parked_questions (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            parked_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution TEXT
+        );
+
         -- Indexes for common query patterns (issue #465)
         -- tasks: lookup by project, filter by state, find by source
         CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);

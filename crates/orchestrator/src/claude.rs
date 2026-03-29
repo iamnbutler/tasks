@@ -10,10 +10,12 @@ use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, AnswerConfidence, AwaySummary, ConflictContext, ConflictTriage,
+    EvaluationContext, OrchestratorAction, QualityEvaluation, QuestionAnswer, QuestionContext,
+    SystemContext,
 };
 use events::EventType;
+use models::parked_question::ParkedQuestion;
 use models::task::{Task, TaskSource};
 use tasks_agent::{AnthropicProvider, CompletionConfig, CompletionRequest, Message, Provider};
 use tasks_github::GitHubClient;
@@ -483,13 +485,22 @@ impl Orchestrator for ClaudeOrchestrator {
         &self,
         context: &QuestionContext,
     ) -> Result<String, OrchestratorError> {
+        let result = self.answer_question_with_confidence(context).await?;
+        Ok(result.answer)
+    }
+
+    async fn answer_question_with_confidence(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<QuestionAnswer, OrchestratorError> {
         info!(
             task_id = %context.task.id,
             question_len = context.question.len(),
-            "Answering stuck agent's question"
+            human_present = context.human_present,
+            "Answering stuck agent's question with confidence assessment"
         );
 
-        let system = build_question_answer_system_prompt();
+        let system = build_question_answer_system_prompt_with_confidence();
 
         let user_prompt = build_question_answer_prompt(
             &context.task.title,
@@ -508,21 +519,128 @@ impl Orchestrator for ClaudeOrchestrator {
             .await
             .map_err(OrchestratorError::Agent)?;
 
-        let answer = response.text().trim().to_string();
+        let text = response.text().trim().to_string();
+
+        // Try to parse structured response with confidence
+        let result = parse_confidence_answer(&text);
 
         info!(
             task_id = %context.task.id,
-            answer_len = answer.len(),
+            answer_len = result.answer.len(),
+            confidence = ?result.confidence,
             "Generated answer for stuck agent"
         );
 
-        Ok(answer)
+        Ok(result)
+    }
+
+    async fn generate_away_summary(
+        &self,
+        events_while_away: &[events::Event],
+        parked_questions: Vec<ParkedQuestion>,
+        away_seconds: i64,
+    ) -> Result<AwaySummary, OrchestratorError> {
+        let mut prs_merged = 0u32;
+        let mut prs_rejected = 0u32;
+        let mut questions_answered = 0u32;
+        let mut conflicts_resolved = 0u32;
+
+        for event in events_while_away {
+            match event.event_type {
+                EventType::MergeCompleted => prs_merged += 1,
+                EventType::MergeRejected | EventType::MergeChangesRequested => {
+                    prs_rejected += 1;
+                }
+                EventType::OrchestratorFeedback => {
+                    let action = event.data.get("action").and_then(|v| v.as_str());
+                    match action {
+                        Some("question_answer") => questions_answered += 1,
+                        Some("mechanical_rebase") | Some("auto_resolve") => {
+                            conflicts_resolved += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let questions_parked = parked_questions.len() as u32;
+
+        // Build human-readable duration
+        let duration = if away_seconds < 60 {
+            format!("{}s", away_seconds)
+        } else if away_seconds < 3600 {
+            format!("{}m", away_seconds / 60)
+        } else {
+            format!(
+                "{}h {}m",
+                away_seconds / 3600,
+                (away_seconds % 3600) / 60
+            )
+        };
+
+        let mut parts = Vec::new();
+        if prs_merged > 0 {
+            parts.push(format!(
+                "merged {} PR{}",
+                prs_merged,
+                if prs_merged == 1 { "" } else { "s" }
+            ));
+        }
+        if prs_rejected > 0 {
+            parts.push(format!(
+                "rejected {} PR{}",
+                prs_rejected,
+                if prs_rejected == 1 { "" } else { "s" }
+            ));
+        }
+        if questions_answered > 0 {
+            parts.push(format!(
+                "answered {} agent question{}",
+                questions_answered,
+                if questions_answered == 1 { "" } else { "s" }
+            ));
+        }
+        if conflicts_resolved > 0 {
+            parts.push(format!(
+                "resolved {} conflict{}",
+                conflicts_resolved,
+                if conflicts_resolved == 1 { "" } else { "s" }
+            ));
+        }
+        if questions_parked > 0 {
+            parts.push(format!(
+                "{} question{} need{} your input",
+                questions_parked,
+                if questions_parked == 1 { "" } else { "s" },
+                if questions_parked == 1 { "s" } else { "" }
+            ));
+        }
+
+        let message = if parts.is_empty() {
+            format!("While you were gone ({duration}): nothing notable happened.")
+        } else {
+            format!("While you were gone ({duration}): {}.", parts.join(", "))
+        };
+
+        Ok(AwaySummary {
+            away_duration_seconds: away_seconds,
+            prs_merged,
+            prs_rejected,
+            questions_answered,
+            questions_parked,
+            conflicts_resolved,
+            parked_questions,
+            message,
+        })
     }
 }
 
-/// Build the system prompt for answering agent questions.
-fn build_question_answer_system_prompt() -> String {
+/// Build the system prompt for answering agent questions with confidence assessment.
+fn build_question_answer_system_prompt_with_confidence() -> String {
     r#"You are a project foreman helping an implementor who is stuck on a coding task.
+The human operator is currently away, so you are making autonomous decisions.
 
 Your role:
 - Give concise, actionable guidance — the agent needs to move forward, not read an essay.
@@ -531,11 +649,58 @@ Your role:
 - If the question is about a design decision, make the call — don't equivocate.
 - Keep your answer under 500 words. Shorter is better.
 
+IMPORTANT: You must also assess your confidence in the answer.
+Start your response with a confidence tag on its own line:
+- [CONFIDENCE: high] — You're confident this is the right guidance (technical questions with clear answers, standard patterns)
+- [CONFIDENCE: medium] — You can give reasonable guidance but it involves judgment calls
+- [CONFIDENCE: low] — The question requires human judgment (business decisions, unclear requirements, security-sensitive choices, questions about user preferences)
+
+Then provide your answer on the following lines.
+
 Do NOT:
 - Repeat the question back
 - Give vague advice like "consider the tradeoffs"
 - Suggest the agent ask someone else
 - Write code unless it directly answers the question"#.to_string()
+}
+
+/// Parse a confidence-tagged answer from the LLM response.
+fn parse_confidence_answer(text: &str) -> QuestionAnswer {
+    let text = text.trim();
+
+    // Try to extract [CONFIDENCE: level] tag
+    if let Some(rest) = text.strip_prefix("[CONFIDENCE:") {
+        if let Some(end) = rest.find(']') {
+            let level = rest[..end].trim().to_lowercase();
+            let answer = rest[end + 1..].trim().to_string();
+            let confidence = match level.as_str() {
+                "high" => AnswerConfidence::High,
+                "medium" => AnswerConfidence::Medium,
+                "low" => AnswerConfidence::Low,
+                _ => AnswerConfidence::Medium,
+            };
+            let park_reason = if confidence == AnswerConfidence::Low {
+                Some(
+                    "The orchestrator assessed low confidence in answering this question autonomously."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            return QuestionAnswer {
+                answer,
+                confidence,
+                park_reason,
+            };
+        }
+    }
+
+    // No confidence tag found — default to medium
+    QuestionAnswer {
+        answer: text.to_string(),
+        confidence: AnswerConfidence::Medium,
+        park_reason: None,
+    }
 }
 
 /// Build the user prompt for answering an agent's question.
@@ -644,6 +809,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -727,5 +893,38 @@ That's all."#;
     fn test_extract_json_none() {
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("incomplete { json").is_none());
+    }
+
+    #[test]
+    fn test_parse_confidence_high() {
+        let text = "[CONFIDENCE: high]\nUse the standard pattern from the codebase.";
+        let result = parse_confidence_answer(text);
+        assert_eq!(result.confidence, AnswerConfidence::High);
+        assert_eq!(result.answer, "Use the standard pattern from the codebase.");
+        assert!(result.park_reason.is_none());
+    }
+
+    #[test]
+    fn test_parse_confidence_low() {
+        let text = "[CONFIDENCE: low]\nThis depends on business requirements.";
+        let result = parse_confidence_answer(text);
+        assert_eq!(result.confidence, AnswerConfidence::Low);
+        assert!(result.park_reason.is_some());
+    }
+
+    #[test]
+    fn test_parse_confidence_missing_tag() {
+        let text = "Just do it this way.";
+        let result = parse_confidence_answer(text);
+        assert_eq!(result.confidence, AnswerConfidence::Medium);
+        assert_eq!(result.answer, "Just do it this way.");
+    }
+
+    #[test]
+    fn test_parse_confidence_medium() {
+        let text = "[CONFIDENCE: medium]\nI'd suggest approach A but B could also work.";
+        let result = parse_confidence_answer(text);
+        assert_eq!(result.confidence, AnswerConfidence::Medium);
+        assert!(result.park_reason.is_none());
     }
 }

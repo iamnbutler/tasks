@@ -18,6 +18,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use models::automation::{Automation, AutomationRun, AutomationState, RunStatus, TriggerType};
 use models::merge_queue::{MergeQueueEntry, MergeStatus};
+use models::parked_question::ParkedQuestion;
 use models::project::Project;
 use models::task::{FailureInfo, Task, TaskSource, TaskState};
 use thiserror::Error;
@@ -356,6 +357,69 @@ impl Store {
         let affected = self
             .conn()?
             .execute("DELETE FROM merge_queue WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    // ── Parked Questions (spec §4.1, issue #534) ────────────────────
+
+    /// Save a parked question.
+    pub fn save_parked_question(&self, question: &ParkedQuestion) -> Result<(), StoreError> {
+        let parked_at = question.parked_at.to_rfc3339();
+        let resolved_at = question.resolved_at.map(|dt| dt.to_rfc3339());
+        self.conn()?.execute(
+            "INSERT OR REPLACE INTO parked_questions (id, task_id, question, reason, parked_at, resolved_at, resolution)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                question.id,
+                question.task_id,
+                question.question,
+                question.reason,
+                parked_at,
+                resolved_at,
+                question.resolution,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all unresolved parked questions.
+    pub fn list_pending_parked_questions(&self) -> Result<Vec<ParkedQuestion>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, question, reason, parked_at, resolved_at, resolution
+             FROM parked_questions WHERE resolved_at IS NULL ORDER BY parked_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let parked_at: String = row.get(4)?;
+            let resolved_at: Option<String> = row.get(5)?;
+            Ok(ParkedQuestion {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                question: row.get(2)?,
+                reason: row.get(3)?,
+                parked_at: DateTime::parse_from_rfc3339(&parked_at)
+                    .unwrap_or_default()
+                    .with_timezone(&Utc),
+                resolved_at: resolved_at.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                }),
+                resolution: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Resolve a parked question.
+    pub fn resolve_parked_question(
+        &self,
+        id: &str,
+        resolution: &str,
+    ) -> Result<bool, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let affected = self.conn()?.execute(
+            "UPDATE parked_questions SET resolved_at = ?1, resolution = ?2 WHERE id = ?3 AND resolved_at IS NULL",
+            params![now, resolution, id],
+        )?;
         Ok(affected > 0)
     }
 

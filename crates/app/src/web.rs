@@ -81,6 +81,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounting/tasks/{id}", get(get_task_accounting))
         .route("/containers", get(list_containers))
         .route("/events/query", get(query_events))
+        // Parked questions (spec §4.1, issue #534)
+        .route("/parked-questions", get(list_parked_questions))
+        .route("/parked-questions/{id}/resolve", post(resolve_parked_question))
         // Self-update endpoints (issue #305, #320)
         .route("/self-update", get(get_self_update_status))
         .route("/self-update/apply", post(apply_self_update))
@@ -119,6 +122,7 @@ struct SnapshotResponse {
     automations: Vec<models::automation::Automation>,
     slot_utilization: SlotUtilization,
     human_present: bool,
+    parked_questions: Vec<models::parked_question::ParkedQuestion>,
 }
 
 #[derive(Serialize)]
@@ -409,6 +413,12 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
             max: state.max_sessions,
         },
         human_present: state.server.is_human_present(),
+        parked_questions: state
+            .server
+            .store
+            .as_ref()
+            .and_then(|s| s.list_pending_parked_questions().ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -1081,6 +1091,51 @@ async fn list_containers(
 ///
 /// Returns information about whether an update is available from upstream.
 /// Note: Full functionality requires Phase 1 infrastructure (#319).
+// --- Parked Questions (spec §4.1, issue #534) ---
+
+/// GET /api/parked-questions — List unresolved parked questions.
+async fn list_parked_questions(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<models::parked_question::ParkedQuestion>>, ApiError> {
+    let store = state
+        .server
+        .store
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no store configured".to_string()))?;
+    let questions = store
+        .list_pending_parked_questions()
+        .map_err(|e| ApiError::Server(server::ServerError::StoreError(e.to_string())))?;
+    Ok(Json(questions))
+}
+
+/// POST /api/parked-questions/:id/resolve — Resolve a parked question.
+async fn resolve_parked_question(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ResolveParkedQuestionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = state
+        .server
+        .store
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no store configured".to_string()))?;
+    let resolved = store
+        .resolve_parked_question(&id, &body.resolution)
+        .map_err(|e| ApiError::Server(server::ServerError::StoreError(e.to_string())))?;
+    if resolved {
+        Ok(Json(serde_json::json!({ "resolved": true })))
+    } else {
+        Err(ApiError::NotFound(format!("parked question {} not found or already resolved", id)))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResolveParkedQuestionRequest {
+    resolution: String,
+}
+
+// --- Self-update ---
+
 async fn get_self_update_status(
     State(state): State<ApiState>,
 ) -> Json<SelfUpdateStatusResponse> {
@@ -1203,7 +1258,26 @@ async fn event_stream(
     Query(query): Query<EventStreamQuery>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     // Register presence — the guard lives until the stream is dropped (client disconnects).
-    let presence_guard = state.server.presence.connect_owned();
+    let (presence_guard, was_reconnect) = state.server.presence.connect_owned();
+
+    // Emit presence event if this is a reconnection (0 → 1 connections).
+    if was_reconnect {
+        let event = events::Event::new(
+            events::EventType::SystemHumanConnected,
+            "",
+            events::Actor::System,
+            serde_json::json!({
+                "connection_count": state.server.presence.connection_count(),
+                "last_disconnect_at": state.server.presence.last_disconnect_at(),
+            }),
+        );
+        let bus = state.server.event_bus.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bus.publish(event).await {
+                tracing::error!(error = %e, "failed to emit human connected event");
+            }
+        });
+    }
 
     let rx = state.server.event_bus.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |result| {

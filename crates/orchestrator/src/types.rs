@@ -8,6 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use models::merge_queue::{ConflictInfo, ConflictType, MergeQueueEntry, MergeStatus};
+use models::parked_question::ParkedQuestion;
 use models::project::Project;
 use models::task::{Task, TaskState};
 use serde::{Deserialize, Serialize};
@@ -279,6 +280,32 @@ pub struct SystemContext {
     pub last_think_at: Option<DateTime<Utc>>,
 }
 
+/// The orchestrator's response to an agent question, including confidence.
+///
+/// When the human is disconnected, the orchestrator assesses its confidence
+/// in the answer. Low-confidence answers are parked for the human instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    /// The answer text (may be empty if parked).
+    pub answer: String,
+    /// Confidence level: "high", "medium", or "low".
+    pub confidence: AnswerConfidence,
+    /// If parked, the reason it wasn't answered directly.
+    pub park_reason: Option<String>,
+}
+
+/// Confidence level for an autonomous question answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerConfidence {
+    /// Orchestrator is confident — answer and unblock the agent.
+    High,
+    /// Orchestrator is somewhat confident — answer but flag for human review.
+    Medium,
+    /// Orchestrator is not confident — park for human.
+    Low,
+}
+
 /// Actions the orchestrator can request from its think() pass.
 ///
 /// The run loop interprets these and executes them against the server.
@@ -297,7 +324,29 @@ pub enum OrchestratorAction {
         task_id: String,
         reason: String,
     },
-    // Future: DispatchAgent { task_id: String, config: DispatchConfig }
-    // Future: CreateIssue { repo: String, title: String, body: String }
-    // Future: CommentOnPr { pr_url: String, body: String }
+    /// Emit an away summary when the human reconnects (spec §4.1, issue #534).
+    EmitAwaySummary(AwaySummary),
+}
+
+/// Summary of what the orchestrator did while the human was away (spec §4.1).
+///
+/// Generated when the human reconnects after being disconnected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwaySummary {
+    /// How long the human was away.
+    pub away_duration_seconds: i64,
+    /// Number of PRs merged autonomously.
+    pub prs_merged: u32,
+    /// Number of PRs rejected.
+    pub prs_rejected: u32,
+    /// Number of agent questions answered autonomously.
+    pub questions_answered: u32,
+    /// Number of questions parked for the human.
+    pub questions_parked: u32,
+    /// Number of conflicts resolved.
+    pub conflicts_resolved: u32,
+    /// Parked questions awaiting human input.
+    pub parked_questions: Vec<ParkedQuestion>,
+    /// Human-readable summary message.
+    pub message: String,
 }

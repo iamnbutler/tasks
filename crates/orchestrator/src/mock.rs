@@ -5,9 +5,11 @@ use std::sync::Mutex;
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, AnswerConfidence, AwaySummary, ConflictContext, ConflictTriage,
+    EvaluationContext, OrchestratorAction, QualityEvaluation, QuestionAnswer, QuestionContext,
+    SystemContext,
 };
+use models::parked_question::ParkedQuestion;
 use models::task::Task;
 
 /// A mock orchestrator that returns configurable responses.
@@ -123,6 +125,36 @@ impl Orchestrator for MockOrchestrator {
     ) -> Result<String, OrchestratorError> {
         *self.answer_question_count.lock().unwrap() += 1;
         Ok("Mock: proceed with whatever approach you think is best.".to_string())
+    }
+
+    async fn answer_question_with_confidence(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<QuestionAnswer, OrchestratorError> {
+        let answer = self.answer_question(context).await?;
+        Ok(QuestionAnswer {
+            answer,
+            confidence: AnswerConfidence::High,
+            park_reason: None,
+        })
+    }
+
+    async fn generate_away_summary(
+        &self,
+        _events_while_away: &[events::Event],
+        parked_questions: Vec<ParkedQuestion>,
+        away_seconds: i64,
+    ) -> Result<AwaySummary, OrchestratorError> {
+        Ok(AwaySummary {
+            away_duration_seconds: away_seconds,
+            prs_merged: 0,
+            prs_rejected: 0,
+            questions_answered: 0,
+            questions_parked: parked_questions.len() as u32,
+            conflicts_resolved: 0,
+            parked_questions,
+            message: format!("Mock: away for {}s", away_seconds),
+        })
     }
 }
 
@@ -263,5 +295,51 @@ mod tests {
         let result = mock.answer_question(&ctx).await.unwrap();
         assert!(!result.is_empty());
         assert_eq!(*mock.answer_question_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_answer_question_with_confidence() {
+        let mock = MockOrchestrator::approving();
+        let ctx = QuestionContext {
+            task: Task::new("task-1", TaskSource::Internal, "Test task", "proj-1"),
+            project: Project::new("proj-1", "owner/repo"),
+            question: "How should I structure the database schema?".to_string(),
+            human_present: false,
+        };
+        let result = mock.answer_question_with_confidence(&ctx).await.unwrap();
+        assert!(!result.answer.is_empty());
+        assert_eq!(result.confidence, AnswerConfidence::High);
+        assert!(result.park_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_away_summary_empty() {
+        let mock = MockOrchestrator::approving();
+        let result = mock
+            .generate_away_summary(&[], Vec::new(), 300)
+            .await
+            .unwrap();
+        assert_eq!(result.away_duration_seconds, 300);
+        assert_eq!(result.prs_merged, 0);
+        assert!(result.message.contains("300s"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_away_summary_with_events() {
+        use models::parked_question::ParkedQuestion;
+
+        let mock = MockOrchestrator::approving();
+        let parked = vec![ParkedQuestion::new(
+            "pq-1",
+            "task-1",
+            "What color should the button be?",
+            "Business decision",
+        )];
+        let result = mock
+            .generate_away_summary(&[], parked, 3600)
+            .await
+            .unwrap();
+        assert_eq!(result.questions_parked, 1);
+        assert_eq!(result.parked_questions.len(), 1);
     }
 }

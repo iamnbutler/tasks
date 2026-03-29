@@ -10,9 +10,10 @@
 
 use crate::error::OrchestratorError;
 use crate::types::{
-    ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction, QualityEvaluation,
-    QuestionContext, SystemContext,
+    AwaySummary, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
+    QualityEvaluation, QuestionAnswer, QuestionContext, SystemContext,
 };
+use models::parked_question::ParkedQuestion;
 use models::task::Task;
 
 /// Trait for orchestrator implementations.
@@ -80,4 +81,25 @@ pub trait Orchestrator: Sync {
         &self,
         context: &QuestionContext,
     ) -> Result<String, OrchestratorError>;
+
+    /// Answer a stuck agent's question with confidence assessment (spec §4.1).
+    ///
+    /// Like `answer_question`, but also assesses whether the orchestrator
+    /// is confident enough to answer autonomously. Low-confidence answers
+    /// should be parked for the human instead.
+    async fn answer_question_with_confidence(
+        &self,
+        context: &QuestionContext,
+    ) -> Result<QuestionAnswer, OrchestratorError>;
+
+    /// Generate a summary of what happened while the human was away (spec §4.1).
+    ///
+    /// Called when the human reconnects. The orchestrator reviews events that
+    /// occurred during the absence and produces a concise summary.
+    async fn generate_away_summary(
+        &self,
+        events_while_away: &[events::Event],
+        parked_questions: Vec<ParkedQuestion>,
+        away_seconds: i64,
+    ) -> Result<AwaySummary, OrchestratorError>;
 }
