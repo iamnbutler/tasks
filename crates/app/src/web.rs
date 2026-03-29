@@ -119,6 +119,10 @@ struct SnapshotResponse {
     automations: Vec<models::automation::Automation>,
     slot_utilization: SlotUtilization,
     human_present: bool,
+    /// Cargo package version of the server binary.
+    server_version: &'static str,
+    /// Current data schema version (bumped on incompatible changes).
+    data_version: u32,
 }
 
 #[derive(Serialize)]
@@ -409,6 +413,8 @@ async fn snapshot(State(state): State<ApiState>) -> Json<SnapshotResponse> {
             max: state.max_sessions,
         },
         human_present: state.server.is_human_present(),
+        server_version: env!("CARGO_PKG_VERSION"),
+        data_version: tasks_store::DATA_VERSION,
     })
 }
 

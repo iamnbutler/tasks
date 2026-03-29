@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import {
+  AlertTriangle,
   LayoutDashboard,
   ListTodo,
   GitMerge,
@@ -546,9 +547,42 @@ function ProjectSelector() {
 // Layout
 // ---------------------------------------------------------------------------
 
+const DATA_VERSION_KEY = "tasks:data_version";
+
 export function Layout() {
   const { connected, snapshot, updateStatus, updateDismissed, dismissUpdate, refreshUpdateStatus } = useAppState();
   const slotUtil = snapshot?.slot_utilization;
+  const [dataVersionMismatch, setDataVersionMismatch] = useState(false);
+  const initialVersionSet = useRef(false);
+
+  // Detect data version changes across page loads / server restarts.
+  // On first load, store the version. On subsequent snapshots, compare.
+  useEffect(() => {
+    if (snapshot?.data_version == null) return;
+    const currentVersion = String(snapshot.data_version);
+    const storedVersion = localStorage.getItem(DATA_VERSION_KEY);
+
+    if (storedVersion === null || !initialVersionSet.current) {
+      // First time seeing a version — store it
+      localStorage.setItem(DATA_VERSION_KEY, currentVersion);
+      initialVersionSet.current = true;
+      // If there was already a stored version and it differs, that means the
+      // server was upgraded between sessions.
+      if (storedVersion !== null && storedVersion !== currentVersion) {
+        setDataVersionMismatch(true);
+      }
+    } else if (storedVersion !== currentVersion) {
+      // Version changed while the app is running (server restarted with new version)
+      setDataVersionMismatch(true);
+    }
+  }, [snapshot?.data_version]);
+
+  function dismissDataVersionBanner() {
+    setDataVersionMismatch(false);
+    if (snapshot?.data_version != null) {
+      localStorage.setItem(DATA_VERSION_KEY, String(snapshot.data_version));
+    }
+  }
 
   // Show update banner if update is available (or applying) and not dismissed
   const showUpdateBanner = updateStatus && (updateStatus.available || updateStatus.applying) && !updateDismissed;
@@ -612,11 +646,43 @@ export function Layout() {
               </span>
             )}
           </div>
+          {snapshot?.server_version && (
+            <div className="text-[10px] text-muted-foreground/60">
+              v{snapshot.server_version}
+            </div>
+          )}
         </div>
       </aside>
 
       {/* Main content */}
       <main className="flex flex-1 flex-col overflow-hidden">
+        {dataVersionMismatch && (
+          <div className="flex items-center gap-2 bg-yellow-500/10 border-b border-yellow-500/30 px-4 py-2 text-sm text-yellow-200">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-yellow-500" />
+            <span>
+              Data schema updated to v{snapshot?.data_version}. The server has cleared
+              stale data automatically. You may want to reload the page.
+            </span>
+            <div className="ml-auto flex gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 text-xs"
+                onClick={() => window.location.reload()}
+              >
+                Reload
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 text-xs text-muted-foreground"
+                onClick={dismissDataVersionBanner}
+              >
+                Dismiss
+              </Button>
+            </div>
+          </div>
+        )}
         {showUpdateBanner && (
           <UpdateBanner
             status={updateStatus}
