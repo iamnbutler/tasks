@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { ExternalLink, Check, X } from "lucide-react";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
-import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
+import { ApiError, flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ListView, ListEmptyState } from "@/components/ui/list-view";
@@ -70,8 +70,8 @@ function MergeQueueRow({
     try {
       await approveMerge(entry.id);
       onRefresh();
-    } catch {
-      toast.error("Failed to approve merge entry");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Failed to approve merge entry");
     }
   }
 
@@ -79,8 +79,8 @@ function MergeQueueRow({
     try {
       await rejectMerge(entry.id);
       onRefresh();
-    } catch {
-      toast.error("Failed to reject merge entry");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Failed to reject merge entry");
     }
   }
 
@@ -292,8 +292,8 @@ export function MergeQueuePage() {
     try {
       await flushMergeQueue();
       await refreshSnapshot();
-    } catch {
-      toast.error("Failed to flush merge queue");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Failed to flush merge queue");
     } finally {
       setFlushing(false);
     }

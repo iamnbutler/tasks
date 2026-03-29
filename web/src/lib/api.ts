@@ -12,10 +12,35 @@ import type {
   UpdateStatus,
 } from "./types";
 
+/** An API error with the status code and server-provided message. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+async function extractErrorMessage(
+  res: Response,
+  path: string
+): Promise<string> {
+  try {
+    const body = await res.json();
+    if (typeof body?.error === "string") return body.error;
+  } catch {
+    // body wasn't JSON — fall through
+  }
+  return `${res.status} ${res.statusText}: ${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init);
   if (!res.ok) {
-    throw new Error(`${res.status} ${res.statusText}: ${path}`);
+    const msg = await extractErrorMessage(res, path);
+    throw new ApiError(res.status, msg);
   }
   return res.json();
 }
@@ -23,7 +48,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 async function requestVoid(path: string, init?: RequestInit): Promise<void> {
   const res = await fetch(path, init);
   if (!res.ok) {
-    throw new Error(`${res.status} ${res.statusText}: ${path}`);
+    const msg = await extractErrorMessage(res, path);
+    throw new ApiError(res.status, msg);
   }
 }
 

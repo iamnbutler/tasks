@@ -22,7 +22,8 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
-import { cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
+import { ApiError, cancelTask, fetchTaskEvents, sendChat, subscribeEvents } from "@/lib/api";
+import { allowedTransitions, isTerminalState } from "@/lib/task-states";
 import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -476,9 +477,13 @@ function SessionView({ taskId, chatEnabled }: { taskId: string; chatEnabled: boo
     setChatInput("");
     try {
       await sendChat(taskId, text);
-    } catch {
+    } catch (err) {
       setChatInput(text);
-      toast.error("Failed to send message to agent");
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : "Failed to send message to agent";
+      toast.error(message);
     } finally {
       setSending(false);
     }
@@ -740,12 +745,50 @@ function PropertyRow({ label, children }: { label: string; children: React.React
   );
 }
 
+function AllowedTransitions({ state }: { state: TaskState }) {
+  const transitions = allowedTransitions(state);
+  if (transitions.length === 0) {
+    return (
+      <span className="text-xs text-muted-foreground italic">
+        Terminal state
+      </span>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {transitions.map((s) => {
+        const meta = taskStateMeta[s];
+        if (!meta) return null;
+        const Icon = meta.icon;
+        return (
+          <Badge
+            key={s}
+            variant="outline"
+            className={cn("gap-1 text-[10px] px-1.5 py-0", meta.className)}
+          >
+            <Icon className="h-2.5 w-2.5" />
+            {meta.label}
+          </Badge>
+        );
+      })}
+    </div>
+  );
+}
+
 function PropertiesSidebar({ task, projectName }: { task: Task; projectName: string }) {
   return (
     <div className="space-y-1">
       <PropertyRow label="Status">
         <StateBadge state={task.state} />
       </PropertyRow>
+
+      {/* Show allowed next states */}
+      <div className="py-2">
+        <span className="text-sm text-muted-foreground block mb-1.5">
+          {isTerminalState(task.state) ? "Transitions" : "Next states"}
+        </span>
+        <AllowedTransitions state={task.state} />
+      </div>
 
       <PropertyRow label="Priority">
         <span className="text-sm">
@@ -869,8 +912,12 @@ export function TaskDetailPage() {
     setCancelling(true);
     try {
       await cancelTask(id);
-    } catch {
-      toast.error("Failed to cancel task");
+    } catch (err) {
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : "Failed to cancel task";
+      toast.error(message);
     } finally {
       setCancelling(false);
     }
