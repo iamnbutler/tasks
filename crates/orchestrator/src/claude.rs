@@ -8,10 +8,10 @@ use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, build_think_prompt, parse_pr_url, system_prompt, think_system_prompt};
 use crate::types::{
-    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
-    QualityEvaluation, QuestionContext, SystemContext,
+    default_triage, ConflictContext, ConflictTriage, EvaluationContext, OperatingMode,
+    OrchestratorAction, QualityEvaluation, QuestionContext, SystemContext,
 };
 use events::EventType;
 use models::task::{Task, TaskSource};
@@ -374,107 +374,93 @@ impl Orchestrator for ClaudeOrchestrator {
         &self,
         context: &SystemContext,
     ) -> Result<Vec<OrchestratorAction>, OrchestratorError> {
-        // Rule-based reasoning pass — no LLM calls.
-        // Survey system state and recent events, identify patterns, narrate.
-        let mut actions = Vec::new();
-
-        // Narrate recent events the human should know about
-        for event in &context.recent_events {
-            match &event.event_type {
-                EventType::TaskStateFailed => {
-                    let reason = event
-                        .data
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown reason");
-                    actions.push(OrchestratorAction::EmitThought(format!(
-                        "Task {} failed: {}",
-                        event.task, reason
-                    )));
-                }
-                EventType::TaskStateCompleted => {
-                    actions.push(OrchestratorAction::EmitThought(format!(
-                        "Task {} completed.",
-                        event.task
-                    )));
-                }
-                EventType::MergeCompleted => {
-                    let task_id = event
-                        .data
-                        .get("task_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&event.task);
-                    actions.push(OrchestratorAction::EmitThought(format!(
-                        "Merged PR for task {}.",
-                        task_id
-                    )));
-                }
-                EventType::MergeConflict => {
-                    let task_id = event
-                        .data
-                        .get("task_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&event.task);
-                    actions.push(OrchestratorAction::EmitThought(format!(
-                        "Conflict detected on task {}.",
-                        task_id
-                    )));
-                }
-                EventType::SystemModePlay => {
-                    actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Play — fully autonomous.".to_string(),
-                    ));
-                }
-                EventType::SystemModePause => {
-                    actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Pause — holding approved merges.".to_string(),
-                    ));
-                }
-                EventType::SystemModeStop => {
-                    actions.push(OrchestratorAction::EmitThought(
-                        "Mode changed to Stop — idle.".to_string(),
-                    ));
-                }
-                _ => {}
-            }
+        // If there are no recent events and no interesting state, skip narration.
+        // This avoids unnecessary LLM calls during quiet periods.
+        if context.recent_events.is_empty() && !has_interesting_state(context) {
+            return Ok(Vec::new());
         }
 
-        // Pattern detection: multiple failures in the same area
-        let recent_failures: Vec<&events::Event> = context
-            .recent_events
+        // Build summaries for the LLM prompt
+        let mode = match context.mode {
+            OperatingMode::Play => "Play",
+            OperatingMode::Pause => "Pause",
+            OperatingMode::Stop => "Stop",
+        };
+
+        let projects: Vec<String> = context
+            .projects
             .iter()
-            .filter(|e| e.event_type == EventType::TaskStateFailed)
+            .map(|p| p.repo.clone())
             .collect();
-        if recent_failures.len() >= 3 {
-            actions.push(OrchestratorAction::EmitThought(format!(
-                "{} tasks failed recently — possible systemic issue.",
-                recent_failures.len()
-            )));
-        }
 
-        // Surface long-running sessions
-        use models::task::TaskState;
-        let long_running: Vec<&Task> = context
+        let task_summaries: Vec<String> = context
             .tasks
             .iter()
-            .filter(|t| t.state == TaskState::Running)
-            .filter(|t| {
-                t.last_activity_at
-                    .map(|at| (chrono::Utc::now() - at).num_minutes() > 30)
-                    .unwrap_or(false)
+            .map(|t| {
+                let id_prefix = &t.id[..8.min(t.id.len())];
+                let age = t.last_activity_at
+                    .map(|at| format!("{}m ago", (chrono::Utc::now() - at).num_minutes()))
+                    .unwrap_or_else(|| "no activity".to_string());
+                format!("[{}] {} — state: {:?}, last activity: {}", id_prefix, t.title, t.state, age)
             })
             .collect();
-        for task in &long_running {
-            let mins = task
-                .last_activity_at
-                .map(|at| (chrono::Utc::now() - at).num_minutes())
-                .unwrap_or(0);
-            actions.push(OrchestratorAction::EmitThought(format!(
-                "Task {} has been running with no activity for {}m.",
-                &task.id[..8.min(task.id.len())],
-                mins
-            )));
-        }
+
+        let merge_queue_summaries: Vec<String> = context
+            .merge_queue
+            .iter()
+            .map(|e| {
+                let id_prefix = &e.id[..8.min(e.id.len())];
+                format!("[{}] {} — status: {:?}, PR: {}", id_prefix, e.task_id, e.status, e.pr_url)
+            })
+            .collect();
+
+        let recent_event_summaries: Vec<String> = context
+            .recent_events
+            .iter()
+            .map(summarize_event)
+            .collect();
+
+        let last_think_ago = context.last_think_at.map(|at| {
+            (chrono::Utc::now() - at).num_seconds().unsigned_abs()
+        });
+
+        let system = think_system_prompt();
+        let user_prompt = build_think_prompt(
+            mode,
+            context.human_present,
+            &projects,
+            &task_summaries,
+            &merge_queue_summaries,
+            &recent_event_summaries,
+            last_think_ago,
+        );
+
+        // Use a faster/cheaper model for think() narration (configurable).
+        let think_model = std::env::var("TASKS_THINK_MODEL")
+            .unwrap_or_else(|_| self.model.clone());
+
+        let config = CompletionConfig::new(&think_model).with_max_tokens(2048);
+        let request = CompletionRequest::new(config, vec![Message::user(user_prompt)])
+            .with_system(system);
+
+        let response = match self.provider.complete(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Fall back to rule-based narration if LLM fails
+                warn!(error = %e, "LLM narration failed, falling back to rule-based think()");
+                return Ok(rule_based_think(context));
+            }
+        };
+
+        let text = response.text();
+
+        // Parse the JSON array of thought strings
+        let thoughts = parse_thought_array(&text);
+
+        let actions = thoughts
+            .into_iter()
+            .map(OrchestratorAction::EmitThought)
+            .collect();
 
         Ok(actions)
     }
@@ -517,6 +503,198 @@ impl Orchestrator for ClaudeOrchestrator {
         );
 
         Ok(answer)
+    }
+}
+
+/// Check whether the system has interesting state worth narrating
+/// even without new events (e.g., long-running tasks, non-empty merge queue).
+fn has_interesting_state(context: &SystemContext) -> bool {
+    use models::task::TaskState;
+
+    // Non-empty merge queue is always worth checking
+    if !context.merge_queue.is_empty() {
+        return true;
+    }
+
+    // Tasks stuck in Running with no recent activity
+    let has_stuck_tasks = context.tasks.iter().any(|t| {
+        t.state == TaskState::Running
+            && t.last_activity_at
+                .map(|at| (chrono::Utc::now() - at).num_minutes() > 30)
+                .unwrap_or(false)
+    });
+    if has_stuck_tasks {
+        return true;
+    }
+
+    // Tasks in Question or Conflict state
+    let has_attention_tasks = context.tasks.iter().any(|t| {
+        matches!(t.state, TaskState::Question | TaskState::Conflict | TaskState::Failed)
+    });
+    if has_attention_tasks {
+        return true;
+    }
+
+    false
+}
+
+/// Summarize an event into a human-readable string for the think prompt.
+fn summarize_event(event: &events::Event) -> String {
+    let event_str = event.event_type.as_str();
+    let task = if event.task.is_empty() {
+        String::new()
+    } else {
+        let prefix = &event.task[..8.min(event.task.len())];
+        format!(" (task {})", prefix)
+    };
+
+    // Extract useful data fields
+    let detail = match &event.event_type {
+        EventType::TaskStateFailed => {
+            event.data.get("reason")
+                .and_then(|v| v.as_str())
+                .map(|r| format!(": {}", r))
+                .unwrap_or_default()
+        }
+        EventType::OrchestratorDecision => {
+            let approved = event.data.get("approved").and_then(|v| v.as_bool());
+            let reasoning = event.data.get("reasoning").and_then(|v| v.as_str());
+            match (approved, reasoning) {
+                (Some(true), Some(r)) => format!(": approved — {}", truncate(r, 100)),
+                (Some(false), Some(r)) => format!(": rejected — {}", truncate(r, 100)),
+                _ => String::new(),
+            }
+        }
+        EventType::MergeConflict => {
+            event.data.get("conflict_type")
+                .and_then(|v| v.as_str())
+                .map(|ct| format!(": {}", ct))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+
+    format!("[{}]{}{}", event_str, task, detail)
+}
+
+/// Rule-based think() fallback when LLM narration is unavailable.
+fn rule_based_think(context: &SystemContext) -> Vec<OrchestratorAction> {
+    let mut actions = Vec::new();
+
+    for event in &context.recent_events {
+        match &event.event_type {
+            EventType::TaskStateFailed => {
+                let reason = event.data.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown reason");
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "Task {} failed: {}", event.task, reason
+                )));
+            }
+            EventType::TaskStateCompleted => {
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "Task {} completed.", event.task
+                )));
+            }
+            EventType::MergeCompleted => {
+                let task_id = event.data.get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&event.task);
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "Merged PR for task {}.", task_id
+                )));
+            }
+            EventType::MergeConflict => {
+                let task_id = event.data.get("task_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&event.task);
+                actions.push(OrchestratorAction::EmitThought(format!(
+                    "Conflict detected on task {}.", task_id
+                )));
+            }
+            EventType::SystemModePlay => {
+                actions.push(OrchestratorAction::EmitThought(
+                    "Mode changed to Play — fully autonomous.".to_string(),
+                ));
+            }
+            EventType::SystemModePause => {
+                actions.push(OrchestratorAction::EmitThought(
+                    "Mode changed to Pause — holding approved merges.".to_string(),
+                ));
+            }
+            EventType::SystemModeStop => {
+                actions.push(OrchestratorAction::EmitThought(
+                    "Mode changed to Stop — idle.".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Pattern detection: multiple failures
+    let recent_failures = context.recent_events.iter()
+        .filter(|e| e.event_type == EventType::TaskStateFailed)
+        .count();
+    if recent_failures >= 3 {
+        actions.push(OrchestratorAction::EmitThought(format!(
+            "{} tasks failed recently — possible systemic issue.", recent_failures
+        )));
+    }
+
+    // Surface long-running sessions
+    use models::task::TaskState;
+    for task in &context.tasks {
+        if task.state == TaskState::Running {
+            if let Some(at) = task.last_activity_at {
+                let mins = (chrono::Utc::now() - at).num_minutes();
+                if mins > 30 {
+                    actions.push(OrchestratorAction::EmitThought(format!(
+                        "Task {} has been running with no activity for {}m.",
+                        &task.id[..8.min(task.id.len())], mins
+                    )));
+                }
+            }
+        }
+    }
+
+    actions
+}
+
+/// Parse an LLM response into a vector of thought strings.
+///
+/// Expects a JSON array of strings. Falls back to treating the entire
+/// response as a single thought if parsing fails.
+fn parse_thought_array(text: &str) -> Vec<String> {
+    // Try to extract a JSON array from the response
+    let trimmed = text.trim();
+
+    // Find the array in the text
+    let json_str = if trimmed.starts_with('[') {
+        trimmed
+    } else if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            &trimmed[start..=end]
+        } else {
+            trimmed
+        }
+    } else {
+        // No array found — if there's meaningful text, use it as a single thought
+        if !trimmed.is_empty() && trimmed != "[]" {
+            return vec![trimmed.to_string()];
+        }
+        return Vec::new();
+    };
+
+    match serde_json::from_str::<Vec<String>>(json_str) {
+        Ok(thoughts) => thoughts.into_iter().filter(|t| !t.trim().is_empty()).collect(),
+        Err(_) => {
+            // If the text has content but isn't valid JSON, use it as a thought
+            if !trimmed.is_empty() && trimmed != "[]" {
+                vec![trimmed.to_string()]
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -644,6 +822,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
@@ -727,5 +906,89 @@ That's all."#;
     fn test_extract_json_none() {
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("incomplete { json").is_none());
+    }
+
+    #[test]
+    fn test_parse_thought_array_valid() {
+        let input = r#"["Thought one", "Thought two"]"#;
+        let thoughts = parse_thought_array(input);
+        assert_eq!(thoughts, vec!["Thought one", "Thought two"]);
+    }
+
+    #[test]
+    fn test_parse_thought_array_empty() {
+        assert!(parse_thought_array("[]").is_empty());
+    }
+
+    #[test]
+    fn test_parse_thought_array_with_surrounding_text() {
+        let input = r#"Here are my thoughts: ["One", "Two"] end"#;
+        let thoughts = parse_thought_array(input);
+        assert_eq!(thoughts, vec!["One", "Two"]);
+    }
+
+    #[test]
+    fn test_parse_thought_array_filters_empty_strings() {
+        let input = r#"["Good thought", "", "  "]"#;
+        let thoughts = parse_thought_array(input);
+        assert_eq!(thoughts, vec!["Good thought"]);
+    }
+
+    #[test]
+    fn test_parse_thought_array_invalid_json_uses_raw_text() {
+        let input = "This is a plain text thought";
+        let thoughts = parse_thought_array(input);
+        assert_eq!(thoughts, vec!["This is a plain text thought"]);
+    }
+
+    #[test]
+    fn test_has_interesting_state_empty() {
+        let context = SystemContext {
+            mode: OperatingMode::Play,
+            projects: vec![],
+            tasks: vec![],
+            merge_queue: vec![],
+            human_present: false,
+            recent_events: vec![],
+            last_think_at: None,
+        };
+        assert!(!has_interesting_state(&context));
+    }
+
+    #[test]
+    fn test_has_interesting_state_with_merge_queue() {
+        use models::merge_queue::MergeQueueEntry;
+        let context = SystemContext {
+            mode: OperatingMode::Play,
+            projects: vec![],
+            tasks: vec![],
+            merge_queue: vec![MergeQueueEntry::new("test", "task1", "https://github.com/o/r/pull/1")],
+            human_present: false,
+            recent_events: vec![],
+            last_think_at: None,
+        };
+        assert!(has_interesting_state(&context));
+    }
+
+    #[test]
+    fn test_rule_based_think_mode_changes() {
+        use events::{Event, Actor};
+        let context = SystemContext {
+            mode: OperatingMode::Play,
+            projects: vec![],
+            tasks: vec![],
+            merge_queue: vec![],
+            human_present: false,
+            recent_events: vec![
+                Event::new(EventType::SystemModePlay, "", Actor::System, serde_json::json!({})),
+            ],
+            last_think_at: None,
+        };
+        let actions = rule_based_think(&context);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            OrchestratorAction::EmitThought(msg) => assert!(msg.contains("Play")),
+            _ => panic!("expected EmitThought"),
+        }
     }
 }

@@ -255,6 +255,108 @@ pub fn build_deep_review_prompt(
     prompt
 }
 
+/// Build the system prompt for the orchestrator's think() narration pass.
+pub fn think_system_prompt() -> String {
+    r#"You are the orchestrator for the Tasks platform — an AI project foreman that coordinates coding agents working on GitHub issues.
+
+You are performing a periodic reasoning pass over the current system state. Your job is to narrate what's happening in the project — like a collaborator giving a status update, not a log parser echoing events.
+
+## What to narrate
+
+- **Observations**: Synthesize events into insight. "Three tasks failed with timeout errors — might be a systemic issue" is good. "Task A failed. Task B failed. Task C failed." is bad.
+- **Decisions you made**: If evaluations happened, explain your reasoning briefly. "Approved #456 — clean refactor, tests pass" not just "Approved #456".
+- **Concerns**: Flag anything that looks wrong or needs human attention. Missing migrations, unusual patterns, tasks stuck for too long.
+- **Project health**: When appropriate, give a pulse check. "4 tasks completed today, 2 stuck in conflict, merge queue is clear."
+- **What you're doing next**: If there are pending evaluations or tasks that need attention, mention them.
+
+## What NOT to narrate
+
+- Don't echo every event mechanically. Filter for signal.
+- Don't narrate when nothing interesting happened. If the system is idle, say nothing.
+- Don't be verbose. Each thought should be 1-2 sentences max.
+- Don't repeat yourself across think passes.
+
+## Output format
+
+Respond with a JSON array of thought strings. Each string is one distinct observation or narration.
+Return an empty array `[]` if there's nothing worth saying.
+
+Example:
+```json
+[
+  "Approved PR #42 for task 'Fix auth bug' — the diff correctly addresses the timeout issue, tests pass.",
+  "Task abc123 has been stuck in Running state for 45 minutes with no activity — might need investigation.",
+  "3 of 4 active tasks are on the same repo. If they touch overlapping files, we may see merge conflicts soon."
+]
+```"#.to_string()
+}
+
+/// Build the user prompt for the orchestrator's think() narration pass.
+pub fn build_think_prompt(
+    mode: &str,
+    human_present: bool,
+    projects: &[String],
+    task_summaries: &[String],
+    merge_queue_summaries: &[String],
+    recent_event_summaries: &[String],
+    last_think_ago: Option<u64>,
+) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str(&format!("## System State\n\n**Mode:** {mode}\n**Human present:** {human_present}\n"));
+    if let Some(secs) = last_think_ago {
+        prompt.push_str(&format!("**Time since last narration:** {}s\n", secs));
+    }
+    prompt.push('\n');
+
+    // Projects
+    prompt.push_str("### Projects\n");
+    if projects.is_empty() {
+        prompt.push_str("No projects.\n");
+    } else {
+        for p in projects {
+            prompt.push_str(&format!("- {p}\n"));
+        }
+    }
+    prompt.push('\n');
+
+    // Tasks
+    prompt.push_str("### Tasks\n");
+    if task_summaries.is_empty() {
+        prompt.push_str("No tasks.\n");
+    } else {
+        for t in task_summaries {
+            prompt.push_str(&format!("- {t}\n"));
+        }
+    }
+    prompt.push('\n');
+
+    // Merge queue
+    prompt.push_str("### Merge Queue\n");
+    if merge_queue_summaries.is_empty() {
+        prompt.push_str("Empty.\n");
+    } else {
+        for m in merge_queue_summaries {
+            prompt.push_str(&format!("- {m}\n"));
+        }
+    }
+    prompt.push('\n');
+
+    // Recent events
+    prompt.push_str("### Recent Events (since last narration)\n");
+    if recent_event_summaries.is_empty() {
+        prompt.push_str("No events since last narration.\n");
+    } else {
+        for e in recent_event_summaries {
+            prompt.push_str(&format!("- {e}\n"));
+        }
+    }
+    prompt.push('\n');
+
+    prompt.push_str("Narrate what's happening. Return a JSON array of thought strings, or `[]` if nothing is worth saying.");
+    prompt
+}
+
 /// Truncate text to a maximum length, adding ellipsis if truncated.
 fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {

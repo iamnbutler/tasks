@@ -1538,6 +1538,25 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             continue;
                         }
 
+                        // Narrate: agent asked a question, orchestrator will answer
+                        {
+                            let brief_q = if question.len() > 100 {
+                                format!("{}...", &question[..100])
+                            } else {
+                                question.clone()
+                            };
+                            let thought = Event::new(
+                                EventType::OrchestratorThought,
+                                &task_id,
+                                Actor::Orchestrator,
+                                serde_json::json!({ "message": format!(
+                                    "Agent on task {} is stuck — answering: \"{}\"",
+                                    &task_id[..8.min(task_id.len())], brief_q
+                                )}),
+                            );
+                            let _ = orch_server.event_bus.publish(thought).await;
+                        }
+
                         // No human present — orchestrator answers autonomously.
                         // Look up the task and project for context.
                         let (task, project) = {
@@ -1764,6 +1783,22 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
             info!(entry_id = %entry_id, queue_remaining = eval_queue.len(), "evaluating merge queue entry");
 
+            // Narrate: evaluation starting
+            {
+                let task_title = {
+                    let state = orch_server.state.read().await;
+                    state.tasks.get(&task_id).map(|t| t.title.clone()).unwrap_or_default()
+                };
+                let pr_num = pr_url.rsplit('/').next().unwrap_or("?");
+                let thought = Event::new(
+                    EventType::OrchestratorThought,
+                    "",
+                    Actor::Orchestrator,
+                    serde_json::json!({ "message": format!("Evaluating PR #{} for '{}'...", pr_num, task_title) }),
+                );
+                let _ = orch_server.event_bus.publish(thought).await;
+            }
+
             {
             let (entry_id, task_id, pr_url) = (entry_id, task_id, pr_url);
                 // Build evaluation context
@@ -1870,6 +1905,25 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     .await
                 {
                     error!(error = %e, "failed to emit orchestrator decision event");
+                }
+
+                // Narrate: evaluation decision with reasoning
+                {
+                    let pr_num = pr_url.rsplit('/').next().unwrap_or("?");
+                    let verdict = if evaluation.approved { "Approved" } else { "Rejected" };
+                    // Truncate reasoning for the thought to keep it concise
+                    let brief = if evaluation.reasoning.len() > 150 {
+                        format!("{}...", &evaluation.reasoning[..150])
+                    } else {
+                        evaluation.reasoning.clone()
+                    };
+                    let thought = Event::new(
+                        EventType::OrchestratorThought,
+                        &task_id,
+                        Actor::Orchestrator,
+                        serde_json::json!({ "message": format!("{} PR #{} — {}", verdict, pr_num, brief) }),
+                    );
+                    let _ = orch_server.event_bus.publish(thought).await;
                 }
 
                 // Post evaluation comment on the GitHub PR (best-effort).
@@ -1998,6 +2052,23 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                                     reasoning = %triage.reasoning,
                                                     "conflict triage complete"
                                                 );
+
+                                                // Narrate: conflict triage decision
+                                                {
+                                                    let pr_num = pr_url.rsplit('/').next().unwrap_or("?");
+                                                    let thought = Event::new(
+                                                        EventType::OrchestratorThought,
+                                                        &task_id,
+                                                        Actor::Orchestrator,
+                                                        serde_json::json!({ "message": format!(
+                                                            "Conflict on PR #{}: {} — {}",
+                                                            pr_num,
+                                                            format!("{:?}", triage.resolution).to_lowercase(),
+                                                            triage.reasoning
+                                                        )}),
+                                                    );
+                                                    let _ = orch_server.event_bus.publish(thought).await;
+                                                }
 
                                                 // Act on the triage decision
                                                 match triage.resolution {
