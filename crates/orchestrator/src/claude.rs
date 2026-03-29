@@ -644,6 +644,7 @@ mod tests {
             provider: AnthropicProvider::new("test-key"),
             github: GitHubClient::new("test-token"),
             model: DEFAULT_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 

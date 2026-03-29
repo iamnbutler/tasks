@@ -6,6 +6,7 @@
 
 mod accounting;
 mod schema;
+pub mod work_claims;
 
 pub use accounting::{AccountingSummary, TaskAccounting};
 pub use schema::DATA_VERSION;
@@ -138,7 +139,7 @@ impl Store {
     }
 
     /// Get a connection from the pool.
-    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, StoreError> {
+    pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, StoreError> {
         Ok(self.pool.get()?)
     }
 

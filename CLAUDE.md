@@ -66,6 +66,18 @@ cargo run -- run --web                # web UI (serves on port 4800)
 
 Requires `.env` with `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
 
+## Work queue configuration
+
+The work queue controls how tasks are dispatched to containers. These environment variables can be set in `.env`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORK_QUEUE_TIMEOUT` | 15 | Seconds between dispatches (rate limiting) |
+| `CONTAINER_TIMEOUT` | 7200 | Max seconds a container can work before being reclaimed (2 hours) |
+| `HEALTH_CHECK_INTERVAL` | 30 | Seconds between health checks for dead/stale containers |
+
+The work queue ensures only one container works on each task at a time, preventing duplicate implementations.
+
 ## Web frontend
 
 - `web/` — React + Vite SPA with shadcn/ui + Tailwind CSS v4 + TanStack Table
