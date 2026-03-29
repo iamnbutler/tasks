@@ -3,6 +3,8 @@
 //! Tracks a high-water mark per repository and fetches only items
 //! updated since the last successful poll.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 
 use crate::client::GitHubClient;
@@ -76,6 +78,11 @@ impl RepoPoller {
             self.poll_pull_requests_inner(),
         )?;
 
+        // Deduplicate by node_id to guard against duplicates from paginated
+        // fetches (e.g. items shifting between cursor pages during a poll).
+        let issues = Self::dedup_issues(issues);
+        let pull_requests = Self::dedup_pull_requests(pull_requests);
+
         // Advance high-water mark to the max updated_at across all returned items.
         let max_ts = issues
             .iter()
@@ -97,7 +104,7 @@ impl RepoPoller {
 
     /// Poll for issues only.
     pub async fn poll_issues(&mut self) -> Result<Vec<Issue>, GitHubError> {
-        let issues = self.poll_issues_inner().await?;
+        let issues = Self::dedup_issues(self.poll_issues_inner().await?);
 
         let max_ts = issues.iter().map(|i| i.updated_at).max();
         if let Some(ts) = max_ts {
@@ -114,7 +121,7 @@ impl RepoPoller {
 
     /// Poll for pull requests only.
     pub async fn poll_pull_requests(&mut self) -> Result<Vec<PullRequest>, GitHubError> {
-        let prs = self.poll_pull_requests_inner().await?;
+        let prs = Self::dedup_pull_requests(self.poll_pull_requests_inner().await?);
 
         let max_ts = prs.iter().map(|p| p.updated_at).max();
         if let Some(ts) = max_ts {
@@ -131,6 +138,23 @@ impl RepoPoller {
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
+
+    /// Deduplicate issues by `node_id`, keeping the first occurrence.
+    fn dedup_issues(issues: Vec<Issue>) -> Vec<Issue> {
+        let mut seen = HashSet::with_capacity(issues.len());
+        issues
+            .into_iter()
+            .filter(|i| seen.insert(i.node_id.clone()))
+            .collect()
+    }
+
+    /// Deduplicate pull requests by `node_id`, keeping the first occurrence.
+    fn dedup_pull_requests(prs: Vec<PullRequest>) -> Vec<PullRequest> {
+        let mut seen = HashSet::with_capacity(prs.len());
+        prs.into_iter()
+            .filter(|p| seen.insert(p.node_id.clone()))
+            .collect()
+    }
 
     async fn poll_issues_inner(&self) -> Result<Vec<Issue>, GitHubError> {
         // Include both Open and Closed states so we can detect external closures.
@@ -162,5 +186,122 @@ impl RepoPoller {
         self.client
             .list_pull_requests(&self.owner, &self.repo, &filters)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{IssueState, PullRequestState, User};
+    use chrono::Utc;
+
+    fn make_issue(node_id: &str, number: u64) -> Issue {
+        let now = Utc::now();
+        Issue {
+            owner: "o".into(),
+            repo: "r".into(),
+            number,
+            node_id: node_id.into(),
+            title: format!("Issue {number}"),
+            body: None,
+            state: IssueState::Open,
+            state_reason: None,
+            labels: vec![],
+            assignees: vec![],
+            milestone: None,
+            comments: vec![],
+            parent: None,
+            sub_issues: vec![],
+            blocked_by: vec![],
+            linked_pull_requests: vec![],
+            author: User {
+                login: "u".into(),
+                node_id: "u1".into(),
+            },
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+        }
+    }
+
+    fn make_pr(node_id: &str, number: u64) -> PullRequest {
+        let now = Utc::now();
+        PullRequest {
+            owner: "o".into(),
+            repo: "r".into(),
+            number,
+            node_id: node_id.into(),
+            title: format!("PR {number}"),
+            body: None,
+            state: PullRequestState::Open,
+            head_ref: "feat".into(),
+            head_sha: "abc".into(),
+            base_ref: "main".into(),
+            is_draft: false,
+            mergeable: None,
+            labels: vec![],
+            assignees: vec![],
+            review_decision: None,
+            reviews: vec![],
+            comments: vec![],
+            linked_issues: vec![],
+            author: User {
+                login: "u".into(),
+                node_id: "u1".into(),
+            },
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            merged_at: None,
+        }
+    }
+
+    #[test]
+    fn dedup_issues_removes_duplicates() {
+        let issues = vec![
+            make_issue("A", 1),
+            make_issue("B", 2),
+            make_issue("A", 1), // duplicate
+            make_issue("C", 3),
+            make_issue("B", 2), // duplicate
+        ];
+        let deduped = RepoPoller::dedup_issues(issues);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].node_id, "A");
+        assert_eq!(deduped[1].node_id, "B");
+        assert_eq!(deduped[2].node_id, "C");
+    }
+
+    #[test]
+    fn dedup_issues_no_duplicates() {
+        let issues = vec![make_issue("A", 1), make_issue("B", 2)];
+        let deduped = RepoPoller::dedup_issues(issues);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn dedup_issues_empty() {
+        let deduped = RepoPoller::dedup_issues(vec![]);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn dedup_pull_requests_removes_duplicates() {
+        let prs = vec![
+            make_pr("X", 10),
+            make_pr("Y", 11),
+            make_pr("X", 10), // duplicate
+        ];
+        let deduped = RepoPoller::dedup_pull_requests(prs);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].node_id, "X");
+        assert_eq!(deduped[1].node_id, "Y");
+    }
+
+    #[test]
+    fn dedup_pull_requests_no_duplicates() {
+        let prs = vec![make_pr("X", 10)];
+        let deduped = RepoPoller::dedup_pull_requests(prs);
+        assert_eq!(deduped.len(), 1);
     }
 }
