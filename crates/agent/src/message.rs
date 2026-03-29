@@ -185,6 +185,10 @@ impl Response {
     pub fn text(&self) -> String {
         self.content.iter().filter_map(|c| c.as_text()).collect::<Vec<_>>().join("")
     }
+
+    pub fn thinking(&self) -> String {
+        self.content.iter().filter_map(|c| c.as_thinking()).collect::<Vec<_>>().join("")
+    }
 }
 
 /// Token usage information.
@@ -223,6 +227,21 @@ mod tests {
             Content::text("world"),
         ]);
         assert_eq!(msg.text(), "hello world");
+    }
+
+    #[test]
+    fn test_response_text_excludes_thinking() {
+        let response = Response {
+            content: vec![
+                Content::thinking("let me reason"),
+                Content::text("final answer"),
+            ],
+            tool_calls: vec![],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: None,
+        };
+        assert_eq!(response.text(), "final answer");
+        assert_eq!(response.thinking(), "let me reason");
     }
 
     #[test]
