@@ -127,6 +127,9 @@ pub struct ReconcileResult {
     pub new_state: Option<TaskState>,
     /// If the task should be cancelled (skip label added).
     pub cancelled: bool,
+    /// If the issue was closed, why — combining `state_reason` with linked PR
+    /// data to distinguish agent success from external rejection.
+    pub closure_reason: Option<tasks_github::model::ClosureReason>,
 }
 
 impl ReconcileResult {
@@ -212,11 +215,13 @@ pub fn reconcile_task(
     }
 
     // Detect external closure.
-    if issue.state == tasks_github::model::IssueState::Closed {
-        let new_state = match issue.state_reason {
-            Some(tasks_github::model::IssueStateReason::Completed) => TaskState::Completed,
-            _ => TaskState::Cancelled,
+    if let Some(closure_reason) = issue.classify_closure() {
+        use tasks_github::model::ClosureReason;
+        let new_state = match closure_reason {
+            ClosureReason::PrMerged | ClosureReason::ManualCompletion => TaskState::Completed,
+            ClosureReason::NotPlanned | ClosureReason::Unknown => TaskState::Cancelled,
         };
+        result.closure_reason = Some(closure_reason);
         result.new_state = Some(new_state);
         task.set_state(new_state);
         return result;
@@ -552,6 +557,11 @@ mod tests {
         let result = reconcile_task(&mut task, &closed_issue, &cfg);
         assert_eq!(result.new_state, Some(TaskState::Completed));
         assert_eq!(task.state, TaskState::Completed);
+        // No linked PRs → ManualCompletion, not PrMerged
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::ManualCompletion)
+        );
     }
 
     #[test]
@@ -567,6 +577,82 @@ mod tests {
         let result = reconcile_task(&mut task, &closed_issue, &cfg);
         assert_eq!(result.new_state, Some(TaskState::Cancelled));
         assert_eq!(task.state, TaskState::Cancelled);
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::NotPlanned)
+        );
+    }
+
+    #[test]
+    fn reconcile_closure_pr_merged_means_agent_success() {
+        // Issue closed as completed with a linked merged PR → PrMerged.
+        // This is the "agent's work was accepted" signal.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        closed_issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+        closed_issue.linked_pull_requests = vec![tasks_github::model::LinkedPR {
+            number: 100,
+            title: "Fix bug #42".to_string(),
+            state: PullRequestState::Merged,
+            node_id: "PR_100".to_string(),
+        }];
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Completed));
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::PrMerged)
+        );
+    }
+
+    #[test]
+    fn reconcile_closure_with_open_pr_is_manual_completion() {
+        // Issue closed as completed but linked PR is still open (not merged).
+        // This is manual completion, not agent success.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        closed_issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+        closed_issue.linked_pull_requests = vec![tasks_github::model::LinkedPR {
+            number: 100,
+            title: "Fix bug #42".to_string(),
+            state: PullRequestState::Open,
+            node_id: "PR_100".to_string(),
+        }];
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Completed));
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::ManualCompletion)
+        );
+    }
+
+    #[test]
+    fn reconcile_closure_unknown_when_no_state_reason() {
+        // Issue closed without a state_reason → Unknown.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        // state_reason is None (default from make_issue)
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Cancelled));
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::Unknown)
+        );
     }
 
     #[test]
