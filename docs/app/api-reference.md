@@ -33,9 +33,13 @@ GET /api/snapshot
     "active": 2,
     "max": 5
   },
-  "human_present": true
+  "human_present": true,
+  "server_version": "abc1234",
+  "data_version": 7
 }
 ```
+
+`server_version` is the current binary's git commit SHA. `data_version` is the SQLite schema version. The web UI uses `data_version` to detect schema changes across sessions and prompt for a reload.
 
 #### Get Current Mode
 
@@ -103,10 +107,13 @@ GET /api/tasks
     "state": "in_progress",
     "project_id": "project-uuid",
     "github_issue_number": 42,
-    "created_at": "2024-01-15T10:30:00Z"
+    "created_at": "2024-01-15T10:30:00Z",
+    "rejection_feedback": null
   }
 ]
 ```
+
+`rejection_feedback` is populated when the orchestrator rejects a PR and provides feedback for the agent. It is `null` when no feedback is present.
 
 #### Get Task by ID
 
@@ -698,4 +705,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-03-30 -->*
