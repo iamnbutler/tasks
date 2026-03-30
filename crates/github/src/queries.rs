@@ -125,6 +125,38 @@ const PR_FIELDS: &str = r#"
             updatedAt
         }
     }
+    commits(last: 1) {
+        nodes {
+            commit {
+                statusCheckRollup {
+                    state
+                    contexts(first: 100) {
+                        nodes {
+                            __typename
+                            ... on CheckRun {
+                                name
+                                conclusion
+                                status
+                            }
+                            ... on StatusContext {
+                                context
+                                state
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    latestReviews(first: 100) {
+        nodes {
+            id
+            author { login ... on User { id } ... on Bot { id } ... on Mannequin { id } }
+            state
+            body
+            submittedAt
+        }
+    }
     closingIssuesReferences(first: 50) {
         nodes {
             number
@@ -132,6 +164,9 @@ const PR_FIELDS: &str = r#"
             state
             id
         }
+    }
+    reactions {
+        totalCount
     }
     createdAt
     updatedAt
