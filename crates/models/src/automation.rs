@@ -64,6 +64,9 @@ pub struct Automation {
     pub prompt: String,
     /// Compiled/hardened workflow (can be deferred until first run).
     pub compiled_workflow: Option<String>,
+    /// When the workflow was last compiled. Used to detect staleness:
+    /// if `updated_at > compiled_at`, the compiled workflow is outdated.
+    pub compiled_at: Option<DateTime<Utc>>,
     /// What triggers this automation.
     pub trigger: TriggerType,
     /// Current state of the automation.
@@ -88,6 +91,7 @@ impl Automation {
             name: name.into(),
             prompt: prompt.into(),
             compiled_workflow: None,
+            compiled_at: None,
             trigger,
             state: AutomationState::Active,
             created_at: now,
@@ -99,6 +103,23 @@ impl Automation {
     pub fn set_state(&mut self, state: AutomationState) {
         self.state = state;
         self.updated_at = Utc::now();
+    }
+
+    /// Set the compiled workflow and record the compilation timestamp.
+    pub fn set_compiled_workflow(&mut self, workflow: String) {
+        self.compiled_workflow = Some(workflow);
+        self.compiled_at = Some(Utc::now());
+    }
+
+    /// Whether the compiled workflow is stale (definition updated after last compilation).
+    /// Returns `true` if there is a compiled workflow whose `compiled_at` predates `updated_at`,
+    /// or if `compiled_at` is missing despite a workflow being present.
+    pub fn is_compiled_workflow_stale(&self) -> bool {
+        match (&self.compiled_workflow, self.compiled_at) {
+            (Some(_), Some(compiled)) => self.updated_at > compiled,
+            (Some(_), None) => true, // compiled but no timestamp — assume stale
+            _ => false,              // no workflow at all — nothing to be stale
+        }
     }
 }
 

@@ -478,6 +478,10 @@ export function AutomationFormDialog({
                 </div>
                 <p className="text-xs text-muted-foreground">
                   This is the compiled version of your prompt (read-only).
+                  {automation.compiled_at && ` Compiled: ${new Date(automation.compiled_at).toLocaleString()}.`}
+                  {automation.compiled_at && new Date(automation.updated_at) > new Date(automation.compiled_at) && (
+                    <span className="text-warning"> Stale — automation was updated after last compilation.</span>
+                  )}
                 </p>
               </div>
             )}

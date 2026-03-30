@@ -76,6 +76,7 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             name TEXT NOT NULL,
             prompt TEXT NOT NULL,
             compiled_workflow TEXT,
+            compiled_at TEXT,
             trigger_type TEXT NOT NULL,
             trigger_config TEXT NOT NULL DEFAULT '{}',
             state TEXT NOT NULL DEFAULT 'active',
@@ -255,6 +256,27 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
         Err(e) => {
             tracing::warn!(error = %e, "could not create unique index on merge_queue.pr_url (duplicates may exist)");
+        }
+    }
+
+    // Migration: add compiled_at column to automations table (issue #522)
+    // Tracks when the workflow was last compiled for staleness detection.
+    match conn.execute(
+        "ALTER TABLE automations ADD COLUMN compiled_at TEXT",
+        [],
+    ) {
+        Ok(_) => {
+            tracing::info!("added compiled_at column to automations table");
+        }
+        Err(rusqlite::Error::SqliteFailure(e, Some(ref msg)))
+            if e.extended_code == rusqlite::ffi::SQLITE_ERROR
+                && msg.contains("duplicate column name") =>
+        {
+            tracing::debug!("compiled_at column already exists");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to add compiled_at column");
+            return Err(e);
         }
     }
 

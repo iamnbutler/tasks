@@ -132,6 +132,7 @@ export interface Automation {
   name: string;
   prompt: string;
   compiled_workflow?: string;
+  compiled_at?: string;
   trigger: TriggerConfig;
   state: AutomationState;
   created_at: string;
