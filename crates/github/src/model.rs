@@ -41,6 +41,33 @@ pub struct Issue {
     pub closed_at: Option<DateTime<Utc>>,
 }
 
+impl Issue {
+    /// Classify why this issue was closed by combining `state_reason` with
+    /// linked PR data. Returns `None` if the issue is not closed.
+    ///
+    /// This solves the ambiguity where `state_reason == Completed` could mean
+    /// either "agent's PR was merged" or "maintainer manually closed it."
+    pub fn classify_closure(&self) -> Option<ClosureReason> {
+        if self.state != IssueState::Closed {
+            return None;
+        }
+
+        let has_merged_pr = self
+            .linked_pull_requests
+            .iter()
+            .any(|pr| pr.state == PullRequestState::Merged);
+
+        Some(match self.state_reason {
+            Some(IssueStateReason::Completed) if has_merged_pr => ClosureReason::PrMerged,
+            Some(IssueStateReason::Completed) => ClosureReason::ManualCompletion,
+            Some(IssueStateReason::NotPlanned) => ClosureReason::NotPlanned,
+            // Reopened shouldn't appear on a closed issue, but handle gracefully
+            Some(IssueStateReason::Reopened) => ClosureReason::Unknown,
+            None => ClosureReason::Unknown,
+        })
+    }
+}
+
 /// A normalized GitHub pull request (spec github.md §2.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -92,6 +119,26 @@ pub enum IssueStateReason {
     Completed,
     NotPlanned,
     Reopened,
+}
+
+/// Why a closed issue was closed — richer than `IssueStateReason` alone.
+///
+/// Combines `state_reason` with linked PR state to distinguish between:
+/// - Agent's PR was merged (success feedback)
+/// - Maintainer manually completed it (no merged PR)
+/// - Maintainer rejected / closed as not-planned
+/// - Closed with no state_reason at all
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosureReason {
+    /// A linked PR was merged, then the issue was closed. Agent work accepted.
+    PrMerged,
+    /// Closed as completed, but no linked PR was merged. Manual completion.
+    ManualCompletion,
+    /// Closed as not-planned. Maintainer decided not to pursue it (rejection/duplicate).
+    NotPlanned,
+    /// Closed without a `state_reason`. Ambiguous — treated as cancellation.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,4 +351,115 @@ pub struct RateLimit {
     pub remaining: u32,
     /// When the rate limit resets.
     pub reset_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_closed_issue(
+        state_reason: Option<IssueStateReason>,
+        linked_prs: Vec<LinkedPR>,
+    ) -> Issue {
+        let now = Utc::now();
+        Issue {
+            owner: "acme".to_string(),
+            repo: "widgets".to_string(),
+            number: 1,
+            node_id: "I_1".to_string(),
+            title: "Test".to_string(),
+            body: None,
+            state: IssueState::Closed,
+            state_reason,
+            labels: vec![],
+            assignees: vec![],
+            milestone: None,
+            comments: vec![],
+            parent: None,
+            sub_issues: vec![],
+            blocked_by: vec![],
+            linked_pull_requests: linked_prs,
+            author: User { login: "u".to_string(), node_id: "U_1".to_string() },
+            created_at: now,
+            updated_at: now,
+            closed_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn classify_closure_returns_none_for_open_issue() {
+        let mut issue = make_closed_issue(None, vec![]);
+        issue.state = IssueState::Open;
+        assert!(issue.classify_closure().is_none());
+    }
+
+    #[test]
+    fn classify_closure_pr_merged() {
+        let issue = make_closed_issue(
+            Some(IssueStateReason::Completed),
+            vec![LinkedPR {
+                number: 10,
+                title: "Fix".to_string(),
+                state: PullRequestState::Merged,
+                node_id: "PR_10".to_string(),
+            }],
+        );
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::PrMerged));
+    }
+
+    #[test]
+    fn classify_closure_manual_completion() {
+        let issue = make_closed_issue(Some(IssueStateReason::Completed), vec![]);
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::ManualCompletion));
+    }
+
+    #[test]
+    fn classify_closure_completed_with_open_pr_is_manual() {
+        let issue = make_closed_issue(
+            Some(IssueStateReason::Completed),
+            vec![LinkedPR {
+                number: 10,
+                title: "Fix".to_string(),
+                state: PullRequestState::Open,
+                node_id: "PR_10".to_string(),
+            }],
+        );
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::ManualCompletion));
+    }
+
+    #[test]
+    fn classify_closure_not_planned() {
+        let issue = make_closed_issue(Some(IssueStateReason::NotPlanned), vec![]);
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::NotPlanned));
+    }
+
+    #[test]
+    fn classify_closure_unknown_no_reason() {
+        let issue = make_closed_issue(None, vec![]);
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::Unknown));
+    }
+
+    #[test]
+    fn classify_closure_multiple_prs_one_merged() {
+        // If any linked PR is merged, it counts as PrMerged.
+        let issue = make_closed_issue(
+            Some(IssueStateReason::Completed),
+            vec![
+                LinkedPR {
+                    number: 10,
+                    title: "First attempt".to_string(),
+                    state: PullRequestState::Closed,
+                    node_id: "PR_10".to_string(),
+                },
+                LinkedPR {
+                    number: 11,
+                    title: "Second attempt".to_string(),
+                    state: PullRequestState::Merged,
+                    node_id: "PR_11".to_string(),
+                },
+            ],
+        );
+        assert_eq!(issue.classify_closure(), Some(ClosureReason::PrMerged));
+    }
 }
