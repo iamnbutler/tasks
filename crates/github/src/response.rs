@@ -383,8 +383,11 @@ pub(crate) struct GqlPullRequest {
     pub assignees: Option<Nodes<GqlUser>>,
     pub review_decision: Option<String>,
     pub reviews: Connection<GqlReview>,
+    pub latest_reviews: Option<Nodes<GqlReview>>,
     pub comments: Connection<GqlComment>,
+    pub commits: Option<Nodes<GqlCommitConnection>>,
     pub closing_issues_references: Option<Nodes<GqlClosingIssue>>,
+    pub reactions: Option<GqlReactionSummary>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
@@ -399,6 +402,48 @@ pub(crate) struct GqlReview {
     pub state: String,
     pub body: Option<String>,
     pub submitted_at: DateTime<Utc>,
+}
+
+/// Wrapper for commits connection (we only fetch `last: 1`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GqlCommitConnection {
+    pub commit: GqlCommitDetail,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GqlCommitDetail {
+    pub status_check_rollup: Option<GqlStatusCheckRollup>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GqlStatusCheckRollup {
+    pub state: String,
+    pub contexts: Nodes<GqlCheckContext>,
+}
+
+/// A check context can be either a CheckRun or a StatusContext.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+pub(crate) enum GqlCheckContext {
+    CheckRun {
+        name: String,
+        conclusion: Option<String>,
+        status: String,
+    },
+    StatusContext {
+        context: String,
+        state: String,
+    },
+}
+
+/// Reaction summary (just total count).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GqlReactionSummary {
+    pub total_count: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -473,6 +518,69 @@ impl GqlPullRequest {
             .map(GqlComment::into_model)
             .collect();
 
+        let latest_reviews = self
+            .latest_reviews
+            .map(|n| {
+                n.nodes
+                    .into_iter()
+                    .map(|r| {
+                        let state = match r.state.as_str() {
+                            "APPROVED" => model::ReviewState::Approved,
+                            "CHANGES_REQUESTED" => model::ReviewState::ChangesRequested,
+                            "DISMISSED" => model::ReviewState::Dismissed,
+                            _ => model::ReviewState::Commented,
+                        };
+                        model::Review {
+                            id: r.id,
+                            author: r
+                                .author
+                                .map(GqlUser::into_model)
+                                .unwrap_or_else(ghost_user),
+                            state,
+                            body: r.body,
+                            submitted_at: r.submitted_at,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract CI status from the last commit's statusCheckRollup.
+        let (ci_status, check_runs, status_contexts) = self
+            .commits
+            .and_then(|c| c.nodes.into_iter().next())
+            .and_then(|c| c.commit.status_check_rollup)
+            .map(|rollup| {
+                let ci_state = match rollup.state.as_str() {
+                    "EXPECTED" => Some(model::StatusCheckRollupState::Expected),
+                    "ERROR" => Some(model::StatusCheckRollupState::Error),
+                    "FAILURE" => Some(model::StatusCheckRollupState::Failure),
+                    "PENDING" => Some(model::StatusCheckRollupState::Pending),
+                    "SUCCESS" => Some(model::StatusCheckRollupState::Success),
+                    _ => None,
+                };
+                let mut checks = Vec::new();
+                let mut statuses = Vec::new();
+                for ctx in rollup.contexts.nodes {
+                    match ctx {
+                        GqlCheckContext::CheckRun {
+                            name,
+                            conclusion,
+                            status,
+                        } => checks.push(model::CheckRun {
+                            name,
+                            status,
+                            conclusion,
+                        }),
+                        GqlCheckContext::StatusContext { context, state } => {
+                            statuses.push(model::StatusContext { context, state })
+                        }
+                    }
+                }
+                (ci_state, checks, statuses)
+            })
+            .unwrap_or((None, Vec::new(), Vec::new()));
+
         let linked_issues = self
             .closing_issues_references
             .map(|n| {
@@ -487,6 +595,8 @@ impl GqlPullRequest {
                     .collect()
             })
             .unwrap_or_default();
+
+        let reaction_count = self.reactions.map(|r| r.total_count).unwrap_or(0);
 
         model::PullRequest {
             owner: owner.to_string(),
@@ -505,8 +615,13 @@ impl GqlPullRequest {
             assignees,
             review_decision,
             reviews,
+            latest_reviews,
             comments,
             linked_issues,
+            ci_status,
+            check_runs,
+            status_contexts,
+            reaction_count,
             author: self
                 .author
                 .map(GqlUser::into_model)

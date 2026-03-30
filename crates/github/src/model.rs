@@ -91,10 +91,20 @@ pub struct PullRequest {
     pub review_decision: Option<ReviewDecision>,
     /// All reviews, ordered chronologically.
     pub reviews: Vec<Review>,
+    /// Latest review per reviewer (most recent review from each person).
+    pub latest_reviews: Vec<Review>,
     /// Issue-level comments (not review comments).
     pub comments: Vec<Comment>,
     /// Issues this PR closes/references.
     pub linked_issues: Vec<LinkedIssueRef>,
+    /// Overall CI status rollup from the head commit.
+    pub ci_status: Option<StatusCheckRollupState>,
+    /// Individual check runs from the head commit.
+    pub check_runs: Vec<CheckRun>,
+    /// Legacy status contexts from the head commit.
+    pub status_contexts: Vec<StatusContext>,
+    /// Total reaction count on this PR.
+    pub reaction_count: u32,
     pub author: User,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -210,6 +220,32 @@ impl PrMergeStatus {
         // More than 5 conflicting files is complex
         self.conflicting_files.len() > 5
     }
+}
+
+/// Overall CI status from GitHub's `statusCheckRollup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StatusCheckRollupState {
+    Expected,
+    Error,
+    Failure,
+    Pending,
+    Success,
+}
+
+/// An individual CI check run result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRun {
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+}
+
+/// A legacy commit status context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusContext {
+    pub context: String,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
