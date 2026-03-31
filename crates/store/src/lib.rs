@@ -522,17 +522,23 @@ impl Store {
     }
 
     /// Cascade-delete all data for a project's tasks: merge queue entries,
-    /// accounting, then tasks. Runs in a transaction so partial failures
-    /// don't leave the store inconsistent.
-    pub fn delete_project_data(&self, project: &str, task_ids: &[String]) -> Result<(), StoreError> {
+    /// accounting, then tasks. Uses SQL subqueries to find all tasks by
+    /// project, so it catches DB-only entries that may not be in memory.
+    /// Runs in a transaction so partial failures don't leave the store
+    /// inconsistent.
+    pub fn delete_project_data(&self, project: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
         let tx = conn.unchecked_transaction()?;
 
-        // Delete merge queue entries and accounting for each task
-        for task_id in task_ids {
-            tx.execute("DELETE FROM merge_queue WHERE task_id = ?1", params![task_id])?;
-            tx.execute("DELETE FROM task_accounting WHERE task_id = ?1", params![task_id])?;
-        }
+        // Delete merge queue entries and accounting for all tasks belonging to this project
+        tx.execute(
+            "DELETE FROM merge_queue WHERE task_id IN (SELECT id FROM tasks WHERE project = ?1)",
+            params![project],
+        )?;
+        tx.execute(
+            "DELETE FROM task_accounting WHERE task_id IN (SELECT id FROM tasks WHERE project = ?1)",
+            params![project],
+        )?;
 
         // Delete all tasks for the project
         tx.execute("DELETE FROM tasks WHERE project = ?1", params![project])?;

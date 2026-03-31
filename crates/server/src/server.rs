@@ -155,28 +155,52 @@ impl Server {
             state.projects.insert(project.id.clone(), project);
         }
 
-        // Load tasks
+        // Load tasks — skip orphaned tasks whose project no longer exists
         let tasks = store
             .list_tasks()
             .map_err(|e| ServerError::StoreError(e.to_string()))?;
         for task in tasks {
-            state.tasks.insert(task.id.clone(), task);
+            if state.projects.contains_key(&task.project) {
+                state.tasks.insert(task.id.clone(), task);
+            } else {
+                tracing::warn!(
+                    task_id = %task.id,
+                    project_id = %task.project,
+                    "skipping orphaned task (project no longer exists)"
+                );
+            }
         }
 
-        // Load merge queue entries
+        // Load merge queue entries — skip orphaned entries whose task no longer exists
         let entries = store
             .list_merge_entries()
             .map_err(|e| ServerError::StoreError(e.to_string()))?;
         for entry in entries {
-            state.merge_queue.enqueue(entry);
+            if state.tasks.contains_key(&entry.task_id) {
+                state.merge_queue.enqueue(entry);
+            } else {
+                tracing::warn!(
+                    entry_id = %entry.id,
+                    task_id = %entry.task_id,
+                    "skipping orphaned merge queue entry (task no longer exists)"
+                );
+            }
         }
 
-        // Load automations
+        // Load automations — skip orphaned automations whose project no longer exists
         let automations = store
             .list_automations()
             .map_err(|e| ServerError::StoreError(e.to_string()))?;
         for automation in automations {
-            state.automations.insert(automation.id.clone(), automation);
+            if state.projects.contains_key(&automation.project_id) {
+                state.automations.insert(automation.id.clone(), automation);
+            } else {
+                tracing::warn!(
+                    automation_id = %automation.id,
+                    project_id = %automation.project_id,
+                    "skipping orphaned automation (project no longer exists)"
+                );
+            }
         }
 
         Ok(())
@@ -198,13 +222,26 @@ impl Server {
         let mut state = self.state.write().await;
         let removed = state.projects.remove(id).is_some();
         if removed {
-            // Collect task IDs for this project
-            let task_ids: Vec<String> = state
+            // Collect task IDs from both in-memory state and the store to
+            // ensure we clean up everything, even if some tasks were already
+            // removed from memory but still exist in the database.
+            let mut task_ids: Vec<String> = state
                 .tasks
                 .iter()
                 .filter(|(_, task)| task.project == id)
                 .map(|(task_id, _)| task_id.clone())
                 .collect();
+
+            // Also include task IDs from the store that may not be in memory
+            if let Some(ref store) = self.store {
+                if let Ok(db_tasks) = store.list_tasks_by_project(id) {
+                    for task in db_tasks {
+                        if !task_ids.contains(&task.id) {
+                            task_ids.push(task.id);
+                        }
+                    }
+                }
+            }
 
             // Remove tasks from in-memory state
             for task_id in &task_ids {
@@ -227,9 +264,11 @@ impl Server {
                 state.automations.remove(automation_id);
             }
 
-            // Cascade delete in persistent store (transactional)
+            // Cascade delete in persistent store (transactional).
+            // Uses SQL subqueries to delete by project, independent of
+            // the in-memory task list.
             if let Some(ref store) = self.store {
-                    if let Err(e) = store.delete_project_data(id, &task_ids) {
+                    if let Err(e) = store.delete_project_data(id) {
                         tracing::error!(project_id = %id, error = %e, "failed to cascade-delete project data from store");
                     }
                     if let Err(e) = store.delete_automations_for_project(id) {
