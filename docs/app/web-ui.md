@@ -217,6 +217,8 @@ The automation form dialog collects:
   - **Event** — fires on a specific platform event type
 - **Active** toggle — enable or pause the automation at creation time
 
+In **edit mode**, an additional read-only **Compiled Workflow** panel appears when a compiled workflow exists. It shows the compiled version of the prompt along with its compilation timestamp. If the automation was updated after the last compilation (`updated_at > compiled_at`), a staleness warning is displayed — the workflow will be recompiled on the next run. <!-- LAST_UPDATED: 2026-03-31 -->
+
 ### Runs Panel
 
 Clicking an automation row (or choosing **View Runs**) opens the runs history panel. Each run shows:

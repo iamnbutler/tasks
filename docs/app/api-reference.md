@@ -479,6 +479,25 @@ GET /api/automations?project_id=<project-uuid>
 
 **Response:** Array of `Automation` objects.
 
+**`Automation` object schema:**
+
+```json
+{
+  "id": "automation-uuid",
+  "project_id": "project-uuid",
+  "name": "Daily dependency audit",
+  "prompt": "Check for outdated dependencies...",
+  "compiled_workflow": "...",
+  "compiled_at": "2026-03-30T00:13:42Z",
+  "trigger": { "type": "schedule", "cron": "0 9 * * 1-5" },
+  "state": "active",
+  "created_at": "2026-03-01T08:00:00Z",
+  "updated_at": "2026-03-30T00:10:00Z"
+}
+```
+
+`compiled_workflow` and `compiled_at` may be `null` if the automation has not been compiled yet. If `updated_at > compiled_at`, the compiled workflow is stale and will be recompiled on the next run. <!-- LAST_UPDATED: 2026-03-31 -->
+
 #### Create Automation
 
 ```http
