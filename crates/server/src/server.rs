@@ -872,6 +872,33 @@ impl Server {
                     tracing::error!(task_id = %task_id, error = %e, "failed to persist task state to store");
                 }
         }
+
+        // Cascade terminal task transitions to linked merge queue entries (#500).
+        // Remove the entry immediately so it doesn't linger until the next
+        // cleanup cooldown or GitHub poll.
+        if new_state.is_terminal() {
+            let removed = state
+                .merge_queue
+                .remove_by_task_ids(&[task_id.to_string()]);
+            for entry in &removed {
+                tracing::info!(
+                    task_id = %task_id,
+                    entry_id = %entry.id,
+                    new_state = ?new_state,
+                    "cascade: removed merge queue entry for terminal task"
+                );
+                if let Some(ref store) = self.store {
+                    if let Err(e) = store.delete_merge_entry(&entry.id) {
+                        tracing::error!(
+                            entry_id = %entry.id,
+                            error = %e,
+                            "failed to delete cascaded merge entry from store"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(true)
     }
 
@@ -3377,6 +3404,86 @@ mod tests {
         assert!(state.tasks.get("task-2").is_none());
 
         // Merge queue entries for proj-1 tasks removed
+        assert_eq!(state.merge_queue.entries().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_task_state_cascades_to_merge_queue() {
+        // Issue #500: when a task goes terminal, its merge queue entry
+        // should be removed immediately instead of lingering.
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        // Create three tasks with merge queue entries
+        for (tid, mid) in [("t1", "mq1"), ("t2", "mq2"), ("t3", "mq3")] {
+            let task = Task::new(tid, TaskSource::Internal, "Test", "proj-1");
+            server.add_task(task).await.unwrap();
+            let entry = crate::model::merge_queue::MergeQueueEntry::new(
+                mid,
+                tid,
+                &format!("https://github.com/owner/repo/pull/{}", &tid[1..]),
+            );
+            server.add_to_merge_queue(entry).await.unwrap();
+        }
+
+        // Verify all three entries exist
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.merge_queue.entries().len(), 3);
+        }
+
+        // Complete t1 — its merge queue entry should be removed
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.merge_queue.entries().len(), 2);
+            assert!(state.merge_queue.get("mq1").is_none());
+        }
+
+        // Fail t2 — its merge queue entry should be removed
+        server
+            .set_task_state("t2", TaskState::Failed, Actor::System)
+            .await
+            .unwrap();
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.merge_queue.entries().len(), 1);
+            assert!(state.merge_queue.get("mq2").is_none());
+        }
+
+        // Cancel t3 — its merge queue entry should be removed
+        server
+            .set_task_state("t3", TaskState::Cancelled, Actor::System)
+            .await
+            .unwrap();
+        {
+            let state = server.state.read().await;
+            assert_eq!(state.merge_queue.entries().len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_task_without_merge_entry_is_fine() {
+        // Ensure no panic/error when a task goes terminal but has no merge queue entry.
+        let server = test_server().await;
+
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+
+        let task = Task::new("t1", TaskSource::Internal, "Test", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        server
+            .set_task_state("t1", TaskState::Completed, Actor::System)
+            .await
+            .unwrap();
+
+        let state = server.state.read().await;
         assert_eq!(state.merge_queue.entries().len(), 0);
     }
 }
