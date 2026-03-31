@@ -1,11 +1,21 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X, Info } from "lucide-react";
+import { ExternalLink, Check, X, Info, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
-import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
+import { flushMergeQueue, approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { ListView, ListEmptyState } from "@/components/ui/list-view";
 import { ListHeader, ListHeaderTabs } from "@/components/ui/list-header";
 import {
@@ -81,6 +91,25 @@ function MergeQueueRow({
       onRefresh();
     } catch {
       toast.error("Failed to reject merge entry");
+    }
+  }
+
+  const [rcOpen, setRcOpen] = useState(false);
+  const [rcFeedback, setRcFeedback] = useState("");
+  const [rcSubmitting, setRcSubmitting] = useState(false);
+
+  async function handleRequestChanges() {
+    if (!rcFeedback.trim()) return;
+    setRcSubmitting(true);
+    try {
+      await requestChanges(entry.id, rcFeedback.trim(), rcFeedback.trim());
+      setRcOpen(false);
+      setRcFeedback("");
+      onRefresh();
+    } catch {
+      toast.error("Failed to request changes");
+    } finally {
+      setRcSubmitting(false);
     }
   }
 
@@ -161,6 +190,48 @@ function MergeQueueRow({
               <Check className="h-3.5 w-3.5" />
               Approve
             </Button>
+            <Dialog open={rcOpen} onOpenChange={setRcOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1 rounded-none border-r border-border"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                  Request Changes
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Request Changes</DialogTitle>
+                  <DialogDescription>
+                    Describe what needs to change. The task will be re-dispatched with your feedback.
+                  </DialogDescription>
+                </DialogHeader>
+                <Textarea
+                  placeholder="Describe the changes needed..."
+                  value={rcFeedback}
+                  onChange={(e) => setRcFeedback(e.target.value)}
+                  rows={4}
+                />
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setRcOpen(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={handleRequestChanges}
+                    disabled={!rcFeedback.trim() || rcSubmitting}
+                  >
+                    {rcSubmitting ? "Submitting..." : "Submit"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
             <Button
               variant="ghost"
               size="sm"

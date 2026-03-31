@@ -1,10 +1,22 @@
+import { useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, MessageSquare } from "lucide-react";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
-import { approveMerge, rejectMerge } from "@/lib/api";
+import { approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -105,6 +117,106 @@ export function prRepoShort(url: string): string | null {
 export function getTask(taskId: string, tasks: Task[]): Task | undefined {
   if (!taskId) return undefined;
   return tasks.find((t) => t.id === taskId);
+}
+
+// ---------------------------------------------------------------------------
+// Merge Actions (extracted to support dialog state)
+// ---------------------------------------------------------------------------
+
+function MergeActions({ entryId, onRefresh }: { entryId: string; onRefresh: () => void }) {
+  const [rcOpen, setRcOpen] = useState(false);
+  const [rcFeedback, setRcFeedback] = useState("");
+  const [rcSubmitting, setRcSubmitting] = useState(false);
+
+  async function handleApprove() {
+    await approveMerge(entryId);
+    onRefresh();
+  }
+
+  async function handleReject() {
+    await rejectMerge(entryId);
+    onRefresh();
+  }
+
+  async function handleRequestChanges() {
+    if (!rcFeedback.trim()) return;
+    setRcSubmitting(true);
+    try {
+      await requestChanges(entryId, rcFeedback.trim(), rcFeedback.trim());
+      setRcOpen(false);
+      setRcFeedback("");
+      onRefresh();
+    } catch {
+      toast.error("Failed to request changes");
+    } finally {
+      setRcSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="inline-flex items-center rounded-md border border-border">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1 rounded-r-none border-r border-border"
+        onClick={handleApprove}
+      >
+        <Check className="h-3.5 w-3.5" />
+        Approve
+      </Button>
+      <Dialog open={rcOpen} onOpenChange={setRcOpen}>
+        <DialogTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 rounded-none border-r border-border"
+          >
+            <MessageSquare className="h-3.5 w-3.5" />
+            Request Changes
+          </Button>
+        </DialogTrigger>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Request Changes</DialogTitle>
+            <DialogDescription>
+              Describe what needs to change. The task will be re-dispatched with your feedback.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            placeholder="Describe the changes needed..."
+            value={rcFeedback}
+            onChange={(e) => setRcFeedback(e.target.value)}
+            rows={4}
+          />
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setRcOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={handleRequestChanges}
+              disabled={!rcFeedback.trim() || rcSubmitting}
+            >
+              {rcSubmitting ? "Submitting..." : "Submit"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1 rounded-l-none"
+        onClick={handleReject}
+      >
+        <X className="h-3.5 w-3.5" />
+        Reject
+      </Button>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -270,38 +382,7 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
       const refresh = (table.options.meta as { refreshSnapshot: () => Promise<void> })
         ?.refreshSnapshot;
 
-      async function handleApprove() {
-        await approveMerge(entry.id);
-        refresh?.();
-      }
-
-      async function handleReject() {
-        await rejectMerge(entry.id);
-        refresh?.();
-      }
-
-      return (
-        <div className="inline-flex items-center rounded-md border border-border">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1 rounded-r-none border-r border-border"
-            onClick={handleApprove}
-          >
-            <Check className="h-3.5 w-3.5" />
-            Approve
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1 rounded-l-none"
-            onClick={handleReject}
-          >
-            <X className="h-3.5 w-3.5" />
-            Reject
-          </Button>
-        </div>
-      );
+      return <MergeActions entryId={entry.id} onRefresh={() => refresh?.()} />;
     },
   },
 ];
