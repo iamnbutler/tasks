@@ -10,6 +10,7 @@ pub mod message;
 pub mod provider;
 pub mod providers;
 pub mod session;
+pub mod tool_exec;
 
 pub use completions::CompletionsService;
 pub use error::AgentError;
@@ -20,6 +21,7 @@ pub use provider::{
 pub use providers::AnthropicProvider;
 pub use session::{Chain, Session, SessionBuilder, SessionId, SessionState};
 pub use chain::{ChainBuilder, ChainResult, StepOutput, StepResult};
+pub use tool_exec::{ToolBatch, execute_tool_calls, partition_tool_calls};
 
 /// Convenience result type.
 pub type Result<T> = std::result::Result<T, AgentError>;
