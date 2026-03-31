@@ -40,6 +40,7 @@ pub enum RebuildScope {
 
 impl RebuildScope {
     /// Parse a scope from a string (for reading from .update-scope file).
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "none" => Self::None,
@@ -112,10 +113,12 @@ pub struct UpdateInfo {
     /// The commit SHA available on origin/main.
     pub available_commit: String,
     /// Number of commits behind.
+    #[allow(dead_code)]
     pub commits_behind: u32,
     /// What needs to be rebuilt.
     pub scope: RebuildScope,
     /// Changed files (for debugging/logging).
+    #[allow(dead_code)]
     pub changed_files: Vec<String>,
 }
 

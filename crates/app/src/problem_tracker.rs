@@ -9,10 +9,14 @@
 //! - Merge conflicts within a time window
 //! - Agent errors within a time window
 //! - Task failures within a time window
+//!
+//! NOTE: Auto mode-lowering is currently disabled (see `should_lower_mode`).
+//! These types are retained for future use when #536 is implemented.
 
 use std::time::{Duration, Instant};
 
 /// Reason for recommending mode lowering.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerReason {
     /// Multiple consecutive evaluation failures (API errors, etc.)
@@ -50,6 +54,7 @@ impl std::fmt::Display for LowerReason {
 }
 
 /// Configuration for problem thresholds.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProblemThresholds {
     /// Number of consecutive evaluation failures before lowering mode.
@@ -85,6 +90,7 @@ impl Default for ProblemThresholds {
 /// transitioning from Play to Pause mode.
 #[derive(Debug)]
 pub struct ProblemTracker {
+    #[allow(dead_code)]
     thresholds: ProblemThresholds,
     /// Consecutive evaluation failures (API errors, not rejections).
     consecutive_eval_failures: u32,
@@ -155,6 +161,7 @@ impl ProblemTracker {
     }
 
     /// Clean up old entries outside the tracking window.
+    #[allow(dead_code)]
     fn prune_old_entries(&mut self) {
         let cutoff = Instant::now() - self.thresholds.window_duration;
         self.recent_conflicts.retain(|&t| t > cutoff);
@@ -189,6 +196,7 @@ impl ProblemTracker {
     }
 
     /// Check if mode has been lowered by this tracker.
+    #[allow(dead_code)]
     pub fn is_mode_lowered(&self) -> bool {
         self.mode_lowered
     }
