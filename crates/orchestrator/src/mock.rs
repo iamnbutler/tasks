@@ -39,6 +39,7 @@ impl MockOrchestrator {
                 approved: true,
                 reasoning: "Mock: approved".to_string(),
                 feedback: None,
+                missing_context: Vec::new(),
             }),
             conflict_triage: Mutex::new(None),
             evaluate_count: Mutex::new(0),
@@ -57,6 +58,7 @@ impl MockOrchestrator {
                 approved: false,
                 reasoning: "Mock: rejected".to_string(),
                 feedback: Some(feedback),
+                missing_context: Vec::new(),
             }),
             conflict_triage: Mutex::new(None),
             evaluate_count: Mutex::new(0),
@@ -176,6 +178,7 @@ mod tests {
             approved: false,
             reasoning: "changed my mind".to_string(),
             feedback: Some("redo everything".to_string()),
+            missing_context: Vec::new(),
         });
         let ctx = test_context();
         let result = mock.evaluate(&ctx).await.unwrap();

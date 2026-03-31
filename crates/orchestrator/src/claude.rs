@@ -172,6 +172,9 @@ impl Orchestrator for ClaudeOrchestrator {
             "Fetched PR details"
         );
 
+        // Track data sources that were unavailable
+        let mut missing_context: Vec<String> = Vec::new();
+
         // Fetch the actual diff
         let diff = match self.github.get_pr_diff(&owner, &repo, pr_number).await {
             Ok(d) => {
@@ -180,6 +183,7 @@ impl Orchestrator for ClaudeOrchestrator {
             }
             Err(e) => {
                 warn!(error = %e, "Failed to fetch PR diff, continuing without it");
+                missing_context.push("pr_diff".to_string());
                 None
             }
         };
@@ -202,6 +206,7 @@ impl Orchestrator for ClaudeOrchestrator {
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to fetch associated issue, continuing without it");
+                        missing_context.push("associated_issue".to_string());
                         None
                     }
                 }
@@ -240,15 +245,20 @@ impl Orchestrator for ClaudeOrchestrator {
             || pass1.files_to_review.is_none()
             || pass1.files_to_review.as_ref().is_some_and(|f| f.is_empty())
         {
+            if !missing_context.is_empty() {
+                warn!(missing = ?missing_context, "Evaluation completed with incomplete data");
+            }
             info!(
                 approved = pass1.approved,
                 has_feedback = pass1.feedback.is_some(),
+                incomplete = !missing_context.is_empty(),
                 "Evaluation complete (pass 1 — no deeper review needed)"
             );
             return Ok(QualityEvaluation {
                 approved: pass1.approved,
                 reasoning: pass1.reasoning,
                 feedback: pass1.feedback,
+                missing_context: missing_context.clone(),
             });
         }
 
@@ -308,9 +318,13 @@ impl Orchestrator for ClaudeOrchestrator {
 
         let pass2 = self.parse_evaluation_response(&response_text)?;
 
+        if !missing_context.is_empty() {
+            warn!(missing = ?missing_context, "Evaluation completed with incomplete data");
+        }
         info!(
             approved = pass2.approved,
             has_feedback = pass2.feedback.is_some(),
+            incomplete = !missing_context.is_empty(),
             "Evaluation complete (pass 2 — deep review)"
         );
 
@@ -318,6 +332,7 @@ impl Orchestrator for ClaudeOrchestrator {
             approved: pass2.approved,
             reasoning: pass2.reasoning,
             feedback: pass2.feedback,
+            missing_context,
         })
     }
 
