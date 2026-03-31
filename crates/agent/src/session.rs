@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::AgentError;
+use crate::hooks::{HookRegistry, ToolHook};
 use crate::message::{Content, Message, Role, Response, Tool, ToolCall, ToolResult, Usage};
 use crate::provider::{CompletionConfig, CompletionRequest, Provider};
 
@@ -37,6 +38,7 @@ pub struct Session {
     pub config: CompletionConfig,
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
+    pub hooks: HookRegistry,
     pub created_at: DateTime<Utc>,
 }
 
@@ -53,6 +55,7 @@ impl Session {
             config,
             total_usage: Usage::default(),
             metadata: HashMap::new(),
+            hooks: HookRegistry::new(),
             created_at: Utc::now(),
         }
     }
@@ -63,6 +66,19 @@ impl Session {
 
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.system_prompt = Some(prompt.into());
+    }
+
+    /// Add a hook to the session's hook registry.
+    pub fn add_hook(&mut self, hook: Arc<dyn ToolHook>) {
+        self.hooks.add(hook);
+    }
+
+    /// Get a `ToolUseContext` for the current session state.
+    pub fn hook_context(&self) -> crate::hooks::ToolUseContext {
+        crate::hooks::ToolUseContext {
+            session_id: self.id.clone(),
+            metadata: self.metadata.clone(),
+        }
     }
 
     pub fn add_tool(&mut self, tool: Tool) {
@@ -265,6 +281,7 @@ pub struct SessionBuilder {
     config: CompletionConfig,
     system_prompt: Option<String>,
     tools: Vec<Tool>,
+    hooks: HookRegistry,
     initial_messages: Vec<Message>,
 }
 
@@ -274,6 +291,7 @@ impl SessionBuilder {
             config: CompletionConfig::new(model),
             system_prompt: None,
             tools: Vec::new(),
+            hooks: HookRegistry::new(),
             initial_messages: Vec::new(),
         }
     }
@@ -303,6 +321,11 @@ impl SessionBuilder {
         self
     }
 
+    pub fn hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
+        self.hooks.add(hook);
+        self
+    }
+
     pub fn message(mut self, message: Message) -> Self {
         self.initial_messages.push(message);
         self
@@ -312,6 +335,7 @@ impl SessionBuilder {
         let mut session = Session::new(self.config);
         session.system_prompt = self.system_prompt;
         session.tools = self.tools;
+        session.hooks = self.hooks;
         session.messages = self.initial_messages;
         session
     }

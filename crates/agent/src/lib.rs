@@ -6,6 +6,7 @@
 pub mod chain;
 pub mod completions;
 pub mod error;
+pub mod hooks;
 pub mod message;
 pub mod provider;
 pub mod providers;
@@ -21,7 +22,8 @@ pub use provider::{
 pub use providers::AnthropicProvider;
 pub use session::{Chain, Session, SessionBuilder, SessionId, SessionState};
 pub use chain::{ChainBuilder, ChainResult, StepOutput, StepResult};
-pub use tool_exec::{ToolBatch, execute_tool_calls, partition_tool_calls};
+pub use hooks::{HookRegistry, PostHookResult, PreHookResult, ToolHook, ToolUseContext};
+pub use tool_exec::{ToolBatch, execute_tool_calls, execute_tool_calls_hooked, partition_tool_calls};
 
 /// Convenience result type.
 pub type Result<T> = std::result::Result<T, AgentError>;

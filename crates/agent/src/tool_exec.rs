@@ -8,6 +8,7 @@ use std::future::Future;
 
 use futures::future::join_all;
 
+use crate::hooks::{HookRegistry, PreHookResult, ToolUseContext};
 use crate::message::{Tool, ToolCall, ToolResult};
 
 /// Maximum number of concurrency-safe tools to run in parallel.
@@ -97,6 +98,88 @@ where
     }
 
     results
+}
+
+/// Execute tool calls with hooks applied at each stage of the lifecycle.
+///
+/// For each tool call:
+/// 1. Pre-hooks run (can block or modify input)
+/// 2. Tool executes via the provided `executor`
+/// 3. Post-hooks run (can modify output)
+///
+/// Concurrency behavior is identical to [`execute_tool_calls`]: safe tools
+/// run in parallel, unsafe tools run serially.
+pub async fn execute_tool_calls_hooked<F, Fut>(
+    tool_calls: Vec<ToolCall>,
+    tools: &[Tool],
+    hooks: &HookRegistry,
+    context: &ToolUseContext,
+    executor: F,
+) -> Vec<ToolResult>
+where
+    F: Fn(ToolCall) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult> + Send,
+{
+    if hooks.is_empty() {
+        return execute_tool_calls(tool_calls, tools, executor).await;
+    }
+
+    let batches = partition_tool_calls(tool_calls, tools);
+    let mut results = Vec::new();
+
+    for batch in batches {
+        if batch.is_concurrent && batch.calls.len() > 1 {
+            for chunk in batch.calls.chunks(MAX_CONCURRENT) {
+                let futures: Vec<_> = chunk
+                    .iter()
+                    .cloned()
+                    .map(|tc| {
+                        let hooks = hooks;
+                        let context = context;
+                        let executor = &executor;
+                        async move {
+                            execute_single_hooked(tc, hooks, context, executor).await
+                        }
+                    })
+                    .collect();
+                results.extend(join_all(futures).await);
+            }
+        } else {
+            for tc in batch.calls {
+                results.push(execute_single_hooked(tc, hooks, context, &executor).await);
+            }
+        }
+    }
+
+    results
+}
+
+/// Execute a single tool call with pre/post hooks.
+async fn execute_single_hooked<F, Fut>(
+    mut tool_call: ToolCall,
+    hooks: &HookRegistry,
+    context: &ToolUseContext,
+    executor: &F,
+) -> ToolResult
+where
+    F: Fn(ToolCall) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult> + Send,
+{
+    // Pre-hooks: can block or modify input
+    match hooks.run_pre_hooks(&tool_call.name, &tool_call.arguments, context) {
+        PreHookResult::Continue(new_input) => {
+            tool_call.arguments = new_input;
+        }
+        PreHookResult::Block(error) => {
+            return ToolResult::error(&tool_call.id, error);
+        }
+    }
+
+    // Execute
+    let result = executor(tool_call.clone()).await;
+
+    // Post-hooks
+    hooks.apply_to_result(&tool_call, result, context)
 }
 
 #[cfg(test)]
