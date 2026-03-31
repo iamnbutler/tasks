@@ -12,6 +12,9 @@ use crate::error::AgentError;
 use crate::message::{Content, Message, Role, Response, Tool, ToolCall, ToolResult, Usage};
 use crate::provider::{CompletionConfig, CompletionRequest, Provider};
 
+/// Default compaction threshold as a fraction of context window (85%).
+const DEFAULT_COMPACT_THRESHOLD: f32 = 0.85;
+
 /// Unique session identifier.
 pub type SessionId = String;
 
@@ -38,6 +41,8 @@ pub struct Session {
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Number of times this session has been compacted.
+    pub compaction_count: u32,
 }
 
 impl Session {
@@ -54,6 +59,7 @@ impl Session {
             total_usage: Usage::default(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
+            compaction_count: 0,
         }
     }
 
@@ -223,6 +229,91 @@ impl Session {
         result
     }
 
+    /// Check whether the conversation should be compacted based on estimated token usage.
+    ///
+    /// Returns true when estimated tokens exceed `DEFAULT_COMPACT_THRESHOLD` (85%) of
+    /// the context window's input budget.
+    pub fn needs_compaction(&self) -> bool {
+        let total_tokens: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        let threshold = (self.config.input_budget() as f32 * DEFAULT_COMPACT_THRESHOLD) as u32;
+        total_tokens > threshold
+    }
+
+    /// Compact the conversation by summarizing older messages via an LLM call.
+    ///
+    /// This replaces the middle of the conversation with a summary, preserving:
+    /// - The first message (task context)
+    /// - The N most recent messages (for continuity)
+    ///
+    /// The summary is inserted as an assistant message to maintain proper role
+    /// alternation (the first message is a user message with task context).
+    pub async fn compact_if_needed(
+        &mut self,
+        provider: &(impl Provider + ?Sized),
+    ) -> std::result::Result<bool, AgentError> {
+        if !self.needs_compaction() {
+            return Ok(false);
+        }
+
+        let total = self.messages.len();
+        // Need at least a few messages to meaningfully compact
+        if total < 4 {
+            return Ok(false);
+        }
+
+        // Keep the last ~10 messages (or fewer if conversation is short)
+        let keep_recent = 10.min(total.saturating_sub(2));
+        let compact_end = total - keep_recent;
+
+        // Nothing to compact if boundary is at or before message 1
+        if compact_end <= 1 {
+            return Ok(false);
+        }
+
+        // Summarize messages [0..compact_end] (includes task context for reference)
+        let messages_to_summarize = &self.messages[..compact_end];
+        let summary = summarize_messages(provider, messages_to_summarize, &self.config.model).await?;
+
+        // Build new message list:
+        // [0] Original first message (user - task context)
+        // [1] Assistant summary of compacted conversation
+        // [2..] Recent messages preserved as-is, starting from a user message
+        //
+        // We must ensure proper role alternation. The summary is an assistant
+        // message, so the first recent message must be a user message. Skip
+        // any leading assistant messages in the recent tail.
+        let mut recent_start = compact_end;
+        while recent_start < total && self.messages[recent_start].role == Role::Assistant {
+            recent_start += 1;
+        }
+
+        let mut new_messages = Vec::with_capacity(2 + (total - recent_start));
+        new_messages.push(self.messages[0].clone());
+        new_messages.push(Message::assistant(format!(
+            "[Conversation Summary — compaction #{}]\n{}",
+            self.compaction_count + 1,
+            summary
+        )));
+        if recent_start < total {
+            new_messages.extend_from_slice(&self.messages[recent_start..]);
+        }
+
+        let old_count = self.messages.len();
+        self.messages = new_messages;
+        self.compaction_count += 1;
+
+        tracing::info!(
+            session_id = %self.id,
+            compaction_count = self.compaction_count,
+            messages_before = old_count,
+            messages_after = self.messages.len(),
+            summarized_range = %format!("[0..{}]", compact_end),
+            "compacted conversation via summarization"
+        );
+
+        Ok(true)
+    }
+
     /// Apply a response to the session, updating state.
     pub fn apply_response(&mut self, response: &Response) {
         if !response.content.is_empty() {
@@ -258,6 +349,68 @@ impl Session {
         self.state = SessionState::Cancelled;
         self.pending_tool_calls.clear();
     }
+}
+
+/// Format messages into a text representation for the summarization prompt.
+///
+/// Each message is formatted with its role and a truncated preview of its content.
+/// Content is safely truncated at char boundaries to avoid UTF-8 panics.
+fn format_messages_for_summary(messages: &[Message]) -> String {
+    let mut parts = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let role = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => "System",
+        };
+        let content = msg.text();
+        // Safely truncate at char boundary
+        let truncated: String = if content.chars().count() > 500 {
+            let mut s: String = content.chars().take(500).collect();
+            s.push_str("...");
+            s
+        } else {
+            content
+        };
+        if !truncated.is_empty() {
+            parts.push(format!("[{}]: {}", role, truncated));
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Summarize a slice of messages by asking the LLM to produce a concise summary.
+async fn summarize_messages(
+    provider: &(impl Provider + ?Sized),
+    messages: &[Message],
+    model: &str,
+) -> std::result::Result<String, AgentError> {
+    let formatted = format_messages_for_summary(messages);
+
+    let summary_prompt = format!(
+        "Summarize the following conversation concisely. Preserve:\n\
+         - Key decisions and their reasoning\n\
+         - Important facts, file paths, and code references\n\
+         - Current task state and what has been accomplished\n\
+         - Any outstanding issues or next steps\n\n\
+         Be direct and factual. Do not include preamble.\n\n\
+         ---\n{}\n---",
+        formatted
+    );
+
+    let config = CompletionConfig::new(model).with_max_tokens(1024).with_temperature(0.0);
+    let request = CompletionRequest::new(
+        config,
+        vec![Message::user(summary_prompt)],
+    )
+    .with_system("You are a conversation summarizer. Produce a concise summary that captures all important context needed to continue the conversation effectively.".to_string());
+
+    let response = provider.complete(request).await?;
+    let text = response.text();
+    if text.is_empty() {
+        return Err(AgentError::Other("Summarization returned empty response".into()));
+    }
+    Ok(text)
 }
 
 /// Builder for creating and configuring sessions.
@@ -661,5 +814,158 @@ mod tests {
         }
         // First message preserved
         assert_eq!(request.messages[0].text(), "implement feature X");
+    }
+
+    #[test]
+    fn test_format_messages_for_summary_basic() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+        ];
+        let formatted = format_messages_for_summary(&messages);
+        assert!(formatted.contains("[User]: hello"));
+        assert!(formatted.contains("[Assistant]: hi there"));
+    }
+
+    #[test]
+    fn test_format_messages_for_summary_truncates_long_content() {
+        let long_text = "x".repeat(1000);
+        let messages = vec![Message::user(long_text)];
+        let formatted = format_messages_for_summary(&messages);
+        assert!(formatted.contains("..."));
+        // Should be 500 chars + "..." = 503, plus the "[User]: " prefix
+        assert!(formatted.len() < 600);
+    }
+
+    #[test]
+    fn test_format_messages_for_summary_utf8_safe() {
+        // Each emoji is a multi-byte char (4 bytes); slicing at byte 500 would panic
+        // Need >500 chars to trigger truncation
+        let emoji_text = "🎉".repeat(600); // 600 chars, 2400 bytes
+        let messages = vec![Message::user(emoji_text)];
+        // This should not panic
+        let formatted = format_messages_for_summary(&messages);
+        assert!(formatted.contains("..."));
+    }
+
+    #[test]
+    fn test_needs_compaction_under_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200_000)
+            .with_max_tokens(4096);
+        let mut session = Session::new(config);
+        session.add_user_message("short message");
+        assert!(!session.needs_compaction());
+    }
+
+    #[test]
+    fn test_needs_compaction_over_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+        // Input budget = 90, threshold = 90 * 0.85 = 76 tokens
+        // Fill with enough messages to exceed
+        for i in 0..30 {
+            session.add_user_message(&format!("message {} with some text to use up tokens", i));
+            session.add_assistant_message(&format!("response {} with corresponding text content", i));
+        }
+        assert!(session.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_no_compaction_when_under_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200_000)
+            .with_max_tokens(4096);
+        let mut session = Session::new(config);
+        session.add_user_message("hello");
+        session.add_assistant_message("hi");
+
+        let provider = MockProvider;
+        let compacted = session.compact_if_needed(&provider).await.unwrap();
+        assert!(!compacted);
+        assert_eq!(session.compaction_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_compacts_when_over_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+
+        // Fill with enough messages to exceed threshold
+        session.add_user_message("task: implement feature X");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("working on step {} of the implementation", i));
+            session.add_user_message(&format!("continue with step {}", i + 1));
+        }
+
+        let original_count = session.messages.len();
+        let provider = MockProvider;
+        let compacted = session.compact_if_needed(&provider).await.unwrap();
+
+        assert!(compacted);
+        assert_eq!(session.compaction_count, 1);
+        assert!(session.messages.len() < original_count);
+        // First message preserved
+        assert_eq!(session.messages[0].text(), "task: implement feature X");
+        // Second message is the assistant summary (not user — avoids consecutive user messages)
+        assert_eq!(session.messages[1].role, Role::Assistant);
+        assert!(session.messages[1].text().contains("[Conversation Summary"));
+    }
+
+    #[tokio::test]
+    async fn test_compact_maintains_role_alternation() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_max_tokens(10);
+        let mut session = Session::new(config);
+
+        session.add_user_message("task context");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("response {}", i));
+            session.add_user_message(&format!("query {}", i));
+        }
+
+        let provider = MockProvider;
+        session.compact_if_needed(&provider).await.unwrap();
+
+        // Verify no consecutive same-role messages
+        for window in session.messages.windows(2) {
+            assert_ne!(
+                window[0].role, window[1].role,
+                "Consecutive messages have same role: {:?} at positions with text '{}' and '{}'",
+                window[0].role,
+                window[0].text().chars().take(50).collect::<String>(),
+                window[1].text().chars().take(50).collect::<String>(),
+            );
+        }
+    }
+
+    /// Minimal mock provider for testing compaction.
+    struct MockProvider;
+
+    impl Provider for MockProvider {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[&str] { &["test-model"] }
+
+        async fn complete(&self, _request: CompletionRequest) -> std::result::Result<Response, AgentError> {
+            Ok(Response {
+                content: vec![Content::text("Summary: The conversation involved implementing a feature with multiple steps.")],
+                tool_calls: vec![],
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(Usage { input_tokens: 100, output_tokens: 50 }),
+            })
+        }
+
+        async fn complete_streaming(
+            &self,
+            request: CompletionRequest,
+        ) -> std::result::Result<tokio::sync::mpsc::UnboundedReceiver<crate::provider::StreamChunk>, AgentError> {
+            let response = self.complete(request).await?;
+            Ok(crate::provider::streaming_from_complete(response))
+        }
     }
 }
