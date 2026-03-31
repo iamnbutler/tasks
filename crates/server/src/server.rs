@@ -1386,11 +1386,24 @@ impl Server {
                 let mut state = self.state.write().await;
                 match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
                     Ok(true) => {
-                        tracing::debug!(
+                        tracing::info!(
                             entry_id = %entry_id,
                             head_sha = %head_sha,
                             "reconciliation: updated head_sha for PR"
                         );
+                        // New commits detected — reset Approved entries to Pending
+                        // so the orchestrator re-evaluates the updated code.
+                        if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                            if entry.status == MergeStatus::Approved {
+                                tracing::info!(
+                                    entry_id = %entry_id,
+                                    head_sha = %head_sha,
+                                    "reconciliation: new commits on approved PR, resetting to Pending for re-evaluation"
+                                );
+                                entry.status = MergeStatus::Pending;
+                                changes += 1;
+                            }
+                        }
                     }
                     Ok(false) => {} // No change
                     Err(e) => {

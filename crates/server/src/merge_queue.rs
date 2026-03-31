@@ -693,6 +693,41 @@ mod tests {
     }
 
     #[test]
+    fn update_head_sha_returns_changed() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+
+        // First update: no prior SHA, should report changed
+        assert_eq!(q.update_head_sha("m1", "abc123").unwrap(), true);
+        assert_eq!(q.get("m1").unwrap().head_sha.as_deref(), Some("abc123"));
+
+        // Same SHA: no change
+        assert_eq!(q.update_head_sha("m1", "abc123").unwrap(), false);
+
+        // Different SHA: changed
+        assert_eq!(q.update_head_sha("m1", "def456").unwrap(), true);
+        assert_eq!(q.get("m1").unwrap().head_sha.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn approved_entry_can_be_reset_to_pending_on_sha_change() {
+        let mut q = MergeQueue::new();
+        q.enqueue(entry("m1", "t1"));
+        q.approve("m1").unwrap();
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Approved);
+
+        // Simulate what reconcile_merge_queue does: update SHA and reset if changed
+        let changed = q.update_head_sha("m1", "new_sha").unwrap();
+        assert!(changed);
+        if let Some(e) = q.get_mut("m1") {
+            if e.status == MergeStatus::Approved {
+                e.status = MergeStatus::Pending;
+            }
+        }
+        assert_eq!(q.get("m1").unwrap().status, MergeStatus::Pending);
+    }
+
+    #[test]
     fn entries_with_positions_no_approved() {
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
