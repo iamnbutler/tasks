@@ -18,10 +18,12 @@ You review the ACTUAL CODE DIFF, not just PR metadata. Do not trust the PR descr
 ## Review process
 
 **Pass 1 — Diff triage:**
-Read the diff carefully. Evaluate:
+Read the diff carefully. You will also receive **File Context** — surrounding code (±50 lines) for the most-changed files. Use this to understand how the changes fit into the broader codebase.
+
+Evaluate:
 
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
-2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases?
+2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases? Use the file context to check callers/dependents.
 3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
 4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
 5. **Queue context**: Consider other PRs in the merge queue. If this PR appears to depend on changes from another PR that hasn't merged yet, or if issues you see would be resolved by a PR ahead in the queue, factor that into your decision.
@@ -70,12 +72,16 @@ Response format for Pass 2 is the same, but `needs_deeper_review` must be false.
 }
 
 /// Build the user prompt with PR and issue context.
+///
+/// `file_contexts` contains `(path, context_window)` pairs for proactively
+/// fetched surrounding code. Pass `&[]` if no context was fetched.
 pub fn build_evaluation_prompt(
     pr: &PullRequest,
     issue: Option<&Issue>,
     task_title: &str,
     task_description: Option<&str>,
     diff: Option<&str>,
+    file_contexts: &[(String, String)],
     queue_context: &[QueueEntrySummary],
 ) -> String {
     let mut prompt = String::new();
@@ -195,6 +201,21 @@ pub fn build_evaluation_prompt(
         prompt.push_str("\nConsider whether this PR might depend on or conflict with any of the above.\n\n");
     }
 
+    // File context — proactively fetched surrounding code for key changed files
+    if !file_contexts.is_empty() {
+        prompt.push_str("## File Context\n\n");
+        prompt.push_str("Surrounding code for the most-changed files (line numbers shown, `...` indicates skipped lines):\n\n");
+        for (path, context) in file_contexts {
+            prompt.push_str(&format!("### `{}`\n\n", path));
+            prompt.push_str("```\n");
+            prompt.push_str(context);
+            if !context.ends_with('\n') {
+                prompt.push('\n');
+            }
+            prompt.push_str("```\n\n");
+        }
+    }
+
     // The diff — this is what the review is actually about
     if let Some(diff) = diff {
         prompt.push_str("## Diff\n\n");
@@ -230,8 +251,8 @@ pub fn build_deep_review_prompt(
     files: &[(String, String)],
     queue_context: &[QueueEntrySummary],
 ) -> String {
-    // Start with the same base prompt
-    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, Some(diff), queue_context);
+    // Start with the same base prompt (no file contexts in deep review — we include full files below)
+    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, Some(diff), &[], queue_context);
 
     // Add the reviewer's reasoning from pass 1
     prompt.push_str("\n## Previous Review Notes\n\n");
@@ -422,7 +443,7 @@ mod tests {
     #[test]
     fn test_build_evaluation_prompt_basic() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None, None, &[]);
+        let prompt = build_evaluation_prompt(&pr, None, "Fix auth bug", None, None, &[], &[]);
 
         // Should contain task info
         assert!(prompt.contains("Fix auth bug"));
@@ -451,6 +472,7 @@ mod tests {
             Some("Fix the timeout issue"),
             None,
             &[],
+            &[],
         );
 
         // Should contain issue info
@@ -467,7 +489,7 @@ mod tests {
         let mut pr = test_pr();
         pr.mergeable = Some(MergeableState::Conflicting);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[], &[]);
         assert!(prompt.contains("has conflicts"));
     }
 
@@ -476,14 +498,14 @@ mod tests {
         let mut pr = test_pr();
         pr.review_decision = Some(ReviewDecision::ChangesRequested);
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[], &[]);
         assert!(prompt.contains("Changes requested"));
     }
 
     #[test]
     fn test_build_evaluation_prompt_with_reviews() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[], &[]);
 
         // Should contain review info
         assert!(prompt.contains("@testuser"));
@@ -508,6 +530,7 @@ mod tests {
             None,
             Some("diff --git a/src/auth.rs b/src/auth.rs\n-old\n+new"),
             &[],
+            &[],
         );
         assert!(prompt.contains("## Diff"));
         assert!(prompt.contains("-old"));
@@ -517,7 +540,7 @@ mod tests {
     #[test]
     fn test_build_evaluation_prompt_no_diff_notes_absence() {
         let pr = test_pr();
-        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[]);
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[], &[]);
         assert!(prompt.contains("No diff available"));
     }
 
@@ -569,7 +592,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_evaluation_prompt(&pr, None, "Test task", None, None, &queue_context);
+        let prompt = build_evaluation_prompt(&pr, None, "Test task", None, None, &[], &queue_context);
 
         // Should contain queue context section
         assert!(prompt.contains("## Merge Queue Context"));
@@ -585,5 +608,39 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_file_context() {
+        let pr = test_pr();
+        let file_contexts = vec![
+            ("src/auth.rs".to_string(), "8: fn login() {\n9:     let user = get_user();\n10:     validate(user);\n11:     Ok(user)\n12: }\n".to_string()),
+        ];
+        let prompt = build_evaluation_prompt(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff content"),
+            &file_contexts,
+            &[],
+        );
+        assert!(prompt.contains("## File Context"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("fn login()"));
+        assert!(prompt.contains("validate(user)"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_no_file_context() {
+        let pr = test_pr();
+        let prompt = build_evaluation_prompt(&pr, None, "Test", None, None, &[], &[]);
+        assert!(!prompt.contains("## File Context"));
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_file_context() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("File Context"));
     }
 }

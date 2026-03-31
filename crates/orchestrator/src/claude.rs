@@ -6,6 +6,7 @@
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::diff::{parse_diff_files, extract_context_window, MAX_CONTEXT_FILES, MAX_CONTEXT_LINES, CONTEXT_WINDOW};
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
 use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
@@ -214,7 +215,55 @@ impl Orchestrator for ClaudeOrchestrator {
             _ => None,
         };
 
-        // --- Pass 1: Triage with diff ---
+        // --- Proactive context fetching ---
+        // Parse the diff to find the most-changed files and fetch surrounding code
+        let mut file_contexts: Vec<(String, String)> = Vec::new();
+        if let Some(ref diff_text) = diff {
+            let changed_files = parse_diff_files(diff_text);
+            let mut total_lines = 0usize;
+
+            for file in changed_files.iter().take(MAX_CONTEXT_FILES) {
+                if total_lines >= MAX_CONTEXT_LINES {
+                    break;
+                }
+                match self
+                    .github
+                    .get_file_content_at_ref(&owner, &repo, &file.path, &pr.head_ref)
+                    .await
+                {
+                    Ok(Some(content)) => {
+                        let context_window =
+                            extract_context_window(&content, &file.changed_lines, CONTEXT_WINDOW);
+                        let line_count = context_window.lines().count();
+                        if line_count > 0 {
+                            info!(
+                                path = %file.path,
+                                context_lines = line_count,
+                                "Fetched proactive context"
+                            );
+                            total_lines += line_count;
+                            file_contexts.push((file.path.clone(), context_window));
+                        }
+                    }
+                    Ok(None) => {
+                        info!(path = %file.path, "File not found for proactive context (may be new)");
+                    }
+                    Err(e) => {
+                        warn!(path = %file.path, error = %e, "Failed to fetch proactive context");
+                    }
+                }
+            }
+
+            if !file_contexts.is_empty() {
+                info!(
+                    files = file_contexts.len(),
+                    total_lines,
+                    "Proactive context fetched for evaluation"
+                );
+            }
+        }
+
+        // --- Pass 1: Triage with diff + proactive context ---
         let system = system_prompt();
         let user_prompt = build_evaluation_prompt(
             &pr,
@@ -222,6 +271,7 @@ impl Orchestrator for ClaudeOrchestrator {
             &context.task.title,
             context.task.description.as_deref(),
             diff.as_deref(),
+            &file_contexts,
             &context.queue_context,
         );
 
