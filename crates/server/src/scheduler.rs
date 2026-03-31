@@ -88,11 +88,6 @@ pub fn issue_to_task(
     project_id: &str,
     label_config: &LabelConfig,
 ) -> Option<Task> {
-    // Skip closed issues.
-    if issue.state != tasks_github::model::IssueState::Open {
-        return None;
-    }
-
     let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
 
     // Check for the canonical skip label — always skip regardless of config.
@@ -120,6 +115,23 @@ pub fn issue_to_task(
     task.source_created_at = Some(issue.created_at);
     task.source_number = Some(issue.number);
     task.priority = parse_priority_from_labels(&issue_label_names);
+
+    // Import closed issues as terminal tasks so they are tracked as "seen"
+    // even if closed before the first poll (issue #502).
+    if issue.state != tasks_github::model::IssueState::Open {
+        if let Some(closure_reason) = issue.classify_closure() {
+            use tasks_github::model::ClosureReason;
+            let terminal_state = match closure_reason {
+                ClosureReason::PrMerged | ClosureReason::ManualCompletion => TaskState::Completed,
+                ClosureReason::NotPlanned | ClosureReason::Unknown => TaskState::Cancelled,
+            };
+            task.state = terminal_state;
+        } else {
+            // Closed but no classifiable reason — mark cancelled.
+            task.state = TaskState::Cancelled;
+        }
+        return Some(task);
+    }
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| issue_label_names.contains(&b.as_str()));
@@ -534,12 +546,46 @@ mod tests {
     }
 
     #[test]
-    fn closed_issue_not_imported() {
+    fn closed_issue_imported_as_cancelled() {
+        // Closed issue with no state_reason → ClosureReason::Unknown → Cancelled
         let issue = make_issue(55, vec![make_label("bug")], GhIssueState::Closed);
         let cfg = default_label_config();
 
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("closed issues should be imported");
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn closed_issue_completed_imported_as_completed() {
+        let mut issue = make_issue(56, vec![make_label("bug")], GhIssueState::Closed);
+        issue.state_reason = Some(tasks_github::model::IssueStateReason::Completed);
+        let cfg = default_label_config();
+
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("closed issues should be imported");
+        assert_eq!(task.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn closed_issue_not_planned_imported_as_cancelled() {
+        let mut issue = make_issue(57, vec![make_label("bug")], GhIssueState::Closed);
+        issue.state_reason = Some(tasks_github::model::IssueStateReason::NotPlanned);
+        let cfg = default_label_config();
+
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("closed issues should be imported");
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn closed_issue_with_skip_label_not_imported() {
+        let issue = make_issue(
+            58,
+            vec![make_label("bug"), make_label(super::SKIP_LABEL)],
+            GhIssueState::Closed,
+        );
+        let cfg = default_label_config();
+
         let task = issue_to_task(&issue, "proj-1", &cfg);
-        assert!(task.is_none(), "closed issues should be skipped");
+        assert!(task.is_none(), "closed issue with skip label should still be skipped");
     }
 
     #[test]

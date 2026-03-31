@@ -727,12 +727,22 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     _ => {} // No changes or task not found
                                 }
                             } else {
-                                // New issue — create task (existing behavior)
+                                // New issue — create task.
+                                // Closed issues are imported as terminal tasks so
+                                // they are tracked as "seen" (issue #502).
                                 if let Some(task) = server::scheduler::issue_to_task(
                                     issue,
                                     project_id,
                                     &label_config,
                                 ) {
+                                    if task.state.is_terminal() {
+                                        debug!(
+                                            project = %project_id,
+                                            issue = issue.number,
+                                            state = ?task.state,
+                                            "importing already-closed issue as terminal task"
+                                        );
+                                    }
                                     if let Err(e) = poll_server.add_task(task).await {
                                         warn!(
                                             project = %project_id,
