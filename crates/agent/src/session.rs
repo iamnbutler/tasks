@@ -12,6 +12,15 @@ use crate::error::AgentError;
 use crate::message::{Content, Message, Role, Response, Tool, ToolCall, ToolResult, Usage};
 use crate::provider::{CompletionConfig, CompletionRequest, Provider};
 
+/// Maximum consecutive compaction failures before backing off.
+const MAX_COMPACTION_FAILURES: u32 = 3;
+
+/// Fraction of context window that triggers compaction (85%).
+const COMPACTION_THRESHOLD: f32 = 0.85;
+
+/// Minimum number of recent messages to preserve after compaction.
+const COMPACTION_KEEP_RECENT: usize = 10;
+
 /// Unique session identifier.
 pub type SessionId = String;
 
@@ -38,6 +47,10 @@ pub struct Session {
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Number of times compaction has been performed in this session.
+    pub compaction_count: u32,
+    /// Consecutive compaction failures (resets on success). Used for backoff.
+    compaction_failures: u32,
 }
 
 impl Session {
@@ -54,6 +67,8 @@ impl Session {
             total_usage: Usage::default(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
+            compaction_count: 0,
+            compaction_failures: 0,
         }
     }
 
@@ -134,6 +149,153 @@ impl Session {
         }
 
         request
+    }
+
+    /// Compact conversation history via LLM summarization if context usage exceeds threshold.
+    ///
+    /// Returns `Ok(true)` if compaction was performed, `Ok(false)` if not needed or skipped.
+    /// Compaction replaces older messages with a system-role summary, preserving the first
+    /// user message (task context) and recent messages for continuity.
+    ///
+    /// The summary is inserted as a `Role::System` message to avoid role alternation
+    /// violations (the first message is typically `Role::User`).
+    pub async fn compact_if_needed(&mut self, provider: &(impl Provider + ?Sized)) -> Result<bool, AgentError> {
+        // Back off after repeated failures
+        if self.compaction_failures >= MAX_COMPACTION_FAILURES {
+            tracing::debug!(
+                session_id = %self.id,
+                failures = self.compaction_failures,
+                "skipping compaction after repeated failures"
+            );
+            return Ok(false);
+        }
+
+        let total_tokens: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        let threshold = (self.config.context_window as f32 * COMPACTION_THRESHOLD) as u32;
+
+        if total_tokens <= threshold {
+            return Ok(false);
+        }
+
+        // Not enough messages to meaningfully compact
+        if self.messages.len() <= COMPACTION_KEEP_RECENT + 1 {
+            return Ok(false);
+        }
+
+        tracing::info!(
+            session_id = %self.id,
+            total_tokens,
+            threshold,
+            total_messages = self.messages.len(),
+            "compacting conversation history via summarization"
+        );
+
+        // Determine which messages to summarize vs keep
+        let keep_recent = self.messages.len().saturating_sub(COMPACTION_KEEP_RECENT);
+        let messages_to_summarize = &self.messages[..keep_recent];
+
+        match self.summarize_conversation(provider, messages_to_summarize).await {
+            Ok(summary) => {
+                let recent = self.messages[keep_recent..].to_vec();
+
+                // Rebuild messages: [first_user_msg, system_summary, assistant_ack, ...recent]
+                // Using Role::System for the summary avoids consecutive User messages.
+                let mut new_messages = Vec::with_capacity(3 + recent.len());
+                new_messages.push(self.messages[0].clone());
+                new_messages.push(Message::system(format!(
+                    "[Conversation Summary — compaction #{}]\n{}",
+                    self.compaction_count + 1,
+                    summary
+                )));
+                new_messages.push(Message::assistant(
+                    "Understood. I have the conversation context from the summary and will continue from here."
+                ));
+                new_messages.extend(recent);
+
+                // Ensure valid role alternation at the boundary.
+                // If recent starts with an Assistant message, we'd have two consecutive
+                // Assistant messages. In that case, drop the ack.
+                if new_messages.len() > 3 && new_messages[3].role == Role::Assistant {
+                    new_messages.remove(2);
+                }
+
+                self.messages = new_messages;
+                self.compaction_count += 1;
+                self.compaction_failures = 0;
+
+                tracing::info!(
+                    session_id = %self.id,
+                    compaction_count = self.compaction_count,
+                    new_message_count = self.messages.len(),
+                    "compaction complete"
+                );
+
+                Ok(true)
+            }
+            Err(e) => {
+                self.compaction_failures += 1;
+                tracing::warn!(
+                    session_id = %self.id,
+                    error = %e,
+                    failures = self.compaction_failures,
+                    max_failures = MAX_COMPACTION_FAILURES,
+                    "compaction summarization failed"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Summarize a slice of conversation messages using the provider.
+    async fn summarize_conversation(
+        &self,
+        provider: &(impl Provider + ?Sized),
+        messages: &[Message],
+    ) -> Result<String, AgentError> {
+        // Format messages into a readable transcript
+        let mut transcript = String::new();
+        for msg in messages {
+            let role_label = match msg.role {
+                Role::System => "System",
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+            let text = msg.text();
+            if !text.is_empty() {
+                transcript.push_str(&format!("[{}]: {}\n\n", role_label, text));
+            }
+            // Note: tool use/result details are omitted from the transcript to save
+            // tokens. The summary captures the semantic content, not raw tool output.
+            for content in &msg.content {
+                match content {
+                    Content::ToolUse { name, .. } => {
+                        transcript.push_str(&format!("[{} used tool: {}]\n\n", role_label, name));
+                    }
+                    Content::ToolResult { is_error, .. } if *is_error => {
+                        transcript.push_str("[Tool returned an error]\n\n");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let system_prompt = r#"You are a conversation summarizer. Summarize the following conversation transcript, preserving:
+- Key decisions made and their reasoning
+- Important facts, file paths, code changes, and technical details
+- Current task state and what has been accomplished
+- Any errors encountered and how they were resolved
+- Outstanding work or next steps mentioned
+
+Be concise but thorough. Focus on information the assistant will need to continue working effectively.
+Return ONLY the summary, no preamble."#;
+
+        let config = CompletionConfig::new(&self.config.model)
+            .with_max_tokens(1024);
+        let request = CompletionRequest::new(config, vec![Message::user(transcript)])
+            .with_system(system_prompt);
+
+        let response = provider.complete(request).await?;
+        Ok(response.text().trim().to_string())
     }
 
     /// Truncate messages to fit within the context window budget.
@@ -420,6 +582,56 @@ impl<P: Provider> Chain<P> {
 mod tests {
     use super::*;
     use crate::message::{Content, StopReason};
+    use tokio::sync::mpsc;
+
+    /// A mock provider that returns a canned response for testing compaction.
+    struct MockProvider {
+        response_text: String,
+    }
+
+    impl MockProvider {
+        fn new(text: impl Into<String>) -> Self {
+            Self { response_text: text.into() }
+        }
+    }
+
+    impl Provider for MockProvider {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[&str] { &["mock-model"] }
+        async fn complete(&self, _request: CompletionRequest) -> std::result::Result<Response, AgentError> {
+            Ok(Response {
+                content: vec![Content::text(&self.response_text)],
+                tool_calls: vec![],
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(Usage { input_tokens: 10, output_tokens: 20 }),
+            })
+        }
+        fn supports_streaming(&self) -> bool { false }
+        async fn complete_streaming(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<mpsc::UnboundedReceiver<crate::provider::StreamChunk>, AgentError> {
+            Err(AgentError::Other("not supported".into()))
+        }
+    }
+
+    /// A mock provider that always fails, for testing compaction failure backoff.
+    struct FailingProvider;
+
+    impl Provider for FailingProvider {
+        fn name(&self) -> &str { "failing" }
+        fn models(&self) -> &[&str] { &[] }
+        async fn complete(&self, _request: CompletionRequest) -> std::result::Result<Response, AgentError> {
+            Err(AgentError::Provider("summarization failed".into()))
+        }
+        fn supports_streaming(&self) -> bool { false }
+        async fn complete_streaming(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<mpsc::UnboundedReceiver<crate::provider::StreamChunk>, AgentError> {
+            Err(AgentError::Other("not supported".into()))
+        }
+    }
 
     #[test]
     fn test_session_new() {
@@ -661,5 +873,154 @@ mod tests {
         }
         // First message preserved
         assert_eq!(request.messages[0].text(), "implement feature X");
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_under_threshold() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        session.add_user_message("hello");
+        session.add_assistant_message("hi");
+
+        let provider = MockProvider::new("summary");
+        let result = session.compact_if_needed(&provider).await.unwrap();
+        assert!(!result, "should not compact when under threshold");
+        assert_eq!(session.compaction_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_over_threshold() {
+        // Use a tiny context window to force compaction
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        // Add enough messages to exceed 85% of 200 = 170 tokens
+        session.add_user_message("task: implement a complex feature with many requirements");
+        for i in 0..20 {
+            session.add_assistant_message(&format!(
+                "working on step {} with detailed explanation of what I am doing", i
+            ));
+            session.add_user_message(&format!("continue with step {} please", i + 1));
+        }
+
+        let original_count = session.messages.len();
+        let provider = MockProvider::new("Summary of the conversation so far.");
+        let result = session.compact_if_needed(&provider).await.unwrap();
+        assert!(result, "should compact when over threshold");
+        assert_eq!(session.compaction_count, 1);
+        assert!(session.messages.len() < original_count);
+
+        // First message should still be the original task context
+        assert_eq!(session.messages[0].role, Role::User);
+        assert!(session.messages[0].text().contains("implement a complex feature"));
+
+        // Second message should be the system summary
+        assert_eq!(session.messages[1].role, Role::System);
+        assert!(session.messages[1].text().contains("Conversation Summary"));
+        assert!(session.messages[1].text().contains("Summary of the conversation so far."));
+    }
+
+    #[tokio::test]
+    async fn test_compact_role_alternation_no_consecutive_user() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        session.add_user_message("task context");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("step {} detailed work output", i));
+            session.add_user_message(&format!("continue with step {}", i + 1));
+        }
+
+        let provider = MockProvider::new("summary text");
+        session.compact_if_needed(&provider).await.unwrap();
+
+        // Verify no two consecutive messages have the same role
+        // (except System which is handled differently by providers)
+        for window in session.messages.windows(2) {
+            let r0 = window[0].role;
+            let r1 = window[1].role;
+            // User-User and Assistant-Assistant are forbidden
+            assert!(
+                !(r0 == Role::User && r1 == Role::User),
+                "consecutive User messages at roles {:?} -> {:?}", r0, r1
+            );
+            assert!(
+                !(r0 == Role::Assistant && r1 == Role::Assistant),
+                "consecutive Assistant messages at roles {:?} -> {:?}", r0, r1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compact_failure_backoff() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        // Add enough messages to exceed threshold
+        session.add_user_message("task context");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("step {} detailed output", i));
+            session.add_user_message(&format!("continue {}", i));
+        }
+
+        let provider = FailingProvider;
+
+        // Each call should fail gracefully (return Ok(false)) and increment failure count
+        for i in 0..MAX_COMPACTION_FAILURES {
+            let result = session.compact_if_needed(&provider).await.unwrap();
+            assert!(!result);
+            assert_eq!(session.compaction_failures, i + 1);
+        }
+
+        // After MAX_COMPACTION_FAILURES, it should skip without even trying
+        let result = session.compact_if_needed(&provider).await.unwrap();
+        assert!(!result);
+        // Failure count should not increase further (we didn't attempt)
+        assert_eq!(session.compaction_failures, MAX_COMPACTION_FAILURES);
+    }
+
+    #[tokio::test]
+    async fn test_compact_resets_failure_count_on_success() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200)
+            .with_max_tokens(20);
+        let mut session = Session::new(config);
+
+        // Simulate some prior failures
+        session.compaction_failures = 2;
+
+        // Add messages to exceed threshold
+        session.add_user_message("task context");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("step {} output", i));
+            session.add_user_message(&format!("continue {}", i));
+        }
+
+        let provider = MockProvider::new("summary");
+        let result = session.compact_if_needed(&provider).await.unwrap();
+        assert!(result);
+        assert_eq!(session.compaction_failures, 0, "failures should reset on success");
+        assert_eq!(session.compaction_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_compact_too_few_messages() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(10) // tiny window
+            .with_max_tokens(1);
+        let mut session = Session::new(config);
+
+        // Only a few messages — not enough to justify compaction
+        session.add_user_message("task");
+        session.add_assistant_message("ok");
+
+        let provider = MockProvider::new("summary");
+        let result = session.compact_if_needed(&provider).await.unwrap();
+        assert!(!result, "should not compact when too few messages");
     }
 }
