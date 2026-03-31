@@ -218,10 +218,14 @@ impl WorkQueue {
         Ok(())
     }
 
-    /// Health check — reclaim work from dead/timed-out containers.
+    /// Health check — reclaim work from dead/timed-out sessions.
+    ///
+    /// Uses `source_id` (task_id) to check if a session is alive, not `container_id`.
+    /// This avoids a bug where the work queue's container_id doesn't match the
+    /// runtime's actual container_id.
     pub fn health_check<F>(
         &mut self,
-        is_container_alive: F,
+        is_session_alive: F,
     ) -> Result<Vec<ReclaimedWork>, WorkQueueError>
     where
         F: Fn(&str) -> bool,
@@ -237,8 +241,11 @@ impl WorkQueue {
                 continue;
             };
 
-            let should_reclaim = if !is_container_alive(container_id) {
-                Some("container not found".to_string())
+            // Check if session is alive using source_id (task_id), not container_id.
+            // The work queue's container_id is a pre-generated UUID that doesn't match
+            // the actual container ID from the runtime.
+            let should_reclaim = if !is_session_alive(&claim.source_id) {
+                Some("session not found".to_string())
             } else if let Some(claimed_at) = claim.claimed_at {
                 let elapsed = Utc::now().signed_duration_since(claimed_at);
                 if elapsed.num_seconds() > self.config.container_timeout.as_secs() as i64 {
@@ -587,7 +594,7 @@ mod tests {
     // ---- health_check tests ----
 
     #[test]
-    fn health_check_reclaims_from_dead_containers() {
+    fn health_check_reclaims_from_dead_sessions() {
         let store = setup_store();
         let config = WorkQueueConfig {
             work_queue_timeout: Duration::from_secs(0),
@@ -601,7 +608,7 @@ mod tests {
         // Claim the item
         queue.claim_next(10, 0, "container-1").unwrap();
 
-        // Health check with dead container
+        // Health check with dead session (closure receives source_id, not container_id)
         let reclaimed = queue.health_check(|_| false).unwrap();
 
         assert_eq!(reclaimed.len(), 1);
@@ -610,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn health_check_keeps_alive_containers() {
+    fn health_check_keeps_alive_sessions() {
         let store = setup_store();
         let config = WorkQueueConfig {
             work_queue_timeout: Duration::from_secs(0),
@@ -624,11 +631,42 @@ mod tests {
         // Claim the item
         queue.claim_next(10, 0, "container-1").unwrap();
 
-        // Health check with alive container
+        // Health check with alive session (closure receives source_id, not container_id)
         let reclaimed = queue.health_check(|_| true).unwrap();
 
         assert!(reclaimed.is_empty());
         assert_eq!(queue.unclaimed_count(), 0);
+    }
+
+    #[test]
+    fn health_check_passes_source_id_not_container_id() {
+        let store = setup_store();
+        let config = WorkQueueConfig {
+            work_queue_timeout: Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut queue = WorkQueue::new(store.clone(), config);
+
+        // Task with source_id "t1"
+        let tasks = make_tasks(&[("t1", "proj", TaskState::Waiting)]);
+        queue.rebuild(&tasks).unwrap();
+
+        // Claim with container_id "container-xyz"
+        queue.claim_next(10, 0, "container-xyz").unwrap();
+
+        // Health check should pass source_id "t1", NOT container_id "container-xyz".
+        // We verify this by returning true for "t1" (alive) and false for anything else.
+        // If container_id was passed, it would be "container-xyz" which would return false
+        // and the task would be reclaimed.
+        let reclaimed = queue.health_check(|id| id == "t1").unwrap();
+
+        // If source_id is passed, closure returns true for "t1", so nothing is reclaimed.
+        // If container_id "container-xyz" was passed, it would return false and reclaim.
+        assert!(
+            reclaimed.is_empty(),
+            "task should not be reclaimed because closure receives source_id 't1' (which returns true), \
+             not container_id 'container-xyz' (which would return false)"
+        );
     }
 
     // ---- unclaimed_count tests ----

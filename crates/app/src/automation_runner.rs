@@ -127,11 +127,6 @@ pub async fn execute_automation_run(
     }
 }
 
-/// Returns `true` if the session ID belongs to an automation run.
-pub fn is_automation_session(session_id: &str) -> bool {
-    session_id.starts_with(SESSION_PREFIX)
-}
-
 /// Extract the run ID from an automation session ID.
 ///
 /// Returns `None` if the session ID does not have the automation prefix.
@@ -314,13 +309,6 @@ async fn recover_stuck_runs(server: &Server, deadline: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_automation_session() {
-        assert!(is_automation_session("automation-run:abc-123"));
-        assert!(!is_automation_session("task-abc-123"));
-        assert!(!is_automation_session(""));
-    }
 
     #[test]
     fn test_run_id_from_session() {

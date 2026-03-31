@@ -359,8 +359,41 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             None
         }
     };
-    let chat_history: Arc<tokio::sync::Mutex<Vec<tasks_agent::Message>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // Initialize chat history - restore from event log if available
+    let chat_history: Arc<tokio::sync::Mutex<Vec<tasks_agent::Message>>> = {
+        let mut history = Vec::new();
+
+        // Try to restore chat history from system event log
+        match server.event_bus.read_task(SYSTEM_TASK_ID).await {
+            Ok(events) => {
+                for event in events {
+                    match event.event_type {
+                        EventType::OrchestratorMessage => {
+                            // Human message
+                            if let Some(msg) = event.data.get("message").and_then(|v| v.as_str()) {
+                                history.push(tasks_agent::Message::user(msg.to_string()));
+                            }
+                        }
+                        EventType::OrchestratorResponse => {
+                            // AI response
+                            if let Some(msg) = event.data.get("message").and_then(|v| v.as_str()) {
+                                history.push(tasks_agent::Message::assistant(msg.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !history.is_empty() {
+                    info!(message_count = history.len(), "restored orchestrator chat history from event log");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to restore orchestrator chat history");
+            }
+        }
+
+        Arc::new(tokio::sync::Mutex::new(history))
+    };
 
     // --- 5c. Create memory watchdog ---
 
@@ -1493,7 +1526,17 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     }
                 }
                 Err(e) => {
-                    error!(task_id = %task_id, error = %e, "failed to start session");
+                    // Check if error is AlreadyExists — means the session is still running
+                    // from a previous dispatch. This can happen due to container ID mismatch
+                    // between work queue and session manager. Don't call handle_task_failure
+                    // because the original session is still running correctly.
+                    let is_already_exists = e.to_string().contains("session already exists");
+
+                    if is_already_exists {
+                        warn!(task_id = %task_id, "session already exists, skipping duplicate dispatch");
+                    } else {
+                        error!(task_id = %task_id, error = %e, "failed to start session");
+                    }
 
                     // Release the claim
                     let mut queue = dispatch_work_queue.write().await;
@@ -1501,13 +1544,17 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         warn!(work_id = %work_item.id, error = %e2, "failed to release claim");
                     }
 
-                    // Handle failure for backoff — treat as no progress so backoff kicks in.
-                    // This prevents tight retry loops when containers can't start.
-                    if let Err(e2) = dispatch_server
-                        .handle_task_failure(&task_id, false, max_retries, None)
-                        .await
-                    {
-                        warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                    // Only handle as failure if it's NOT an AlreadyExists error.
+                    // For AlreadyExists, the original session is still running correctly.
+                    if !is_already_exists {
+                        // Handle failure for backoff — treat as no progress so backoff kicks in.
+                        // This prevents tight retry loops when containers can't start.
+                        if let Err(e2) = dispatch_server
+                            .handle_task_failure(&task_id, false, max_retries, None)
+                            .await
+                        {
+                            warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                        }
                     }
                 }
             }
@@ -2552,10 +2599,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
             let mut queue = health_work_queue.write().await;
 
-            // Use sync version that won't block if lock is held
+            // Use sync version that won't block if lock is held.
+            // Check by task_id (source_id), not container_id, because the work queue's
+            // container_id doesn't match the runtime's actual container_id.
             let session_mgr = health_session_mgr.clone();
-            let is_alive = |container_id: &str| -> bool {
-                session_mgr.has_container_sync(container_id)
+            let is_alive = |task_id: &str| -> bool {
+                session_mgr.has_session_sync(task_id)
             };
 
             match queue.health_check(is_alive) {
