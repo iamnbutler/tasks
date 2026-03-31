@@ -28,6 +28,8 @@ enum MqAction {
     Remove { entry_id: String, pr_url: String },
     MarkConflict { entry_id: String, pr_url: String },
     ClearConflict { entry_id: String },
+    /// Reset an Approved entry back to Pending when mergeable state is unknown.
+    DeferToPending { entry_id: String },
 }
 
 #[derive(Debug, Error)]
@@ -1298,7 +1300,10 @@ impl Server {
                 tasks_github::model::PullRequestState::Open => {
                     // For open PRs, always update head_sha to detect new commits
                     let sha_update_id = entry_id.clone();
-                    // Update conflict status from GitHub's mergeable field
+                    // Update conflict status from GitHub's mergeable field.
+                    // When mergeable is Unknown (computation pending), defer
+                    // evaluation by resetting Approved entries back to Pending
+                    // so the orchestrator doesn't merge a potentially conflicting PR.
                     let conflict_action = match pr.mergeable {
                         Some(tasks_github::model::MergeableState::Conflicting)
                             if *current_status != MergeStatus::Conflict =>
@@ -1309,6 +1314,16 @@ impl Server {
                             if *current_status == MergeStatus::Conflict =>
                         {
                             Some(MqAction::ClearConflict { entry_id })
+                        }
+                        Some(tasks_github::model::MergeableState::Unknown) | None
+                            if *current_status == MergeStatus::Approved =>
+                        {
+                            tracing::info!(
+                                entry_id = %entry_id,
+                                pr_url = %pr_url,
+                                "reconciliation: mergeable state unknown, deferring approved entry back to Pending"
+                            );
+                            Some(MqAction::DeferToPending { entry_id })
                         }
                         _ => None,
                     };
@@ -1376,6 +1391,15 @@ impl Server {
                             tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
                         } else {
                             changes += 1;
+                        }
+                    }
+                    MqAction::DeferToPending { entry_id } => {
+                        let mut state = self.state.write().await;
+                        if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                            if entry.status == MergeStatus::Approved {
+                                entry.status = MergeStatus::Pending;
+                                changes += 1;
+                            }
                         }
                     }
                 }
