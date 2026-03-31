@@ -304,7 +304,48 @@ pub enum OrchestratorAction {
         task_id: String,
         reason: String,
     },
-    // Future: DispatchAgent { task_id: String, config: DispatchConfig }
+    /// Dispatch a one-off agent session to perform a specific task.
+    ///
+    /// The agent runs in a container, reports back through events, and is
+    /// bounded by timeout and turn limits. Results appear in subsequent
+    /// think() calls via `recent_events`.
+    DispatchAgent(DispatchAgentRequest),
     // Future: CreateIssue { repo: String, title: String, body: String }
     // Future: CommentOnPr { pr_url: String, body: String }
+}
+
+/// Request to dispatch a one-off orchestrator-directed agent session.
+///
+/// These are lightweight, bounded sessions for tasks like:
+/// - Investigating a pattern in the codebase
+/// - Triaging or closing GitHub issues
+/// - Making a small targeted fix identified during review
+/// - Writing a follow-up issue
+///
+/// Results feed back into the orchestrator via events
+/// (`orchestrator:agent:completed` / `orchestrator:agent:failed`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchAgentRequest {
+    /// Unique correlation ID for this dispatch.
+    /// Used to match completion events back to the request.
+    pub id: String,
+
+    /// The prompt/instructions for the agent.
+    pub prompt: String,
+
+    /// Which agent type to use (e.g., "explorer", "implementer", "reviewer").
+    /// Must match a built-in agent definition.
+    pub agent_type: String,
+
+    /// Repository to work in (owner/repo format).
+    pub repo: String,
+
+    /// Branch to work on. If None, uses the repo's default branch.
+    pub branch: Option<String>,
+
+    /// Maximum session duration in seconds. Defaults to 300 (5 minutes).
+    pub timeout_seconds: Option<u64>,
+
+    /// Why this agent is being dispatched (for the audit trail / human visibility).
+    pub reason: String,
 }

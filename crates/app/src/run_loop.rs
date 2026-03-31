@@ -2746,6 +2746,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let think_server = server.clone();
     let think_event_bus = server.event_bus.clone();
+    let think_session_mgr = session_manager.clone();
     let mut think_shutdown_rx = shutdown_tx.subscribe();
 
     let think_handle = tokio::spawn(async move {
@@ -2841,6 +2842,88 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             }
                             OrchestratorAction::PrioritizeTask { task_id, reason } => {
                                 info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            }
+                            OrchestratorAction::DispatchAgent(request) => {
+                                info!(
+                                    dispatch_id = %request.id,
+                                    agent_type = %request.agent_type,
+                                    repo = %request.repo,
+                                    reason = %request.reason,
+                                    "orchestrator dispatching one-off agent session"
+                                );
+
+                                // Emit dispatched event
+                                let dispatched_event = Event::new(
+                                    EventType::OrchestratorAgentDispatched,
+                                    SYSTEM_TASK_ID,
+                                    Actor::Orchestrator,
+                                    serde_json::json!({
+                                        "dispatch_id": request.id,
+                                        "agent_type": request.agent_type,
+                                        "repo": request.repo,
+                                        "reason": request.reason,
+                                        "prompt_preview": &request.prompt[..request.prompt.len().min(200)],
+                                    }),
+                                );
+                                if let Err(e) = think_server.event_bus.publish(dispatched_event).await {
+                                    error!(error = %e, "failed to publish orchestrator agent dispatched event");
+                                }
+
+                                // Spawn the agent session asynchronously
+                                let dispatch_id = request.id.clone();
+                                let repo_url = format!("https://github.com/{}.git", request.repo);
+                                let branch = request.branch.unwrap_or_else(|| "main".to_string());
+                                let timeout_secs = request.timeout_seconds.unwrap_or(300);
+
+                                let mgr = think_session_mgr.clone();
+                                let bus = think_server.event_bus.clone();
+
+                                // Use dispatch_id as the "task_id" for session tracking
+                                let session_task_id = format!("orchestrator-agent-{}", dispatch_id);
+
+                                tokio::spawn(async move {
+                                    let time_limits = tasks_session::SessionLimits {
+                                        soft_limit: Some(Duration::from_secs(timeout_secs)),
+                                        hard_limit: Some(Duration::from_secs(timeout_secs + 60)),
+                                    };
+
+                                    match mgr.start_session_with_limits(
+                                        session_task_id.clone(),
+                                        repo_url,
+                                        branch,
+                                        request.prompt,
+                                        None,
+                                        Some(Duration::from_secs(30)), // short progress threshold
+                                        time_limits,
+                                    ).await {
+                                        Ok(_) => {
+                                            info!(
+                                                dispatch_id = %dispatch_id,
+                                                session_task_id = %session_task_id,
+                                                "orchestrator agent session started"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                dispatch_id = %dispatch_id,
+                                                error = %e,
+                                                "failed to start orchestrator agent session"
+                                            );
+                                            let failed_event = Event::new(
+                                                EventType::OrchestratorAgentFailed,
+                                                SYSTEM_TASK_ID,
+                                                Actor::Orchestrator,
+                                                serde_json::json!({
+                                                    "dispatch_id": dispatch_id,
+                                                    "error": e.to_string(),
+                                                }),
+                                            );
+                                            if let Err(e) = bus.publish(failed_event).await {
+                                                error!(error = %e, "failed to publish agent failed event");
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
                     }
