@@ -448,6 +448,14 @@ impl Server {
         removed
     }
 
+    /// List all automation runs currently in `Running` status.
+    pub fn list_running_automation_runs(&self) -> Result<Vec<AutomationRun>, ServerError> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| ServerError::StoreError("store not available".into()))?;
+        store.list_running_automation_runs()
+            .map_err(|e| ServerError::StoreError(e.to_string()))
+    }
+
     /// List runs for an automation.
     pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<AutomationRun>, ServerError> {
         let store = self.store.as_ref()

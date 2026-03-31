@@ -471,6 +471,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let automation_listener_handle = crate::automation_runner::spawn_automation_event_listener(
         &server.event_bus,
         server.clone(),
+        config.automation_hard_limit,
         automation_listener_shutdown_rx,
     );
     info!("automation event listener started");

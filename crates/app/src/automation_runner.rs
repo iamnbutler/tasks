@@ -7,8 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use events::EventBus;
@@ -138,6 +139,13 @@ pub fn run_id_from_session(session_id: &str) -> Option<&str> {
     session_id.strip_prefix(SESSION_PREFIX)
 }
 
+/// Buffer added to the hard limit before the watchdog considers a run stuck.
+/// This gives time for normal event delivery after the session is killed.
+const WATCHDOG_BUFFER: Duration = Duration::from_secs(5 * 60); // 5 minutes
+
+/// How often the watchdog checks for stuck runs.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Spawn a background task that listens for session completion/failure events
 /// and updates automation run records accordingly.
 ///
@@ -145,19 +153,34 @@ pub fn run_id_from_session(session_id: &str) -> Option<&str> {
 /// (`TaskStateCompleted`, `TaskStateAwaitingMerge`, or `TaskStateFailed`), this
 /// listener calls `server.complete_automation_run()` or `server.fail_automation_run()`.
 ///
+/// Also handles `SystemTimeLimitHard` events, which fire when a session hits its
+/// hard time limit — these are treated as failures.
+///
 /// Both `TaskStateCompleted` and `TaskStateAwaitingMerge` are treated as successful
 /// completion — the agent may create a PR and wait for merge, which is a valid
 /// successful outcome for an automation run.
+///
+/// Includes two recovery mechanisms:
+/// - **Lag recovery**: When the broadcast channel lags, scans the store for
+///   running automation runs and reconciles their state.
+/// - **Watchdog**: Periodically scans for runs stuck in `Running` past
+///   `hard_limit + buffer` and forcibly fails them.
 ///
 /// The `shutdown_rx` receiver allows graceful shutdown of the listener.
 pub fn spawn_automation_event_listener(
     event_bus: &EventBus,
     server: Arc<Server>,
+    hard_limit: Duration,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     let mut rx = event_bus.subscribe();
+    let watchdog_deadline = hard_limit + WATCHDOG_BUFFER;
 
     tokio::spawn(async move {
+        let mut watchdog_interval = tokio::time::interval(WATCHDOG_INTERVAL);
+        // Don't let missed ticks pile up — just skip them
+        watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 result = rx.recv() => {
@@ -186,16 +209,22 @@ pub fn spawn_automation_event_listener(
                                         );
                                     }
                                 }
-                                // Agent exited with failure
-                                events::EventType::TaskStateFailed => {
+                                // Agent exited with failure or was killed by hard time limit
+                                events::EventType::TaskStateFailed
+                                | events::EventType::SystemTimeLimitHard => {
                                     let reason = event
                                         .data
                                         .get("reason")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("session failed");
+                                        .unwrap_or(if event.event_type == events::EventType::SystemTimeLimitHard {
+                                            "session killed: hard time limit exceeded"
+                                        } else {
+                                            "session failed"
+                                        });
                                     info!(
                                         run_id = %run_id,
                                         reason = %reason,
+                                        event_type = %event.event_type.as_str(),
                                         "automation session failed, marking run as failed"
                                     );
                                     if let Err(e) = server
@@ -216,14 +245,20 @@ pub fn spawn_automation_event_listener(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             error!(
                                 skipped = n,
-                                "automation event listener lagged — {n} events dropped from broadcast channel"
+                                "automation event listener lagged — {n} events dropped, running recovery scan"
                             );
+                            // Recover: check all running automation runs against
+                            // their deadline so we don't miss terminal events.
+                            recover_stuck_runs(&server, watchdog_deadline).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             info!("event bus closed, automation event listener shutting down");
                             break;
                         }
                     }
+                }
+                _ = watchdog_interval.tick() => {
+                    recover_stuck_runs(&server, watchdog_deadline).await;
                 }
                 _ = shutdown_rx.recv() => {
                     info!("automation event listener received shutdown signal");
@@ -232,6 +267,48 @@ pub fn spawn_automation_event_listener(
             }
         }
     })
+}
+
+/// Scan for automation runs stuck in `Running` state past the deadline and
+/// forcibly fail them. This handles the case where terminal events were lost
+/// due to broadcast lag or other delivery failures.
+async fn recover_stuck_runs(server: &Server, deadline: Duration) {
+    let runs = match server.list_running_automation_runs() {
+        Ok(runs) => runs,
+        Err(e) => {
+            error!(error = %e, "watchdog: failed to list running automation runs");
+            return;
+        }
+    };
+
+    let now = Utc::now();
+    for run in runs {
+        let elapsed = now.signed_duration_since(run.started_at);
+        if elapsed > chrono::Duration::from_std(deadline).unwrap_or(chrono::Duration::max_value()) {
+            warn!(
+                run_id = %run.id,
+                elapsed_secs = elapsed.num_seconds(),
+                "watchdog: automation run stuck past deadline, forcibly failing"
+            );
+            if let Err(e) = server
+                .fail_automation_run(
+                    &run.id,
+                    format!(
+                        "watchdog: run stuck in Running state for {}s (deadline: {}s)",
+                        elapsed.num_seconds(),
+                        deadline.as_secs(),
+                    ),
+                )
+                .await
+            {
+                error!(
+                    run_id = %run.id,
+                    error = %e,
+                    "watchdog: failed to mark stuck automation run as failed"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
