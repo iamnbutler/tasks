@@ -15,6 +15,66 @@ use crate::workflow::LabelConfig;
 /// `labels.ignore` list from `workflow.toml`.
 pub const SKIP_LABEL: &str = "tasks/skip";
 
+/// Priority label prefixes. Labels matching these patterns are parsed for priority.
+/// Supported formats:
+/// - `p0`, `p1`, `p2`, `p3`
+/// - `tasks/p0`, `tasks/p1`, etc.
+/// - `priority/p0`, `priority/p1`, etc.
+/// - `urgent` (maps to p0)
+/// - `high` (maps to p1)
+/// Lower numbers = higher priority.
+const PRIORITY_PREFIXES: &[&str] = &["priority/p", "tasks/p", "p"];
+
+/// Parse priority from a list of label names.
+///
+/// Supported formats:
+/// - `p0`, `p1`, `p2`, `p3` — direct priority
+/// - `tasks/p0`, `tasks/p1`, etc. — namespaced
+/// - `priority/p0`, `priority/p1`, etc. — namespaced
+/// - `urgent` — maps to priority 0
+/// - `high` — maps to priority 1
+///
+/// Returns the priority as an i32 (0 = highest, 3 = lowest).
+/// If multiple priority labels exist, returns the highest (lowest number).
+/// Returns None if no priority label is found.
+fn parse_priority_from_labels(labels: &[&str]) -> Option<i32> {
+    let mut best_priority: Option<i32> = None;
+
+    for label in labels {
+        let label_lower = label.to_lowercase();
+
+        // Check for special keywords first
+        let priority = match label_lower.as_str() {
+            "urgent" => Some(0),
+            "high" => Some(1),
+            _ => {
+                // Try prefix-based parsing
+                let mut found = None;
+                for prefix in PRIORITY_PREFIXES {
+                    if let Some(suffix) = label_lower.strip_prefix(prefix) {
+                        if let Ok(p) = suffix.parse::<i32>() {
+                            if (0..=9).contains(&p) {
+                                found = Some(p);
+                                break;
+                            }
+                        }
+                    }
+                }
+                found
+            }
+        };
+
+        if let Some(p) = priority {
+            best_priority = Some(match best_priority {
+                None => p,
+                Some(current) => current.min(p),
+            });
+        }
+    }
+
+    best_priority
+}
+
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error("github error: {0}")]
@@ -59,6 +119,7 @@ pub fn issue_to_task(
     task.labels = issue.labels.iter().map(|l| l.name.clone()).collect();
     task.source_created_at = Some(issue.created_at);
     task.source_number = Some(issue.number);
+    task.priority = parse_priority_from_labels(&issue_label_names);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| issue_label_names.contains(&b.as_str()));
@@ -107,6 +168,7 @@ pub fn pr_to_task(
     task.labels = pr.labels.iter().map(|l| l.name.clone()).collect();
     task.source_created_at = Some(pr.created_at);
     task.source_number = Some(pr.number);
+    task.priority = parse_priority_from_labels(&pr_label_names);
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| pr_label_names.contains(&b.as_str()));
@@ -171,6 +233,14 @@ pub fn reconcile_task(
         result.updated_fields.push("labels");
     }
 
+    // Derive priority from labels.
+    let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+    let new_priority = parse_priority_from_labels(&issue_label_names);
+    if task.priority != new_priority {
+        task.priority = new_priority;
+        result.updated_fields.push("priority");
+    }
+
     // Derive blocked_by from GitHub blocking issue relationships.
     // Format: "gh-{owner}-{repo}-issue-{number}" to match our task ID convention.
     let new_blocked_by: Vec<String> = issue
@@ -193,8 +263,6 @@ pub fn reconcile_task(
         }
         return result;
     }
-
-    let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
 
     // Check for skip/ignore labels added after import → cancel the task.
     // This is a hard override for ALL non-terminal states including active ones
@@ -839,5 +907,81 @@ mod tests {
         // The blocked_by should point to acme/backend#5, not acme/frontend#5.
         assert_eq!(task.blocked_by.len(), 1);
         assert_eq!(task.blocked_by[0], "gh-acme-backend-issue-5");
+    }
+
+    // --- Priority parsing tests ---
+
+    #[test]
+    fn parse_priority_basic_p_labels() {
+        assert_eq!(parse_priority_from_labels(&["p0"]), Some(0));
+        assert_eq!(parse_priority_from_labels(&["p1"]), Some(1));
+        assert_eq!(parse_priority_from_labels(&["p2"]), Some(2));
+        assert_eq!(parse_priority_from_labels(&["p3"]), Some(3));
+    }
+
+    #[test]
+    fn parse_priority_namespaced_labels() {
+        assert_eq!(parse_priority_from_labels(&["tasks/p0"]), Some(0));
+        assert_eq!(parse_priority_from_labels(&["tasks/p1"]), Some(1));
+        assert_eq!(parse_priority_from_labels(&["priority/p2"]), Some(2));
+        assert_eq!(parse_priority_from_labels(&["priority/p3"]), Some(3));
+    }
+
+    #[test]
+    fn parse_priority_keyword_labels() {
+        assert_eq!(parse_priority_from_labels(&["urgent"]), Some(0));
+        assert_eq!(parse_priority_from_labels(&["high"]), Some(1));
+        assert_eq!(parse_priority_from_labels(&["URGENT"]), Some(0)); // case insensitive
+        assert_eq!(parse_priority_from_labels(&["HIGH"]), Some(1));
+    }
+
+    #[test]
+    fn parse_priority_selects_highest() {
+        // Multiple priority labels — pick the highest (lowest number)
+        assert_eq!(parse_priority_from_labels(&["p2", "p1"]), Some(1));
+        assert_eq!(parse_priority_from_labels(&["p3", "urgent"]), Some(0));
+        assert_eq!(parse_priority_from_labels(&["high", "tasks/p2"]), Some(1));
+    }
+
+    #[test]
+    fn parse_priority_no_match() {
+        assert_eq!(parse_priority_from_labels(&["bug", "enhancement"]), None);
+        assert_eq!(parse_priority_from_labels(&[]), None);
+    }
+
+    #[test]
+    fn issue_to_task_sets_priority() {
+        let issue = make_issue(42, vec![make_label("bug"), make_label("p1")], GhIssueState::Open);
+        let cfg = default_label_config();
+
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("should produce a task");
+        assert_eq!(task.priority, Some(1));
+    }
+
+    #[test]
+    fn pr_to_task_sets_priority() {
+        let pr = make_pr(99, vec![make_label("feature"), make_label("urgent")], PullRequestState::Open);
+        let cfg = default_label_config();
+
+        let task = pr_to_task(&pr, "proj-2", &cfg).expect("should produce a task");
+        assert_eq!(task.priority, Some(0));
+    }
+
+    #[test]
+    fn reconcile_updates_priority() {
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+
+        // Initial priority is None
+        assert_eq!(task.priority, None);
+
+        // Add a priority label
+        let mut updated_issue = issue.clone();
+        updated_issue.labels = vec![make_label("bug"), make_label("tasks/p2")];
+
+        let result = reconcile_task(&mut task, &updated_issue, &cfg);
+        assert!(result.updated_fields.contains(&"priority"));
+        assert_eq!(task.priority, Some(2));
     }
 }
