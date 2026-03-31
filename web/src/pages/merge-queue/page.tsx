@@ -1,13 +1,22 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X, Info } from "lucide-react";
+import { ExternalLink, Check, X, Info, MessageSquare } from "lucide-react";
 import { toast } from "sonner";
 import { useAppState } from "@/hooks/use-app-state";
-import { flushMergeQueue, approveMerge, rejectMerge } from "@/lib/api";
+import { flushMergeQueue, approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ListView, ListEmptyState } from "@/components/ui/list-view";
 import { ListHeader, ListHeaderTabs } from "@/components/ui/list-header";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   ListRow,
   LinkCell,
@@ -81,6 +90,25 @@ function MergeQueueRow({
       onRefresh();
     } catch {
       toast.error("Failed to reject merge entry");
+    }
+  }
+
+  const [requestChangesOpen, setRequestChangesOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleRequestChanges() {
+    if (!feedback.trim()) return;
+    setSubmitting(true);
+    try {
+      await requestChanges(entry.id, feedback.trim(), feedback.trim());
+      setRequestChangesOpen(false);
+      setFeedback("");
+      onRefresh();
+    } catch {
+      toast.error("Failed to request changes");
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -161,6 +189,48 @@ function MergeQueueRow({
               <Check className="h-3.5 w-3.5" />
               Approve
             </Button>
+            <Dialog open={requestChangesOpen} onOpenChange={setRequestChangesOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1 rounded-none border-r border-border"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                  Request Changes
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Request Changes</DialogTitle>
+                  <DialogDescription>
+                    Describe the changes needed. This feedback will be sent back to the agent.
+                  </DialogDescription>
+                </DialogHeader>
+                <textarea
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring min-h-[100px] resize-y"
+                  placeholder="Describe what needs to change..."
+                  value={feedback}
+                  onChange={(e) => setFeedback(e.target.value)}
+                />
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setRequestChangesOpen(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={handleRequestChanges}
+                    disabled={!feedback.trim() || submitting}
+                  >
+                    {submitting ? "Submitting..." : "Submit"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
             <Button
               variant="ghost"
               size="sm"
