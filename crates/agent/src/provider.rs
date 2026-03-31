@@ -32,6 +32,16 @@ pub struct CompletionConfig {
     /// Stop sequences
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// Fraction of context window that triggers compaction (0.0–1.0).
+    /// When estimated input tokens exceed `context_window * compact_threshold`,
+    /// the session will summarize older messages instead of hard-truncating.
+    /// Set to 0.0 to disable compaction. Default: 0.85.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f32,
+}
+
+fn default_compact_threshold() -> f32 {
+    0.85
 }
 
 fn default_max_tokens() -> u32 {
@@ -64,6 +74,7 @@ impl Default for CompletionConfig {
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
+            compact_threshold: default_compact_threshold(),
         }
     }
 }
@@ -87,6 +98,11 @@ impl CompletionConfig {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_compact_threshold(mut self, threshold: f32) -> Self {
+        self.compact_threshold = threshold;
         self
     }
 
