@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use gpui::{div, prelude::*, Entity, FontWeight, Styled, Window};
 
 use crate::api::{self, TaskState};
-use crate::components::{Badge, BadgeVariant, Card, CardContent, CardHeader};
-use crate::state::AppState;
+use crate::components::{Badge, BadgeVariant, Button, ButtonVariant, Card, CardContent, CardHeader};
+use crate::state::{AppState, ConnectionStatus};
 use crate::theme::{colors, radius, rgb, spacing, style_helpers::StyledExt, typography, ComponentTheme};
 
 /// Maximum number of recent events to display.
@@ -37,18 +37,58 @@ impl Render for Dashboard {
 
         // Check if we have data
         let Some(snapshot) = state.snapshot() else {
-            return div()
+            let connection_status = state.connection_status();
+            let last_error = state.last_error().map(|s| s.to_string());
+            let state_entity = self.state.clone();
+
+            let (status_text, show_retry) = match connection_status {
+                ConnectionStatus::Connecting => ("Connecting to server...", false),
+                ConnectionStatus::Reconnecting => ("Reconnecting to server...", true),
+                ConnectionStatus::Failed => ("Failed to connect to server", true),
+                ConnectionStatus::Disconnected => ("Disconnected from server", true),
+                ConnectionStatus::Connected => ("Waiting for data...", false),
+            };
+
+            let mut container = div()
                 .size_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .child(
+                .gap(spacing::SPACE_3);
+
+            container = container.child(
+                div()
+                    .text_muted()
+                    .text_size(typography::TEXT_SM)
+                    .child(status_text.to_string()),
+            );
+
+            if let Some(err) = last_error {
+                container = container.child(
                     div()
-                        .text_muted()
-                        .text_size(typography::TEXT_SM)
-                        .child("No data yet"),
-                )
-                .into_any_element();
+                        .text_size(typography::TEXT_XS)
+                        .text_color(rgb(colors::DESTRUCTIVE))
+                        .max_w(gpui::px(400.0))
+                        .text_ellipsis()
+                        .overflow_hidden()
+                        .child(err),
+                );
+            }
+
+            if show_retry {
+                container = container.child(
+                    Button::new("retry-connection", "Retry")
+                        .variant(ButtonVariant::Outline)
+                        .on_click(move |_event, _window, cx| {
+                            state_entity.update(cx, |state, cx| {
+                                state.retry_connection(cx);
+                            });
+                        }),
+                );
+            }
+
+            return container.into_any_element();
         };
 
         // Calculate stats
