@@ -117,6 +117,24 @@ impl<R: ContainerRuntime> Session<R> {
         Ok(())
     }
 
+    /// Start the agent with a repo, branch, prompt, and agent configuration.
+    ///
+    /// The `agent_config` controls tool restrictions, model selection, and
+    /// turn limits for this agent session.
+    pub fn start_agent_with_config(
+        &mut self,
+        repo: impl Into<String>,
+        branch: impl Into<String>,
+        prompt: impl Into<String>,
+        agent_config: crate::protocol::AgentStartConfig,
+    ) -> Result<(), SessionError> {
+        let transport = self.transport.as_mut().ok_or(SessionError::NotStarted)?;
+        let cmd = Command::start_with_config(repo, branch, prompt, agent_config);
+        transport.send(&cmd)?;
+        self.state = SessionState::Running;
+        Ok(())
+    }
+
     /// Send a chat message to the agent.
     pub fn send_chat(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         let transport = self.transport.as_mut().ok_or(SessionError::NotStarted)?;

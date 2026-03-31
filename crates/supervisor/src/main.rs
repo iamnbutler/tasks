@@ -15,6 +15,21 @@ use tokio::sync::mpsc;
 // Protocol types (matching spec/session-runtime.md §4)
 // ---------------------------------------------------------------------------
 
+/// Agent configuration received from the host.
+#[derive(serde::Deserialize, Default)]
+struct AgentConfig {
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    disallowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+}
+
 /// Commands from host → supervisor (§4.1).
 #[derive(serde::Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -23,6 +38,8 @@ enum Cmd {
         repo: String,
         branch: String,
         prompt: String,
+        #[serde(default)]
+        agent_config: Option<AgentConfig>,
     },
     Chat {
         text: String,
@@ -161,22 +178,59 @@ struct AgentHandle {
 
 /// Start the agent process. Returns the handle and spawns tasks that
 /// forward stdout/stderr as protocol events via the provided channel.
+///
+/// If `agent_config` is provided, it overrides the default model and
+/// adds tool restriction flags (--allowed-tools / --disallowed-tools)
+/// and a max-turns limit to the agent command.
 async fn start_agent(
     prompt: &str,
+    agent_config: Option<&AgentConfig>,
     event_tx: &mpsc::UnboundedSender<Ev>,
 ) -> Result<AgentHandle, String> {
     let agent_cmd = std::env::var("AGENT_CMD").unwrap_or_else(|_| "claude".to_string());
+
+    // Determine model: agent_config overrides env/default
+    let model = agent_config
+        .and_then(|c| c.model.clone())
+        .unwrap_or_else(|| "claude-opus-4-6".to_string());
+
     let agent_args: Vec<String> = std::env::var("AGENT_ARGS")
         .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_else(|_| vec![
-            "--print".to_string(),
-            "--verbose".to_string(),
-            "--model".to_string(),
-            "claude-opus-4-6".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ]);
+        .unwrap_or_else(|_| {
+            let mut args = vec![
+                "--print".to_string(),
+                "--verbose".to_string(),
+                "--model".to_string(),
+                model,
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ];
+
+            // Add max-turns if configured
+            if let Some(max_turns) = agent_config.and_then(|c| c.max_turns) {
+                args.push("--max-turns".to_string());
+                args.push(max_turns.to_string());
+            }
+
+            // Add allowed-tools if configured
+            if let Some(allowed) = agent_config.and_then(|c| c.allowed_tools.as_ref()) {
+                if !allowed.is_empty() {
+                    args.push("--allowed-tools".to_string());
+                    args.push(allowed.join(","));
+                }
+            }
+
+            // Add disallowed-tools if configured
+            if let Some(disallowed) = agent_config.and_then(|c| c.disallowed_tools.as_ref()) {
+                if !disallowed.is_empty() {
+                    args.push("--disallowed-tools".to_string());
+                    args.push(disallowed.join(","));
+                }
+            }
+
+            args
+        });
 
     // Run the agent as the non-root "agent" user (Claude Code refuses
     // --dangerously-skip-permissions as root). The supervisor stays root (PID 1).
@@ -426,10 +480,14 @@ async fn main() {
             // Commands from host.
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    Cmd::Start { repo, branch, prompt } => {
+                    Cmd::Start { repo, branch, prompt, agent_config } => {
                         if agent.is_some() {
                             log!("start received while agent already running — ignoring");
                             continue;
+                        }
+                        if let Some(ref config) = agent_config {
+                            log!("agent config: type={:?} model={:?} max_turns={:?}",
+                                config.agent_type, config.model, config.max_turns);
                         }
                         // Clone repo if needed (§3).
                         if !repo_exists() {
@@ -440,7 +498,7 @@ async fn main() {
                             }
                         }
                         // Start agent.
-                        match start_agent(&prompt, &event_tx).await {
+                        match start_agent(&prompt, agent_config.as_ref(), &event_tx).await {
                             Ok(mut handle) => {
                                 // Flush pending chat messages.
                                 for text in pending_chat.drain(..) {

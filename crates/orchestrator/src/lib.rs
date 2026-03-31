@@ -6,6 +6,7 @@
 //!
 //! Also provides a chat interface for user interaction (orchestrator chat).
 
+pub mod agents;
 pub mod chat;
 pub mod error;
 mod claude;
@@ -14,6 +15,7 @@ mod orchestrator;
 mod prompt;
 pub mod types;
 
+pub use agents::{AgentConfig, AgentDefinition, built_in_agents, get_agent_definition};
 pub use chat::{ChatContext, ChatEvent, ChatResponse, OrchestratorChat, event_to_chat_event};
 pub use claude::ClaudeOrchestrator;
 pub use error::OrchestratorError;
