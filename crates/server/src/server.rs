@@ -28,6 +28,7 @@ enum MqAction {
     Remove { entry_id: String, pr_url: String },
     MarkConflict { entry_id: String, pr_url: String },
     ClearConflict { entry_id: String },
+    DeferApproval { entry_id: String },
 }
 
 #[derive(Debug, Error)]
@@ -1310,6 +1311,14 @@ impl Server {
                         {
                             Some(MqAction::ClearConflict { entry_id })
                         }
+                        // When GitHub hasn't computed mergeable yet (Unknown or None),
+                        // defer any Approved entry back to Pending so we don't merge
+                        // a PR that might have conflicts (issue #503).
+                        Some(tasks_github::model::MergeableState::Unknown) | None
+                            if *current_status == MergeStatus::Approved =>
+                        {
+                            Some(MqAction::DeferApproval { entry_id })
+                        }
                         _ => None,
                     };
                     (conflict_action, Some(sha_update_id))
@@ -1376,6 +1385,19 @@ impl Server {
                             tracing::warn!(entry_id = %entry_id, error = %e, "failed to clear conflict during reconciliation");
                         } else {
                             changes += 1;
+                        }
+                    }
+                    MqAction::DeferApproval { entry_id } => {
+                        tracing::info!(
+                            entry_id = %entry_id,
+                            "reconciliation: mergeable state unknown, deferring approved entry back to pending"
+                        );
+                        let mut state = self.state.write().await;
+                        if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                            if entry.status == MergeStatus::Approved {
+                                entry.status = MergeStatus::Pending;
+                                changes += 1;
+                            }
                         }
                     }
                 }
@@ -3498,5 +3520,119 @@ mod tests {
 
         let state = server.state.read().await;
         assert_eq!(state.merge_queue.entries().len(), 0);
+    }
+
+    fn test_pr(number: u64, owner: &str, repo: &str, mergeable: Option<tasks_github::model::MergeableState>) -> tasks_github::model::PullRequest {
+        tasks_github::model::PullRequest {
+            owner: owner.into(),
+            repo: repo.into(),
+            number,
+            node_id: String::new(),
+            title: "Test PR".into(),
+            body: None,
+            state: tasks_github::model::PullRequestState::Open,
+            head_ref: "feature".into(),
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            is_draft: false,
+            mergeable,
+            labels: vec![],
+            assignees: vec![],
+            review_decision: None,
+            reviews: vec![],
+            latest_reviews: vec![],
+            comments: vec![],
+            linked_issues: vec![],
+            ci_status: None,
+            check_runs: vec![],
+            status_contexts: vec![],
+            reaction_count: 0,
+            author: tasks_github::model::User { login: "test".into(), node_id: String::new() },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            closed_at: None,
+            merged_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_merge_queue_defers_approved_when_mergeable_unknown() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+        let task = Task::new("task-1", crate::model::task::TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+        server.approve_merge_entry("mq-1", "looks good").await.unwrap();
+
+        // Verify it's approved
+        {
+            let state = server.state.read().await;
+            let entry = state.merge_queue.get("mq-1").unwrap();
+            assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Approved);
+        }
+
+        // Reconcile with a PR that has mergeable=Unknown
+        let pr = test_pr(1, "owner", "repo", Some(tasks_github::model::MergeableState::Unknown));
+
+        let changes = server.reconcile_merge_queue(&[pr]).await.unwrap();
+        assert!(changes > 0, "should have deferred the approved entry");
+
+        // Entry should be back to Pending
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn reconcile_merge_queue_defers_approved_when_mergeable_none() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+        let task = Task::new("task-1", crate::model::task::TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+        server.approve_merge_entry("mq-1", "looks good").await.unwrap();
+
+        // Reconcile with a PR that has mergeable=None
+        let pr = test_pr(1, "owner", "repo", None);
+
+        let changes = server.reconcile_merge_queue(&[pr]).await.unwrap();
+        assert!(changes > 0, "should have deferred the approved entry");
+
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn reconcile_merge_queue_no_defer_when_pending() {
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+        let task = Task::new("task-1", crate::model::task::TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        let entry = crate::model::merge_queue::MergeQueueEntry::new(
+            "mq-1", "task-1", "https://github.com/owner/repo/pull/1",
+        );
+        server.add_to_merge_queue(entry).await.unwrap();
+
+        // Entry is Pending (default), reconcile with Unknown should not change it
+        let pr = test_pr(1, "owner", "repo", Some(tasks_github::model::MergeableState::Unknown));
+
+        let changes = server.reconcile_merge_queue(&[pr]).await.unwrap();
+        // head_sha update counts as a change, but status should stay Pending
+        let state = server.state.read().await;
+        let entry = state.merge_queue.get("mq-1").unwrap();
+        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Pending);
     }
 }
