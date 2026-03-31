@@ -2902,7 +2902,8 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         info!(port = web_port, "web server started");
         let mut web_shutdown_rx = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
-            axum::serve(listener, app)
+            // Use into_make_service_with_connect_info so rate limiter can access peer IP
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async move {
                     let _ = web_shutdown_rx.recv().await;
                     info!("web server received shutdown signal");
