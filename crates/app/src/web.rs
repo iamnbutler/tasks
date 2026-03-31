@@ -27,7 +27,7 @@ use tower_http::cors::CorsLayer;
 use tower_governor::{
     GovernorLayer,
     governor::GovernorConfigBuilder,
-    key_extractor::SmartIpKeyExtractor,
+    key_extractor::PeerIpKeyExtractor,
 };
 
 use tasks_agent::CompletionsService;
@@ -108,11 +108,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}/run", post(trigger_automation));
 
     // Rate limiting: 50 requests per second per IP, bursting up to 150.
+    // Use PeerIpKeyExtractor for direct socket IP (works locally without proxy).
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(50)
             .burst_size(150)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(PeerIpKeyExtractor)
             .finish()
             .expect("valid governor config"),
     );
