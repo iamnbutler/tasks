@@ -8,7 +8,10 @@ use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{
+    build_context_window, build_deep_review_prompt, build_evaluation_prompt_with_context,
+    parse_diff_files, parse_pr_url, system_prompt,
+};
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
     QualityEvaluation, QuestionContext, SystemContext,
@@ -214,15 +217,58 @@ impl Orchestrator for ClaudeOrchestrator {
             _ => None,
         };
 
-        // --- Pass 1: Triage with diff ---
+        // Proactively fetch context for key changed files
+        let mut file_contexts: Vec<(String, String)> = Vec::new();
+        if let Some(ref diff_text) = diff {
+            let changed_files = parse_diff_files(diff_text);
+            let files_to_fetch: Vec<_> = changed_files.iter().take(3).collect();
+
+            if !files_to_fetch.is_empty() {
+                info!(
+                    file_count = files_to_fetch.len(),
+                    files = ?files_to_fetch.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                    "Proactively fetching context for most-changed files"
+                );
+            }
+
+            for diff_file in files_to_fetch {
+                match self
+                    .github
+                    .get_file_content_at_ref(&owner, &repo, &diff_file.path, &pr.head_ref)
+                    .await
+                {
+                    Ok(Some(content)) => {
+                        let windowed = build_context_window(&content, &diff_file.changed_lines, 50);
+                        if !windowed.is_empty() {
+                            info!(
+                                path = %diff_file.path,
+                                context_len = windowed.len(),
+                                changed_lines = diff_file.changed_lines.len(),
+                                "Fetched file context"
+                            );
+                            file_contexts.push((diff_file.path.clone(), windowed));
+                        }
+                    }
+                    Ok(None) => {
+                        info!(path = %diff_file.path, "File not found on PR branch (may be deleted)");
+                    }
+                    Err(e) => {
+                        warn!(path = %diff_file.path, error = %e, "Failed to fetch file context");
+                    }
+                }
+            }
+        }
+
+        // --- Pass 1: Triage with diff + proactive context ---
         let system = system_prompt();
-        let user_prompt = build_evaluation_prompt(
+        let user_prompt = build_evaluation_prompt_with_context(
             &pr,
             issue.as_ref(),
             &context.task.title,
             context.task.description.as_deref(),
             diff.as_deref(),
             &context.queue_context,
+            &file_contexts,
         );
 
         let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
