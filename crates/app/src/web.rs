@@ -31,7 +31,7 @@ use tower_governor::{
 };
 
 use tasks_agent::CompletionsService;
-use events::Actor;
+use events::{Actor, SYSTEM_TASK_ID};
 use server::Server;
 use server::presence::OwnedConnectionGuard;
 use models::Mode;
@@ -1046,7 +1046,7 @@ async fn orchestrator_chat(
     // The orchestrator can pick this up and respond accordingly.
     let event = events::Event::new(
         events::EventType::OrchestratorMessage,
-        "", // No specific task - this is a system-wide message
+        SYSTEM_TASK_ID,
         Actor::Human,
         serde_json::json!({
             "message": req.message,

@@ -108,7 +108,7 @@ pub fn matches_task(event: &Event, task_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Actor, EventType};
+    use crate::{Actor, EventType, SYSTEM_TASK_ID};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -421,7 +421,7 @@ mod tests {
             Event::new(EventType::TaskCreated, "task-1", Actor::System, serde_json::json!({})),
             Event::new(EventType::AgentMessage, "task-2", Actor::Agent, serde_json::json!({})),
             Event::new(EventType::MergeCompleted, "task-3", Actor::System, serde_json::json!({})),
-            Event::new(EventType::SystemStarted, "", Actor::System, serde_json::json!({})),
+            Event::new(EventType::SystemStarted, SYSTEM_TASK_ID, Actor::System, serde_json::json!({})),
         ];
 
         for event in &events {
@@ -434,15 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn filter_empty_task_id() {
+    fn filter_system_task_id() {
         let event = Event::new(
             EventType::SystemStarted,
-            "",
+            SYSTEM_TASK_ID,
             Actor::System,
             serde_json::json!({}),
         );
 
-        assert!(matches_task(&event, ""));
+        assert!(matches_task(&event, SYSTEM_TASK_ID));
         assert!(!matches_task(&event, "task-1"));
     }
 

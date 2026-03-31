@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use events::{Actor, Event, EventBus, EventType};
+use events::{Actor, Event, EventBus, EventType, SYSTEM_TASK_ID};
 
 use crate::merge_queue::MergeQueue;
 use crate::model::merge_queue::MergeStatus;
@@ -1018,7 +1018,7 @@ impl Server {
         // Emit task:reordered event to notify clients
         let event = Event::new(
             EventType::TaskReordered,
-            "",
+            SYSTEM_TASK_ID,
             actor,
             serde_json::json!({ "task_ids": task_ids }),
         );

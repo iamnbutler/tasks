@@ -44,6 +44,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("event format version mismatch: found v{found}, expected v{expected}")]
     FormatMismatch { found: u32, expected: u32 },
+    #[error("invalid task ID: empty string (use SYSTEM_TASK_ID for system-wide events)")]
+    EmptyTaskId,
 }
 
 /// Configures retention limits for event log compaction.
@@ -150,6 +152,10 @@ impl EventStore {
     /// the same task file are serialized via a per-task mutex to prevent byte
     /// interleaving.
     pub async fn append(&self, event: &Event) -> Result<(), StoreError> {
+        if event.task.is_empty() {
+            return Err(StoreError::EmptyTaskId);
+        }
+
         let path = self.task_log_path(&event.task);
         let lock = self.task_lock(&event.task).await;
 
@@ -274,14 +280,6 @@ impl EventStore {
             }
         }
 
-        // Also scan the empty-string task dir (system-wide events like orchestrator messages)
-        let empty_events = self.read_task("").await?;
-        for event in empty_events {
-            if event.event_type.as_str().starts_with(type_prefix) {
-                matching.push(event);
-            }
-        }
-
         // Sort by timestamp ascending
         matching.sort_by(|a, b| a.ts.cmp(&b.ts));
 
@@ -329,9 +327,6 @@ impl EventStore {
         for task_id in &task_ids {
             total_removed += self.compact_task(task_id).await?;
         }
-
-        // Also compact system-wide events (empty task ID).
-        total_removed += self.compact_task("").await?;
 
         if total_removed > 0 {
             tracing::info!(
@@ -505,9 +500,42 @@ impl EventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Actor, EventType};
+    use crate::{Actor, EventType, SYSTEM_TASK_ID};
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn append_rejects_empty_task_id() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        let event = Event::new(
+            EventType::OrchestratorMessage,
+            "",
+            Actor::System,
+            serde_json::json!({}),
+        );
+
+        let err = store.append(&event).await.unwrap_err();
+        assert!(matches!(err, StoreError::EmptyTaskId));
+    }
+
+    #[tokio::test]
+    async fn append_accepts_system_task_id() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        let event = Event::new(
+            EventType::OrchestratorMessage,
+            SYSTEM_TASK_ID,
+            Actor::System,
+            serde_json::json!({}),
+        );
+
+        store.append(&event).await.unwrap();
+        let events = store.read_task(SYSTEM_TASK_ID).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
 
     #[tokio::test]
     async fn append_and_read() {
@@ -596,7 +624,7 @@ mod tests {
         store
             .append(&Event::new(
                 EventType::OrchestratorMessage,
-                "", // system-wide
+                SYSTEM_TASK_ID,
                 Actor::Human,
                 serde_json::json!({"message": "hello"}),
             ))
