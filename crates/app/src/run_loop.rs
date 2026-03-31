@@ -981,7 +981,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                         );
                                     }
                                 }
-                                PullRequestState::Open => unreachable!(),
+                                PullRequestState::Open => {
+                                    // Filtered out at loop start; log if we somehow get here
+                                    debug!(pr = pr.number, "skipping Open PR in closure handler");
+                                }
                             }
                         }
 
