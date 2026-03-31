@@ -382,37 +382,8 @@ async fn main() {
     // the main loop emits them to the host.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Ev>();
 
-    // Set up Claude Code auth for the agent user.
-    // Write credential helper to the agent user's home directory.
-    let agent_user = std::env::var("AGENT_USER").unwrap_or_else(|_| "agent".to_string());
-    let agent_home = format!("/home/{agent_user}");
-    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-        let claude_dir = format!("{agent_home}/.claude");
-        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
-            log!("failed to create claude config dir {claude_dir}: {e}");
-        }
-        let script = format!("#!/bin/bash\necho \"{api_key}\"\n");
-        let script_path = format!("{claude_dir}/anthropic_key.sh");
-        if let Err(e) = std::fs::write(&script_path, &script) {
-            log!("failed to write anthropic_key.sh: {e}");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)) {
-                log!("failed to set permissions on anthropic_key.sh: {e}");
-            }
-            // Ensure the agent user owns the .claude directory
-            let chown = std::process::Command::new("chown")
-                .args(["-R", &format!("{agent_user}:{agent_user}"), &claude_dir])
-                .status();
-            if let Err(e) = chown {
-                log!("failed to chown {claude_dir}: {e}");
-            }
-        }
-    }
-
     // Emit system:ready (§4.2).
+    // Note: ANTHROPIC_API_KEY is passed to the agent via --preserve-env on sudo (line 187).
     emit(&Ev::SystemReady {});
 
     // Read commands from stdin on a blocking thread (stdin is sync).
