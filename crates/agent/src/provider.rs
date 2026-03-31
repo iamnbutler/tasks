@@ -32,6 +32,15 @@ pub struct CompletionConfig {
     /// Stop sequences
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// Context compaction threshold (fraction of context window).
+    /// When estimated token usage exceeds this fraction, compaction is triggered.
+    /// Set to 0.0 to disable compaction. Default: 0.85.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f32,
+}
+
+fn default_compact_threshold() -> f32 {
+    0.85
 }
 
 fn default_max_tokens() -> u32 {
@@ -64,6 +73,7 @@ impl Default for CompletionConfig {
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
+            compact_threshold: default_compact_threshold(),
         }
     }
 }
