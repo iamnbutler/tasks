@@ -9,5 +9,6 @@ mod transport;
 mod session;
 
 pub use container::{ContainerConfig, ContainerError, ContainerRuntime, AppleContainerRuntime};
+pub use protocol::AgentStartConfig;
 pub use transport::{StdioTransport, TransportError};
 pub use session::{Session, SessionError, SessionState};
