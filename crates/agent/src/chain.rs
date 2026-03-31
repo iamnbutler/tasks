@@ -199,6 +199,7 @@ impl<P: Provider> ChainBuilder<P> {
             ChainStep::Prompt { message, validator } => {
                 self.session.add_user_message(&message);
                 self.session.state = SessionState::Processing;
+                self.session.compact_if_needed(self.provider.as_ref()).await?;
                 let request = self.session.build_request();
                 let response = self.provider.complete(request).await?;
 

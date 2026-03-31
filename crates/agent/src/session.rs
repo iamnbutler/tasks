@@ -38,6 +38,8 @@ pub struct Session {
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Number of times compaction has been performed.
+    pub compaction_count: u32,
 }
 
 impl Session {
@@ -54,6 +56,7 @@ impl Session {
             total_usage: Usage::default(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
+            compaction_count: 0,
         }
     }
 
@@ -258,6 +261,162 @@ impl Session {
         self.state = SessionState::Cancelled;
         self.pending_tool_calls.clear();
     }
+
+    /// Check whether context compaction should trigger.
+    ///
+    /// Returns `true` when estimated total tokens (messages + overhead) exceed
+    /// the configured compact threshold fraction of the context window.
+    pub fn needs_compaction(&self) -> bool {
+        if self.config.compact_threshold <= 0.0 || self.messages.len() <= 2 {
+            return false;
+        }
+        let total_tokens: u32 = self.estimate_total_tokens();
+        let threshold = self.config.compact_budget();
+        total_tokens > threshold
+    }
+
+    /// Estimate total input tokens including system prompt and tool definitions.
+    fn estimate_total_tokens(&self) -> u32 {
+        let mut tokens: u32 = self.messages.iter().map(|m| m.estimate_tokens()).sum();
+        if let Some(ref system) = self.system_prompt {
+            tokens += (system.len() as u32) / 4 + 10;
+        }
+        for tool in &self.tools {
+            tokens += (tool.description.len() as u32 + tool.parameters.to_string().len() as u32) / 4 + 20;
+        }
+        tokens
+    }
+
+    /// Compact the conversation by summarizing older messages via an LLM call.
+    ///
+    /// Keeps the first message (task context) and recent messages intact,
+    /// replacing the middle portion with a summary. Falls back to truncation
+    /// if the summarization call fails.
+    pub async fn compact_if_needed(
+        &mut self,
+        provider: &(impl Provider + ?Sized),
+    ) -> std::result::Result<bool, AgentError> {
+        if !self.needs_compaction() {
+            return Ok(false);
+        }
+
+        let total = self.messages.len();
+        // Keep the first message + last N recent messages; summarize the middle.
+        // Reserve ~40% of messages as "recent" (minimum 4, maximum 20).
+        let keep_recent = (total * 2 / 5).clamp(4, 20).min(total.saturating_sub(1));
+        let summarize_end = total - keep_recent; // exclusive
+
+        if summarize_end <= 1 {
+            // Nothing to summarize beyond the first message
+            return Ok(false);
+        }
+
+        // Build the conversation excerpt to summarize
+        let to_summarize = &self.messages[1..summarize_end];
+        let mut conversation_text = String::new();
+        for msg in to_summarize {
+            let role_label = match msg.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::System => "System",
+            };
+            let text = msg.text();
+            if !text.is_empty() {
+                conversation_text.push_str(&format!("{}: {}\n\n", role_label, text));
+            }
+            // Summarize tool interactions concisely
+            for content in &msg.content {
+                match content {
+                    Content::ToolUse { name, .. } => {
+                        conversation_text.push_str(&format!("(Tool call: {})\n", name));
+                    }
+                    Content::ToolResult { content, is_error, .. } => {
+                        let status = if *is_error { "error" } else { "result" };
+                        let preview: String = content.chars().take(200).collect();
+                        conversation_text
+                            .push_str(&format!("(Tool {}: {}...)\n", status, preview));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let summarize_prompt = format!(
+            "Summarize the following conversation excerpt concisely. \
+             Preserve key facts, decisions, code changes, file paths, \
+             and any information needed to continue the task. \
+             Be specific about what was done and what was decided. \
+             Do NOT include preamble — output only the summary.\n\n\
+             ---\n{conversation_text}---"
+        );
+
+        // Use a small, focused request for summarization
+        let summary_config = CompletionConfig::new(self.config.model.clone())
+            .with_max_tokens(1024)
+            .with_compact_threshold(0.0); // prevent recursive compaction
+        let summary_request = CompletionRequest::new(
+            summary_config,
+            vec![Message::user(summarize_prompt)],
+        );
+
+        let summary = match provider.complete(summary_request).await {
+            Ok(response) => {
+                if let Some(usage) = response.usage {
+                    self.total_usage.input_tokens += usage.input_tokens;
+                    self.total_usage.output_tokens += usage.output_tokens;
+                }
+                let text = response.text();
+                if text.is_empty() {
+                    tracing::warn!(
+                        session_id = %self.id,
+                        "compaction summary was empty, skipping"
+                    );
+                    return Ok(false);
+                }
+                text
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.id,
+                    error = %e,
+                    "compaction summarization failed, falling back to truncation"
+                );
+                return Ok(false);
+            }
+        };
+
+        // Replace old messages: keep first + summary marker + recent
+        let first_message = self.messages[0].clone();
+        let recent_messages: Vec<Message> = self.messages[summarize_end..].to_vec();
+        let compacted_count = summarize_end - 1; // messages replaced (excluding first)
+
+        self.messages.clear();
+        self.messages.push(first_message);
+        self.messages.push(Message::user(format!(
+            "[Conversation Summary — compaction #{}]\n\
+             The following summarizes {} earlier messages:\n\n{}",
+            self.compaction_count + 1,
+            compacted_count,
+            summary
+        )));
+        // The summary is from the user role, so we need an assistant acknowledgment
+        // to maintain valid role alternation.
+        self.messages
+            .push(Message::assistant("Understood, continuing with the context above."));
+        self.messages.extend(recent_messages);
+
+        self.compaction_count += 1;
+
+        tracing::info!(
+            session_id = %self.id,
+            compacted_messages = compacted_count,
+            remaining_messages = self.messages.len(),
+            compaction_number = self.compaction_count,
+            "compacted conversation history via summarization"
+        );
+
+        Ok(true)
+    }
 }
 
 /// Builder for creating and configuring sessions.
@@ -349,6 +508,9 @@ impl<P: Provider> Chain<P> {
         self.session.add_user_message(message);
         self.session.state = SessionState::Processing;
 
+        // Compact before building the request to preserve context
+        self.session.compact_if_needed(self.provider.as_ref()).await?;
+
         let request = self.session.build_request();
         let response = self.provider.complete(request).await?;
         self.session.apply_response(&response);
@@ -366,6 +528,8 @@ impl<P: Provider> Chain<P> {
     {
         self.session.add_user_message(message);
         self.session.state = SessionState::Processing;
+
+        self.session.compact_if_needed(self.provider.as_ref()).await?;
 
         let request = self.session.build_request();
         let response = self.provider.complete(request).await?;
@@ -404,6 +568,9 @@ impl<P: Provider> Chain<P> {
         self.session.apply_tool_results(results);
         self.session.state = SessionState::Processing;
 
+        // Compact before building the request to preserve context
+        self.session.compact_if_needed(self.provider.as_ref()).await?;
+
         let request = self.session.build_request();
         let response = self.provider.complete(request).await?;
         self.session.apply_response(&response);
@@ -420,6 +587,39 @@ impl<P: Provider> Chain<P> {
 mod tests {
     use super::*;
     use crate::message::{Content, StopReason};
+    use tokio::sync::mpsc;
+    use crate::provider::StreamChunk;
+
+    /// A mock provider that returns a fixed response for testing compaction.
+    struct MockProvider {
+        response: Response,
+    }
+
+    impl MockProvider {
+        fn with_summary(summary: &str) -> Self {
+            Self {
+                response: Response {
+                    content: vec![Content::text(summary)],
+                    tool_calls: vec![],
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(Usage { input_tokens: 50, output_tokens: 20 }),
+                },
+            }
+        }
+    }
+
+    impl Provider for MockProvider {
+        fn name(&self) -> &str { "mock" }
+        fn models(&self) -> &[&str] { &["mock-model"] }
+        async fn complete(&self, _request: CompletionRequest) -> std::result::Result<Response, AgentError> {
+            Ok(self.response.clone())
+        }
+        async fn complete_streaming(&self, _request: CompletionRequest)
+            -> std::result::Result<mpsc::UnboundedReceiver<StreamChunk>, AgentError>
+        {
+            Err(AgentError::Provider("not implemented".into()))
+        }
+    }
 
     #[test]
     fn test_session_new() {
@@ -661,5 +861,139 @@ mod tests {
         }
         // First message preserved
         assert_eq!(request.messages[0].text(), "implement feature X");
+    }
+
+    #[test]
+    fn test_needs_compaction_under_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(10000)
+            .with_compact_threshold(0.85);
+        let mut session = Session::new(config);
+        session.add_user_message("hello");
+        session.add_assistant_message("hi");
+        assert!(!session.needs_compaction());
+    }
+
+    #[test]
+    fn test_needs_compaction_over_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_compact_threshold(0.5); // 50 token threshold
+        let mut session = Session::new(config);
+        // Add enough messages to exceed 50 tokens
+        for i in 0..20 {
+            session.add_user_message(&format!("message number {} with extra content to consume tokens", i));
+            session.add_assistant_message(&format!("response {} with lots of additional detail text", i));
+        }
+        assert!(session.needs_compaction());
+    }
+
+    #[test]
+    fn test_needs_compaction_disabled_when_threshold_zero() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(10)
+            .with_compact_threshold(0.0);
+        let mut session = Session::new(config);
+        for _ in 0..20 {
+            session.add_user_message("message with lots of text content here");
+            session.add_assistant_message("response with lots of text content here");
+        }
+        assert!(!session.needs_compaction());
+    }
+
+    #[test]
+    fn test_needs_compaction_too_few_messages() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(10)
+            .with_compact_threshold(0.5);
+        let mut session = Session::new(config);
+        session.add_user_message("a very long message that would exceed any budget");
+        assert!(!session.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_performs_compaction() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_compact_threshold(0.5);
+        let mut session = Session::new(config);
+
+        // First message (task context — always kept)
+        session.add_user_message("implement feature X");
+        // Add many messages to exceed threshold
+        for i in 0..20 {
+            session.add_assistant_message(&format!("working on step {} with detailed explanation", i));
+            session.add_user_message(&format!("continue with step {} please proceed", i + 1));
+        }
+        let original_count = session.messages.len();
+        assert!(session.needs_compaction());
+
+        let provider = MockProvider::with_summary("Summary: implemented steps 0-20 of feature X");
+        let compacted = session.compact_if_needed(&provider).await.unwrap();
+
+        assert!(compacted);
+        assert_eq!(session.compaction_count, 1);
+        // Should have fewer messages now
+        assert!(session.messages.len() < original_count);
+        // First message preserved
+        assert_eq!(session.messages[0].text(), "implement feature X");
+        // Summary marker present
+        assert!(session.messages[1].text().contains("[Conversation Summary"));
+        assert!(session.messages[1].text().contains("Summary: implemented steps 0-20"));
+        // Assistant acknowledgment
+        assert_eq!(session.messages[2].text(), "Understood, continuing with the context above.");
+        // Recent messages preserved at the end
+        let last = session.messages.last().unwrap();
+        assert!(last.text().contains("continue with step"));
+    }
+
+    #[tokio::test]
+    async fn test_compact_if_needed_skips_when_under_threshold() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100000)
+            .with_compact_threshold(0.85);
+        let mut session = Session::new(config);
+        session.add_user_message("hello");
+        session.add_assistant_message("hi");
+
+        let provider = MockProvider::with_summary("should not be called");
+        let compacted = session.compact_if_needed(&provider).await.unwrap();
+
+        assert!(!compacted);
+        assert_eq!(session.compaction_count, 0);
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_compact_tracks_usage() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_compact_threshold(0.5);
+        let mut session = Session::new(config);
+        session.add_user_message("task context");
+        for i in 0..20 {
+            session.add_assistant_message(&format!("working on step {} with detailed explanation", i));
+            session.add_user_message(&format!("continue with step {} please proceed", i + 1));
+        }
+
+        let provider = MockProvider::with_summary("Summary of work done");
+        session.compact_if_needed(&provider).await.unwrap();
+
+        // Usage from the summarization call should be tracked
+        assert_eq!(session.total_usage.input_tokens, 50);
+        assert_eq!(session.total_usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn test_compact_budget() {
+        let config = CompletionConfig::new("test-model")
+            .with_context_window(200_000)
+            .with_compact_threshold(0.85);
+        assert_eq!(config.compact_budget(), 170_000);
+
+        let config2 = CompletionConfig::new("test-model")
+            .with_context_window(100)
+            .with_compact_threshold(0.5);
+        assert_eq!(config2.compact_budget(), 50);
     }
 }
