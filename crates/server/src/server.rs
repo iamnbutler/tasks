@@ -3164,10 +3164,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Entry should be rejected
+        // Entry should be removed by cascade (terminal task removes linked entries)
         let state = server.state.read().await;
-        let entry = state.merge_queue.get("mq-1").unwrap();
-        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Rejected);
+        assert!(
+            state.merge_queue.get("mq-1").is_none(),
+            "merge queue entry should be removed when task becomes terminal"
+        );
         drop(state);
 
         // Task should be Completed (not Waiting)
