@@ -21,13 +21,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::Event;
+
+/// Maximum entries per event type kept in the in-memory type index.
+/// Keeps memory bounded (~50 types × 2000 entries × ~50 bytes ≈ 5 MB)
+/// while supporting typical query limits (100–500).
+const TYPE_INDEX_CAP_PER_TYPE: usize = 2000;
 
 /// Current event log format version. Bump when the Event serialization
 /// format changes in an incompatible way.
@@ -69,6 +74,63 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Lightweight in-memory index for type-prefix queries.
+///
+/// Stores only `(task_id, timestamp)` per event — no payload cloning.
+/// Populated lazily on the first `query_by_type_prefix` call, then kept
+/// up-to-date by `append()`.  Capped at [`TYPE_INDEX_CAP_PER_TYPE`]
+/// entries per event type to bound memory.
+struct TypeIndex {
+    /// event_type string → vec of (task_id, timestamp), append order.
+    entries: HashMap<String, Vec<(String, DateTime<Utc>)>>,
+    /// `true` once the index has been fully populated from on-disk files.
+    populated: bool,
+}
+
+impl TypeIndex {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            populated: false,
+        }
+    }
+
+    fn insert(&mut self, event_type: &str, task_id: &str, ts: DateTime<Utc>) {
+        let vec = self.entries.entry(event_type.to_string()).or_default();
+        vec.push((task_id.to_string(), ts));
+        if vec.len() > TYPE_INDEX_CAP_PER_TYPE {
+            // Evict oldest half to amortize.
+            let drain = TYPE_INDEX_CAP_PER_TYPE / 2;
+            vec.drain(..drain);
+        }
+    }
+
+    /// Return the unique task IDs that contain events matching `prefix`
+    /// among the most recent `limit` entries (by timestamp).
+    fn task_ids_for_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        let mut matching: Vec<(DateTime<Utc>, &str)> = Vec::new();
+        for (event_type, entries) in &self.entries {
+            if event_type.starts_with(prefix) {
+                for (tid, ts) in entries {
+                    matching.push((*ts, tid.as_str()));
+                }
+            }
+        }
+        // Sort descending by timestamp, take most recent `limit`.
+        matching.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        matching.truncate(limit);
+        let mut task_ids: Vec<String> = matching.into_iter().map(|(_, tid)| tid.to_string()).collect();
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        task_ids
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.populated = false;
+    }
+}
+
 /// Append-only event store backed by the filesystem.
 ///
 /// Events are stored per-task in JSONL format. Each task gets its own
@@ -76,12 +138,17 @@ impl Default for RetentionPolicy {
 ///
 /// Concurrent writes to the same task file are serialized via a per-task
 /// mutex to prevent byte interleaving.
+///
+/// An in-memory [`TypeIndex`] accelerates `query_by_type_prefix` from
+/// O(tasks × events) full-scan to O(matching_tasks × events_per_task).
 pub struct EventStore {
     root: PathBuf,
     /// Per-task write locks to serialize concurrent appends to the same file.
     write_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Retention policy for compaction.
     retention: RetentionPolicy,
+    /// Secondary index for event-type prefix queries.
+    type_index: RwLock<TypeIndex>,
 }
 
 impl EventStore {
@@ -97,6 +164,7 @@ impl EventStore {
             root: root.as_ref().to_path_buf(),
             write_locks: Mutex::new(HashMap::new()),
             retention,
+            type_index: RwLock::new(TypeIndex::new()),
         }
     }
 
@@ -151,6 +219,10 @@ impl EventStore {
     /// Creates the task directory if it doesn't exist. Concurrent writes to
     /// the same task file are serialized via a per-task mutex to prevent byte
     /// interleaving.
+    ///
+    /// The type index write lock is held across the file write so that lazy
+    /// population in [`Self::query_by_type_prefix`] cannot observe the
+    /// on-disk event without the index entry (or vice-versa).
     pub async fn append(&self, event: &Event) -> Result<(), StoreError> {
         if event.task.is_empty() {
             return Err(StoreError::EmptyTaskId);
@@ -159,11 +231,16 @@ impl EventStore {
         let path = self.task_log_path(&event.task);
         let lock = self.task_lock(&event.task).await;
 
-        // Serialize the JSON before acquiring the lock to minimize hold time.
+        // Serialize the JSON before acquiring locks to minimize hold time.
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
 
         let _guard = lock.lock().await;
+
+        // Acquire the type-index write lock *before* the file write.
+        // This ensures atomicity: no concurrent population can read the
+        // file between the write and the index update.
+        let mut index = self.type_index.write().await;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
@@ -177,6 +254,10 @@ impl EventStore {
 
         file.write_all(line.as_bytes()).await?;
         file.flush().await?;
+
+        if index.populated {
+            index.insert(event.event_type.as_str(), &event.task, event.ts);
+        }
 
         Ok(())
     }
@@ -260,17 +341,25 @@ impl EventStore {
 
     /// Query events across all tasks, filtered by an event-type prefix.
     ///
-    /// Scans every task's event log and returns events whose type starts with
-    /// `type_prefix` (e.g. `"orchestrator:"`).  Results are sorted by timestamp
-    /// ascending and truncated to `limit`.
+    /// Uses an in-memory type index to read only the task files that
+    /// contain matching events, rather than scanning every file.
+    /// Results are sorted by timestamp ascending and truncated to `limit`.
     pub async fn query_by_type_prefix(
         &self,
         type_prefix: &str,
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        let task_ids = self.list_tasks().await?;
-        let mut matching = Vec::new();
+        // Ensure the type index is populated (one-time cost).
+        self.ensure_type_index_populated().await?;
 
+        // Use the index to find which tasks to read.
+        let task_ids = {
+            let index = self.type_index.read().await;
+            index.task_ids_for_prefix(type_prefix, limit)
+        };
+
+        // Read only the relevant task files.
+        let mut matching = Vec::new();
         for task_id in &task_ids {
             let events = self.read_task(task_id).await?;
             for event in events {
@@ -280,15 +369,49 @@ impl EventStore {
             }
         }
 
-        // Sort by timestamp ascending
+        // Sort by timestamp ascending.
         matching.sort_by(|a, b| a.ts.cmp(&b.ts));
 
-        // Apply limit (take from the end to get the most recent)
+        // Apply limit (take from the end to get the most recent).
         if matching.len() > limit {
             matching = matching.split_off(matching.len() - limit);
         }
 
         Ok(matching)
+    }
+
+    /// Populate the type index from on-disk event files if not already done.
+    ///
+    /// Holds the type-index write lock for the entire scan to prevent races
+    /// with concurrent `append()` calls. This is a one-time cost at startup.
+    async fn ensure_type_index_populated(&self) -> Result<(), StoreError> {
+        // Fast path: already populated.
+        if self.type_index.read().await.populated {
+            return Ok(());
+        }
+
+        let mut index = self.type_index.write().await;
+        // Double-check after acquiring the write lock.
+        if index.populated {
+            return Ok(());
+        }
+
+        let task_ids = self.list_tasks().await?;
+        for task_id in &task_ids {
+            let events = self.read_task(task_id).await?;
+            for event in &events {
+                index.insert(event.event_type.as_str(), &event.task, event.ts);
+            }
+        }
+        index.populated = true;
+
+        tracing::debug!(
+            tasks = task_ids.len(),
+            index_types = index.entries.len(),
+            "type index populated from disk"
+        );
+
+        Ok(())
     }
 
     /// List all task IDs that have event logs.
@@ -384,6 +507,10 @@ impl EventStore {
         }
 
         fs::rename(&tmp_path, &path).await?;
+
+        // Invalidate the type index since events were removed.
+        // The next query_by_type_prefix call will re-populate it.
+        self.type_index.write().await.clear();
 
         tracing::debug!(
             task_id,
@@ -676,6 +803,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_by_type_prefix_indexes_post_population_appends() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Append an event and populate the index via a query.
+        store
+            .append(&Event::new(
+                EventType::OrchestratorDecision,
+                "task-1",
+                Actor::Orchestrator,
+                serde_json::json!({"round": 1}),
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Now append more events *after* the index is populated.
+        store
+            .append(&Event::new(
+                EventType::OrchestratorFeedback,
+                "task-2",
+                Actor::Orchestrator,
+                serde_json::json!({"round": 2}),
+            ))
+            .await
+            .unwrap();
+
+        // Non-matching event should not appear.
+        store
+            .append(&Event::new(
+                EventType::TaskCreated,
+                "task-3",
+                Actor::System,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Verify only orchestrator events are returned.
+        for event in &results {
+            assert!(event.event_type.as_str().starts_with("orchestrator:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn query_by_type_prefix_skips_unrelated_tasks() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Create many tasks with non-matching events.
+        for i in 0..20 {
+            store
+                .append(&Event::new(
+                    EventType::AgentMessage,
+                    &format!("task-{}", i),
+                    Actor::Agent,
+                    serde_json::json!({"i": i}),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Only one task has an orchestrator event.
+        store
+            .append(&Event::new(
+                EventType::OrchestratorDecision,
+                "task-5",
+                Actor::Orchestrator,
+                serde_json::json!({"decision": true}),
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task, "task-5");
     }
 
     #[tokio::test]
