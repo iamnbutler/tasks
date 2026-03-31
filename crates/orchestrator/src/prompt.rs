@@ -18,7 +18,7 @@ You review the ACTUAL CODE DIFF, not just PR metadata. Do not trust the PR descr
 ## Review process
 
 **Pass 1 — Diff triage:**
-Read the diff carefully. Evaluate:
+Read the diff carefully. You may also receive auto-fetched file context showing surrounding code for the most-changed files — use this to understand how changes fit into the broader codebase. Evaluate:
 
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
 2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases?
@@ -213,6 +213,48 @@ pub fn build_evaluation_prompt(
     prompt.push_str("Review the diff above against the issue requirements. ");
     prompt.push_str("Evaluate correctness, completeness, and whether this actually solves the issue. ");
     prompt.push_str("Respond with your evaluation in the JSON format specified in your instructions.");
+
+    prompt
+}
+
+/// File context fetched proactively from the diff.
+pub struct FileContext {
+    /// File path.
+    pub path: String,
+    /// Context-windowed content (line-numbered, with gaps).
+    pub content: String,
+}
+
+/// Build the evaluation prompt with proactively-fetched file context.
+///
+/// This enhances pass 1 by including surrounding code context for the
+/// most-changed files in the diff, so the reviewer can see how changes
+/// fit into the broader codebase.
+pub fn build_evaluation_prompt_with_context(
+    pr: &PullRequest,
+    issue: Option<&Issue>,
+    task_title: &str,
+    task_description: Option<&str>,
+    diff: Option<&str>,
+    queue_context: &[QueueEntrySummary],
+    file_contexts: &[FileContext],
+) -> String {
+    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, diff, queue_context);
+
+    if !file_contexts.is_empty() {
+        prompt.push_str("\n## File Context (auto-fetched)\n\n");
+        prompt.push_str("The following shows surrounding code context for the most-changed files, ");
+        prompt.push_str("so you can see how the diff fits into the broader codebase.\n\n");
+        for ctx in file_contexts {
+            prompt.push_str(&format!("### `{}`\n\n", ctx.path));
+            prompt.push_str("```\n");
+            prompt.push_str(&ctx.content);
+            if !ctx.content.ends_with('\n') {
+                prompt.push('\n');
+            }
+            prompt.push_str("```\n\n");
+        }
+    }
 
     prompt
 }
@@ -585,5 +627,61 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_file_context() {
+        let pr = test_pr();
+        let file_contexts = vec![
+            FileContext {
+                path: "src/auth.rs".to_string(),
+                content: "10: fn login() {\n11:     validate();\n12: }".to_string(),
+            },
+            FileContext {
+                path: "src/session.rs".to_string(),
+                content: "5: fn create_session() {\n6:     // ...\n7: }".to_string(),
+            },
+        ];
+
+        let prompt = build_evaluation_prompt_with_context(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff content"),
+            &[],
+            &file_contexts,
+        );
+
+        // Should contain file context section
+        assert!(prompt.contains("## File Context (auto-fetched)"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("fn login()"));
+        assert!(prompt.contains("src/session.rs"));
+        assert!(prompt.contains("fn create_session()"));
+        assert!(prompt.contains("surrounding code context"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_empty_file_context() {
+        let pr = test_pr();
+        let prompt = build_evaluation_prompt_with_context(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff content"),
+            &[],
+            &[],
+        );
+
+        // Should NOT contain file context section when empty
+        assert!(!prompt.contains("## File Context"));
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_file_context() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("auto-fetched file context"));
     }
 }

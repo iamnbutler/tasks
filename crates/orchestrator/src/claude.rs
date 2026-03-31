@@ -7,8 +7,15 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::error::OrchestratorError;
+use crate::diff::{
+    extract_context_window, parse_diff_files, CONTEXT_WINDOW_LINES, MAX_CONTEXT_FILES,
+    MAX_CONTEXT_LINES_PER_FILE,
+};
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{
+    build_evaluation_prompt_with_context, build_deep_review_prompt, parse_pr_url, system_prompt,
+    FileContext,
+};
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
     QualityEvaluation, QuestionContext, SystemContext,
@@ -214,15 +221,72 @@ impl Orchestrator for ClaudeOrchestrator {
             _ => None,
         };
 
-        // --- Pass 1: Triage with diff ---
+        // --- Proactive context fetching ---
+        // Parse the diff to find the most-changed files and fetch surrounding
+        // code context so the reviewer sees how changes fit into the codebase.
+        let file_contexts = if let Some(ref diff_text) = diff {
+            let changed_files = parse_diff_files(diff_text);
+            let mut contexts = Vec::new();
+
+            for file in changed_files.iter().take(MAX_CONTEXT_FILES) {
+                // Skip files that are likely non-code (binary, generated, etc.)
+                if is_likely_non_code(&file.path) {
+                    continue;
+                }
+
+                match self
+                    .github
+                    .get_file_content_at_ref(&owner, &repo, &file.path, &pr.head_ref)
+                    .await
+                {
+                    Ok(Some(content)) => {
+                        let windowed = extract_context_window(
+                            &content,
+                            &file.changed_lines,
+                            CONTEXT_WINDOW_LINES,
+                            MAX_CONTEXT_LINES_PER_FILE,
+                        );
+                        info!(
+                            path = %file.path,
+                            changed_lines = file.changed_lines.len(),
+                            context_len = windowed.len(),
+                            "Fetched proactive file context"
+                        );
+                        contexts.push(FileContext {
+                            path: file.path.clone(),
+                            content: windowed,
+                        });
+                    }
+                    Ok(None) => {
+                        info!(path = %file.path, "File not found for proactive context (may be deleted)");
+                    }
+                    Err(e) => {
+                        warn!(path = %file.path, error = %e, "Failed to fetch proactive file context");
+                    }
+                }
+            }
+            contexts
+        } else {
+            Vec::new()
+        };
+
+        if !file_contexts.is_empty() {
+            info!(
+                file_count = file_contexts.len(),
+                "Proactive context fetched for pass 1"
+            );
+        }
+
+        // --- Pass 1: Triage with diff + proactive context ---
         let system = system_prompt();
-        let user_prompt = build_evaluation_prompt(
+        let user_prompt = build_evaluation_prompt_with_context(
             &pr,
             issue.as_ref(),
             &context.task.title,
             context.task.description.as_deref(),
             diff.as_deref(),
             &context.queue_context,
+            &file_contexts,
         );
 
         let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
@@ -578,6 +642,26 @@ fn build_question_answer_prompt(
     ));
 
     prompt
+}
+
+/// Check if a file path is likely non-code (binary, generated, lock files, etc.)
+/// that wouldn't benefit from context fetching.
+fn is_likely_non_code(path: &str) -> bool {
+    let non_code_extensions = [
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot",
+        ".mp3", ".mp4", ".wav", ".pdf", ".zip", ".tar", ".gz", ".lock", ".sum",
+    ];
+    let non_code_files = [
+        "package-lock.json",
+        "yarn.lock",
+        "Cargo.lock",
+        "bun.lockb",
+        "pnpm-lock.yaml",
+    ];
+
+    let lower = path.to_lowercase();
+    non_code_extensions.iter().any(|ext| lower.ends_with(ext))
+        || non_code_files.iter().any(|f| path.ends_with(f))
 }
 
 /// Extract JSON from a text response.
