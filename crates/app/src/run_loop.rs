@@ -496,6 +496,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
     let github_token = config.github_token.clone();
     let poll_config_watcher = workflow_config_watcher.clone();
     let poll_rejected_cooldown = rejected_pr_cooldown.clone();
+    let poll_session_mgr = session_manager.clone();
     let mut poll_shutdown_rx = shutdown_tx.subscribe();
 
     let poll_handle = tokio::spawn(async move {
@@ -686,6 +687,24 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                                 updated_fields = ?result.updated_fields,
                                                 "reconciled task from GitHub"
                                             );
+
+                                            // Stop the running session when the issue
+                                            // is closed externally (issue #499).
+                                            if new_state.is_terminal() {
+                                                match poll_session_mgr.stop_session(&task_id).await {
+                                                    Ok(()) => {
+                                                        info!(
+                                                            task_id = %task_id,
+                                                            new_state = ?new_state,
+                                                            "stopped session for externally closed issue"
+                                                        );
+                                                    }
+                                                    Err(_) => {
+                                                        // No active session — task was
+                                                        // waiting/blocked, not running.
+                                                    }
+                                                }
+                                            }
                                         } else if !result.updated_fields.is_empty() {
                                             debug!(
                                                 project = %project_id,
