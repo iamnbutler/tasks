@@ -26,6 +26,15 @@ const MAX_EVENTS: usize = 200;
 /// Polling interval for snapshot refresh (milliseconds).
 const POLL_INTERVAL_MS: u64 = 5_000;
 
+/// Initial retry base delay (milliseconds) for exponential backoff.
+const INITIAL_RETRY_BASE_MS: u64 = 1_000;
+
+/// Maximum retry delay (milliseconds) for exponential backoff.
+const INITIAL_RETRY_MAX_MS: u64 = 30_000;
+
+/// Maximum number of automatic retries before giving up.
+const INITIAL_RETRY_MAX_ATTEMPTS: u32 = 10;
+
 /// Check whether an event type string should trigger a snapshot refresh.
 /// Matches: task:*, merge:*, system:mode*
 fn is_state_changing_event(event_type: &str) -> bool {
@@ -118,6 +127,10 @@ pub struct AppState {
     stop_polling: Option<Arc<AtomicBool>>,
     /// Whether a fetch is currently in flight.
     fetch_in_flight: Arc<AtomicBool>,
+    /// Number of consecutive initial connection failures (reset on success).
+    initial_retry_count: u32,
+    /// Flag to stop the initial retry loop.
+    stop_initial_retry: Option<Arc<AtomicBool>>,
 }
 
 impl AppState {
@@ -158,6 +171,8 @@ impl AppState {
             sse_client: Some(sse_client),
             stop_polling: None,
             fetch_in_flight: Arc::new(AtomicBool::new(false)),
+            initial_retry_count: 0,
+            stop_initial_retry: None,
         };
 
         // Start polling loop
@@ -358,21 +373,47 @@ impl AppState {
     fn update_snapshot(&mut self, result: Result<Snapshot, ApiError>, cx: &mut Context<Self>) {
         match result {
             Ok(snapshot) => {
+                let was_initial = self.snapshot.is_none();
                 self.snapshot = Some(snapshot);
                 self.last_error = None;
+                self.initial_retry_count = 0;
+                self.stop_initial_retry();
                 // Update connection status if we were previously disconnected
-                if self.connection_status == ConnectionStatus::Disconnected
-                    || self.connection_status == ConnectionStatus::Failed
-                {
+                if self.connection_status != ConnectionStatus::Connected {
                     self.connection_status = ConnectionStatus::Connected;
                     cx.emit(AppStateEvent::ConnectionStatusChanged(
                         self.connection_status,
                     ));
                 }
+                if was_initial {
+                    info!("Initial snapshot loaded successfully");
+                }
                 cx.emit(AppStateEvent::SnapshotUpdated);
                 cx.notify();
             }
             Err(e) => {
+                let is_initial = self.snapshot.is_none();
+                if is_initial {
+                    // On initial connection failure, update status and schedule retry
+                    self.initial_retry_count += 1;
+                    let new_status = if self.initial_retry_count >= INITIAL_RETRY_MAX_ATTEMPTS {
+                        ConnectionStatus::Failed
+                    } else {
+                        ConnectionStatus::Connecting
+                    };
+                    if self.connection_status != new_status {
+                        self.connection_status = new_status;
+                        cx.emit(AppStateEvent::ConnectionStatusChanged(new_status));
+                    }
+                    warn!(
+                        error = %e,
+                        attempt = self.initial_retry_count,
+                        "Initial snapshot fetch failed"
+                    );
+                    if self.initial_retry_count < INITIAL_RETRY_MAX_ATTEMPTS {
+                        self.schedule_initial_retry(cx);
+                    }
+                }
                 self.set_error(e.to_string(), cx);
             }
         }
@@ -395,6 +436,61 @@ impl AppState {
         }
         cx.emit(AppStateEvent::EventReceived(event));
         cx.notify();
+    }
+
+    /// Manually retry connecting to the server.
+    ///
+    /// Resets the retry counter and immediately attempts a snapshot fetch.
+    /// Use this from a "Retry" button in the UI.
+    pub fn retry_connect(&mut self, cx: &mut Context<Self>) {
+        self.stop_initial_retry();
+        self.initial_retry_count = 0;
+        self.connection_status = ConnectionStatus::Connecting;
+        cx.emit(AppStateEvent::ConnectionStatusChanged(
+            ConnectionStatus::Connecting,
+        ));
+        cx.notify();
+        self.refresh_snapshot(cx);
+    }
+
+    /// Schedule an automatic retry for the initial snapshot fetch with exponential backoff.
+    fn schedule_initial_retry(&mut self, cx: &mut Context<Self>) {
+        // Stop any existing retry timer
+        self.stop_initial_retry();
+
+        let delay_ms = (INITIAL_RETRY_BASE_MS * 2u64.pow(self.initial_retry_count - 1))
+            .min(INITIAL_RETRY_MAX_MS);
+        let delay = Duration::from_millis(delay_ms);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        self.stop_initial_retry = Some(stop_flag.clone());
+
+        info!(delay_ms, attempt = self.initial_retry_count, "Scheduling initial connection retry");
+
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(delay).await;
+
+            if stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+
+            if let Err(e) = this.update(cx, |state, cx| {
+                // Only retry if we still don't have a snapshot
+                if state.snapshot.is_none() {
+                    state.refresh_snapshot(cx);
+                }
+            }) {
+                warn!(error = %e, "Failed to trigger initial retry");
+            }
+        })
+        .detach();
+    }
+
+    /// Stop the initial retry timer.
+    fn stop_initial_retry(&mut self) {
+        if let Some(flag) = self.stop_initial_retry.take() {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 
     // --- Polling ---
@@ -466,6 +562,7 @@ impl EventEmitter<AppStateEvent> for AppState {}
 impl Drop for AppState {
     fn drop(&mut self) {
         self.stop_polling();
+        self.stop_initial_retry();
     }
 }
 
