@@ -968,6 +968,28 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_closure_stops_active_task() {
+        // Issue #499: When an issue is closed externally while a task is Running,
+        // reconcile should still transition the task to a terminal state.
+        let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
+        let cfg = default_label_config();
+        let mut task = make_task_from_issue(&issue, &cfg);
+        task.set_state(TaskState::Running);
+
+        let mut closed_issue = issue.clone();
+        closed_issue.state = GhIssueState::Closed;
+        closed_issue.state_reason = Some(tasks_github::model::IssueStateReason::NotPlanned);
+
+        let result = reconcile_task(&mut task, &closed_issue, &cfg);
+        assert_eq!(result.new_state, Some(TaskState::Cancelled));
+        assert_eq!(task.state, TaskState::Cancelled);
+        assert_eq!(
+            result.closure_reason,
+            Some(tasks_github::model::ClosureReason::NotPlanned)
+        );
+    }
+
+    #[test]
     fn reconcile_updates_priority() {
         let issue = make_issue(42, vec![make_label("bug")], GhIssueState::Open);
         let cfg = default_label_config();
