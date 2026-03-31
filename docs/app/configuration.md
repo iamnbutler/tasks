@@ -45,6 +45,14 @@ Tasks is configured through environment variables and a `.env` file.
 | `TASKS_CONTAINER_IMAGE` | Container image for agent sessions | `tasks-agent:latest` |
 | `TASKS_CONTAINER_MEMORY` | Container memory limit | `8G` |
 
+### Work Queue <!-- LAST_UPDATED: 2026-03-30 -->
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WORK_QUEUE_TIMEOUT` | Minimum seconds between dispatches (rate limiting) | `15` |
+| `CONTAINER_TIMEOUT` | Maximum seconds a container can work before being reclaimed | `7200` (2 hours) |
+| `HEALTH_CHECK_INTERVAL` | Seconds between health checks for dead or stale containers | `30` |
+
 ### Memory Pressure
 
 | Variable | Description | Default |
@@ -256,4 +264,4 @@ Consider network isolation for sensitive environments.
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-03-30 -->*

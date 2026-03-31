@@ -28,7 +28,7 @@ The main navigation sections are:
 | **Containers** | Active container session monitor |
 | **Automations** | Reusable automation workflows |
 
-Mode controls (Stop / Pause / Play icon buttons) are in the nav footer.
+Mode controls (Stop / Pause / Play icon buttons) are in the nav footer. The sidebar footer also shows the running server version.
 
 ## Dashboard
 
@@ -47,7 +47,7 @@ Mode controls are located in the nav footer as three icon buttons (Stop / Pause 
 | Icon | Mode | Description |
 |------|------|-------------|
 | Square | **Stop** | All activity halted |
-| Pause | **Pause** | Agents work, merges paused |
+| Pause | **Pause** | Agents work; approved PRs are held until flushed. Rejections, conflicts, and change requests still process automatically. |
 | Play | **Play** | Full autonomy |
 
 ## Tasks View
@@ -83,7 +83,7 @@ Click a task to view its detail page. The detail view is split into tabs:
 | **Chat** | Send messages to the active agent session |
 | **Details** | Full task description (Markdown rendered) |
 
-A **Properties** sidebar on the right shows metadata (state, project, created date) and the task event timeline.
+A **Properties** sidebar on the right shows metadata (state, project, created date) and the task event timeline. When the orchestrator has rejected a PR and provided feedback, a **Rejection Feedback** section appears in the sidebar with the orchestrator's notes. Tasks with active feedback are also flagged with an amber warning indicator in the task list.
 
 #### Chat Block Types
 
@@ -122,6 +122,8 @@ For each entry:
 ### Flush
 
 In Pause mode, use the **Flush** button to merge all approved entries via the GitHub API.
+
+> **Pause mode note:** Only approved PR merges are held in Pause mode. Rejections, conflict resolution, and change requests continue to process automatically.
 
 ## Orchestrator
 
@@ -248,4 +250,4 @@ Clicking a run row opens the automation detail view, which shows a live chat-sty
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-03-30 -->*
