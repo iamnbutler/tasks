@@ -32,6 +32,10 @@ pub struct CompletionConfig {
     /// Stop sequences
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// Fraction of context window at which to trigger compaction (0.0–1.0).
+    /// Defaults to 0.85 (85%). Set to 0.0 to disable compaction.
+    #[serde(default = "default_compact_threshold")]
+    pub compact_threshold: f32,
 }
 
 fn default_max_tokens() -> u32 {
@@ -42,6 +46,10 @@ fn default_context_window() -> u32 {
     // Conservative default for deserialization (non-Claude models).
     // CompletionConfig::new() overrides this via context_window_for_model().
     128_000
+}
+
+fn default_compact_threshold() -> f32 {
+    0.85
 }
 
 /// Infer context window size from model name.
@@ -64,6 +72,7 @@ impl Default for CompletionConfig {
             temperature: None,
             top_p: None,
             stop_sequences: Vec::new(),
+            compact_threshold: default_compact_threshold(),
         }
     }
 }
@@ -90,9 +99,23 @@ impl CompletionConfig {
         self
     }
 
+    pub fn with_compact_threshold(mut self, threshold: f32) -> Self {
+        self.compact_threshold = threshold;
+        self
+    }
+
     /// Maximum input tokens available after reserving space for the response.
     pub fn input_budget(&self) -> u32 {
         self.context_window.saturating_sub(self.max_tokens)
+    }
+
+    /// Token count at which context compaction should trigger.
+    /// Returns `None` if compaction is disabled (threshold == 0.0).
+    pub fn compact_budget(&self) -> Option<u32> {
+        if self.compact_threshold <= 0.0 {
+            return None;
+        }
+        Some((self.input_budget() as f32 * self.compact_threshold) as u32)
     }
 }
 
