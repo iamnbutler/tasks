@@ -16,7 +16,7 @@
 //! events newer than a max age. Orphaned task directories (those without a
 //! corresponding events file) can also be cleaned up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use chrono::Utc;
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::Event;
 
@@ -69,6 +69,81 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// In-memory index of events grouped by event type string.
+///
+/// Uses a `BTreeMap` so that prefix queries can use efficient range scans
+/// instead of scanning all entries.
+struct TypeIndex {
+    /// Events grouped by their `event_type.as_str()` value.
+    by_type: BTreeMap<String, Vec<Event>>,
+    /// Whether the index has been populated from disk.
+    populated: bool,
+}
+
+impl TypeIndex {
+    fn new() -> Self {
+        Self {
+            by_type: BTreeMap::new(),
+            populated: false,
+        }
+    }
+
+    /// Insert an event into the index.
+    fn insert(&mut self, event: Event) {
+        self.by_type
+            .entry(event.event_type.as_str().to_string())
+            .or_default()
+            .push(event);
+    }
+
+    /// Query events whose type starts with `prefix`, sorted by timestamp,
+    /// returning the most recent `limit` events.
+    fn query_by_prefix(&self, prefix: &str, limit: usize) -> Vec<Event> {
+        let start = prefix.to_string();
+        let mut matching: Vec<&Event> = if let Some(end) = Self::prefix_successor(prefix) {
+            self.by_type
+                .range(start..end)
+                .flat_map(|(_, events)| events.iter())
+                .collect()
+        } else {
+            self.by_type
+                .range(start..)
+                .flat_map(|(_, events)| events.iter())
+                .collect()
+        };
+
+        matching.sort_by(|a, b| a.ts.cmp(&b.ts));
+
+        if matching.len() > limit {
+            matching = matching.split_off(matching.len() - limit);
+        }
+
+        matching.into_iter().cloned().collect()
+    }
+
+    /// Remove all events belonging to a specific task.
+    fn remove_task_events(&mut self, task_id: &str) {
+        for events in self.by_type.values_mut() {
+            events.retain(|e| e.task != task_id);
+        }
+        self.by_type.retain(|_, events| !events.is_empty());
+    }
+
+    /// Compute the first string that is lexicographically *after* all strings
+    /// starting with `prefix`. Returns `None` if the prefix is all `0xFF` bytes.
+    fn prefix_successor(prefix: &str) -> Option<String> {
+        let mut bytes = prefix.as_bytes().to_vec();
+        while let Some(last) = bytes.last_mut() {
+            if *last < 0xFF {
+                *last += 1;
+                return String::from_utf8(bytes).ok();
+            }
+            bytes.pop();
+        }
+        None
+    }
+}
+
 /// Append-only event store backed by the filesystem.
 ///
 /// Events are stored per-task in JSONL format. Each task gets its own
@@ -76,12 +151,18 @@ impl Default for RetentionPolicy {
 ///
 /// Concurrent writes to the same task file are serialized via a per-task
 /// mutex to prevent byte interleaving.
+///
+/// An in-memory type index accelerates `query_by_type_prefix` calls after
+/// the first invocation (which populates the index from disk). Subsequent
+/// calls are O(matching events) instead of O(all events across all tasks).
 pub struct EventStore {
     root: PathBuf,
     /// Per-task write locks to serialize concurrent appends to the same file.
     write_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Retention policy for compaction.
     retention: RetentionPolicy,
+    /// In-memory index for event type prefix queries.
+    type_index: RwLock<TypeIndex>,
 }
 
 impl EventStore {
@@ -97,6 +178,7 @@ impl EventStore {
             root: root.as_ref().to_path_buf(),
             write_locks: Mutex::new(HashMap::new()),
             retention,
+            type_index: RwLock::new(TypeIndex::new()),
         }
     }
 
@@ -177,6 +259,14 @@ impl EventStore {
 
         file.write_all(line.as_bytes()).await?;
         file.flush().await?;
+
+        // Update the in-memory type index if it has been populated.
+        {
+            let mut index = self.type_index.write().await;
+            if index.populated {
+                index.insert(event.clone());
+            }
+        }
 
         Ok(())
     }
@@ -260,35 +350,55 @@ impl EventStore {
 
     /// Query events across all tasks, filtered by an event-type prefix.
     ///
-    /// Scans every task's event log and returns events whose type starts with
-    /// `type_prefix` (e.g. `"orchestrator:"`).  Results are sorted by timestamp
-    /// ascending and truncated to `limit`.
+    /// Uses an in-memory index for efficient lookups. The index is lazily
+    /// populated from disk on the first call, then kept up-to-date by
+    /// `append` and `compact_task`. Results are sorted by timestamp ascending
+    /// and truncated to `limit` (keeping the most recent).
     pub async fn query_by_type_prefix(
         &self,
         type_prefix: &str,
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        let task_ids = self.list_tasks().await?;
-        let mut matching = Vec::new();
+        // Ensure the index is populated (one-time disk read).
+        self.ensure_type_index_populated().await?;
 
-        for task_id in &task_ids {
-            let events = self.read_task(task_id).await?;
-            for event in events {
-                if event.event_type.as_str().starts_with(type_prefix) {
-                    matching.push(event);
-                }
+        let index = self.type_index.read().await;
+        Ok(index.query_by_prefix(type_prefix, limit))
+    }
+
+    /// Populate the type index from disk if not already done.
+    async fn ensure_type_index_populated(&self) -> Result<(), StoreError> {
+        // Fast path: check with a read lock.
+        {
+            let index = self.type_index.read().await;
+            if index.populated {
+                return Ok(());
             }
         }
 
-        // Sort by timestamp ascending
-        matching.sort_by(|a, b| a.ts.cmp(&b.ts));
-
-        // Apply limit (take from the end to get the most recent)
-        if matching.len() > limit {
-            matching = matching.split_off(matching.len() - limit);
+        // Slow path: acquire write lock and populate.
+        let mut index = self.type_index.write().await;
+        // Double-check after acquiring write lock.
+        if index.populated {
+            return Ok(());
         }
 
-        Ok(matching)
+        let task_ids = self.list_tasks().await?;
+        for task_id in &task_ids {
+            let events = self.read_task(task_id).await?;
+            for event in events {
+                index.insert(event);
+            }
+        }
+
+        index.populated = true;
+        tracing::debug!(
+            types = index.by_type.len(),
+            tasks = task_ids.len(),
+            "type index populated from disk"
+        );
+
+        Ok(())
     }
 
     /// List all task IDs that have event logs.
@@ -384,6 +494,17 @@ impl EventStore {
         }
 
         fs::rename(&tmp_path, &path).await?;
+
+        // Update the type index: remove old entries for this task, re-add kept ones.
+        {
+            let mut index = self.type_index.write().await;
+            if index.populated {
+                index.remove_task_events(task_id);
+                for event in &kept {
+                    index.insert(event.clone());
+                }
+            }
+        }
 
         tracing::debug!(
             task_id,
@@ -974,5 +1095,120 @@ mod tests {
         let removed = store.cleanup_orphaned_tasks().await.unwrap();
         assert_eq!(removed, 1);
         assert!(!task_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn type_index_populated_from_disk_on_first_query() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Write events directly to disk (simulating pre-existing data).
+        store
+            .append(&Event::new(
+                EventType::OrchestratorDecision,
+                "task-1",
+                Actor::Orchestrator,
+                serde_json::json!({"approved": true}),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(&Event::new(
+                EventType::TaskCreated,
+                "task-1",
+                Actor::System,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+
+        // Create a new store pointing at the same dir (cold start).
+        let store2 = EventStore::new(dir.path());
+
+        // First query should populate the index from disk.
+        let results = store2
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Subsequent queries should use the in-memory index.
+        let results = store2
+            .query_by_type_prefix("task:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn type_index_updated_on_append_after_population() {
+        let dir = tempdir().unwrap();
+        let store = EventStore::new(dir.path());
+
+        // Populate the index by querying.
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 0);
+
+        // Now append an event — it should be added to the index.
+        store
+            .append(&Event::new(
+                EventType::OrchestratorDecision,
+                "task-1",
+                Actor::Orchestrator,
+                serde_json::json!({"approved": true}),
+            ))
+            .await
+            .unwrap();
+
+        // Query should find it without re-reading disk.
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn type_index_updated_on_compaction() {
+        let dir = tempdir().unwrap();
+        let policy = RetentionPolicy {
+            max_events: Some(2),
+            max_age: None,
+        };
+        let store = EventStore::with_retention(dir.path(), policy);
+
+        // Write 5 orchestrator events.
+        for i in 0..5 {
+            store
+                .append(&Event::new(
+                    EventType::OrchestratorDecision,
+                    "task-1",
+                    Actor::Orchestrator,
+                    serde_json::json!({"index": i}),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Populate the index.
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 5);
+
+        // Compact — should keep only 2.
+        let removed = store.compact_task("task-1").await.unwrap();
+        assert_eq!(removed, 3);
+
+        // Index should reflect compaction.
+        let results = store
+            .query_by_type_prefix("orchestrator:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
