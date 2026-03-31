@@ -126,7 +126,19 @@ pub struct Tool {
     /// default to `false` and run serially.
     #[serde(default)]
     pub is_concurrency_safe: bool,
+    /// Maximum result size in bytes before the output is persisted to disk.
+    ///
+    /// - `Some(n)`: persist to disk and return a preview if result exceeds `n` bytes
+    /// - `None`: never persist (tool results are always returned in full)
+    ///
+    /// Defaults to `Some(100_000)` (100 KB). Set to `None` for tools like `Read`
+    /// that already self-limit or return structured data the model must process.
+    #[serde(default = "Tool::default_max_result_size")]
+    pub max_result_size: Option<usize>,
 }
+
+/// Default max result size: 100 KB.
+pub const DEFAULT_MAX_RESULT_SIZE: usize = 100_000;
 
 impl Tool {
     pub fn new(
@@ -139,6 +151,7 @@ impl Tool {
             description: description.into(),
             parameters,
             is_concurrency_safe: false,
+            max_result_size: Some(DEFAULT_MAX_RESULT_SIZE),
         }
     }
 
@@ -153,7 +166,18 @@ impl Tool {
             description: description.into(),
             parameters,
             is_concurrency_safe: true,
+            max_result_size: Some(DEFAULT_MAX_RESULT_SIZE),
         }
+    }
+
+    /// Set the max result size for this tool. `None` disables persistence.
+    pub fn with_max_result_size(mut self, max_result_size: Option<usize>) -> Self {
+        self.max_result_size = max_result_size;
+        self
+    }
+
+    fn default_max_result_size() -> Option<usize> {
+        Some(DEFAULT_MAX_RESULT_SIZE)
     }
 }
 
