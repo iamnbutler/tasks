@@ -119,6 +119,13 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Whether this tool is safe to execute concurrently with other safe tools.
+    ///
+    /// Read-only tools (file reads, searches, etc.) can be marked as concurrency-safe
+    /// so they run in parallel, while mutating tools (file writes, shell commands)
+    /// default to `false` and run serially.
+    #[serde(default)]
+    pub is_concurrency_safe: bool,
 }
 
 impl Tool {
@@ -131,6 +138,21 @@ impl Tool {
             name: name.into(),
             description: description.into(),
             parameters,
+            is_concurrency_safe: false,
+        }
+    }
+
+    /// Create a tool marked as safe for concurrent execution.
+    pub fn new_concurrent(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            is_concurrency_safe: true,
         }
     }
 }
