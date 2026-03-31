@@ -8,6 +8,7 @@
 
 pub mod agents;
 pub mod chat;
+mod diff;
 pub mod error;
 mod claude;
 pub mod mock;

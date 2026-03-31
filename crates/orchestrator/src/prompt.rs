@@ -18,10 +18,12 @@ You review the ACTUAL CODE DIFF, not just PR metadata. Do not trust the PR descr
 ## Review process
 
 **Pass 1 — Diff triage:**
-Read the diff carefully. Evaluate:
+Read the diff carefully. You may also receive **file context** showing code around the changed lines in the most-modified files. Use this context to understand how changes integrate with surrounding code — check for callers that weren't updated, broken invariants, or incomplete changes.
+
+Evaluate:
 
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
-2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases?
+2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases? Use the file context to check surrounding code.
 3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
 4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
 5. **Queue context**: Consider other PRs in the merge queue. If this PR appears to depend on changes from another PR that hasn't merged yet, or if issues you see would be resolved by a PR ahead in the queue, factor that into your decision.
@@ -67,6 +69,61 @@ Response format for Pass 2 is the same, but `needs_deeper_review` must be false.
 - For large diffs: if truncated, lean toward requesting deeper review rather than approving blind.
 - Be concise but specific. If rejecting, point to exact lines/hunks in the diff.
 - Consider queue ordering: if a "missing function" or "undefined reference" issue might be resolved by a PR ahead in the queue, mention this in your reasoning rather than rejecting outright."#.to_string()
+}
+
+/// A file context entry: path and windowed content around changed lines.
+pub struct FileContext {
+    /// File path (e.g., "src/main.rs").
+    pub path: String,
+    /// Windowed content with line numbers (context around changed lines).
+    pub content: String,
+}
+
+/// Build the user prompt with PR, issue, and proactive file context.
+///
+/// This is the enhanced version that includes context windows around changed
+/// files, allowing the reviewer to see surrounding code without a second pass.
+pub fn build_evaluation_prompt_with_context(
+    pr: &PullRequest,
+    issue: Option<&Issue>,
+    task_title: &str,
+    task_description: Option<&str>,
+    diff: Option<&str>,
+    queue_context: &[QueueEntrySummary],
+    file_contexts: &[FileContext],
+) -> String {
+    let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, diff, queue_context);
+
+    if !file_contexts.is_empty() {
+        // Insert file context before the evaluation request
+        let eval_header = "## Evaluation Request";
+        if let Some(pos) = prompt.find(eval_header) {
+            let context_section = build_file_context_section(file_contexts);
+            prompt.insert_str(pos, &context_section);
+        }
+    }
+
+    prompt
+}
+
+/// Build the file context section for the prompt.
+fn build_file_context_section(file_contexts: &[FileContext]) -> String {
+    let mut section = String::new();
+    section.push_str("## File Context (around changed lines)\n\n");
+    section.push_str("The following shows code context (with line numbers) around the changed lines in the most-modified files. ");
+    section.push_str("Use this to understand how the changes fit into the surrounding code.\n\n");
+
+    for ctx in file_contexts {
+        section.push_str(&format!("### `{}`\n\n", ctx.path));
+        section.push_str("```\n");
+        section.push_str(&ctx.content);
+        if !ctx.content.ends_with('\n') {
+            section.push('\n');
+        }
+        section.push_str("```\n\n");
+    }
+
+    section
 }
 
 /// Build the user prompt with PR and issue context.
@@ -585,5 +642,60 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_file_context() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("file context"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_file_context() {
+        let pr = test_pr();
+        let file_contexts = vec![
+            FileContext {
+                path: "src/auth.rs".to_string(),
+                content: "10: fn login() {\n11:     let timeout = 30;\n12: }".to_string(),
+            },
+        ];
+        let prompt = build_evaluation_prompt_with_context(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff --git a/src/auth.rs b/src/auth.rs\n-old\n+new"),
+            &[],
+            &file_contexts,
+        );
+
+        // Should contain file context section
+        assert!(prompt.contains("## File Context (around changed lines)"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("fn login()"));
+        assert!(prompt.contains("let timeout = 30"));
+        // Should still contain the diff
+        assert!(prompt.contains("## Diff"));
+        // File context should appear before evaluation request
+        let ctx_pos = prompt.find("## File Context").unwrap();
+        let eval_pos = prompt.find("## Evaluation Request").unwrap();
+        assert!(ctx_pos < eval_pos);
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_empty_file_context() {
+        let pr = test_pr();
+        let prompt = build_evaluation_prompt_with_context(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff content"),
+            &[],
+            &[], // no file contexts
+        );
+
+        // Should NOT contain file context section when empty
+        assert!(!prompt.contains("## File Context"));
     }
 }

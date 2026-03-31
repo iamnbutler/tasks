@@ -6,9 +6,10 @@
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::diff::{extract_context_window, parse_diff_files};
 use crate::error::OrchestratorError;
 use crate::orchestrator::Orchestrator;
-use crate::prompt::{build_evaluation_prompt, build_deep_review_prompt, parse_pr_url, system_prompt};
+use crate::prompt::{build_evaluation_prompt_with_context, build_deep_review_prompt, parse_pr_url, system_prompt, FileContext};
 use crate::types::{
     default_triage, ConflictContext, ConflictTriage, EvaluationContext, OrchestratorAction,
     QualityEvaluation, QuestionContext, SystemContext,
@@ -214,15 +215,66 @@ impl Orchestrator for ClaudeOrchestrator {
             _ => None,
         };
 
-        // --- Pass 1: Triage with diff ---
+        // --- Proactive context fetching ---
+        // Parse the diff to find the most-changed files and fetch context
+        // windows around their changed lines. This gives the reviewer
+        // surrounding code context without needing a pass-2 deep review.
+        let mut file_contexts: Vec<FileContext> = Vec::new();
+        if let Some(ref diff_text) = diff {
+            let changed_files = parse_diff_files(diff_text);
+            // Fetch up to 3 most-changed files
+            for diff_file in changed_files.iter().take(3) {
+                match self
+                    .github
+                    .get_file_content_at_ref(&owner, &repo, &diff_file.path, &pr.head_ref)
+                    .await
+                {
+                    Ok(Some(content)) => {
+                        let windowed = extract_context_window(
+                            &content,
+                            &diff_file.changed_lines,
+                            50,   // ±50 lines around each change
+                            1000, // max 1000 lines per file
+                        );
+                        if !windowed.is_empty() {
+                            info!(
+                                path = %diff_file.path,
+                                changed_lines = diff_file.changed_lines.len(),
+                                context_lines = windowed.lines().count(),
+                                "Fetched proactive file context"
+                            );
+                            file_contexts.push(FileContext {
+                                path: diff_file.path.clone(),
+                                content: windowed,
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        info!(path = %diff_file.path, "File not found on PR branch (may be deleted)");
+                    }
+                    Err(e) => {
+                        warn!(path = %diff_file.path, error = %e, "Failed to fetch file context, skipping");
+                    }
+                }
+            }
+            if !file_contexts.is_empty() {
+                info!(
+                    file_count = file_contexts.len(),
+                    "Proactive context fetched for evaluation"
+                );
+            }
+        }
+
+        // --- Pass 1: Triage with diff + proactive file context ---
         let system = system_prompt();
-        let user_prompt = build_evaluation_prompt(
+        let user_prompt = build_evaluation_prompt_with_context(
             &pr,
             issue.as_ref(),
             &context.task.title,
             context.task.description.as_deref(),
             diff.as_deref(),
             &context.queue_context,
+            &file_contexts,
         );
 
         let config = CompletionConfig::new(&self.model).with_max_tokens(self.max_tokens);
