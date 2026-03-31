@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
+use tower_governor::{
+    GovernorLayer,
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+};
 
 use tasks_agent::CompletionsService;
 use events::Actor;
@@ -101,6 +106,29 @@ pub fn router(state: ApiState) -> Router {
         .route("/automations/{id}/runs/{run_id}/events", get(list_automation_run_events))
         .route("/automations/{id}/runs/{run_id}/cancel", post(cancel_automation_run))
         .route("/automations/{id}/run", post(trigger_automation));
+
+    // Rate limiting: 50 requests per second per IP, bursting up to 150.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(50)
+            .burst_size(150)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("valid governor config"),
+    );
+    let governor_limiter = governor_conf.limiter().clone();
+    let governor_layer = GovernorLayer::new(governor_conf);
+
+    // Background task to clean up rate-limiter state for expired IPs.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            governor_limiter.retain_recent();
+        }
+    });
+
+    // Apply rate limiting only to API routes, not static files
+    let api = api.layer(governor_layer);
 
     Router::new()
         .nest("/api", api)

@@ -32,3 +32,4 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 uuid.workspace = true
 sysinfo.workspace = true
 croner = "2"
+tower_governor = "0.8"
