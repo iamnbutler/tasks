@@ -82,13 +82,183 @@ export interface MergeQueueEntry {
 
 export type Actor = "human" | "orchestrator" | "scheduler" | "agent" | "system";
 
-export interface Event {
+// ---------------------------------------------------------------------------
+// Typed event payloads
+// ---------------------------------------------------------------------------
+
+/** orchestrator:decision */
+export interface OrchestratorDecisionData {
+  entry_id?: string;
+  approved: boolean;
+  reasoning?: string;
+  task_id?: string;
+}
+
+/** orchestrator:feedback */
+export interface OrchestratorFeedbackData {
+  feedback?: string;
+  context?: string;
+  task_id?: string;
+  // Conflict-resolution variant
+  action?: string;
+  entry_id?: string;
+  pr_url?: string;
+  success?: boolean;
+}
+
+/** orchestrator:escalation */
+export interface OrchestratorEscalationData {
+  action?: string;
+  reasoning?: string;
+  reason?: string;
+  message?: string;
+  entry_id?: string;
+  pr_url?: string;
+  from?: string;
+  to?: string;
+  details?: Record<string, unknown>;
+}
+
+/** orchestrator:message / orchestrator:response / orchestrator:thought */
+export interface OrchestratorMessageData {
+  message?: string;
+  error?: boolean;
+}
+
+/** human:message */
+export interface HumanMessageData {
+  message?: string;
+  source?: string;
+}
+
+/** agent:message */
+export interface AgentMessageData {
+  text?: string;
+  stream?: string;
+  completion_hint?: boolean;
+  source?: string;
+}
+
+/** agent:error */
+export interface AgentErrorData {
+  text?: string;
+  source?: string;
+}
+
+/** agent:question */
+export interface AgentQuestionData {
+  question?: string;
+  message?: string;
+  text?: string;
+  source?: string;
+}
+
+/** automation:run:output */
+export interface AutomationRunOutputData {
+  automation_id?: string;
+  chunk?: string;
+}
+
+/** Content block inside a parsed agent message (JSON in agent:message text) */
+export interface AgentContentBlockText {
+  type: "text";
+  text: string;
+}
+
+export interface AgentToolInput {
+  file_path?: string;
+  filePath?: string;
+  path?: string;
+  pattern?: string;
+  command?: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface AgentContentBlockToolUse {
+  type: "tool_use";
+  name?: string;
+  input?: AgentToolInput;
+}
+
+export interface AgentContentBlockToolResult {
+  type: "tool_result";
+  content?: string;
+}
+
+export interface AgentContentBlockThinking {
+  type: "thinking";
+}
+
+export type AgentContentBlock =
+  | AgentContentBlockText
+  | AgentContentBlockToolUse
+  | AgentContentBlockToolResult
+  | AgentContentBlockThinking;
+
+/** Parsed JSON message from agent stdout (the text field parsed as JSON) */
+export interface AgentParsedMessage {
+  type?: string;
+  result?: { text?: string };
+  message?: { content?: AgentContentBlock[] };
+  content?: AgentContentBlock[];
+}
+
+// ---------------------------------------------------------------------------
+// Event type map — maps event.type string to its data shape
+// ---------------------------------------------------------------------------
+
+export interface EventDataMap {
+  "orchestrator:decision": OrchestratorDecisionData;
+  "orchestrator:feedback": OrchestratorFeedbackData;
+  "orchestrator:escalation": OrchestratorEscalationData;
+  "orchestrator:message": OrchestratorMessageData;
+  "orchestrator:response": OrchestratorMessageData;
+  "orchestrator:thought": OrchestratorMessageData;
+  "human:message": HumanMessageData;
+  "agent:message": AgentMessageData;
+  "agent:error": AgentErrorData;
+  "agent:question": AgentQuestionData;
+  "automation:run:output": AutomationRunOutputData;
+}
+
+export type KnownEventType = keyof EventDataMap;
+
+// ---------------------------------------------------------------------------
+// Event — discriminated by `type`
+// ---------------------------------------------------------------------------
+
+interface EventBase {
   id: string;
-  type: string;
   task: string;
   actor: Actor;
   ts: string;
+}
+
+/** A typed event whose `type` is one of the known event types. */
+export type TypedEvent<T extends KnownEventType = KnownEventType> = EventBase & {
+  type: T;
+  data: EventDataMap[T];
+};
+
+/** An event with an unrecognized type (e.g. task:state:*, future additions). */
+export interface UntypedEvent extends EventBase {
+  type: string;
   data: Record<string, unknown>;
+}
+
+/** Union of all events. Consumer code can narrow via `isEventType()`. */
+export type Event = UntypedEvent;
+
+/**
+ * Type guard to narrow an Event to a specific known type with typed data.
+ * Returns the event with its `data` field typed according to the EventDataMap.
+ */
+export function isEventType<T extends KnownEventType>(
+  event: Event,
+  type: T,
+): event is Event & { type: T; data: EventDataMap[T] } {
+  return event.type === type;
 }
 
 export interface SlotUtilization {
