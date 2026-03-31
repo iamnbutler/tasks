@@ -1300,6 +1300,10 @@ impl Server {
                     // Only mark as conflict if entry is Pending — don't override
                     // Approved/Merging status, as that would reset the entry to
                     // Pending after clear_conflict and cause duplicate evaluations.
+                    let mergeable_unknown = matches!(
+                        pr.mergeable,
+                        Some(tasks_github::model::MergeableState::Unknown) | None
+                    );
                     let conflict_action = match pr.mergeable {
                         Some(tasks_github::model::MergeableState::Conflicting)
                             if *current_status == MergeStatus::Pending =>
@@ -1313,7 +1317,7 @@ impl Server {
                         }
                         _ => None,
                     };
-                    (conflict_action, Some(sha_update_id))
+                    (conflict_action, Some((sha_update_id, mergeable_unknown)))
                 }
             };
             actions.push((action, entry_id_for_sha_update, pr.head_sha.clone()));
@@ -1382,9 +1386,30 @@ impl Server {
                 }
             }
 
-            // Update head_sha for open PRs to detect new commits
-            if let Some(entry_id) = entry_id_for_sha_update {
+            // Update head_sha and mergeable_unknown for open PRs
+            if let Some((entry_id, mergeable_unknown)) = entry_id_for_sha_update {
                 let mut state = self.state.write().await;
+
+                // Update mergeable_unknown flag (issue #503)
+                if let Some(entry) = state.merge_queue.get_mut(&entry_id) {
+                    if entry.mergeable_unknown != mergeable_unknown {
+                        if mergeable_unknown {
+                            tracing::debug!(
+                                entry_id = %entry_id,
+                                "reconciliation: GitHub mergeable status is Unknown, deferring evaluation"
+                            );
+                        } else {
+                            tracing::debug!(
+                                entry_id = %entry_id,
+                                "reconciliation: GitHub mergeable status resolved"
+                            );
+                        }
+                        entry.mergeable_unknown = mergeable_unknown;
+                        changes += 1;
+                    }
+                }
+
+                // Update head_sha to detect new commits
                 match state.merge_queue.update_head_sha(&entry_id, &head_sha) {
                     Ok(true) => {
                         tracing::info!(
