@@ -3,6 +3,7 @@
 //! A session maintains conversation history and state across multiple prompt turns.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 use crate::error::AgentError;
 use crate::message::{Content, Message, Role, Response, Tool, ToolCall, ToolResult, Usage};
 use crate::provider::{CompletionConfig, CompletionRequest, Provider};
+use crate::tool_result_budget;
 
 /// Unique session identifier.
 pub type SessionId = String;
@@ -38,6 +40,10 @@ pub struct Session {
     pub total_usage: Usage,
     pub metadata: HashMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    /// Directory for persisting large tool outputs. When set, tool results
+    /// exceeding their `max_result_size` are written to disk and replaced
+    /// with a preview + file path.
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Session {
@@ -54,6 +60,7 @@ impl Session {
             total_usage: Usage::default(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
+            output_dir: None,
         }
     }
 
@@ -243,12 +250,31 @@ impl Session {
         }
     }
 
+    /// Set the output directory for persisting large tool results.
+    pub fn set_output_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.output_dir = Some(dir.into());
+    }
+
     /// Apply tool results and prepare for the next turn.
     ///
     /// Stores results in `pending_tool_results` so that `build_request()`
     /// emits them as proper `Content::ToolResult` blocks (required by the
     /// Anthropic API), rather than plain text.
+    ///
+    /// When `output_dir` is set, large tool results are persisted to disk
+    /// and replaced with a preview + file path, based on each tool's
+    /// `max_result_size` setting.
     pub fn apply_tool_results(&mut self, results: Vec<ToolResult>) {
+        let results = if let Some(ref output_dir) = self.output_dir {
+            tool_result_budget::budget_tool_results(
+                results,
+                &self.pending_tool_calls,
+                &self.tools,
+                output_dir,
+            )
+        } else {
+            results
+        };
         self.pending_tool_results = results;
         self.pending_tool_calls.clear();
         self.state = SessionState::Ready;

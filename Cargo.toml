@@ -28,3 +28,4 @@ gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
 gpuikit = { path = "../gpuikit" }
 smol = "2.0"
+tempfile = "3.10"

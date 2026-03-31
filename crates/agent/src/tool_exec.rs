@@ -112,6 +112,7 @@ mod tests {
             description: String::new(),
             parameters: serde_json::json!({}),
             is_concurrency_safe: concurrent,
+            max_result_size: Some(crate::message::DEFAULT_MAX_RESULT_SIZE),
         }
     }
 
