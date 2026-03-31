@@ -1967,6 +1967,19 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                 let state = orch_server.state.read().await;
                 match state.merge_queue.get(&entry_id) {
                     Some(e) if e.status == server::model::merge_queue::MergeStatus::Pending => {
+                        // Defer evaluation when GitHub's mergeable is Unknown (issue #503).
+                        // The next poll cycle will re-check and clear the flag once resolved.
+                        if e.mergeable_unknown {
+                            tracing::debug!(
+                                entry_id = %entry_id,
+                                "deferring evaluation: GitHub mergeable=Unknown, will retry next cycle"
+                            );
+                            // Re-queue so it gets picked up on the next tick
+                            if eval_queued.insert(entry_id.clone()) {
+                                eval_queue.push_back(entry_id.clone());
+                            }
+                            continue;
+                        }
                         (e.task_id.clone(), e.pr_url.clone())
                     }
                     _ => continue, // Entry gone or no longer pending
