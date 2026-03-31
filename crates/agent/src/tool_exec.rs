@@ -8,6 +8,7 @@ use std::future::Future;
 
 use futures::future::join_all;
 
+use crate::hooks::{HookRegistry, PostHookAction, PreHookAction, ToolUseContext};
 use crate::message::{Tool, ToolCall, ToolResult};
 
 /// Maximum number of concurrency-safe tools to run in parallel.
@@ -97,6 +98,97 @@ where
     }
 
     results
+}
+
+/// Execute tool calls with hook support.
+///
+/// Like [`execute_tool_calls`], but runs pre/post hooks around each tool
+/// invocation. Pre-hooks can block or modify input; post-hooks can modify
+/// output or add context.
+///
+/// Returns `(results, additional_contexts, should_stop)`:
+/// - `results`: Tool results in the same order as input calls.
+/// - `additional_contexts`: Any extra context strings from post-hooks.
+/// - `should_stop`: Whether a post-hook requested stopping the query loop.
+pub async fn execute_tool_calls_with_hooks<F, Fut>(
+    tool_calls: Vec<ToolCall>,
+    tools: &[Tool],
+    hooks: &HookRegistry,
+    context: &ToolUseContext,
+    executor: F,
+) -> (Vec<ToolResult>, Vec<String>, bool)
+where
+    F: Fn(ToolCall) -> Fut + Send + Sync,
+    Fut: Future<Output = ToolResult> + Send,
+{
+    if hooks.is_empty() {
+        let results = execute_tool_calls(tool_calls, tools, executor).await;
+        return (results, Vec::new(), false);
+    }
+
+    // With hooks, we execute tools one at a time to properly apply hooks.
+    // This is the same approach Claude Code takes — hooks are inherently serial.
+    let mut results = Vec::with_capacity(tool_calls.len());
+    let mut additional_contexts = Vec::new();
+    let mut should_stop = false;
+
+    for tc in tool_calls {
+        // Run pre-hooks
+        match hooks.run_pre_hooks(&tc, context) {
+            PreHookAction::Block(reason) => {
+                results.push(ToolResult::error(&tc.id, reason));
+                continue;
+            }
+            PreHookAction::Continue(modified_input) => {
+                // Execute tool with (possibly modified) input
+                let call_to_execute = ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: modified_input,
+                };
+
+                let result = executor(call_to_execute).await;
+
+                // Run post-hooks (success or failure)
+                if result.is_error {
+                    match hooks.run_failure_hooks(&tc, &result.content, context) {
+                        crate::hooks::FailureHookAction::Continue => {
+                            results.push(result);
+                        }
+                        crate::hooks::FailureHookAction::ReplaceError(new_error) => {
+                            results.push(ToolResult::error(&tc.id, new_error));
+                        }
+                        crate::hooks::FailureHookAction::Retry(retry_input) => {
+                            // Single retry with modified input
+                            let retry_call = ToolCall {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                arguments: retry_input,
+                            };
+                            let retry_result = executor(retry_call).await;
+                            results.push(retry_result);
+                        }
+                    }
+                } else {
+                    match hooks.run_post_hooks(&tc, &result.content, context) {
+                        PostHookAction::Continue(output) => {
+                            results.push(ToolResult::success(&tc.id, output));
+                        }
+                        PostHookAction::AddContext { output, context: ctx } => {
+                            results.push(ToolResult::success(&tc.id, output));
+                            additional_contexts.push(ctx);
+                        }
+                        PostHookAction::StopLoop(output) => {
+                            results.push(ToolResult::success(&tc.id, output));
+                            should_stop = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (results, additional_contexts, should_stop)
 }
 
 #[cfg(test)]
