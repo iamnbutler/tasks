@@ -6,8 +6,140 @@
 //! - Conflicts: Are there merge conflicts?
 //! - Conventions: Does the change meet project standards?
 
+use std::collections::HashSet;
+
 use crate::types::QueueEntrySummary;
 use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
+
+/// A file changed in a diff, with the line numbers that were modified.
+#[derive(Debug, Clone)]
+pub struct DiffFile {
+    /// File path (post-image, i.e. the "b/" side).
+    pub path: String,
+    /// Line numbers that were added or modified in the new version.
+    pub changed_lines: Vec<usize>,
+}
+
+/// Parse a unified diff to extract changed files and their modified line numbers.
+///
+/// Returns files sorted by number of changed lines (most changes first).
+pub fn parse_diff_files(diff: &str) -> Vec<DiffFile> {
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_lines: Vec<usize> = Vec::new();
+    // Current line number in the new file (post-image)
+    let mut new_line: usize = 0;
+
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            // Flush previous file
+            if let Some(prev_path) = current_path.take() {
+                if !current_lines.is_empty() {
+                    files.push(DiffFile {
+                        path: prev_path,
+                        changed_lines: std::mem::take(&mut current_lines),
+                    });
+                }
+            }
+            current_path = Some(path.to_string());
+        } else if line.starts_with("+++ /dev/null") {
+            // File was deleted — skip
+            if let Some(prev_path) = current_path.take() {
+                if !current_lines.is_empty() {
+                    files.push(DiffFile {
+                        path: prev_path,
+                        changed_lines: std::mem::take(&mut current_lines),
+                    });
+                }
+            }
+            current_path = None;
+        } else if line.starts_with("@@ ") {
+            // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+            if let Some(new_start) = parse_hunk_new_start(line) {
+                new_line = new_start;
+            }
+        } else if current_path.is_some() && !line.starts_with("diff ") && !line.starts_with("--- ") && !line.starts_with("index ") {
+            if line.starts_with('+') {
+                // Added line
+                current_lines.push(new_line);
+                new_line += 1;
+            } else if line.starts_with('-') {
+                // Removed line — don't advance new_line
+            } else {
+                // Context line
+                new_line += 1;
+            }
+        }
+    }
+
+    // Flush last file
+    if let Some(path) = current_path {
+        if !current_lines.is_empty() {
+            files.push(DiffFile {
+                path,
+                changed_lines: current_lines,
+            });
+        }
+    }
+
+    // Sort by most changed lines first
+    files.sort_by(|a, b| b.changed_lines.len().cmp(&a.changed_lines.len()));
+    files
+}
+
+/// Parse the new-file start line from a hunk header.
+fn parse_hunk_new_start(line: &str) -> Option<usize> {
+    // Format: @@ -old_start[,old_count] +new_start[,new_count] @@
+    let plus_idx = line.find('+')?;
+    let after_plus = &line[plus_idx + 1..];
+    let end = after_plus.find(|c: char| c == ',' || c == ' ')?;
+    after_plus[..end].parse().ok()
+}
+
+/// Build a context window around changed lines in a file.
+///
+/// Returns numbered lines (±`context` lines around each changed line),
+/// with `...` markers where lines are skipped.
+pub fn build_context_window(content: &str, changed_lines: &[usize], context: usize) -> String {
+    if changed_lines.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    // Build set of line numbers to include (1-indexed)
+    let include: HashSet<usize> = changed_lines
+        .iter()
+        .flat_map(|&line| {
+            let start = line.saturating_sub(context).max(1);
+            let end = (line + context).min(total);
+            start..=end
+        })
+        .collect();
+
+    let mut result = String::new();
+    let mut prev_included = false;
+
+    for (idx, line_content) in lines.iter().enumerate() {
+        let line_num = idx + 1; // 1-indexed
+        if include.contains(&line_num) {
+            if !prev_included && line_num > 1 && !result.is_empty() {
+                result.push_str("...\n");
+            }
+            result.push_str(&format!("{}: {}\n", line_num, line_content));
+            prev_included = true;
+        } else {
+            prev_included = false;
+        }
+    }
+
+    if !prev_included && !result.is_empty() {
+        result.push_str("...\n");
+    }
+
+    result
+}
 
 /// Build the system prompt for quality evaluation.
 pub fn system_prompt() -> String {
@@ -18,10 +150,12 @@ You review the ACTUAL CODE DIFF, not just PR metadata. Do not trust the PR descr
 ## Review process
 
 **Pass 1 — Diff triage:**
-Read the diff carefully. Evaluate:
+Read the diff carefully. You may also receive a "File Context" section with surrounding code for the most-changed files — use this to understand how changes integrate with the rest of the codebase.
+
+Evaluate:
 
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
-2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases?
+2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases? Use file context (when available) to check callers, imports, and surrounding logic.
 3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
 4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
 5. **Queue context**: Consider other PRs in the merge queue. If this PR appears to depend on changes from another PR that hasn't merged yet, or if issues you see would be resolved by a PR ahead in the queue, factor that into your decision.
@@ -70,6 +204,10 @@ Response format for Pass 2 is the same, but `needs_deeper_review` must be false.
 }
 
 /// Build the user prompt with PR and issue context.
+///
+/// `file_contexts` provides proactively-fetched context windows for key files
+/// in the diff (path, windowed content). When non-empty, these are included
+/// so the reviewer can see surrounding code, not just isolated hunks.
 pub fn build_evaluation_prompt(
     pr: &PullRequest,
     issue: Option<&Issue>,
@@ -77,6 +215,19 @@ pub fn build_evaluation_prompt(
     task_description: Option<&str>,
     diff: Option<&str>,
     queue_context: &[QueueEntrySummary],
+) -> String {
+    build_evaluation_prompt_with_context(pr, issue, task_title, task_description, diff, queue_context, &[])
+}
+
+/// Build the user prompt with PR and issue context, including proactive file context.
+pub fn build_evaluation_prompt_with_context(
+    pr: &PullRequest,
+    issue: Option<&Issue>,
+    task_title: &str,
+    task_description: Option<&str>,
+    diff: Option<&str>,
+    queue_context: &[QueueEntrySummary],
+    file_contexts: &[(String, String)],
 ) -> String {
     let mut prompt = String::new();
 
@@ -209,8 +360,23 @@ pub fn build_evaluation_prompt(
         prompt.push_str("**No diff available.** Evaluate based on metadata only, and lean toward requesting deeper review.\n\n");
     }
 
+    // Proactive file context — surrounding code for key changed files
+    if !file_contexts.is_empty() {
+        prompt.push_str("## File Context\n\n");
+        prompt.push_str("Surrounding code context for the most-changed files (line numbers shown):\n\n");
+        for (path, content) in file_contexts {
+            prompt.push_str(&format!("### `{}`\n\n", path));
+            prompt.push_str("```\n");
+            prompt.push_str(&truncate_text(content, 5_000));
+            prompt.push_str("\n```\n\n");
+        }
+    }
+
     prompt.push_str("## Evaluation Request\n\n");
     prompt.push_str("Review the diff above against the issue requirements. ");
+    if !file_contexts.is_empty() {
+        prompt.push_str("Use the file context to understand how changes integrate with surrounding code. ");
+    }
     prompt.push_str("Evaluate correctness, completeness, and whether this actually solves the issue. ");
     prompt.push_str("Respond with your evaluation in the JSON format specified in your instructions.");
 
@@ -230,7 +396,7 @@ pub fn build_deep_review_prompt(
     files: &[(String, String)],
     queue_context: &[QueueEntrySummary],
 ) -> String {
-    // Start with the same base prompt
+    // Start with the same base prompt (no file_contexts — deep review has its own files section)
     let mut prompt = build_evaluation_prompt(pr, issue, task_title, task_description, Some(diff), queue_context);
 
     // Add the reviewer's reasoning from pass 1
@@ -585,5 +751,142 @@ mod tests {
         let prompt = system_prompt();
         assert!(prompt.contains("Queue context"));
         assert!(prompt.contains("queue ordering"));
+    }
+
+    #[test]
+    fn test_parse_diff_files_basic() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+index abc123..def456 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,3 +10,4 @@ fn main() {
+     let x = 1;
+     let y = 2;
++    let z = 3;
+     println!("done");
+"#;
+        let files = parse_diff_files(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].changed_lines, vec![12]);
+    }
+
+    #[test]
+    fn test_parse_diff_files_multiple() {
+        let diff = r#"diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,5 @@
+ line1
++added1
++added2
+ line3
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -5,3 +5,4 @@
+ ctx
++new_line
+ ctx
+"#;
+        let files = parse_diff_files(diff);
+        assert_eq!(files.len(), 2);
+        // a.rs has more changes, should be first
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].changed_lines.len(), 2);
+        assert_eq!(files[1].path, "src/b.rs");
+        assert_eq!(files[1].changed_lines.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_diff_files_deleted_file() {
+        let diff = r#"diff --git a/src/old.rs b/src/old.rs
+--- a/src/old.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-line1
+-line2
+-line3
+"#;
+        let files = parse_diff_files(diff);
+        // Deleted files have no added lines
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_build_context_window_basic() {
+        let content = (1..=20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = build_context_window(&content, &[10], 3);
+        // Should include lines 7-13
+        assert!(result.contains("7: line 7"));
+        assert!(result.contains("10: line 10"));
+        assert!(result.contains("13: line 13"));
+        // Should start with line 7 (not line 1)
+        assert!(result.starts_with("7: "), "should start at line 7, got:\n{result}");
+    }
+
+    #[test]
+    fn test_build_context_window_multiple_regions() {
+        let content = (1..=100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = build_context_window(&content, &[10, 90], 3);
+        // Should have two regions with ... separator
+        assert!(result.contains("10: line 10"));
+        assert!(result.contains("90: line 90"));
+        assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn test_build_context_window_empty_lines() {
+        let result = build_context_window("some content", &[], 50);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_with_file_context() {
+        let pr = test_pr();
+        let file_contexts = vec![
+            ("src/auth.rs".to_string(), "10: fn login() {\n11:     // impl\n12: }".to_string()),
+        ];
+        let prompt = build_evaluation_prompt_with_context(
+            &pr,
+            None,
+            "Fix auth bug",
+            None,
+            Some("diff content"),
+            &[],
+            &file_contexts,
+        );
+
+        assert!(prompt.contains("## File Context"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("fn login()"));
+        assert!(prompt.contains("Use the file context"));
+    }
+
+    #[test]
+    fn test_build_evaluation_prompt_without_file_context_unchanged() {
+        let pr = test_pr();
+        let with_context = build_evaluation_prompt_with_context(
+            &pr, None, "Test", None, None, &[], &[],
+        );
+        let without_context = build_evaluation_prompt(
+            &pr, None, "Test", None, None, &[],
+        );
+        assert_eq!(with_context, without_context);
+        assert!(!with_context.contains("## File Context"));
+    }
+
+    #[test]
+    fn test_system_prompt_mentions_file_context() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("File Context"));
     }
 }
