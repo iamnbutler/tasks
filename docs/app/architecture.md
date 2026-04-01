@@ -46,7 +46,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 | Crate | Purpose |
 |-------|---------|
 | `github` | GraphQL client, normalized model, polling |
-| `orchestrator` | AI project foreman, quality evaluation |
+| `orchestrator` | AI project foreman, quality evaluation, agent dispatch |
 
 ### UI Crates
 
@@ -68,6 +68,10 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 7. **Human** approves/rejects in merge queue
 8. **Merger** lands approved changes; transient GitHub API failures revert the entry to Approved for automatic retry on the next poll cycle
 
+> If a GitHub issue is closed externally while a task session is active, the session is stopped automatically (5-second graceful shutdown). The task state is updated to terminal in the same reconciliation pass.
+
+> If a PR receives new commits after being approved, its merge queue entry resets from Approved back to Pending so the orchestrator can re-evaluate the updated code.
+
 ### Event System
 
 All state changes are recorded as immutable events:
@@ -79,6 +83,49 @@ Event → EventBus → Subscribers
 ```
 
 Events are stored per-task in `~/.local/state/tasks/events/{task-id}/events.jsonl`.
+
+## Orchestrator <!-- LAST_UPDATED: 2026-04-01 -->
+
+The orchestrator is an AI project foreman that runs a `think()` pass each poll cycle. It evaluates open tasks, reviews completed work, and emits `OrchestratorAction` values (intentions) for the run loop to execute. This keeps orchestrator logic pure — it returns decisions, not side effects.
+
+### Actions
+
+| Action | Description |
+|--------|-------------|
+| `EmitThought` | Append a thought to the narration feed |
+| `UpdateTaskState` | Transition a task to a new state |
+| `PrioritizeTask` | Request priority dispatch for a task |
+| `DispatchAgent` | Spawn a one-off bounded agent session |
+
+### Dispatch Agent
+
+The orchestrator can spawn one-off agent sessions for targeted work — codebase investigation, issue triage, or small fixes identified during review. These sessions are bounded by time (default: 5 minutes) and turn limits.
+
+Dispatched agents report back via events:
+
+| Event | Meaning |
+|-------|---------|
+| `orchestrator:agent:dispatched` | Session spawned |
+| `orchestrator:agent:completed` | Session finished successfully |
+| `orchestrator:agent:failed` | Session failed or timed out |
+
+Results flow back into the orchestrator via `recent_events` on the next `think()` pass.
+
+### Specialized Agent Types <!-- LAST_UPDATED: 2026-04-01 -->
+
+Agents are dispatched with a type that controls their tool access, model, and turn limits. The supervisor enforces these restrictions when starting the agent process.
+
+| Type | Purpose | Tool Access |
+|------|---------|-------------|
+| `implementer` | Full coding sessions | All tools |
+| `reviewer` | Read-only quality checks | No write/exec tools |
+| `explorer` | Codebase research | Read-only tools |
+
+The orchestrator selects the agent type based on the task. For example, code review dispatches a `reviewer` agent; investigating a pattern dispatches an `explorer`.
+
+### Chat History
+
+Orchestrator chat history is restored from the event log on startup, so conversation context persists across server restarts.
 
 ## Session Runtime
 
@@ -146,4 +193,4 @@ Event logs are compacted hourly according to a configurable retention policy. Co
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-04-01 -->*

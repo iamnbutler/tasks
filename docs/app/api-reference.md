@@ -308,9 +308,11 @@ GET /api/merge-queue
 ]
 ```
 
-#### Approve Entry <!-- LAST_UPDATED: 2026-03-27 -->
+#### Approve Entry <!-- LAST_UPDATED: 2026-04-01 -->
 
 In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush. If the GitHub merge fails transiently, the entry reverts to Approved and will be retried automatically on the next poll cycle.
+
+> **Note:** If the agent pushes new commits to the PR after it has been approved, the entry automatically resets from Approved back to Pending so the orchestrator can re-evaluate the updated code.
 
 ```http
 POST /api/merge-queue/:id/approve
@@ -665,6 +667,16 @@ event: task:updated
 data: {"id":"task-uuid","state":"completed"}
 ```
 
+**Common event type prefixes:**
+
+| Prefix | Description |
+|--------|-------------|
+| `task:` | Task state changes |
+| `orchestrator:` | Orchestrator thoughts and actions |
+| `orchestrator:agent:` | Orchestrator-dispatched agent sessions (`dispatched`, `completed`, `failed`) |
+| `session:` | Container session lifecycle |
+| `merge:` | Merge queue events |
+
 #### Query Historical Events
 
 Query past events from the event log by type prefix.
@@ -705,4 +717,4 @@ All errors return JSON with the following structure:
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-03-30 -->*
+*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED: 2026-04-01 -->*
