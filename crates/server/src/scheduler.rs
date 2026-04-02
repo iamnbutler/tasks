@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-use tasks_github::model::{Issue, PullRequest};
+use tasks_github::model::{ClosureReason, Issue, PullRequest};
 use crate::model::task::{Task, TaskSource, TaskState};
 use crate::workflow::LabelConfig;
 
@@ -88,10 +88,7 @@ pub fn issue_to_task(
     project_id: &str,
     label_config: &LabelConfig,
 ) -> Option<Task> {
-    // Skip closed issues.
-    if issue.state != tasks_github::model::IssueState::Open {
-        return None;
-    }
+    let is_closed = issue.state != tasks_github::model::IssueState::Open;
 
     let issue_label_names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
 
@@ -120,6 +117,16 @@ pub fn issue_to_task(
     task.source_created_at = Some(issue.created_at);
     task.source_number = Some(issue.number);
     task.priority = parse_priority_from_labels(&issue_label_names);
+
+    // Import closed issues as terminal tasks so they are tracked as "seen"
+    // even if closed before the first poll or between poll intervals (#502).
+    if is_closed {
+        task.state = match issue.classify_closure() {
+            Some(ClosureReason::NotPlanned) => TaskState::Cancelled,
+            _ => TaskState::Completed,
+        };
+        return Some(task);
+    }
 
     // If any label matches a blocked label, set state to Blocked.
     let is_blocked = label_config.blocked.iter().any(|b| issue_label_names.contains(&b.as_str()));
@@ -534,12 +541,31 @@ mod tests {
     }
 
     #[test]
-    fn closed_issue_not_imported() {
+    fn closed_issue_imported_as_completed() {
         let issue = make_issue(55, vec![make_label("bug")], GhIssueState::Closed);
         let cfg = default_label_config();
 
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("closed issue should be imported");
+        assert_eq!(task.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn closed_issue_not_planned_imported_as_cancelled() {
+        let mut issue = make_issue(55, vec![make_label("bug")], GhIssueState::Closed);
+        issue.state_reason = Some(tasks_github::model::IssueStateReason::NotPlanned);
+        let cfg = default_label_config();
+
+        let task = issue_to_task(&issue, "proj-1", &cfg).expect("closed issue should be imported");
+        assert_eq!(task.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn closed_issue_with_skip_label_not_imported() {
+        let issue = make_issue(55, vec![make_label(super::SKIP_LABEL)], GhIssueState::Closed);
+        let cfg = default_label_config();
+
         let task = issue_to_task(&issue, "proj-1", &cfg);
-        assert!(task.is_none(), "closed issues should be skipped");
+        assert!(task.is_none(), "closed issue with skip label should still be skipped");
     }
 
     #[test]
