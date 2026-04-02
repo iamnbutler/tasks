@@ -510,7 +510,23 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         let container_id = session.container_id().unwrap().to_string();
         tracing::info!(task_id = %task_id, container_id = %container_id, "container ready");
 
-        session.start_agent(&repo_url, &branch, &prompt)?;
+        // Start agent - if this fails, destroy the container to prevent orphans
+        if let Err(e) = session.start_agent(&repo_url, &branch, &prompt) {
+            tracing::error!(
+                task_id = %task_id,
+                container_id = %container_id,
+                error = %e,
+                "failed to start agent, destroying orphaned container"
+            );
+            if let Err(destroy_err) = self.runtime.destroy(&container_id).await {
+                tracing::error!(
+                    container_id = %container_id,
+                    error = %destroy_err,
+                    "failed to destroy orphaned container"
+                );
+            }
+            return Err(e.into());
+        }
         tracing::info!(task_id = %task_id, "agent started");
 
         // Create command channel
