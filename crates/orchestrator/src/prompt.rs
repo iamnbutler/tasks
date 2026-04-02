@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::types::QueueEntrySummary;
-use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
+use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision, StatusCheckRollupState};
 
 /// A file changed in a diff, with the line numbers that were modified.
 #[derive(Debug, Clone)]
@@ -294,6 +294,43 @@ pub fn build_evaluation_prompt_with_context(
         }
         None => {
             prompt.push_str("- **Review Status**: No required reviews\n");
+        }
+    }
+
+    // CI status - critical for merge decision
+    match pr.ci_status {
+        Some(StatusCheckRollupState::Success) => {
+            prompt.push_str("- **CI Status**: ✓ All checks passing\n");
+        }
+        Some(StatusCheckRollupState::Pending) => {
+            prompt.push_str("- **CI Status**: ⏳ Checks still running\n");
+        }
+        Some(StatusCheckRollupState::Failure) => {
+            prompt.push_str("- **CI Status**: ✗ FAILING — DO NOT APPROVE\n");
+            // Include failed check details
+            let failed: Vec<_> = pr
+                .check_runs
+                .iter()
+                .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                .collect();
+            if !failed.is_empty() {
+                prompt.push_str("  - Failed checks:\n");
+                for check in failed.iter().take(5) {
+                    prompt.push_str(&format!("    - {}\n", check.name));
+                }
+                if failed.len() > 5 {
+                    prompt.push_str(&format!("    - ... and {} more\n", failed.len() - 5));
+                }
+            }
+        }
+        Some(StatusCheckRollupState::Error) => {
+            prompt.push_str("- **CI Status**: ⚠ Error — checks could not run\n");
+        }
+        Some(StatusCheckRollupState::Expected) => {
+            prompt.push_str("- **CI Status**: Expected (checks not yet started)\n");
+        }
+        None => {
+            prompt.push_str("- **CI Status**: Unknown (no status checks configured)\n");
         }
     }
 

@@ -906,6 +906,32 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     let retry_client = GitHubClient::new(&retry_token);
                                     for (entry_id, pr_url) in &approved_entries {
                                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+                                            // GATE: Check CI status before merge retry (#690)
+                                            let ci_ok = match retry_client.get_pull_request(&owner, &repo, number).await {
+                                                Ok(pr) => {
+                                                    use tasks_github::model::StatusCheckRollupState;
+                                                    match pr.ci_status {
+                                                        Some(StatusCheckRollupState::Success) => true,
+                                                        Some(StatusCheckRollupState::Pending) => {
+                                                            info!(entry_id = %entry_id, "CI still pending on retry, skipping");
+                                                            false
+                                                        }
+                                                        Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error) => {
+                                                            warn!(entry_id = %entry_id, "CI failing on retry, skipping merge");
+                                                            false
+                                                        }
+                                                        Some(StatusCheckRollupState::Expected) | None => true,
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(entry_id = %entry_id, error = %e, "failed to check CI on retry");
+                                                    false
+                                                }
+                                            };
+                                            if !ci_ok {
+                                                continue;
+                                            }
+
                                             info!(entry_id = %entry_id, pr_url = %pr_url, "retrying merge for approved entry");
                                             if let Err(e) = poll_server.mark_entry_merging(entry_id, pr_url).await {
                                                 error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging for retry");
@@ -2184,6 +2210,55 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     if mode == server::Mode::Play {
                         // Execute the merge on GitHub (Play mode = continuous merge authority)
                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                            // GATE: Check CI status before merging (#690)
+                            // Fetch fresh PR data to get current CI status
+                            let ci_ok = match merge_github.get_pull_request(&owner, &repo, number).await {
+                                Ok(pr) => {
+                                    use tasks_github::model::StatusCheckRollupState;
+                                    match pr.ci_status {
+                                        Some(StatusCheckRollupState::Success) => {
+                                            info!(entry_id = %entry_id, "CI checks passing, proceeding with merge");
+                                            true
+                                        }
+                                        Some(StatusCheckRollupState::Pending) => {
+                                            info!(entry_id = %entry_id, "CI checks still running, deferring merge");
+                                            false
+                                        }
+                                        Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error) => {
+                                            warn!(entry_id = %entry_id, ci_status = ?pr.ci_status, "CI checks failing, cannot merge");
+                                            // Reject the merge entry since CI is failing
+                                            let failed_checks: Vec<_> = pr.check_runs
+                                                .iter()
+                                                .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                                                .map(|c| c.name.as_str())
+                                                .take(5)
+                                                .collect();
+                                            let feedback = format!(
+                                                "CI checks are failing. Failed checks: {}. Fix the failures and push again.",
+                                                if failed_checks.is_empty() { "unknown".to_string() } else { failed_checks.join(", ") }
+                                            );
+                                            if let Err(e) = orch_server.request_changes_merge_entry(&entry_id, "CI checks failing", &feedback).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to request changes for CI failure");
+                                            }
+                                            false
+                                        }
+                                        Some(StatusCheckRollupState::Expected) | None => {
+                                            // No CI configured or checks haven't started - proceed with merge
+                                            info!(entry_id = %entry_id, "No CI checks configured, proceeding with merge");
+                                            true
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(entry_id = %entry_id, error = %e, "failed to fetch PR for CI check, deferring merge");
+                                    false
+                                }
+                            };
+
+                            if !ci_ok {
+                                continue; // Skip merge, will retry on next evaluation cycle
+                            }
+
                             // Transition to Merging before the API call for visibility
                             if let Err(e) = orch_server.mark_entry_merging(&entry_id, &pr_url).await {
                                 error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging");
