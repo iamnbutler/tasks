@@ -308,9 +308,17 @@ GET /api/merge-queue
 ]
 ```
 
-#### Approve Entry <!-- LAST_UPDATED: 2026-03-27 -->
+#### Approve Entry <!-- LAST_UPDATED: 2026-04-02 -->
 
-In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush. If the GitHub merge fails transiently, the entry reverts to Approved and will be retried automatically on the next poll cycle.
+In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
+
+Before executing the merge, CI status is checked:
+- **CI passing** — merge proceeds immediately
+- **CI pending** — merge is deferred; retried automatically on the next poll cycle
+- **CI failing** — entry moves to "request changes" with feedback listing the failed checks
+- **No CI configured** — merge proceeds
+
+If the GitHub merge fails transiently (not CI-related), the entry reverts to Approved and will be retried automatically on the next poll cycle.
 
 ```http
 POST /api/merge-queue/:id/approve
