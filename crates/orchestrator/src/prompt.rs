@@ -157,7 +157,7 @@ Evaluate:
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
 2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases? Use file context (when available) to check callers, imports, and surrounding logic.
 3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
-4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
+4. **Conflicts**: Check mergeable state and review status from the metadata. (CI status is shown for context but is verified separately before merge — focus your review on code quality, not CI.)
 5. **Queue context**: Consider other PRs in the merge queue. If this PR appears to depend on changes from another PR that hasn't merged yet, or if issues you see would be resolved by a PR ahead in the queue, factor that into your decision.
 
 After reading the diff, decide:
@@ -297,17 +297,18 @@ pub fn build_evaluation_prompt_with_context(
         }
     }
 
-    // CI status - critical for merge decision
+    // CI status - informational only, CI failures are handled separately by the merge gate
+    // Focus your evaluation on code quality; CI is checked before merge execution
     match pr.ci_status {
         Some(StatusCheckRollupState::Success) => {
             prompt.push_str("- **CI Status**: ✓ All checks passing\n");
         }
         Some(StatusCheckRollupState::Pending) => {
-            prompt.push_str("- **CI Status**: ⏳ Checks still running\n");
+            prompt.push_str("- **CI Status**: ⏳ Checks still running (will be verified before merge)\n");
         }
         Some(StatusCheckRollupState::Failure) => {
-            prompt.push_str("- **CI Status**: ✗ FAILING — DO NOT APPROVE\n");
-            // Include failed check details
+            prompt.push_str("- **CI Status**: ✗ Failing (agent will be re-dispatched to fix)\n");
+            // Include failed check details for context
             let failed: Vec<_> = pr
                 .check_runs
                 .iter()
@@ -618,7 +619,7 @@ mod tests {
         assert!(prompt.contains("Issue alignment"));
         assert!(prompt.contains("Correctness"));
         assert!(prompt.contains("Completeness"));
-        assert!(prompt.contains("Conflicts/CI"));
+        assert!(prompt.contains("Conflicts"));
         assert!(prompt.contains("JSON"));
     }
 

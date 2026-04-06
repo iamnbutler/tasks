@@ -2188,6 +2188,54 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     evaluated_prs.insert(pr_url.clone(), sha.clone());
                 }
 
+                // GATE: Check CI status before acting on evaluation (#690)
+                // If CI is failing, re-dispatch the agent to fix it regardless of code review outcome
+                let ci_failing = if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                    match merge_github.get_pull_request(&owner, &repo, number).await {
+                        Ok(pr) => {
+                            use tasks_github::model::StatusCheckRollupState;
+                            matches!(pr.ci_status, Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error))
+                        }
+                        Err(e) => {
+                            warn!(entry_id = %entry_id, error = %e, "failed to fetch PR for CI check");
+                            false // Assume CI is OK if we can't check
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if ci_failing {
+                    // CI is failing — re-dispatch agent to fix, don't reject or approve
+                    info!(entry_id = %entry_id, "CI failing, requesting changes to fix");
+
+                    // Get failed check names for feedback
+                    let feedback = if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                        match merge_github.get_pull_request(&owner, &repo, number).await {
+                            Ok(pr) => {
+                                let failed: Vec<_> = pr.check_runs
+                                    .iter()
+                                    .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                                    .map(|c| c.name.as_str())
+                                    .take(5)
+                                    .collect();
+                                format!(
+                                    "CI checks are failing: {}. Please fix the build/test failures and push again.",
+                                    if failed.is_empty() { "unknown checks".to_string() } else { failed.join(", ") }
+                                )
+                            }
+                            Err(_) => "CI checks are failing. Please fix the build/test failures and push again.".to_string()
+                        }
+                    } else {
+                        "CI checks are failing. Please fix the build/test failures and push again.".to_string()
+                    };
+
+                    if let Err(e) = orch_server.request_changes_merge_entry(&entry_id, "CI checks failing", &feedback).await {
+                        error!(entry_id = %entry_id, error = %e, "failed to request changes for CI failure");
+                    }
+                    continue; // Skip normal approval/rejection flow
+                }
+
                 // Act on the decision (issue #337).
                 //
                 // Rejections, conflict handling, and changes-requested execute
