@@ -10,7 +10,7 @@ import {
 import type { ReactNode } from "react";
 import { createElement } from "react";
 import type { Automation, Event, Snapshot, Task, MergeQueueEntry, UpdateStatus } from "@/lib/types";
-import { fetchAutomations, fetchSnapshot, fetchUpdateStatus, subscribeEvents } from "@/lib/api";
+import { fetchAutomations, fetchEvents, fetchSnapshot, fetchUpdateStatus, subscribeEvents } from "@/lib/api";
 
 const MAX_EVENTS = 200;
 const POLL_INTERVAL_MS = 5_000;
@@ -150,6 +150,27 @@ function useAppStateCore(): AppState {
     }
   }, []);
 
+  // Load historical orchestrator events on startup
+  const orchestratorEventsFetchInFlight = useRef(false);
+  const loadHistoricalOrchestratorEvents = useCallback(async () => {
+    if (orchestratorEventsFetchInFlight.current) return;
+    orchestratorEventsFetchInFlight.current = true;
+    try {
+      const events = await fetchEvents({ type_prefix: "orchestrator:", limit: 500 });
+      // Add all events to seen set to avoid duplicates when live events arrive
+      for (const event of events) {
+        seenOrchestratorIds.current.add(event.id);
+      }
+      // Sort by timestamp ascending (oldest first) for display
+      events.sort((a, b) => a.ts.localeCompare(b.ts));
+      setOrchestratorEvents(events);
+    } catch {
+      // Events query endpoint may not exist yet; ignore errors silently
+    } finally {
+      orchestratorEventsFetchInFlight.current = false;
+    }
+  }, []);
+
   // Compute filtered tasks based on selected project
   const filteredTasks = useMemo(() => {
     const tasks = snapshot?.tasks ?? [];
@@ -181,6 +202,7 @@ function useAppStateCore(): AppState {
     refreshSnapshot();
     refreshUpdateStatus();
     refreshAutomations();
+    loadHistoricalOrchestratorEvents();
 
     const interval = setInterval(() => {
       refreshSnapshot();
@@ -201,7 +223,7 @@ function useAppStateCore(): AppState {
       clearInterval(automationsInterval);
       clearInterval(updateInterval);
     };
-  }, [refreshSnapshot, refreshUpdateStatus, refreshAutomations]);
+  }, [refreshSnapshot, refreshUpdateStatus, refreshAutomations, loadHistoricalOrchestratorEvents]);
 
   // --- SSE subscription with reconnection --------------------------------
   useEffect(() => {

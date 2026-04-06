@@ -24,7 +24,7 @@ use crate::presence::PresenceTracker;
 /// Internal action type for merge queue reconciliation.
 /// Used to decide what to do outside the read lock.
 enum MqAction {
-    MarkMerged { entry_id: String, task_id: String, pr_url: String },
+    MarkMerged { entry_id: String, pr_url: String },
     Remove { entry_id: String, pr_url: String },
     MarkConflict { entry_id: String, pr_url: String },
     ClearConflict { entry_id: String },
@@ -1190,8 +1190,7 @@ impl Server {
             };
 
             let result = crate::scheduler::reconcile_task(task, issue, label_config);
-            // Drop the mutable borrow on `task` so we can immutably borrow the map.
-            drop(task);
+            // Note: the mutable borrow on `task` ends here since `result` doesn't hold it.
 
             // Validate blocked_by: reject self-refs, nonexistent tasks, and cycles.
             if result.updated_fields.contains(&"blocked_by") {
@@ -1278,16 +1277,15 @@ impl Server {
                 pr.owner, pr.repo, pr.number
             );
 
-            let Some((entry_id, task_id, current_status)) = entry_index.get(&pr_url) else {
+            let Some((entry_id, _task_id, current_status)) = entry_index.get(&pr_url) else {
                 continue;
             };
             let entry_id = entry_id.clone();
-            let task_id = task_id.clone();
 
             let (action, entry_id_for_sha_update) = match pr.state {
                 tasks_github::model::PullRequestState::Merged => {
                     if *current_status != MergeStatus::Merged {
-                        (Some(MqAction::MarkMerged { entry_id, task_id, pr_url }), None)
+                        (Some(MqAction::MarkMerged { entry_id, pr_url }), None)
                     } else {
                         continue;
                     }
@@ -1298,10 +1296,13 @@ impl Server {
                 tasks_github::model::PullRequestState::Open => {
                     // For open PRs, always update head_sha to detect new commits
                     let sha_update_id = entry_id.clone();
-                    // Update conflict status from GitHub's mergeable field
+                    // Update conflict status from GitHub's mergeable field.
+                    // Only mark as conflict if entry is Pending — don't override
+                    // Approved/Merging status, as that would reset the entry to
+                    // Pending after clear_conflict and cause duplicate evaluations.
                     let conflict_action = match pr.mergeable {
                         Some(tasks_github::model::MergeableState::Conflicting)
-                            if *current_status != MergeStatus::Conflict =>
+                            if *current_status == MergeStatus::Pending =>
                         {
                             Some(MqAction::MarkConflict { entry_id, pr_url })
                         }
@@ -1323,7 +1324,7 @@ impl Server {
         for (action, entry_id_for_sha_update, head_sha) in actions {
             if let Some(action) = action {
                 match action {
-                    MqAction::MarkMerged { entry_id, pr_url, .. } => {
+                    MqAction::MarkMerged { entry_id, pr_url } => {
                         tracing::info!(
                             entry_id = %entry_id,
                             pr_url = %pr_url,
@@ -3164,10 +3165,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Entry should be rejected
+        // Entry should be removed by cascade (terminal task removes linked entries)
         let state = server.state.read().await;
-        let entry = state.merge_queue.get("mq-1").unwrap();
-        assert_eq!(entry.status, crate::model::merge_queue::MergeStatus::Rejected);
+        assert!(
+            state.merge_queue.get("mq-1").is_none(),
+            "merge queue entry should be removed when task becomes terminal"
+        );
         drop(state);
 
         // Task should be Completed (not Waiting)

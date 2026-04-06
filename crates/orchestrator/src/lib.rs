@@ -23,6 +23,7 @@ pub use mock::MockOrchestrator;
 pub use orchestrator::Orchestrator;
 pub use prompt::parse_pr_url;
 pub use types::{
-    ConflictContext, ConflictResolution, ConflictTriage, EvaluationContext, OperatingMode,
-    OrchestratorAction, QualityEvaluation, QuestionContext, QueueEntrySummary, SystemContext,
+    ConflictContext, ConflictResolution, ConflictTriage, DispatchAgentRequest, EvaluationContext,
+    OperatingMode, OrchestratorAction, QualityEvaluation, QuestionContext, QueueEntrySummary,
+    SystemContext,
 };

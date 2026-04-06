@@ -359,8 +359,41 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             None
         }
     };
-    let chat_history: Arc<tokio::sync::Mutex<Vec<tasks_agent::Message>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    // Initialize chat history - restore from event log if available
+    let chat_history: Arc<tokio::sync::Mutex<Vec<tasks_agent::Message>>> = {
+        let mut history = Vec::new();
+
+        // Try to restore chat history from system event log
+        match server.event_bus.read_task(SYSTEM_TASK_ID).await {
+            Ok(events) => {
+                for event in events {
+                    match event.event_type {
+                        EventType::OrchestratorMessage => {
+                            // Human message
+                            if let Some(msg) = event.data.get("message").and_then(|v| v.as_str()) {
+                                history.push(tasks_agent::Message::user(msg.to_string()));
+                            }
+                        }
+                        EventType::OrchestratorResponse => {
+                            // AI response
+                            if let Some(msg) = event.data.get("message").and_then(|v| v.as_str()) {
+                                history.push(tasks_agent::Message::assistant(msg.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !history.is_empty() {
+                    info!(message_count = history.len(), "restored orchestrator chat history from event log");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to restore orchestrator chat history");
+            }
+        }
+
+        Arc::new(tokio::sync::Mutex::new(history))
+    };
 
     // --- 5c. Create memory watchdog ---
 
@@ -873,6 +906,32 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                                     let retry_client = GitHubClient::new(&retry_token);
                                     for (entry_id, pr_url) in &approved_entries {
                                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(pr_url) {
+                                            // GATE: Check CI status before merge retry (#690)
+                                            let ci_ok = match retry_client.get_pull_request(&owner, &repo, number).await {
+                                                Ok(pr) => {
+                                                    use tasks_github::model::StatusCheckRollupState;
+                                                    match pr.ci_status {
+                                                        Some(StatusCheckRollupState::Success) => true,
+                                                        Some(StatusCheckRollupState::Pending) => {
+                                                            info!(entry_id = %entry_id, "CI still pending on retry, skipping");
+                                                            false
+                                                        }
+                                                        Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error) => {
+                                                            warn!(entry_id = %entry_id, "CI failing on retry, skipping merge");
+                                                            false
+                                                        }
+                                                        Some(StatusCheckRollupState::Expected) | None => true,
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(entry_id = %entry_id, error = %e, "failed to check CI on retry");
+                                                    false
+                                                }
+                                            };
+                                            if !ci_ok {
+                                                continue;
+                                            }
+
                                             info!(entry_id = %entry_id, pr_url = %pr_url, "retrying merge for approved entry");
                                             if let Err(e) = poll_server.mark_entry_merging(entry_id, pr_url).await {
                                                 error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging for retry");
@@ -1493,7 +1552,17 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     }
                 }
                 Err(e) => {
-                    error!(task_id = %task_id, error = %e, "failed to start session");
+                    // Check if error is AlreadyExists — means the session is still running
+                    // from a previous dispatch. This can happen due to container ID mismatch
+                    // between work queue and session manager. Don't call handle_task_failure
+                    // because the original session is still running correctly.
+                    let is_already_exists = e.to_string().contains("session already exists");
+
+                    if is_already_exists {
+                        warn!(task_id = %task_id, "session already exists, skipping duplicate dispatch");
+                    } else {
+                        error!(task_id = %task_id, error = %e, "failed to start session");
+                    }
 
                     // Release the claim
                     let mut queue = dispatch_work_queue.write().await;
@@ -1501,13 +1570,17 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         warn!(work_id = %work_item.id, error = %e2, "failed to release claim");
                     }
 
-                    // Handle failure for backoff — treat as no progress so backoff kicks in.
-                    // This prevents tight retry loops when containers can't start.
-                    if let Err(e2) = dispatch_server
-                        .handle_task_failure(&task_id, false, max_retries, None)
-                        .await
-                    {
-                        warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                    // Only handle as failure if it's NOT an AlreadyExists error.
+                    // For AlreadyExists, the original session is still running correctly.
+                    if !is_already_exists {
+                        // Handle failure for backoff — treat as no progress so backoff kicks in.
+                        // This prevents tight retry loops when containers can't start.
+                        if let Err(e2) = dispatch_server
+                            .handle_task_failure(&task_id, false, max_retries, None)
+                            .await
+                        {
+                            warn!(task_id = %task_id, error = %e2, "failed to handle session start failure");
+                        }
                     }
                 }
             }
@@ -2115,6 +2188,54 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     evaluated_prs.insert(pr_url.clone(), sha.clone());
                 }
 
+                // GATE: Check CI status before acting on evaluation (#690)
+                // If CI is failing, re-dispatch the agent to fix it regardless of code review outcome
+                let ci_failing = if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                    match merge_github.get_pull_request(&owner, &repo, number).await {
+                        Ok(pr) => {
+                            use tasks_github::model::StatusCheckRollupState;
+                            matches!(pr.ci_status, Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error))
+                        }
+                        Err(e) => {
+                            warn!(entry_id = %entry_id, error = %e, "failed to fetch PR for CI check");
+                            false // Assume CI is OK if we can't check
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if ci_failing {
+                    // CI is failing — re-dispatch agent to fix, don't reject or approve
+                    info!(entry_id = %entry_id, "CI failing, requesting changes to fix");
+
+                    // Get failed check names for feedback
+                    let feedback = if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                        match merge_github.get_pull_request(&owner, &repo, number).await {
+                            Ok(pr) => {
+                                let failed: Vec<_> = pr.check_runs
+                                    .iter()
+                                    .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                                    .map(|c| c.name.as_str())
+                                    .take(5)
+                                    .collect();
+                                format!(
+                                    "CI checks are failing: {}. Please fix the build/test failures and push again.",
+                                    if failed.is_empty() { "unknown checks".to_string() } else { failed.join(", ") }
+                                )
+                            }
+                            Err(_) => "CI checks are failing. Please fix the build/test failures and push again.".to_string()
+                        }
+                    } else {
+                        "CI checks are failing. Please fix the build/test failures and push again.".to_string()
+                    };
+
+                    if let Err(e) = orch_server.request_changes_merge_entry(&entry_id, "CI checks failing", &feedback).await {
+                        error!(entry_id = %entry_id, error = %e, "failed to request changes for CI failure");
+                    }
+                    continue; // Skip normal approval/rejection flow
+                }
+
                 // Act on the decision (issue #337).
                 //
                 // Rejections, conflict handling, and changes-requested execute
@@ -2137,6 +2258,55 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     if mode == server::Mode::Play {
                         // Execute the merge on GitHub (Play mode = continuous merge authority)
                         if let Some((owner, repo, number)) = tasks_orchestrator::parse_pr_url(&pr_url) {
+                            // GATE: Check CI status before merging (#690)
+                            // Fetch fresh PR data to get current CI status
+                            let ci_ok = match merge_github.get_pull_request(&owner, &repo, number).await {
+                                Ok(pr) => {
+                                    use tasks_github::model::StatusCheckRollupState;
+                                    match pr.ci_status {
+                                        Some(StatusCheckRollupState::Success) => {
+                                            info!(entry_id = %entry_id, "CI checks passing, proceeding with merge");
+                                            true
+                                        }
+                                        Some(StatusCheckRollupState::Pending) => {
+                                            info!(entry_id = %entry_id, "CI checks still running, deferring merge");
+                                            false
+                                        }
+                                        Some(StatusCheckRollupState::Failure) | Some(StatusCheckRollupState::Error) => {
+                                            warn!(entry_id = %entry_id, ci_status = ?pr.ci_status, "CI checks failing, cannot merge");
+                                            // Reject the merge entry since CI is failing
+                                            let failed_checks: Vec<_> = pr.check_runs
+                                                .iter()
+                                                .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                                                .map(|c| c.name.as_str())
+                                                .take(5)
+                                                .collect();
+                                            let feedback = format!(
+                                                "CI checks are failing. Failed checks: {}. Fix the failures and push again.",
+                                                if failed_checks.is_empty() { "unknown".to_string() } else { failed_checks.join(", ") }
+                                            );
+                                            if let Err(e) = orch_server.request_changes_merge_entry(&entry_id, "CI checks failing", &feedback).await {
+                                                error!(entry_id = %entry_id, error = %e, "failed to request changes for CI failure");
+                                            }
+                                            false
+                                        }
+                                        Some(StatusCheckRollupState::Expected) | None => {
+                                            // No CI configured or checks haven't started - proceed with merge
+                                            info!(entry_id = %entry_id, "No CI checks configured, proceeding with merge");
+                                            true
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(entry_id = %entry_id, error = %e, "failed to fetch PR for CI check, deferring merge");
+                                    false
+                                }
+                            };
+
+                            if !ci_ok {
+                                continue; // Skip merge, will retry on next evaluation cycle
+                            }
+
                             // Transition to Merging before the API call for visibility
                             if let Err(e) = orch_server.mark_entry_merging(&entry_id, &pr_url).await {
                                 error!(entry_id = %entry_id, error = %e, "failed to mark entry as merging");
@@ -2552,10 +2722,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
             let mut queue = health_work_queue.write().await;
 
-            // Use sync version that won't block if lock is held
+            // Use sync version that won't block if lock is held.
+            // Check by task_id (source_id), not container_id, because the work queue's
+            // container_id doesn't match the runtime's actual container_id.
             let session_mgr = health_session_mgr.clone();
-            let is_alive = |container_id: &str| -> bool {
-                session_mgr.has_container_sync(container_id)
+            let is_alive = |task_id: &str| -> bool {
+                session_mgr.has_session_sync(task_id)
             };
 
             match queue.health_check(is_alive) {
@@ -2746,6 +2918,7 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
 
     let think_server = server.clone();
     let think_event_bus = server.event_bus.clone();
+    let think_session_mgr = session_manager.clone();
     let mut think_shutdown_rx = shutdown_tx.subscribe();
 
     let think_handle = tokio::spawn(async move {
@@ -2841,6 +3014,88 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                             }
                             OrchestratorAction::PrioritizeTask { task_id, reason } => {
                                 info!(task_id = %task_id, reason = %reason, "orchestrator requested task prioritization (not yet implemented)");
+                            }
+                            OrchestratorAction::DispatchAgent(request) => {
+                                info!(
+                                    dispatch_id = %request.id,
+                                    agent_type = %request.agent_type,
+                                    repo = %request.repo,
+                                    reason = %request.reason,
+                                    "orchestrator dispatching one-off agent session"
+                                );
+
+                                // Emit dispatched event
+                                let dispatched_event = Event::new(
+                                    EventType::OrchestratorAgentDispatched,
+                                    SYSTEM_TASK_ID,
+                                    Actor::Orchestrator,
+                                    serde_json::json!({
+                                        "dispatch_id": request.id,
+                                        "agent_type": request.agent_type,
+                                        "repo": request.repo,
+                                        "reason": request.reason,
+                                        "prompt_preview": &request.prompt[..request.prompt.len().min(200)],
+                                    }),
+                                );
+                                if let Err(e) = think_server.event_bus.publish(dispatched_event).await {
+                                    error!(error = %e, "failed to publish orchestrator agent dispatched event");
+                                }
+
+                                // Spawn the agent session asynchronously
+                                let dispatch_id = request.id.clone();
+                                let repo_url = format!("https://github.com/{}.git", request.repo);
+                                let branch = request.branch.unwrap_or_else(|| "main".to_string());
+                                let timeout_secs = request.timeout_seconds.unwrap_or(300);
+
+                                let mgr = think_session_mgr.clone();
+                                let bus = think_server.event_bus.clone();
+
+                                // Use dispatch_id as the "task_id" for session tracking
+                                let session_task_id = format!("orchestrator-agent-{}", dispatch_id);
+
+                                tokio::spawn(async move {
+                                    let time_limits = tasks_session::SessionLimits {
+                                        soft_limit: Some(Duration::from_secs(timeout_secs)),
+                                        hard_limit: Some(Duration::from_secs(timeout_secs + 60)),
+                                    };
+
+                                    match mgr.start_session_with_limits(
+                                        session_task_id.clone(),
+                                        repo_url,
+                                        branch,
+                                        request.prompt,
+                                        None,
+                                        Some(Duration::from_secs(30)), // short progress threshold
+                                        time_limits,
+                                    ).await {
+                                        Ok(_) => {
+                                            info!(
+                                                dispatch_id = %dispatch_id,
+                                                session_task_id = %session_task_id,
+                                                "orchestrator agent session started"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                dispatch_id = %dispatch_id,
+                                                error = %e,
+                                                "failed to start orchestrator agent session"
+                                            );
+                                            let failed_event = Event::new(
+                                                EventType::OrchestratorAgentFailed,
+                                                SYSTEM_TASK_ID,
+                                                Actor::Orchestrator,
+                                                serde_json::json!({
+                                                    "dispatch_id": dispatch_id,
+                                                    "error": e.to_string(),
+                                                }),
+                                            );
+                                            if let Err(e) = bus.publish(failed_event).await {
+                                                error!(error = %e, "failed to publish agent failed event");
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
                     }

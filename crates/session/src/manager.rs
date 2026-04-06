@@ -159,10 +159,26 @@ impl<R: ContainerRuntime + Send + Sync + 'static> SessionManager<R> {
         self.sessions.read().await.contains_key(task_id)
     }
 
+    /// Check if a session exists by task_id (sync version for health checks).
+    ///
+    /// Uses `try_read()` to avoid blocking. If the lock cannot be acquired,
+    /// returns `true` to be conservative (assume session exists).
+    pub fn has_session_sync(&self, task_id: &str) -> bool {
+        if let Ok(sessions) = self.sessions.try_read() {
+            sessions.contains_key(task_id)
+        } else {
+            // If we can't get the lock, assume session exists to be safe
+            true
+        }
+    }
+
     /// Check if a session exists by container_id (sync version for health checks).
     ///
     /// Uses `try_read()` to avoid blocking. If the lock cannot be acquired,
     /// returns `true` to be conservative (assume container exists).
+    ///
+    /// DEPRECATED: Use `has_session_sync` instead. This method has a bug where
+    /// the work queue's container_id doesn't match the runtime's actual container_id.
     pub fn has_container_sync(&self, container_id: &str) -> bool {
         if let Ok(sessions) = self.sessions.try_read() {
             sessions.values().any(|h| h.container_id == container_id)
@@ -494,7 +510,23 @@ impl<R: ContainerRuntime + Clone + Send + Sync + 'static> SessionManager<R> {
         let container_id = session.container_id().unwrap().to_string();
         tracing::info!(task_id = %task_id, container_id = %container_id, "container ready");
 
-        session.start_agent(&repo_url, &branch, &prompt)?;
+        // Start agent - if this fails, destroy the container to prevent orphans
+        if let Err(e) = session.start_agent(&repo_url, &branch, &prompt) {
+            tracing::error!(
+                task_id = %task_id,
+                container_id = %container_id,
+                error = %e,
+                "failed to start agent, destroying orphaned container"
+            );
+            if let Err(destroy_err) = self.runtime.destroy(&container_id).await {
+                tracing::error!(
+                    container_id = %container_id,
+                    error = %destroy_err,
+                    "failed to destroy orphaned container"
+                );
+            }
+            return Err(e.into());
+        }
         tracing::info!(task_id = %task_id, "agent started");
 
         // Create command channel
