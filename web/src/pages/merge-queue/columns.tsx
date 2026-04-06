@@ -1,10 +1,10 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import { Link } from "react-router-dom";
-import { ExternalLink, Check, X } from "lucide-react";
+import { ExternalLink, Check, X, MessageSquare } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatRelativeTime, projectLabel } from "@/lib/utils";
-import { approveMerge, rejectMerge } from "@/lib/api";
+import { approveMerge, rejectMerge, requestChanges } from "@/lib/api";
 import type { MergeQueueEntry, MergeStatus, Project, Task } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -280,6 +280,13 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
         refresh?.();
       }
 
+      async function handleRequestChanges() {
+        const feedback = window.prompt("Describe the changes needed:");
+        if (!feedback?.trim()) return;
+        await requestChanges(entry.id, feedback.trim(), feedback.trim());
+        refresh?.();
+      }
+
       return (
         <div className="inline-flex items-center rounded-md border border-border">
           <Button
@@ -290,6 +297,15 @@ export const columns: ColumnDef<MergeQueueEntry>[] = [
           >
             <Check className="h-3.5 w-3.5" />
             Approve
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 rounded-none border-r border-border"
+            onClick={handleRequestChanges}
+          >
+            <MessageSquare className="h-3.5 w-3.5" />
+            Request Changes
           </Button>
           <Button
             variant="ghost"
