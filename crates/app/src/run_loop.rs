@@ -1625,6 +1625,11 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
         evaluated_prs: &std::collections::HashMap<String, String>,
         entry: &server::model::merge_queue::MergeQueueEntry,
     ) -> bool {
+        // Skip entries where GitHub hasn't resolved mergeability yet (issue #503).
+        // They'll be re-evaluated once reconcile_merge_queue clears the flag.
+        if entry.mergeable_unknown {
+            return false;
+        }
         match evaluated_prs.get(&entry.pr_url) {
             None => true,
             Some(last_sha) => entry.head_sha.as_ref().is_some_and(|sha| sha != last_sha),
@@ -1705,6 +1710,10 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         // Seed the queue with pending entries not yet evaluated
                         let state = orch_server.state.read().await;
                         for entry in state.merge_queue.pending() {
+                            // Skip entries where GitHub hasn't resolved mergeability yet (issue #503)
+                            if entry.mergeable_unknown {
+                                continue;
+                            }
                             // Check if PR needs evaluation: never evaluated or has new commits
                             let needs_eval = match evaluated_prs.get(&entry.pr_url) {
                                 None => true,
@@ -1720,6 +1729,9 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                     EventType::SystemModePause => {
                         let state = orch_server.state.read().await;
                         for entry in state.merge_queue.pending() {
+                            if entry.mergeable_unknown {
+                                continue;
+                            }
                             if !evaluated_prs.contains_key(&entry.pr_url) && eval_queued.insert(entry.id.clone()) {
                                 eval_queue.push_back(entry.id.clone());
                             }

@@ -728,6 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn mergeable_unknown_flag_defaults_to_false() {
+        let e = entry("m1", "t1");
+        assert!(!e.mergeable_unknown);
+    }
+
+    #[test]
+    fn mergeable_unknown_entries_still_appear_in_pending() {
+        // The mergeable_unknown flag is checked at the orchestrator level,
+        // not in the merge queue's pending() filter. This ensures the queue
+        // accurately reports all pending entries while the orchestrator
+        // decides which ones are ready for evaluation.
+        let mut q = MergeQueue::new();
+        let mut e = entry("m1", "t1");
+        e.mergeable_unknown = true;
+        q.enqueue(e);
+        assert_eq!(q.pending().len(), 1);
+    }
+
+    #[test]
     fn entries_with_positions_no_approved() {
         let mut q = MergeQueue::new();
         q.enqueue(entry("m1", "t1"));
