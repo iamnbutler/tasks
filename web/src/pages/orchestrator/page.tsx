@@ -17,6 +17,7 @@ import { cn, formatRelativeTime, projectLabel } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { Event, Task, Project } from "@/lib/types";
+import { isEventType } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Task helpers: resolve task ID → title, number, repo info
@@ -90,80 +91,75 @@ function parseOrchestratorEvents(
 ): OrchestratorBlock[] {
   const blocks: OrchestratorBlock[] = [];
   for (const event of events) {
-    if (event.type === "orchestrator:decision") {
-      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
+    if (isEventType(event, "orchestrator:decision")) {
+      const d = event.data;
+      const taskId = d.task_id ?? event.task;
       blocks.push({
         kind: "decision",
         id: event.id,
         timestamp: event.ts,
-        approved: event.data?.approved === true,
-        reasoning: typeof event.data?.reasoning === "string" ? event.data.reasoning : undefined,
+        approved: d.approved === true,
+        reasoning: d.reasoning,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
+        entryId: d.entry_id,
       });
-    } else if (event.type === "orchestrator:feedback") {
-      const taskId = typeof event.data?.task_id === "string" ? event.data.task_id : event.task;
-      const context = typeof event.data?.context === "string" ? event.data.context : undefined;
+    } else if (isEventType(event, "orchestrator:feedback")) {
+      const d = event.data;
+      const taskId = d.task_id ?? event.task;
       // Distinguish question answers from regular feedback
       blocks.push({
-        kind: context === "question_answer" ? "question_answer" : "feedback",
+        kind: d.context === "question_answer" ? "question_answer" : "feedback",
         id: event.id,
         timestamp: event.ts,
-        feedback: typeof event.data?.feedback === "string" ? event.data.feedback : undefined,
+        feedback: d.feedback,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        content: context,
+        content: d.context,
       });
-    } else if (event.type === "orchestrator:escalation") {
-      const action = typeof event.data?.action === "string" ? event.data.action : undefined;
+    } else if (isEventType(event, "orchestrator:escalation")) {
+      const d = event.data;
       // Extract reasoning - backend sends "reasoning" for conflicts, "reason" for mode changes
-      const reasoning =
-        typeof event.data?.reasoning === "string" ? event.data.reasoning :
-        typeof event.data?.reason === "string" ? event.data.reason :
-        undefined;
+      const reasoning = d.reasoning ?? d.reason;
       const taskId = event.task;
-      // For agent_question escalations, the message field contains the question
-      const message = typeof event.data?.message === "string" ? event.data.message : undefined;
-
       blocks.push({
         kind: "escalation",
         id: event.id,
         timestamp: event.ts,
-        content: action === "agent_question" ? message : reasoning,
+        content: d.action === "agent_question" ? d.message : reasoning,
         taskId,
         taskInfo: getTaskInfo(taskId, tasks, projects) ?? undefined,
-        entryId: typeof event.data?.entry_id === "string" ? event.data.entry_id : undefined,
-        escalationAction: action,
-        prUrl: typeof event.data?.pr_url === "string" ? event.data.pr_url : undefined,
-        fromMode: typeof event.data?.from === "string" ? event.data.from : undefined,
-        toMode: typeof event.data?.to === "string" ? event.data.to : undefined,
+        entryId: d.entry_id,
+        escalationAction: d.action,
+        prUrl: d.pr_url,
+        fromMode: d.from,
+        toMode: d.to,
       });
-    } else if (event.type === "orchestrator:message") {
+    } else if (isEventType(event, "orchestrator:message")) {
       // Human message to orchestrator
       blocks.push({
         kind: "message",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
         actor: "human",
       });
-    } else if (event.type === "orchestrator:response") {
+    } else if (isEventType(event, "orchestrator:response")) {
       // Orchestrator response to human
       blocks.push({
         kind: "message",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
         actor: "orchestrator",
       });
-    } else if (event.type === "orchestrator:thought") {
+    } else if (isEventType(event, "orchestrator:thought")) {
       // Stream-of-consciousness narration from the orchestrator
       blocks.push({
         kind: "thought",
         id: event.id,
         timestamp: event.ts,
-        content: typeof event.data?.message === "string" ? event.data.message : undefined,
+        content: event.data.message,
       });
     }
   }
