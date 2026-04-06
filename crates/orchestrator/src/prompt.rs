@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::types::QueueEntrySummary;
-use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision};
+use tasks_github::model::{Issue, PullRequest, MergeableState, ReviewDecision, StatusCheckRollupState};
 
 /// A file changed in a diff, with the line numbers that were modified.
 #[derive(Debug, Clone)]
@@ -157,7 +157,7 @@ Evaluate:
 1. **Issue alignment**: Does the diff actually address the issue? Not "does the PR description say it does" — do the actual code changes solve the problem?
 2. **Correctness**: Are there obvious bugs, missing error handling, or incomplete changes? For removals: is anything left that depends on the removed code? For additions: does the new code handle edge cases? Use file context (when available) to check callers, imports, and surrounding logic.
 3. **Completeness**: Does the diff cover all aspects of the issue, or are there gaps?
-4. **Conflicts/CI**: Check mergeable state and review status from the metadata.
+4. **Conflicts**: Check mergeable state and review status from the metadata. (CI status is shown for context but is verified separately before merge — focus your review on code quality, not CI.)
 5. **Queue context**: Consider other PRs in the merge queue. If this PR appears to depend on changes from another PR that hasn't merged yet, or if issues you see would be resolved by a PR ahead in the queue, factor that into your decision.
 
 After reading the diff, decide:
@@ -294,6 +294,44 @@ pub fn build_evaluation_prompt_with_context(
         }
         None => {
             prompt.push_str("- **Review Status**: No required reviews\n");
+        }
+    }
+
+    // CI status - informational only, CI failures are handled separately by the merge gate
+    // Focus your evaluation on code quality; CI is checked before merge execution
+    match pr.ci_status {
+        Some(StatusCheckRollupState::Success) => {
+            prompt.push_str("- **CI Status**: ✓ All checks passing\n");
+        }
+        Some(StatusCheckRollupState::Pending) => {
+            prompt.push_str("- **CI Status**: ⏳ Checks still running (will be verified before merge)\n");
+        }
+        Some(StatusCheckRollupState::Failure) => {
+            prompt.push_str("- **CI Status**: ✗ Failing (agent will be re-dispatched to fix)\n");
+            // Include failed check details for context
+            let failed: Vec<_> = pr
+                .check_runs
+                .iter()
+                .filter(|c| c.conclusion.as_deref() == Some("failure"))
+                .collect();
+            if !failed.is_empty() {
+                prompt.push_str("  - Failed checks:\n");
+                for check in failed.iter().take(5) {
+                    prompt.push_str(&format!("    - {}\n", check.name));
+                }
+                if failed.len() > 5 {
+                    prompt.push_str(&format!("    - ... and {} more\n", failed.len() - 5));
+                }
+            }
+        }
+        Some(StatusCheckRollupState::Error) => {
+            prompt.push_str("- **CI Status**: ⚠ Error — checks could not run\n");
+        }
+        Some(StatusCheckRollupState::Expected) => {
+            prompt.push_str("- **CI Status**: Expected (checks not yet started)\n");
+        }
+        None => {
+            prompt.push_str("- **CI Status**: Unknown (no status checks configured)\n");
         }
     }
 
@@ -581,7 +619,7 @@ mod tests {
         assert!(prompt.contains("Issue alignment"));
         assert!(prompt.contains("Correctness"));
         assert!(prompt.contains("Completeness"));
-        assert!(prompt.contains("Conflicts/CI"));
+        assert!(prompt.contains("Conflicts"));
         assert!(prompt.contains("JSON"));
     }
 
