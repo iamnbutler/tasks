@@ -66,7 +66,12 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 5. **Session** bridges events between agent and server
 6. **Merge Queue** receives completed work for review
 7. **Human** approves/rejects in merge queue
-8. **Merger** lands approved changes; transient GitHub API failures revert the entry to Approved for automatic retry on the next poll cycle
+8. **Merger** checks CI status before executing merge:
+   - CI passing → merge proceeds
+   - CI pending → deferred to next poll cycle
+   - CI failing → entry reverts to "request changes" with feedback about failed checks
+   - No CI configured → merge proceeds
+   - Transient GitHub API failures → entry reverts to Approved and retried on next poll cycle
 
 ### Event System
 
