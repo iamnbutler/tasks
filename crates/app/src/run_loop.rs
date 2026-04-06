@@ -2176,6 +2176,12 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
                         "**Orchestrator Evaluation: {}**\n\n{}",
                         verdict, evaluation.reasoning
                     );
+                    if !evaluation.missing_context.is_empty() {
+                        comment_body.push_str(&format!(
+                            "\n\n> **Note:** This evaluation was made with incomplete data. Missing: {}",
+                            evaluation.missing_context.join(", ")
+                        ));
+                    }
                     if let Some(feedback) = &evaluation.feedback {
                         comment_body.push_str(&format!(
                             "\n\n---\n**Feedback for agent:**\n{}",
