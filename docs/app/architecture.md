@@ -36,7 +36,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 
 | Crate | Purpose |
 |-------|---------|
-| `agent` | LLM abstraction layer, provider trait, session handling |
+| `agent` | LLM abstraction layer, provider trait, session handling with context compaction |
 | `session` | Session lifecycle management, event bridging |
 | `runtime` | Container lifecycle, JSON-line protocol |
 | `supervisor` | PID 1 inside containers, workspace provisioning |
@@ -118,6 +118,25 @@ Communication uses JSON-line protocol over stdio:
 - `agent:started` - Agent process launched
 - `agent:stdout/stderr` - Agent output
 - `agent:exit` - Agent terminated
+
+## Context Management <!-- LAST_UPDATED: 2026-04-06 -->
+
+Agent sessions handling long-running tasks can accumulate conversation history that exceeds the model's context window. The `agent` crate uses a two-stage strategy to keep sessions within budget:
+
+### 1. LLM Summarization (Compaction)
+
+When estimated tokens exceed 85% of the context window, older messages are summarized via an LLM call before the next turn:
+
+- The first message (task context) and the most recent ~10 messages are preserved verbatim.
+- Everything in between is replaced with a single summary message that retains key decisions, file paths, errors, and outstanding action items.
+- The summary is produced by calling the same provider with a dedicated summarization system prompt.
+- `Session::compaction_count` tracks how many times compaction has run.
+
+The threshold is controlled by `CompletionConfig::compact_threshold` (default `0.85`).
+
+### 2. Hard Truncation (Fallback)
+
+If compaction cannot run (fewer than 4 messages) or the session is still over budget after compaction, `truncate_to_budget()` drops messages from the middle, keeping the first message and as many recent messages as fit. Orphaned `ToolResult` messages at the truncation boundary are skipped to maintain API invariants.
 
 ## Storage
 
