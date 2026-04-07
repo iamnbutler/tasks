@@ -46,7 +46,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 | Crate | Purpose |
 |-------|---------|
 | `github` | GraphQL client, normalized model, polling |
-| `orchestrator` | AI project foreman, quality evaluation |
+| `orchestrator` | AI project foreman, quality evaluation; records `missing_context` on evaluations when PR diffs or linked issues can't be fetched |
 
 ### UI Crates
 
@@ -59,17 +59,17 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 
 ### Issue to PR Flow
 
-1. **Scheduler** polls GitHub for issues/PRs
+1. **Scheduler** polls GitHub for issues/PRs; closed issues are imported as terminal tasks (Completed or Cancelled based on closure reason) rather than skipped, so they are tracked as "seen"
 2. **Orchestrator** evaluates work and assigns tasks
 3. **Dispatcher** spawns container session
 4. **Agent** (Claude Code) works on the task
 5. **Session** bridges events between agent and server
-6. **Merge Queue** receives completed work for review
+6. **Merge Queue** receives completed work for review; entries with `mergeable_unknown: true` (GitHub's mergeability computation still pending) are skipped by the orchestrator until GitHub reports a definitive status
 7. **Human** approves/rejects in merge queue
 8. **Merger** checks CI status before executing merge:
    - CI passing → merge proceeds
    - CI pending → deferred to next poll cycle
-   - CI failing → entry reverts to "request changes" with feedback about failed checks
+   - CI failing → entry reverts to "request changes" with feedback about failed checks; agent is re-dispatched to fix without losing the branch/PR
    - No CI configured → merge proceeds
    - Transient GitHub API failures → entry reverts to Approved and retried on next poll cycle
 
@@ -123,6 +123,17 @@ Communication uses JSON-line protocol over stdio:
 - `agent:started` - Agent process launched
 - `agent:stdout/stderr` - Agent output
 - `agent:exit` - Agent terminated
+
+## Quality Evaluation <!-- LAST_UPDATED: 2026-04-07 -->
+
+When the orchestrator evaluates a PR for merge readiness, it produces a `QualityEvaluation` with:
+
+- `approved: bool` — whether the PR meets quality standards
+- `reasoning: String` — the orchestrator's rationale
+- `feedback: Option<String>` — specific guidance for the implementor if changes are needed
+- `missing_context: Vec<String>` — what data was unavailable during evaluation (e.g. `"pr_diff"`, `"associated_issue"`)
+
+When `missing_context` is non-empty the evaluation was made with incomplete information. The orchestrator surfaces this in its PR comment so humans can gauge the confidence level of the decision.
 
 ## Context Management <!-- LAST_UPDATED: 2026-04-06 -->
 

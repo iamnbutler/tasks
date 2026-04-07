@@ -303,10 +303,13 @@ GET /api/merge-queue
     "task_id": "task-uuid",
     "pr_number": 123,
     "state": "pending",
-    "created_at": "2024-01-15T12:00:00Z"
+    "created_at": "2024-01-15T12:00:00Z",
+    "mergeable_unknown": false
   }
 ]
 ```
+
+`mergeable_unknown` is `true` when GitHub's mergeability computation is still pending. The orchestrator skips evaluation of such entries; the flag clears automatically once GitHub reports a definitive status (Mergeable or Conflicting). <!-- LAST_UPDATED: 2026-04-07 -->
 
 #### Approve Entry <!-- LAST_UPDATED: 2026-04-02 -->
 
