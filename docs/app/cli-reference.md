@@ -84,6 +84,28 @@ ID  Repository              Status
 2   example/other-repo      active
 ```
 
+### `rebuild`
+
+Rebuild local state from GitHub. Clears all tasks and merge queue entries, then re-polls all tracked projects to recreate them from open issues and PRs. Accounting data and project configuration are preserved.
+
+```bash
+tasks rebuild
+```
+
+Use this to recover from a desync between local state and GitHub (e.g. after a crash, manual database changes, or a prolonged outage).
+
+**Output:**
+
+```
+Cleared 12 tasks and 3 merge queue entries
+Polling iamnbutler/tasks...
+  15 issues, 4 PRs processed
+
+Rebuild complete: 12 tasks, 3 merge queue entries created
+```
+
+> This command runs synchronously and reports results directly. The API equivalent (`POST /api/rebuild`) triggers re-population asynchronously via the GitHub poller.
+
 ## Environment Variables
 
 | Variable | Description | Required |
@@ -112,4 +134,4 @@ TASKS_DATA_DIR=/custom/path/to/data
 
 ---
 
-*This documentation is automatically maintained. Last updated: <!-- LAST_UPDATED -->*
+*This documentation is automatically maintained. Last updated: 2026-04-10*
