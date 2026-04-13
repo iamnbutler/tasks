@@ -46,7 +46,7 @@ Tasks is built as a modular Rust monorepo with a React web frontend. This docume
 | Crate | Purpose |
 |-------|---------|
 | `github` | GraphQL client, normalized model, polling |
-| `orchestrator` | AI project foreman, quality evaluation |
+| `orchestrator` | AI project foreman, quality evaluation, conflict triage |
 
 ### UI Crates
 
@@ -123,6 +123,19 @@ Communication uses JSON-line protocol over stdio:
 - `agent:started` - Agent process launched
 - `agent:stdout/stderr` - Agent output
 - `agent:exit` - Agent terminated
+
+## Quality Evaluation <!-- LAST_UPDATED: 2026-04-13 -->
+
+When a PR lands in the merge queue, the orchestrator performs a `QualityEvaluation` before deciding to approve, reject, or request changes. The evaluation includes:
+
+| Field | Description |
+|-------|-------------|
+| `approved` | Whether the orchestrator approves the PR for merge |
+| `reasoning` | Explanation of the decision |
+| `feedback` | Specific improvement notes sent back to the agent (if changes are needed) |
+| `missing_context` | Data sources unavailable during evaluation (e.g. `"pr_diff"`, `"associated_issue"`) |
+
+When `missing_context` is non-empty, the evaluation was made with incomplete information. Humans reviewing orchestrator decisions can use this to gauge confidence — an evaluation that lacked the PR diff or issue body may be less reliable than one with full context.
 
 ## Context Management <!-- LAST_UPDATED: 2026-04-06 -->
 

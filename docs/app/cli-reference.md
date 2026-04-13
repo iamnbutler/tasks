@@ -84,6 +84,18 @@ ID  Repository              Status
 2   example/other-repo      active
 ```
 
+### `rebuild`
+
+Clear all local tasks and merge queue entries, then re-poll all tracked projects from GitHub to rebuild state from scratch. Useful for recovering from a desync between local state and GitHub.
+
+```bash
+tasks rebuild
+```
+
+Projects are preserved. Tasks and merge queue entries are cleared and re-created from open GitHub issues and PRs on the next poll cycle.
+
+> **Note:** This is the CLI equivalent of `POST /api/rebuild`. The API version is non-blocking (re-population happens asynchronously); the CLI version polls immediately.
+
 ## Environment Variables
 
 | Variable | Description | Required |

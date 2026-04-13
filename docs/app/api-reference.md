@@ -303,12 +303,15 @@ GET /api/merge-queue
     "task_id": "task-uuid",
     "pr_number": 123,
     "state": "pending",
+    "mergeable_unknown": false,
     "created_at": "2024-01-15T12:00:00Z"
   }
 ]
 ```
 
-#### Approve Entry <!-- LAST_UPDATED: 2026-04-02 -->
+`mergeable_unknown` is `true` when GitHub's mergeability check is still computing (this can happen immediately after a push). The orchestrator defers evaluation for these entries until GitHub resolves the check.
+
+#### Approve Entry <!-- LAST_UPDATED: 2026-04-13 -->
 
 In Play mode, approval triggers an immediate GitHub merge. In Pause mode, the entry is approved but merges on flush.
 
@@ -316,6 +319,7 @@ Before executing the merge, CI status is checked:
 - **CI passing** — merge proceeds immediately
 - **CI pending** — merge is deferred; retried automatically on the next poll cycle
 - **CI failing** — entry moves to "request changes" with feedback listing the failed checks
+- **Mergeability unknown** — merge is deferred until GitHub resolves its mergeability check (retried automatically)
 - **No CI configured** — merge proceeds
 
 If the GitHub merge fails transiently (not CI-related), the entry reverts to Approved and will be retried automatically on the next poll cycle.
