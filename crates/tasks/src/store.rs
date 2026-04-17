@@ -6,11 +6,18 @@ use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
+use tokio::sync::broadcast;
 
+use crate::events::{Event, EventPayload};
 use crate::models::{
     Complexity, GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Spec,
     SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
+
+/// Capacity of the in-memory event broadcast channel. Slow subscribers that
+/// fall this far behind receive `RecvError::Lagged` and must catch up via
+/// `events_since`.
+const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -30,6 +37,7 @@ pub enum StoreError {
 
 pub struct Store {
     pool: SqlitePool,
+    event_tx: broadcast::Sender<Event>,
 }
 
 impl Store {
@@ -39,7 +47,8 @@ impl Store {
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = SqlitePoolOptions::new().max_connections(8).connect(&url).await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        Ok(Self { pool, event_tx })
     }
 
     /// Open an in-memory database (useful for tests).
@@ -49,7 +58,8 @@ impl Store {
             .connect("sqlite::memory:")
             .await?;
         MIGRATOR.run(&pool).await?;
-        Ok(Self { pool })
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        Ok(Self { pool, event_tx })
     }
 
     // --- projects ---
@@ -273,6 +283,67 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    // --- events ---
+
+    /// Append an event to the log and broadcast it to live subscribers.
+    ///
+    /// `seq` is assigned by SQLite's AUTOINCREMENT. If there are no
+    /// subscribers or they've all fallen away, the broadcast silently drops.
+    pub async fn append_event(
+        &self,
+        payload: EventPayload,
+    ) -> Result<Event, StoreError> {
+        let timestamp = Utc::now();
+        let payload_json = serde_json::to_string(&payload)?;
+
+        let row = sqlx::query(
+            "INSERT INTO events (timestamp, payload) VALUES (?, ?) RETURNING seq",
+        )
+        .bind(timestamp.to_rfc3339())
+        .bind(payload_json)
+        .fetch_one(&self.pool)
+        .await?;
+        let seq: i64 = row.try_get("seq")?;
+
+        let event = Event {
+            seq,
+            timestamp,
+            payload,
+        };
+        let _ = self.event_tx.send(event.clone());
+        Ok(event)
+    }
+
+    /// Subscribe to live events. Returns a receiver that will see every event
+    /// appended from now on. Does not replay history — pair with `events_since`
+    /// to catch up.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.event_tx.subscribe()
+    }
+
+    /// Return all events with seq >= `since`, ordered by seq ascending.
+    pub async fn events_since(&self, since: i64) -> Result<Vec<Event>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(event_from_row).collect()
+    }
+
+    /// Return the last N events, ordered by seq ascending.
+    pub async fn recent_events(&self, limit: i64) -> Result<Vec<Event>, StoreError> {
+        let mut rows = sqlx::query(
+            "SELECT seq, timestamp, payload FROM events ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        rows.into_iter().map(event_from_row).collect()
+    }
 }
 
 // --- row mappers ---
@@ -366,6 +437,15 @@ fn spec_queue_entry_from_row(
             .transpose()?,
         feedback: row.try_get("feedback")?,
         blocking_dependencies: serde_json::from_str(&deps_raw)?,
+    })
+}
+
+fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
+    let payload_raw: String = row.try_get("payload")?;
+    Ok(Event {
+        seq: row.try_get("seq")?,
+        timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
+        payload: serde_json::from_str(&payload_raw)?,
     })
 }
 
@@ -604,5 +684,144 @@ mod tests {
 
         store.set_mode(Mode::Stop).await.unwrap();
         assert_eq!(store.get_mode().await.unwrap(), Mode::Stop);
+    }
+
+    // --- events ---
+
+    #[tokio::test]
+    async fn append_event_assigns_monotonic_seq() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+
+        let e1 = store
+            .append_event(EventPayload::ProjectAdded {
+                project_id: project_id.clone(),
+            })
+            .await
+            .unwrap();
+        let e2 = store
+            .append_event(EventPayload::TaskIngested {
+                task_id: task_id.clone(),
+                project_id: project_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(e2.seq > e1.seq);
+    }
+
+    #[tokio::test]
+    async fn append_event_payload_roundtrip() {
+        let store = Store::open_in_memory().await.unwrap();
+        let task_id = TaskId::new();
+        let session_id = SessionId::new();
+
+        let payload = EventPayload::SessionCompleted {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            status: SessionStatus::ScoutSucceeded,
+        };
+        let appended = store.append_event(payload.clone()).await.unwrap();
+
+        let history = store.events_since(0).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].seq, appended.seq);
+        assert_eq!(history[0].payload, payload);
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_live_events() {
+        let store = Store::open_in_memory().await.unwrap();
+        let mut rx = store.subscribe_events();
+
+        let task_id = TaskId::new();
+        store
+            .append_event(EventPayload::TaskStateChanged {
+                task_id: task_id.clone(),
+                from: TaskState::New,
+                to: TaskState::Scouting,
+            })
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        match event.payload {
+            EventPayload::TaskStateChanged { to, .. } => {
+                assert_eq!(to, TaskState::Scouting);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn events_since_filters_by_seq() {
+        let store = Store::open_in_memory().await.unwrap();
+
+        let mut seqs = Vec::new();
+        for _ in 0..5 {
+            let e = store
+                .append_event(EventPayload::Note {
+                    source: "test".into(),
+                    message: "hello".into(),
+                })
+                .await
+                .unwrap();
+            seqs.push(e.seq);
+        }
+
+        let mid = seqs[2];
+        let tail = store.events_since(mid).await.unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail.first().unwrap().seq, mid);
+    }
+
+    #[tokio::test]
+    async fn recent_events_returns_last_n_in_order() {
+        let store = Store::open_in_memory().await.unwrap();
+        for i in 0..10 {
+            store
+                .append_event(EventPayload::Note {
+                    source: "test".into(),
+                    message: format!("{i}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let recent = store.recent_events(3).await.unwrap();
+        assert_eq!(recent.len(), 3);
+        // Ordered ascending: the last 3 appended
+        assert!(recent[0].seq < recent[1].seq);
+        assert!(recent[1].seq < recent[2].seq);
+        match &recent[2].payload {
+            EventPayload::Note { message, .. } => assert_eq!(message, "9"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn events_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+
+        {
+            let store = Store::open(&path).await.unwrap();
+            store
+                .append_event(EventPayload::Note {
+                    source: "boot".into(),
+                    message: "first".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(&path).await.unwrap();
+        let history = store.events_since(0).await.unwrap();
+        assert_eq!(history.len(), 1);
+        match &history[0].payload {
+            EventPayload::Note { message, .. } => assert_eq!(message, "first"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
