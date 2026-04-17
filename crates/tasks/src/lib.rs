@@ -7,3 +7,4 @@ pub mod events;
 pub mod github;
 pub mod models;
 pub mod store;
+pub mod vm;

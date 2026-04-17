@@ -22,6 +22,8 @@ chrono.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
 reqwest.workspace = true
+vm-pool-protocol.workspace = true
+vm-pool-client.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
