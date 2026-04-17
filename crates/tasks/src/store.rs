@@ -9,10 +9,30 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 use crate::events::{Event, EventPayload};
+use crate::github::GhIssue;
 use crate::models::{
     Complexity, GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Spec,
     SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
+
+/// Result of upserting an external record into our domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertOutcome<T> {
+    Inserted(T),
+    Existing(T),
+}
+
+impl<T> UpsertOutcome<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            UpsertOutcome::Inserted(t) | UpsertOutcome::Existing(t) => t,
+        }
+    }
+
+    pub fn is_new(&self) -> bool {
+        matches!(self, UpsertOutcome::Inserted(_))
+    }
+}
 
 /// Capacity of the in-memory event broadcast channel. Slow subscribers that
 /// fall this far behind receive `RecvError::Lagged` and must catch up via
@@ -140,6 +160,72 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
+    }
+
+    /// Upsert a task from a GitHub issue.
+    ///
+    /// On first sighting: insert with `state = new`, priority 0, `ingested_at = now`.
+    /// On re-sighting: update title/body/labels/gh_state but keep our internal
+    /// id, state, priority, ingested_at untouched.
+    pub async fn upsert_gh_issue(
+        &self,
+        project_id: &ProjectId,
+        issue: GhIssue,
+    ) -> Result<UpsertOutcome<Task>, StoreError> {
+        let existing = sqlx::query(
+            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
+             state, priority, ingested_at, updated_at FROM tasks \
+             WHERE project_id = ? AND gh_issue_number = ?",
+        )
+        .bind(project_id.as_str())
+        .bind(issue.number as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = existing {
+            let task = task_from_row(row)?;
+            let labels_json = serde_json::to_string(&issue.labels)?;
+            let now = Utc::now();
+            sqlx::query(
+                "UPDATE tasks SET title = ?, body = ?, labels = ?, gh_state = ?, \
+                 updated_at = ? WHERE id = ?",
+            )
+            .bind(&issue.title)
+            .bind(&issue.body)
+            .bind(labels_json)
+            .bind(issue.state.as_str())
+            .bind(now.to_rfc3339())
+            .bind(task.id.as_str())
+            .execute(&self.pool)
+            .await?;
+
+            let updated = Task {
+                title: issue.title,
+                body: issue.body,
+                labels: issue.labels,
+                gh_state: issue.state,
+                updated_at: now,
+                ..task
+            };
+            return Ok(UpsertOutcome::Existing(updated));
+        }
+
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new(),
+            project_id: project_id.clone(),
+            gh_issue_number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            labels: issue.labels,
+            gh_state: issue.state,
+            state: TaskState::New,
+            priority: 0,
+            ingested_at: now,
+            updated_at: now,
+        };
+        self.insert_task(&task).await?;
+        Ok(UpsertOutcome::Inserted(task))
     }
 
     pub async fn update_task_state(
@@ -567,6 +653,91 @@ mod tests {
         let loaded = store.get_task(&task.id).await.unwrap().unwrap();
         assert_eq!(loaded.state, TaskState::Scouting);
         assert!(loaded.updated_at >= task.updated_at);
+    }
+
+    #[tokio::test]
+    async fn upsert_gh_issue_inserts_new_task() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 7,
+            title: "Fix the thing".into(),
+            body: "Details".into(),
+            labels: vec!["bug".into()],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let outcome = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap();
+        assert!(outcome.is_new());
+        let task = outcome.into_inner();
+        assert_eq!(task.gh_issue_number, 7);
+        assert_eq!(task.title, "Fix the thing");
+        assert_eq!(task.state, TaskState::New);
+        assert_eq!(task.priority, 0);
+
+        // Verify persistence
+        let loaded = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(loaded.title, "Fix the thing");
+    }
+
+    #[tokio::test]
+    async fn upsert_gh_issue_updates_existing_preserves_internal_fields() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 42,
+            title: "First pass".into(),
+            body: "Initial body".into(),
+            labels: vec!["p1".into()],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let first = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap();
+        let first_task = first.clone().into_inner();
+
+        // Advance our internal state to something non-default
+        store
+            .update_task_state(&first_task.id, TaskState::Scouting)
+            .await
+            .unwrap();
+
+        // Re-observe with edits from GitHub
+        let updated_issue = GhIssue {
+            number: 42,
+            title: "Revised title".into(),
+            body: "Revised body".into(),
+            labels: vec!["p0".into(), "bug".into()],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let second = store
+            .upsert_gh_issue(&project.id, updated_issue)
+            .await
+            .unwrap();
+        assert!(!second.is_new(), "second upsert should be Existing");
+        let second_task = second.into_inner();
+
+        // Identity preserved
+        assert_eq!(second_task.id, first_task.id);
+        assert_eq!(second_task.ingested_at, first_task.ingested_at);
+        assert_eq!(second_task.priority, first_task.priority);
+        // Internal state not clobbered by GitHub re-observation
+        assert_eq!(second_task.state, TaskState::Scouting);
+        // External fields updated
+        assert_eq!(second_task.title, "Revised title");
+        assert_eq!(second_task.body, "Revised body");
+        assert_eq!(second_task.labels, vec!["p0", "bug"]);
+        assert!(second_task.updated_at > first_task.updated_at);
     }
 
     #[tokio::test]
