@@ -1,31 +1,25 @@
 [package]
-name = "tasks"
-description = "Human-in-the-loop agent orchestration server"
+name = "scout-supervisor"
+description = "PID 1 binary running inside a Scout VM. Clones a repo, drives the agent, emits ScoutEvents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "tasks"
+name = "scout-supervisor"
 path = "src/main.rs"
 
 [dependencies]
 tokio.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-chrono.workspace = true
-uuid.workspace = true
-sqlx.workspace = true
-reqwest.workspace = true
 vm-pool-protocol.workspace = true
-vm-pool-client.workspace = true
 tasks-protocol.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-axum.workspace = true

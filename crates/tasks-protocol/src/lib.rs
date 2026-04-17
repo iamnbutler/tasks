@@ -1,8 +1,9 @@
-//! vm-pool integration: TasksProtocol defines the command/event vocabulary
-//! flowing between the tasks server and a Scout VM's supervisor.
+//! Protocol types shared between the `tasks` server and Scout VMs.
 //!
-//! Infrastructure-level traffic (Ping/Pong/Shutdown/Ready) is handled by vm-pool
-//! itself. TasksProtocol only carries the application-level Scout messages.
+//! The server sends [`ScoutCommand`] messages (wrapped in `VmCommand<P>` by
+//! vm-pool) to a Scout VM's supervisor. The supervisor streams back
+//! [`ScoutEvent`] messages (wrapped in `VmEvent<P>`). Infrastructure-level
+//! traffic (Ping/Pong/Shutdown/Ready) is handled by vm-pool itself.
 
 use serde::{Deserialize, Serialize};
 use vm_pool_protocol::AppProtocol;
@@ -41,14 +42,13 @@ pub enum ScoutCommand {
 pub enum ScoutEvent {
     /// Supervisor has received `Start` and is setting up (clone, branch).
     Started { branch: String },
-    /// A stdout/stderr line from Claude Code. Best-effort — may be dropped
-    /// under load. Useful for breadcrumbs / live log tailing.
+    /// A stdout/stderr line from the agent process. Best-effort — may be
+    /// dropped under load. Useful for breadcrumbs / live log tailing.
     Progress { stream: LogStream, line: String },
-    /// Claude Code finished. Implementation branch state at this point is
+    /// Agent process finished. Implementation branch state at this point is
     /// whatever the agent produced.
     ImplementationFinished { exit_code: i32 },
-    /// The supervisor has distilled the SPEC.md written by Claude Code.
-    /// Terminal success.
+    /// The supervisor has read SPEC.md produced by the agent. Terminal success.
     Completed {
         spec_markdown: String,
         files_touched: Vec<String>,
@@ -96,9 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn service_command_with_tasks_protocol_composes() {
-        // Verify that tasks' ScoutCommand plugs cleanly into vm-pool's
-        // generic ServiceCommand<P> without extra glue.
+    fn service_command_composes() {
         let cmd: ServiceCommand<TasksProtocol> = ServiceCommand::Send {
             vm_id: VmId::new("vm-abc"),
             command: ScoutCommand::Cancel,
@@ -109,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn service_event_with_tasks_protocol_composes() {
+    fn service_event_composes() {
         let evt: ServiceEvent<TasksProtocol> = ServiceEvent::VmApp {
             vm_id: VmId::new("vm-abc"),
             event: ScoutEvent::Started {

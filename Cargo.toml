@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tasks"]
+members = ["crates/scout-supervisor", "crates/tasks", "crates/tasks-protocol"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
@@ -37,3 +37,6 @@ tempfile = "3"
 # vm-pool (sibling workspace)
 vm-pool-protocol = { path = "../tasks-vm/crates/protocol" }
 vm-pool-client = { path = "../tasks-vm/crates/client" }
+
+# tasks internal
+tasks-protocol = { path = "crates/tasks-protocol" }
