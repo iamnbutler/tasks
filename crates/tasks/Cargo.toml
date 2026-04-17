@@ -29,3 +29,5 @@ tasks-protocol.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+vm-pool-service.workspace = true
+vm-pool-manager.workspace = true

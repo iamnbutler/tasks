@@ -37,6 +37,8 @@ tempfile = "3"
 # vm-pool (sibling workspace)
 vm-pool-protocol = { path = "../tasks-vm/crates/protocol" }
 vm-pool-client = { path = "../tasks-vm/crates/client" }
+vm-pool-service = { path = "../tasks-vm/crates/service" }
+vm-pool-manager = { path = "../tasks-vm/crates/pool" }
 
 # tasks internal
 tasks-protocol = { path = "crates/tasks-protocol" }

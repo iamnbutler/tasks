@@ -266,6 +266,44 @@ impl Store {
         Ok(())
     }
 
+    pub async fn update_session_branch(
+        &self,
+        id: &SessionId,
+        branch: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE sessions SET branch = ? WHERE id = ?")
+            .bind(branch)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("session {id}")));
+        }
+        Ok(())
+    }
+
+    pub async fn update_session_completion(
+        &self,
+        id: &SessionId,
+        status: SessionStatus,
+        completed_at: DateTime<Utc>,
+        exit_reason: Option<String>,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE sessions SET status = ?, completed_at = ?, exit_reason = ? WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(completed_at.to_rfc3339())
+        .bind(exit_reason)
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("session {id}")));
+        }
+        Ok(())
+    }
+
     pub async fn get_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         let row = sqlx::query(
             "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
