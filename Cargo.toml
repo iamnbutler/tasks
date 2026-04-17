@@ -1,31 +1,30 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
-exclude = ["crates/desktop", "crates/gpui-client"]
-default-members = ["crates/app"]
+members = ["crates/tasks"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+repository = "https://github.com/iamnbutler/tasks"
 
 [workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-trait-variant = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-bytes = "1.11"
-futures = "0.3"
-sysinfo = "0.33"
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
-gpuikit = { path = "../gpuikit" }
-smol = "2.0"
-tempfile = "3.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "sqlite",
+    "chrono",
+    "uuid",
+    "migrate",
+    "macros",
+] }
+tempfile = "3"
