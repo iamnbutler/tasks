@@ -195,15 +195,38 @@ pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
     pub is_error: bool,
+    /// Supplementary context appended after the tool result in the same user message.
+    ///
+    /// Each note becomes an additional text content block following the tool_result block,
+    /// so the model sees it as context right after the tool output. Useful for warnings,
+    /// suggestions, or hints that shouldn't clutter the primary `content` field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl ToolResult {
     pub fn success(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { tool_call_id: tool_call_id.into(), content: content.into(), is_error: false }
+        Self {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            is_error: false,
+            notes: Vec::new(),
+        }
     }
 
     pub fn error(tool_call_id: impl Into<String>, error: impl Into<String>) -> Self {
-        Self { tool_call_id: tool_call_id.into(), content: error.into(), is_error: true }
+        Self {
+            tool_call_id: tool_call_id.into(),
+            content: error.into(),
+            is_error: true,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Append a supplementary note that the model will see after the tool result.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
     }
 }
 

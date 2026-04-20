@@ -124,11 +124,17 @@ impl Session {
     /// messages for continuity). A warning is logged when truncation occurs.
     pub fn build_request(&mut self) -> CompletionRequest {
         if !self.pending_tool_results.is_empty() {
-            let tool_result_content: Vec<Content> = std::mem::take(&mut self.pending_tool_results)
-                .into_iter()
-                .map(|r| Content::tool_result(r.tool_call_id, r.content, r.is_error))
-                .collect();
-            self.messages.push(Message::new(Role::User, tool_result_content));
+            let results = std::mem::take(&mut self.pending_tool_results);
+            let mut content: Vec<Content> = Vec::with_capacity(results.len());
+            let mut trailing_notes: Vec<String> = Vec::new();
+            for r in results {
+                content.push(Content::tool_result(r.tool_call_id, r.content, r.is_error));
+                trailing_notes.extend(r.notes);
+            }
+            for note in trailing_notes {
+                content.push(Content::text(note));
+            }
+            self.messages.push(Message::new(Role::User, content));
         }
 
         let messages = self.truncate_to_budget();
@@ -700,6 +706,49 @@ mod tests {
         let last_msg = request.messages.last().unwrap();
         assert_eq!(last_msg.role, Role::User);
         assert!(matches!(&last_msg.content[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tc-1"));
+    }
+
+    #[test]
+    fn test_tool_result_notes_appended_after_tool_result() {
+        let mut session = Session::new(CompletionConfig::new("test-model"));
+        session.add_user_message("go");
+
+        let response = Response {
+            content: vec![],
+            tool_calls: vec![
+                ToolCall {
+                    id: "tc-1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "tc-2".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: None,
+        };
+        session.apply_response(&response);
+
+        session.apply_tool_results(vec![
+            ToolResult::success("tc-1", "file contents")
+                .with_note("Note: this is a test file; implementation is in src/lib.rs"),
+            ToolResult::success("tc-2", "47 matches")
+                .with_note("Tip: narrow the pattern to reduce noise."),
+        ]);
+
+        let request = session.build_request();
+        let last_msg = request.messages.last().unwrap();
+        assert_eq!(last_msg.role, Role::User);
+
+        // First two content blocks are tool results (in order), then the two notes as text.
+        assert_eq!(last_msg.content.len(), 4);
+        assert!(matches!(&last_msg.content[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tc-1"));
+        assert!(matches!(&last_msg.content[1], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tc-2"));
+        assert!(matches!(&last_msg.content[2], Content::Text { text } if text.starts_with("Note:")));
+        assert!(matches!(&last_msg.content[3], Content::Text { text } if text.starts_with("Tip:")));
     }
 
     #[test]
