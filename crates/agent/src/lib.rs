@@ -6,6 +6,7 @@
 pub mod chain;
 pub mod completions;
 pub mod error;
+pub mod file_state_cache;
 pub mod message;
 pub mod provider;
 pub mod providers;
@@ -16,6 +17,7 @@ pub mod tool_result_budget;
 
 pub use completions::CompletionsService;
 pub use error::AgentError;
+pub use file_state_cache::{FileState, FileStateCache, SharedFileStateCache};
 pub use tool_error::ToolError;
 pub use message::{Content, Message, Response, Role, StopReason, Tool, ToolCall, ToolResult, Usage, DEFAULT_MAX_RESULT_SIZE};
 pub use provider::{
