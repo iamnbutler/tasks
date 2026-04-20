@@ -2954,6 +2954,36 @@ mod tests {
         assert!(task.rejection_feedback.is_none());
     }
 
+    #[tokio::test]
+    async fn new_rejection_feedback_overrides_old(/* issue #505 */) {
+        // Regression test for #505: the dispatch loop no longer clears feedback
+        // eagerly, so we need to confirm that setting new feedback cleanly
+        // overrides a previously-set value (the documented mechanism for
+        // invalidating stale feedback without risking data loss on dispatch
+        // failure).
+        let server = test_server().await;
+        let project = Project::new("proj-1", "owner/repo");
+        server.add_project(project).await;
+        let task = Task::new("task-1", TaskSource::Internal, "Test task", "proj-1");
+        server.add_task(task).await.unwrap();
+
+        server
+            .set_task_rejection_feedback("task-1", Some("first attempt was wrong".into()))
+            .await
+            .unwrap();
+        server
+            .set_task_rejection_feedback("task-1", Some("second attempt also wrong".into()))
+            .await
+            .unwrap();
+
+        let task = server.get_task("task-1").await.unwrap();
+        assert_eq!(
+            task.rejection_feedback.as_deref(),
+            Some("second attempt also wrong"),
+            "newer feedback must replace older"
+        );
+    }
+
     // --- Progress detection tests (spec §13.1, §13.2) ---
 
     #[tokio::test]

@@ -1542,14 +1542,16 @@ pub async fn run(config: AppConfig) -> Result<RunResult, Box<dyn std::error::Err
             {
                 Ok(_) => {
                     info!(task_id = %task_id, work_id = %work_item.id, "session started for claimed work");
-                    // Clear rejection feedback after successful dispatch (issue #423).
-                    // This prevents stale feedback from being repeated if the task
-                    // is rejected and re-dispatched again.
-                    if task.rejection_feedback.is_some() {
-                        if let Err(e) = dispatch_server.clear_task_rejection_feedback(&task_id).await {
-                            warn!(task_id = %task_id, error = %e, "failed to clear rejection feedback after dispatch");
-                        }
-                    }
+                    // Intentionally do NOT clear rejection_feedback here (issue #505).
+                    // start_session() returning Ok only means the container handoff
+                    // succeeded — not that the agent actually consumed the prompt.
+                    // Clearing at this point risks losing feedback if the session
+                    // crashes before the agent processes its first message.
+                    // Stale feedback is not a real concern because:
+                    //   - The next rejection overwrites via set_task_rejection_feedback.
+                    //   - Terminal tasks aren't re-dispatched.
+                    //   - A retry after transient failure legitimately needs to see
+                    //     the same feedback again.
                 }
                 Err(e) => {
                     // Check if error is AlreadyExists — means the session is still running
