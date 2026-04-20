@@ -106,6 +106,7 @@ pub fn budget_tool_results(
                 tool_call_id: result.tool_call_id,
                 content: budgeted_content,
                 is_error: result.is_error,
+                notes: result.notes,
             }
         })
         .collect()
