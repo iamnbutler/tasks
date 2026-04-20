@@ -126,6 +126,23 @@ pub struct Tool {
     /// default to `false` and run serially.
     #[serde(default)]
     pub is_concurrency_safe: bool,
+    /// Whether this tool has no side effects (no filesystem/process/network writes).
+    ///
+    /// Read-only tools can freely parallelize and are safe to speculatively execute.
+    #[serde(default)]
+    pub is_read_only: bool,
+    /// Whether this tool performs hard-to-reverse operations (delete, overwrite, drop).
+    ///
+    /// Destructive tools warrant extra scrutiny: higher confirmation thresholds,
+    /// serial execution, audit logging, etc.
+    #[serde(default)]
+    pub is_destructive: bool,
+    /// Name of the input parameter (if any) that carries a filesystem path.
+    ///
+    /// Enables path-aware behavior (per-path locking, permission checks, surfacing
+    /// which file a tool call targets) without hard-coding per-tool logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_parameter: Option<String>,
     /// Maximum result size in bytes before the output is persisted to disk.
     ///
     /// - `Some(n)`: persist to disk and return a preview if result exceeds `n` bytes
@@ -151,6 +168,9 @@ impl Tool {
             description: description.into(),
             parameters,
             is_concurrency_safe: false,
+            is_read_only: false,
+            is_destructive: false,
+            path_parameter: None,
             max_result_size: Some(DEFAULT_MAX_RESULT_SIZE),
         }
     }
@@ -166,6 +186,9 @@ impl Tool {
             description: description.into(),
             parameters,
             is_concurrency_safe: true,
+            is_read_only: false,
+            is_destructive: false,
+            path_parameter: None,
             max_result_size: Some(DEFAULT_MAX_RESULT_SIZE),
         }
     }
@@ -174,6 +197,42 @@ impl Tool {
     pub fn with_max_result_size(mut self, max_result_size: Option<usize>) -> Self {
         self.max_result_size = max_result_size;
         self
+    }
+
+    /// Mark this tool as read-only (no side effects).
+    pub fn read_only(mut self) -> Self {
+        self.is_read_only = true;
+        self
+    }
+
+    /// Mark this tool as destructive (hard to reverse).
+    pub fn destructive(mut self) -> Self {
+        self.is_destructive = true;
+        self
+    }
+
+    /// Declare the input parameter that carries a filesystem path.
+    pub fn with_path_parameter(mut self, parameter: impl Into<String>) -> Self {
+        self.path_parameter = Some(parameter.into());
+        self
+    }
+
+    /// Extract the path this tool call targets, if any.
+    ///
+    /// Returns `Some(path)` when `path_parameter` is set and the input object
+    /// contains that key with a string value.
+    pub fn get_path<'a>(&self, input: &'a serde_json::Value) -> Option<&'a str> {
+        self.path_parameter
+            .as_deref()
+            .and_then(|param| input.get(param))
+            .and_then(|v| v.as_str())
+    }
+
+    /// Whether this tool can run in parallel with other safe tools.
+    ///
+    /// True if explicitly marked concurrency-safe, or if it's read-only and not destructive.
+    pub fn can_parallelize(&self) -> bool {
+        self.is_concurrency_safe || (self.is_read_only && !self.is_destructive)
     }
 
     fn default_max_result_size() -> Option<usize> {
@@ -308,5 +367,75 @@ mod tests {
     fn test_usage_total() {
         let usage = Usage { input_tokens: 100, output_tokens: 50 };
         assert_eq!(usage.total(), 150);
+    }
+
+    #[test]
+    fn test_tool_defaults_are_safe() {
+        let tool = Tool::new("write_file", "writes", serde_json::json!({}));
+        assert!(!tool.is_concurrency_safe);
+        assert!(!tool.is_read_only);
+        assert!(!tool.is_destructive);
+        assert!(tool.path_parameter.is_none());
+        assert!(!tool.can_parallelize());
+    }
+
+    #[test]
+    fn test_read_only_tool_can_parallelize() {
+        let tool = Tool::new("read_file", "reads", serde_json::json!({})).read_only();
+        assert!(tool.is_read_only);
+        assert!(!tool.is_destructive);
+        assert!(tool.can_parallelize());
+    }
+
+    #[test]
+    fn test_destructive_read_only_is_not_parallelizable() {
+        // Contrived, but codifies the rule: destructive overrides read_only for parallelization.
+        let tool = Tool::new("purge", "wipes", serde_json::json!({}))
+            .read_only()
+            .destructive();
+        assert!(!tool.can_parallelize());
+    }
+
+    #[test]
+    fn test_concurrency_safe_overrides_other_flags() {
+        let tool = Tool::new_concurrent("search", "searches", serde_json::json!({}));
+        assert!(tool.can_parallelize());
+    }
+
+    #[test]
+    fn test_get_path_extracts_declared_parameter() {
+        let tool =
+            Tool::new("read_file", "reads", serde_json::json!({})).with_path_parameter("file_path");
+        let input = serde_json::json!({ "file_path": "/tmp/foo.rs", "offset": 0 });
+        assert_eq!(tool.get_path(&input), Some("/tmp/foo.rs"));
+    }
+
+    #[test]
+    fn test_get_path_returns_none_when_parameter_missing() {
+        let tool = Tool::new("read_file", "reads", serde_json::json!({}))
+            .with_path_parameter("file_path");
+        let input = serde_json::json!({ "other": "value" });
+        assert_eq!(tool.get_path(&input), None);
+    }
+
+    #[test]
+    fn test_get_path_returns_none_when_not_declared() {
+        let tool = Tool::new("no_path", "generic", serde_json::json!({}));
+        let input = serde_json::json!({ "file_path": "/tmp/foo.rs" });
+        assert_eq!(tool.get_path(&input), None);
+    }
+
+    #[test]
+    fn test_tool_new_metadata_fields_deserialize_defaults() {
+        // Existing callers serializing Tool without new fields should deserialize safely.
+        let json = serde_json::json!({
+            "name": "legacy",
+            "description": "",
+            "parameters": {},
+        });
+        let tool: Tool = serde_json::from_value(json).unwrap();
+        assert!(!tool.is_read_only);
+        assert!(!tool.is_destructive);
+        assert!(tool.path_parameter.is_none());
     }
 }
