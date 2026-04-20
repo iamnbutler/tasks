@@ -3,10 +3,12 @@
 //! A session maintains conversation history and state across multiple prompt turns.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AgentError;
@@ -15,7 +17,66 @@ use crate::provider::{CompletionConfig, CompletionRequest, Provider};
 use crate::tool_result_budget;
 
 /// Unique session identifier.
-pub type SessionId = String;
+///
+/// Newtype wrapper around `String` so the compiler can distinguish session
+/// identifiers from other string-typed IDs (task, tool call, etc.) — the
+/// canonical case that motivates branded IDs (#687). `#[serde(transparent)]`
+/// keeps the JSON representation a bare string for backwards compatibility
+/// with any stored/exchanged payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Generate a new random session identifier (UUID v4).
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Borrow the underlying string representation.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consume and return the inner `String`.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<String> for SessionId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SessionId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl AsRef<str> for SessionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// State of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +112,7 @@ pub struct Session {
 impl Session {
     pub fn new(config: CompletionConfig) -> Self {
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: SessionId::new(),
             state: SessionState::Ready,
             system_prompt: None,
             messages: Vec::new(),
@@ -67,7 +128,7 @@ impl Session {
         }
     }
 
-    pub fn with_id(id: impl Into<String>, config: CompletionConfig) -> Self {
+    pub fn with_id(id: impl Into<SessionId>, config: CompletionConfig) -> Self {
         Self { id: id.into(), ..Self::new(config) }
     }
 
@@ -589,6 +650,40 @@ mod tests {
         assert_eq!(session.state, SessionState::Ready);
         assert!(session.messages.is_empty());
         assert!(!session.id.is_empty());
+    }
+
+    #[test]
+    fn session_id_display_matches_inner_string() {
+        let id = SessionId::from("session-abc".to_string());
+        assert_eq!(format!("{}", id), "session-abc");
+        assert_eq!(id.as_str(), "session-abc");
+    }
+
+    #[test]
+    fn session_id_serde_is_transparent_string() {
+        let id: SessionId = "session-xyz".into();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"session-xyz\"");
+        let round: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, id);
+    }
+
+    #[test]
+    fn session_with_id_accepts_string_and_str_and_session_id() {
+        let cfg = CompletionConfig::new("test-model");
+        let a = Session::with_id("lit-str", cfg.clone());
+        let b = Session::with_id(String::from("owned"), cfg.clone());
+        let c = Session::with_id(SessionId::from("typed"), cfg);
+        assert_eq!(a.id.as_str(), "lit-str");
+        assert_eq!(b.id.as_str(), "owned");
+        assert_eq!(c.id.as_str(), "typed");
+    }
+
+    #[test]
+    fn session_id_default_generates_unique_values() {
+        let a = SessionId::default();
+        let b = SessionId::default();
+        assert_ne!(a, b, "two default-constructed SessionIds should differ");
     }
 
     #[test]
