@@ -10,11 +10,13 @@ pub mod message;
 pub mod provider;
 pub mod providers;
 pub mod session;
+pub mod tool_error;
 pub mod tool_exec;
 pub mod tool_result_budget;
 
 pub use completions::CompletionsService;
 pub use error::AgentError;
+pub use tool_error::ToolError;
 pub use message::{Content, Message, Response, Role, StopReason, Tool, ToolCall, ToolResult, Usage, DEFAULT_MAX_RESULT_SIZE};
 pub use provider::{
     CompletionConfig, CompletionRequest, Provider, StreamChunk, streaming_from_complete,

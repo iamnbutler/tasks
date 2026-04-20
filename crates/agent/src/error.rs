@@ -31,6 +31,9 @@ pub enum AgentError {
     #[error("Tool execution failed: {0}")]
     ToolExecution(String),
 
+    #[error(transparent)]
+    Tool(crate::tool_error::ToolError),
+
     #[error("Validation error: {0}")]
     Validation(String),
 
@@ -72,8 +75,15 @@ impl AgentError {
             AgentError::RateLimited { .. } => true,
             AgentError::Network(_) => true,
             AgentError::Api { status, .. } => matches!(status, 500 | 502 | 503 | 529),
+            AgentError::Tool(t) => t.is_retryable(),
             _ => false,
         }
+    }
+}
+
+impl From<crate::tool_error::ToolError> for AgentError {
+    fn from(err: crate::tool_error::ToolError) -> Self {
+        AgentError::Tool(err)
     }
 }
 
@@ -112,5 +122,22 @@ mod tests {
     #[test]
     fn cancelled_is_not_retryable() {
         assert!(!AgentError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn tool_timeout_routes_through_agent_error_retryable() {
+        let err: AgentError = crate::tool_error::ToolError::Timeout(
+            std::time::Duration::from_secs(1),
+        )
+        .into();
+        assert!(matches!(err, AgentError::Tool(_)));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn tool_validation_not_retryable_through_agent_error() {
+        let err: AgentError =
+            crate::tool_error::ToolError::Validation("bad input".into()).into();
+        assert!(!err.is_retryable());
     }
 }
