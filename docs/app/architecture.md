@@ -143,6 +143,52 @@ The threshold is controlled by `CompletionConfig::compact_threshold` (default `0
 
 If compaction cannot run (fewer than 4 messages) or the session is still over budget after compaction, `truncate_to_budget()` drops messages from the middle, keeping the first message and as many recent messages as fit. Orphaned `ToolResult` messages at the truncation boundary are skipped to maintain API invariants.
 
+## Tool System <!-- LAST_UPDATED: 2026-04-20 -->
+
+The `agent` crate defines a `Tool` struct that agents expose to the LLM. Each tool carries metadata the session layer uses for scheduling, permission checks, and error recovery.
+
+### Tool Metadata
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `is_read_only` | `bool` | Tool has no side effects; safe for parallel execution |
+| `is_destructive` | `bool` | Hard-to-reverse operation |
+| `path_parameter` | `Option<String>` | Name of the input field that holds a filesystem path |
+| `is_concurrency_safe` | `bool` | Explicitly marked safe for concurrent execution |
+
+Builder methods: `.read_only()`, `.destructive()`, `.with_path_parameter(name)`.
+
+`can_parallelize()` returns `true` when `is_concurrency_safe || (is_read_only && !is_destructive)`.
+
+### Tool Errors
+
+`ToolError` provides typed variants for tool failures, enabling structured recovery instead of falling back to string matching:
+
+| Variant | Meaning |
+|---------|---------|
+| `Validation` | Invalid input |
+| `PermissionDenied` | Access refused |
+| `Execution` | Runtime failure |
+| `Timeout(Duration)` | Operation exceeded time limit |
+| `Cancelled` | Explicitly cancelled |
+| `FileNotFound(path)` | Target path doesn't exist |
+| `FileModified(path)` | File changed since last read |
+| `StringNotFound { file, snippet }` | Edit target not found in file |
+| `MultipleMatches { file, snippet, count }` | Edit target is ambiguous |
+| `InvalidRegex` | Malformed pattern |
+
+`StringNotFound` and `MultipleMatches` enable smarter edit-tool recovery — the model can respond to `MultipleMatches` by providing more surrounding context rather than retrying blindly. `is_retryable()` is `true` for transient failures (`Timeout`, `Io`).
+
+### File State Cache
+
+`FileStateCache` (shared as `SharedFileStateCache = Arc<RwLock<FileStateCache>>`) snapshots file content hashes and mtimes when a tool reads a file. Before writing, an edit tool calls `is_modified()` to check whether the file changed underneath it; a mismatch returns `ToolError::FileModified` so the agent re-reads before editing.
+
+The cache performs no I/O — callers supply content and mtime, keeping it portable between host and container contexts.
+
+### Tool Result Notes
+
+`ToolResult` carries a `notes: Vec<String>` field for supplementary context (warnings, hints, match counts). Each note is emitted as an additional text content block after the tool result in the Anthropic API message, compliant with the API shape.
+
 ## Storage
 
 ### SQLite Database <!-- LAST_UPDATED: 2026-03-27 -->
