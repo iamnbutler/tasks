@@ -8,7 +8,9 @@ pub mod session;
 pub mod merge_queue;
 pub mod mode;
 pub mod project;
+pub mod spec;
 pub mod work_queue;
 
 pub use mode::Mode;
+pub use spec::{Complexity, Spec, SpecStatus, TaskKind};
 pub use work_queue::{WorkType, WorkItem, ClaimResult, ReclaimedWork};
