@@ -79,10 +79,19 @@ tasks list-projects
 **Output:**
 
 ```
-ID  Repository              Status
-1   iamnbutler/tasks        active
-2   example/other-repo      active
+iamnbutler/tasks (branch: main)
+example/other-repo (branch: main)
 ```
+
+### `rebuild`
+
+Clear all tasks and merge queue entries, then re-populate from GitHub. Useful for recovering from a desync.
+
+```bash
+tasks rebuild
+```
+
+> Re-population happens asynchronously as the GitHub poller discovers items on its next cycle.
 
 ## Environment Variables
 
