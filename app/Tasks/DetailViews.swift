@@ -100,9 +100,92 @@ struct SpecDetailView: View {
                 Divider()
 
                 MarkdownBody(text: spec.content)
+
+                if entry != nil {
+                    Divider()
+
+                    ReviewForm(specId: spec.id)
+                }
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// Verdict buttons + feedback field. The server is the authority on verdict
+/// legality — this form only pre-disables the obviously-unhelpful case
+/// (needs_revision without feedback, since feedback is the reviewer's
+/// message to the next scout).
+struct ReviewForm: View {
+    @Environment(AppModel.self) private var model
+    let specId: String
+
+    @State private var feedback = ""
+    @State private var submitting = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Verdict")
+                .font(.headline)
+
+            TextField(
+                "Feedback — fed to the next scout on needs revision",
+                text: $feedback, axis: .vertical
+            )
+            .lineLimit(3...8)
+            .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 8) {
+                Button("Approve") {
+                    submit(.approved)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Needs revision") {
+                    submit(.needsRevision)
+                }
+                .tint(.orange)
+                .disabled(feedback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Write feedback first — it's the message the re-scout sees")
+
+                Button("Reject") {
+                    submit(.rejected)
+                }
+                .tint(.red)
+
+                if submitting {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .disabled(submitting)
+    }
+
+    private func submit(_ verdict: ReviewVerdict) {
+        submitting = true
+        errorMessage = nil
+        let trimmed = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            do {
+                try await model.review(
+                    specId: specId,
+                    verdict: verdict,
+                    feedback: trimmed.isEmpty ? nil : trimmed)
+                feedback = ""
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            submitting = false
         }
     }
 }

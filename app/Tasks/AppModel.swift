@@ -36,6 +36,20 @@ final class AppModel {
         specQueue.first { $0.specId == specId }
     }
 
+    /// One verdict = one POST. Applies the returned entry optimistically;
+    /// the event-driven refresh reconciles everything else (task state
+    /// changes on approve/needs-revision). Throws so the review form can
+    /// show the server's real error message.
+    func review(specId: String, verdict: ReviewVerdict, feedback: String?) async throws {
+        let updated = try await client.reviewSpec(specId, verdict: verdict, feedback: feedback)
+        if let index = specQueue.firstIndex(where: { $0.specId == specId }) {
+            specQueue[index] = updated
+        } else {
+            specQueue.append(updated)
+        }
+        await refresh()
+    }
+
     /// Optimistic drag-reorder; the server's answer (or a refresh on failure)
     /// is authoritative.
     func moveTasks(from source: IndexSet, to destination: Int) {

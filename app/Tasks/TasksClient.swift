@@ -1,5 +1,22 @@
 import Foundation
 
+/// A non-2xx response. The server always ships `{"error": "..."}` JSON;
+/// `message` carries it so UI surfaces the real reason, not just a code.
+struct APIError: LocalizedError {
+    let status: Int
+    let message: String
+
+    var errorDescription: String? { message }
+}
+
+/// The three verdicts a reviewer may deliver (clients.md); `pending_review`
+/// and `blocked` are server-assigned.
+enum ReviewVerdict: String, Sendable {
+    case approved
+    case needsRevision = "needs_revision"
+    case rejected
+}
+
 /// Thin client for the tasks server's loopback HTTP API.
 struct TasksClient: Sendable {
     // Honors the same TASKS_SERVER_PORT the server reads.
@@ -23,6 +40,17 @@ struct TasksClient: Sendable {
     /// Returns the full re-sorted queue.
     func reorderQueue(_ taskIds: [String]) async throws -> [TaskItem] {
         try await post("queue/reorder", body: ["task_ids": taskIds])
+    }
+
+    /// Deliver a review verdict. Returns the updated queue entry.
+    func reviewSpec(_ specId: String, verdict: ReviewVerdict, feedback: String?)
+        async throws -> SpecQueueItem
+    {
+        var body = ["status": verdict.rawValue]
+        if let feedback {
+            body["feedback"] = feedback
+        }
+        return try await post("spec-queue/\(specId)/review", body: body)
     }
 
     enum SSESignal: Sendable {
@@ -64,23 +92,28 @@ struct TasksClient: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
         let (data, response) = try await URLSession.shared.data(for: request)
-        try Self.checkOK(response)
+        try Self.checkOK(response, body: data)
         return try Self.makeDecoder().decode(T.self, from: data)
     }
 
     private func get<T: Decodable>(_ path: String) async throws -> T {
         let (data, response) = try await URLSession.shared.data(from: baseURL.appending(path: path))
-        try Self.checkOK(response)
+        try Self.checkOK(response, body: data)
         return try Self.makeDecoder().decode(T.self, from: data)
     }
 
-    private static func checkOK(_ response: URLResponse) throws {
+    private struct ServerError: Decodable {
+        let error: String
+    }
+
+    private static func checkOK(_ response: URLResponse, body: Data? = nil) throws {
         guard let http = response as? HTTPURLResponse,
             !(200..<300).contains(http.statusCode)
         else { return }
-        throw URLError(
-            .badServerResponse,
-            userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])
+        let message = body.flatMap { try? JSONDecoder().decode(ServerError.self, from: $0).error }
+        throw APIError(
+            status: http.statusCode,
+            message: message ?? "HTTP \(http.statusCode)")
     }
 
     private static func makeDecoder() -> JSONDecoder {
