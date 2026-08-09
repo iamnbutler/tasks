@@ -52,10 +52,6 @@ const DEFAULT_SCOUT_IMAGE: &str = "agent:v1";
 const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
 const DEFAULT_CLONE_URL_BASE: &str = "https://github.com";
 
-/// Branch scouts base their throwaway branch on. Per-project configuration is
-/// future work; every tracked repo uses `main` today.
-const BASE_BRANCH: &str = "main";
-
 /// How often the dispatch loop re-reads mode + queue.
 const DISPATCH_TICK: Duration = Duration::from_millis(500);
 
@@ -117,6 +113,9 @@ pub struct Config {
     /// Prefix for derived clone URLs (`GITHUB_CLONE_URL_BASE`); the full URL is
     /// `<base>/<owner>/<repo>.git`.
     pub clone_url_base: String,
+    /// Branch scouts base their throwaway branch on (`SCOUT_BASE_BRANCH`).
+    /// Future: per-project config.
+    pub scout_base_branch: String,
     /// VM shape requested from vm-pool for each scout.
     pub vm_config: VmConfig,
 }
@@ -145,7 +144,11 @@ impl Config {
             github_api_url: env_string("GITHUB_API_URL"),
             clone_url_base: env_string("GITHUB_CLONE_URL_BASE")
                 .unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into()),
-            vm_config: VmConfig::default(),
+            scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
+            vm_config: VmConfig {
+                env: scout_vm_env(),
+                ..VmConfig::default()
+            },
         })
     }
 
@@ -160,6 +163,39 @@ impl Config {
 
 fn env_string(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+/// Credentials for the agent inside Scout VMs, resolved host-side once at
+/// startup: `ANTHROPIC_API_KEY` from the environment, else the output of the
+/// host's Claude Code `apiKeyHelper` script (`~/.claude/anthropic_key.sh`)
+/// when one exists. Injected per-VM via `VmConfig.env`, never baked into
+/// images. Empty means scouts will fail agent auth — warned at startup.
+fn scout_vm_env() -> Vec<(String, String)> {
+    if let Some(key) = env_string("ANTHROPIC_API_KEY") {
+        return vec![("ANTHROPIC_API_KEY".into(), key)];
+    }
+    let helper = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".claude/anthropic_key.sh"));
+    if let Some(helper) = helper.filter(|p| p.exists()) {
+        match std::process::Command::new(&helper).output() {
+            Ok(out) if out.status.success() => {
+                let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !key.is_empty() {
+                    tracing::info!("scout credentials: host apiKeyHelper");
+                    return vec![("ANTHROPIC_API_KEY".into(), key)];
+                }
+            }
+            Ok(out) => {
+                tracing::warn!(status = %out.status, "apiKeyHelper failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not run apiKeyHelper");
+            }
+        }
+    }
+    tracing::warn!("no scout credentials found — scouts will fail agent auth");
+    Vec::new()
 }
 
 fn parse_env<T: std::str::FromStr>(
@@ -426,7 +462,7 @@ async fn top_up(
 
         let target = ScoutTarget {
             repo_clone_url: clone_url(config, &project),
-            base_branch: BASE_BRANCH.to_string(),
+            base_branch: config.scout_base_branch.clone(),
         };
         let task_id = task.id.clone();
         info!(
@@ -566,6 +602,7 @@ mod tests {
             github_token: None,
             github_api_url: None,
             clone_url_base: DEFAULT_CLONE_URL_BASE.into(),
+            scout_base_branch: "main".into(),
             vm_config: VmConfig::default(),
         }
     }
