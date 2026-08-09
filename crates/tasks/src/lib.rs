@@ -7,6 +7,7 @@ pub mod events;
 pub mod github;
 pub mod models;
 pub mod scout;
+pub mod server;
 pub mod store;
 
 pub use tasks_protocol as protocol;

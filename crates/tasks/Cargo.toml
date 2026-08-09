@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 tokio.workspace = true
+tokio-stream.workspace = true
+axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -28,6 +30,5 @@ tasks-protocol.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-axum.workspace = true
 vm-pool-service.workspace = true
 vm-pool-manager.workspace = true

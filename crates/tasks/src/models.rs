@@ -66,6 +66,10 @@ pub struct Task {
     pub gh_state: GhState,
     pub state: TaskState,
     pub priority: i32,
+    /// Position in the human-curated queue, 1-based. `None` means unranked and
+    /// sorts after every ranked task. Only ever written by explicit reorder
+    /// requests — never by the GitHub poller.
+    pub manual_rank: Option<i32>,
     pub ingested_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -229,6 +233,15 @@ pub struct SpecQueueEntry {
     pub approved_at: Option<DateTime<Utc>>,
     pub feedback: Option<String>,
     pub blocking_dependencies: Vec<TaskId>,
+}
+
+/// A spec queue entry joined with the id of the task the spec was written for.
+/// The queue listing needs the task id, and it lives on `specs`, not `spec_queue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecQueueItem {
+    #[serde(flatten)]
+    pub entry: SpecQueueEntry,
+    pub task_id: TaskId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

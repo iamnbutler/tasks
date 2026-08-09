@@ -56,6 +56,15 @@ pub enum EventPayload {
         from: Option<SpecQueueStatus>,
         to: SpecQueueStatus,
     },
+    /// The human-curated task queue was reordered. `task_ids` is the new order,
+    /// front to back; tasks not listed were left unranked.
+    QueueReordered {
+        task_ids: Vec<TaskId>,
+    },
+    /// The spec queue was reordered. Same semantics as [`Self::QueueReordered`].
+    SpecQueueReordered {
+        spec_ids: Vec<SpecId>,
+    },
     ModeChanged {
         from: Mode,
         to: Mode,

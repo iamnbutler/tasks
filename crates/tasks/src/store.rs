@@ -11,8 +11,8 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Complexity, GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Spec,
-    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    Complexity, GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Spec, SpecId,
+    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
 };
 
 /// Result of upserting an external record into our domain.
@@ -53,6 +53,8 @@ pub enum StoreError {
     BadEnum { column: &'static str, value: String },
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("invalid request: {0}")]
+    Invalid(String),
 }
 
 pub struct Store {
@@ -65,7 +67,10 @@ impl Store {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let url = format!("sqlite://{}?mode=rwc", path.display());
-        let pool = SqlitePoolOptions::new().max_connections(8).connect(&url).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect(&url)
+            .await?;
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Ok(Self { pool, event_tx })
@@ -99,12 +104,11 @@ impl Store {
     }
 
     pub async fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, repo_owner, repo_name, added_at FROM projects WHERE id = ?",
-        )
-        .bind(id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, repo_owner, repo_name, added_at FROM projects WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
         row.map(project_from_row).transpose()
     }
 
@@ -122,8 +126,8 @@ impl Store {
     pub async fn insert_task(&self, task: &Task) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO tasks (id, project_id, gh_issue_number, title, body, labels, \
-             gh_state, state, priority, ingested_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             gh_state, state, priority, manual_rank, ingested_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task.id.as_str())
         .bind(task.project_id.as_str())
@@ -134,6 +138,7 @@ impl Store {
         .bind(task.gh_state.as_str())
         .bind(task.state.as_str())
         .bind(task.priority)
+        .bind(task.manual_rank)
         .bind(task.ingested_at.to_rfc3339())
         .bind(task.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -144,7 +149,7 @@ impl Store {
     pub async fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StoreError> {
         let row = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, ingested_at, updated_at FROM tasks WHERE id = ?",
+             state, priority, manual_rank, ingested_at, updated_at FROM tasks WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -152,21 +157,75 @@ impl Store {
         row.map(task_from_row).transpose()
     }
 
+    /// List tasks in queue order: manual rank first (nulls last), then derived
+    /// priority descending, then oldest first.
     pub async fn list_tasks(&self) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, ingested_at, updated_at FROM tasks ORDER BY ingested_at",
+             state, priority, manual_rank, ingested_at, updated_at FROM tasks \
+             ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
     }
 
+    /// Replace the manual queue order with `ids`, assigning ranks 1..N in the
+    /// given order. Every task not listed is left unranked, so a reorder is
+    /// always a complete statement of the curated queue.
+    ///
+    /// Appends [`EventPayload::QueueReordered`] on success.
+    pub async fn set_queue_order(&self, ids: &[TaskId]) -> Result<(), StoreError> {
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                return Err(StoreError::Invalid(format!("duplicate task id: {id}")));
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut missing = Vec::new();
+        for id in ids {
+            let found = sqlx::query("SELECT 1 FROM tasks WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if found.is_none() {
+                missing.push(id.to_string());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(StoreError::NotFound(format!(
+                "tasks: {}",
+                missing.join(", ")
+            )));
+        }
+
+        sqlx::query("UPDATE tasks SET manual_rank = NULL WHERE manual_rank IS NOT NULL")
+            .execute(&mut *tx)
+            .await?;
+        for (idx, id) in ids.iter().enumerate() {
+            sqlx::query("UPDATE tasks SET manual_rank = ? WHERE id = ?")
+                .bind(idx as i64 + 1)
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        self.append_event(EventPayload::QueueReordered {
+            task_ids: ids.to_vec(),
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Upsert a task from a GitHub issue.
     ///
     /// On first sighting: insert with `state = new`, priority 0, `ingested_at = now`.
     /// On re-sighting: update title/body/labels/gh_state but keep our internal
-    /// id, state, priority, ingested_at untouched.
+    /// id, state, priority, manual_rank, ingested_at untouched. GitHub is never
+    /// allowed to disturb the human-curated ordering.
     pub async fn upsert_gh_issue(
         &self,
         project_id: &ProjectId,
@@ -174,7 +233,7 @@ impl Store {
     ) -> Result<UpsertOutcome<Task>, StoreError> {
         let existing = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, ingested_at, updated_at FROM tasks \
+             state, priority, manual_rank, ingested_at, updated_at FROM tasks \
              WHERE project_id = ? AND gh_issue_number = ?",
         )
         .bind(project_id.as_str())
@@ -221,6 +280,7 @@ impl Store {
             gh_state: issue.state,
             state: TaskState::New,
             priority: 0,
+            manual_rank: None,
             ingested_at: now,
             updated_at: now,
         };
@@ -228,11 +288,7 @@ impl Store {
         Ok(UpsertOutcome::Inserted(task))
     }
 
-    pub async fn update_task_state(
-        &self,
-        id: &TaskId,
-        state: TaskState,
-    ) -> Result<(), StoreError> {
+    pub async fn update_task_state(&self, id: &TaskId, state: TaskState) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
             .bind(state.as_str())
@@ -315,6 +371,16 @@ impl Store {
         row.map(session_from_row).transpose()
     }
 
+    pub async fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
+             exit_reason FROM sessions ORDER BY started_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(session_from_row).collect()
+    }
+
     // --- specs ---
 
     pub async fn insert_spec(&self, spec: &Spec) -> Result<(), StoreError> {
@@ -345,12 +411,19 @@ impl Store {
         row.map(spec_from_row).transpose()
     }
 
+    pub async fn list_specs(&self) -> Result<Vec<Spec>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, task_id, content, complexity, files_touched, \
+             created_at FROM specs ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(spec_from_row).collect()
+    }
+
     // --- spec queue ---
 
-    pub async fn upsert_spec_queue_entry(
-        &self,
-        entry: &SpecQueueEntry,
-    ) -> Result<(), StoreError> {
+    pub async fn upsert_spec_queue_entry(&self, entry: &SpecQueueEntry) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO spec_queue (spec_id, status, rank, approved_at, feedback, \
              blocking_dependencies) VALUES (?, ?, ?, ?, ?, ?) \
@@ -386,6 +459,156 @@ impl Store {
         row.map(spec_queue_entry_from_row).transpose()
     }
 
+    /// List the spec queue in review order: manual rank first (nulls last),
+    /// then oldest spec first. Each item carries the owning task id.
+    pub async fn list_spec_queue(&self) -> Result<Vec<SpecQueueItem>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT q.spec_id, q.status, q.rank, q.approved_at, q.feedback, \
+             q.blocking_dependencies, s.task_id FROM spec_queue q \
+             JOIN specs s ON s.id = q.spec_id \
+             ORDER BY q.rank IS NULL, q.rank, s.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(spec_queue_item_from_row).collect()
+    }
+
+    /// Replace the spec queue order with `ids`, assigning ranks 1..N. Entries
+    /// not listed are left unranked. Same semantics as [`Self::set_queue_order`].
+    ///
+    /// Appends [`EventPayload::SpecQueueReordered`] on success.
+    pub async fn set_spec_queue_order(&self, ids: &[SpecId]) -> Result<(), StoreError> {
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                return Err(StoreError::Invalid(format!("duplicate spec id: {id}")));
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut missing = Vec::new();
+        for id in ids {
+            let found = sqlx::query("SELECT 1 FROM spec_queue WHERE spec_id = ?")
+                .bind(id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+            if found.is_none() {
+                missing.push(id.to_string());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(StoreError::NotFound(format!(
+                "spec queue entries: {}",
+                missing.join(", ")
+            )));
+        }
+
+        sqlx::query("UPDATE spec_queue SET rank = NULL WHERE rank IS NOT NULL")
+            .execute(&mut *tx)
+            .await?;
+        for (idx, id) in ids.iter().enumerate() {
+            sqlx::query("UPDATE spec_queue SET rank = ? WHERE spec_id = ?")
+                .bind(idx as i64 + 1)
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        self.append_event(EventPayload::SpecQueueReordered {
+            spec_ids: ids.to_vec(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record a review outcome for a queued spec and advance the owning task.
+    ///
+    /// `status` must be a review outcome — `Approved`, `NeedsRevision` or
+    /// `Rejected`. `PendingReview` and `Blocked` are states the system assigns,
+    /// not verdicts a reviewer can render, and are rejected as invalid.
+    ///
+    /// Task side effects: approved → `Queued`, rejected → `Rejected`,
+    /// needs revision → back to `New` so it can be scouted again.
+    pub async fn review_spec(
+        &self,
+        spec_id: &SpecId,
+        status: SpecQueueStatus,
+        feedback: Option<String>,
+    ) -> Result<SpecQueueEntry, StoreError> {
+        let next_task_state = match status {
+            SpecQueueStatus::Approved => TaskState::Queued,
+            SpecQueueStatus::Rejected => TaskState::Rejected,
+            SpecQueueStatus::NeedsRevision => TaskState::New,
+            SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked => {
+                return Err(StoreError::Invalid(format!(
+                    "{} is not a review outcome",
+                    status.as_str()
+                )));
+            }
+        };
+
+        let entry = self
+            .get_spec_queue_entry(spec_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("spec queue entry {spec_id}")))?;
+        let spec = self
+            .get_spec(spec_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("spec {spec_id}")))?;
+        let task = self
+            .get_task(&spec.task_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {}", spec.task_id)))?;
+
+        let now = Utc::now();
+        let approved_at = match status {
+            SpecQueueStatus::Approved => Some(now),
+            _ => None,
+        };
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE spec_queue SET status = ?, approved_at = ?, feedback = ? \
+             WHERE spec_id = ?",
+        )
+        .bind(status.as_str())
+        .bind(approved_at.map(|t| t.to_rfc3339()))
+        .bind(&feedback)
+        .bind(spec_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(next_task_state.as_str())
+            .bind(now.to_rfc3339())
+            .bind(task.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::SpecQueueStatusChanged {
+            spec_id: spec_id.clone(),
+            from: Some(entry.status),
+            to: status,
+        })
+        .await?;
+        if task.state != next_task_state {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id: task.id.clone(),
+                from: task.state,
+                to: next_task_state,
+            })
+            .await?;
+        }
+
+        Ok(SpecQueueEntry {
+            status,
+            approved_at,
+            feedback,
+            ..entry
+        })
+    }
+
     // --- mode ---
 
     pub async fn get_mode(&self) -> Result<Mode, StoreError> {
@@ -414,20 +637,16 @@ impl Store {
     ///
     /// `seq` is assigned by SQLite's AUTOINCREMENT. If there are no
     /// subscribers or they've all fallen away, the broadcast silently drops.
-    pub async fn append_event(
-        &self,
-        payload: EventPayload,
-    ) -> Result<Event, StoreError> {
+    pub async fn append_event(&self, payload: EventPayload) -> Result<Event, StoreError> {
         let timestamp = Utc::now();
         let payload_json = serde_json::to_string(&payload)?;
 
-        let row = sqlx::query(
-            "INSERT INTO events (timestamp, payload) VALUES (?, ?) RETURNING seq",
-        )
-        .bind(timestamp.to_rfc3339())
-        .bind(payload_json)
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("INSERT INTO events (timestamp, payload) VALUES (?, ?) RETURNING seq")
+                .bind(timestamp.to_rfc3339())
+                .bind(payload_json)
+                .fetch_one(&self.pool)
+                .await?;
         let seq: i64 = row.try_get("seq")?;
 
         let event = Event {
@@ -448,23 +667,21 @@ impl Store {
 
     /// Return all events with seq >= `since`, ordered by seq ascending.
     pub async fn events_since(&self, since: i64) -> Result<Vec<Event>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq",
-        )
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq")
+                .bind(since)
+                .fetch_all(&self.pool)
+                .await?;
         rows.into_iter().map(event_from_row).collect()
     }
 
     /// Return the last N events, ordered by seq ascending.
     pub async fn recent_events(&self, limit: i64) -> Result<Vec<Event>, StoreError> {
-        let mut rows = sqlx::query(
-            "SELECT seq, timestamp, payload FROM events ORDER BY seq DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut rows =
+            sqlx::query("SELECT seq, timestamp, payload FROM events ORDER BY seq DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?;
         rows.reverse();
         rows.into_iter().map(event_from_row).collect()
     }
@@ -501,6 +718,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task, StoreError> {
             value: state_raw,
         })?,
         priority: row.try_get("priority")?,
+        manual_rank: row.try_get("manual_rank")?,
         ingested_at: parse_ts(&row.try_get::<String, _>("ingested_at")?, "ingested_at")?,
         updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
@@ -543,9 +761,7 @@ fn spec_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Spec, StoreError> {
     })
 }
 
-fn spec_queue_entry_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> Result<SpecQueueEntry, StoreError> {
+fn spec_queue_entry_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SpecQueueEntry, StoreError> {
     let status_raw: String = row.try_get("status")?;
     let approved_at: Option<String> = row.try_get("approved_at")?;
     let deps_raw: String = row.try_get("blocking_dependencies")?;
@@ -561,6 +777,14 @@ fn spec_queue_entry_from_row(
             .transpose()?,
         feedback: row.try_get("feedback")?,
         blocking_dependencies: serde_json::from_str(&deps_raw)?,
+    })
+}
+
+fn spec_queue_item_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SpecQueueItem, StoreError> {
+    let task_id = TaskId::from_raw(row.try_get::<String, _>("task_id")?);
+    Ok(SpecQueueItem {
+        entry: spec_queue_entry_from_row(row)?,
+        task_id,
     })
 }
 
@@ -608,6 +832,7 @@ mod tests {
             gh_state: GhState::Open,
             state: TaskState::New,
             priority: 10,
+            manual_rank: None,
             ingested_at: now,
             updated_at: now,
         }
@@ -893,6 +1118,354 @@ mod tests {
 
         store.set_mode(Mode::Stop).await.unwrap();
         assert_eq!(store.get_mode().await.unwrap(), Mode::Stop);
+    }
+
+    // --- queue ordering ---
+
+    fn task_with(project_id: &ProjectId, number: u64, priority: i32) -> Task {
+        Task {
+            gh_issue_number: number,
+            priority,
+            ..sample_task(project_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tasks_manual_rank_beats_priority_and_nulls_sort_last() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let high = task_with(&project.id, 1, 100);
+        let low = task_with(&project.id, 2, 1);
+        let unranked = task_with(&project.id, 3, 50);
+        for t in [&high, &low, &unranked] {
+            store.insert_task(t).await.unwrap();
+        }
+
+        // Default order is priority desc
+        let ids: Vec<_> = store
+            .list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![high.id.clone(), unranked.id.clone(), low.id.clone()]
+        );
+
+        store
+            .set_queue_order(&[low.id.clone(), high.id.clone()])
+            .await
+            .unwrap();
+
+        let tasks = store.list_tasks().await.unwrap();
+        let ids: Vec<_> = tasks.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![low.id.clone(), high.id.clone(), unranked.id.clone()]
+        );
+        assert_eq!(tasks[0].manual_rank, Some(1));
+        assert_eq!(tasks[1].manual_rank, Some(2));
+        assert_eq!(tasks[2].manual_rank, None);
+    }
+
+    #[tokio::test]
+    async fn set_queue_order_clears_ranks_of_omitted_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let a = task_with(&project.id, 1, 0);
+        let b = task_with(&project.id, 2, 0);
+        store.insert_task(&a).await.unwrap();
+        store.insert_task(&b).await.unwrap();
+
+        store
+            .set_queue_order(&[a.id.clone(), b.id.clone()])
+            .await
+            .unwrap();
+        store
+            .set_queue_order(std::slice::from_ref(&b.id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_task(&a.id).await.unwrap().unwrap().manual_rank,
+            None
+        );
+        assert_eq!(
+            store.get_task(&b.id).await.unwrap().unwrap().manual_rank,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_queue_order_rejects_unknown_and_duplicate_ids() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+
+        let ghost = TaskId::new();
+        let err = store
+            .set_queue_order(&[task.id.clone(), ghost.clone()])
+            .await
+            .unwrap_err();
+        match err {
+            StoreError::NotFound(msg) => assert!(msg.contains(ghost.as_str())),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        // Nothing was applied
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().manual_rank,
+            None
+        );
+
+        let err = store
+            .set_queue_order(&[task.id.clone(), task.id.clone()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn upsert_gh_issue_never_touches_manual_rank() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 9,
+            title: "First".into(),
+            body: "b".into(),
+            labels: vec![],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let task = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        store
+            .set_queue_order(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
+
+        let repoll = GhIssue {
+            title: "Retitled".into(),
+            labels: vec!["p0".into()],
+            ..issue
+        };
+        let observed = store
+            .upsert_gh_issue(&project.id, repoll)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(observed.manual_rank, Some(1));
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().manual_rank,
+            Some(1)
+        );
+    }
+
+    // --- spec review ---
+
+    /// Insert a project + task + session + spec + pending queue entry.
+    async fn seed_spec(store: &Store, number: u64) -> (Task, Spec) {
+        let project = match store.list_projects().await.unwrap().into_iter().next() {
+            Some(p) => p,
+            None => {
+                let p = sample_project();
+                store.insert_project(&p).await.unwrap();
+                p
+            }
+        };
+        let task = task_with(&project.id, number, 0);
+        store.insert_task(&task).await.unwrap();
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: format!("scout/{number}"),
+            status: SessionStatus::ScoutSucceeded,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            exit_reason: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        let spec = Spec {
+            id: SpecId::new(),
+            session_id: session.id.clone(),
+            task_id: task.id.clone(),
+            content: "## Spec".into(),
+            complexity: Complexity::Simple,
+            files_touched: vec![],
+            created_at: Utc::now(),
+        };
+        store.insert_spec(&spec).await.unwrap();
+        store
+            .upsert_spec_queue_entry(&SpecQueueEntry {
+                spec_id: spec.id.clone(),
+                status: SpecQueueStatus::PendingReview,
+                rank: None,
+                approved_at: None,
+                feedback: None,
+                blocking_dependencies: vec![],
+            })
+            .await
+            .unwrap();
+        (task, spec)
+    }
+
+    #[tokio::test]
+    async fn review_spec_approve_queues_task() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, spec) = seed_spec(&store, 1).await;
+
+        let entry = store
+            .review_spec(&spec.id, SpecQueueStatus::Approved, Some("ship it".into()))
+            .await
+            .unwrap();
+        assert_eq!(entry.status, SpecQueueStatus::Approved);
+        assert!(entry.approved_at.is_some());
+        assert_eq!(entry.feedback, Some("ship it".into()));
+
+        let loaded = store.get_spec_queue_entry(&spec.id).await.unwrap().unwrap();
+        assert_eq!(loaded, entry);
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn review_spec_outcomes_drive_task_state() {
+        let store = Store::open_in_memory().await.unwrap();
+
+        let (rejected_task, rejected_spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(&rejected_spec.id, SpecQueueStatus::Rejected, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_task(&rejected_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Rejected
+        );
+
+        let (revise_task, revise_spec) = seed_spec(&store, 2).await;
+        store
+            .update_task_state(&revise_task.id, TaskState::SpecReady)
+            .await
+            .unwrap();
+        store
+            .review_spec(
+                &revise_spec.id,
+                SpecQueueStatus::NeedsRevision,
+                Some("more detail".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_task(&revise_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::New
+        );
+    }
+
+    #[tokio::test]
+    async fn review_spec_rejects_non_outcome_status_and_unknown_spec() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_, spec) = seed_spec(&store, 1).await;
+
+        for bad in [SpecQueueStatus::PendingReview, SpecQueueStatus::Blocked] {
+            let err = store.review_spec(&spec.id, bad, None).await.unwrap_err();
+            assert!(matches!(err, StoreError::Invalid(_)), "{bad:?}");
+        }
+
+        let err = store
+            .review_spec(&SpecId::new(), SpecQueueStatus::Approved, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn review_spec_emits_events() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, spec) = seed_spec(&store, 1).await;
+
+        store
+            .review_spec(&spec.id, SpecQueueStatus::Approved, None)
+            .await
+            .unwrap();
+
+        let payloads: Vec<_> = store
+            .events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec.id.clone(),
+            from: Some(SpecQueueStatus::PendingReview),
+            to: SpecQueueStatus::Approved,
+        }));
+        assert!(payloads.contains(&EventPayload::TaskStateChanged {
+            task_id: task.id.clone(),
+            from: TaskState::New,
+            to: TaskState::Queued,
+        }));
+    }
+
+    #[tokio::test]
+    async fn spec_queue_listing_and_reorder() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task_a, spec_a) = seed_spec(&store, 1).await;
+        let (_, spec_b) = seed_spec(&store, 2).await;
+
+        let queue = store.list_spec_queue().await.unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].entry.spec_id, spec_a.id);
+        assert_eq!(queue[0].task_id, task_a.id);
+
+        store
+            .set_spec_queue_order(&[spec_b.id.clone(), spec_a.id.clone()])
+            .await
+            .unwrap();
+        let queue = store.list_spec_queue().await.unwrap();
+        assert_eq!(queue[0].entry.spec_id, spec_b.id);
+        assert_eq!(queue[0].entry.rank, Some(1));
+        assert_eq!(queue[1].entry.rank, Some(2));
+
+        let err = store
+            .set_spec_queue_order(&[SpecId::new()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_and_specs() {
+        let store = Store::open_in_memory().await.unwrap();
+        seed_spec(&store, 1).await;
+        seed_spec(&store, 2).await;
+
+        assert_eq!(store.list_sessions().await.unwrap().len(), 2);
+        assert_eq!(store.list_specs().await.unwrap().len(), 2);
     }
 
     // --- events ---

@@ -189,6 +189,7 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
         gh_state: GhState::Open,
         state: TaskState::New,
         priority: 0,
+        manual_rank: None,
         ingested_at: now,
         updated_at: now,
     };
