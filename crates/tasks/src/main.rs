@@ -31,6 +31,7 @@ environment:
   TASKS_POLL_INTERVAL    seconds between GitHub polls (default 60)
   SCOUT_MAX_CONCURRENT   scouts running at once (default 2)
   SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)
+  SCOUT_TIMEOUT_SECS     wall-clock budget per scout (default 3600)
   VM_POOL_SOCKET         vm-pool service socket (default /tmp/vm-pool.sock)
   GITHUB_TOKEN           required for polling; also used for repo clones
   GITHUB_API_URL         GraphQL endpoint override

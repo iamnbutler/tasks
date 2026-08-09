@@ -71,6 +71,7 @@ env / `.env`:
 | `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
+| `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |

@@ -20,6 +20,11 @@ ENV PATH="/home/agent/.cargo/bin:${PATH}"
 # Headless agent invocation. The prompt arrives on stdin; SPEC.md is the
 # artifact. Credentials (ANTHROPIC_API_KEY) are injected per-VM, never baked
 # into the image.
-ENV SCOUT_AGENT_CMD="claude --print --dangerously-skip-permissions"
+# stream-json turns stdout into typed JSON-lines (assistant messages, thinking,
+# tool calls with inputs, tool results, and a final result record with usage and
+# cost) which the server persists as the session transcript. --verbose is
+# mandatory: `--print --output-format stream-json` without it exits with
+# "requires --verbose" and every scout fails at the agent step.
+ENV SCOUT_AGENT_CMD="claude --print --output-format stream-json --verbose --dangerously-skip-permissions"
 
 ENTRYPOINT ["/usr/local/bin/scout-supervisor"]

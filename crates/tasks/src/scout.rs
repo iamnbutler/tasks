@@ -10,6 +10,7 @@
 //! `Arc<Scout>` or clone the underlying [`ClientHandle`]).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use thiserror::Error;
@@ -19,10 +20,10 @@ use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 
 use crate::events::EventPayload;
 use crate::models::{
-    Complexity, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
-    Task, TaskState,
+    Complexity, ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
+    SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptStream,
 };
-use crate::protocol::{ScoutCommand, ScoutEvent, TasksProtocol};
+use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -35,6 +36,10 @@ pub enum ScoutError {
     ScoutFailed(String),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
+    /// Wall-clock deadline hit. The message lands verbatim in
+    /// `sessions.exit_reason`, so both integration tests match on `timed out`.
+    #[error("scout timed out after {secs}s")]
+    Timeout { secs: u64 },
 }
 
 /// How this dispatcher boots a Scout VM. Uniform across dispatches — anything
@@ -45,6 +50,10 @@ pub struct ScoutConfig {
     pub image: String,
     /// VM configuration passed to vm-pool.
     pub vm_config: VmConfig,
+    /// Wall-clock budget for one dispatch, measured from entry to
+    /// [`Scout::dispatch`] so allocation is charged to it too. On expiry the
+    /// VM is deallocated and the dispatch fails with [`ScoutError::Timeout`].
+    pub timeout: Duration,
 }
 
 /// The repository a single dispatch explores. Per-project, so one dispatcher
@@ -84,6 +93,9 @@ impl Scout {
     /// `PendingReview`.
     pub async fn dispatch(&self, task: Task, target: &ScoutTarget) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
+        // Stamped before anything else so the deadline covers allocation too,
+        // making it a true wall-clock budget rather than a drain budget.
+        let started = Instant::now();
 
         // Subscribe before allocating so no event for our VM can be missed.
         let mut events = self.client.subscribe_events();
@@ -101,7 +113,20 @@ impl Scout {
             .await?;
 
         let session_id = SessionId::new();
-        let prompt = render_prompt(&task);
+
+        // A re-scout after a review carries the verdict forward. This is a fact
+        // about the task rather than a caller decision, so `dispatch`'s
+        // signature is unchanged and the dispatch loop needs no edit.
+        let prior = self.store.latest_reviewed_spec(&task.id).await?;
+        if let Some(p) = &prior {
+            info!(
+                task_id = %task.id,
+                prior_spec = %p.spec.id,
+                verdict = p.status.as_str(),
+                "re-scouting with the previous review"
+            );
+        }
+        let prompt = render_prompt(&task, prior.as_ref());
 
         // Allocate
         let vm_id = self
@@ -120,6 +145,7 @@ impl Scout {
             started_at: Utc::now(),
             completed_at: None,
             exit_reason: None,
+            usage: None,
         };
         self.store.insert_session(&session_row).await?;
         self.store
@@ -148,11 +174,53 @@ impl Scout {
             return Err(e.into());
         }
 
-        // Drain events until terminal Completed / Failed.
-        let result = drain_scout_events(&mut events, &vm_id).await;
+        // Drain events until terminal Completed / Failed, or until the budget
+        // runs out. `saturating_sub` means an already-blown budget fires
+        // immediately instead of wrapping.
+        let (mut sink, writer) = spawn_transcript_writer(self.store.clone(), session_id.clone());
+        let mut usage: Option<SessionUsage> = None;
+        let remaining = self.config.timeout.saturating_sub(started.elapsed());
+        let result = match tokio::time::timeout(
+            remaining,
+            drain_scout_events(&mut events, &vm_id, &mut sink, &mut usage),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                let secs = self.config.timeout.as_secs();
+                self.note_timeout(&task, &vm_id, secs).await;
+                Err(ScoutError::Timeout { secs })
+            }
+        };
+
+        // Close the queue and let the writer finish *before* any completion
+        // event is appended, so a client refetching on that event finds the
+        // whole transcript rather than a truncated one.
+        if sink.dropped_total > 0 {
+            warn!(
+                session_id = %session_id,
+                dropped = sink.dropped_total,
+                "transcript lines dropped under queue pressure"
+            );
+        }
+        drop(sink);
+        if let Err(e) = writer.await {
+            warn!(session_id = %session_id, error = %e, "transcript writer task failed");
+        }
+
+        // Recorded on the failure path too: a scout that burned tokens and then
+        // died is the case most worth costing.
+        if let Some(usage) = &usage
+            && let Err(e) = self.store.update_session_usage(&session_id, usage).await
+        {
+            warn!(session_id = %session_id, error = %e, "recording session usage failed");
+        }
 
         // Always try to deallocate. Ignore errors — the pool's health loop
-        // will reap if we die mid-call.
+        // will reap if we die mid-call. For a timeout this *is* the cancel:
+        // there is deliberately no in-band Cancel command, so freeing the slot
+        // means destroying the VM.
         if let Err(e) = self.client.deallocate(&vm_id).await {
             warn!(%vm_id, error = %e, "failed to deallocate scout VM");
         }
@@ -180,6 +248,26 @@ impl Scout {
                     .await?;
                 Err(e)
             }
+        }
+    }
+
+    /// Breadcrumb naming the deadline, written at expiry so the vm id and the
+    /// budget land in the entry. Best-effort on purpose: a failed breadcrumb
+    /// must not skip the deallocation that is the whole point of the timeout.
+    async fn note_timeout(&self, task: &Task, vm_id: &VmId, secs: u64) {
+        warn!(task_id = %task.id, %vm_id, timeout_secs = secs, "scout timed out");
+        if let Err(e) = self
+            .store
+            .append_event(EventPayload::Note {
+                source: crate::run::DISPATCHER.into(),
+                message: format!(
+                    "scout for {} timed out after {secs}s; deallocating {vm_id}",
+                    task.id
+                ),
+            })
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "could not record the timeout note");
         }
     }
 
@@ -313,6 +401,162 @@ struct DrainOutcome {
     exit_code: Option<i32>,
 }
 
+/// Longest single line we persist. One tool result can be enormous; past this
+/// the line is cut on a char boundary and marked.
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 32 * 1024;
+/// Total transcript bytes persisted for one session. Past this we write one
+/// notice and stop recording — the scout itself keeps running untouched.
+const MAX_TRANSCRIPT_BYTES_PER_SESSION: usize = 8 * 1024 * 1024;
+/// Depth of the hand-off queue between the drain loop and the writer task.
+const TRANSCRIPT_QUEUE_CAPACITY: usize = 1024;
+/// Lines coalesced into one transaction.
+const TRANSCRIPT_BATCH: usize = 64;
+
+/// The wire enum meets the domain enum here, at the dispatcher boundary, so
+/// neither `models` nor `store` has to know about the protocol crate.
+impl From<LogStream> for TranscriptStream {
+    fn from(s: LogStream) -> Self {
+        match s {
+            LogStream::Stdout => TranscriptStream::Stdout,
+            LogStream::Stderr => TranscriptStream::Stderr,
+        }
+    }
+}
+
+/// Non-blocking handle the drain loop pushes agent output into.
+///
+/// `push` must never await the store: the drain loop is also what waits for
+/// `Completed`, and it reads a vm-pool broadcast that drops the oldest events
+/// for slow consumers. Making SQLite latency into lost scout events would be a
+/// bad trade, so this is a `try_send` onto a bounded queue and a separate task
+/// does the writing.
+struct TranscriptSink {
+    tx: tokio::sync::mpsc::Sender<(TranscriptStream, String)>,
+    /// Bytes accepted so far, against `MAX_TRANSCRIPT_BYTES_PER_SESSION`.
+    bytes: usize,
+    /// Set once the byte budget is spent, so the notice is written once.
+    capped: bool,
+    /// Lines lost to queue pressure since the last marker.
+    dropped: u64,
+    /// Total dropped, for the summary line on the way out.
+    dropped_total: u64,
+}
+
+impl TranscriptSink {
+    fn push(&mut self, stream: TranscriptStream, line: String) {
+        if self.capped {
+            return;
+        }
+        let line = truncate_line(line);
+        if self.bytes + line.len() > MAX_TRANSCRIPT_BYTES_PER_SESSION {
+            self.capped = true;
+            // Best-effort: if even this doesn't fit the queue, the log still
+            // records the cap when the sink is dropped.
+            let _ = self.tx.try_send((
+                TranscriptStream::Stderr,
+                format!(
+                    "[tasks] transcript truncated: session passed {} bytes; \
+                     nothing further will be recorded (the scout is unaffected)",
+                    MAX_TRANSCRIPT_BYTES_PER_SESSION
+                ),
+            ));
+            return;
+        }
+
+        // A dropped line leaves no hole a reader could detect, because seq is
+        // assigned at persist time. So say so explicitly as soon as there's room.
+        if self.dropped > 0
+            && self
+                .tx
+                .try_send((
+                    TranscriptStream::Stderr,
+                    format!("[tasks] {} transcript line(s) dropped here", self.dropped),
+                ))
+                .is_ok()
+        {
+            self.dropped = 0;
+        }
+
+        match self.tx.try_send((stream, line)) {
+            Ok(()) => self.bytes += 1,
+            Err(_) => {
+                self.dropped += 1;
+                self.dropped_total += 1;
+            }
+        }
+    }
+}
+
+/// Cut an over-long line on a char boundary and say how much went missing.
+fn truncate_line(line: String) -> String {
+    if line.len() <= MAX_TRANSCRIPT_LINE_BYTES {
+        return line;
+    }
+    let mut cut = MAX_TRANSCRIPT_LINE_BYTES;
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = line.len() - cut;
+    let mut out = line;
+    out.truncate(cut);
+    out.push_str(&format!("…[tasks: truncated {dropped} bytes]"));
+    out
+}
+
+/// Spawn the task that drains the sink's queue into the store, coalescing up
+/// to [`TRANSCRIPT_BATCH`] lines per transaction. Finishes when the sink is
+/// dropped and the queue is empty.
+fn spawn_transcript_writer(
+    store: Arc<Store>,
+    session_id: SessionId,
+) -> (TranscriptSink, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(TRANSCRIPT_QUEUE_CAPACITY);
+    let handle = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(TRANSCRIPT_BATCH);
+        while rx.recv_many(&mut batch, TRANSCRIPT_BATCH).await > 0 {
+            if let Err(e) = store.append_transcript_lines(&session_id, &batch).await {
+                warn!(session_id = %session_id, error = %e, "persisting transcript lines failed");
+            }
+            batch.clear();
+        }
+    });
+    (
+        TranscriptSink {
+            tx,
+            bytes: 0,
+            capped: false,
+            dropped: 0,
+            dropped_total: 0,
+        },
+        handle,
+    )
+}
+
+/// Pull token usage out of the final stream-json `result` record.
+///
+/// Read field by field out of a `Value` rather than deserialized into a struct:
+/// the record's shape belongs to Claude Code, and a renamed key must cost us a
+/// null, not a failed scout. Key order is not assumed — real records don't put
+/// `type` first.
+fn parse_usage(line: &str) -> Option<SessionUsage> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    let usage = value.get("usage");
+    let u64_at =
+        |obj: Option<&serde_json::Value>, key: &str| -> Option<u64> { obj?.get(key)?.as_u64() };
+    Some(SessionUsage {
+        input_tokens: u64_at(usage, "input_tokens"),
+        output_tokens: u64_at(usage, "output_tokens"),
+        cache_read_input_tokens: u64_at(usage, "cache_read_input_tokens"),
+        cache_creation_input_tokens: u64_at(usage, "cache_creation_input_tokens"),
+        total_cost_usd: value.get("total_cost_usd").and_then(|v| v.as_f64()),
+        duration_ms: value.get("duration_ms").and_then(|v| v.as_u64()),
+        num_turns: value.get("num_turns").and_then(|v| v.as_u64()),
+    })
+}
+
 /// Consume this dispatch's own event subscription until its VM reports a
 /// terminal Completed/Failed. Events from other VMs (concurrent scouts) are
 /// ignored; service errors for our requests surface as [`ClientError`] on the
@@ -320,6 +564,8 @@ struct DrainOutcome {
 async fn drain_scout_events(
     events: &mut EventStream<TasksProtocol>,
     target_vm: &VmId,
+    sink: &mut TranscriptSink,
+    usage_out: &mut Option<SessionUsage>,
 ) -> Result<DrainOutcome, ScoutError> {
     let mut branch: Option<String> = None;
     let mut exit_code: Option<i32> = None;
@@ -331,8 +577,16 @@ async fn drain_scout_events(
                 ScoutEvent::Started { branch: b } => {
                     branch = Some(b);
                 }
-                ScoutEvent::Progress { .. } => {
-                    // Surface later via events/log tailing if useful.
+                ScoutEvent::Progress { stream, line } => {
+                    // The result record is the last thing the agent prints; it
+                    // is also just another stdout line, so it gets persisted
+                    // like the rest and parsed on the way past.
+                    if stream == LogStream::Stdout
+                        && let Some(usage) = parse_usage(&line)
+                    {
+                        *usage_out = Some(usage);
+                    }
+                    sink.push(stream.into(), line);
                 }
                 ScoutEvent::ImplementationFinished { exit_code: c } => {
                     exit_code = Some(c);
@@ -359,11 +613,16 @@ async fn drain_scout_events(
     }
 }
 
-fn render_prompt(task: &Task) -> String {
+/// Build the scout prompt, splicing in the previous attempt when the task has
+/// one. The section sits between the issue body and the instructions so the
+/// model reads issue → what went wrong last time → what to do.
+fn render_prompt(task: &Task, prior: Option<&ReviewedSpec>) -> String {
+    let previous = prior.map(render_previous_attempt).unwrap_or_default();
     format!(
         "You are a Scout in the Double Diamond architecture.\n\n\
          ## Issue: {title} (#{num})\n\n\
          {body}\n\n\
+         {previous}\
          ## Your job\n\n\
          1. Implement a working solution in the cloned repo (cwd).\n\
          2. Run the project's tests / lint / typecheck — get them green.\n\
@@ -388,7 +647,58 @@ fn render_prompt(task: &Task) -> String {
         title = task.title,
         num = task.gh_issue_number,
         body = task.body,
+        previous = previous,
     )
+}
+
+/// Render the `## Previous attempt` section: the verdict, the reviewer's
+/// feedback verbatim, and the spec it was written about. The spec is quoted
+/// rather than summarised because feedback like "section 3 is underspecified"
+/// is meaningless without section 3.
+fn render_previous_attempt(prior: &ReviewedSpec) -> String {
+    let feedback = prior
+        .feedback
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .unwrap_or("(no written feedback was left)");
+    let fence = fence_for(&prior.spec.content);
+    format!(
+        "## Previous attempt\n\n\
+         A previous scout explored this same issue and produced the spec below. \
+         A reviewer read it and returned a verdict of **{verdict}**.\n\n\
+         Treat the reviewer's feedback as a requirement, not a suggestion. Do not \
+         resubmit the previous spec unchanged, and do not repeat the shortcomings \
+         it identifies. Explore the current code yourself — the previous spec may \
+         itself be out of date.\n\n\
+         ### Reviewer feedback\n\n\
+         {feedback}\n\n\
+         ### Previous spec\n\n\
+         {fence}markdown\n\
+         {spec}\n\
+         {fence}\n\n",
+        verdict = prior.status.as_str(),
+        feedback = feedback,
+        fence = fence,
+        spec = prior.spec.content.trim_end(),
+    )
+}
+
+/// A fence long enough to quote `content` intact: one backtick longer than the
+/// longest backtick run inside it, minimum three. Specs routinely contain
+/// fenced code, and a plain ``` wrapper would be closed by the first one.
+fn fence_for(content: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
 }
 
 /// The Scout's self-reported complexity: the first non-empty line after a
@@ -438,6 +748,121 @@ fn infer_complexity(files_touched: &[String]) -> Complexity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_fixture() -> Task {
+        Task {
+            id: crate::models::TaskId::new(),
+            project_id: crate::models::ProjectId::new(),
+            gh_issue_number: 42,
+            title: "A title".into(),
+            body: "The issue body.".into(),
+            labels: vec![],
+            gh_state: crate::models::GhState::Open,
+            state: TaskState::New,
+            priority: 0,
+            manual_rank: None,
+            dispatch_attempts: 0,
+            ingested_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn reviewed(content: &str, feedback: Option<&str>) -> ReviewedSpec {
+        ReviewedSpec {
+            spec: Spec {
+                id: SpecId::new(),
+                session_id: SessionId::new(),
+                task_id: crate::models::TaskId::new(),
+                content: content.into(),
+                complexity: Complexity::Simple,
+                files_touched: vec![],
+                created_at: Utc::now(),
+            },
+            status: SpecQueueStatus::NeedsRevision,
+            feedback: feedback.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_fresh_prompt_has_no_previous_attempt_section() {
+        let prompt = render_prompt(&task_fixture(), None);
+        assert!(!prompt.contains("Previous attempt"));
+        // The body must still run straight into the instructions.
+        assert!(prompt.contains("The issue body.\n\n## Your job"));
+    }
+
+    #[test]
+    fn a_re_scout_prompt_carries_the_verdict_feedback_and_prior_spec() {
+        let prior = reviewed(
+            "## Spec: old\n\nSection 3 is thin.",
+            Some("Flesh out section 3."),
+        );
+        let prompt = render_prompt(&task_fixture(), Some(&prior));
+
+        let attempt = prompt.find("## Previous attempt").expect("section present");
+        let verdict = prompt.find("needs_revision").expect("verdict present");
+        let feedback = prompt
+            .find("Flesh out section 3.")
+            .expect("feedback present");
+        let spec = prompt
+            .find("Section 3 is thin.")
+            .expect("prior spec present");
+        let job = prompt.find("## Your job").expect("instructions present");
+
+        // Order matters: issue → verdict → feedback → prior spec → instructions.
+        assert!(attempt < verdict && verdict < feedback && feedback < spec && spec < job);
+    }
+
+    #[test]
+    fn missing_or_blank_feedback_still_renders() {
+        for empty in [None, Some(""), Some("   ")] {
+            let prompt = render_prompt(&task_fixture(), Some(&reviewed("spec body", empty)));
+            assert!(prompt.contains("## Previous attempt"));
+            assert!(prompt.contains("no written feedback"));
+        }
+    }
+
+    #[test]
+    fn the_fence_outlives_fences_nested_in_the_quoted_spec() {
+        // A spec containing its own ```rust block would break out of a plain
+        // ``` wrapper and merge its headings into the prompt's structure.
+        let nested = "## Spec\n\n```rust\nfn x() {}\n```\n";
+        let prompt = render_prompt(&task_fixture(), Some(&reviewed(nested, Some("f"))));
+        assert!(prompt.contains("````markdown"));
+        assert_eq!(fence_for("no fences"), "```");
+        assert_eq!(fence_for("a ``` b"), "````");
+        assert_eq!(fence_for("a ````` b"), "``````");
+    }
+
+    #[test]
+    fn usage_parses_regardless_of_key_order_and_survives_junk() {
+        let record = r#"{"subtype":"success","duration_ms":1234,"num_turns":3,
+            "total_cost_usd":0.0421,"usage":{"input_tokens":1200,"output_tokens":340},
+            "type":"result"}"#;
+        let usage = parse_usage(record).expect("parses with type last");
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(340));
+        assert_eq!(usage.total_cost_usd, Some(0.0421));
+        assert_eq!(usage.num_turns, Some(3));
+        // Absent keys are nulls, not failures.
+        assert_eq!(usage.cache_read_input_tokens, None);
+
+        assert!(parse_usage(r#"{"type":"assistant"}"#).is_none());
+        assert!(parse_usage("not json at all").is_none());
+        assert!(parse_usage(r#"{"type":"result"}"#).is_some());
+    }
+
+    #[test]
+    fn over_long_lines_are_cut_on_a_char_boundary_and_marked() {
+        // Multi-byte chars straddling the cut must not panic or corrupt.
+        let line = "é".repeat(MAX_TRANSCRIPT_LINE_BYTES);
+        let out = truncate_line(line);
+        assert!(out.contains("[tasks: truncated"));
+        assert!(out.len() < MAX_TRANSCRIPT_LINE_BYTES + 64);
+
+        let short = "left alone".to_string();
+        assert_eq!(truncate_line(short.clone()), short);
+    }
 
     #[test]
     fn parse_complexity_reads_section() {

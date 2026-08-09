@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 use crate::events::{Event, EventPayload};
 use crate::models::{
     Mode, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId,
+    Task, TaskId, TranscriptLine,
 };
 use crate::store::{Store, StoreError};
 
@@ -39,6 +39,12 @@ const DEFAULT_EVENT_LIMIT: i64 = 100;
 
 /// Interval between SSE keep-alive comments.
 const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Transcript lines `/sessions/{id}/transcript` returns without an explicit
+/// `limit`, and the ceiling on one the caller asks for. The SSE replay pages at
+/// the maximum until it catches up.
+const DEFAULT_TRANSCRIPT_LIMIT: i64 = 500;
+const MAX_TRANSCRIPT_LIMIT: i64 = 2000;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -88,6 +94,11 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/tasks/{task_id}", get(get_task))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
+        .route("/sessions/{session_id}/transcript", get(list_transcript))
+        .route(
+            "/sessions/{session_id}/transcript/stream",
+            get(stream_transcript),
+        )
         .route("/specs", get(list_specs))
         .route("/specs/{spec_id}", get(get_spec))
         .route("/spec-queue", get(list_spec_queue))
@@ -317,6 +328,107 @@ async fn set_mode(
     Ok(Json(ModeResponse { mode }))
 }
 
+// --- transcripts ---
+
+#[derive(Debug, Deserialize)]
+struct TranscriptQuery {
+    since: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// Catch-up read of a session's agent output. `since` is **inclusive**, to
+/// match `/events?since=` — a tailing client passes `last_seq + 1`. An empty
+/// array means "nothing recorded", not an error: sessions that predate
+/// transcript capture have none.
+async fn list_transcript(
+    State(store): State<Arc<Store>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<Vec<TranscriptLine>>> {
+    let session_id = SessionId::from_raw(session_id);
+    if store.get_session(&session_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("session {session_id}")));
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_TRANSCRIPT_LIMIT)
+        .min(MAX_TRANSCRIPT_LIMIT);
+    if limit <= 0 {
+        return Err(ApiError::BadRequest("limit must be positive".into()));
+    }
+    let lines = store
+        .transcript_since(&session_id, query.since.unwrap_or(0), limit)
+        .await?;
+    Ok(Json(lines))
+}
+
+/// SSE tail of a session's transcript: replay from `since`, then live lines.
+///
+/// The replay pages until it catches up and deliberately takes no `limit`. The
+/// obvious alternative — one limit-sized page, then attach the tail — hands the
+/// client a stream that jumps silently from the end of the page to the newest
+/// line, and a stream is exactly the shape in which that hole goes unnoticed.
+/// The per-session byte cap is what keeps reading it all affordable.
+async fn stream_transcript(
+    State(store): State<Arc<Store>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
+    let session_id = SessionId::from_raw(session_id);
+    if store.get_session(&session_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("session {session_id}")));
+    }
+
+    // Subscribe *before* reading history, so a line appended between the two
+    // steps arrives on the live channel instead of falling down the gap.
+    let live = store.subscribe_transcript();
+
+    let mut backfill = Vec::new();
+    let mut next = query.since.unwrap_or(0);
+    loop {
+        let page = store
+            .transcript_since(&session_id, next, MAX_TRANSCRIPT_LIMIT)
+            .await?;
+        let Some(last) = page.last() else { break };
+        next = last.seq + 1;
+        let full = page.len() as i64 == MAX_TRANSCRIPT_LIMIT;
+        backfill.extend(page);
+        if !full {
+            break;
+        }
+    }
+
+    let session_filter = session_id.clone();
+    let tail = BroadcastStream::new(live).filter_map(move |result| {
+        let line = match result {
+            Ok(line) => line,
+            Err(err) => {
+                warn!(error = %err, "transcript sse subscriber lagged");
+                return None;
+            }
+        };
+        // Drop other sessions, and anything the backfill already delivered.
+        if line.session_id != session_filter || line.seq < next {
+            return None;
+        }
+        to_sse(&line)
+    });
+
+    let replay: Vec<_> = backfill.iter().filter_map(to_sse).collect();
+    let stream = tokio_stream::iter(replay).chain(tail);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE)))
+}
+
+fn to_sse(line: &TranscriptLine) -> Option<Result<SseEvent, Infallible>> {
+    match SseEvent::default().json_data(line) {
+        Ok(sse) => Some(Ok(sse)),
+        Err(err) => {
+            error!(error = %err, seq = line.seq, "serializing transcript line for sse");
+            None
+        }
+    }
+}
+
 // --- events ---
 
 #[derive(Debug, Deserialize)]
@@ -436,6 +548,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
             exit_reason: None,
+            usage: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -1003,5 +1116,207 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched, spec);
+    }
+
+    // --- transcripts (#759) ---
+
+    /// A running session with no transcript yet.
+    async fn seed_session(store: &Arc<Store>) -> SessionId {
+        let (_, project) = (store, {
+            let project = Project {
+                id: ProjectId::new(),
+                repo_owner: "o".into(),
+                repo_name: "r".into(),
+                added_at: Utc::now(),
+            };
+            store.insert_project(&project).await.unwrap();
+            project
+        });
+        let task = insert_task(store, &project, 1, 0).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        session.id
+    }
+
+    #[tokio::test]
+    async fn transcript_reads_page_and_honour_inclusive_since() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let session_id = seed_session(&store).await;
+        let batch: Vec<_> = (1..=5)
+            .map(|i| (crate::models::TranscriptStream::Stdout, format!("line {i}")))
+            .collect();
+        store
+            .append_transcript_lines(&session_id, &batch)
+            .await
+            .unwrap();
+
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let all: Vec<TranscriptLine> = http
+            .get(format!("{base}/sessions/{session_id}/transcript"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].line, "line 1");
+
+        // Inclusive, like /events?since=.
+        let tail: Vec<TranscriptLine> = http
+            .get(format!("{base}/sessions/{session_id}/transcript?since=4"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(tail.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![4, 5]);
+
+        // An unknown session is a 404, not an empty array — those mean
+        // different things to a client.
+        let resp = http
+            .get(format!("{base}/sessions/sess_nope/transcript"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let resp = http
+            .get(format!("{base}/sessions/{session_id}/transcript?limit=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// A session with no lines is "nothing recorded", not an error.
+    #[tokio::test]
+    async fn an_empty_transcript_is_an_empty_array() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let session_id = seed_session(&store).await;
+        let base = spawn(store.clone()).await;
+
+        let lines: Vec<TranscriptLine> = reqwest::Client::new()
+            .get(format!("{base}/sessions/{session_id}/transcript"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(lines.is_empty());
+    }
+
+    /// The regression guard for the SSE replay: one limit-sized page followed
+    /// by the live tail would silently skip everything in between. The count is
+    /// an exact multiple of the page size, which is the boundary where a naive
+    /// loop stops early.
+    #[tokio::test]
+    async fn transcript_stream_replays_past_one_page_without_a_hole() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let session_id = seed_session(&store).await;
+
+        let total = (MAX_TRANSCRIPT_LIMIT * 2) as usize;
+        let batch: Vec<_> = (1..=total)
+            .map(|i| (crate::models::TranscriptStream::Stdout, format!("line {i}")))
+            .collect();
+        store
+            .append_transcript_lines(&session_id, &batch)
+            .await
+            .unwrap();
+
+        let base = spawn(store.clone()).await;
+        let mut stream = reqwest::Client::new()
+            .get(format!("{base}/sessions/{session_id}/transcript/stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let mut body = String::new();
+        let mut seqs: Vec<i64> = Vec::new();
+        while seqs.len() < total {
+            let chunk = tokio::time::timeout(Duration::from_secs(30), stream.chunk())
+                .await
+                .expect("sse chunk timed out")
+                .unwrap()
+                .expect("sse stream closed early");
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(end) = body.find("\n\n") {
+                let frame: String = body.drain(..end + 2).collect();
+                if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) {
+                    seqs.push(serde_json::from_str::<TranscriptLine>(data).unwrap().seq);
+                }
+            }
+        }
+
+        // Dense 1..=total with nothing skipped in the middle.
+        assert_eq!(seqs.len(), total);
+        assert_eq!(seqs, (1..=total as i64).collect::<Vec<_>>());
+    }
+
+    /// Subscribe-then-backfill: a line appended while the handler is reading
+    /// history must arrive on the live channel rather than fall down the gap.
+    #[tokio::test]
+    async fn transcript_stream_tails_lines_appended_after_it_attached() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let session_id = seed_session(&store).await;
+        store
+            .append_transcript_lines(
+                &session_id,
+                &[(crate::models::TranscriptStream::Stdout, "historic".into())],
+            )
+            .await
+            .unwrap();
+
+        let base = spawn(store.clone()).await;
+        let mut stream = reqwest::Client::new()
+            .get(format!("{base}/sessions/{session_id}/transcript/stream"))
+            .send()
+            .await
+            .unwrap();
+
+        store
+            .append_transcript_lines(
+                &session_id,
+                &[(crate::models::TranscriptStream::Stderr, "live".into())],
+            )
+            .await
+            .unwrap();
+
+        let mut body = String::new();
+        let mut lines: Vec<TranscriptLine> = Vec::new();
+        while lines.len() < 2 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+                .await
+                .expect("sse chunk timed out")
+                .unwrap()
+                .expect("sse stream closed early");
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(end) = body.find("\n\n") {
+                let frame: String = body.drain(..end + 2).collect();
+                if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) {
+                    lines.push(serde_json::from_str(data).unwrap());
+                }
+            }
+        }
+        assert_eq!(lines[0].line, "historic");
+        assert_eq!(lines[1].line, "live");
+        assert_eq!(
+            lines[1].seq, 2,
+            "no duplicate or skipped seq at the handoff"
+        );
     }
 }
