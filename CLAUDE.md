@@ -1,155 +1,77 @@
-# Tasks
+# Tasks (v2)
 
-A human-in-the-loop platform that orchestrates coding agents to get project work done.
+A human-in-the-loop platform that orchestrates coding agents (headless Claude
+Code) to get project work done, built around the Double Diamond architecture
+(issue #744): parallel Scout exploration → spec queue → serial Builder
+implementation.
+
+## Load-bearing design rules
+
+- **The Scout/Builder information barrier is inviolable.** Builders never see
+  Scout code — the spec is the deliverable. Specs are text, so a Builder run
+  can batch N specs into one branch. Never propose reusing Scout branches.
+- **Never persist a GitHub-owned fact** (PR mergeable/SHA/CI, issue
+  open-closed, labels). Query at decision time. Persist only Tasks-owned
+  state plus append-only decisions keyed to immutable SHAs. GitHub writes go
+  through the server, never through agents.
+- **Manual queue is human-authoritative.** `tasks.manual_rank` is set only via
+  the API; the GitHub poller must never write it.
+- **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
+  must never depend on tasks crates. App vocabulary enters vm-pool only
+  through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
+  stays independently publishable.
+- **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
+  loop.** The server consumes Claude Code's typed output (stream-json, hooks,
+  MCP tools, structured outputs); it does not reimplement the loop.
 
 ## Project structure
 
-- `spec/` — Specification documents
-  - `spec.md` — Main platform spec
-  - `session-runtime.md` — Session runtime architecture (container provider, supervisor, protocol)
-  - `github.md` — GitHub integration: normalized model, GraphQL queries, polling
-- `crates/` — Rust crates (host-side server)
-  - `app/` — Binary entry point: startup, run loops, component wiring
-  - `events/` — Event system: append-only log, pub/sub
-  - `github/` — GitHub integration: GraphQL client, normalized model, polling
-  - `agent/` — LLM abstraction layer: Provider trait, Anthropic client, session, chain builder
-  - `models/` — Shared domain types: project, task, merge entry, task state
-  - `orchestrator/` — Orchestrator: AI project foreman, quality evaluation, merge authority
-  - `runtime/` — Session runtime: container lifecycle, protocol, transport
-  - `server/` — Server: domain models, operating modes, merge queue, presence
-  - `session/` — Session management: lifecycle, monitoring, event bridging
-  - `store/` — Persistent storage: SQLite for projects, tasks, merge queue
-  - `supervisor/` — Container supervisor binary (PID 1 inside containers)
-  - `desktop/` — GPUI-based native desktop app (macOS/Linux)
-  - `gpui-client/` — HTTP API client library for GPUI frontend
-- `web/` — React + Vite frontend (shadcn/ui + Tailwind CSS v4 + TanStack Table)
+- `crates/tasks/` — the server binary: models, SQLite store, event log,
+  GitHub polling (read-only intake), scout dispatcher, HTTP API + SSE
+- `crates/tasks-protocol/` — ScoutCommand/ScoutEvent, the `AppProtocol` impl
+  shared between server and Scout VMs
+- `crates/scout-supervisor/` — PID 1 inside Scout VMs: clone, branch, run the
+  agent, report the spec back
+- `crates/vm-pool/` — vendored VM infrastructure (protocol, pool, service,
+  client, supervisor). Has its own CLAUDE.md and TODO.md; conventions there
+  apply within it (notably: no mocks, real processes in tests)
+- `images/` — container image definitions (base, agent, automation)
+- `docs/plans/` — implementation plans; `docs/vm-pool.md` — vm-pool spec
+- `spec` for the platform: issue #744 + docs/plans/2026-08-09-v2-resume.md
 
-## Key decisions
+## Conventions
 
-- Host runtime: Rust
-- Container supervisor: Rust (PID 1 inside containers, built from same workspace)
-- Session isolation: apple/container (one lightweight Linux VM per session)
-- Host ↔ container communication: JSON-line protocol over stdio
-- Agent provider: Claude Code (initial), pluggable
-- Container images: built with `container build` (apple/container CLI), NOT Docker
-- Data directory: `~/.local/state/tasks/` (SQLite + event logs), configurable via `TASKS_DATA_DIR`
-- Config: `.env` file at project root, loaded automatically via dotenvy
-
-## Working on issues
-
-- When making design decisions during brainstorming or implementation, leave comments on the relevant GitHub issue with the decision and reasoning. Don't edit the issue body — comments create a timeline and make active issues more glanceable in the list.
-
-## Building the container image
-
-```sh
-make container-image   # cross-compile supervisor + build image
-```
-
-The supervisor binary is cross-compiled on the host for `aarch64-unknown-linux-gnu` and copied into the container image. This is faster than building inside Docker.
-
-**Prerequisites** (run `make check-linker` to verify):
-- Cross-linker: `brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu` (macOS) or `apt install gcc-aarch64-linux-gnu` (Linux)
-- Rust target: `rustup target add aarch64-unknown-linux-gnu`
-
-**Individual targets:**
-- `make supervisor` — build the supervisor binary only
-- `make container-image` — build supervisor + container image
-- `make check-linker` — verify cross-compilation toolchain is installed
+- Tests use real processes and real SQLite (in-memory or tempfile). No mocks.
+  HTTP tests bind real servers on `127.0.0.1:0`.
+- Errors: `thiserror` enums per module. Logging: `tracing`.
+- Rust edition 2024, `cargo fmt` + `cargo clippy --workspace --all-targets`
+  clean before committing.
 
 ## Running
 
 ```sh
-cargo run -- add-project owner/repo   # add a project (stored in SQLite)
-cargo run -- run                      # headless mode
-cargo run -- run --web                # web UI (serves on port 4800)
+cargo run -p tasks -- serve            # poller + scout dispatcher + HTTP API
+cargo run -p tasks -- add-project owner/repo
+cargo test --workspace
 ```
 
-Requires `.env` with `GITHUB_TOKEN` and `ANTHROPIC_API_KEY`.
+`serve` runs the Diamond 1 loop (`crates/tasks/src/run.rs`): GitHub intake,
+scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates
+*new* work only — `Pause`/`Stop` never interrupt a scout already in flight.
+Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
+polling, an unreachable vm-pool disables dispatch and reconnects periodically,
+and the API stays up either way.
 
-## Work queue configuration
+Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`). Config via
+env / `.env`:
 
-The work queue controls how tasks are dispatched to containers. These environment variables can be set in `.env`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WORK_QUEUE_TIMEOUT` | 15 | Seconds between dispatches (rate limiting) |
-| `CONTAINER_TIMEOUT` | 7200 | Max seconds a container can work before being reclaimed (2 hours) |
-| `HEALTH_CHECK_INTERVAL` | 30 | Seconds between health checks for dead/stale containers |
-
-The work queue ensures only one container works on each task at a time, preventing duplicate implementations.
-
-## Web frontend
-
-- `web/` — React + Vite SPA with shadcn/ui + Tailwind CSS v4 + TanStack Table
-- Built output goes to `web/build/`, served by the Rust server at `/`
-- API endpoints at `/api/*`, SSE event stream at `/api/events`
-- Uses bun as package manager
-
-```sh
-bun install && bun web build   # build frontend
-bun web dev                    # dev mode (proxies /api to localhost:4800)
-```
-
-### API endpoints
-
-- `GET /api/snapshot` — Full system state (spec Section 16.3)
-- `GET /api/tasks` — List all tasks
-- `GET /api/tasks/:id` — Get single task
-- `GET /api/tasks/:id/events` — Task event history
-- `GET /api/projects` — List projects
-- `POST /api/projects` — Add project `{ repo: "owner/repo" }`
-- `DELETE /api/projects/:id` — Remove a project
-- `GET /api/merge-queue` — Merge queue entries
-- `GET /api/mode` — Current operating mode
-- `POST /api/mode` — Set operating mode `{ mode: "play"|"pause"|"stop" }`
-- `POST /api/merge-queue/:id/approve` — Approve merge entry
-- `POST /api/merge-queue/:id/reject` — Reject merge entry
-- `POST /api/merge-queue/flush` — Flush approved entries (Pause mode only)
-- `POST /api/tasks/:id/chat` — Send chat message to agent session `{ message: string }`
-- `GET /api/events` — SSE live event stream (optional `?pattern=&task_id=` filters)
-
-## Desktop app (GPUI)
-
-A native desktop application built with [GPUI](https://github.com/zed-industries/zed) (Zed's GPU-accelerated UI framework).
-
-- `crates/desktop/` — Main desktop app crate
-- `crates/gpui-client/` — Shared HTTP API client
-
-### Building
-
-The desktop app requires system libraries for X11/Wayland:
-
-**macOS:**
-```sh
-# No additional dependencies needed
-cargo build --package tasks-desktop
-```
-
-**Linux (Debian/Ubuntu):**
-```sh
-sudo apt install libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-cargo build --package tasks-desktop
-```
-
-### Running
-
-```sh
-# Start the server first
-cargo run -- run --web
-
-# In another terminal, run the desktop app
-cargo run --package tasks-desktop
-```
-
-### Configuration
-
-- `TASKS_SERVER_URL` — Server URL (default: `http://localhost:4800`)
-
-### Architecture
-
-- **api.rs** — HTTP API client (mirrors web frontend's `api.ts`)
-- **sse.rs** — SSE client with auto-reconnection
-- **state.rs** — Reactive app state management (GPUI Model-based)
-- **theme.rs** — Theming system matching web frontend's Tailwind colors
-- **components/** — UI primitives (Badge, Button, Card, Input)
-- **views/** — View components (Dashboard, etc.)
+| var | default | |
+| --- | --- | --- |
+| `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
+| `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
+| `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
+| `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
+| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
+| `GITHUB_TOKEN` | — | required for polling; also used for clones |
+| `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
+| `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |

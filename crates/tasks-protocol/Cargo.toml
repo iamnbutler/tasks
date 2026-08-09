@@ -1,0 +1,14 @@
+[package]
+name = "tasks-protocol"
+description = "Protocol types between the tasks server and Scout VMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+vm-pool-protocol.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

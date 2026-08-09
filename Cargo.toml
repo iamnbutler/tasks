@@ -1,31 +1,57 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
-exclude = ["crates/desktop", "crates/gpui-client"]
-default-members = ["crates/app"]
+members = [
+    "crates/scout-supervisor",
+    "crates/tasks",
+    "crates/tasks-protocol",
+    "crates/vm-pool/client",
+    "crates/vm-pool/pool",
+    "crates/vm-pool/protocol",
+    "crates/vm-pool/service",
+    "crates/vm-pool/supervisor",
+]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+repository = "https://github.com/iamnbutler/tasks"
 
 [workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-trait-variant = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-bytes = "1.11"
-futures = "0.3"
-sysinfo = "0.33"
-gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit"] }
-gpuikit = { path = "../gpuikit" }
-smol = "2.0"
-tempfile = "3.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "sqlite",
+    "chrono",
+    "uuid",
+    "migrate",
+    "macros",
+] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tempfile = "3"
+
+dirs = "6"
+
+# vm-pool (vendored infrastructure — these crates must never depend on
+# tasks crates; app vocabulary enters only through the AppProtocol generic)
+vm-pool-protocol = { path = "crates/vm-pool/protocol", version = "0.1.0-alpha.1" }
+vm-pool-client = { path = "crates/vm-pool/client", version = "0.1.0-alpha.1" }
+vm-pool-service = { path = "crates/vm-pool/service", version = "0.1.0-alpha.1" }
+vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
+
+# tasks internal
+tasks-protocol = { path = "crates/tasks-protocol" }

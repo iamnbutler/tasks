@@ -1,0 +1,25 @@
+[package]
+name = "vm-pool-supervisor"
+description = "PID 1 process that runs inside VMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "vm_pool_supervisor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "supervisor"
+path = "src/main.rs"
+
+[dependencies]
+vm-pool-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
