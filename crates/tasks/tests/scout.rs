@@ -231,7 +231,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
         repo_clone_url: repo_url,
         base_branch: "main".into(),
     };
-    let mut scout = Scout::new(store.clone(), client, scout_config);
+    let scout = Scout::new(store.clone(), client.handle(), scout_config);
     let spec = scout.dispatch(task.clone()).await.expect("dispatch");
 
     // 6. Assertions
@@ -277,6 +277,61 @@ async fn scout_dispatch_end_to_end_produces_spec() {
 }
 
 #[tokio::test]
+async fn two_scouts_dispatch_concurrently() {
+    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        stub_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task_a) = insert_project_and_task(&store, "Task A", "body a").await;
+    let task_b = Task {
+        id: TaskId::new(),
+        gh_issue_number: 2,
+        title: "Task B".into(),
+        body: "body b".into(),
+        ..task_a.clone()
+    };
+    store.insert_task(&task_b).await.unwrap();
+
+    let scout_config = ScoutConfig {
+        image: "agent:v1".into(),
+        vm_config: VmConfig::default(),
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+    // One dispatcher, one vm-pool connection, two simultaneous dispatches
+    // (pool is sized max_vms: 2). Each dispatch filters its own VM's events.
+    let scout = Scout::new(store.clone(), client.handle(), scout_config);
+    let (a, b) = tokio::join!(
+        scout.dispatch(task_a.clone()),
+        scout.dispatch(task_b.clone())
+    );
+    let spec_a = a.expect("dispatch a");
+    let spec_b = b.expect("dispatch b");
+
+    assert_eq!(spec_a.task_id, task_a.id);
+    assert_eq!(spec_b.task_id, task_b.id);
+    assert!(spec_a.content.contains("## Spec"));
+    assert!(spec_b.content.contains("## Spec"));
+    for t in [&task_a, &task_b] {
+        let stored = store.get_task(&t.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, TaskState::SpecReady, "task {}", t.id);
+    }
+}
+
+#[tokio::test]
 async fn scout_dispatch_failure_resets_task_to_new() {
     let supervisor_bin = cargo_build("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
@@ -301,7 +356,7 @@ async fn scout_dispatch_failure_resets_task_to_new() {
         repo_clone_url: repo_url,
         base_branch: "main".into(),
     };
-    let mut scout = Scout::new(store.clone(), client, scout_config);
+    let scout = Scout::new(store.clone(), client.handle(), scout_config);
     let result = scout.dispatch(task.clone()).await;
     assert!(
         result.is_err(),

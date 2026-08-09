@@ -2,15 +2,19 @@
 //!
 //! Given a Task, the dispatcher allocates a VM from vm-pool, sends a
 //! [`ScoutCommand::Start`], streams back [`ScoutEvent`]s, and persists the
-//! resulting [`Spec`] + queue entry to the store. One scout at a time per
-//! dispatcher instance (the vm-pool client holds a single event stream).
+//! resulting [`Spec`] + queue entry to the store.
+//!
+//! Dispatches run concurrently: `dispatch` takes `&self`, and each call holds
+//! its own event-stream subscription filtered by its VM id, so N scouts can
+//! explore N tasks in parallel over one vm-pool connection (share via
+//! `Arc<Scout>` or clone the underlying [`ClientHandle`]).
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use thiserror::Error;
 use tracing::{info, warn};
-use vm_pool_client::{Client, ClientError};
+use vm_pool_client::{ClientError, ClientHandle, EventStream};
 use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 
 use crate::events::EventPayload;
@@ -29,8 +33,6 @@ pub enum ScoutError {
     Client(#[from] ClientError),
     #[error("scout failed: {0}")]
     ScoutFailed(String),
-    #[error("vm-pool service error: {0}")]
-    ServiceError(String),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
 }
@@ -50,12 +52,16 @@ pub struct ScoutConfig {
 
 pub struct Scout {
     store: Arc<Store>,
-    client: Client<TasksProtocol>,
+    client: ClientHandle<TasksProtocol>,
     config: ScoutConfig,
 }
 
 impl Scout {
-    pub fn new(store: Arc<Store>, client: Client<TasksProtocol>, config: ScoutConfig) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        client: ClientHandle<TasksProtocol>,
+        config: ScoutConfig,
+    ) -> Self {
         Self {
             store,
             client,
@@ -69,8 +75,11 @@ impl Scout {
     /// On success, returns the persisted [`Spec`]. Task state is advanced to
     /// `SpecReady` and a spec-queue entry is created with status
     /// `PendingReview`.
-    pub async fn dispatch(&mut self, task: Task) -> Result<Spec, ScoutError> {
+    pub async fn dispatch(&self, task: Task) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
+
+        // Subscribe before allocating so no event for our VM can be missed.
+        let mut events = self.client.subscribe_events();
 
         // Advance task state to Scouting and log the transition.
         self.store
@@ -133,7 +142,7 @@ impl Scout {
         }
 
         // Drain events until terminal Completed / Failed.
-        let result = self.drain_scout_events(&vm_id).await;
+        let result = drain_scout_events(&mut events, &vm_id).await;
 
         // Always try to deallocate. Ignore errors — the pool's health loop
         // will reap if we die mid-call.
@@ -163,57 +172,6 @@ impl Scout {
                 self.finalize_failed(&session_id, &task, &vm_id, reason)
                     .await?;
                 Err(e)
-            }
-        }
-    }
-
-    async fn drain_scout_events(&mut self, target_vm: &VmId) -> Result<DrainOutcome, ScoutError> {
-        let mut branch: Option<String> = None;
-        let mut exit_code: Option<i32> = None;
-        loop {
-            let event = self
-                .client
-                .next_event()
-                .await
-                .ok_or(ScoutError::StreamClosed)?;
-
-            match event {
-                ServiceEvent::VmApp { vm_id, event: app } if &vm_id == target_vm => {
-                    match app {
-                        ScoutEvent::Started { branch: b } => {
-                            branch = Some(b);
-                        }
-                        ScoutEvent::Progress { .. } => {
-                            // Surface later via events/log tailing if useful.
-                        }
-                        ScoutEvent::ImplementationFinished { exit_code: c } => {
-                            exit_code = Some(c);
-                        }
-                        ScoutEvent::Completed {
-                            spec_markdown,
-                            files_touched,
-                        } => {
-                            return Ok(DrainOutcome {
-                                branch: branch.unwrap_or_default(),
-                                spec_markdown,
-                                files_touched,
-                                exit_code,
-                            });
-                        }
-                        ScoutEvent::Failed { reason } => {
-                            return Err(ScoutError::ScoutFailed(reason));
-                        }
-                    }
-                }
-                ServiceEvent::VmApp { .. } => {
-                    // Event for a different VM — ignore (one-scout-at-a-time invariant).
-                }
-                ServiceEvent::Error { message } => {
-                    return Err(ScoutError::ServiceError(message));
-                }
-                _other => {
-                    // CommandSent / PoolStatus / VmAllocated / etc. — not interesting here.
-                }
             }
         }
     }
@@ -343,6 +301,52 @@ struct DrainOutcome {
     spec_markdown: String,
     files_touched: Vec<String>,
     exit_code: Option<i32>,
+}
+
+/// Consume this dispatch's own event subscription until its VM reports a
+/// terminal Completed/Failed. Events from other VMs (concurrent scouts) are
+/// ignored; service errors for our requests surface as [`ClientError`] on the
+/// calls themselves, not on this stream.
+async fn drain_scout_events(
+    events: &mut EventStream<TasksProtocol>,
+    target_vm: &VmId,
+) -> Result<DrainOutcome, ScoutError> {
+    let mut branch: Option<String> = None;
+    let mut exit_code: Option<i32> = None;
+    loop {
+        let event = events.recv().await.ok_or(ScoutError::StreamClosed)?;
+
+        match event {
+            ServiceEvent::VmApp { vm_id, event: app } if &vm_id == target_vm => match app {
+                ScoutEvent::Started { branch: b } => {
+                    branch = Some(b);
+                }
+                ScoutEvent::Progress { .. } => {
+                    // Surface later via events/log tailing if useful.
+                }
+                ScoutEvent::ImplementationFinished { exit_code: c } => {
+                    exit_code = Some(c);
+                }
+                ScoutEvent::Completed {
+                    spec_markdown,
+                    files_touched,
+                } => {
+                    return Ok(DrainOutcome {
+                        branch: branch.unwrap_or_default(),
+                        spec_markdown,
+                        files_touched,
+                        exit_code,
+                    });
+                }
+                ScoutEvent::Failed { reason } => {
+                    return Err(ScoutError::ScoutFailed(reason));
+                }
+            },
+            _other => {
+                // Another VM's events, or pool-level chatter — not ours.
+            }
+        }
+    }
 }
 
 fn render_prompt(task: &Task) -> String {
