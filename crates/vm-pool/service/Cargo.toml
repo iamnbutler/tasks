@@ -1,0 +1,30 @@
+[package]
+name = "vm-pool-service"
+description = "Main service binary with Unix socket API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "vm_pool_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vm-pool"
+path = "src/main.rs"
+
+[dependencies]
+vm-pool-protocol.workspace = true
+vm-pool-manager.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

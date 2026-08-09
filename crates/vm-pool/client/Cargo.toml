@@ -1,0 +1,20 @@
+[package]
+name = "vm-pool-client"
+description = "Client library for communicating with the vm-pool service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vm-pool-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+vm-pool-service = { path = "../service" }
+vm-pool-manager = { path = "../pool" }
+tempfile.workspace = true

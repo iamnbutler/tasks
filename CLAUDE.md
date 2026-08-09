@@ -1,0 +1,59 @@
+# Tasks (v2)
+
+A human-in-the-loop platform that orchestrates coding agents (headless Claude
+Code) to get project work done, built around the Double Diamond architecture
+(issue #744): parallel Scout exploration → spec queue → serial Builder
+implementation.
+
+## Load-bearing design rules
+
+- **The Scout/Builder information barrier is inviolable.** Builders never see
+  Scout code — the spec is the deliverable. Specs are text, so a Builder run
+  can batch N specs into one branch. Never propose reusing Scout branches.
+- **Never persist a GitHub-owned fact** (PR mergeable/SHA/CI, issue
+  open-closed, labels). Query at decision time. Persist only Tasks-owned
+  state plus append-only decisions keyed to immutable SHAs. GitHub writes go
+  through the server, never through agents.
+- **Manual queue is human-authoritative.** `tasks.manual_rank` is set only via
+  the API; the GitHub poller must never write it.
+- **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
+  must never depend on tasks crates. App vocabulary enters vm-pool only
+  through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
+  stays independently publishable.
+- **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
+  loop.** The server consumes Claude Code's typed output (stream-json, hooks,
+  MCP tools, structured outputs); it does not reimplement the loop.
+
+## Project structure
+
+- `crates/tasks/` — the server binary: models, SQLite store, event log,
+  GitHub polling (read-only intake), scout dispatcher, HTTP API + SSE
+- `crates/tasks-protocol/` — ScoutCommand/ScoutEvent, the `AppProtocol` impl
+  shared between server and Scout VMs
+- `crates/scout-supervisor/` — PID 1 inside Scout VMs: clone, branch, run the
+  agent, report the spec back
+- `crates/vm-pool/` — vendored VM infrastructure (protocol, pool, service,
+  client, supervisor). Has its own CLAUDE.md and TODO.md; conventions there
+  apply within it (notably: no mocks, real processes in tests)
+- `images/` — container image definitions (base, agent, automation)
+- `docs/plans/` — implementation plans; `docs/vm-pool.md` — vm-pool spec
+- `spec` for the platform: issue #744 + docs/plans/2026-08-09-v2-resume.md
+
+## Conventions
+
+- Tests use real processes and real SQLite (in-memory or tempfile). No mocks.
+  HTTP tests bind real servers on `127.0.0.1:0`.
+- Errors: `thiserror` enums per module. Logging: `tracing`.
+- Rust edition 2024, `cargo fmt` + `cargo clippy --workspace --all-targets`
+  clean before committing.
+
+## Running
+
+```sh
+cargo run -p tasks -- serve            # HTTP API on port 4800 (TASKS_SERVER_PORT)
+cargo run -p tasks -- add-project owner/repo
+cargo test --workspace
+```
+
+Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`). Config via
+env / `.env`: `GITHUB_TOKEN`, `VM_POOL_SOCKET`.

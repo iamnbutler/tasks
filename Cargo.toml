@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/scout-supervisor", "crates/tasks", "crates/tasks-protocol"]
+members = [
+    "crates/scout-supervisor",
+    "crates/tasks",
+    "crates/tasks-protocol",
+    "crates/vm-pool/client",
+    "crates/vm-pool/pool",
+    "crates/vm-pool/protocol",
+    "crates/vm-pool/service",
+    "crates/vm-pool/supervisor",
+]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
@@ -35,11 +44,14 @@ axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tempfile = "3"
 
-# vm-pool (sibling workspace)
-vm-pool-protocol = { path = "../tasks-vm/crates/protocol" }
-vm-pool-client = { path = "../tasks-vm/crates/client" }
-vm-pool-service = { path = "../tasks-vm/crates/service" }
-vm-pool-manager = { path = "../tasks-vm/crates/pool" }
+dirs = "6"
+
+# vm-pool (vendored infrastructure — these crates must never depend on
+# tasks crates; app vocabulary enters only through the AppProtocol generic)
+vm-pool-protocol = { path = "crates/vm-pool/protocol", version = "0.1.0-alpha.1" }
+vm-pool-client = { path = "crates/vm-pool/client", version = "0.1.0-alpha.1" }
+vm-pool-service = { path = "crates/vm-pool/service", version = "0.1.0-alpha.1" }
+vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
 
 # tasks internal
 tasks-protocol = { path = "crates/tasks-protocol" }
