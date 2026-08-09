@@ -70,6 +70,11 @@ pub struct Task {
     /// sorts after every ranked task. Only ever written by explicit reorder
     /// requests — never by the GitHub poller.
     pub manual_rank: Option<i32>,
+    /// Consecutive failed scout dispatches. Persisted so restarts can't reset
+    /// the count: at `MAX_DISPATCH_ATTEMPTS` the dispatcher rejects the task
+    /// instead of retrying it forever. Cleared when a scout produces a spec.
+    /// Never written by the GitHub poller.
+    pub dispatch_attempts: u32,
     pub ingested_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
