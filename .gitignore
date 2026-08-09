@@ -10,3 +10,7 @@ target/
 Cargo.lock
 .claude/worktrees/
 .worktrees/
+
+# Xcode
+xcuserdata/
+DerivedData/
