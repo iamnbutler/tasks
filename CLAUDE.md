@@ -50,10 +50,28 @@ implementation.
 ## Running
 
 ```sh
-cargo run -p tasks -- serve            # HTTP API on port 4800 (TASKS_SERVER_PORT)
+cargo run -p tasks -- serve            # poller + scout dispatcher + HTTP API
 cargo run -p tasks -- add-project owner/repo
 cargo test --workspace
 ```
 
+`serve` runs the Diamond 1 loop (`crates/tasks/src/run.rs`): GitHub intake,
+scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates
+*new* work only — `Pause`/`Stop` never interrupt a scout already in flight.
+Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
+polling, an unreachable vm-pool disables dispatch and reconnects periodically,
+and the API stays up either way.
+
 Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`). Config via
-env / `.env`: `GITHUB_TOKEN`, `VM_POOL_SOCKET`.
+env / `.env`:
+
+| var | default | |
+| --- | --- | --- |
+| `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
+| `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
+| `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
+| `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
+| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
+| `GITHUB_TOKEN` | — | required for polling; also used for clones |
+| `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
+| `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |

@@ -37,13 +37,20 @@ pub enum ScoutError {
     StreamClosed,
 }
 
-/// How this dispatcher boots a Scout VM.
+/// How this dispatcher boots a Scout VM. Uniform across dispatches — anything
+/// that varies per task lives in [`ScoutTarget`].
 #[derive(Debug, Clone)]
 pub struct ScoutConfig {
     /// Image reference to allocate from vm-pool, e.g. `"agent:v1"`.
     pub image: String,
     /// VM configuration passed to vm-pool.
     pub vm_config: VmConfig,
+}
+
+/// The repository a single dispatch explores. Per-project, so one dispatcher
+/// serves every tracked project.
+#[derive(Debug, Clone)]
+pub struct ScoutTarget {
     /// Repo clone URL (what the scout-supervisor `git clone`s).
     pub repo_clone_url: String,
     /// Branch to base the throwaway scout branch on.
@@ -69,13 +76,13 @@ impl Scout {
         }
     }
 
-    /// Dispatch a scout for `task`. Runs the full lifecycle: allocate VM,
-    /// run scout, persist spec, deallocate VM.
+    /// Dispatch a scout for `task` against `target`. Runs the full lifecycle:
+    /// allocate VM, run scout, persist spec, deallocate VM.
     ///
     /// On success, returns the persisted [`Spec`]. Task state is advanced to
     /// `SpecReady` and a spec-queue entry is created with status
     /// `PendingReview`.
-    pub async fn dispatch(&self, task: Task) -> Result<Spec, ScoutError> {
+    pub async fn dispatch(&self, task: Task, target: &ScoutTarget) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
 
         // Subscribe before allocating so no event for our VM can be missed.
@@ -129,8 +136,8 @@ impl Scout {
                 &vm_id,
                 ScoutCommand::Start {
                     task_id: task.id.to_string(),
-                    repo_clone_url: self.config.repo_clone_url.clone(),
-                    base_branch: self.config.base_branch.clone(),
+                    repo_clone_url: target.repo_clone_url.clone(),
+                    base_branch: target.base_branch.clone(),
                     prompt,
                 },
             )

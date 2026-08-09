@@ -6,6 +6,7 @@
 pub mod events;
 pub mod github;
 pub mod models;
+pub mod run;
 pub mod scout;
 pub mod server;
 pub mod store;

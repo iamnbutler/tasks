@@ -102,9 +102,21 @@ pub fn router(store: Arc<Store>) -> Router {
 
 /// Serve the API on loopback at `port`. Runs until the process is killed.
 pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
+    serve_with_shutdown(store, port, std::future::pending()).await
+}
+
+/// Serve the API on loopback at `port` until `shutdown` resolves, then stop
+/// accepting connections and let the in-flight ones drain.
+pub async fn serve_with_shutdown(
+    store: Arc<Store>,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     info!(addr = %listener.local_addr()?, "tasks api listening");
-    axum::serve(listener, router(store)).await
+    axum::serve(listener, router(store))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 // --- projects ---

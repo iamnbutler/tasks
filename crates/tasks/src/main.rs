@@ -1,34 +1,37 @@
 //! tasks CLI entry point.
 //!
-//! Two subcommands for now: `serve` runs the HTTP control API, `add-project`
-//! writes straight to the store. Everything else is driven over the API — see
+//! Two subcommands for now: `serve` runs the server (GitHub poller + scout
+//! dispatcher + HTTP control API — see [`tasks::run`]), `add-project` writes
+//! straight to the store. Everything else is driven over the API — see
 //! [`tasks::server`] for the route list.
-
-use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use tracing::info;
 
 use tasks::events::EventPayload;
 use tasks::models::{Project, ProjectId};
-use tasks::server;
+use tasks::run::{self, Config};
 use tasks::store::Store;
-
-const DEFAULT_PORT: u16 = 4800;
 
 const USAGE: &str = "\
 tasks — human-in-the-loop agent orchestration
 
 usage:
-  tasks serve [--port N]        run the HTTP control API (default port 4800,
-                                override with TASKS_SERVER_PORT)
+  tasks serve [--port N]        run the server: GitHub poller, scout
+                                dispatcher and HTTP control API (default
+                                port 4800, override with TASKS_SERVER_PORT)
   tasks add-project <owner/repo>  track a GitHub repository
 
 environment:
-  TASKS_DATA_DIR      where tasks.db lives (default ~/.local/state/tasks-v2)
-  TASKS_SERVER_PORT   default port for `serve`
+  TASKS_DATA_DIR         where tasks.db lives (default ~/.local/state/tasks-v2)
+  TASKS_SERVER_PORT      default port for `serve`
+  TASKS_POLL_INTERVAL    seconds between GitHub polls (default 60)
+  SCOUT_MAX_CONCURRENT   scouts running at once (default 2)
+  SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)
+  VM_POOL_SOCKET         vm-pool service socket (default /tmp/vm-pool.sock)
+  GITHUB_TOKEN           required for polling; also used for repo clones
+  GITHUB_API_URL         GraphQL endpoint override
+  GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com)
 ";
 
 #[tokio::main]
@@ -53,19 +56,14 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: &[String]) -> Result<()> {
-    let mut port = match std::env::var("TASKS_SERVER_PORT") {
-        Ok(raw) => raw
-            .parse()
-            .with_context(|| format!("TASKS_SERVER_PORT is not a port number: {raw}"))?,
-        Err(_) => DEFAULT_PORT,
-    };
+    let mut config = Config::from_env()?;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--port" => {
                 let raw = rest.next().context("--port requires a value")?;
-                port = raw
+                config.port = raw
                     .parse()
                     .with_context(|| format!("not a port number: {raw}"))?;
             }
@@ -73,8 +71,7 @@ async fn serve(args: &[String]) -> Result<()> {
         }
     }
 
-    let store = Arc::new(open_store().await?);
-    server::serve(store, port).await?;
+    run::run(config).await?;
     Ok(())
 }
 
@@ -112,25 +109,5 @@ async fn add_project(args: &[String]) -> Result<()> {
 }
 
 async fn open_store() -> Result<Store> {
-    let data_dir = data_dir()?;
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-    let db_path = data_dir.join("tasks.db");
-    info!(db = %db_path.display(), "opening store");
-    Ok(Store::open(&db_path).await?)
-}
-
-fn data_dir() -> Result<PathBuf> {
-    if let Ok(s) = std::env::var("TASKS_DATA_DIR") {
-        return Ok(PathBuf::from(s));
-    }
-    let home = dirs_home()?;
-    Ok(home.join(".local/state/tasks-v2"))
-}
-
-fn dirs_home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME environment variable not set")
+    Ok(run::open_store(&run::data_dir()?).await?)
 }
