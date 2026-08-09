@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    Mode, ProjectId, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -36,6 +36,13 @@ pub enum EventPayload {
         task_id: TaskId,
         from: TaskState,
         to: TaskState,
+    },
+    /// The snapshot of GitHub's open/closed flag on a task changed. Emitted by
+    /// the poller — notably when an issue disappears from a repository's open
+    /// set, which is the only signal GitHub gives us that it was closed.
+    TaskGhStateChanged {
+        task_id: TaskId,
+        gh_state: GhState,
     },
     SessionStarted {
         session_id: SessionId,
