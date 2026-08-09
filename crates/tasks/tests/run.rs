@@ -157,6 +157,154 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     assert_eq!(project.id, closed.project_id);
 }
 
+/// Every `task_gh_state_changed` on the log, oldest first.
+async fn gh_state_changes(store: &Store) -> Vec<(TaskId, GhState)> {
+    store
+        .events_since(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EventPayload::TaskGhStateChanged { task_id, gh_state } => Some((task_id, gh_state)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// GitHub never says "issue 3 was closed" — it just stops returning it from the
+/// open-issue query. A poll that sees a complete open set has to read that
+/// absence as a closure, or the row stays `open` forever and clients render a
+/// phantom task.
+#[tokio::test]
+async fn poll_closes_tasks_whose_issues_left_the_open_set() {
+    let url = spawn_fake_github(vec![
+        page(vec![
+            issue(1, "first", "OPEN"),
+            issue(2, "second", "OPEN"),
+            issue(3, "third", "OPEN"),
+        ]),
+        // A bulk cleanup upstream: only #2 is still open.
+        page(vec![issue(2, "second", "OPEN")]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    let project = insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 3);
+    let before = store.list_tasks().await.unwrap();
+    assert!(before.iter().all(|t| t.gh_state == GhState::Open));
+    let id_of = |number: u64| {
+        before
+            .iter()
+            .find(|t| t.gh_issue_number == number)
+            .unwrap()
+            .id
+            .clone()
+    };
+
+    assert_eq!(
+        run::poll_once(&store, &github).await.unwrap(),
+        0,
+        "nothing new to ingest"
+    );
+
+    let after = store.list_tasks().await.unwrap();
+    assert_eq!(after.len(), 3, "rows are marked, never deleted");
+    for (number, expected) in [
+        (1, GhState::Closed),
+        (2, GhState::Open),
+        (3, GhState::Closed),
+    ] {
+        let task = after
+            .iter()
+            .find(|t| t.gh_issue_number == number)
+            .unwrap_or_else(|| panic!("task for issue {number}"));
+        assert_eq!(task.gh_state, expected, "issue {number}");
+        assert_eq!(task.state, TaskState::New, "our state is ours to set");
+        assert_eq!(task.id, id_of(number), "same row, not a re-ingest");
+    }
+    assert_eq!(project.id, after[0].project_id);
+
+    let mut changes = gh_state_changes(&store).await;
+    changes.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let mut expected = vec![(id_of(1), GhState::Closed), (id_of(3), GhState::Closed)];
+    expected.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    assert_eq!(changes, expected);
+
+    // The canned server repeats its last page, so a third poll sees the same
+    // open set: no further writes, no duplicate events.
+    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 0);
+    assert_eq!(gh_state_changes(&store).await.len(), 2);
+}
+
+/// A failed fetch is not an empty repository. Reconciling on a partial open set
+/// would close every task in the project.
+#[tokio::test]
+async fn a_failed_fetch_reconciles_nothing() {
+    let url = spawn_fake_github(vec![
+        page(vec![issue(1, "first", "OPEN"), issue(2, "second", "OPEN")]),
+        json!({"errors": [{"message": "Bad credentials"}]}),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 2);
+
+    // The project is skipped, not failed: intake for other projects goes on.
+    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 0);
+
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert!(
+        tasks.iter().all(|t| t.gh_state == GhState::Open),
+        "an unreachable repo must not look like a closed one"
+    );
+    assert!(gh_state_changes(&store).await.is_empty());
+}
+
+/// Reopening rides the ordinary upsert path: the issue is back in the open set,
+/// so the snapshot is refreshed with it.
+#[tokio::test]
+async fn a_reopened_issue_polls_back_to_open() {
+    let url = spawn_fake_github(vec![
+        page(vec![issue(1, "first", "OPEN")]),
+        page(vec![]),
+        page(vec![issue(1, "first", "OPEN")]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 1);
+    let task_id = store.list_tasks().await.unwrap()[0].id.clone();
+
+    run::poll_once(&store, &github).await.unwrap();
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().gh_state,
+        GhState::Closed
+    );
+
+    assert_eq!(
+        run::poll_once(&store, &github).await.unwrap(),
+        0,
+        "a reopened issue is the same task, not a new one"
+    );
+    let reopened = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(reopened.gh_state, GhState::Open);
+    assert_eq!(store.list_tasks().await.unwrap().len(), 1);
+    assert_eq!(
+        gh_state_changes(&store).await,
+        vec![(task_id, GhState::Closed)],
+        "only the poller-inferred closure needs an event of its own"
+    );
+}
+
 #[tokio::test]
 async fn poll_loop_skips_polling_while_stopped() {
     let github_url = spawn_fake_github(vec![page(vec![issue(1, "only", "OPEN")])]).await;

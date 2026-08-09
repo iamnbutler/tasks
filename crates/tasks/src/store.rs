@@ -193,6 +193,27 @@ impl Store {
         rows.into_iter().map(task_from_row).collect()
     }
 
+    /// [`Self::list_tasks`] minus pure intake noise: tasks whose issue is closed
+    /// on GitHub and that never left `new`.
+    ///
+    /// Anything further along the pipeline stays visible whatever GitHub thinks
+    /// of the issue — in-flight and historical work must not vanish from a
+    /// client's list because someone closed the issue behind it. Ordering is
+    /// identical to [`Self::list_tasks`].
+    pub async fn list_active_tasks(&self) -> Result<Vec<Task>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks WHERE NOT (gh_state = ? AND state = ?) \
+             ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
+        )
+        .bind(GhState::Closed.as_str())
+        .bind(TaskState::New.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(task_from_row).collect()
+    }
+
     /// Replace the manual queue order with `ids`, assigning ranks 1..N in the
     /// given order. Every task not listed is left unranked, so a reorder is
     /// always a complete statement of the curated queue.
@@ -310,6 +331,65 @@ impl Store {
         };
         self.insert_task(&task).await?;
         Ok(UpsertOutcome::Inserted(task))
+    }
+
+    /// Mark every task of `project_id` whose issue has vanished from the
+    /// repository's open set as closed. Returns the ids it changed.
+    ///
+    /// GitHub's open-issue query is the only intake we have, and a closed issue
+    /// simply stops appearing in it — absence is the close notification. So the
+    /// caller must pass a *complete* open set: `open_issue_numbers` is every
+    /// open issue number a successful fetch returned. A partial or failed fetch
+    /// would read as "everything was closed", which is why
+    /// [`crate::run::poll_once`] skips reconciliation for a project it could not
+    /// fetch.
+    ///
+    /// Only `gh_state` (and `updated_at`) is written. `state`, `manual_rank` and
+    /// `dispatch_attempts` are Tasks-owned — a task already scouting or queued
+    /// keeps flowing; `gh_state` gates *new* dispatch only. Reopening needs no
+    /// counterpart: the issue reappears in the open set and
+    /// [`Self::upsert_gh_issue`] refreshes `gh_state` from the snapshot.
+    ///
+    /// The row updates are one transaction; the matching
+    /// [`EventPayload::TaskGhStateChanged`] events are the caller's to append,
+    /// mirroring how the poller emits [`EventPayload::TaskIngested`].
+    pub async fn reconcile_closed_issues(
+        &self,
+        project_id: &ProjectId,
+        open_issue_numbers: &[u64],
+    ) -> Result<Vec<TaskId>, StoreError> {
+        let open: std::collections::HashSet<u64> = open_issue_numbers.iter().copied().collect();
+
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT id, gh_issue_number FROM tasks WHERE project_id = ? AND gh_state = ?",
+        )
+        .bind(project_id.as_str())
+        .bind(GhState::Open.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut closed = Vec::new();
+        for row in rows {
+            let number = row.try_get::<i64, _>("gh_issue_number")?.max(0) as u64;
+            if open.contains(&number) {
+                continue;
+            }
+            closed.push(TaskId::from_raw(row.try_get::<String, _>("id")?));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        for id in &closed {
+            sqlx::query("UPDATE tasks SET gh_state = ?, updated_at = ? WHERE id = ?")
+                .bind(GhState::Closed.as_str())
+                .bind(&now)
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        Ok(closed)
     }
 
     pub async fn update_task_state(&self, id: &TaskId, state: TaskState) -> Result<(), StoreError> {
@@ -1433,6 +1513,235 @@ mod tests {
         assert_eq!(
             store.get_task(&task.id).await.unwrap().unwrap().manual_rank,
             Some(1)
+        );
+    }
+
+    // --- gh_state reconciliation ---
+
+    /// A second project, so the bystander assertions are about a real neighbour
+    /// rather than a hypothetical one.
+    async fn second_project(store: &Store) -> Project {
+        let project = Project {
+            id: ProjectId::new(),
+            repo_owner: "iamnbutler".into(),
+            repo_name: "other".into(),
+            added_at: Utc::now(),
+        };
+        store.insert_project(&project).await.unwrap();
+        project
+    }
+
+    #[tokio::test]
+    async fn reconcile_closed_issues_closes_only_the_absent_open_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let other = second_project(&store).await;
+
+        let still_open = task_with(&project.id, 1, 0);
+        let vanished = task_with(&project.id, 2, 0);
+        let also_vanished = task_with(&project.id, 3, 0);
+        let already_closed = Task {
+            gh_state: GhState::Closed,
+            ..task_with(&project.id, 4, 0)
+        };
+        // Same issue number, different repo: absence over there says nothing
+        // about this project.
+        let bystander = task_with(&other.id, 2, 0);
+        for t in [
+            &still_open,
+            &vanished,
+            &also_vanished,
+            &already_closed,
+            &bystander,
+        ] {
+            store.insert_task(t).await.unwrap();
+        }
+
+        let mut closed = store
+            .reconcile_closed_issues(&project.id, &[1])
+            .await
+            .unwrap();
+        closed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut expected = vec![vanished.id.clone(), also_vanished.id.clone()];
+        expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(closed, expected, "exactly the absent open tasks");
+
+        for id in [&vanished.id, &also_vanished.id] {
+            assert_eq!(
+                store.get_task(id).await.unwrap().unwrap().gh_state,
+                GhState::Closed,
+                "task {id}"
+            );
+        }
+        assert_eq!(
+            store
+                .get_task(&still_open.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .gh_state,
+            GhState::Open
+        );
+        assert_eq!(
+            store
+                .get_task(&bystander.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .gh_state,
+            GhState::Open,
+            "another project's rows are none of this project's business"
+        );
+
+        // An already-closed row is not reported a second time, and nothing about
+        // it moves.
+        let stored = store.get_task(&already_closed.id).await.unwrap().unwrap();
+        assert_eq!(stored, already_closed);
+
+        // An empty open set closes everything still open in the project — a real
+        // repository with no open issues left.
+        let closed = store
+            .reconcile_closed_issues(&project.id, &[])
+            .await
+            .unwrap();
+        assert_eq!(closed, vec![still_open.id.clone()]);
+        assert!(
+            store
+                .reconcile_closed_issues(&project.id, &[])
+                .await
+                .unwrap()
+                .is_empty(),
+            "reconciliation is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_closed_issues_leaves_tasks_owned_state_alone() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let task = task_with(&project.id, 7, 0);
+        store.insert_task(&task).await.unwrap();
+        store
+            .update_task_state(&task.id, TaskState::Scouting)
+            .await
+            .unwrap();
+        store.record_dispatch_failure(&task.id).await.unwrap();
+        store
+            .set_queue_order(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
+        let before = store.get_task(&task.id).await.unwrap().unwrap();
+
+        let closed = store
+            .reconcile_closed_issues(&project.id, &[])
+            .await
+            .unwrap();
+        assert_eq!(closed, vec![task.id.clone()]);
+
+        let after = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(after.gh_state, GhState::Closed);
+        assert!(after.updated_at >= before.updated_at, "timestamp refreshed");
+        // Everything Tasks owns is untouched: a task mid-pipeline keeps flowing.
+        assert_eq!(
+            after,
+            Task {
+                gh_state: GhState::Closed,
+                updated_at: after.updated_at,
+                ..before
+            }
+        );
+    }
+
+    /// Reopening needs no code of its own: the issue is back in the open set, so
+    /// the ordinary upsert path refreshes the snapshot.
+    #[tokio::test]
+    async fn a_reopened_issue_goes_back_to_open_through_upsert() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 3,
+            title: "Round trip".into(),
+            body: "b".into(),
+            labels: vec![],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let task = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            store
+                .reconcile_closed_issues(&project.id, &[])
+                .await
+                .unwrap(),
+            vec![task.id.clone()]
+        );
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().gh_state,
+            GhState::Closed
+        );
+
+        let reopened = store
+            .upsert_gh_issue(&project.id, issue)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reopened.id, task.id, "same row, not a re-ingest");
+        assert_eq!(reopened.gh_state, GhState::Open);
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().gh_state,
+            GhState::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn list_active_tasks_hides_only_closed_intake() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let open_new = task_with(&project.id, 1, 0);
+        let closed_new = Task {
+            gh_state: GhState::Closed,
+            ..task_with(&project.id, 2, 0)
+        };
+        let closed_in_flight = Task {
+            gh_state: GhState::Closed,
+            ..task_with(&project.id, 3, 0)
+        };
+        for t in [&open_new, &closed_new, &closed_in_flight] {
+            store.insert_task(t).await.unwrap();
+        }
+        store
+            .update_task_state(&closed_in_flight.id, TaskState::SpecReady)
+            .await
+            .unwrap();
+
+        let visible: Vec<_> = store
+            .list_active_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(visible.contains(&open_new.id));
+        assert!(
+            visible.contains(&closed_in_flight.id),
+            "work already underway must not disappear"
+        );
+        assert!(!visible.contains(&closed_new.id));
+        assert_eq!(
+            store.list_tasks().await.unwrap().len(),
+            3,
+            "no rows deleted"
         );
     }
 

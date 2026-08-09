@@ -157,8 +157,23 @@ async fn create_project(
 
 // --- tasks ---
 
-async fn list_tasks(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Task>>> {
-    Ok(Json(store.list_tasks().await?))
+#[derive(Debug, Deserialize)]
+struct TasksQuery {
+    /// `?all=true` returns every row. The default hides tasks whose issue is
+    /// closed on GitHub and that never left `new` — intake noise from issues
+    /// that died before any work started.
+    all: Option<bool>,
+}
+
+async fn list_tasks(
+    State(store): State<Arc<Store>>,
+    Query(query): Query<TasksQuery>,
+) -> ApiResult<Json<Vec<Task>>> {
+    let tasks = match query.all.unwrap_or(false) {
+        true => store.list_tasks().await?,
+        false => store.list_active_tasks().await?,
+    };
+    Ok(Json(tasks))
 }
 
 async fn get_task(
@@ -542,6 +557,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tasks[0].id, low.id);
+    }
+
+    /// An issue closed before any work started is intake noise; one that got as
+    /// far as a spec is history a client still needs.
+    #[tokio::test]
+    async fn tasks_listing_hides_closed_intake_unless_all_is_asked_for() {
+        let (store, project) = store_with_project().await;
+        let open_new = insert_task(&store, &project, 1, 0).await;
+        let closed_new = insert_task(&store, &project, 2, 0).await;
+        let closed_spec_ready = insert_task(&store, &project, 3, 0).await;
+        store
+            .reconcile_closed_issues(&project.id, &[open_new.gh_issue_number])
+            .await
+            .unwrap();
+        store
+            .update_task_state(&closed_spec_ready.id, TaskState::SpecReady)
+            .await
+            .unwrap();
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let visible: Vec<TaskId> = http
+            .get(format!("{base}/tasks"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Vec<Task>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(visible.contains(&open_new.id));
+        assert!(
+            visible.contains(&closed_spec_ready.id),
+            "work that reached a spec stays visible"
+        );
+        assert!(!visible.contains(&closed_new.id));
+
+        let all: Vec<TaskId> = http
+            .get(format!("{base}/tasks?all=true"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Vec<Task>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&closed_new.id));
     }
 
     #[tokio::test]

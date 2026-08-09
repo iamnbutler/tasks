@@ -49,6 +49,12 @@ the server only.
 - `GET /tasks` — already in queue order; render it as-is, don't re-sort.
   Task: `{id, project_id, gh_issue_number, title, body, labels, gh_state,
   state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at}`.
+  By default the list **omits tasks with `gh_state: "closed"` and
+  `state: "new"`** — issues that were closed on GitHub before any work started,
+  i.e. pure intake noise. Every other task stays visible whatever its
+  `gh_state`, so in-flight and historical work never disappears from the list
+  because someone closed the issue behind it. `GET /tasks?all=true` returns
+  every row including the closed intake. Ordering is identical either way.
 - `GET /sessions` / `GET /sessions/{id}` — scout runs.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,
@@ -73,7 +79,10 @@ states will appear as the pipeline grows.
 
 Event JSON: `{seq, timestamp, payload}` where payload is tagged by `"kind"`
 (snake_case): `project_added`, `task_ingested`, `task_state_changed`
-(`from`/`to`), `session_started`, `session_completed`, `spec_created`,
+(`from`/`to`), `task_gh_state_changed` (`task_id`, `gh_state` — the poller's
+snapshot of GitHub's open/closed flag moved, most often because the issue
+dropped out of the repository's open set; refetch the task or the list),
+`session_started`, `session_completed`, `spec_created`,
 `spec_queue_status_changed`, `queue_reordered`, `spec_queue_reordered`,
 `mode_changed`, `note` (`source`, `message` — free-form breadcrumbs; a
 scrolling activity feed of these is the cheapest useful "what is it doing"

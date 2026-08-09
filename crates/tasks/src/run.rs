@@ -336,7 +336,11 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 /// first time.
 ///
 /// A project whose fetch fails is logged and skipped so one unreachable repo
-/// can't stall intake for the others.
+/// can't stall intake for the others. That skip is load-bearing for the second
+/// half of the pass: GitHub only tells us an issue was closed by leaving it out
+/// of the open set, so absence reconciliation
+/// ([`Store::reconcile_closed_issues`]) is only sound on a complete open set. A
+/// partial fetch would read as a mass closure.
 pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, StoreError> {
     let mut ingested = 0;
     for project in store.list_projects().await? {
@@ -355,6 +359,7 @@ pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, St
             }
         };
 
+        let open_numbers: Vec<u64> = issues.iter().map(|issue| issue.number).collect();
         for issue in issues {
             let outcome = store.upsert_gh_issue(&project.id, issue).await?;
             if outcome.is_new() {
@@ -367,6 +372,25 @@ pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, St
                     .await?;
                 ingested += 1;
             }
+        }
+
+        let closed = store
+            .reconcile_closed_issues(&project.id, &open_numbers)
+            .await?;
+        if !closed.is_empty() {
+            info!(
+                repo = format!("{}/{}", project.repo_owner, project.repo_name),
+                count = closed.len(),
+                "issues closed upstream since the last poll"
+            );
+        }
+        for task_id in closed {
+            store
+                .append_event(EventPayload::TaskGhStateChanged {
+                    task_id,
+                    gh_state: GhState::Closed,
+                })
+                .await?;
         }
     }
     Ok(ingested)
