@@ -26,9 +26,9 @@ sqlx.workspace = true
 reqwest.workspace = true
 vm-pool-protocol.workspace = true
 vm-pool-client.workspace = true
+vm-pool-service.workspace = true
+vm-pool-manager.workspace = true
 tasks-protocol.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-vm-pool-service.workspace = true
-vm-pool-manager.workspace = true

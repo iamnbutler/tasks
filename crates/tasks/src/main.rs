@@ -21,6 +21,9 @@ usage:
                                 dispatcher and HTTP control API (default
                                 port 4800, override with TASKS_SERVER_PORT)
   tasks add-project <owner/repo>  track a GitHub repository
+  tasks vm-pool                 run the vm-pool service specialized for
+                                scouts (ContainerRuntime + TasksProtocol)
+                                on VM_POOL_SOCKET
 
 environment:
   TASKS_DATA_DIR         where tasks.db lives (default ~/.local/state/tasks-v2)
@@ -44,6 +47,7 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
+        Some("vm-pool") => vm_pool().await,
         Some("-h") | Some("--help") | Some("help") | None => {
             print!("{USAGE}");
             Ok(())
@@ -73,6 +77,35 @@ async fn serve(args: &[String]) -> Result<()> {
 
     run::run(config).await?;
     Ok(())
+}
+
+/// The vm-pool service, specialized for Tasks: real containers via the
+/// `container` CLI, ScoutCommand/ScoutEvent passthrough. The stock
+/// vm-pool-service binary is NoRuntime + ShellProtocol and can't carry our
+/// protocol.
+async fn vm_pool() -> Result<()> {
+    use vm_pool_manager::{ContainerRuntime, PoolConfig};
+    use vm_pool_service::{Service, ServiceConfig};
+
+    let socket_path = std::env::var("VM_POOL_SOCKET")
+        .unwrap_or_else(|_| "/tmp/vm-pool.sock".into())
+        .into();
+    let data_dir = run::data_dir()?;
+    let config = ServiceConfig {
+        socket_path,
+        snapshot_dir: data_dir.join("snapshots"),
+        pool: PoolConfig::default(),
+    };
+    let service = Service::<ContainerRuntime, tasks_protocol::TasksProtocol>::with_runtime(
+        config,
+        ContainerRuntime::new(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("starting vm-pool service: {e}"))?;
+    service
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("vm-pool service: {e}"))
 }
 
 async fn add_project(args: &[String]) -> Result<()> {
