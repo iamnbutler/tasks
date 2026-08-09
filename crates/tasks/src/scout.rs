@@ -477,8 +477,9 @@ impl TranscriptSink {
             self.dropped = 0;
         }
 
+        let len = line.len();
         match self.tx.try_send((stream, line)) {
-            Ok(()) => self.bytes += 1,
+            Ok(()) => self.bytes += len,
             Err(_) => {
                 self.dropped += 1;
                 self.dropped_total += 1;
@@ -862,6 +863,41 @@ mod tests {
 
         let short = "left alone".to_string();
         assert_eq!(truncate_line(short.clone()), short);
+    }
+
+    #[test]
+    fn the_session_byte_cap_counts_bytes_not_lines() {
+        // Room for every push, so nothing is lost to queue pressure and the
+        // cap is the only thing that can stop recording.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(TRANSCRIPT_QUEUE_CAPACITY);
+        let mut sink = TranscriptSink {
+            tx,
+            bytes: 0,
+            capped: false,
+            dropped: 0,
+            dropped_total: 0,
+        };
+
+        let line = "x".repeat(MAX_TRANSCRIPT_LINE_BYTES);
+        let fits = MAX_TRANSCRIPT_BYTES_PER_SESSION / MAX_TRANSCRIPT_LINE_BYTES;
+        for _ in 0..fits {
+            sink.push(TranscriptStream::Stdout, line.clone());
+        }
+        assert!(!sink.capped, "exactly the budget must not trip the cap");
+
+        // One byte over the budget trips it and queues the notice.
+        sink.push(TranscriptStream::Stdout, "x".into());
+        assert!(sink.capped);
+        sink.push(TranscriptStream::Stdout, "ignored after the cap".into());
+
+        let mut recorded = 0;
+        let mut last = String::new();
+        while let Ok((_, l)) = rx.try_recv() {
+            recorded += 1;
+            last = l;
+        }
+        assert_eq!(recorded, fits + 1, "capped pushes must not be recorded");
+        assert!(last.contains("transcript truncated"));
     }
 
     #[test]
