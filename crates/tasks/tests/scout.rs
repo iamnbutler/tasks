@@ -222,8 +222,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
 
     // 4. Set up store with a task
     let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
-    let (_project, task) =
-        insert_project_and_task(&store, "Stub task", "Do the stub thing").await;
+    let (_project, task) = insert_project_and_task(&store, "Stub task", "Do the stub thing").await;
 
     // 5. Dispatch
     let scout_config = ScoutConfig {
@@ -236,7 +235,11 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     let spec = scout.dispatch(task.clone()).await.expect("dispatch");
 
     // 6. Assertions
-    assert!(spec.content.contains("## Spec"), "spec content: {}", spec.content);
+    assert!(
+        spec.content.contains("## Spec"),
+        "spec content: {}",
+        spec.content
+    );
     assert!(spec.files_touched.iter().any(|f| f == "src/stub.rs"));
 
     let stored_task = store.get_task(&task.id).await.unwrap().unwrap();
@@ -265,9 +268,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     let state_changes: Vec<_> = events
         .iter()
         .filter_map(|e| match &e.payload {
-            tasks::events::EventPayload::TaskStateChanged { from, to, .. } => {
-                Some((*from, *to))
-            }
+            tasks::events::EventPayload::TaskStateChanged { from, to, .. } => Some((*from, *to)),
             _ => None,
         })
         .collect();
@@ -302,7 +303,10 @@ async fn scout_dispatch_failure_resets_task_to_new() {
     };
     let mut scout = Scout::new(store.clone(), client, scout_config);
     let result = scout.dispatch(task.clone()).await;
-    assert!(result.is_err(), "expected dispatch to error, got {result:?}");
+    assert!(
+        result.is_err(),
+        "expected dispatch to error, got {result:?}"
+    );
 
     let stored_task = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(

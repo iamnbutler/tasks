@@ -5,12 +5,18 @@
 //!
 //! On [`ScoutCommand::Start`]:
 //!   1. Creates a workdir
-//!   2. Clones the repo at `base_branch`
+//!   2. Clones the repo at `base_branch`, records the base commit SHA
 //!   3. Creates a throwaway branch `scout/<task_id>-<short-uuid>`
-//!   4. Writes the prompt to `PROMPT.md`
+//!   4. Writes the prompt to `PROMPT.md` (reference copy) and pipes it to the
+//!      agent's stdin
 //!   5. Runs the configured agent command with cwd = workdir
 //!   6. Streams agent stdout/stderr as `ScoutEvent::Progress`
-//!   7. On exit: reads `SPEC.md` if present, emits `Completed`; else `Failed`
+//!   7. On exit: reads `SPEC.md` if present, emits `Completed`; else `Failed`.
+//!      A non-zero agent exit with a valid `SPEC.md` still completes — a spec
+//!      from a messy exit is still a spec.
+//!
+//! There is no in-band cancellation: the host cancels a scout by
+//! deallocating the VM, which tears down this process and everything under it.
 //!
 //! The agent command is configured via the `SCOUT_AGENT_CMD` environment
 //! variable (tokens space-separated; no shell expansion). Default:
@@ -20,13 +26,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
+use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TasksProtocol};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use vm_pool_protocol::{VmCommand, VmEvent};
-use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TasksProtocol};
 
 type TaskVmCommand = VmCommand<TasksProtocol>;
 type TaskVmEvent = VmEvent<TasksProtocol>;
@@ -36,9 +42,7 @@ async fn main() -> Result<()> {
     // Logs go to stderr so they don't collide with the stdout JSON stream.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
     info!("scout-supervisor starting");
 
@@ -96,28 +100,16 @@ async fn main() -> Result<()> {
                 break;
             }
             VmCommand::App {
-                payload: ScoutCommand::Start {
-                    task_id,
-                    repo_clone_url,
-                    base_branch,
-                    prompt,
-                },
+                payload:
+                    ScoutCommand::Start {
+                        task_id,
+                        repo_clone_url,
+                        base_branch,
+                        prompt,
+                    },
             } => {
                 let tx = evt_tx.clone();
                 run_scout(&task_id, &repo_clone_url, &base_branch, &prompt, tx).await;
-            }
-            VmCommand::App {
-                payload: ScoutCommand::Cancel,
-            } => {
-                // Single-threaded command loop: if we're receiving commands,
-                // no scout is running. Nothing to cancel.
-                emit(
-                    &evt_tx,
-                    ScoutEvent::Failed {
-                        reason: "no scout running".into(),
-                    },
-                )
-                .await;
             }
         }
     }
@@ -128,10 +120,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn write_event(
-    stdout: &mut tokio::io::Stdout,
-    event: &TaskVmEvent,
-) -> Result<()> {
+async fn write_event(stdout: &mut tokio::io::Stdout, event: &TaskVmEvent) -> Result<()> {
     let json = serde_json::to_string(event)?;
     stdout.write_all(json.as_bytes()).await?;
     stdout.write_all(b"\n").await?;
@@ -154,7 +143,13 @@ async fn run_scout(
     let workdir = match make_workdir(task_id) {
         Ok(w) => w,
         Err(e) => {
-            emit(&tx, ScoutEvent::Failed { reason: format!("workdir: {e}") }).await;
+            emit(
+                &tx,
+                ScoutEvent::Failed {
+                    reason: format!("workdir: {e}"),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -162,30 +157,75 @@ async fn run_scout(
 
     // 1. Clone
     if let Err(e) = git_clone(repo_clone_url, base_branch, &workdir).await {
-        emit(&tx, ScoutEvent::Failed { reason: format!("clone: {e}") }).await;
+        emit(
+            &tx,
+            ScoutEvent::Failed {
+                reason: format!("clone: {e}"),
+            },
+        )
+        .await;
         return;
     }
+    // Recorded now because the agent may commit; diffing against HEAD later
+    // would miss anything committed.
+    let base_sha = match git_rev_parse_head(&workdir).await {
+        Ok(sha) => sha,
+        Err(e) => {
+            emit(
+                &tx,
+                ScoutEvent::Failed {
+                    reason: format!("rev-parse: {e}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     // 2. Branch
     let short_id = Uuid::new_v4().simple().to_string()[..8].to_string();
     let branch = format!("scout/{task_id}-{short_id}");
     if let Err(e) = git_checkout_new_branch(&workdir, &branch).await {
-        emit(&tx, ScoutEvent::Failed { reason: format!("branch: {e}") }).await;
+        emit(
+            &tx,
+            ScoutEvent::Failed {
+                reason: format!("branch: {e}"),
+            },
+        )
+        .await;
         return;
     }
-    emit(&tx, ScoutEvent::Started { branch: branch.clone() }).await;
+    emit(
+        &tx,
+        ScoutEvent::Started {
+            branch: branch.clone(),
+        },
+    )
+    .await;
 
     // 3. Prompt
     if let Err(e) = tokio::fs::write(workdir.join("PROMPT.md"), prompt).await {
-        emit(&tx, ScoutEvent::Failed { reason: format!("prompt write: {e}") }).await;
+        emit(
+            &tx,
+            ScoutEvent::Failed {
+                reason: format!("prompt write: {e}"),
+            },
+        )
+        .await;
         return;
     }
 
     // 4. Agent
-    let exit_code = match run_agent(&workdir, tx.clone()).await {
+    let exit_code = match run_agent(&workdir, prompt, tx.clone()).await {
         Ok(code) => code,
         Err(e) => {
-            emit(&tx, ScoutEvent::Failed { reason: format!("agent: {e}") }).await;
+            emit(
+                &tx,
+                ScoutEvent::Failed {
+                    reason: format!("agent: {e}"),
+                },
+            )
+            .await;
             return;
         }
     };
@@ -207,7 +247,7 @@ async fn run_scout(
         }
     };
 
-    let files_touched = match git_diff_name_only(&workdir, base_branch).await {
+    let files_touched = match git_diff_name_only(&workdir, &base_sha).await {
         Ok(files) => files,
         Err(e) => {
             warn!("could not compute files_touched: {e}");
@@ -267,9 +307,23 @@ async fn git_checkout_new_branch(workdir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-async fn git_diff_name_only(workdir: &Path, _base_branch: &str) -> Result<Vec<String>> {
+async fn git_rev_parse_head(workdir: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .await
+        .context("spawn git rev-parse")?;
+    if !output.status.success() {
+        anyhow::bail!("git rev-parse exited with {}", output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn git_diff_name_only(workdir: &Path, base_sha: &str) -> Result<Vec<String>> {
     // Stage everything (tracked + untracked) so we can enumerate all files the
-    // agent touched, then diff against HEAD (the base commit we branched off).
+    // agent touched — whether committed or left in the worktree — then diff
+    // the index against the recorded base commit.
     let status = Command::new("git")
         .args(["add", "-A"])
         .current_dir(workdir)
@@ -283,7 +337,7 @@ async fn git_diff_name_only(workdir: &Path, _base_branch: &str) -> Result<Vec<St
     }
 
     let output = Command::new("git")
-        .args(["diff", "--name-only", "--cached", "HEAD"])
+        .args(["diff", "--name-only", "--cached", base_sha])
         .current_dir(workdir)
         .output()
         .await
@@ -299,9 +353,8 @@ async fn git_diff_name_only(workdir: &Path, _base_branch: &str) -> Result<Vec<St
         .collect())
 }
 
-async fn run_agent(workdir: &Path, tx: mpsc::Sender<TaskVmEvent>) -> Result<i32> {
-    let cmd_str =
-        std::env::var("SCOUT_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
+async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) -> Result<i32> {
+    let cmd_str = std::env::var("SCOUT_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
     let mut parts = cmd_str.split_whitespace();
     let prog = parts.next().context("SCOUT_AGENT_CMD is empty")?;
     let args: Vec<&str> = parts.collect();
@@ -310,11 +363,23 @@ async fn run_agent(workdir: &Path, tx: mpsc::Sender<TaskVmEvent>) -> Result<i32>
     let mut child = Command::new(prog)
         .args(&args)
         .current_dir(workdir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn agent")?;
+
+    // Deliver the prompt on stdin, then close it so the agent sees EOF.
+    // Write errors are ignored: an agent that exits without reading (or never
+    // reads stdin) is its own kind of failure, surfaced via exit code.
+    let mut stdin = child.stdin.take().context("agent stdin")?;
+    let prompt_owned = prompt.to_string();
+    tokio::spawn(async move {
+        let _ = stdin.write_all(prompt_owned.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.flush().await;
+        drop(stdin);
+    });
 
     let stdout = child.stdout.take().context("agent stdout")?;
     let stderr = child.stderr.take().context("agent stderr")?;

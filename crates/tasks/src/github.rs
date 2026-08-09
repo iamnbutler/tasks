@@ -59,11 +59,7 @@ impl GitHubClient {
     }
 
     /// Fetch all OPEN issues for a repository, paging as needed.
-    pub async fn list_open_issues(
-        &self,
-        owner: &str,
-        name: &str,
-    ) -> Result<Vec<GhIssue>, GhError> {
+    pub async fn list_open_issues(&self, owner: &str, name: &str) -> Result<Vec<GhIssue>, GhError> {
         let mut issues = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -133,9 +129,9 @@ impl GitHubClient {
             return Err(GhError::GraphQl(msg));
         }
 
-        let data = resp.data.ok_or_else(|| {
-            GhError::Shape("response missing `data` field".into())
-        })?;
+        let data = resp
+            .data
+            .ok_or_else(|| GhError::Shape("response missing `data` field".into()))?;
         let issues = data
             .repository
             .ok_or_else(|| GhError::Shape("repository is null".into()))?
@@ -296,8 +292,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/graphql");
-        let handle =
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, queue, handle)
     }
 

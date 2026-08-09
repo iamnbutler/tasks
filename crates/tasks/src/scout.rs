@@ -15,8 +15,8 @@ use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 
 use crate::events::EventPayload;
 use crate::models::{
-    Complexity, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
-    SpecQueueStatus, Task, TaskState,
+    Complexity, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
+    Task, TaskState,
 };
 use crate::protocol::{ScoutCommand, ScoutEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
@@ -88,7 +88,10 @@ impl Scout {
         let prompt = render_prompt(&task);
 
         // Allocate
-        let vm_id = self.client.allocate(&self.config.image, self.config.vm_config.clone()).await?;
+        let vm_id = self
+            .client
+            .allocate(&self.config.image, self.config.vm_config.clone())
+            .await?;
         info!(%vm_id, task_id = %task.id, "allocated scout VM");
 
         // Persist initial session (branch filled in once Scout emits Started).
@@ -139,7 +142,12 @@ impl Scout {
         }
 
         match result {
-            Ok(DrainOutcome { branch, spec_markdown, files_touched, exit_code }) => {
+            Ok(DrainOutcome {
+                branch,
+                spec_markdown,
+                files_touched,
+                exit_code,
+            }) => {
                 self.finalize_succeeded(
                     &session_id,
                     &task,
@@ -152,16 +160,14 @@ impl Scout {
             }
             Err(e) => {
                 let reason = format!("{e}");
-                self.finalize_failed(&session_id, &task, &vm_id, reason).await?;
+                self.finalize_failed(&session_id, &task, &vm_id, reason)
+                    .await?;
                 Err(e)
             }
         }
     }
 
-    async fn drain_scout_events(
-        &mut self,
-        target_vm: &VmId,
-    ) -> Result<DrainOutcome, ScoutError> {
+    async fn drain_scout_events(&mut self, target_vm: &VmId) -> Result<DrainOutcome, ScoutError> {
         let mut branch: Option<String> = None;
         let mut exit_code: Option<i32> = None;
         loop {
@@ -222,23 +228,23 @@ impl Scout {
         _exit_code: Option<i32>,
     ) -> Result<Spec, ScoutError> {
         let now = Utc::now();
-        sqlx_update_session_branch(&self.store, session_id, &branch).await?;
-        sqlx_update_session_completion(
-            &self.store,
-            session_id,
-            SessionStatus::ScoutSucceeded,
-            now,
-            None,
-        )
-        .await?;
+        self.store
+            .update_session_branch(session_id, &branch)
+            .await?;
+        self.store
+            .update_session_completion(session_id, SessionStatus::ScoutSucceeded, now, None)
+            .await?;
 
-        // Persist spec + queue entry
+        // Persist spec + queue entry. Complexity comes from the Scout's own
+        // `### Complexity` section; file count is only the fallback.
+        let complexity =
+            parse_complexity(&spec_markdown).unwrap_or_else(|| infer_complexity(&files_touched));
         let spec = Spec {
             id: SpecId::new(),
             session_id: session_id.clone(),
             task_id: task.id.clone(),
             content: spec_markdown,
-            complexity: infer_complexity(&files_touched),
+            complexity,
             files_touched,
             created_at: now,
         };
@@ -298,14 +304,14 @@ impl Scout {
         reason: String,
     ) -> Result<(), ScoutError> {
         let now = Utc::now();
-        sqlx_update_session_completion(
-            &self.store,
-            session_id,
-            SessionStatus::ScoutFailed,
-            now,
-            Some(reason.clone()),
-        )
-        .await?;
+        self.store
+            .update_session_completion(
+                session_id,
+                SessionStatus::ScoutFailed,
+                now,
+                Some(reason.clone()),
+            )
+            .await?;
 
         // Back to New so another scout can retry. The orchestrator enforces
         // the re-explore attempt cap.
@@ -371,6 +377,42 @@ fn render_prompt(task: &Task) -> String {
     )
 }
 
+/// The Scout's self-reported complexity: the first non-empty line after a
+/// `### Complexity` heading. Returns `None` when the section is missing or
+/// names zero or several levels (e.g. a lazily-copied `Simple | Medium |
+/// Complex` template line).
+fn parse_complexity(spec: &str) -> Option<Complexity> {
+    let mut in_section = false;
+    for line in spec.lines() {
+        let t = line.trim();
+        if in_section {
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with('#') {
+                return None;
+            }
+            let lower = t.to_lowercase();
+            let matched: Vec<Complexity> = [
+                (lower.contains("simple"), Complexity::Simple),
+                (lower.contains("medium"), Complexity::Medium),
+                (lower.contains("complex"), Complexity::Complex),
+            ]
+            .into_iter()
+            .filter_map(|(hit, c)| hit.then_some(c))
+            .collect();
+            return match matched.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            };
+        }
+        if t.eq_ignore_ascii_case("### complexity") {
+            in_section = true;
+        }
+    }
+    None
+}
+
 fn infer_complexity(files_touched: &[String]) -> Complexity {
     match files_touched.len() {
         0..=2 => Complexity::Simple,
@@ -379,25 +421,22 @@ fn infer_complexity(files_touched: &[String]) -> Complexity {
     }
 }
 
-// Thin helper wrappers so we keep the main flow readable. They bypass
-// `Store`'s public API to tweak specific columns that aren't generally
-// mutable; in the future either expose them or refactor.
-async fn sqlx_update_session_branch(
-    store: &Store,
-    id: &SessionId,
-    branch: &str,
-) -> Result<(), StoreError> {
-    store.update_session_branch(id, branch).await
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn sqlx_update_session_completion(
-    store: &Store,
-    id: &SessionId,
-    status: SessionStatus,
-    completed_at: chrono::DateTime<Utc>,
-    exit_reason: Option<String>,
-) -> Result<(), StoreError> {
-    store
-        .update_session_completion(id, status, completed_at, exit_reason)
-        .await
+    #[test]
+    fn parse_complexity_reads_section() {
+        let spec = "## Spec\n\n### Complexity\n\nMedium\n\n### Notes\n";
+        assert_eq!(parse_complexity(spec), Some(Complexity::Medium));
+    }
+
+    #[test]
+    fn parse_complexity_rejects_template_line_and_missing_section() {
+        let template = "### Complexity\nSimple | Medium | Complex\n";
+        assert_eq!(parse_complexity(template), None);
+        assert_eq!(parse_complexity("## Spec\nno section"), None);
+        let empty_section = "### Complexity\n\n### Notes\nx";
+        assert_eq!(parse_complexity(empty_section), None);
+    }
 }

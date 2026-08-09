@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use tasks_protocol::{ScoutCommand, ScoutEvent, TasksProtocol};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use vm_pool_protocol::{VmCommand, VmEvent};
-use tasks_protocol::{ScoutCommand, ScoutEvent, TasksProtocol};
 
 type TVmCommand = VmCommand<TasksProtocol>;
 type TVmEvent = VmEvent<TasksProtocol>;
@@ -21,12 +21,7 @@ type TVmEvent = VmEvent<TasksProtocol>;
 /// Build the scout-supervisor binary, returning its path.
 async fn build_supervisor() -> PathBuf {
     let output = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "scout-supervisor",
-            "--message-format=json",
-        ])
+        .args(["build", "-p", "scout-supervisor", "--message-format=json"])
         .output()
         .await
         .expect("cargo build");
@@ -111,7 +106,11 @@ impl SupervisorProc {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stdout_lines = BufReader::new(stdout).lines();
-        Self { child, stdin, stdout_lines }
+        Self {
+            child,
+            stdin,
+            stdout_lines,
+        }
     }
 
     async fn send(&mut self, cmd: TVmCommand) {
@@ -162,12 +161,7 @@ async fn start_scout_completes_with_spec() {
     let repo_url = format!("file://{}", repo.display());
     let agent = fixture_stub_agent();
 
-    let mut sup = SupervisorProc::spawn(
-        &binary,
-        agent.to_str().unwrap(),
-        tmp.path(),
-    )
-    .await;
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
     assert!(matches!(sup.recv().await, VmEvent::Ready));
 
     sup.send(VmCommand::App {
@@ -221,6 +215,14 @@ async fn start_scout_completes_with_spec() {
             files_touched,
         } => {
             assert!(spec_markdown.contains("## Spec"), "spec: {spec_markdown}");
+            // The stub echoes its stdin into the spec — proves the prompt
+            // actually reached the agent.
+            assert!(
+                spec_markdown.contains("Implement a stub function."),
+                "prompt did not reach the agent via stdin: {spec_markdown}"
+            );
+            // The stub COMMITS src/stub.rs — proves files_touched diffs
+            // against the recorded base SHA, not HEAD.
             assert!(files_touched.contains(&"src/stub.rs".to_string()));
             // SPEC.md and PROMPT.md should be filtered out.
             assert!(!files_touched.iter().any(|f| f == "SPEC.md"));

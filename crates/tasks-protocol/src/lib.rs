@@ -18,6 +18,11 @@ impl AppProtocol for TasksProtocol {
 }
 
 /// Commands the tasks server sends to a Scout VM.
+///
+/// There is deliberately no cancel command: the host cancels a scout by
+/// deallocating its VM, which tears down the supervisor and everything
+/// under it. In-band cancellation would race the supervisor's
+/// single-threaded command loop for no benefit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScoutCommand {
@@ -31,9 +36,6 @@ pub enum ScoutCommand {
         /// template instructions, rendered host-side.
         prompt: String,
     },
-    /// Abort in-flight exploration. The supervisor should exit cleanly; the
-    /// host will deallocate the VM.
-    Cancel,
 }
 
 /// Events a Scout VM streams back to the tasks server.
@@ -95,11 +97,20 @@ mod tests {
         assert_eq!(back, evt);
     }
 
+    fn start_cmd() -> ScoutCommand {
+        ScoutCommand::Start {
+            task_id: "task_abc".into(),
+            repo_clone_url: "https://github.com/o/r.git".into(),
+            base_branch: "main".into(),
+            prompt: "go".into(),
+        }
+    }
+
     #[test]
     fn service_command_composes() {
         let cmd: ServiceCommand<TasksProtocol> = ServiceCommand::Send {
             vm_id: VmId::new("vm-abc"),
-            command: ScoutCommand::Cancel,
+            command: start_cmd(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: ServiceCommand<TasksProtocol> = serde_json::from_str(&json).unwrap();
@@ -122,7 +133,7 @@ mod tests {
     #[test]
     fn vm_command_wraps_scout_command() {
         let wrapped: VmCommand<TasksProtocol> = VmCommand::App {
-            payload: ScoutCommand::Cancel,
+            payload: start_cmd(),
         };
         let json = serde_json::to_string(&wrapped).unwrap();
         let back: VmCommand<TasksProtocol> = serde_json::from_str(&json).unwrap();
