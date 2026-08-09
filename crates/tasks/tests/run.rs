@@ -380,6 +380,7 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         poll_interval: Duration::from_secs(3600),
         scout_max_concurrent: max_concurrent,
         scout_image: "agent:v1".into(),
+        scout_timeout: Duration::from_secs(300),
         vm_pool_socket: vm_pool_socket.to_path_buf(),
         github_token: None,
         github_api_url: None,
@@ -724,6 +725,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         started_at: Utc::now(),
         completed_at: None,
         exit_reason: None,
+        usage: None,
     };
     store.insert_session(&orphan).await.unwrap();
     store.set_mode(Mode::Play).await.unwrap();
@@ -768,4 +770,104 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         "a crashed server is not the task's fault"
     );
     assert_eq!(dispatch_order(&store).await, vec![task.id.clone()]);
+}
+
+/// #762: a hung scout is ended by its deadline, counts as a dispatch failure
+/// like any other, and — the point of the feature — frees its slot so the
+/// queue keeps moving.
+#[tokio::test]
+async fn a_hung_scout_times_out_and_frees_its_slot() {
+    // 10s against a 2s deadline; see the comment in tests/scout.rs on why not
+    // 300s. One slot, so the second task can only run once the first lets go.
+    let (_tmp, store, mut config, service) = dispatch_harness_with_agent(1, "sleep 10").await;
+    config.scout_timeout = Duration::from_secs(2);
+    let project = insert_project(&store).await;
+    let hung = insert_task(&store, &project, 1, "hangs forever").await;
+    let queued = insert_task(&store, &project, 2, "waiting behind it").await;
+    store
+        .set_queue_order(&[hung.id.clone(), queued.id.clone()])
+        .await
+        .unwrap();
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+
+    // Three timeouts exhaust the attempt cap, exactly as three of anything else.
+    wait_for_state(&store, &hung.id, TaskState::Rejected).await;
+    // The slot is free: the task behind it gets dispatched.
+    wait_until(Duration::from_secs(60), || {
+        let store = store.clone();
+        let id = queued.id.clone();
+        async move { dispatch_order(&store).await.contains(&id) }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    let stored = store.get_task(&hung.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Rejected);
+    assert_eq!(
+        stored.dispatch_attempts, 3,
+        "a timeout is a dispatch failure"
+    );
+
+    let sessions = store.list_sessions().await.unwrap();
+    let timed_out: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.task_id == hung.id)
+        .inspect(|s| assert_eq!(s.status, SessionStatus::ScoutFailed))
+        .filter(|s| {
+            s.exit_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("timed out"))
+        })
+        .collect();
+    assert_eq!(timed_out.len(), 3, "three sessions ended on the deadline");
+
+    let payloads: Vec<_> = store
+        .events_since(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.payload)
+        .collect();
+    // The task returns to New after each timeout. Asserted on the append-only
+    // log rather than by polling the row: the dispatch loop re-picks the task
+    // within a tick, so a row read can legitimately miss the window. Don't
+    // "fix" this back into a get_task().state check.
+    let back_to_new = payloads
+        .iter()
+        .filter(|p| {
+            matches!(
+                p,
+                EventPayload::TaskStateChanged {
+                    task_id,
+                    from: TaskState::Scouting,
+                    to: TaskState::New
+                } if *task_id == hung.id
+            )
+        })
+        .count();
+    assert_eq!(back_to_new, 3, "each timeout requeues the task");
+    assert!(
+        payloads.iter().any(|p| matches!(
+            p,
+            EventPayload::Note { source, message }
+                if source == "dispatcher" && message.contains("timed out")
+        )),
+        "the dispatcher leaves a breadcrumb naming the timeout"
+    );
+
+    // Cancellation is deallocation — no VM may outlive its dispatch, or the
+    // pool leaks a slot per hang.
+    wait_until(Duration::from_secs(60), || {
+        let service = service.clone();
+        async move { service.pool.list().await.is_empty() }
+    })
+    .await;
 }

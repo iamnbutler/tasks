@@ -147,7 +147,9 @@ impl TaskState {
 }
 
 /// A Scout run — one VM executing a throwaway implementation for a task.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: `usage` carries `f64` costs. `PartialEq` is kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
     pub task_id: TaskId,
@@ -157,6 +159,61 @@ pub struct Session {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub exit_reason: Option<String>,
+    /// Tokens and cost parsed from the agent's final stream-json `result`
+    /// record. `None` for sessions that predate transcript capture, that
+    /// never reached a result, or whose record didn't parse.
+    #[serde(default)]
+    pub usage: Option<SessionUsage>,
+}
+
+/// What one agent run cost. Every field is optional: the shape belongs to
+/// Claude Code, and a renamed key must cost us a null, not a failed scout.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub total_cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+    pub num_turns: Option<u64>,
+}
+
+/// One line of agent output, as persisted. `seq` is dense per session and
+/// assigned at persist time, so readers can page and tail with `?since=`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptLine {
+    pub session_id: SessionId,
+    pub seq: i64,
+    pub timestamp: DateTime<Utc>,
+    pub stream: TranscriptStream,
+    pub line: String,
+}
+
+/// Which pipe a transcript line came from. Mirrors `tasks_protocol::LogStream`
+/// at the domain layer so the store doesn't depend on the wire enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStream {
+    Stdout,
+    Stderr,
+}
+
+impl TranscriptStream {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TranscriptStream::Stdout => "stdout",
+            TranscriptStream::Stderr => "stderr",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "stdout" => Some(TranscriptStream::Stdout),
+            "stderr" => Some(TranscriptStream::Stderr),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +283,16 @@ impl Complexity {
             _ => None,
         }
     }
+}
+
+/// A spec paired with the verdict a reviewer rendered on it. They always
+/// travel together — feedback is unusable without the artifact it refers to —
+/// so a re-scout carries both forward or neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewedSpec {
+    pub spec: Spec,
+    pub status: SpecQueueStatus,
+    pub feedback: Option<String>,
 }
 
 /// An entry in the spec queue — the orchestrator's working set for judging

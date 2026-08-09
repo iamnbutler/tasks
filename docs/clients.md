@@ -63,6 +63,55 @@ the server only.
 - `GET /events?since=&limit=` — catch-up (default limit 100);
   `GET /events/stream` — SSE, each `data:` line is one Event JSON.
 
+## Session transcripts
+
+Agent output is a **separate channel from the event log**, on purpose (see
+*Event volume* below). Two endpoints, both scoped to one session:
+
+- `GET /sessions/{id}/transcript?since=<seq>&limit=` — catch-up read. Returns
+  `[{session_id, seq, timestamp, stream, line}]`, oldest first. `stream` is
+  `stdout` \| `stderr`. `since` is **inclusive**, matching `/events?since=` — a
+  tailing client passes `last_seq + 1`. `limit` defaults to 500, capped at 2000.
+- `GET /sessions/{id}/transcript/stream` — SSE tail. Replays from `since` (all
+  of it, paging internally — no `limit`, so the stream can't silently skip a
+  span) and then streams live lines, with the same 15s keepalive as
+  `/events/stream`.
+
+`seq` is dense per session and assigned server-side at persist time. An empty
+transcript means *nothing was recorded* — sessions predating transcript capture
+have none — so render it as "no transcript", never as a failure.
+
+Lines are the agent's stream-json output: one JSON object per line (assistant
+messages, thinking, tool calls with their inputs, tool results, and a final
+`result` record). Treat each `line` as opaque text unless you're prepared to
+parse Claude Code's schema — it's forwarded verbatim, and a transcript can
+contain any file the agent read, so it carries the same trust boundary as the
+rest of this API: local SQLite, loopback only, no auth.
+
+`Session` also carries `usage` (`{input_tokens, output_tokens,
+cache_read_input_tokens, cache_creation_input_tokens, total_cost_usd,
+duration_ms, num_turns}`), parsed from that final record. Every field is
+nullable and so is `usage` itself — a renamed upstream key costs a null, not a
+failed scout.
+
+Two caps bound a session server-side: 32 KiB per line (over-long lines are cut
+and marked) and 8 MiB per session, after which one notice is written and
+recording stops — the scout itself is unaffected. Lines lost to queue pressure
+are announced inline as `[tasks] N transcript line(s) dropped here` rather than
+left as an invisible gap.
+
+## Event volume
+
+The event log is deliberately low-rate. Clients are told to treat events as
+invalidation signals and refetch, so every event costs every connected client a
+request — which only works while events are rare and meaningful (a state
+change, a spec, a mode flip). High-rate data must not go through it.
+
+Transcripts are the worked example: a single scout emits thousands of output
+lines, and only an open session-detail view wants them. They live in their own
+table, their own broadcast channel and their own endpoints, and they never
+touch `append_event`. Apply the same rule to anything similar you add later.
+
 All enums are snake_case strings on the wire:
 
 - `Task.state`: `new` → `scouting` → `spec_ready` → `queued` → `done`, with

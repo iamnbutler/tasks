@@ -15,10 +15,11 @@
 //! - `Pause` — poll, but start no new scouts.
 //! - `Stop` — neither poll nor dispatch.
 //!
-//! Mode gates *new* dispatches only. A scout already in flight always runs to
-//! completion: there is no in-band cancel command (see
-//! [`crate::protocol::ScoutCommand`]) — cancelling means deallocating the VM,
-//! and that path is deferred.
+//! Mode gates *new* dispatches only. A scout already in flight runs to
+//! completion or to its deadline: there is no in-band cancel command (see
+//! [`crate::protocol::ScoutCommand`]), so cancelling means deallocating the
+//! VM. That is exactly what `SCOUT_TIMEOUT_SECS` does when a scout hangs —
+//! a timeout is a dispatch failure like any other, not a mode concern.
 //!
 //! Crash consistency is the store's job, not memory's: startup calls
 //! [`reconcile_startup`] to clear work a dead process left mid-flight, and a
@@ -55,6 +56,13 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 const DEFAULT_SCOUT_MAX_CONCURRENT: usize = 2;
 const DEFAULT_SCOUT_IMAGE: &str = "agent:v1";
 const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
+/// Wall-clock budget for one scout. ~2.5x the observed 23-minute live run, and
+/// deliberately below vm-pool's own `PoolConfig::vm_timeout` (7200s): if the
+/// app deadline sat at or above the pool's reaper, infrastructure would tear
+/// the VM down first and the dispatcher would report a stream error instead of
+/// its own timeout — same recovery, worse diagnostics. Raising this past ~2h
+/// means raising the pool's `vm_timeout` too.
+const DEFAULT_SCOUT_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_CLONE_URL_BASE: &str = "https://github.com";
 
 /// How often the dispatch loop re-reads mode + queue.
@@ -66,8 +74,10 @@ const VM_POOL_RETRY: Duration = Duration::from_secs(10);
 /// How long in-flight scouts get to finish after ctrl_c before we walk away.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// `source` on the breadcrumbs this module writes to the event log.
-const DISPATCHER: &str = "dispatcher";
+/// `source` on the breadcrumbs the dispatcher writes to the event log.
+/// `pub(crate)` because [`crate::scout`] emits the timeout note under the same
+/// source — it has the vm id and the deadline that make the entry useful.
+pub(crate) const DISPATCHER: &str = "dispatcher";
 
 /// Consecutive failed dispatches after which a task is rejected outright.
 /// Matches the re-explore cap the plan puts on the server rather than the
@@ -110,6 +120,9 @@ pub struct Config {
     pub scout_max_concurrent: usize,
     /// vm-pool image scouts run in (`SCOUT_IMAGE`).
     pub scout_image: String,
+    /// Wall-clock budget for one scout (`SCOUT_TIMEOUT_SECS`). Past it the VM
+    /// is deallocated and the attempt counts as a dispatch failure.
+    pub scout_timeout: Duration,
     /// vm-pool service socket (`VM_POOL_SOCKET`).
     pub vm_pool_socket: PathBuf,
     /// `GITHUB_TOKEN`. Absent disables polling and leaves clone URLs anonymous.
@@ -143,6 +156,11 @@ impl Config {
             )?
             .max(1),
             scout_image: env_string("SCOUT_IMAGE").unwrap_or_else(|| DEFAULT_SCOUT_IMAGE.into()),
+            scout_timeout: Duration::from_secs(parse_env(
+                "SCOUT_TIMEOUT_SECS",
+                "a number of seconds",
+                DEFAULT_SCOUT_TIMEOUT_SECS,
+            )?),
             vm_pool_socket: env_string("VM_POOL_SOCKET")
                 .unwrap_or_else(|| DEFAULT_VM_POOL_SOCKET.into())
                 .into(),
@@ -444,6 +462,7 @@ async fn dispatch_connected(
         ScoutConfig {
             image: config.scout_image.clone(),
             vm_config: config.vm_config.clone(),
+            timeout: config.scout_timeout,
         },
     ));
 
@@ -686,6 +705,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             scout_max_concurrent: 1,
             scout_image: DEFAULT_SCOUT_IMAGE.into(),
+            scout_timeout: Duration::from_secs(DEFAULT_SCOUT_TIMEOUT_SECS),
             vm_pool_socket: PathBuf::from(DEFAULT_VM_POOL_SOCKET),
             github_token: None,
             github_api_url: None,

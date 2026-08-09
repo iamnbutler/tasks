@@ -11,8 +11,9 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Complexity, GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Spec, SpecId,
-    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    Complexity, GhState, Mode, Project, ProjectId, ReviewedSpec, Session, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -38,6 +39,11 @@ impl<T> UpsertOutcome<T> {
 /// fall this far behind receive `RecvError::Lagged` and must catch up via
 /// `events_since`.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
+
+/// Capacity of the transcript broadcast channel. Larger than the event one:
+/// agent output is far higher-rate, and a session-detail view that lags briefly
+/// should resync rather than lose its place.
+const TRANSCRIPT_BROADCAST_CAPACITY: usize = 4096;
 
 /// `exit_reason` written to sessions that were still `running` when the server
 /// came back up.
@@ -81,6 +87,7 @@ pub enum StoreError {
 pub struct Store {
     pool: SqlitePool,
     event_tx: broadcast::Sender<Event>,
+    transcript_tx: broadcast::Sender<TranscriptLine>,
 }
 
 impl Store {
@@ -94,7 +101,12 @@ impl Store {
             .await?;
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-        Ok(Self { pool, event_tx })
+        let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        Ok(Self {
+            pool,
+            event_tx,
+            transcript_tx,
+        })
     }
 
     /// Open an in-memory database (useful for tests).
@@ -105,7 +117,12 @@ impl Store {
             .await?;
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
-        Ok(Self { pool, event_tx })
+        let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        Ok(Self {
+            pool,
+            event_tx,
+            transcript_tx,
+        })
     }
 
     // --- projects ---
@@ -511,7 +528,7 @@ impl Store {
     pub async fn get_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         let row = sqlx::query(
             "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
-             exit_reason FROM sessions WHERE id = ?",
+             exit_reason, agent_usage FROM sessions WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -522,11 +539,111 @@ impl Store {
     pub async fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
-             exit_reason FROM sessions ORDER BY started_at",
+             exit_reason, agent_usage FROM sessions ORDER BY started_at",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(session_from_row).collect()
+    }
+
+    pub async fn update_session_usage(
+        &self,
+        id: &SessionId,
+        usage: &SessionUsage,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE sessions SET agent_usage = ? WHERE id = ?")
+            .bind(serde_json::to_string(usage)?)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("session {id}")));
+        }
+        Ok(())
+    }
+
+    // --- transcripts ---
+
+    /// Append agent output lines for a session, assigning dense `seq` values
+    /// from `MAX(seq)+1`. One transaction for the batch; subscribers are
+    /// notified only after it commits, so a live tail can never announce a line
+    /// a catch-up read would fail to return.
+    ///
+    /// Returns the persisted lines with their seq values filled in.
+    pub async fn append_transcript_lines(
+        &self,
+        session_id: &SessionId,
+        lines: &[(TranscriptStream, String)],
+    ) -> Result<Vec<TranscriptLine>, StoreError> {
+        if lines.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE session_id = ?",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let mut persisted = Vec::with_capacity(lines.len());
+        for (offset, (stream, line)) in lines.iter().enumerate() {
+            let seq = next + offset as i64;
+            sqlx::query(
+                "INSERT INTO transcript_lines (session_id, seq, timestamp, stream, line) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(session_id.as_str())
+            .bind(seq)
+            .bind(now.to_rfc3339())
+            .bind(stream.as_str())
+            .bind(line)
+            .execute(&mut *tx)
+            .await?;
+            persisted.push(TranscriptLine {
+                session_id: session_id.clone(),
+                seq,
+                timestamp: now,
+                stream: *stream,
+                line: line.clone(),
+            });
+        }
+        tx.commit().await?;
+
+        for line in &persisted {
+            let _ = self.transcript_tx.send(line.clone());
+        }
+        Ok(persisted)
+    }
+
+    /// Transcript lines for a session with `seq >= since`, oldest first.
+    /// `since` is inclusive, matching `/events?since=`; a tailing client passes
+    /// `last_seq + 1`.
+    pub async fn transcript_since(
+        &self,
+        session_id: &SessionId,
+        since: i64,
+        limit: i64,
+    ) -> Result<Vec<TranscriptLine>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT session_id, seq, timestamp, stream, line FROM transcript_lines \
+             WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?",
+        )
+        .bind(session_id.as_str())
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(transcript_line_from_row).collect()
+    }
+
+    /// Live transcript lines for *every* session; subscribers filter by id.
+    /// One channel rather than per-session ones because `SCOUT_MAX_CONCURRENT`
+    /// is small and per-session channel lifetimes aren't worth managing.
+    pub fn subscribe_transcript(&self) -> broadcast::Receiver<TranscriptLine> {
+        self.transcript_tx.subscribe()
     }
 
     // --- reconciliation ---
@@ -661,6 +778,35 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(spec_from_row).collect()
+    }
+
+    /// The most recently created spec for `task` that a reviewer has actually
+    /// ruled on, with its verdict and feedback.
+    ///
+    /// Only the three verdict statuses count. `PendingReview` and `Blocked` are
+    /// server-assigned, so there is no reviewer opinion to replay. Ordering is
+    /// `created_at DESC` with `rowid DESC` as the tiebreak: two specs for one
+    /// task can share a timestamp to second resolution, and the query has to be
+    /// deterministic. `created_at` is always written as UTC RFC-3339, so
+    /// lexicographic ordering matches chronological ordering.
+    pub async fn latest_reviewed_spec(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<ReviewedSpec>, StoreError> {
+        let row = sqlx::query(
+            "SELECT s.id, s.session_id, s.task_id, s.content, s.complexity, \
+             s.files_touched, s.created_at, q.status, q.feedback \
+             FROM specs s JOIN spec_queue q ON q.spec_id = s.id \
+             WHERE s.task_id = ? AND q.status IN (?, ?, ?) \
+             ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1",
+        )
+        .bind(task_id.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(SpecQueueStatus::NeedsRevision.as_str())
+        .bind(SpecQueueStatus::Rejected.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(reviewed_spec_from_row).transpose()
     }
 
     // --- spec queue ---
@@ -984,6 +1130,23 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Session, StoreError>
             .map(|s| parse_ts(&s, "completed_at"))
             .transpose()?,
         exit_reason: row.try_get("exit_reason")?,
+        usage: row
+            .try_get::<Option<String>, _>("agent_usage")?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
+    })
+}
+
+fn transcript_line_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TranscriptLine, StoreError> {
+    let stream_raw: String = row.try_get("stream")?;
+    Ok(TranscriptLine {
+        session_id: SessionId::from_raw(row.try_get::<String, _>("session_id")?),
+        seq: row.try_get("seq")?,
+        timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
+        stream: TranscriptStream::from_str(&stream_raw).ok_or(StoreError::BadEnum {
+            column: "stream",
+            value: stream_raw,
+        })?,
+        line: row.try_get("line")?,
     })
 }
 
@@ -1001,6 +1164,22 @@ fn spec_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Spec, StoreError> {
         })?,
         files_touched: serde_json::from_str(&files_raw)?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+    })
+}
+
+/// Maps a `specs` ⋈ `spec_queue` row. Safe to reuse [`spec_from_row`] on the
+/// joined row because `specs` has no `status` or `feedback` column of its own,
+/// so the two projections can't collide.
+fn reviewed_spec_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ReviewedSpec, StoreError> {
+    let status_raw: String = row.try_get("status")?;
+    let feedback: Option<String> = row.try_get("feedback")?;
+    Ok(ReviewedSpec {
+        status: SpecQueueStatus::from_str(&status_raw).ok_or(StoreError::BadEnum {
+            column: "status",
+            value: status_raw,
+        })?,
+        feedback,
+        spec: spec_from_row(row)?,
     })
 }
 
@@ -1274,6 +1453,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             exit_reason: None,
+            usage: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -1311,6 +1491,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
             exit_reason: None,
+            usage: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -1891,6 +2072,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             exit_reason: None,
+            usage: None,
         };
         store.insert_session(&running).await.unwrap();
 
@@ -2045,6 +2227,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
             exit_reason: None,
+            usage: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -2355,5 +2538,245 @@ mod tests {
             EventPayload::Note { message, .. } => assert_eq!(message, "first"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // --- previous-attempt lookup (#760) ---
+
+    #[tokio::test]
+    async fn latest_reviewed_spec_returns_the_newest_verdict_for_that_task() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, first) = seed_spec(&store, 1).await;
+
+        // Pending review is not a verdict — nothing to replay yet.
+        assert!(
+            store
+                .latest_reviewed_spec(&task.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pending spec is not a reviewed one"
+        );
+
+        store
+            .review_spec(
+                &first.id,
+                SpecQueueStatus::NeedsRevision,
+                Some("fix it".to_string()),
+            )
+            .await
+            .unwrap();
+        let found = store.latest_reviewed_spec(&task.id).await.unwrap().unwrap();
+        assert_eq!(found.spec.id, first.id);
+        assert_eq!(found.status, SpecQueueStatus::NeedsRevision);
+        assert_eq!(found.feedback.as_deref(), Some("fix it"));
+
+        // A newer *unreviewed* spec must not displace the reviewed one.
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: "scout/2".into(),
+            status: SessionStatus::ScoutSucceeded,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        let second = Spec {
+            id: SpecId::new(),
+            session_id: session.id.clone(),
+            task_id: task.id.clone(),
+            content: "## Spec two".into(),
+            complexity: Complexity::Simple,
+            files_touched: vec![],
+            created_at: Utc::now(),
+        };
+        store.insert_spec(&second).await.unwrap();
+        store
+            .upsert_spec_queue_entry(&SpecQueueEntry {
+                spec_id: second.id.clone(),
+                status: SpecQueueStatus::PendingReview,
+                rank: None,
+                approved_at: None,
+                feedback: None,
+                blocking_dependencies: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_reviewed_spec(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .spec
+                .id,
+            first.id,
+            "an unreviewed newer spec must not displace the reviewed one"
+        );
+
+        // Once reviewed, the newer one wins.
+        store
+            .review_spec(
+                &second.id,
+                SpecQueueStatus::Rejected,
+                Some("no".to_string()),
+            )
+            .await
+            .unwrap();
+        let found = store.latest_reviewed_spec(&task.id).await.unwrap().unwrap();
+        assert_eq!(found.spec.id, second.id);
+        assert_eq!(found.status, SpecQueueStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn latest_reviewed_spec_does_not_leak_across_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task_a, spec_a) = seed_spec(&store, 1).await;
+        let (task_b, _spec_b) = seed_spec(&store, 2).await;
+        store
+            .review_spec(
+                &spec_a.id,
+                SpecQueueStatus::NeedsRevision,
+                Some("a only".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .latest_reviewed_spec(&task_b.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "another task's review must not surface here"
+        );
+    }
+
+    // --- transcripts (#759) ---
+
+    #[tokio::test]
+    async fn transcript_lines_get_dense_seqs_and_read_back_from_since() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, _) = seed_spec(&store, 1).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+
+        let first = store
+            .append_transcript_lines(
+                &session.id,
+                &[
+                    (TranscriptStream::Stdout, "one".into()),
+                    (TranscriptStream::Stderr, "two".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        // A second batch continues the sequence rather than restarting it.
+        let second = store
+            .append_transcript_lines(&session.id, &[(TranscriptStream::Stdout, "three".into())])
+            .await
+            .unwrap();
+        assert_eq!(second[0].seq, 3);
+
+        let all = store.transcript_since(&session.id, 0, 100).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].stream, TranscriptStream::Stderr);
+
+        // `since` is inclusive, matching /events?since=.
+        let tail = store.transcript_since(&session.id, 2, 100).await.unwrap();
+        assert_eq!(tail.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![2, 3]);
+
+        let capped = store.transcript_since(&session.id, 0, 2).await.unwrap();
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn appending_transcript_lines_notifies_subscribers_after_commit() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, _) = seed_spec(&store, 1).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+
+        let mut rx = store.subscribe_transcript();
+        store
+            .append_transcript_lines(&session.id, &[(TranscriptStream::Stdout, "hello".into())])
+            .await
+            .unwrap();
+
+        let line = rx.try_recv().expect("broadcast after commit");
+        assert_eq!(line.line, "hello");
+        assert_eq!(line.seq, 1);
+        // Anything announced on the channel must already be readable.
+        assert_eq!(
+            store
+                .transcript_since(&session.id, line.seq, 10)
+                .await
+                .unwrap()[0]
+                .line,
+            "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_usage_round_trips() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (task, _) = seed_spec(&store, 1).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        assert!(
+            store
+                .get_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .usage
+                .is_none()
+        );
+
+        let usage = SessionUsage {
+            input_tokens: Some(1200),
+            output_tokens: Some(340),
+            total_cost_usd: Some(0.0421),
+            ..Default::default()
+        };
+        store
+            .update_session_usage(&session.id, &usage)
+            .await
+            .unwrap();
+        let back = store.get_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(back.usage, Some(usage));
     }
 }

@@ -116,6 +116,26 @@ pub fn stub_agent_path() -> PathBuf {
         .join("stub-agent.sh")
 }
 
+/// A stand-in agent that copies its whole stdin prompt into SPEC.md, so a test
+/// can assert on what the scout was told.
+pub fn echo_prompt_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("echo-prompt-agent.sh")
+}
+
+/// A stand-in agent that emits stream-json shaped output, paced so a test can
+/// attach to the live transcript tail mid-run.
+pub fn stream_json_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scout-supervisor")
+        .join("tests")
+        .join("fixtures")
+        .join("stub-agent-stream-json.sh")
+}
+
 /// Start a vm-pool Service on a fresh Unix socket. Returns the service + socket path.
 pub async fn spawn_vm_pool(
     tmp: &Path,

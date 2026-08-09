@@ -11,6 +11,7 @@
 //! land in the store with the expected state transitions. No mocks.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use vm_pool_protocol::VmConfig;
@@ -88,6 +89,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     let scout_config = ScoutConfig {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
+        timeout: Duration::from_secs(300),
     };
     let target = ScoutTarget {
         repo_clone_url: repo_url,
@@ -173,6 +175,7 @@ async fn two_scouts_dispatch_concurrently() {
     let scout_config = ScoutConfig {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
+        timeout: Duration::from_secs(300),
     };
     let target = ScoutTarget {
         repo_clone_url: repo_url,
@@ -220,6 +223,7 @@ async fn scout_dispatch_failure_resets_task_to_new() {
     let scout_config = ScoutConfig {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
+        timeout: Duration::from_secs(300),
     };
     let target = ScoutTarget {
         repo_clone_url: repo_url,
@@ -237,5 +241,161 @@ async fn scout_dispatch_failure_resets_task_to_new() {
         stored_task.state,
         TaskState::New,
         "failed scout should reset task to New for retry"
+    );
+}
+
+/// #760: a task re-dispatched after `needs_revision` must receive the
+/// reviewer's feedback and the spec it referred to.
+///
+/// The echo-prompt agent copies its whole stdin into SPEC.md, so the second
+/// run's spec content *is* the prompt the scout was given.
+#[tokio::test]
+async fn re_scout_after_needs_revision_receives_the_review() {
+    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        common::echo_prompt_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Needs work", "The issue body.").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    // First pass: a fresh task, so no "Previous attempt" anywhere.
+    let first = scout.dispatch(task.clone(), &target).await.expect("first");
+    assert!(
+        !first.content.contains("## Previous attempt"),
+        "a fresh task's prompt must be unchanged"
+    );
+
+    // Review it back.
+    const FEEDBACK: &str = "Section 3 is underspecified — name the files.";
+    store
+        .review_spec(
+            &first.id,
+            SpecQueueStatus::NeedsRevision,
+            Some(FEEDBACK.to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Re-dispatch: the task is back in `New`.
+    let requeued = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(requeued.state, TaskState::New);
+    let second = scout.dispatch(requeued, &target).await.expect("second");
+
+    assert!(
+        second.content.contains(FEEDBACK),
+        "re-scout prompt is missing the reviewer's feedback:\n{}",
+        second.content
+    );
+    assert!(
+        second.content.contains("## Previous attempt"),
+        "re-scout prompt is missing the Previous attempt section"
+    );
+    assert!(
+        second.content.contains("needs_revision"),
+        "re-scout prompt should name the verdict"
+    );
+    // The prior spec travels with the feedback — feedback about "section 3" is
+    // meaningless without section 3.
+    assert!(
+        second.content.contains("### Received prompt"),
+        "the prior spec's own text should be quoted into the new prompt"
+    );
+}
+
+/// #762: a scout whose agent never reports back is ended by the deadline
+/// rather than holding its slot forever.
+#[tokio::test]
+async fn a_scout_that_never_reports_back_times_out() {
+    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+
+    // A 10s sleep against a 2s deadline. Deliberately not 300s: deallocating a
+    // supervisor *process* does not kill the agent under it (SupervisorRuntime
+    // ::stop is a no-op and the supervisor is blocked on child.wait()), so a
+    // long-sleeping stub keeps the test binary's inherited stderr open and makes
+    // piped `cargo test` output look hung for the sleep's duration. 5x the
+    // deadline is margin enough — keep the ratio if you retune.
+    let wrapper =
+        write_supervisor_wrapper(tmp.path(), &supervisor_bin, "sleep 10", &workdir_root).await;
+    let (service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Hangs", "never finishes").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(2),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    let err = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("should time out");
+    assert!(
+        matches!(err, tasks::scout::ScoutError::Timeout { secs: 2 }),
+        "unexpected error: {err:?}"
+    );
+
+    // Session failed with a timeout reason, task returned for retry.
+    let sessions = store.list_sessions().await.unwrap();
+    let session = sessions.last().expect("a session row");
+    assert_eq!(session.status, SessionStatus::ScoutFailed);
+    assert!(
+        session
+            .exit_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("timed out")),
+        "exit_reason: {:?}",
+        session.exit_reason
+    );
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::New
+    );
+
+    // Cancellation is deallocation: the VM must be gone, or the slot leaks.
+    assert!(
+        service.pool.list().await.is_empty(),
+        "timed-out scout left its VM allocated"
     );
 }
