@@ -401,6 +401,7 @@ mod tests {
             state: TaskState::New,
             priority,
             manual_rank: None,
+            dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
         };

@@ -228,6 +228,9 @@ impl Scout {
         self.store
             .update_task_state(&task.id, TaskState::SpecReady)
             .await?;
+        // A spec proves the task is dispatchable, so its past failures stop
+        // counting: a later `needs_revision` re-scout starts from zero strikes.
+        self.store.reset_dispatch_attempts(&task.id).await?;
 
         self.store
             .append_event(EventPayload::SessionCompleted {

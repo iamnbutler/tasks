@@ -20,12 +20,17 @@
 //! [`crate::protocol::ScoutCommand`]) — cancelling means deallocating the VM,
 //! and that path is deferred.
 //!
+//! Crash consistency is the store's job, not memory's: startup calls
+//! [`reconcile_startup`] to clear work a dead process left mid-flight, and a
+//! task's failed dispatches are counted on its row, so restarts can't hand a
+//! task that can never be scouted three fresh attempts every time.
+//!
 //! Nothing here is required for the API to work. A missing `GITHUB_TOKEN`
 //! disables polling and an unreachable vm-pool socket disables dispatch (with
 //! periodic reconnect); the server stays up either way so manual flows over
 //! HTTP keep working.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,9 +69,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// `source` on the breadcrumbs this module writes to the event log.
 const DISPATCHER: &str = "dispatcher";
 
-/// Consecutive failed dispatches after which the loop stops retrying a task
-/// for the lifetime of the process. Matches the re-explore cap the plan puts
-/// on the server rather than the orchestrator.
+/// Consecutive failed dispatches after which a task is rejected outright.
+/// Matches the re-explore cap the plan puts on the server rather than the
+/// orchestrator. The count lives in the store (`tasks.dispatch_attempts`), so
+/// restarts don't hand a poison task a fresh set of strikes.
 const MAX_DISPATCH_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
@@ -233,13 +239,18 @@ pub async fn open_store(data_dir: &Path) -> Result<Store, RunError> {
 
 /// Run the server until ctrl_c.
 ///
+/// Startup begins with [`reconcile_startup`], so work abandoned by a previous
+/// process is cleaned up before either loop looks at the queue.
+///
 /// Shutdown is best-effort: ctrl_c stops the HTTP listener and signals both
 /// loops. The poll loop exits at once; the dispatch loop starts nothing new
 /// and waits out its in-flight scouts, up to [`SHUTDOWN_GRACE`]. Past that we
 /// stop waiting — the abandoned VMs are reaped by vm-pool's health loop, and
-/// their sessions stay `running` in the store until a scout retries the task.
+/// their sessions stay `running` in the store until the next startup
+/// reconciles them.
 pub async fn run(config: Config) -> Result<(), RunError> {
     let store = Arc::new(open_store(&config.data_dir).await?);
+    reconcile_startup(&store).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let poll = tokio::spawn(poll_loop(
@@ -268,6 +279,24 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
             "in-flight scouts did not finish within the grace period; exiting anyway"
+        );
+    }
+    Ok(())
+}
+
+/// Clean up work a previous process abandoned mid-flight.
+///
+/// Must run before any loop starts: this process owns all dispatch, so every
+/// `running` session it finds at startup is by definition orphaned, and every
+/// `scouting` task is stranded behind one. See
+/// [`Store::reconcile_orphaned_work`] for what that means row by row.
+pub async fn reconcile_startup(store: &Store) -> Result<(), StoreError> {
+    let report = store.reconcile_orphaned_work().await?;
+    if !report.is_empty() {
+        info!(
+            sessions = report.sessions,
+            tasks = report.tasks,
+            "reconciled work orphaned by a previous run"
         );
     }
     Ok(())
@@ -351,7 +380,6 @@ pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, St
 /// drops, dispatch pauses and reconnects every [`VM_POOL_RETRY`] rather than
 /// taking the process down.
 pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watch::Receiver<bool>) {
-    let mut attempts: HashMap<TaskId, u32> = HashMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -373,7 +401,7 @@ pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watc
         };
         info!(socket = %config.vm_pool_socket.display(), "connected to vm-pool");
 
-        dispatch_connected(&store, &config, client, &mut attempts, &mut shutdown).await;
+        dispatch_connected(&store, &config, client, &mut shutdown).await;
     }
 }
 
@@ -384,7 +412,6 @@ async fn dispatch_connected(
     store: &Arc<Store>,
     config: &Config,
     client: Client<TasksProtocol>,
-    attempts: &mut HashMap<TaskId, u32>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let scout = Arc::new(Scout::new(
@@ -403,15 +430,7 @@ async fn dispatch_connected(
 
     loop {
         if !draining
-            && let Err(e) = top_up(
-                store,
-                config,
-                &scout,
-                attempts,
-                &mut in_flight,
-                &mut in_flight_ids,
-            )
-            .await
+            && let Err(e) = top_up(store, config, &scout, &mut in_flight, &mut in_flight_ids).await
         {
             warn!(error = %e, "could not read the task queue; retrying next tick");
         }
@@ -425,7 +444,7 @@ async fn dispatch_connected(
                 match joined {
                     Ok((task_id, result)) => {
                         in_flight_ids.remove(&task_id);
-                        match record_outcome(store, attempts, &task_id, result).await {
+                        match record_outcome(store, &task_id, result).await {
                             Ok(ConnectionLost(true)) => draining = true,
                             Ok(ConnectionLost(false)) => {}
                             Err(e) => warn!(task_id = %task_id, error = %e, "recording scout outcome failed"),
@@ -449,7 +468,6 @@ async fn top_up(
     store: &Arc<Store>,
     config: &Config,
     scout: &Arc<Scout>,
-    attempts: &HashMap<TaskId, u32>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
 ) -> Result<(), StoreError> {
@@ -458,7 +476,7 @@ async fn top_up(
     }
 
     while in_flight.len() < config.scout_max_concurrent {
-        let Some((task, project)) = next_dispatchable(store, in_flight_ids, attempts).await? else {
+        let Some((task, project)) = next_dispatchable(store, in_flight_ids).await? else {
             break;
         };
 
@@ -488,16 +506,19 @@ async fn top_up(
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
 /// applies), state `New`, still open on GitHub, not in flight, not past the
 /// attempt cap.
+///
+/// A task at the cap is rejected the moment it gets there, so the attempt
+/// filter here is belt-and-braces: it also covers rows an older build (or a
+/// crash between the increment and the rejection) left `New` at three strikes.
 async fn next_dispatchable(
     store: &Store,
     skip: &HashSet<TaskId>,
-    attempts: &HashMap<TaskId, u32>,
 ) -> Result<Option<(Task, Project)>, StoreError> {
     for task in store.list_tasks().await? {
         if task.state != TaskState::New
             || task.gh_state == GhState::Closed
             || skip.contains(&task.id)
-            || attempts.get(&task.id).copied().unwrap_or(0) >= MAX_DISPATCH_ATTEMPTS
+            || task.dispatch_attempts >= MAX_DISPATCH_ATTEMPTS
         {
             continue;
         }
@@ -513,18 +534,19 @@ async fn next_dispatchable(
 /// Whether the finished dispatch took the vm-pool connection down with it.
 struct ConnectionLost(bool);
 
-/// Fold a finished dispatch back into the loop's bookkeeping. The store writes
-/// themselves already happened inside [`Scout::dispatch`]; this only tracks
-/// retries and leaves a breadcrumb on the event log.
+/// Fold a finished dispatch back into the pipeline. The spec and session writes
+/// already happened inside [`Scout::dispatch`]; what is left is the retry
+/// accounting — count the failure, reject the task once it has used up its
+/// attempts, and leave a breadcrumb on the event log either way.
 async fn record_outcome(
     store: &Store,
-    attempts: &mut HashMap<TaskId, u32>,
     task_id: &TaskId,
     result: Result<Spec, ScoutError>,
 ) -> Result<ConnectionLost, StoreError> {
     let error = match result {
         Ok(spec) => {
-            attempts.remove(task_id);
+            // The attempt count is cleared by `Scout::finalize_succeeded`,
+            // alongside the rest of the success-path writes.
             info!(task_id = %task_id, spec_id = %spec.id, "scout produced a spec");
             return Ok(ConnectionLost(false));
         }
@@ -544,21 +566,61 @@ async fn record_outcome(
         return Ok(ConnectionLost(true));
     }
 
-    let count = attempts.entry(task_id.clone()).or_insert(0);
-    *count += 1;
-    warn!(task_id = %task_id, attempt = *count, error = %error, "scout dispatch failed");
-    let message = if *count >= MAX_DISPATCH_ATTEMPTS {
-        format!("scout for {task_id} failed {count}x, giving up: {error}")
+    let count = store.record_dispatch_failure(task_id).await?;
+    warn!(task_id = %task_id, attempt = count, error = %error, "scout dispatch failed");
+    if count >= MAX_DISPATCH_ATTEMPTS {
+        reject_exhausted(
+            store,
+            task_id,
+            format!("scout for {task_id} failed {count}x, rejecting the task: {error}"),
+        )
+        .await?;
     } else {
-        format!("scout for {task_id} failed (attempt {count}): {error}")
+        store
+            .append_event(EventPayload::Note {
+                source: DISPATCHER.into(),
+                message: format!("scout for {task_id} failed (attempt {count}): {error}"),
+            })
+            .await?;
+    }
+    Ok(ConnectionLost(false))
+}
+
+/// Retire a task that has burned through [`MAX_DISPATCH_ATTEMPTS`].
+///
+/// [`Scout::dispatch`]'s failure path has already put the task back to `New` by
+/// the time we get here, which is why this runs last and wins: a task left
+/// `New` at the cap would be picked up again by the next process, which is
+/// exactly the retry-forever loop the persisted count exists to stop.
+async fn reject_exhausted(
+    store: &Store,
+    task_id: &TaskId,
+    message: String,
+) -> Result<(), StoreError> {
+    let from = match store.get_task(task_id).await? {
+        Some(task) => task.state,
+        None => {
+            warn!(task_id = %task_id, "task vanished before it could be rejected");
+            return Ok(());
+        }
     };
+    store
+        .update_task_state(task_id, TaskState::Rejected)
+        .await?;
+    store
+        .append_event(EventPayload::TaskStateChanged {
+            task_id: task_id.clone(),
+            from,
+            to: TaskState::Rejected,
+        })
+        .await?;
     store
         .append_event(EventPayload::Note {
             source: DISPATCHER.into(),
             message,
         })
         .await?;
-    Ok(ConnectionLost(false))
+    Ok(())
 }
 
 /// A scout error that means the vm-pool connection is gone, rather than the

@@ -39,6 +39,27 @@ impl<T> UpsertOutcome<T> {
 /// `events_since`.
 const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
+/// `exit_reason` written to sessions that were still `running` when the server
+/// came back up.
+const ORPHANED_EXIT_REASON: &str = "orphaned by server restart";
+
+/// What [`Store::reconcile_orphaned_work`] cleaned up: rows that a previous
+/// process left mid-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconcileReport {
+    /// `running` sessions failed as orphaned.
+    pub sessions: usize,
+    /// `scouting` tasks put back in the queue as `new`.
+    pub tasks: usize,
+}
+
+impl ReconcileReport {
+    /// Whether anything at all was reconciled — the only case worth logging.
+    pub fn is_empty(&self) -> bool {
+        self.sessions == 0 && self.tasks == 0
+    }
+}
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Debug, Error)]
@@ -126,8 +147,8 @@ impl Store {
     pub async fn insert_task(&self, task: &Task) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO tasks (id, project_id, gh_issue_number, title, body, labels, \
-             gh_state, state, priority, manual_rank, ingested_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             gh_state, state, priority, manual_rank, dispatch_attempts, ingested_at, \
+             updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task.id.as_str())
         .bind(task.project_id.as_str())
@@ -139,6 +160,7 @@ impl Store {
         .bind(task.state.as_str())
         .bind(task.priority)
         .bind(task.manual_rank)
+        .bind(task.dispatch_attempts as i64)
         .bind(task.ingested_at.to_rfc3339())
         .bind(task.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -149,7 +171,8 @@ impl Store {
     pub async fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StoreError> {
         let row = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, ingested_at, updated_at FROM tasks WHERE id = ?",
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -162,8 +185,8 @@ impl Store {
     pub async fn list_tasks(&self) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, ingested_at, updated_at FROM tasks \
-             ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -233,8 +256,8 @@ impl Store {
     ) -> Result<UpsertOutcome<Task>, StoreError> {
         let existing = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, ingested_at, updated_at FROM tasks \
-             WHERE project_id = ? AND gh_issue_number = ?",
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks WHERE project_id = ? AND gh_issue_number = ?",
         )
         .bind(project_id.as_str())
         .bind(issue.number as i64)
@@ -281,6 +304,7 @@ impl Store {
             state: TaskState::New,
             priority: 0,
             manual_rank: None,
+            dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
         };
@@ -298,6 +322,50 @@ impl Store {
             .await?;
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("task {id}")));
+        }
+        Ok(())
+    }
+
+    /// Count one more failed dispatch against a task and return the new total.
+    ///
+    /// The counter lives in the database precisely so a restart can't forgive a
+    /// task its strikes — an in-memory tally would let a task that can never be
+    /// scouted be retried forever, one restart at a time.
+    pub async fn record_dispatch_failure(&self, id: &TaskId) -> Result<u32, StoreError> {
+        let row = sqlx::query(
+            "UPDATE tasks SET dispatch_attempts = dispatch_attempts + 1, updated_at = ? \
+             WHERE id = ? RETURNING dispatch_attempts",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let row = row.ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        Ok(row.try_get::<i64, _>("dispatch_attempts")?.max(0) as u32)
+    }
+
+    /// Clear a task's dispatch failures. Called when a scout produces a spec:
+    /// the task has proven dispatchable, so a later re-scout (`needs_revision`)
+    /// starts from a clean slate.
+    pub async fn reset_dispatch_attempts(&self, id: &TaskId) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE tasks SET dispatch_attempts = 0, updated_at = ? \
+             WHERE id = ? AND dispatch_attempts != 0",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            // Either the task is already at zero or it is gone; only the latter
+            // is an error.
+            let exists = sqlx::query("SELECT 1 FROM tasks WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound(format!("task {id}")));
+            }
         }
         Ok(())
     }
@@ -379,6 +447,100 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(session_from_row).collect()
+    }
+
+    // --- reconciliation ---
+
+    /// Fail every `running` session and requeue every `scouting` task.
+    ///
+    /// Meant to be called once at startup, before any loop runs. One process
+    /// owns all dispatch, so at that moment a `running` session cannot be live:
+    /// it belongs to a process that died mid-scout. Left alone those rows are
+    /// phantom state — the session never completes, the task never leaves
+    /// `Scouting`, and the dispatch loop counts the ghost against its capacity
+    /// forever.
+    ///
+    /// Scouting tasks are requeued whether or not they have a session row, on
+    /// the theory that a task stuck in a transient state is always worth more
+    /// requeued than stranded. Attempt counts are deliberately untouched: a
+    /// crashed server is not the task's fault.
+    ///
+    /// The row updates are one transaction; the matching
+    /// [`EventPayload::SessionCompleted`] / [`EventPayload::TaskStateChanged`]
+    /// events are appended after it commits, exactly as the live failure path
+    /// writes them.
+    pub async fn reconcile_orphaned_work(&self) -> Result<ReconcileReport, StoreError> {
+        let now = Utc::now();
+
+        let mut tx = self.pool.begin().await?;
+        let session_rows = sqlx::query("SELECT id, task_id FROM sessions WHERE status = ?")
+            .bind(SessionStatus::Running.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+        let orphaned_sessions = session_rows
+            .into_iter()
+            .map(|row| {
+                Ok::<_, StoreError>((
+                    SessionId::from_raw(row.try_get::<String, _>("id")?),
+                    TaskId::from_raw(row.try_get::<String, _>("task_id")?),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let task_rows = sqlx::query("SELECT id FROM tasks WHERE state = ?")
+            .bind(TaskState::Scouting.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+        let orphaned_tasks = task_rows
+            .into_iter()
+            .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !orphaned_sessions.is_empty() {
+            sqlx::query(
+                "UPDATE sessions SET status = ?, completed_at = ?, exit_reason = ? \
+                 WHERE status = ?",
+            )
+            .bind(SessionStatus::ScoutFailed.as_str())
+            .bind(now.to_rfc3339())
+            .bind(ORPHANED_EXIT_REASON)
+            .bind(SessionStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !orphaned_tasks.is_empty() {
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE state = ?")
+                .bind(TaskState::New.as_str())
+                .bind(now.to_rfc3339())
+                .bind(TaskState::Scouting.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        let report = ReconcileReport {
+            sessions: orphaned_sessions.len(),
+            tasks: orphaned_tasks.len(),
+        };
+
+        for (session_id, task_id) in orphaned_sessions {
+            self.append_event(EventPayload::SessionCompleted {
+                session_id,
+                task_id,
+                status: SessionStatus::ScoutFailed,
+            })
+            .await?;
+        }
+        for task_id in orphaned_tasks {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id,
+                from: TaskState::Scouting,
+                to: TaskState::New,
+            })
+            .await?;
+        }
+
+        Ok(report)
     }
 
     // --- specs ---
@@ -719,6 +881,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task, StoreError> {
         })?,
         priority: row.try_get("priority")?,
         manual_rank: row.try_get("manual_rank")?,
+        dispatch_attempts: row.try_get::<i64, _>("dispatch_attempts")?.max(0) as u32,
         ingested_at: parse_ts(&row.try_get::<String, _>("ingested_at")?, "ingested_at")?,
         updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
@@ -833,6 +996,7 @@ mod tests {
             state: TaskState::New,
             priority: 10,
             manual_rank: None,
+            dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
         }
@@ -1269,6 +1433,283 @@ mod tests {
         assert_eq!(
             store.get_task(&task.id).await.unwrap().unwrap().manual_rank,
             Some(1)
+        );
+    }
+
+    // --- dispatch attempts ---
+
+    #[tokio::test]
+    async fn dispatch_failures_accumulate_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let task_id;
+
+        {
+            let store = Store::open(&path).await.unwrap();
+            let project = sample_project();
+            store.insert_project(&project).await.unwrap();
+            let task = sample_task(&project.id);
+            store.insert_task(&task).await.unwrap();
+            task_id = task.id.clone();
+            assert_eq!(
+                store
+                    .get_task(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .dispatch_attempts,
+                0
+            );
+
+            for expected in 1..=2 {
+                assert_eq!(
+                    store.record_dispatch_failure(&task_id).await.unwrap(),
+                    expected
+                );
+            }
+        }
+
+        // A restart must not forgive the strikes — that is the whole point.
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(
+            store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_attempts,
+            2
+        );
+        assert_eq!(store.record_dispatch_failure(&task_id).await.unwrap(), 3);
+
+        store.reset_dispatch_attempts(&task_id).await.unwrap();
+        assert_eq!(
+            store
+                .get_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_attempts,
+            0
+        );
+        // Resetting an already-clean task is a no-op, not an error.
+        store.reset_dispatch_attempts(&task_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_attempt_writes_reject_unknown_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let ghost = TaskId::new();
+        assert!(matches!(
+            store.record_dispatch_failure(&ghost).await.unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+        assert!(matches!(
+            store.reset_dispatch_attempts(&ghost).await.unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn upsert_gh_issue_never_touches_dispatch_attempts() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 11,
+            title: "First".into(),
+            body: "b".into(),
+            labels: vec![],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let task = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            task.dispatch_attempts, 0,
+            "a fresh issue starts unpenalized"
+        );
+        store.record_dispatch_failure(&task.id).await.unwrap();
+        store.record_dispatch_failure(&task.id).await.unwrap();
+
+        let repoll = GhIssue {
+            title: "Retitled".into(),
+            body: "edited".into(),
+            ..issue
+        };
+        let observed = store
+            .upsert_gh_issue(&project.id, repoll)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(observed.dispatch_attempts, 2);
+        assert_eq!(
+            store
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_attempts,
+            2
+        );
+    }
+
+    // --- reconciliation ---
+
+    #[tokio::test]
+    async fn reconcile_orphaned_work_fails_sessions_and_requeues_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        // Orphan 1: a scouting task with the running session it died under.
+        let orphaned = task_with(&project.id, 1, 0);
+        store.insert_task(&orphaned).await.unwrap();
+        store
+            .update_task_state(&orphaned.id, TaskState::Scouting)
+            .await
+            .unwrap();
+        let running = Session {
+            id: SessionId::new(),
+            task_id: orphaned.id.clone(),
+            vm_id: Some("vm-gone".into()),
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+        };
+        store.insert_session(&running).await.unwrap();
+
+        // Orphan 2: a scouting task with no session row at all.
+        let sessionless = task_with(&project.id, 2, 0);
+        store.insert_task(&sessionless).await.unwrap();
+        store
+            .update_task_state(&sessionless.id, TaskState::Scouting)
+            .await
+            .unwrap();
+
+        // Bystanders: a finished session and a task that never left New.
+        let (settled_task, _) = seed_spec(&store, 3).await;
+        let untouched = task_with(&project.id, 4, 0);
+        store.insert_task(&untouched).await.unwrap();
+
+        // Seqs are a 1-based AUTOINCREMENT, so the next one is count + 1.
+        let next_seq = store.events_since(0).await.unwrap().len() as i64 + 1;
+        let report = store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                sessions: 1,
+                tasks: 2
+            }
+        );
+
+        let session = store.get_session(&running.id).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::ScoutFailed);
+        assert!(session.completed_at.is_some());
+        assert_eq!(
+            session.exit_reason.as_deref(),
+            Some("orphaned by server restart")
+        );
+
+        for id in [&orphaned.id, &sessionless.id] {
+            assert_eq!(
+                store.get_task(id).await.unwrap().unwrap().state,
+                TaskState::New,
+                "task {id}"
+            );
+        }
+        assert_eq!(
+            store.get_task(&untouched.id).await.unwrap().unwrap().state,
+            TaskState::New
+        );
+        // A completed session and its task are none of reconciliation's business.
+        assert_eq!(
+            store
+                .get_task(&settled_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::New
+        );
+        assert_eq!(
+            store
+                .list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|s| s.status == SessionStatus::ScoutSucceeded)
+                .count(),
+            1
+        );
+
+        let payloads: Vec<_> = store
+            .events_since(next_seq)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::SessionCompleted {
+            session_id: running.id.clone(),
+            task_id: orphaned.id.clone(),
+            status: SessionStatus::ScoutFailed,
+        }));
+        for id in [&orphaned.id, &sessionless.id] {
+            assert!(
+                payloads.contains(&EventPayload::TaskStateChanged {
+                    task_id: id.clone(),
+                    from: TaskState::Scouting,
+                    to: TaskState::New,
+                }),
+                "no TaskStateChanged for {id}"
+            );
+        }
+        assert_eq!(payloads.len(), 3, "no events beyond the affected rows");
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphaned_work_is_a_no_op_on_a_clean_store() {
+        let store = Store::open_in_memory().await.unwrap();
+        seed_spec(&store, 1).await;
+        let before = store.events_since(0).await.unwrap().len();
+
+        let report = store.reconcile_orphaned_work().await.unwrap();
+        assert!(report.is_empty());
+        assert_eq!(report, ReconcileReport::default());
+        assert_eq!(store.events_since(0).await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphaned_work_leaves_attempt_counts_alone() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+        store.record_dispatch_failure(&task.id).await.unwrap();
+        store
+            .update_task_state(&task.id, TaskState::Scouting)
+            .await
+            .unwrap();
+
+        store.reconcile_orphaned_work().await.unwrap();
+
+        // A crashed server is not the task's fault.
+        assert_eq!(
+            store
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .dispatch_attempts,
+            1
         );
     }
 
