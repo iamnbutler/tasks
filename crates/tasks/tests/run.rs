@@ -23,7 +23,9 @@ use tasks_protocol::TasksProtocol;
 
 use tasks::events::EventPayload;
 use tasks::github::GitHubClient;
-use tasks::models::{GhState, Mode, Project, ProjectId, Task, TaskId, TaskState};
+use tasks::models::{
+    GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
+};
 use tasks::run::{self, Config};
 use tasks::store::Store;
 
@@ -250,6 +252,21 @@ async fn dispatch_harness(
     Config,
     Arc<Service<SupervisorRuntime, TasksProtocol>>,
 ) {
+    dispatch_harness_with_agent(max_concurrent, stub_agent_path().to_str().unwrap()).await
+}
+
+/// [`dispatch_harness`] with the scout's agent command spelled out. `true`
+/// gives an agent that exits cleanly without writing `SPEC.md`, which the
+/// supervisor reports as a scout failure — a task that can never be scouted.
+async fn dispatch_harness_with_agent(
+    max_concurrent: usize,
+    agent_cmd: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<Store>,
+    Config,
+    Arc<Service<SupervisorRuntime, TasksProtocol>>,
+) {
     let supervisor_bin = cargo_build("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let clone_root = tmp.path().join("repos");
@@ -257,13 +274,8 @@ async fn dispatch_harness(
 
     let workdir_root = tmp.path().join("scout-workdirs");
     tokio::fs::create_dir_all(&workdir_root).await.unwrap();
-    let wrapper = write_supervisor_wrapper(
-        tmp.path(),
-        &supervisor_bin,
-        stub_agent_path().to_str().unwrap(),
-        &workdir_root,
-    )
-    .await;
+    let wrapper =
+        write_supervisor_wrapper(tmp.path(), &supervisor_bin, agent_cmd, &workdir_root).await;
     let (service, socket) = spawn_vm_pool(tmp.path(), &wrapper, max_concurrent.max(1)).await;
 
     let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
@@ -294,6 +306,7 @@ async fn insert_task_with_gh_state(
         state: TaskState::New,
         priority: 0,
         manual_rank: None,
+        dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
     };
@@ -426,4 +439,185 @@ async fn pause_blocks_new_dispatches() {
         dispatch_order(&store).await,
         vec![first.id.clone(), second.id.clone()]
     );
+}
+
+// --- crash consistency ---
+
+/// Poll until `task` reaches `state`, then let the loop run a little longer so
+/// any dispatch it was still going to start would show up in the assertions.
+async fn wait_for_state(store: &Arc<Store>, task_id: &TaskId, state: TaskState) {
+    let s = store.clone();
+    let id = task_id.clone();
+    wait_until(Duration::from_secs(120), || {
+        let s = s.clone();
+        let id = id.clone();
+        async move { s.get_task(&id).await.unwrap().unwrap().state == state }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+/// A task whose scout can never succeed gets three tries and is then rejected,
+/// with the count on the row so a later process can't hand it three more.
+#[tokio::test]
+async fn three_failed_dispatches_reject_the_task() {
+    let (_tmp, store, config, _service) = dispatch_harness_with_agent(1, "true").await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "no spec, ever").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    wait_for_state(&store, &task.id, TaskState::Rejected).await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Rejected);
+    assert_eq!(stored.dispatch_attempts, 3, "strikes are persisted");
+    assert_eq!(
+        dispatch_order(&store).await,
+        vec![task.id.clone(); 3],
+        "exactly three dispatches, no more"
+    );
+    assert!(store.list_specs().await.unwrap().is_empty());
+    assert!(
+        store
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.status == SessionStatus::ScoutFailed)
+    );
+
+    let payloads: Vec<_> = store
+        .events_since(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.payload)
+        .collect();
+    assert!(
+        payloads.iter().any(|p| matches!(
+            p,
+            EventPayload::TaskStateChanged { task_id, to: TaskState::Rejected, .. }
+                if *task_id == task.id
+        )),
+        "the rejection is on the event log"
+    );
+    assert!(
+        payloads.iter().any(|p| matches!(
+            p,
+            EventPayload::Note { source, message }
+                if source == "dispatcher" && message.contains("rejecting")
+        )),
+        "with a breadcrumb saying why"
+    );
+}
+
+/// Restart simulation: a task carrying two strikes from a previous process gets
+/// the one attempt it has left, not a fresh three.
+#[tokio::test]
+async fn a_restart_resumes_the_persisted_attempt_count() {
+    let (_tmp, store, config, _service) = dispatch_harness_with_agent(1, "true").await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "already on thin ice").await;
+    for expected in 1..=2 {
+        assert_eq!(
+            store.record_dispatch_failure(&task.id).await.unwrap(),
+            expected
+        );
+    }
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    wait_for_state(&store, &task.id, TaskState::Rejected).await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    assert_eq!(
+        dispatch_order(&store).await,
+        vec![task.id.clone()],
+        "one attempt was left, so one dispatch"
+    );
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Rejected);
+    assert_eq!(stored.dispatch_attempts, 3);
+}
+
+/// A server killed mid-scout leaves a `running` session and a `Scouting` task.
+/// Startup reconciliation clears both, and the freed task is scouted normally.
+#[tokio::test]
+async fn startup_reconciles_orphaned_work_before_dispatch() {
+    let (_tmp, store, config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "was mid-scout when we died").await;
+
+    // Exactly what `tasks serve` leaves behind when it dies mid-dispatch.
+    store
+        .update_task_state(&task.id, TaskState::Scouting)
+        .await
+        .unwrap();
+    let orphan = Session {
+        id: SessionId::new(),
+        task_id: task.id.clone(),
+        vm_id: Some("vm-from-a-previous-life".into()),
+        branch: String::new(),
+        status: SessionStatus::Running,
+        started_at: Utc::now(),
+        completed_at: None,
+        exit_reason: None,
+    };
+    store.insert_session(&orphan).await.unwrap();
+    store.set_mode(Mode::Play).await.unwrap();
+
+    // Same call, same position in the sequence as `run()`: reconcile first,
+    // then start the loops.
+    run::reconcile_startup(&store).await.unwrap();
+
+    let reconciled = store.get_session(&orphan.id).await.unwrap().unwrap();
+    assert_eq!(reconciled.status, SessionStatus::ScoutFailed);
+    assert!(reconciled.completed_at.is_some());
+    assert_eq!(
+        reconciled.exit_reason.as_deref(),
+        Some("orphaned by server restart")
+    );
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::New,
+        "the stranded task is back in the queue"
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+
+    let s = store.clone();
+    wait_until(Duration::from_secs(60), || {
+        let s = s.clone();
+        async move { s.list_specs().await.unwrap().len() == 1 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::SpecReady);
+    assert_eq!(
+        stored.dispatch_attempts, 0,
+        "a crashed server is not the task's fault"
+    );
+    assert_eq!(dispatch_order(&store).await, vec![task.id.clone()]);
 }

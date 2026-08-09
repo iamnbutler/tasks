@@ -49,6 +49,7 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
         state: TaskState::New,
         priority: 0,
         manual_rank: None,
+        dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
     };
