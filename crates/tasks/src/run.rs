@@ -146,6 +146,8 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into()),
             scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
             vm_config: VmConfig {
+                cpus: Some(parse_env("SCOUT_VM_CPUS", "a positive integer", 4)?),
+                memory_mb: Some(parse_env("SCOUT_VM_MEMORY_MB", "a size in MB", 4096)?),
                 env: scout_vm_env(),
                 ..VmConfig::default()
             },
