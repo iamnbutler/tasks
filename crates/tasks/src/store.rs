@@ -629,6 +629,34 @@ impl Store {
             .bind(id.as_str())
             .execute(&mut *tx)
             .await?;
+
+        // Retirement drains the task's unconsumed specs too: a closed issue's
+        // approved-but-unbuilt spec must not linger in the queue where
+        // `create_build` would happily build work nobody wants anymore.
+        // Terminal entries (`built`, `rejected`) are history and stay put.
+        let spec_rows = sqlx::query(
+            "SELECT q.spec_id, q.status FROM spec_queue q \
+             JOIN specs s ON s.id = q.spec_id \
+             WHERE s.task_id = ? AND q.status IN (?, ?, ?, ?)",
+        )
+        .bind(id.as_str())
+        .bind(SpecQueueStatus::PendingReview.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(SpecQueueStatus::NeedsRevision.as_str())
+        .bind(SpecQueueStatus::Blocked.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut drained = Vec::new();
+        for row in spec_rows {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            let from_raw: String = row.try_get("status")?;
+            sqlx::query("UPDATE spec_queue SET status = ?, rank = NULL WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Rejected.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            drained.push((spec_id, SpecQueueStatus::from_str(&from_raw)));
+        }
         tx.commit().await?;
 
         self.append_event(EventPayload::TaskStateChanged {
@@ -637,6 +665,14 @@ impl Store {
             to,
         })
         .await?;
+        for (spec_id, from) in drained {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from,
+                to: SpecQueueStatus::Rejected,
+            })
+            .await?;
+        }
         self.get_task(id).await
     }
 
@@ -3928,5 +3964,37 @@ mod tests {
             store.claim_next_queued_build().await.unwrap().unwrap().id,
             queued.id
         );
+    }
+
+    /// A closed issue's approved-but-unbuilt spec must not linger where
+    /// `create_build` would consume it.
+    #[tokio::test]
+    async fn retiring_a_task_drains_its_unconsumed_specs() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+        store
+            .reconcile_closed_issues(&project.id, &[])
+            .await
+            .unwrap();
+
+        let retired = store
+            .retire_task(&task.id, TaskState::Done)
+            .await
+            .unwrap()
+            .expect("retirable");
+        assert_eq!(retired.state, TaskState::Done);
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Rejected
+        );
+        let err = store.create_build(&[spec.id], "main").await.unwrap_err();
+        assert!(format!("{err}").contains("rejected"), "{err}");
     }
 }
