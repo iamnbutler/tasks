@@ -461,3 +461,36 @@ impl BuildStatus {
         }
     }
 }
+
+/// One turn in the orchestrator conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorMessage {
+    pub seq: i64,
+    pub role: ChatRole,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(ChatRole::User),
+            "assistant" => Some(ChatRole::Assistant),
+            _ => None,
+        }
+    }
+}

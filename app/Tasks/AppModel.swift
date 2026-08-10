@@ -12,6 +12,7 @@ final class AppModel {
     var sessions: [ScoutSession] = []
     var specs: [Spec] = []
     var builds: [BuildItem] = []
+    var chat: [ChatMessage] = []
     var specQueue: [SpecQueueItem] = []
     var mode: Mode?
     /// Recent event log, newest first, for the Activity feed.
@@ -86,6 +87,19 @@ final class AppModel {
     /// The at-most-one build the serial loop is running.
     var runningBuild: BuildItem? {
         builds.first { $0.status == .running }
+    }
+
+    /// Send a chat turn to the orchestrator. Appends optimistically; the
+    /// reply arrives via the event-driven refresh.
+    func sendChat(_ content: String) async {
+        do {
+            let sent = try await client.sendOrchestratorMessage(content)
+            if !chat.contains(where: { $0.seq == sent.seq }) {
+                chat.append(sent)
+            }
+        } catch {
+            connectionError = error.localizedDescription
+        }
     }
 
     /// Queue a one-spec Builder run (the API takes a batch; the UI's unit is
@@ -180,6 +194,7 @@ final class AppModel {
         async let sessions = Self.attempt { try await c.sessions() }
         async let specs = Self.attempt { try await c.specs() }
         async let builds = Self.attempt { try await c.builds() }
+        async let chat = Self.attempt { try await c.orchestratorMessages() }
         async let specQueue = Self.attempt { try await c.specQueue() }
         async let mode = Self.attempt { try await c.mode() }
         async let events = Self.attempt { try await c.events() }
@@ -198,6 +213,7 @@ final class AppModel {
         apply(await sessions) { self.sessions = $0 }
         apply(await specs) { self.specs = $0 }
         apply(await builds) { self.builds = $0 }
+        apply(await chat) { self.chat = $0 }
         apply(await specQueue) { self.specQueue = $0 }
         apply(await mode) { self.mode = $0 }
         apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }

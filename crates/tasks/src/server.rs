@@ -29,8 +29,8 @@ use tracing::{error, info, warn};
 
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Build, BuildId, Mode, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine,
+    Build, BuildId, ChatRole, Mode, OrchestratorMessage, Project, ProjectId, Session, SessionId,
+    Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
 };
 use crate::store::{Store, StoreError};
 
@@ -109,6 +109,10 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/spec-queue/{spec_id}/review", post(review_spec))
         .route("/builds", get(list_builds).post(request_build))
         .route("/builds/{build_id}", get(get_build))
+        .route(
+            "/orchestrator/messages",
+            get(list_orchestrator_messages).post(send_orchestrator_message),
+        )
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
         .route("/events", get(list_events))
@@ -375,6 +379,42 @@ async fn get_build(
         .ok_or_else(|| ApiError::NotFound(format!("build {id}")))?;
     let spec_ids = store.build_spec_ids(&id).await?;
     Ok(Json(BuildDetail { build, spec_ids }))
+}
+
+// --- orchestrator ---
+
+#[derive(Debug, Deserialize)]
+struct SendMessage {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesQuery {
+    #[serde(default)]
+    since: i64,
+}
+
+/// 202: the message is queued; the orchestrator loop answers it. Watch
+/// `orchestrator_message` events (or poll) for the reply.
+async fn send_orchestrator_message(
+    State(store): State<Arc<Store>>,
+    Json(body): Json<SendMessage>,
+) -> ApiResult<(StatusCode, Json<OrchestratorMessage>)> {
+    let content = body.content.trim();
+    if content.is_empty() {
+        return Err(ApiError::BadRequest("message is empty".into()));
+    }
+    let message = store
+        .append_orchestrator_message(ChatRole::User, content)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(message)))
+}
+
+async fn list_orchestrator_messages(
+    State(store): State<Arc<Store>>,
+    Query(q): Query<MessagesQuery>,
+) -> ApiResult<Json<Vec<OrchestratorMessage>>> {
+    Ok(Json(store.orchestrator_messages_since(q.since).await?))
 }
 
 // --- mode ---

@@ -47,6 +47,7 @@ use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
 use crate::github::GitHubClient;
 use crate::models::{GhState, Mode, Project, Spec, Task, TaskId, TaskState};
+use crate::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
@@ -61,6 +62,14 @@ const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
 /// Builds get the same wall-clock budget as scouts, for the same reason: it
 /// must sit below vm-pool's 7200s reaper so the app deadline fires first.
 const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
+/// Default agent command for orchestrator ticks. `--allowedTools` lets the
+/// headless run curl the tasks API without permission prompts — and nothing
+/// else beyond Claude Code's defaults.
+const DEFAULT_ORCHESTRATOR_CMD: &str =
+    "claude --print --output-format text --allowedTools Bash(curl:*)";
+const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
+/// How often the orchestrator loop checks for unanswered user turns.
+const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 /// Wall-clock budget for one scout. ~2.5x the observed 23-minute live run, and
 /// deliberately below vm-pool's own `PoolConfig::vm_timeout` (7200s): if the
 /// app deadline sat at or above the pool's reaper, infrastructure would tear
@@ -148,6 +157,10 @@ pub struct Config {
     pub builder_timeout: Duration,
     /// REST endpoint override (`GITHUB_REST_API_URL`) — PR creation only.
     pub github_rest_api_url: Option<String>,
+    /// Agent command for orchestrator ticks (`ORCHESTRATOR_CMD`).
+    pub orchestrator_cmd: String,
+    /// Wall-clock budget for one orchestrator tick (`ORCHESTRATOR_TIMEOUT_SECS`).
+    pub orchestrator_timeout: Duration,
 }
 
 impl Config {
@@ -194,6 +207,13 @@ impl Config {
                 DEFAULT_BUILDER_TIMEOUT_SECS,
             )?),
             github_rest_api_url: env_string("GITHUB_REST_API_URL"),
+            orchestrator_cmd: env_string("ORCHESTRATOR_CMD")
+                .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_CMD.into()),
+            orchestrator_timeout: Duration::from_secs(parse_env(
+                "ORCHESTRATOR_TIMEOUT_SECS",
+                "a number of seconds",
+                DEFAULT_ORCHESTRATOR_TIMEOUT_SECS,
+            )?),
         })
     }
 
@@ -309,6 +329,11 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.clone(),
         shutdown_rx.clone(),
     ));
+    let orchestrate = tokio::spawn(orchestrator_loop(
+        store.clone(),
+        config.clone(),
+        shutdown_rx.clone(),
+    ));
 
     server::serve_with_shutdown(store, config.port, async {
         let _ = tokio::signal::ctrl_c().await;
@@ -318,6 +343,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let _ = shutdown_tx.send(true);
     let _ = poll.await;
+    orchestrate.abort();
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
         let _ = dispatch.await;
         let _ = build.await;
@@ -755,6 +781,40 @@ fn is_disconnect(error: &ScoutError) -> bool {
 
 /// Where a scout clones from. Derived per project; the token, when set, rides
 /// along as basic auth so private repos clone without a credential helper.
+// --- orchestrator loop ---
+
+/// Answer pending orchestrator turns until `shutdown` flips.
+///
+/// Not mode-gated on purpose: asking the orchestrator "what's the status?"
+/// must work while everything else is paused — that's what pause is *for*.
+pub async fn orchestrator_loop(
+    store: Arc<Store>,
+    config: Config,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let orchestrator = Orchestrator::new(
+        store,
+        OrchestratorConfig {
+            command: config.orchestrator_cmd.clone(),
+            timeout: config.orchestrator_timeout,
+            workdir: config.data_dir.join("orchestrator"),
+            api_port: config.port,
+        },
+    );
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if let Err(e) = orchestrator.tick().await {
+            warn!(error = %e, "orchestrator tick failed");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(ORCHESTRATOR_TICK) => {}
+            _ = shutdown.changed() => return,
+        }
+    }
+}
+
 // --- serial build loop ---
 
 /// Run queued builds one at a time until `shutdown` flips.
@@ -913,6 +973,8 @@ mod tests {
             builder_image: DEFAULT_BUILDER_IMAGE.into(),
             builder_timeout: Duration::from_secs(DEFAULT_BUILDER_TIMEOUT_SECS),
             github_rest_api_url: None,
+            orchestrator_cmd: "true".into(),
+            orchestrator_timeout: Duration::from_secs(60),
         }
     }
 
