@@ -8,6 +8,7 @@ struct ContentView: View {
     @Environment(AppModel.self) private var model
     @State private var section: NavSection? = .queue
     @State private var selectedTask: TaskItem.ID?
+    @State private var showTaskInspector = false
     @State private var selectedQueueTask: TaskItem.ID?
     /// Events newer than this get the unread accent while Activity is open.
     /// Captured from `lastSeenSeq` when the section is entered, then the model
@@ -28,19 +29,13 @@ struct ContentView: View {
             }
     }
 
-    /// Tasks and Queue are list + detail; Activity and Chat are single
-    /// surfaces and get the full width — no dead detail pane.
+    /// Queue is list + detail (its detail is where review happens). Tasks,
+    /// Activity, and Chat are single full-width surfaces — Tasks opens its
+    /// detail as a click-to-open, Esc-to-close inspector instead of a
+    /// permanently reserved pane.
     @ViewBuilder
     private var split: some View {
-        if section == .activity || section == .chat {
-            NavigationSplitView {
-                sidebar
-                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
-            } detail: {
-                sectionList
-                    .frame(minWidth: 500)
-            }
-        } else {
+        if section == .queue || section == nil {
             NavigationSplitView {
                 sidebar
                     .navigationSplitViewColumnWidth(min: 150, ideal: 180)
@@ -50,6 +45,14 @@ struct ContentView: View {
             } detail: {
                 detail
                     .frame(minWidth: 380)
+            }
+        } else {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            } detail: {
+                sectionList
+                    .frame(minWidth: 500)
             }
         }
     }
@@ -126,6 +129,13 @@ struct ContentView: View {
         switch section {
         case .tasks:
             TasksTable(selection: $selectedTask)
+                .onChange(of: selectedTask) { _, selected in
+                    if selected != nil { showTaskInspector = true }
+                }
+                .inspector(isPresented: $showTaskInspector) {
+                    taskInspector
+                        .inspectorColumnWidth(min: 360, ideal: 460, max: 700)
+                }
         case .queue, nil:
             queueList
         case .activity:
@@ -133,6 +143,39 @@ struct ContentView: View {
         case .chat:
             ChatView()
         }
+    }
+
+    /// The click-to-open task detail. Esc (`.cancelAction`) and the X both
+    /// close it *and* clear the selection, so clicking any row — including
+    /// the same one — reopens it.
+    @ViewBuilder
+    private var taskInspector: some View {
+        if let id = selectedTask, let task = model.task(id) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button {
+                        closeTaskInspector()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.cancelAction)
+                    .help("Close (Esc)")
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                TaskDetailView(task: task)
+            }
+        } else {
+            ContentUnavailableView("", systemImage: "sidebar.right")
+        }
+    }
+
+    private func closeTaskInspector() {
+        showTaskInspector = false
+        selectedTask = nil
     }
 
     /// The queue, grouped in attention order: verdicts you owe, work running
@@ -225,16 +268,10 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         switch section {
-        case .tasks:
-            if let id = selectedTask, let task = model.task(id) {
-                TaskDetailView(task: task)
-            } else {
-                noSelection("Select a task")
-            }
         case .queue, nil:
             queueDetail
-        case .activity, .chat:
-            // Unreachable — these sections use the two-column layout.
+        case .tasks, .activity, .chat:
+            // Unreachable — these sections use the full-width layout.
             EmptyView()
         }
     }
