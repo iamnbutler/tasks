@@ -64,9 +64,12 @@ const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
 const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// Default agent command for orchestrator ticks. `--allowedTools` lets the
 /// headless run curl the tasks API without permission prompts — and nothing
-/// else beyond Claude Code's defaults.
-const DEFAULT_ORCHESTRATOR_CMD: &str =
-    "claude --print --output-format text --allowedTools Bash(curl:*)";
+/// else beyond Claude Code's defaults. stream-json (+ partial messages) is
+/// what feeds `/orchestrator/stream`: text deltas and tool calls surface live
+/// instead of one opaque multi-minute wait. `--verbose` is mandatory with
+/// `--print --output-format stream-json` (see images/scout/Dockerfile).
+const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
+     --include-partial-messages --allowedTools Bash(curl:*)";
 const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
 /// How often the orchestrator loop checks for unanswered user turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);

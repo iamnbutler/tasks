@@ -543,14 +543,8 @@ struct ChatView: View {
                                 .id(message.seq)
                         }
                         if awaitingReply {
-                            HStack(spacing: 6) {
-                                ProgressView().controlSize(.small)
-                                Text("Orchestrator is thinking…")
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal, 4)
-                            .id(Int64.max)
+                            liveTick
+                                .id(Int64.max)
                         }
                     }
                     .padding(12)
@@ -562,6 +556,11 @@ struct ChatView: View {
                 .onChange(of: model.chat.last?.seq) {
                     if let last = model.chat.last?.seq {
                         withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: model.liveReply) {
+                    if awaitingReply {
+                        proxy.scrollTo(Int64.max, anchor: .bottom)
                     }
                 }
             }
@@ -588,6 +587,33 @@ struct ChatView: View {
     /// The last turn is the human's: a reply is on its way.
     private var awaitingReply: Bool {
         model.chat.last?.role == .user
+    }
+
+    /// The in-flight tick, live: the reply streaming into a bubble as it's
+    /// generated, with the agent's current tool call (or "thinking") below.
+    private var liveTick: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !model.liveReply.isEmpty {
+                HStack {
+                    MarkdownView(text: model.liveReply)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            .quaternary.opacity(0.6),
+                            in: RoundedRectangle(cornerRadius: 10))
+                    Spacer(minLength: 60)
+                }
+            }
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(model.liveActivity ?? "Orchestrator is thinking…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 4)
+        }
     }
 
     private func send() {

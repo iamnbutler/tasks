@@ -36,6 +36,15 @@ final class AppModel {
     var connectionError: String?
     var lastRefreshed: Date?
 
+    /// Live view of the in-flight orchestrator tick, from
+    /// `/orchestrator/stream`. `liveReply` is the assistant text generated so
+    /// far (reset on each tool call — pre-tool text is working narration, and
+    /// the segment after the last tool call is the reply that persists);
+    /// `liveActivity` is the latest tool-call label. Both are ephemeral and
+    /// cleared once the durable message lands in `chat`.
+    var liveReply = ""
+    var liveActivity: String?
+
     // Non-private: session-detail views borrow it for transcript tailing.
     let client = TasksClient()
     private var started = false
@@ -169,6 +178,7 @@ final class AppModel {
     func start() async {
         guard !started else { return }
         started = true
+        Task { await orchestratorFeedLoop() }
         while !Task.isCancelled {
             do {
                 for try await _ in client.eventStream() {
@@ -181,6 +191,38 @@ final class AppModel {
             } catch {
                 connectionError = error.localizedDescription
             }
+            try? await Task.sleep(for: .seconds(3))
+        }
+    }
+
+    /// Tail `/orchestrator/stream` forever, mirroring the event loop's
+    /// reconnect policy. A dropped connection just clears the live view —
+    /// the durable reply still arrives through the ordinary refresh.
+    private func orchestratorFeedLoop() async {
+        while !Task.isCancelled {
+            do {
+                for try await frame in client.orchestratorFeed() {
+                    switch frame.kind {
+                    case "delta":
+                        liveReply += frame.text ?? ""
+                    case "tool":
+                        liveActivity = frame.label
+                        liveReply = ""
+                    case "done":
+                        // Keep the reply text visible; the refresh replaces
+                        // it with the persisted message (no flash).
+                        liveActivity = nil
+                    default:
+                        break
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                // Connection errors surface via the event loop's banner.
+            }
+            liveReply = ""
+            liveActivity = nil
             try? await Task.sleep(for: .seconds(3))
         }
     }
@@ -213,7 +255,14 @@ final class AppModel {
         apply(await sessions) { self.sessions = $0 }
         apply(await specs) { self.specs = $0 }
         apply(await builds) { self.builds = $0 }
-        apply(await chat) { self.chat = $0 }
+        apply(await chat) {
+            self.chat = $0
+            // The durable reply has landed — drop the live-tick preview.
+            if $0.last?.role == .assistant {
+                self.liveReply = ""
+                self.liveActivity = nil
+            }
+        }
         apply(await specQueue) { self.specQueue = $0 }
         apply(await mode) { self.mode = $0 }
         apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }

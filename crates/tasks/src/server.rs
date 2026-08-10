@@ -113,6 +113,7 @@ pub fn router(store: Arc<Store>) -> Router {
             "/orchestrator/messages",
             get(list_orchestrator_messages).post(send_orchestrator_message),
         )
+        .route("/orchestrator/stream", get(stream_orchestrator))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
         .route("/events", get(list_events))
@@ -415,6 +416,33 @@ async fn list_orchestrator_messages(
     Query(q): Query<MessagesQuery>,
 ) -> ApiResult<Json<Vec<OrchestratorMessage>>> {
     Ok(Json(store.orchestrator_messages_since(q.since).await?))
+}
+
+/// SSE feed of the in-flight orchestrator tick: `delta` chunks as the reply
+/// is generated, `tool` labels as the agent works, `done` when the durable
+/// message has landed in `/orchestrator/messages`. Ephemeral — there is no
+/// backfill, and a lagged or reconnecting client just resyncs by fetching
+/// the messages; nothing here is ever the source of truth.
+async fn stream_orchestrator(
+    State(store): State<Arc<Store>>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let stream = BroadcastStream::new(store.subscribe_orchestrator_feed()).filter_map(|result| {
+        let event = match result {
+            Ok(event) => event,
+            Err(err) => {
+                warn!(error = %err, "orchestrator feed subscriber lagged");
+                return None;
+            }
+        };
+        match SseEvent::default().json_data(&event) {
+            Ok(sse) => Some(Ok(sse)),
+            Err(err) => {
+                error!(error = %err, "serializing orchestrator feed event for sse");
+                None
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
 }
 
 // --- mode ---

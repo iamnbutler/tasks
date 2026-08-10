@@ -11,10 +11,10 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorMessage, Project,
-    ProjectId, ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
-    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
-    TranscriptStream,
+    Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorFeedEvent,
+    OrchestratorMessage, Project, ProjectId, ReviewedSpec, Session, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -45,6 +45,11 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 /// agent output is far higher-rate, and a session-detail view that lags briefly
 /// should resync rather than lose its place.
 const TRANSCRIPT_BROADCAST_CAPACITY: usize = 4096;
+
+/// Capacity of the orchestrator live-feed channel. Sized like the transcript
+/// one (token deltas are high-rate); a lagged subscriber just misses deltas —
+/// the durable message arrives via `orchestrator_messages` regardless.
+const ORCHESTRATOR_FEED_CAPACITY: usize = 4096;
 
 /// `exit_reason` written to sessions that were still `running` when the server
 /// came back up.
@@ -93,6 +98,7 @@ pub struct Store {
     pool: SqlitePool,
     event_tx: broadcast::Sender<Event>,
     transcript_tx: broadcast::Sender<TranscriptLine>,
+    orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
 }
 
 impl Store {
@@ -107,10 +113,12 @@ impl Store {
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
         Ok(Self {
             pool,
             event_tx,
             transcript_tx,
+            orchestrator_feed_tx,
         })
     }
 
@@ -123,10 +131,12 @@ impl Store {
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
         Ok(Self {
             pool,
             event_tx,
             transcript_tx,
+            orchestrator_feed_tx,
         })
     }
 
@@ -1824,6 +1834,18 @@ impl Store {
             content: content.to_string(),
             created_at: now,
         })
+    }
+
+    /// Publish one moment of an in-flight tick to live-feed subscribers.
+    /// Fire-and-forget: no subscribers, no problem — nothing is persisted.
+    pub fn publish_orchestrator_feed(&self, event: OrchestratorFeedEvent) {
+        let _ = self.orchestrator_feed_tx.send(event);
+    }
+
+    /// Live feed of the in-flight orchestrator tick (`/orchestrator/stream`).
+    /// A lagged subscriber misses deltas, never the durable message.
+    pub fn subscribe_orchestrator_feed(&self) -> broadcast::Receiver<OrchestratorFeedEvent> {
+        self.orchestrator_feed_tx.subscribe()
     }
 
     /// Messages with `seq > since`, oldest first.
