@@ -10,7 +10,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine as _;
-use tasks_protocol::{BuildCommand, BuildEvent, ScoutCommand, TaskCommand, TaskEvent, TasksProtocol};
+use tasks_protocol::{
+    BuildCommand, BuildEvent, ScoutCommand, TaskCommand, TaskEvent, TasksProtocol,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;

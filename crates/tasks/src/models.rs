@@ -44,6 +44,7 @@ id_newtype!(ProjectId, "proj");
 id_newtype!(TaskId, "task");
 id_newtype!(SessionId, "sess");
 id_newtype!(SpecId, "spec");
+id_newtype!(BuildId, "build");
 
 /// A repo being tracked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +123,9 @@ pub enum TaskState {
     InReview,
     /// Spec approved; parked until a Builder run consumes it.
     ReadyToBuild,
+    /// A Builder run is implementing this task's spec (possibly batched with
+    /// others). Failure returns to `ReadyToBuild` — the spec is still good.
+    Building,
     /// Completed through the pipeline.
     Done,
     /// Rejected and won't be pursued.
@@ -136,6 +140,7 @@ impl TaskState {
             TaskState::Scouting => "scouting",
             TaskState::InReview => "in_review",
             TaskState::ReadyToBuild => "ready_to_build",
+            TaskState::Building => "building",
             TaskState::Done => "done",
             TaskState::Rejected => "rejected",
         }
@@ -148,6 +153,7 @@ impl TaskState {
             "scouting" => Some(TaskState::Scouting),
             "in_review" => Some(TaskState::InReview),
             "ready_to_build" => Some(TaskState::ReadyToBuild),
+            "building" => Some(TaskState::Building),
             "done" => Some(TaskState::Done),
             "rejected" => Some(TaskState::Rejected),
             _ => None,
@@ -333,6 +339,10 @@ pub enum SpecQueueStatus {
     NeedsRevision,
     Blocked,
     Rejected,
+    /// Consumed by a successful Builder run. Terminal, and system-assigned:
+    /// `review_spec` rejects it — it is how the approved queue drains, not a
+    /// verdict a reviewer can render.
+    Built,
 }
 
 impl SpecQueueStatus {
@@ -343,6 +353,7 @@ impl SpecQueueStatus {
             SpecQueueStatus::NeedsRevision => "needs_revision",
             SpecQueueStatus::Blocked => "blocked",
             SpecQueueStatus::Rejected => "rejected",
+            SpecQueueStatus::Built => "built",
         }
     }
 
@@ -353,6 +364,7 @@ impl SpecQueueStatus {
             "needs_revision" => Some(SpecQueueStatus::NeedsRevision),
             "blocked" => Some(SpecQueueStatus::Blocked),
             "rejected" => Some(SpecQueueStatus::Rejected),
+            "built" => Some(SpecQueueStatus::Built),
             _ => None,
         }
     }
@@ -381,6 +393,70 @@ impl Mode {
             "play" => Some(Mode::Play),
             "pause" => Some(Mode::Pause),
             "stop" => Some(Mode::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One serial Builder run over a *set* of approved specs, producing one
+/// branch and one PR. Set-shaped from day one (`build_specs`), even though v0
+/// is usually invoked with a single spec.
+///
+/// Everything here is Tasks-owned or immutable. `pr_number` is an identifier,
+/// never a state: PR mergeability, checks, and open/closed are GitHub's and
+/// are queried at decision time, not stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Build {
+    pub id: BuildId,
+    pub project_id: ProjectId,
+    pub vm_id: Option<String>,
+    /// Branch name the server pushes, chosen at request time: `build/<id>`.
+    pub branch: String,
+    pub base_branch: String,
+    /// Commit the branch grew from — the bundle's prerequisite. Immutable.
+    pub base_sha: Option<String>,
+    /// Branch tip the VM reported and the server verified before pushing.
+    pub head_sha: Option<String>,
+    pub pr_number: Option<u64>,
+    pub status: BuildStatus,
+    /// SUMMARY.md from the agent (the PR body), if it wrote one.
+    pub summary: Option<String>,
+    pub files_touched: Vec<String>,
+    pub exit_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildStatus {
+    /// Requested, waiting for the serial build loop to claim it.
+    Queued,
+    /// Claimed; a Builder VM is (or is about to be) running it.
+    Running,
+    /// Branch pushed and PR opened.
+    Succeeded,
+    /// Any failure — agent, egress, push, or PR. `exit_reason` says which.
+    Failed,
+}
+
+impl BuildStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BuildStatus::Queued => "queued",
+            BuildStatus::Running => "running",
+            BuildStatus::Succeeded => "succeeded",
+            BuildStatus::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(BuildStatus::Queued),
+            "running" => Some(BuildStatus::Running),
+            "succeeded" => Some(BuildStatus::Succeeded),
+            "failed" => Some(BuildStatus::Failed),
             _ => None,
         }
     }

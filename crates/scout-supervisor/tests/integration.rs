@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tasks_protocol::{BuildCommand, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
+use tasks_protocol::{
+    BuildCommand, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -198,7 +200,8 @@ async fn start_scout_completes_with_spec() {
                 saw_impl_finished = true;
             }
             VmEvent::App {
-                payload: TaskEvent::Scout(evt @ (ScoutEvent::Completed { .. } | ScoutEvent::Failed { .. })),
+                payload:
+                    TaskEvent::Scout(evt @ (ScoutEvent::Completed { .. } | ScoutEvent::Failed { .. })),
             } => {
                 completion = Some(evt);
             }

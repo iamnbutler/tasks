@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 use crate::models::GhState;
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com/graphql";
+const DEFAULT_REST_BASE_URL: &str = "https://api.github.com";
 const PAGE_SIZE: u32 = 100;
 const CLOSE_INFO_BATCH: usize = 50;
 
@@ -21,6 +22,8 @@ pub enum GhError {
     Http(#[from] reqwest::Error),
     #[error("graphql: {0}")]
     GraphQl(String),
+    #[error("rest: {0}")]
+    Rest(String),
     #[error("unexpected response shape: {0}")]
     Shape(String),
 }
@@ -49,6 +52,7 @@ pub struct GitHubClient {
     http: reqwest::Client,
     token: String,
     base_url: String,
+    rest_base_url: String,
 }
 
 impl GitHubClient {
@@ -65,7 +69,58 @@ impl GitHubClient {
             http,
             token: token.into(),
             base_url: base_url.into(),
+            rest_base_url: DEFAULT_REST_BASE_URL.into(),
         }
+    }
+
+    /// Override the REST root (`GITHUB_REST_API_URL`) — GitHub Enterprise,
+    /// tests. Issues stay on GraphQL; only PR creation uses REST.
+    pub fn with_rest_base_url(mut self, rest_base_url: impl Into<String>) -> Self {
+        self.rest_base_url = rest_base_url.into();
+        self
+    }
+
+    /// Open a pull request — the system's only GitHub write, and it lives on
+    /// the server. Returns the PR *number*: an immutable identifier we may
+    /// persist. The PR's state/mergeability/checks are GitHub's and are not
+    /// read here, let alone stored.
+    pub async fn create_pull_request(
+        &self,
+        owner: &str,
+        name: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<u64, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls", self.rest_base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "title": title,
+                "head": head,
+                "base": base,
+                "body": body,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!(
+                "create pull request: {status}: {msg}"
+            )));
+        }
+        body.get("number")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GhError::Shape("pull request response missing `number`".into()))
     }
 
     /// Fetch all OPEN issues for a repository, paging as needed.

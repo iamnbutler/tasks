@@ -23,7 +23,7 @@ use crate::models::{
     Complexity, ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
     SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptStream,
 };
-use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TasksProtocol};
+use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -160,12 +160,12 @@ impl Scout {
             .client
             .send_to_vm(
                 &vm_id,
-                ScoutCommand::Start {
+                TaskCommand::Scout(ScoutCommand::Start {
                     task_id: task.id.to_string(),
                     repo_clone_url: target.repo_clone_url.clone(),
                     base_branch: target.base_branch.clone(),
                     prompt,
-                },
+                }),
             )
             .await
         {
@@ -574,7 +574,10 @@ async fn drain_scout_events(
         let event = events.recv().await.ok_or(ScoutError::StreamClosed)?;
 
         match event {
-            ServiceEvent::VmApp { vm_id, event: app } if &vm_id == target_vm => match app {
+            ServiceEvent::VmApp {
+                vm_id,
+                event: TaskEvent::Scout(app),
+            } if &vm_id == target_vm => match app {
                 ScoutEvent::Started { branch: b } => {
                     branch = Some(b);
                 }

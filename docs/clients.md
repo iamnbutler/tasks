@@ -64,6 +64,19 @@ the server only.
   render it as Markdown. Also carries `files_touched`, `complexity`,
   `agent_exit_code`.
 - `GET /spec-queue` — `{entry: {...}, task_id}` items for the review screen.
+- `POST /builds` `{"spec_ids": [...], "base_branch"?}` — queue a Builder run
+  over a set of **approved** specs; **202** with the build (`{..., spec_ids}`).
+  Builds are strictly serial — one runs at a time, each cut from a base that
+  already contains the previous one — so 202 means queued, not started. The
+  batch is re-sorted into spec-queue order server-side. 400 on an empty or
+  duplicated set, a non-approved spec, specs from two projects, or a spec
+  already in an active build. Watch `build_*` events or poll.
+- `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
+  `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
+  `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
+  `pr_number` is an identifier, not a state: the PR's mergeability/CI/open
+  state is GitHub's — link out (`https://github.com/{owner}/{repo}/pull/N`),
+  don't expect it here.
 - `GET /events?since=&limit=` — catch-up (default limit 100);
   `GET /events/stream` — SSE, each `data:` line is one Event JSON.
 
@@ -121,7 +134,10 @@ All enums are snake_case strings on the wire:
 - `Task.state`: `backlog` (ingested, inert — the Tasks table) → `queued`
   (explicitly picked up — the Queue, ordered by `manual_rank`) → `scouting` →
   `in_review` (spec awaits a verdict) → `ready_to_build` (approved, parked
-  for a Builder) → `done`, with `rejected` as the terminal failure state.
+  for a Builder) → `building` (a Builder run is implementing it, possibly
+  batched with others) → `done`, with `rejected` as the terminal failure
+  state. A failed build returns `building → ready_to_build` — the spec is
+  still good.
   Scout failures and `needs_revision` verdicts return to `queued`, never
   `backlog` — picked-up work stays picked up.
 - There is no "mark done" endpoint, deliberately: **closing the GitHub issue
@@ -134,8 +150,11 @@ All enums are snake_case strings on the wire:
   issue instead.
 - `Session.status`: `running`, `scout_succeeded`, `scout_failed`, `cancelled`.
 - `SpecQueueEntry.status`: `pending_review`, `approved`, `needs_revision`,
-  `blocked`, `rejected` (only the three verdict values are accepted by the
-  review endpoint; `pending_review`/`blocked` are server-assigned).
+  `blocked`, `rejected`, `built` (only the three verdict values are accepted
+  by the review endpoint; `pending_review`/`blocked` are server-assigned, and
+  `built` is how the approved queue drains — a successful Builder run
+  assigns it, and a spec cannot be built twice).
+- `Build.status`: `queued` → `running` → `succeeded` | `failed`.
 - `Complexity`: `simple`, `medium`, `complex`.
 - `Mode`: `play`, `pause`, `stop`.
 
@@ -149,6 +168,9 @@ snapshot of GitHub's open/closed flag moved, most often because the issue
 dropped out of the repository's open set; refetch the task or the list),
 `session_started`, `session_completed`, `spec_created`,
 `spec_queue_status_changed`, `queue_reordered`, `spec_queue_reordered`,
+`build_requested` (`build_id`, `spec_ids`), `build_started`,
+`build_completed` (`build_id`, `status` — refetch the build for detail),
+`pull_request_opened` (`build_id`, `pr_number`),
 `mode_changed`, `note` (`source`, `message` — free-form breadcrumbs; a
 scrolling activity feed of these is the cheapest useful "what is it doing"
 view).

@@ -114,7 +114,15 @@ async fn main() -> Result<()> {
                     }),
             } => {
                 let tx = evt_tx.clone();
-                run_build(&build_id, &repo_clone_url, &base_branch, &branch, &prompt, tx).await;
+                run_build(
+                    &build_id,
+                    &repo_clone_url,
+                    &base_branch,
+                    &branch,
+                    &prompt,
+                    tx,
+                )
+                .await;
             }
             VmCommand::App {
                 payload: TaskCommand::Scout(_),
@@ -177,7 +185,12 @@ async fn run_build(
 
     // Full-depth clone — see the module doc. This is the single easiest way to
     // break branch egress while everything else still passes.
-    if let Err(e) = git(&workdir, &["clone", "--branch", base_branch, repo_clone_url, "."]).await {
+    if let Err(e) = git(
+        &workdir,
+        &["clone", "--branch", base_branch, repo_clone_url, "."],
+    )
+    .await
+    {
         fail!("clone: {e}");
     }
     // Identity for the sweep commit; a bare clone has none configured.
@@ -233,7 +246,9 @@ async fn run_build(
     if let Err(e) = git(&workdir, &["add", "-A"]).await {
         fail!("sweep add: {e}");
     }
-    let staged = git(&workdir, &["diff", "--cached", "--quiet"]).await.is_err();
+    let staged = git(&workdir, &["diff", "--cached", "--quiet"])
+        .await
+        .is_err();
     if staged
         && let Err(e) = git(
             &workdir,

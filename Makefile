@@ -5,10 +5,11 @@
 
 LINUX_TARGET := aarch64-unknown-linux-gnu
 SCOUT_BIN := target/$(LINUX_TARGET)/release/scout-supervisor
+BUILDER_BIN := target/$(LINUX_TARGET)/release/builder-supervisor
 VM_SUPERVISOR_BIN := target/$(LINUX_TARGET)/release/supervisor
 
-.PHONY: check-toolchain scout-supervisor-linux vm-supervisor-linux \
-        image-base image-agent image-scout images
+.PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
+        vm-supervisor-linux image-base image-agent image-scout image-builder images
 
 check-toolchain:
 	@which $(LINUX_TARGET)-gcc >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }
@@ -17,6 +18,9 @@ check-toolchain:
 
 scout-supervisor-linux: check-toolchain
 	cargo build --release --target $(LINUX_TARGET) -p scout-supervisor
+
+builder-supervisor-linux: check-toolchain
+	cargo build --release --target $(LINUX_TARGET) -p builder-supervisor
 
 vm-supervisor-linux: check-toolchain
 	cargo build --release --target $(LINUX_TARGET) -p vm-pool-supervisor
@@ -35,4 +39,10 @@ image-scout: image-agent scout-supervisor-linux
 	container build -t agent:v1 images/scout
 	rm -f images/scout/scout-supervisor
 
-images: image-scout
+# The Builder image (BUILDER_IMAGE default).
+image-builder: image-agent builder-supervisor-linux
+	cp $(BUILDER_BIN) images/builder/builder-supervisor
+	container build -t builder:v1 images/builder
+	rm -f images/builder/builder-supervisor
+
+images: image-scout image-builder
