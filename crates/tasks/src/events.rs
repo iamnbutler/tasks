@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    BuildId, BuildStatus, GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId,
+    SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -71,6 +72,27 @@ pub enum EventPayload {
     /// The spec queue was reordered. Same semantics as [`Self::QueueReordered`].
     SpecQueueReordered {
         spec_ids: Vec<SpecId>,
+    },
+    /// A Builder run was requested over a set of approved specs.
+    BuildRequested {
+        build_id: BuildId,
+        spec_ids: Vec<SpecId>,
+    },
+    /// The serial build loop claimed the build; a Builder VM is running it.
+    BuildStarted {
+        build_id: BuildId,
+    },
+    /// The build reached a terminal status. Detail (branch, PR, exit reason)
+    /// is on the build row — refetch it.
+    BuildCompleted {
+        build_id: BuildId,
+        status: BuildStatus,
+    },
+    /// The server pushed the branch and opened the pull request. `pr_number`
+    /// is an identifier: the PR's state is GitHub's, queried, never stored.
+    PullRequestOpened {
+        build_id: BuildId,
+        pr_number: u64,
     },
     ModeChanged {
         from: Mode,

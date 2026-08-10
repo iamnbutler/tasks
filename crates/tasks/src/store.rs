@@ -11,9 +11,9 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Complexity, GhState, Mode, Project, ProjectId, ReviewedSpec, Session, SessionId, SessionStatus,
-    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TaskState, TranscriptLine, TranscriptStream,
+    Build, BuildId, BuildStatus, Complexity, GhState, Mode, Project, ProjectId, ReviewedSpec,
+    Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -57,12 +57,16 @@ pub struct ReconcileReport {
     pub sessions: usize,
     /// `scouting` tasks put back in the queue as `new`.
     pub tasks: usize,
+    /// `running` builds failed as orphaned (queued builds are durable intent
+    /// and survive a restart untouched). A wedged running build would block
+    /// the serial queue forever, strictly worse than an orphaned session.
+    pub builds: usize,
 }
 
 impl ReconcileReport {
     /// Whether anything at all was reconciled — the only case worth logging.
     pub fn is_empty(&self) -> bool {
-        self.sessions == 0 && self.tasks == 0
+        self.sessions == 0 && self.tasks == 0 && self.builds == 0
     }
 }
 
@@ -920,6 +924,27 @@ impl Store {
             .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // A `running` build belongs to a dead process; left alone it wedges
+        // the serial build queue forever. `queued` builds are durable intent
+        // and survive untouched. Tasks mid-`building` go back to
+        // `ready_to_build` — their specs are still approved and good.
+        let build_rows = sqlx::query("SELECT id FROM builds WHERE status = ?")
+            .bind(BuildStatus::Running.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+        let orphaned_builds = build_rows
+            .into_iter()
+            .map(|row| Ok::<_, StoreError>(BuildId::from_raw(row.try_get::<String, _>("id")?)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let building_rows = sqlx::query("SELECT id FROM tasks WHERE state = ?")
+            .bind(TaskState::Building.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+        let orphaned_building = building_rows
+            .into_iter()
+            .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
+            .collect::<Result<Vec<_>, _>>()?;
+
         if !orphaned_sessions.is_empty() {
             sqlx::query(
                 "UPDATE sessions SET status = ?, completed_at = ?, exit_reason = ? \
@@ -942,11 +967,32 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        if !orphaned_builds.is_empty() {
+            sqlx::query(
+                "UPDATE builds SET status = ?, completed_at = ?, exit_reason = ? \
+                 WHERE status = ?",
+            )
+            .bind(BuildStatus::Failed.as_str())
+            .bind(now.to_rfc3339())
+            .bind(ORPHANED_EXIT_REASON)
+            .bind(BuildStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !orphaned_building.is_empty() {
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE state = ?")
+                .bind(TaskState::ReadyToBuild.as_str())
+                .bind(now.to_rfc3339())
+                .bind(TaskState::Building.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         let report = ReconcileReport {
             sessions: orphaned_sessions.len(),
             tasks: orphaned_tasks.len(),
+            builds: orphaned_builds.len(),
         };
 
         for (session_id, task_id) in orphaned_sessions {
@@ -962,6 +1008,21 @@ impl Store {
                 task_id,
                 from: TaskState::Scouting,
                 to: TaskState::Queued,
+            })
+            .await?;
+        }
+        for build_id in orphaned_builds {
+            self.append_event(EventPayload::BuildCompleted {
+                build_id,
+                status: BuildStatus::Failed,
+            })
+            .await?;
+        }
+        for task_id in orphaned_building {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id,
+                from: TaskState::Building,
+                to: TaskState::ReadyToBuild,
             })
             .await?;
         }
@@ -1158,7 +1219,9 @@ impl Store {
             SpecQueueStatus::Approved => TaskState::ReadyToBuild,
             SpecQueueStatus::Rejected => TaskState::Rejected,
             SpecQueueStatus::NeedsRevision => TaskState::Queued,
-            SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked => {
+            // `Built` is how the approved queue drains — assigned by a
+            // successful Builder run, never rendered by a reviewer.
+            SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked | SpecQueueStatus::Built => {
                 return Err(StoreError::Invalid(format!(
                     "{} is not a review outcome",
                     status.as_str()
@@ -1225,6 +1288,438 @@ impl Store {
             feedback,
             ..entry
         })
+    }
+
+    // --- builds ---
+
+    /// Queue a Builder run over a set of approved specs. Returns the created
+    /// build in `queued` status; the serial build loop picks it up.
+    ///
+    /// Validation (all → [`StoreError::Invalid`], a 400 at the API):
+    /// - the set is non-empty and free of duplicates
+    /// - every spec exists and its queue status is `approved`
+    /// - all specs belong to one project (one build = one branch = one repo)
+    /// - no spec is already part of a `queued`/`running` build
+    ///
+    /// The order the caller sends is irrelevant: the batch is re-sorted into
+    /// spec-queue order (rank, then spec age), because the queue is
+    /// human-authoritative and a build must not scramble it.
+    pub async fn create_build(
+        &self,
+        spec_ids: &[SpecId],
+        base_branch: &str,
+    ) -> Result<Build, StoreError> {
+        if spec_ids.is_empty() {
+            return Err(StoreError::Invalid(
+                "a build needs at least one spec".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in spec_ids {
+            if !seen.insert(id.as_str()) {
+                return Err(StoreError::Invalid(format!("duplicate spec id: {id}")));
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // One query resolves existence, review status, project, and queue
+        // order for the whole batch.
+        let mut resolved: Vec<(SpecId, String, Option<i64>, i64)> = Vec::new();
+        for id in spec_ids {
+            let row = sqlx::query(
+                "SELECT s.id, s.rowid AS spec_rowid, t.project_id, q.status, q.rank \
+                 FROM specs s \
+                 JOIN tasks t ON t.id = s.task_id \
+                 LEFT JOIN spec_queue q ON q.spec_id = s.id \
+                 WHERE s.id = ?",
+            )
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("spec {id}")))?;
+
+            let status: Option<String> = row.try_get("status")?;
+            match status.as_deref().and_then(SpecQueueStatus::from_str) {
+                Some(SpecQueueStatus::Approved) => {}
+                other => {
+                    return Err(StoreError::Invalid(format!(
+                        "spec {id} is {}, only approved specs can be built",
+                        other.map(|s| s.as_str()).unwrap_or("not in the queue")
+                    )));
+                }
+            }
+
+            let in_flight = sqlx::query(
+                "SELECT b.id FROM build_specs bs JOIN builds b ON b.id = bs.build_id \
+                 WHERE bs.spec_id = ? AND b.status IN (?, ?)",
+            )
+            .bind(id.as_str())
+            .bind(BuildStatus::Queued.as_str())
+            .bind(BuildStatus::Running.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = in_flight {
+                let build: String = row.try_get("id")?;
+                return Err(StoreError::Invalid(format!(
+                    "spec {id} is already part of build {build}"
+                )));
+            }
+
+            resolved.push((
+                id.clone(),
+                row.try_get("project_id")?,
+                row.try_get("rank")?,
+                row.try_get("spec_rowid")?,
+            ));
+        }
+
+        let project_id = resolved[0].1.clone();
+        if resolved.iter().any(|(_, p, _, _)| *p != project_id) {
+            return Err(StoreError::Invalid(
+                "specs span multiple projects; one build builds one repo".into(),
+            ));
+        }
+
+        // Spec-queue order: rank first (nulls last), then spec age.
+        resolved.sort_by_key(|(_, _, rank, rowid)| (rank.is_none(), rank.unwrap_or(0), *rowid));
+
+        let build = Build {
+            id: BuildId::new(),
+            project_id: ProjectId::from_raw(project_id),
+            vm_id: None,
+            branch: String::new(), // set below, needs the id
+            base_branch: base_branch.to_string(),
+            base_sha: None,
+            head_sha: None,
+            pr_number: None,
+            status: BuildStatus::Queued,
+            summary: None,
+            files_touched: vec![],
+            exit_reason: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+        };
+        let branch = format!("build/{}", build.id);
+        sqlx::query(
+            "INSERT INTO builds (id, project_id, branch, base_branch, status, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(build.id.as_str())
+        .bind(build.project_id.as_str())
+        .bind(&branch)
+        .bind(&build.base_branch)
+        .bind(build.status.as_str())
+        .bind(build.created_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        for (position, (spec_id, _, _, _)) in resolved.iter().enumerate() {
+            sqlx::query("INSERT INTO build_specs (build_id, spec_id, position) VALUES (?, ?, ?)")
+                .bind(build.id.as_str())
+                .bind(spec_id.as_str())
+                .bind(position as i64 + 1)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        self.append_event(EventPayload::BuildRequested {
+            build_id: build.id.clone(),
+            spec_ids: resolved.iter().map(|(id, _, _, _)| id.clone()).collect(),
+        })
+        .await?;
+
+        Ok(Build { branch, ..build })
+    }
+
+    /// Claim the next build for the serial loop: if any build is `running`,
+    /// returns `None`; otherwise the oldest `queued` build becomes `running`
+    /// in the same transaction — the check and the claim cannot be split,
+    /// which is what makes execution serial by construction.
+    ///
+    /// The specs' tasks move `ready_to_build → building` (tasks that left
+    /// `ready_to_build` some other way — e.g. retired because their issue
+    /// closed — are left alone). Emits `BuildStarted` plus the task events.
+    pub async fn claim_next_queued_build(&self) -> Result<Option<Build>, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        let running = sqlx::query("SELECT 1 FROM builds WHERE status = ? LIMIT 1")
+            .bind(BuildStatus::Running.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if running.is_some() {
+            return Ok(None);
+        }
+
+        let Some(row) = sqlx::query(
+            "SELECT id FROM builds WHERE status = ? ORDER BY created_at, rowid LIMIT 1",
+        )
+        .bind(BuildStatus::Queued.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let build_id = BuildId::from_raw(row.try_get::<String, _>("id")?);
+
+        sqlx::query("UPDATE builds SET status = ?, started_at = ? WHERE id = ?")
+            .bind(BuildStatus::Running.as_str())
+            .bind(now.to_rfc3339())
+            .bind(build_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        let task_rows = sqlx::query(
+            "SELECT DISTINCT t.id FROM build_specs bs \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE bs.build_id = ? AND t.state = ?",
+        )
+        .bind(build_id.as_str())
+        .bind(TaskState::ReadyToBuild.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut building_tasks = Vec::new();
+        for row in task_rows {
+            let id = TaskId::from_raw(row.try_get::<String, _>("id")?);
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+                .bind(TaskState::Building.as_str())
+                .bind(now.to_rfc3339())
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            building_tasks.push(id);
+        }
+        tx.commit().await?;
+
+        self.append_event(EventPayload::BuildStarted {
+            build_id: build_id.clone(),
+        })
+        .await?;
+        for task_id in building_tasks {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id,
+                from: TaskState::ReadyToBuild,
+                to: TaskState::Building,
+            })
+            .await?;
+        }
+
+        self.get_build(&build_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("build {build_id}")))
+            .map(Some)
+    }
+
+    pub async fn get_build(&self, id: &BuildId) -> Result<Option<Build>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
+             pr_number, status, summary, files_touched, exit_reason, created_at, \
+             started_at, completed_at FROM builds WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(build_from_row).transpose()
+    }
+
+    /// Newest first.
+    pub async fn list_builds(&self) -> Result<Vec<Build>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
+             pr_number, status, summary, files_touched, exit_reason, created_at, \
+             started_at, completed_at FROM builds ORDER BY created_at DESC, rowid DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(build_from_row).collect()
+    }
+
+    /// The build's specs in batch order.
+    pub async fn build_spec_ids(&self, id: &BuildId) -> Result<Vec<SpecId>, StoreError> {
+        let rows =
+            sqlx::query("SELECT spec_id FROM build_specs WHERE build_id = ? ORDER BY position")
+                .bind(id.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| Ok(SpecId::from_raw(row.try_get::<String, _>("spec_id")?)))
+            .collect()
+    }
+
+    pub async fn set_build_vm(&self, id: &BuildId, vm_id: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builds SET vm_id = ? WHERE id = ?")
+            .bind(vm_id)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_build_base_sha(&self, id: &BuildId, base_sha: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builds SET base_sha = ? WHERE id = ?")
+            .bind(base_sha)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Terminal success: branch pushed, PR open. In one transaction the build
+    /// row is completed, the batch's specs drain `approved → built` (a spec
+    /// cannot be built twice), and their tasks conclude `building → done`.
+    pub async fn finalize_build_succeeded(
+        &self,
+        id: &BuildId,
+        head_sha: &str,
+        pr_number: u64,
+        summary: Option<&str>,
+        files_touched: &[String],
+    ) -> Result<Build, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE builds SET status = ?, head_sha = ?, pr_number = ?, summary = ?, \
+             files_touched = ?, completed_at = ? WHERE id = ?",
+        )
+        .bind(BuildStatus::Succeeded.as_str())
+        .bind(head_sha)
+        .bind(pr_number as i64)
+        .bind(summary)
+        .bind(serde_json::to_string(files_touched)?)
+        .bind(now.to_rfc3339())
+        .bind(id.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        let spec_rows = sqlx::query(
+            "SELECT bs.spec_id, s.task_id, t.state FROM build_specs bs \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE bs.build_id = ? ORDER BY bs.position",
+        )
+        .bind(id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut built_specs = Vec::new();
+        let mut done_tasks = Vec::new();
+        for row in spec_rows {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            sqlx::query("UPDATE spec_queue SET status = ? WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Built.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            built_specs.push(spec_id);
+
+            let task_id = TaskId::from_raw(row.try_get::<String, _>("task_id")?);
+            let state: String = row.try_get("state")?;
+            if state == TaskState::Building.as_str() && !done_tasks.contains(&task_id) {
+                sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+                    .bind(TaskState::Done.as_str())
+                    .bind(now.to_rfc3339())
+                    .bind(task_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                done_tasks.push(task_id);
+            }
+        }
+        tx.commit().await?;
+
+        for spec_id in built_specs {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from: Some(SpecQueueStatus::Approved),
+                to: SpecQueueStatus::Built,
+            })
+            .await?;
+        }
+        for task_id in done_tasks {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id,
+                from: TaskState::Building,
+                to: TaskState::Done,
+            })
+            .await?;
+        }
+        self.append_event(EventPayload::PullRequestOpened {
+            build_id: id.clone(),
+            pr_number,
+        })
+        .await?;
+        self.append_event(EventPayload::BuildCompleted {
+            build_id: id.clone(),
+            status: BuildStatus::Succeeded,
+        })
+        .await?;
+
+        self.get_build(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("build {id}")))
+    }
+
+    /// Terminal failure, any stage. The batch's specs stay `approved` and
+    /// their tasks return `building → ready_to_build` — never further back: a
+    /// failed build must not re-scout work that already has a good spec.
+    pub async fn finalize_build_failed(
+        &self,
+        id: &BuildId,
+        reason: &str,
+    ) -> Result<Build, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("UPDATE builds SET status = ?, exit_reason = ?, completed_at = ? WHERE id = ?")
+            .bind(BuildStatus::Failed.as_str())
+            .bind(reason)
+            .bind(now.to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+        let task_rows = sqlx::query(
+            "SELECT DISTINCT t.id FROM build_specs bs \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE bs.build_id = ? AND t.state = ?",
+        )
+        .bind(id.as_str())
+        .bind(TaskState::Building.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut returned = Vec::new();
+        for row in task_rows {
+            let task_id = TaskId::from_raw(row.try_get::<String, _>("id")?);
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+                .bind(TaskState::ReadyToBuild.as_str())
+                .bind(now.to_rfc3339())
+                .bind(task_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            returned.push(task_id);
+        }
+        tx.commit().await?;
+
+        for task_id in returned {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id,
+                from: TaskState::Building,
+                to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        self.append_event(EventPayload::BuildCompleted {
+            build_id: id.clone(),
+            status: BuildStatus::Failed,
+        })
+        .await?;
+
+        self.get_build(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("build {id}")))
     }
 
     // --- mode ---
@@ -1377,6 +1872,38 @@ fn transcript_line_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TranscriptLi
             value: stream_raw,
         })?,
         line: row.try_get("line")?,
+    })
+}
+
+fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
+    let status_raw: String = row.try_get("status")?;
+    let files_raw: String = row.try_get("files_touched")?;
+    let opt_ts = |col: &'static str| -> Result<Option<DateTime<Utc>>, StoreError> {
+        row.try_get::<Option<String>, _>(col)?
+            .map(|s| parse_ts(&s, col))
+            .transpose()
+    };
+    Ok(Build {
+        id: BuildId::from_raw(row.try_get::<String, _>("id")?),
+        project_id: ProjectId::from_raw(row.try_get::<String, _>("project_id")?),
+        vm_id: row.try_get("vm_id")?,
+        branch: row.try_get("branch")?,
+        base_branch: row.try_get("base_branch")?,
+        base_sha: row.try_get("base_sha")?,
+        head_sha: row.try_get("head_sha")?,
+        pr_number: row
+            .try_get::<Option<i64>, _>("pr_number")?
+            .map(|n| n.max(0) as u64),
+        status: BuildStatus::from_str(&status_raw).ok_or(StoreError::BadEnum {
+            column: "status",
+            value: status_raw,
+        })?,
+        summary: row.try_get("summary")?,
+        files_touched: serde_json::from_str(&files_raw)?,
+        exit_reason: row.try_get("exit_reason")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+        started_at: opt_ts("started_at")?,
+        completed_at: opt_ts("completed_at")?,
     })
 }
 
@@ -2326,7 +2853,8 @@ mod tests {
             report,
             ReconcileReport {
                 sessions: 1,
-                tasks: 2
+                tasks: 2,
+                builds: 0
             }
         );
 
@@ -3128,5 +3656,277 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)));
+    }
+
+    /// Insert the full chain a build consumes: a ready_to_build task, its
+    /// session, its spec, and an approved queue entry.
+    async fn approved_spec(store: &Store, project: &Project, issue: u64) -> (Task, Spec) {
+        let mut task = sample_task(&project.id);
+        task.gh_issue_number = issue;
+        task.state = TaskState::ReadyToBuild;
+        store.insert_task(&task).await.unwrap();
+
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: format!("scout/{}", task.id),
+            status: SessionStatus::ScoutSucceeded,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+
+        let spec = Spec {
+            id: SpecId::new(),
+            session_id: session.id,
+            task_id: task.id.clone(),
+            content: format!("## Spec: issue {issue}"),
+            complexity: Complexity::Simple,
+            files_touched: vec![],
+            created_at: Utc::now(),
+        };
+        store.insert_spec(&spec).await.unwrap();
+        store
+            .upsert_spec_queue_entry(&SpecQueueEntry {
+                spec_id: spec.id.clone(),
+                status: SpecQueueStatus::Approved,
+                rank: None,
+                approved_at: Some(Utc::now()),
+                feedback: None,
+                blocking_dependencies: vec![],
+            })
+            .await
+            .unwrap();
+        (task, spec)
+    }
+
+    #[tokio::test]
+    async fn create_build_validates_the_batch() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_task, spec) = approved_spec(&store, &project, 1).await;
+
+        // Empty and duplicated sets.
+        assert!(matches!(
+            store.create_build(&[], "main").await.unwrap_err(),
+            StoreError::Invalid(_)
+        ));
+        assert!(matches!(
+            store
+                .create_build(&[spec.id.clone(), spec.id.clone()], "main")
+                .await
+                .unwrap_err(),
+            StoreError::Invalid(_)
+        ));
+
+        // A non-approved spec.
+        let (_t2, pending) = approved_spec(&store, &project, 2).await;
+        store
+            .review_spec(&pending.id, SpecQueueStatus::Rejected, None)
+            .await
+            .unwrap();
+        let err = store
+            .create_build(&[pending.id.clone()], "main")
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("rejected"), "{err}");
+
+        // A spec already in an active build.
+        let build = store
+            .create_build(&[spec.id.clone()], "main")
+            .await
+            .unwrap();
+        assert_eq!(build.status, BuildStatus::Queued);
+        assert_eq!(build.branch, format!("build/{}", build.id));
+        let err = store
+            .create_build(&[spec.id.clone()], "main")
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("already part of"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_build_resorts_the_batch_into_spec_queue_order() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_ta, spec_a) = approved_spec(&store, &project, 1).await;
+        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
+        // Rank b above a; the human's order wins over the caller's.
+        store
+            .set_spec_queue_order(&[spec_b.id.clone(), spec_a.id.clone()])
+            .await
+            .unwrap();
+
+        let build = store
+            .create_build(&[spec_a.id.clone(), spec_b.id.clone()], "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.build_spec_ids(&build.id).await.unwrap(),
+            vec![spec_b.id, spec_a.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn claiming_is_serial_by_construction() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
+        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
+
+        let first = store
+            .create_build(&[spec_a.id.clone()], "main")
+            .await
+            .unwrap();
+        let _second = store
+            .create_build(&[spec_b.id.clone()], "main")
+            .await
+            .unwrap();
+
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.id, first.id, "oldest first");
+        assert_eq!(claimed.status, BuildStatus::Running);
+        // Its task went building; the second build cannot be claimed.
+        assert_eq!(
+            store.get_task(&task_a.id).await.unwrap().unwrap().state,
+            TaskState::Building
+        );
+        assert!(
+            store.claim_next_queued_build().await.unwrap().is_none(),
+            "one at a time"
+        );
+
+        // Failure returns the task to ready_to_build, spec stays approved,
+        // and the queue unblocks.
+        store
+            .finalize_build_failed(&claimed.id, "agent produced no commits")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_task(&task_a.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild
+        );
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec_a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Approved
+        );
+        let next = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(next.status, BuildStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn a_successful_build_drains_the_batch() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+        let build = store
+            .create_build(&[spec.id.clone()], "main")
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+
+        let done = store
+            .finalize_build_succeeded(
+                &build.id,
+                "headsha123",
+                77,
+                Some("Did the thing."),
+                &["src/lib.rs".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.status, BuildStatus::Succeeded);
+        assert_eq!(done.pr_number, Some(77));
+        assert_eq!(done.head_sha.as_deref(), Some("headsha123"));
+
+        // Spec drained, task concluded, and neither can be re-consumed.
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Built
+        );
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        let err = store
+            .create_build(&[spec.id.clone()], "main")
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("built"), "{err}");
+
+        // Built is not a verdict a reviewer can render.
+        let err = store
+            .review_spec(&spec.id, SpecQueueStatus::Built, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+
+        let payloads: Vec<EventPayload> = store
+            .events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::PullRequestOpened {
+            build_id: build.id.clone(),
+            pr_number: 77,
+        }));
+        assert!(payloads.contains(&EventPayload::BuildCompleted {
+            build_id: build.id,
+            status: BuildStatus::Succeeded,
+        }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_orphaned_running_builds_but_keeps_queued_ones() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
+        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
+        let running = store.create_build(&[spec_a.id], "main").await.unwrap();
+        let queued = store.create_build(&[spec_b.id], "main").await.unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+
+        let report = store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(report.builds, 1);
+
+        let after = store.get_build(&running.id).await.unwrap().unwrap();
+        assert_eq!(after.status, BuildStatus::Failed);
+        assert_eq!(
+            after.exit_reason.as_deref(),
+            Some("orphaned by server restart")
+        );
+        assert_eq!(
+            store.get_task(&task_a.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild
+        );
+        // Queued builds are durable intent: untouched, claimable now.
+        assert_eq!(
+            store.get_build(&queued.id).await.unwrap().unwrap().status,
+            BuildStatus::Queued
+        );
+        assert_eq!(
+            store.claim_next_queued_build().await.unwrap().unwrap().id,
+            queued.id
+        );
     }
 }

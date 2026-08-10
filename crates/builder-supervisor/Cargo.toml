@@ -1,34 +1,25 @@
 [package]
-name = "tasks"
-description = "Human-in-the-loop agent orchestration server"
+name = "builder-supervisor"
+description = "PID 1 binary running inside a Builder VM. Clones a repo at full depth, drives the agent, ships the branch back as a git bundle."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "tasks"
+name = "builder-supervisor"
 path = "src/main.rs"
 
 [dependencies]
 tokio.workspace = true
-tokio-stream.workspace = true
-axum.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-chrono.workspace = true
-uuid.workspace = true
-sqlx.workspace = true
-reqwest.workspace = true
 vm-pool-protocol.workspace = true
-vm-pool-client.workspace = true
-vm-pool-service.workspace = true
-vm-pool-manager.workspace = true
 tasks-protocol.workspace = true
+uuid.workspace = true
 base64.workspace = true
 
 [dev-dependencies]

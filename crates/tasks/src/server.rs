@@ -29,8 +29,8 @@ use tracing::{error, info, warn};
 
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Mode, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId, TranscriptLine,
+    Build, BuildId, Mode, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine,
 };
 use crate::store::{Store, StoreError};
 
@@ -107,6 +107,8 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/spec-queue", get(list_spec_queue))
         .route("/spec-queue/reorder", post(reorder_spec_queue))
         .route("/spec-queue/{spec_id}/review", post(review_spec))
+        .route("/builds", get(list_builds).post(request_build))
+        .route("/builds/{build_id}", get(get_build))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
         .route("/events", get(list_events))
@@ -325,6 +327,54 @@ async fn review_spec(
         entry,
         task_id: spec.task_id,
     }))
+}
+
+// --- builds ---
+
+#[derive(Debug, Deserialize)]
+struct BuildRequest {
+    spec_ids: Vec<SpecId>,
+    /// Branch the batch is cut from and PR'd against. Defaults to `main`.
+    #[serde(default)]
+    base_branch: Option<String>,
+}
+
+/// A build with its batch, in position order.
+#[derive(Debug, Serialize)]
+struct BuildDetail {
+    #[serde(flatten)]
+    build: Build,
+    spec_ids: Vec<SpecId>,
+}
+
+/// 202, not 200/201-with-result: builds are serial and this only queues one.
+/// Watch `build_started` / `build_completed` on the event stream, or poll
+/// `GET /builds/{id}`.
+async fn request_build(
+    State(store): State<Arc<Store>>,
+    Json(body): Json<BuildRequest>,
+) -> ApiResult<(StatusCode, Json<BuildDetail>)> {
+    let base_branch = body.base_branch.as_deref().unwrap_or("main");
+    let build = store.create_build(&body.spec_ids, base_branch).await?;
+    let spec_ids = store.build_spec_ids(&build.id).await?;
+    Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })))
+}
+
+async fn list_builds(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Build>>> {
+    Ok(Json(store.list_builds().await?))
+}
+
+async fn get_build(
+    State(store): State<Arc<Store>>,
+    Path(build_id): Path<String>,
+) -> ApiResult<Json<BuildDetail>> {
+    let id = BuildId::from_raw(build_id);
+    let build = store
+        .get_build(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("build {id}")))?;
+    let spec_ids = store.build_spec_ids(&id).await?;
+    Ok(Json(BuildDetail { build, spec_ids }))
 }
 
 // --- mode ---

@@ -192,3 +192,42 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Like [`write_supervisor_wrapper`], for the builder-supervisor's env.
+pub async fn write_builder_supervisor_wrapper(
+    dir: &Path,
+    supervisor_bin: &Path,
+    agent_cmd: &str,
+    workdir_root: &Path,
+) -> PathBuf {
+    let wrapper = dir.join("builder-supervisor-wrapper.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         export BUILDER_AGENT_CMD={agent}\n\
+         export BUILDER_WORKDIR_ROOT={root}\n\
+         exec {bin}\n",
+        agent = shell_escape(agent_cmd),
+        root = shell_escape(&workdir_root.display().to_string()),
+        bin = shell_escape(&supervisor_bin.display().to_string()),
+    );
+    tokio::fs::write(&wrapper, script).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&wrapper).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&wrapper, p).await.unwrap();
+    }
+    wrapper
+}
+
+/// A stand-in builder agent that commits work, forgets one file, and writes
+/// SUMMARY.md — lives in the builder-supervisor crate's fixtures.
+pub fn stub_builder_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("builder-supervisor")
+        .join("tests")
+        .join("fixtures")
+        .join("stub-builder-agent.sh")
+}

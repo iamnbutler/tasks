@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TasksProtocol};
+use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -101,15 +101,29 @@ async fn main() -> Result<()> {
             }
             VmCommand::App {
                 payload:
-                    ScoutCommand::Start {
+                    TaskCommand::Scout(ScoutCommand::Start {
                         task_id,
                         repo_clone_url,
                         base_branch,
                         prompt,
-                    },
+                    }),
             } => {
                 let tx = evt_tx.clone();
                 run_scout(&task_id, &repo_clone_url, &base_branch, &prompt, tx).await;
+            }
+            // The information barrier's last line: this VM is a Scout, and a
+            // Build command is answered with a terminal refusal, never acted on.
+            VmCommand::App {
+                payload: TaskCommand::Build(_),
+            } => {
+                warn!("received a build command; this VM is a scout");
+                emit(
+                    &evt_tx,
+                    ScoutEvent::Failed {
+                        reason: "this VM is a scout; refusing a build command".into(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -129,7 +143,11 @@ async fn write_event(stdout: &mut tokio::io::Stdout, event: &TaskVmEvent) -> Res
 }
 
 async fn emit(tx: &mpsc::Sender<TaskVmEvent>, event: ScoutEvent) {
-    let _ = tx.send(VmEvent::App { payload: event }).await;
+    let _ = tx
+        .send(VmEvent::App {
+            payload: TaskEvent::Scout(event),
+        })
+        .await;
 }
 
 /// Run the Scout workflow for a task.

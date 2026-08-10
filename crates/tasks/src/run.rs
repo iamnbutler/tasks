@@ -43,6 +43,7 @@ use tracing::{info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::VmConfig;
 
+use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
 use crate::github::GitHubClient;
 use crate::models::{GhState, Mode, Project, Spec, Task, TaskId, TaskState};
@@ -55,7 +56,11 @@ pub const DEFAULT_PORT: u16 = 4800;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 const DEFAULT_SCOUT_MAX_CONCURRENT: usize = 2;
 const DEFAULT_SCOUT_IMAGE: &str = "agent:v1";
+const DEFAULT_BUILDER_IMAGE: &str = "builder:v1";
 const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
+/// Builds get the same wall-clock budget as scouts, for the same reason: it
+/// must sit below vm-pool's 7200s reaper so the app deadline fires first.
+const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// Wall-clock budget for one scout. ~2.5x the observed 23-minute live run, and
 /// deliberately below vm-pool's own `PoolConfig::vm_timeout` (7200s): if the
 /// app deadline sat at or above the pool's reaper, infrastructure would tear
@@ -137,6 +142,12 @@ pub struct Config {
     pub scout_base_branch: String,
     /// VM shape requested from vm-pool for each scout.
     pub vm_config: VmConfig,
+    /// vm-pool image builds run in (`BUILDER_IMAGE`).
+    pub builder_image: String,
+    /// Wall-clock budget for one build (`BUILDER_TIMEOUT_SECS`).
+    pub builder_timeout: Duration,
+    /// REST endpoint override (`GITHUB_REST_API_URL`) — PR creation only.
+    pub github_rest_api_url: Option<String>,
 }
 
 impl Config {
@@ -175,14 +186,26 @@ impl Config {
                 env: scout_vm_env(),
                 ..VmConfig::default()
             },
+            builder_image: env_string("BUILDER_IMAGE")
+                .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.into()),
+            builder_timeout: Duration::from_secs(parse_env(
+                "BUILDER_TIMEOUT_SECS",
+                "a number of seconds",
+                DEFAULT_BUILDER_TIMEOUT_SECS,
+            )?),
+            github_rest_api_url: env_string("GITHUB_REST_API_URL"),
         })
     }
 
     fn github_client(&self) -> Option<GitHubClient> {
         let token = self.github_token.as_ref()?;
-        Some(match &self.github_api_url {
+        let client = match &self.github_api_url {
             Some(url) => GitHubClient::with_base_url(token, url),
             None => GitHubClient::new(token),
+        };
+        Some(match &self.github_rest_api_url {
+            Some(url) => client.with_rest_base_url(url),
+            None => client,
         })
     }
 }
@@ -281,6 +304,11 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.clone(),
         shutdown_rx.clone(),
     ));
+    let build = tokio::spawn(build_loop(
+        store.clone(),
+        config.clone(),
+        shutdown_rx.clone(),
+    ));
 
     server::serve_with_shutdown(store, config.port, async {
         let _ = tokio::signal::ctrl_c().await;
@@ -290,13 +318,16 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let _ = shutdown_tx.send(true);
     let _ = poll.await;
-    if tokio::time::timeout(SHUTDOWN_GRACE, dispatch)
-        .await
-        .is_err()
+    if tokio::time::timeout(SHUTDOWN_GRACE, async {
+        let _ = dispatch.await;
+        let _ = build.await;
+    })
+    .await
+    .is_err()
     {
         warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
-            "in-flight scouts did not finish within the grace period; exiting anyway"
+            "in-flight work did not finish within the grace period; exiting anyway"
         );
     }
     Ok(())
@@ -724,14 +755,134 @@ fn is_disconnect(error: &ScoutError) -> bool {
 
 /// Where a scout clones from. Derived per project; the token, when set, rides
 /// along as basic auth so private repos clone without a credential helper.
+// --- serial build loop ---
+
+/// Run queued builds one at a time until `shutdown` flips.
+///
+/// Mirrors [`dispatch_loop`]'s connection handling — own vm-pool connection,
+/// reconnect every [`VM_POOL_RETRY`] — but awaits each build inline, which
+/// *is* the serialization at the loop level;
+/// [`Store::claim_next_queued_build`] is the serialization at the store.
+/// Every batch is cut from a base branch that already contains the previous
+/// batch. Do not relax this.
+///
+/// Requires GitHub credentials (the push and the PR are server-side writes);
+/// without a token the loop is disabled with a warning and everything else
+/// runs normally. Mode gates the *start* of a run only — `Pause` never
+/// interrupts a running build, which has more at stake than a scout: a
+/// half-built branch has no home.
+pub async fn build_loop(store: Arc<Store>, config: Config, mut shutdown: watch::Receiver<bool>) {
+    let Some(github) = config.github_client() else {
+        warn!("no GITHUB_TOKEN; builds disabled (a build must push and open a PR)");
+        return;
+    };
+    let github = Arc::new(github);
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(
+                    socket = %config.vm_pool_socket.display(),
+                    error = %e,
+                    retry_secs = VM_POOL_RETRY.as_secs(),
+                    "vm-pool unavailable — builds disabled"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(VM_POOL_RETRY) => continue,
+                    _ = shutdown.changed() => return,
+                }
+            }
+        };
+
+        let builder = Builder::new(
+            store.clone(),
+            client.handle(),
+            github.clone(),
+            BuilderConfig {
+                image: config.builder_image.clone(),
+                vm_config: config.vm_config.clone(),
+                timeout: config.builder_timeout,
+                scratch_root: config.data_dir.join("build-scratch"),
+            },
+        );
+
+        loop {
+            match store.get_mode().await {
+                Ok(Mode::Play) => {
+                    match store.claim_next_queued_build().await {
+                        Ok(Some(build)) => {
+                            let project = match store.get_project(&build.project_id).await {
+                                Ok(Some(p)) => p,
+                                Ok(None) => {
+                                    warn!(build_id = %build.id, "build references a missing project");
+                                    let _ = store
+                                        .finalize_build_failed(&build.id, "project not found")
+                                        .await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "could not load the build's project");
+                                    continue;
+                                }
+                            };
+                            let url = clone_url(&config, &project);
+                            // Inline await = serial by construction.
+                            match builder.dispatch(build, &url).await {
+                                Ok(done) => {
+                                    info!(build_id = %done.id, pr = ?done.pr_number, "build succeeded");
+                                }
+                                Err(e) => {
+                                    // Already finalized inside dispatch; a dead
+                                    // socket additionally means reconnecting.
+                                    if matches!(
+                                        e,
+                                        BuilderError::Client(_) | BuilderError::StreamClosed
+                                    ) {
+                                        warn!(error = %e, "lost the vm-pool connection mid-build");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => warn!(error = %e, "could not read the build queue"),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "could not read mode; skipping build tick"),
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(DISPATCH_TICK) => {}
+                _ = shutdown.changed() => return,
+            }
+        }
+    }
+}
+
 fn clone_url(config: &Config, project: &Project) -> String {
+    clone_url_for(
+        &config.clone_url_base,
+        config.github_token.as_deref(),
+        project,
+    )
+}
+
+/// The credentialed clone URL for a project — shared by the scout and builder
+/// paths so both sides of the diamond clone (and the builder pushes) the same
+/// way. Non-https bases take no credentials; they'd be meaningless.
+pub(crate) fn clone_url_for(base: &str, token: Option<&str>, project: &Project) -> String {
     let url = format!(
         "{}/{}/{}.git",
-        config.clone_url_base.trim_end_matches('/'),
+        base.trim_end_matches('/'),
         project.repo_owner,
         project.repo_name
     );
-    match (&config.github_token, url.strip_prefix("https://")) {
+    match (token, url.strip_prefix("https://")) {
         (Some(token), Some(rest)) => format!("https://x-access-token:{token}@{rest}"),
         _ => url,
     }
@@ -759,6 +910,9 @@ mod tests {
             clone_url_base: DEFAULT_CLONE_URL_BASE.into(),
             scout_base_branch: "main".into(),
             vm_config: VmConfig::default(),
+            builder_image: DEFAULT_BUILDER_IMAGE.into(),
+            builder_timeout: Duration::from_secs(DEFAULT_BUILDER_TIMEOUT_SECS),
+            github_rest_api_url: None,
         }
     }
 

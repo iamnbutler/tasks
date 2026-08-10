@@ -387,6 +387,9 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         clone_url_base: format!("file://{}", clone_root.display()),
         scout_base_branch: "main".into(),
         vm_config: VmConfig::default(),
+        builder_image: "builder:v1".into(),
+        builder_timeout: Duration::from_secs(300),
+        github_rest_api_url: None,
     }
 }
 
