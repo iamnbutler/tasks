@@ -154,28 +154,49 @@ final class AppModel {
         }
     }
 
+    /// Every fetch stands alone: one failing endpoint surfaces on the banner
+    /// but must not blank the six that succeeded.
     func refresh() async {
+        let c = client
+        async let projects = Self.attempt { try await c.projects() }
+        async let tasks = Self.attempt { try await c.tasks() }
+        async let sessions = Self.attempt { try await c.sessions() }
+        async let specs = Self.attempt { try await c.specs() }
+        async let specQueue = Self.attempt { try await c.specQueue() }
+        async let mode = Self.attempt { try await c.mode() }
+        async let events = Self.attempt { try await c.events() }
+
+        var firstError: String?
+        func apply<T>(_ result: Result<T, any Error>?, _ assign: (T) -> Void) {
+            switch result {
+            case .success(let value): assign(value)
+            case .failure(let error):
+                if firstError == nil { firstError = error.localizedDescription }
+            case nil: break
+            }
+        }
+        apply(await projects) { self.projects = $0 }
+        apply(await tasks) { self.tasks = $0 }
+        apply(await sessions) { self.sessions = $0 }
+        apply(await specs) { self.specs = $0 }
+        apply(await specQueue) { self.specQueue = $0 }
+        apply(await mode) { self.mode = $0 }
+        apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }
+
+        connectionError = firstError
+        lastRefreshed = Date()
+    }
+
+    /// Nil on cancellation (mid-teardown — not an error, not a result).
+    private nonisolated static func attempt<T: Sendable>(
+        _ op: @Sendable () async throws -> T
+    ) async -> Result<T, any Error>? {
         do {
-            async let projects = client.projects()
-            async let tasks = client.tasks()
-            async let sessions = client.sessions()
-            async let specs = client.specs()
-            async let specQueue = client.specQueue()
-            async let mode = client.mode()
-            async let events = client.events()
-            self.projects = try await projects
-            self.tasks = try await tasks
-            self.sessions = try await sessions
-            self.specs = try await specs
-            self.specQueue = try await specQueue
-            self.mode = try await mode
-            self.events = try await events.sorted { $0.seq > $1.seq }
-            connectionError = nil
-            lastRefreshed = Date()
+            return .success(try await op())
         } catch is CancellationError {
-            return
+            return nil
         } catch {
-            connectionError = error.localizedDescription
+            return .failure(error)
         }
     }
 }
