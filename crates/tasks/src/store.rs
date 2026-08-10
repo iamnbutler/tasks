@@ -225,7 +225,7 @@ impl Store {
              ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
         )
         .bind(GhState::Closed.as_str())
-        .bind(TaskState::New.as_str())
+        .bind(TaskState::Backlog.as_str())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
@@ -279,6 +279,146 @@ impl Store {
         })
         .await?;
         Ok(())
+    }
+
+    /// Pick a backlog task up into the scout queue, appending it at the end of
+    /// the ranked order. The only door from `Backlog` into the pipeline.
+    ///
+    /// Emits the `TaskStateChanged` event itself so every caller gets the same
+    /// audit trail. Returns the updated task.
+    pub async fn queue_task(&self, id: &TaskId) -> Result<Task, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let task = self
+            .require_task_state(&mut tx, id, TaskState::Backlog)
+            .await?;
+        let next_rank: i64 =
+            sqlx::query("SELECT COALESCE(MAX(manual_rank), 0) + 1 AS r FROM tasks")
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get("r")?;
+        sqlx::query("UPDATE tasks SET state = ?, manual_rank = ?, updated_at = ? WHERE id = ?")
+            .bind(TaskState::Queued.as_str())
+            .bind(next_rank)
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::TaskStateChanged {
+            task_id: id.clone(),
+            from: task.state,
+            to: TaskState::Queued,
+        })
+        .await?;
+        self.get_task(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))
+    }
+
+    /// Put a queued (not yet running) task back in the backlog, clearing its
+    /// rank. Work past `Queued` can't be un-picked — cancel or review it
+    /// through the pipeline instead.
+    pub async fn dequeue_task(&self, id: &TaskId) -> Result<Task, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let task = self
+            .require_task_state(&mut tx, id, TaskState::Queued)
+            .await?;
+        sqlx::query("UPDATE tasks SET state = ?, manual_rank = NULL, updated_at = ? WHERE id = ?")
+            .bind(TaskState::Backlog.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::TaskStateChanged {
+            task_id: id.clone(),
+            from: task.state,
+            to: TaskState::Backlog,
+        })
+        .await?;
+        self.get_task(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))
+    }
+
+    /// "Scout now": queue the task (from `Backlog` or already `Queued`) at the
+    /// FRONT of the ranked order, shifting everything else down one. The
+    /// dispatch loop picks it up on its next tick; the concurrency cap still
+    /// applies — this jumps the queue, it does not bypass it.
+    pub async fn push_task_to_front(&self, id: &TaskId) -> Result<Task, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let task = self
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        if !matches!(task.state, TaskState::Backlog | TaskState::Queued) {
+            return Err(StoreError::Invalid(format!(
+                "task {id} is {}, only backlog or queued tasks can be scouted now",
+                task.state.as_str()
+            )));
+        }
+        sqlx::query("UPDATE tasks SET manual_rank = manual_rank + 1 WHERE manual_rank IS NOT NULL")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE tasks SET state = ?, manual_rank = 1, updated_at = ? WHERE id = ?")
+            .bind(TaskState::Queued.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if task.state == TaskState::Backlog {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id: id.clone(),
+                from: TaskState::Backlog,
+                to: TaskState::Queued,
+            })
+            .await?;
+        }
+        self.get_task(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))
+    }
+
+    /// Fetch a task inside a transaction and require an exact state, mapping
+    /// the mismatch to [`StoreError::Invalid`] (a 400 at the API).
+    async fn require_task_state(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &TaskId,
+        expected: TaskState,
+    ) -> Result<Task, StoreError> {
+        let task = self
+            .get_task_in_tx(tx, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        if task.state != expected {
+            return Err(StoreError::Invalid(format!(
+                "task {id} is {}, expected {}",
+                task.state.as_str(),
+                expected.as_str()
+            )));
+        }
+        Ok(task)
+    }
+
+    async fn get_task_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &TaskId,
+    ) -> Result<Option<Task>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+        row.map(task_from_row).transpose()
     }
 
     /// Upsert a task from a GitHub issue.
@@ -339,7 +479,7 @@ impl Store {
             body: issue.body,
             labels: issue.labels,
             gh_state: issue.state,
-            state: TaskState::New,
+            state: TaskState::Backlog,
             priority: 0,
             manual_rank: None,
             dispatch_attempts: 0,
@@ -706,8 +846,10 @@ impl Store {
             .await?;
         }
         if !orphaned_tasks.is_empty() {
+            // Back to `Queued`, not `Backlog`: a crash doesn't un-pick work a
+            // human put in the queue.
             sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE state = ?")
-                .bind(TaskState::New.as_str())
+                .bind(TaskState::Queued.as_str())
                 .bind(now.to_rfc3339())
                 .bind(TaskState::Scouting.as_str())
                 .execute(&mut *tx)
@@ -732,7 +874,7 @@ impl Store {
             self.append_event(EventPayload::TaskStateChanged {
                 task_id,
                 from: TaskState::Scouting,
-                to: TaskState::New,
+                to: TaskState::Queued,
             })
             .await?;
         }
@@ -916,8 +1058,9 @@ impl Store {
     /// `Rejected`. `PendingReview` and `Blocked` are states the system assigns,
     /// not verdicts a reviewer can render, and are rejected as invalid.
     ///
-    /// Task side effects: approved → `Queued`, rejected → `Rejected`,
-    /// needs revision → back to `New` so it can be scouted again.
+    /// Task side effects: approved → `ReadyToBuild`, rejected → `Rejected`,
+    /// needs revision → back to `Queued` so it re-scouts without losing its
+    /// place as picked-up work.
     pub async fn review_spec(
         &self,
         spec_id: &SpecId,
@@ -925,9 +1068,9 @@ impl Store {
         feedback: Option<String>,
     ) -> Result<SpecQueueEntry, StoreError> {
         let next_task_state = match status {
-            SpecQueueStatus::Approved => TaskState::Queued,
+            SpecQueueStatus::Approved => TaskState::ReadyToBuild,
             SpecQueueStatus::Rejected => TaskState::Rejected,
-            SpecQueueStatus::NeedsRevision => TaskState::New,
+            SpecQueueStatus::NeedsRevision => TaskState::Queued,
             SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked => {
                 return Err(StoreError::Invalid(format!(
                     "{} is not a review outcome",
@@ -1252,7 +1395,7 @@ mod tests {
             body: "Do the thing".into(),
             labels: vec!["bug".into(), "p0".into()],
             gh_state: GhState::Open,
-            state: TaskState::New,
+            state: TaskState::Backlog,
             priority: 10,
             manual_rank: None,
             dispatch_attempts: 0,
@@ -1363,7 +1506,7 @@ mod tests {
         let task = outcome.into_inner();
         assert_eq!(task.gh_issue_number, 7);
         assert_eq!(task.title, "Fix the thing");
-        assert_eq!(task.state, TaskState::New);
+        assert_eq!(task.state, TaskState::Backlog);
         assert_eq!(task.priority, 0);
 
         // Verify persistence
@@ -1902,7 +2045,7 @@ mod tests {
             store.insert_task(t).await.unwrap();
         }
         store
-            .update_task_state(&closed_in_flight.id, TaskState::SpecReady)
+            .update_task_state(&closed_in_flight.id, TaskState::InReview)
             .await
             .unwrap();
 
@@ -2111,13 +2254,13 @@ mod tests {
         for id in [&orphaned.id, &sessionless.id] {
             assert_eq!(
                 store.get_task(id).await.unwrap().unwrap().state,
-                TaskState::New,
+                TaskState::Queued,
                 "task {id}"
             );
         }
         assert_eq!(
             store.get_task(&untouched.id).await.unwrap().unwrap().state,
-            TaskState::New
+            TaskState::Backlog
         );
         // A completed session and its task are none of reconciliation's business.
         assert_eq!(
@@ -2127,7 +2270,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::New
+            TaskState::Backlog
         );
         assert_eq!(
             store
@@ -2157,7 +2300,7 @@ mod tests {
                 payloads.contains(&EventPayload::TaskStateChanged {
                     task_id: id.clone(),
                     from: TaskState::Scouting,
-                    to: TaskState::New,
+                    to: TaskState::Queued,
                 }),
                 "no TaskStateChanged for {id}"
             );
@@ -2255,7 +2398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_spec_approve_queues_task() {
+    async fn review_spec_approve_readies_task_for_build() {
         let store = Store::open_in_memory().await.unwrap();
         let (task, spec) = seed_spec(&store, 1).await;
 
@@ -2271,7 +2414,7 @@ mod tests {
         assert_eq!(loaded, entry);
         assert_eq!(
             store.get_task(&task.id).await.unwrap().unwrap().state,
-            TaskState::Queued
+            TaskState::ReadyToBuild
         );
     }
 
@@ -2296,7 +2439,7 @@ mod tests {
 
         let (revise_task, revise_spec) = seed_spec(&store, 2).await;
         store
-            .update_task_state(&revise_task.id, TaskState::SpecReady)
+            .update_task_state(&revise_task.id, TaskState::InReview)
             .await
             .unwrap();
         store
@@ -2314,7 +2457,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::New
+            TaskState::Queued
         );
     }
 
@@ -2339,6 +2482,10 @@ mod tests {
     async fn review_spec_emits_events() {
         let store = Store::open_in_memory().await.unwrap();
         let (task, spec) = seed_spec(&store, 1).await;
+        store
+            .update_task_state(&task.id, TaskState::InReview)
+            .await
+            .unwrap();
 
         store
             .review_spec(&spec.id, SpecQueueStatus::Approved, None)
@@ -2359,8 +2506,8 @@ mod tests {
         }));
         assert!(payloads.contains(&EventPayload::TaskStateChanged {
             task_id: task.id.clone(),
-            from: TaskState::New,
-            to: TaskState::Queued,
+            from: TaskState::InReview,
+            to: TaskState::ReadyToBuild,
         }));
     }
 
@@ -2454,7 +2601,7 @@ mod tests {
         store
             .append_event(EventPayload::TaskStateChanged {
                 task_id: task_id.clone(),
-                from: TaskState::New,
+                from: TaskState::Queued,
                 to: TaskState::Scouting,
             })
             .await

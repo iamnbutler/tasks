@@ -106,15 +106,22 @@ impl GhState {
 /// Where a task sits in our Diamond 1 pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// One state per task, one list per state. `Backlog` is not work — it's the
+/// ingested mirror of the repo's open issues. Everything from `Queued` onward
+/// is work a human explicitly picked up, and it *stays* picked up: scout
+/// failures and `needs_revision` verdicts return to `Queued`, never `Backlog`.
 pub enum TaskState {
-    /// Just ingested from GitHub.
-    New,
+    /// Ingested from GitHub, untouched. Shown in the Tasks table, never queued
+    /// or dispatched.
+    Backlog,
+    /// Explicitly picked up; in the scout queue, ordered by `manual_rank`.
+    Queued,
     /// A Scout is actively exploring.
     Scouting,
-    /// A Spec has been produced and awaits orchestrator review.
-    SpecReady,
-    /// Spec approved and sitting in the queue, waiting for Builder (out of scope this PR).
-    Queued,
+    /// A spec has been produced and awaits a review verdict.
+    InReview,
+    /// Spec approved; parked until a Builder run consumes it.
+    ReadyToBuild,
     /// Completed through the pipeline.
     Done,
     /// Rejected and won't be pursued.
@@ -124,10 +131,11 @@ pub enum TaskState {
 impl TaskState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            TaskState::New => "new",
-            TaskState::Scouting => "scouting",
-            TaskState::SpecReady => "spec_ready",
+            TaskState::Backlog => "backlog",
             TaskState::Queued => "queued",
+            TaskState::Scouting => "scouting",
+            TaskState::InReview => "in_review",
+            TaskState::ReadyToBuild => "ready_to_build",
             TaskState::Done => "done",
             TaskState::Rejected => "rejected",
         }
@@ -135,10 +143,11 @@ impl TaskState {
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "new" => Some(TaskState::New),
-            "scouting" => Some(TaskState::Scouting),
-            "spec_ready" => Some(TaskState::SpecReady),
+            "backlog" => Some(TaskState::Backlog),
             "queued" => Some(TaskState::Queued),
+            "scouting" => Some(TaskState::Scouting),
+            "in_review" => Some(TaskState::InReview),
+            "ready_to_build" => Some(TaskState::ReadyToBuild),
             "done" => Some(TaskState::Done),
             "rejected" => Some(TaskState::Rejected),
             _ => None,

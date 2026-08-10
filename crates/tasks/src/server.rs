@@ -92,6 +92,9 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/projects", get(list_projects).post(create_project))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
+        .route("/tasks/{task_id}/queue", post(queue_task))
+        .route("/tasks/{task_id}/dequeue", post(dequeue_task))
+        .route("/tasks/{task_id}/scout", post(scout_task_now))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/transcript", get(list_transcript))
@@ -197,6 +200,33 @@ async fn get_task(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("task {id}")))
+}
+
+/// Pick a backlog task up into the scout queue (appended at the end).
+async fn queue_task(
+    State(store): State<Arc<Store>>,
+    Path(task_id): Path<String>,
+) -> ApiResult<Json<Task>> {
+    Ok(Json(store.queue_task(&TaskId::from_raw(task_id)).await?))
+}
+
+/// Return a queued (not yet running) task to the backlog.
+async fn dequeue_task(
+    State(store): State<Arc<Store>>,
+    Path(task_id): Path<String>,
+) -> ApiResult<Json<Task>> {
+    Ok(Json(store.dequeue_task(&TaskId::from_raw(task_id)).await?))
+}
+
+/// "Scout now": queue the task at the front. The dispatch loop picks it up on
+/// its next tick; the concurrency cap still applies.
+async fn scout_task_now(
+    State(store): State<Arc<Store>>,
+    Path(task_id): Path<String>,
+) -> ApiResult<Json<Task>> {
+    Ok(Json(
+        store.push_task_to_front(&TaskId::from_raw(task_id)).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,7 +558,7 @@ mod tests {
             body: "body".into(),
             labels: vec![],
             gh_state: GhState::Open,
-            state: TaskState::New,
+            state: TaskState::Backlog,
             priority,
             manual_rank: None,
             dispatch_attempts: 0,
@@ -623,6 +653,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_membership_over_http() {
+        let (store, project) = store_with_project().await;
+        let a = insert_task(&store, &project, 1, 0).await;
+        let b = insert_task(&store, &project, 2, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        // Pick up a, then b: ranks append in order.
+        let a1: Task = http
+            .post(format!("{base}/tasks/{}/queue", a.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(a1.state, TaskState::Queued);
+        assert_eq!(a1.manual_rank, Some(1));
+        let b1: Task = http
+            .post(format!("{base}/tasks/{}/queue", b.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(b1.manual_rank, Some(2));
+
+        // Queueing a non-backlog task is a 400.
+        let resp = http
+            .post(format!("{base}/tasks/{}/queue", a.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // Scout-now on a backlog task queues it at the front, shifting others.
+        let c = insert_task(&store, &project, 3, 0).await;
+        let c1: Task = http
+            .post(format!("{base}/tasks/{}/scout", c.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(c1.state, TaskState::Queued);
+        assert_eq!(c1.manual_rank, Some(1));
+        let order: Vec<TaskId> = store
+            .list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.manual_rank.is_some())
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(order, vec![c.id.clone(), a.id.clone(), b.id.clone()]);
+
+        // Dequeue returns to backlog and clears the rank.
+        let b2: Task = http
+            .post(format!("{base}/tasks/{}/dequeue", b.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(b2.state, TaskState::Backlog);
+        assert_eq!(b2.manual_rank, None);
+
+        // Dequeuing work that's past Queued is a 400; unknown ids are 404.
+        store
+            .update_task_state(&c.id, TaskState::Scouting)
+            .await
+            .unwrap();
+        let resp = http
+            .post(format!("{base}/tasks/{}/dequeue", c.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = http
+            .post(format!("{base}/tasks/nonexistent/queue"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // Scout-now on an already-queued task re-fronts it without a
+        // duplicate state-change event.
+        let a2: Task = http
+            .post(format!("{base}/tasks/{}/scout", a.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(a2.manual_rank, Some(1));
+        let queue_events = store
+            .events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.payload, EventPayload::TaskStateChanged { task_id, to: TaskState::Queued, .. } if *task_id == a.id)
+            })
+            .count();
+        assert_eq!(queue_events, 1, "re-fronting must not re-announce pickup");
+    }
+
+    #[tokio::test]
     async fn queue_reorder_roundtrip_and_ordering() {
         let (store, project) = store_with_project().await;
         let high = insert_task(&store, &project, 1, 100).await;
@@ -688,7 +830,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_task_state(&closed_spec_ready.id, TaskState::SpecReady)
+            .update_task_state(&closed_spec_ready.id, TaskState::InReview)
             .await
             .unwrap();
         let base = spawn(store.clone()).await;
@@ -801,7 +943,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::Queued
+            TaskState::ReadyToBuild
         );
 
         http.post(format!("{base}/spec-queue/{}/review", revise_spec.id))
@@ -816,7 +958,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            TaskState::New
+            TaskState::Queued
         );
 
         http.post(format!("{base}/spec-queue/{}/review", rejected_spec.id))

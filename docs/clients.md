@@ -36,7 +36,10 @@ No auth, loopback only — don't build a login flow.
 | Add a repo | `POST /projects` `{"repo_owner","repo_name"}` | 201 with the project; 400 if it already exists |
 | Reorder task queue (drag & drop) | `POST /queue/reorder` `{"task_ids":[...]}` | **Full order, front to back.** Ranks are rewritten 1..N transactionally; any task not listed becomes unranked and sorts after all ranked tasks (then priority desc, then ingested_at). Send the complete on-screen order after every drop. The response is the same projection as the default `GET /tasks` (closed intake hidden), so it can replace the client's list directly. |
 | Reorder spec queue | `POST /spec-queue/reorder` `{"spec_ids":[...]}` | Same full-order semantics |
-| Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected` — the three verdicts a reviewer may deliver. `approved` → spec enters the queue for the Builder; `needs_revision` → the task goes back to `new` and will be re-scouted; `rejected` → dead end. `feedback` is free text; include it for `needs_revision` (it's the reviewer's message to the next scout). |
+| Pick up a task | `POST /tasks/{task_id}/queue` | `backlog` → `queued`, appended at the end of the ranked order. 400 unless the task is `backlog`. The only door from the backlog into the pipeline — scouts dispatch **only** queued tasks. |
+| Un-pick a task | `POST /tasks/{task_id}/dequeue` | `queued` → `backlog`, rank cleared. 400 once work has started (past `queued`). |
+| Scout now | `POST /tasks/{task_id}/scout` | Queue the task (from `backlog` or `queued`) at the **front**, shifting everything else down. The dispatch loop picks it up on its next tick; the concurrency cap still applies — it jumps the queue, it doesn't bypass it. |
+| Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected`. `approved` → task `ready_to_build`; `needs_revision` → task returns to `queued` for a re-scout (feedback reaches the next scout's prompt); `rejected` → dead end. |
 | Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running). |
 
 Everything else is read-only. There is deliberately no
@@ -50,7 +53,7 @@ the server only.
   Task: `{id, project_id, gh_issue_number, title, body, labels, gh_state,
   state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at}`.
   By default the list **omits tasks with `gh_state: "closed"` and
-  `state: "new"`** — issues that were closed on GitHub before any work started,
+  `state: "backlog"`** — issues that were closed on GitHub before any work started,
   i.e. pure intake noise. Every other task stays visible whatever its
   `gh_state`, so in-flight and historical work never disappears from the list
   because someone closed the issue behind it. `GET /tasks?all=true` returns
@@ -114,8 +117,12 @@ touch `append_event`. Apply the same rule to anything similar you add later.
 
 All enums are snake_case strings on the wire:
 
-- `Task.state`: `new` → `scouting` → `spec_ready` → `queued` → `done`, with
-  `rejected` as the terminal failure state.
+- `Task.state`: `backlog` (ingested, inert — the Tasks table) → `queued`
+  (explicitly picked up — the Queue, ordered by `manual_rank`) → `scouting` →
+  `in_review` (spec awaits a verdict) → `ready_to_build` (approved, parked
+  for a Builder) → `done`, with `rejected` as the terminal failure state.
+  Scout failures and `needs_revision` verdicts return to `queued`, never
+  `backlog` — picked-up work stays picked up.
 - `Session.status`: `running`, `scout_succeeded`, `scout_failed`, `cancelled`.
 - `SpecQueueEntry.status`: `pending_review`, `approved`, `needs_revision`,
   `blocked`, `rejected` (only the three verdict values are accepted by the
@@ -159,7 +166,7 @@ view).
   `rejected` with a dispatcher `note` explaining why; on server startup,
   orphaned `running` sessions become `scout_failed`
   (`exit_reason: "orphaned by server restart"`) and stuck `scouting` tasks
-  return to `new` — clients just see the normal events.
+  return to `queued` — clients just see the normal events.
 - **Re-scout feedback loop** (next branch): `needs_revision` feedback will be
   fed into the next scout's prompt. No API change expected; the review call
   you make today is already the right hook.

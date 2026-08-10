@@ -547,18 +547,18 @@ async fn top_up(
 }
 
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
-/// applies), state `New`, still open on GitHub, not in flight, not past the
+/// applies), state `Queued` (explicitly picked up), still open on GitHub, not in flight, not past the
 /// attempt cap.
 ///
 /// A task at the cap is rejected the moment it gets there, so the attempt
 /// filter here is belt-and-braces: it also covers rows an older build (or a
-/// crash between the increment and the rejection) left `New` at three strikes.
+/// crash between the increment and the rejection) left `Queued` at three strikes.
 async fn next_dispatchable(
     store: &Store,
     skip: &HashSet<TaskId>,
 ) -> Result<Option<(Task, Project)>, StoreError> {
     for task in store.list_tasks().await? {
-        if task.state != TaskState::New
+        if task.state != TaskState::Queued
             || task.gh_state == GhState::Closed
             || skip.contains(&task.id)
             || task.dispatch_attempts >= MAX_DISPATCH_ATTEMPTS

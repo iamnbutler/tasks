@@ -14,8 +14,12 @@ implementation.
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
   through the server, never through agents.
-- **Manual queue is human-authoritative.** `tasks.manual_rank` is set only via
-  the API; the GitHub poller must never write it.
+- **Manual queue is human-authoritative, and queue membership is explicit.**
+  `tasks.manual_rank` is set only via the API; the GitHub poller must never
+  write it. Ingested issues land in `backlog` and are never dispatched — only
+  explicitly queued tasks (`POST /tasks/{id}/queue` or `/scout`) reach a
+  Scout, and picked-up work stays picked up (failures and `needs_revision`
+  return to `queued`, not `backlog`).
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
