@@ -1023,6 +1023,37 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+
+        // Invariant sweep: no live spec-queue entry may belong to a concluded
+        // task. `retire_task` maintains this inline; rows retired before that
+        // existed (or by any future gap) are healed here at startup, so a
+        // stale approved spec can never sit where `create_build` would
+        // consume it.
+        let stale_spec_rows = sqlx::query(
+            "SELECT q.spec_id, q.status FROM spec_queue q \
+             JOIN specs s ON s.id = q.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE t.state IN (?, ?) AND q.status IN (?, ?, ?, ?)",
+        )
+        .bind(TaskState::Done.as_str())
+        .bind(TaskState::Rejected.as_str())
+        .bind(SpecQueueStatus::PendingReview.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(SpecQueueStatus::NeedsRevision.as_str())
+        .bind(SpecQueueStatus::Blocked.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut drained_specs = Vec::new();
+        for row in stale_spec_rows {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            let from_raw: String = row.try_get("status")?;
+            sqlx::query("UPDATE spec_queue SET status = ?, rank = NULL WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Rejected.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            drained_specs.push((spec_id, SpecQueueStatus::from_str(&from_raw)));
+        }
         tx.commit().await?;
 
         let report = ReconcileReport {
@@ -1059,6 +1090,14 @@ impl Store {
                 task_id,
                 from: TaskState::Building,
                 to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        for (spec_id, from) in drained_specs {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from,
+                to: SpecQueueStatus::Rejected,
             })
             .await?;
         }
@@ -3996,5 +4035,45 @@ mod tests {
         );
         let err = store.create_build(&[spec.id], "main").await.unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
+    }
+
+    /// Rows retired before the inline drain existed (or via any future gap)
+    /// are healed at startup: no live queue entry may belong to a concluded
+    /// task.
+    #[tokio::test]
+    async fn startup_reconcile_drains_specs_of_concluded_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+        // Conclude the task behind the queue's back (as pre-drain retirement did).
+        store
+            .update_task_state(&task.id, TaskState::Done)
+            .await
+            .unwrap();
+
+        store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Rejected
+        );
+
+        // A live task's approved spec is untouched.
+        let (_t2, live) = approved_spec(&store, &project, 2).await;
+        store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&live.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Approved
+        );
     }
 }
