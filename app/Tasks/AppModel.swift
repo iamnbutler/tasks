@@ -17,7 +17,8 @@ final class AppModel {
     var connectionError: String?
     var lastRefreshed: Date?
 
-    private let client = TasksClient()
+    // Non-private: session-detail views borrow it for transcript tailing.
+    let client = TasksClient()
     private var started = false
 
     func task(_ id: String) -> TaskItem? {

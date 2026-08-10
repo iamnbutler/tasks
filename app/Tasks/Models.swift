@@ -105,6 +105,54 @@ struct ScoutSession: Decodable, Identifiable, Hashable {
     let startedAt: Date
     let completedAt: Date?
     let exitReason: String?
+    /// Parsed from the agent's final stream-json `result` record. Nil for
+    /// sessions predating transcript capture or that never reached a result.
+    let usage: SessionUsage?
+}
+
+/// What one agent run cost. Everything optional — the shape belongs to
+/// Claude Code, and a renamed upstream key costs a null, not a crash.
+struct SessionUsage: Decodable, Hashable {
+    let inputTokens: UInt64?
+    let outputTokens: UInt64?
+    let cacheReadInputTokens: UInt64?
+    let cacheCreationInputTokens: UInt64?
+    let totalCostUsd: Double?
+    let durationMs: UInt64?
+    let numTurns: UInt64?
+}
+
+/// One line of agent output. `seq` is dense per session, assigned by the
+/// server at persist time; tailing clients resume with `since = last + 1`.
+struct TranscriptLine: Decodable, Identifiable, Hashable {
+    let sessionId: String
+    let seq: Int64
+    let timestamp: Date
+    let stream: TranscriptStream
+    let line: String
+
+    var id: Int64 { seq }
+}
+
+enum TranscriptStream: WireEnum {
+    case stdout, stderr
+    case unknown(String)
+
+    init(wire: String) {
+        switch wire {
+        case "stdout": self = .stdout
+        case "stderr": self = .stderr
+        default: self = .unknown(wire)
+        }
+    }
+
+    var wire: String {
+        switch self {
+        case .stdout: "stdout"
+        case .stderr: "stderr"
+        case .unknown(let raw): raw
+        }
+    }
 }
 
 enum SessionStatus: WireEnum {

@@ -231,22 +231,47 @@ struct SessionDetailView: View {
                     }
                 }
 
+                if let usage = session.usage {
+                    UsageBadgeRow(usage: usage)
+                }
+
                 if let reason = session.exitReason, !reason.isEmpty {
                     Callout(title: "Exit reason", text: reason, color: .red)
                 }
 
                 Divider()
 
-                // Transcript pane lands here once the server persists scout
-                // output — docs/plans/2026-08-09-session-transcripts.md.
-                ContentUnavailableView {
-                    Label("No transcript", systemImage: "text.bubble")
-                } description: {
-                    Text("The server doesn't capture scout output yet.")
-                }
+                TranscriptView(session: session)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// Compact chips for what a scout run cost, from the agent's final result
+/// record. Renders whatever fields survived parsing; each is independently
+/// optional.
+struct UsageBadgeRow: View {
+    let usage: SessionUsage
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let cost = usage.totalCostUsd {
+                StatusBadge(text: String(format: "$%.2f", cost), color: .green)
+            }
+            if let turns = usage.numTurns {
+                StatusBadge(text: "\(turns) turns", color: .blue)
+            }
+            if let input = usage.inputTokens {
+                StatusBadge(text: "\(input.formatted()) in", color: .secondary)
+            }
+            if let output = usage.outputTokens {
+                StatusBadge(text: "\(output.formatted()) out", color: .secondary)
+            }
+            if let cached = usage.cacheReadInputTokens, cached > 0 {
+                StatusBadge(text: "\(cached.formatted()) cached", color: .secondary)
+            }
         }
     }
 }
