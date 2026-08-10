@@ -447,7 +447,9 @@ fn render_prompt(batch: &[(Spec, Task)]) -> String {
          2. Run the project's tests / lint / typecheck — get them green.\n\
          3. Commit your work with clear messages (a git identity is configured).\n\
          4. Write `SUMMARY.md` in the repo root: one or two paragraphs \
-         describing the change, suitable as a pull request body.\n\
+         describing the change, suitable as a pull request body. Do not use \
+         GitHub closing keywords (`Closes #N`, `Fixes #N`) — the server \
+         links the issues itself.\n\
          5. Do NOT push and do NOT open a PR — the server does both.\n",
     );
     out
@@ -470,7 +472,7 @@ fn pr_text(batch: &[(Spec, Task)], outcome: &BuildOutcome) -> (String, String) {
     };
 
     let mut body = match &outcome.summary {
-        Some(s) => s.clone(),
+        Some(s) => neutralize_closing_keywords(s),
         None => batch
             .iter()
             .map(|(_, t)| format!("- {} (#{})", t.title, t.gh_issue_number))
@@ -482,6 +484,51 @@ fn pr_text(batch: &[(Spec, Task)], outcome: &BuildOutcome) -> (String, String) {
         body.push_str(&format!("Implements #{}\n", task.gh_issue_number));
     }
     (title, body)
+}
+
+/// Rewrite GitHub closing keywords (`Closes #N`, `Fixes #N`, …) in
+/// agent-authored text to `Implements #N`. GitHub reads those keywords
+/// anywhere in a PR body, so an agent writing "Closes #763" in SUMMARY.md
+/// would make the merge close the issue — GitHub state that isn't ours to
+/// write. The keyword only counts when a `#<digits>` reference follows.
+fn neutralize_closing_keywords(text: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut prev: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if !c.is_ascii_alphabetic() {
+            out.push(c);
+            prev = Some(c);
+            chars.next();
+            continue;
+        }
+        let mut end = start;
+        while let Some(&(i, ch)) = chars.peek() {
+            if !ch.is_ascii_alphabetic() {
+                break;
+            }
+            end = i + ch.len_utf8();
+            chars.next();
+        }
+        let word = &text[start..end];
+        // A word boundary on the left (maximal alpha run handles letters;
+        // this rules out things like "v2fixed") …
+        let standalone = !prev.is_some_and(|p| p.is_ascii_alphanumeric());
+        // … a closing keyword, and an issue reference on the right — GitHub
+        // accepts an optional colon between them.
+        let closes_a_ref = standalone && KEYWORDS.iter().any(|k| word.eq_ignore_ascii_case(k)) && {
+            let rest = text[end..].strip_prefix(':').unwrap_or(&text[end..]);
+            let rest = rest.trim_start();
+            rest.strip_prefix('#')
+                .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        };
+        out.push_str(if closes_a_ref { "Implements" } else { word });
+        prev = word.chars().last();
+    }
+    out
 }
 
 /// The clone URL a Builder VM uses — same construction as scouts.
@@ -570,6 +617,47 @@ mod tests {
         let (title, body) = pr_text(&single, &no_summary);
         assert_eq!(title, "First thing");
         assert!(body.contains("- First thing (#7)"));
+    }
+
+    /// The live bug this guards: the #763 builder's SUMMARY.md began with
+    /// "Closes #763.", which flowed verbatim into PR #785's body — merging
+    /// would have GitHub close the issue on the server's behalf.
+    #[test]
+    fn agent_summaries_cannot_smuggle_closing_keywords() {
+        assert_eq!(
+            neutralize_closing_keywords("Closes #763.\n\nThe change adds fixtures."),
+            "Implements #763.\n\nThe change adds fixtures."
+        );
+        // Every keyword GitHub honors, any case, optional colon.
+        assert_eq!(neutralize_closing_keywords("fixes #12"), "Implements #12");
+        assert_eq!(
+            neutralize_closing_keywords("RESOLVED: #9"),
+            "Implements: #9"
+        );
+        // A keyword without an issue reference is ordinary prose.
+        assert_eq!(
+            neutralize_closing_keywords("This fixes the flaky test and closes a gap."),
+            "This fixes the flaky test and closes a gap."
+        );
+        // Part of a longer word is not a keyword.
+        assert_eq!(
+            neutralize_closing_keywords("unfixed #4 preCloses #5"),
+            "unfixed #4 preCloses #5"
+        );
+        // A `#` not followed by digits is not an issue reference.
+        assert_eq!(neutralize_closing_keywords("fixes #abc"), "fixes #abc");
+
+        let batch = vec![pair(763, "Golden fixtures", "spec")];
+        let outcome = BuildOutcome {
+            base_sha: "a".into(),
+            head_sha: "b".into(),
+            bundle_base64: String::new(),
+            summary: Some("Closes #763. Adds golden fixtures.".into()),
+            files_touched: vec![],
+        };
+        let (_, body) = pr_text(&batch, &outcome);
+        assert!(!body.contains("Closes"));
+        assert!(body.starts_with("Implements #763. Adds golden fixtures."));
     }
 
     #[test]
