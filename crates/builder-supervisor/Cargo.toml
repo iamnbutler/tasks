@@ -1,0 +1,26 @@
+[package]
+name = "builder-supervisor"
+description = "PID 1 binary running inside a Builder VM. Clones a repo at full depth, drives the agent, ships the branch back as a git bundle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "builder-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vm-pool-protocol.workspace = true
+tasks-protocol.workspace = true
+uuid.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

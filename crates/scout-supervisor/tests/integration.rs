@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tasks_protocol::{ScoutCommand, ScoutEvent, TasksProtocol};
+use tasks_protocol::{BuildCommand, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -165,12 +165,12 @@ async fn start_scout_completes_with_spec() {
     assert!(matches!(sup.recv().await, VmEvent::Ready));
 
     sup.send(VmCommand::App {
-        payload: ScoutCommand::Start {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
             task_id: "task_42".into(),
             repo_clone_url: repo_url,
             base_branch: "main".into(),
             prompt: "Implement a stub function.".into(),
-        },
+        }),
     })
     .await;
 
@@ -181,24 +181,24 @@ async fn start_scout_completes_with_spec() {
     while completion.is_none() {
         match sup.recv().await {
             VmEvent::App {
-                payload: ScoutEvent::Started { branch },
+                payload: TaskEvent::Scout(ScoutEvent::Started { branch }),
             } => {
                 assert!(branch.starts_with("scout/task_42-"));
                 saw_started = true;
             }
             VmEvent::App {
-                payload: ScoutEvent::Progress { .. },
+                payload: TaskEvent::Scout(ScoutEvent::Progress { .. }),
             } => {
                 // fine
             }
             VmEvent::App {
-                payload: ScoutEvent::ImplementationFinished { exit_code },
+                payload: TaskEvent::Scout(ScoutEvent::ImplementationFinished { exit_code }),
             } => {
                 assert_eq!(exit_code, 0);
                 saw_impl_finished = true;
             }
             VmEvent::App {
-                payload: evt @ (ScoutEvent::Completed { .. } | ScoutEvent::Failed { .. }),
+                payload: TaskEvent::Scout(evt @ (ScoutEvent::Completed { .. } | ScoutEvent::Failed { .. })),
             } => {
                 completion = Some(evt);
             }
@@ -248,12 +248,12 @@ async fn start_scout_fails_if_agent_missing_spec() {
     assert!(matches!(sup.recv().await, VmEvent::Ready));
 
     sup.send(VmCommand::App {
-        payload: ScoutCommand::Start {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
             task_id: "task_7".into(),
             repo_clone_url: repo_url,
             base_branch: "main".into(),
             prompt: "n/a".into(),
-        },
+        }),
     })
     .await;
 
@@ -261,7 +261,7 @@ async fn start_scout_fails_if_agent_missing_spec() {
     while failure.is_none() {
         match sup.recv().await {
             VmEvent::App {
-                payload: ScoutEvent::Failed { reason },
+                payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
             } => {
                 failure = Some(ScoutEvent::Failed { reason });
             }
@@ -290,23 +290,55 @@ async fn start_scout_fails_on_clone_error() {
     assert!(matches!(sup.recv().await, VmEvent::Ready));
 
     sup.send(VmCommand::App {
-        payload: ScoutCommand::Start {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
             task_id: "task_bad".into(),
             repo_clone_url: "file:///nonexistent/repo".into(),
             base_branch: "main".into(),
             prompt: "n/a".into(),
-        },
+        }),
     })
     .await;
 
     // First event should be a Failed (clone error) — we should not see Started.
     match sup.recv().await {
         VmEvent::App {
-            payload: ScoutEvent::Failed { reason },
+            payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
         } => {
             assert!(reason.contains("clone"), "reason: {reason}");
         }
         other => panic!("expected Failed, got {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// The wire barrier's supervisor half: a Build command sent to a Scout VM is
+/// refused with a terminal Failed, never acted on.
+#[tokio::test]
+async fn a_build_command_is_refused_not_acted_on() {
+    let binary = build_supervisor().await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut sup = SupervisorProc::spawn(&binary, "true", tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Build(BuildCommand::Start {
+            build_id: "build_x".into(),
+            repo_clone_url: "file:///nowhere".into(),
+            base_branch: "main".into(),
+            branch: "build/build_x".into(),
+            prompt: "n/a".into(),
+        }),
+    })
+    .await;
+
+    match sup.recv().await {
+        VmEvent::App {
+            payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
+        } => assert!(reason.contains("scout"), "reason: {reason}"),
+        other => panic!("expected a refusal, got {other:?}"),
     }
 
     sup.send(VmCommand::Shutdown).await;
