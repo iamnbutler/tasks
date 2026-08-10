@@ -103,12 +103,28 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if necessary) a SQLite database at the given path and run migrations.
+    ///
+    /// WAL + a busy timeout are load-bearing: the pool holds 8 connections
+    /// shared by the poller, the dispatch/build/orchestrator loops, transcript
+    /// batch writes from live scouts, and the API's parallel reads. With the
+    /// defaults (rollback journal, busy_timeout 0) any overlap fails instantly
+    /// with `SQLITE_BUSY` ("database is locked") instead of waiting its turn —
+    /// seen live the first time a scout streamed transcripts while the app
+    /// refreshed.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        let url = format!("sqlite://{}?mode=rwc", path.display());
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+
+        let options = SqliteConnectOptions::new()
+            .filename(path.as_ref())
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            // NORMAL is durable enough under WAL (a power cut can lose the
+            // tail of the log, never corrupt) and avoids an fsync per commit.
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect(&url)
+            .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
