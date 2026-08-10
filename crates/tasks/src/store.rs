@@ -549,6 +549,87 @@ impl Store {
         Ok(closed)
     }
 
+    /// Tasks whose GitHub issue is closed but whose Tasks-owned state still
+    /// says the work is picked up: `queued`, `in_review`, or `ready_to_build`.
+    ///
+    /// These are the closure-derived retirement candidates — issue closure IS
+    /// the "done" signal, there is no manual mark-done. `scouting` is
+    /// deliberately excluded: a scout in flight runs to completion, lands the
+    /// task in `in_review`, and the next poll retires it from there. The list
+    /// is not limited to issues closed *this* poll, so rows that predate this
+    /// mechanism (or that a failed reason-lookup skipped) self-heal on any
+    /// later pass.
+    pub async fn list_retirable_tasks(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<Task>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
+             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
+             FROM tasks WHERE project_id = ? AND gh_state = ? AND state IN (?, ?, ?) \
+             ORDER BY ingested_at",
+        )
+        .bind(project_id.as_str())
+        .bind(GhState::Closed.as_str())
+        .bind(TaskState::Queued.as_str())
+        .bind(TaskState::InReview.as_str())
+        .bind(TaskState::ReadyToBuild.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(task_from_row).collect()
+    }
+
+    /// Retire a picked-up task because its GitHub issue was closed. `to` is
+    /// `Done` (closed as completed) or `Rejected` (closed as not-planned /
+    /// duplicate) — nothing else is a retirement.
+    ///
+    /// Re-checks inside the transaction that the task is still a retirement
+    /// candidate ([`Self::list_retirable_tasks`]'s criteria); if the state
+    /// moved or the issue reopened in the meantime, returns `Ok(None)` and
+    /// writes nothing. Clears `manual_rank` so retired work frees its queue
+    /// slot, and emits [`EventPayload::TaskStateChanged`].
+    pub async fn retire_task(
+        &self,
+        id: &TaskId,
+        to: TaskState,
+    ) -> Result<Option<Task>, StoreError> {
+        if !matches!(to, TaskState::Done | TaskState::Rejected) {
+            return Err(StoreError::Invalid(format!(
+                "{} is not a retirement state",
+                to.as_str()
+            )));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let task = self
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        let retirable = task.gh_state == GhState::Closed
+            && matches!(
+                task.state,
+                TaskState::Queued | TaskState::InReview | TaskState::ReadyToBuild
+            );
+        if !retirable {
+            return Ok(None);
+        }
+        sqlx::query("UPDATE tasks SET state = ?, manual_rank = NULL, updated_at = ? WHERE id = ?")
+            .bind(to.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::TaskStateChanged {
+            task_id: id.clone(),
+            from: task.state,
+            to,
+        })
+        .await?;
+        self.get_task(id).await
+    }
+
     pub async fn update_task_state(&self, id: &TaskId, state: TaskState) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
@@ -2925,5 +3006,121 @@ mod tests {
             .unwrap();
         let back = store.get_session(&session.id).await.unwrap().unwrap();
         assert_eq!(back.usage, Some(usage));
+    }
+
+    #[tokio::test]
+    async fn retirable_listing_is_closed_and_picked_up_only() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut wanted = Vec::new();
+        for (number, state, gh_state) in [
+            (1, TaskState::Queued, GhState::Closed),
+            (2, TaskState::InReview, GhState::Closed),
+            (3, TaskState::ReadyToBuild, GhState::Closed),
+            // Not candidates: still open, never picked up, mid-scout, or done.
+            (4, TaskState::Queued, GhState::Open),
+            (5, TaskState::Backlog, GhState::Closed),
+            (6, TaskState::Scouting, GhState::Closed),
+            (7, TaskState::Done, GhState::Closed),
+        ] {
+            let mut task = sample_task(&project.id);
+            task.gh_issue_number = number;
+            task.state = state;
+            task.gh_state = gh_state;
+            store.insert_task(&task).await.unwrap();
+            if number <= 3 {
+                wanted.push(task.id);
+            }
+        }
+
+        let mut got: Vec<TaskId> = store
+            .list_retirable_tasks(&project.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        wanted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(got, wanted);
+    }
+
+    #[tokio::test]
+    async fn retire_task_concludes_the_work_and_frees_its_queue_slot() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut task = sample_task(&project.id);
+        task.state = TaskState::Queued;
+        task.gh_state = GhState::Closed;
+        task.manual_rank = Some(3);
+        store.insert_task(&task).await.unwrap();
+
+        let retired = store
+            .retire_task(&task.id, TaskState::Done)
+            .await
+            .unwrap()
+            .expect("task was retirable");
+        assert_eq!(retired.state, TaskState::Done);
+        assert_eq!(retired.manual_rank, None);
+
+        let payloads: Vec<EventPayload> = store
+            .events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::TaskStateChanged {
+            task_id: task.id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Done,
+        }));
+    }
+
+    /// Retirement is a no-op (not an error) when the decision-time re-check
+    /// fails: the issue reopened, or the state moved on.
+    #[tokio::test]
+    async fn retire_task_declines_when_no_longer_a_candidate() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut reopened = sample_task(&project.id);
+        reopened.state = TaskState::InReview;
+        reopened.gh_state = GhState::Open;
+        store.insert_task(&reopened).await.unwrap();
+        assert!(
+            store
+                .retire_task(&reopened.id, TaskState::Done)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut scouting = sample_task(&project.id);
+        scouting.gh_issue_number = 43;
+        scouting.state = TaskState::Scouting;
+        scouting.gh_state = GhState::Closed;
+        store.insert_task(&scouting).await.unwrap();
+        assert!(
+            store
+                .retire_task(&scouting.id, TaskState::Rejected)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Neither attempt left a trace.
+        assert!(store.events_since(0).await.unwrap().is_empty());
+
+        let err = store
+            .retire_task(&reopened.id, TaskState::Backlog)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
     }
 }

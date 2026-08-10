@@ -410,6 +410,52 @@ pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, St
                 })
                 .await?;
         }
+
+        // Closure-derived retirement: issue closure IS the "done" signal for
+        // picked-up work — there is no manual mark-done. The close *reason* is
+        // GitHub-owned, so it's queried here at decision time, never persisted.
+        let retirable = store.list_retirable_tasks(&project.id).await?;
+        if retirable.is_empty() {
+            continue;
+        }
+        let numbers: Vec<u64> = retirable.iter().map(|t| t.gh_issue_number).collect();
+        let info = match github
+            .issue_close_info(&project.repo_owner, &project.repo_name, &numbers)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(error = %e, "fetching close reasons failed; retiring next poll");
+                continue;
+            }
+        };
+        for task in retirable {
+            let to = match info.get(&task.gh_issue_number) {
+                // Reopened between the open-set fetch and this lookup; the
+                // next poll's upsert refreshes gh_state and it flows again.
+                Some(i) if i.state == GhState::Open => continue,
+                Some(i) => match i.state_reason.as_deref() {
+                    Some("NOT_PLANNED") | Some("DUPLICATE") => TaskState::Rejected,
+                    _ => TaskState::Done,
+                },
+                // Deleted / converted to a discussion — it is never coming
+                // back as an issue, so the work is concluded either way.
+                None => {
+                    warn!(
+                        issue = task.gh_issue_number,
+                        "issue no longer resolvable; retiring as done"
+                    );
+                    TaskState::Done
+                }
+            };
+            if let Some(retired) = store.retire_task(&task.id, to).await? {
+                info!(
+                    issue = retired.gh_issue_number,
+                    to = to.as_str(),
+                    "issue closed upstream; retired its task"
+                );
+            }
+        }
     }
     Ok(ingested)
 }
@@ -694,6 +740,7 @@ fn clone_url(config: &Config, project: &Project) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::models::ProjectId;
@@ -752,6 +799,163 @@ mod tests {
         assert_eq!(
             clone_url(&config, &project()),
             "file:///srv/repos/iamnbutler/tasks.git"
+        );
+    }
+
+    /// Fake GraphQL endpoint that pops canned responses in request order —
+    /// poll_once issues the open-issues query first, then (if anything is
+    /// retirable) the close-info query.
+    async fn spawn_fake_github(responses: Vec<Value>) -> String {
+        use axum::{Router, extract::State, response::Json, routing::post};
+        use std::sync::Mutex;
+
+        let queue = Arc::new(Mutex::new(responses));
+        let app = Router::new()
+            .route(
+                "/graphql",
+                post(
+                    move |State(q): State<Arc<Mutex<Vec<Value>>>>, _body: String| async move {
+                        let resp = {
+                            let mut g = q.lock().unwrap();
+                            if g.is_empty() {
+                                json!({"data": {"repository": {"issues": {
+                                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                                    "nodes": []}}}})
+                            } else {
+                                g.remove(0)
+                            }
+                        };
+                        Json(resp)
+                    },
+                ),
+            )
+            .with_state(queue);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    async fn seed_task(store: &Store, project: &Project, number: u64, state: TaskState) -> Task {
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new(),
+            project_id: project.id.clone(),
+            gh_issue_number: number,
+            title: format!("issue {number}"),
+            body: String::new(),
+            labels: vec![],
+            gh_state: GhState::Open,
+            state,
+            priority: 0,
+            manual_rank: (state == TaskState::Queued).then_some(1),
+            dispatch_attempts: 0,
+            ingested_at: now,
+            updated_at: now,
+        };
+        store.insert_task(&task).await.unwrap();
+        task
+    }
+
+    /// The whole closure-derived retirement path: issues vanish from the open
+    /// set, the poller queries their close reason at decision time, and
+    /// picked-up work concludes as done/rejected — while a scout in flight and
+    /// untouched backlog rows are left alone.
+    #[tokio::test]
+    async fn poll_once_retires_picked_up_work_when_issues_close() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = project();
+        store.insert_project(&project).await.unwrap();
+
+        let queued = seed_task(&store, &project, 1, TaskState::Queued).await;
+        let in_review = seed_task(&store, &project, 2, TaskState::InReview).await;
+        let ready = seed_task(&store, &project, 3, TaskState::ReadyToBuild).await;
+        let scouting = seed_task(&store, &project, 4, TaskState::Scouting).await;
+        let backlog = seed_task(&store, &project, 5, TaskState::Backlog).await;
+
+        let url = spawn_fake_github(vec![
+            // Poll: the repository has no open issues left.
+            json!({"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": []}}}}),
+            // Close-info lookup for the three retirable tasks. Issue 3 no
+            // longer resolves (deleted / converted) -> retired as done anyway.
+            json!({
+                "data": {"repository": {
+                    "i1": {"number": 1, "state": "CLOSED", "stateReason": "COMPLETED"},
+                    "i2": {"number": 2, "state": "CLOSED", "stateReason": "NOT_PLANNED"},
+                    "i3": null,
+                }},
+                "errors": [{"message": "Could not resolve to an Issue with the number of 3."}]
+            }),
+        ])
+        .await;
+        let github = GitHubClient::with_base_url("token", url);
+
+        poll_once(&store, &github).await.unwrap();
+
+        let state_of = async |id: &TaskId| store.get_task(id).await.unwrap().unwrap();
+        let queued = state_of(&queued.id).await;
+        assert_eq!(queued.state, TaskState::Done);
+        assert_eq!(queued.manual_rank, None, "retirement frees the queue slot");
+        assert_eq!(state_of(&in_review.id).await.state, TaskState::Rejected);
+        assert_eq!(state_of(&ready.id).await.state, TaskState::Done);
+        assert_eq!(
+            state_of(&scouting.id).await.state,
+            TaskState::Scouting,
+            "a scout in flight is not interrupted; it retires from in_review next poll"
+        );
+        assert_eq!(state_of(&backlog.id).await.state, TaskState::Backlog);
+
+        let payloads: Vec<EventPayload> = store
+            .events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::TaskStateChanged {
+            task_id: queued.id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Done,
+        }));
+        assert!(payloads.contains(&EventPayload::TaskStateChanged {
+            task_id: in_review.id,
+            from: TaskState::InReview,
+            to: TaskState::Rejected,
+        }));
+    }
+
+    /// A failed close-reason lookup must not strand the candidates — they stay
+    /// picked up and the next poll tries again.
+    #[tokio::test]
+    async fn poll_once_leaves_retirement_for_next_poll_when_lookup_fails() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = project();
+        store.insert_project(&project).await.unwrap();
+        let task = seed_task(&store, &project, 1, TaskState::InReview).await;
+
+        let url = spawn_fake_github(vec![
+            json!({"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "nodes": []}}}}),
+            json!({"errors": [{"message": "Bad credentials"}]}),
+        ])
+        .await;
+        let github = GitHubClient::with_base_url("token", url);
+
+        poll_once(&store, &github).await.unwrap();
+
+        let after = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(after.state, TaskState::InReview, "still a candidate");
+        assert_eq!(
+            after.gh_state,
+            GhState::Closed,
+            "closure was still recorded"
+        );
+        assert_eq!(
+            store.list_retirable_tasks(&project.id).await.unwrap().len(),
+            1
         );
     }
 }

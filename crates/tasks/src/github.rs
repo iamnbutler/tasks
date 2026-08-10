@@ -13,6 +13,7 @@ use crate::models::GhState;
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com/graphql";
 const PAGE_SIZE: u32 = 100;
+const CLOSE_INFO_BATCH: usize = 50;
 
 #[derive(Debug, Error)]
 pub enum GhError {
@@ -33,6 +34,15 @@ pub struct GhIssue {
     pub labels: Vec<String>,
     pub state: GhState,
     pub updated_at: DateTime<Utc>,
+}
+
+/// How a specific issue looks right now — state plus GitHub's close reason
+/// (`stateReason`: COMPLETED, NOT_PLANNED, DUPLICATE, ...). Fetched at
+/// decision time and never persisted; GitHub owns these facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueCloseInfo {
+    pub state: GhState,
+    pub state_reason: Option<String>,
 }
 
 pub struct GitHubClient {
@@ -72,6 +82,99 @@ impl GitHubClient {
         }
         debug!(owner, name, count = issues.len(), "fetched open issues");
         Ok(issues)
+    }
+
+    /// Look up state + close reason for specific issue numbers, batched via
+    /// GraphQL aliases. Issues that don't resolve (deleted, converted to a
+    /// discussion, transferred) are simply absent from the returned map.
+    ///
+    /// GitHub answers an unresolvable alias with a null node *and* an errors
+    /// entry, so unlike [`Self::list_open_issues`] this tolerates errors as
+    /// long as `data.repository` came back — otherwise one dead number would
+    /// poison the whole batch.
+    pub async fn issue_close_info(
+        &self,
+        owner: &str,
+        name: &str,
+        numbers: &[u64],
+    ) -> Result<std::collections::HashMap<u64, IssueCloseInfo>, GhError> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in numbers.chunks(CLOSE_INFO_BATCH) {
+            let fields: String = chunk
+                .iter()
+                .map(|n| format!("i{n}: issue(number: {n}) {{ number state stateReason }}\n"))
+                .collect();
+            let query = format!(
+                "query($owner: String!, $name: String!) {{\n\
+                   repository(owner: $owner, name: $name) {{\n{fields}}}\n}}"
+            );
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "name": name },
+            });
+
+            let resp: serde_json::Value = self
+                .http
+                .post(&self.base_url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/json")
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+
+            let repository = resp.pointer("/data/repository").filter(|v| !v.is_null());
+            let Some(repository) = repository else {
+                if let Some(errs) = resp.get("errors").and_then(|e| e.as_array()) {
+                    let msg = errs
+                        .iter()
+                        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(GhError::GraphQl(msg));
+                }
+                return Err(GhError::Shape("repository is null".into()));
+            };
+            let nodes = repository
+                .as_object()
+                .ok_or_else(|| GhError::Shape("repository is not an object".into()))?;
+
+            for (alias, node) in nodes {
+                if node.is_null() {
+                    warn!(alias, "issue did not resolve; leaving it out");
+                    continue;
+                }
+                let number = node
+                    .get("number")
+                    .and_then(|n| n.as_u64())
+                    .ok_or_else(|| GhError::Shape(format!("{alias}: number missing")))?;
+                let state = match node.get("state").and_then(|s| s.as_str()) {
+                    Some("OPEN") => GhState::Open,
+                    _ => GhState::Closed,
+                };
+                let state_reason = node
+                    .get("stateReason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_owned);
+                out.insert(
+                    number,
+                    IssueCloseInfo {
+                        state,
+                        state_reason,
+                    },
+                );
+            }
+        }
+        debug!(
+            owner,
+            name,
+            asked = numbers.len(),
+            resolved = out.len(),
+            "fetched issue close info"
+        );
+        Ok(out)
     }
 
     async fn fetch_page(
@@ -372,6 +475,62 @@ mod tests {
 
         let client = GitHubClient::with_base_url("token", url);
         let err = client.list_open_issues("own", "repo").await.unwrap_err();
+        match err {
+            GhError::GraphQl(msg) => assert!(msg.contains("Bad credentials")),
+            other => panic!("expected GraphQl error, got {other:?}"),
+        }
+    }
+
+    /// GitHub answers an unresolvable issue alias with a null node plus an
+    /// errors entry; the resolvable siblings in the same batch must survive.
+    #[tokio::test]
+    async fn issue_close_info_parses_aliases_and_tolerates_dead_numbers() {
+        let responses = vec![json!({
+            "data": {
+                "repository": {
+                    "i1": {"number": 1, "state": "CLOSED", "stateReason": "COMPLETED"},
+                    "i2": {"number": 2, "state": "CLOSED", "stateReason": "NOT_PLANNED"},
+                    "i3": {"number": 3, "state": "OPEN", "stateReason": null},
+                    "i4": null,
+                }
+            },
+            "errors": [{"message": "Could not resolve to an Issue with the number of 4."}]
+        })];
+        let (url, _q, _h) = spawn_fake(responses).await;
+
+        let client = GitHubClient::with_base_url("token", url);
+        let info = client
+            .issue_close_info("own", "repo", &[1, 2, 3, 4])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            info.get(&1),
+            Some(&IssueCloseInfo {
+                state: GhState::Closed,
+                state_reason: Some("COMPLETED".into()),
+            })
+        );
+        assert_eq!(
+            info.get(&2).and_then(|i| i.state_reason.as_deref()),
+            Some("NOT_PLANNED")
+        );
+        assert_eq!(info.get(&3).map(|i| i.state), Some(GhState::Open));
+        assert!(!info.contains_key(&4), "dead number stays absent");
+    }
+
+    #[tokio::test]
+    async fn issue_close_info_fails_when_data_is_absent() {
+        let responses = vec![json!({
+            "errors": [{"message": "Bad credentials"}]
+        })];
+        let (url, _q, _h) = spawn_fake(responses).await;
+
+        let client = GitHubClient::with_base_url("token", url);
+        let err = client
+            .issue_close_info("own", "repo", &[1])
+            .await
+            .unwrap_err();
         match err {
             GhError::GraphQl(msg) => assert!(msg.contains("Bad credentials")),
             other => panic!("expected GraphQl error, got {other:?}"),
