@@ -13,6 +13,23 @@ final class AppModel {
     var specs: [Spec] = []
     var specQueue: [SpecQueueItem] = []
     var mode: Mode?
+    /// Recent event log, newest first, for the Activity feed.
+    var events: [ActivityEvent] = []
+    /// Highest event seq the user has seen in Activity; drives the unread
+    /// divider and the sidebar badge. Persisted so "while you were away"
+    /// survives relaunch.
+    var lastSeenSeq: Int64 = UserDefaults.standard.object(forKey: "lastSeenSeq") as? Int64 ?? 0
+
+    var unreadCount: Int {
+        events.filter { $0.seq > lastSeenSeq }.count
+    }
+
+    func markActivityRead() {
+        if let newest = events.first?.seq, newest > lastSeenSeq {
+            lastSeenSeq = newest
+            UserDefaults.standard.set(newest, forKey: "lastSeenSeq")
+        }
+    }
 
     var connectionError: String?
     var lastRefreshed: Date?
@@ -51,16 +68,62 @@ final class AppModel {
         await refresh()
     }
 
-    /// Optimistic drag-reorder; the server's answer (or a refresh on failure)
-    /// is authoritative. Since #770 the reorder response is the same filtered
-    /// projection as GET /tasks, so applying it directly is safe.
-    func moveTasks(from source: IndexSet, to destination: Int) {
-        var reordered = tasks
-        reordered.move(fromOffsets: source, toOffset: destination)
-        tasks = reordered
+    /// One intent = one POST; the response is the updated task, and the
+    /// event-driven refresh reconciles the rest. Errors surface on the banner.
+    func queueTask(_ id: String) async {
+        await perform { try await self.client.queueTask(id) }
+    }
+
+    func dequeueTask(_ id: String) async {
+        await perform { try await self.client.dequeueTask(id) }
+    }
+
+    func scoutNow(_ id: String) async {
+        await perform { try await self.client.scoutNow(id) }
+    }
+
+    func setMode(_ mode: Mode) async {
+        do {
+            self.mode = try await client.setMode(mode)
+        } catch {
+            connectionError = error.localizedDescription
+        }
+    }
+
+    private func perform(_ op: @escaping () async throws -> TaskItem) async {
+        do {
+            let updated = try await op()
+            if let index = tasks.firstIndex(where: { $0.id == updated.id }) {
+                tasks[index] = updated
+            }
+            await refresh()
+        } catch {
+            connectionError = error.localizedDescription
+        }
+    }
+
+    /// Optimistic drag-reorder of the "Up next" group. Only `queued` tasks
+    /// carry meaning in the ranked order now, so the reorder POST sends
+    /// exactly their ids — everything else goes unranked, which is correct.
+    /// The response is the full filtered projection (#770) and replaces the
+    /// list directly.
+    func moveQueued(from source: IndexSet, to destination: Int) {
+        var upNext = tasks.filter { $0.state == .queued }
+        upNext.move(fromOffsets: source, toOffset: destination)
+        let order = upNext.map(\.id)
+        // Optimistic: re-sort the local list to match the new ranks.
+        let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+        tasks.sort { a, b in
+            switch (rank[a.id], rank[b.id]) {
+            case (let x?, let y?): return x < y
+            case (.some, nil): return true
+            case (nil, .some): return false
+            case (nil, nil): return false
+            }
+        }
         Task {
             do {
-                tasks = try await client.reorderQueue(reordered.map(\.id))
+                tasks = try await client.reorderQueue(order)
             } catch {
                 connectionError = error.localizedDescription
                 await refresh()
@@ -99,12 +162,14 @@ final class AppModel {
             async let specs = client.specs()
             async let specQueue = client.specQueue()
             async let mode = client.mode()
+            async let events = client.events()
             self.projects = try await projects
             self.tasks = try await tasks
             self.sessions = try await sessions
             self.specs = try await specs
             self.specQueue = try await specQueue
             self.mode = try await mode
+            self.events = try await events.sorted { $0.seq > $1.seq }
             connectionError = nil
             lastRefreshed = Date()
         } catch is CancellationError {

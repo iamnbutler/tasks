@@ -67,16 +67,19 @@ enum GhState: WireEnum {
     }
 }
 
+/// One state per stage (docs/clients.md): backlog is the inert issue mirror;
+/// everything from queued onward is explicitly picked-up work.
 enum TaskState: WireEnum {
-    case new, scouting, specReady, queued, done, rejected
+    case backlog, queued, scouting, inReview, readyToBuild, done, rejected
     case unknown(String)
 
     init(wire: String) {
         switch wire {
-        case "new": self = .new
-        case "scouting": self = .scouting
-        case "spec_ready": self = .specReady
+        case "backlog": self = .backlog
         case "queued": self = .queued
+        case "scouting": self = .scouting
+        case "in_review": self = .inReview
+        case "ready_to_build": self = .readyToBuild
         case "done": self = .done
         case "rejected": self = .rejected
         default: self = .unknown(wire)
@@ -85,13 +88,22 @@ enum TaskState: WireEnum {
 
     var wire: String {
         switch self {
-        case .new: "new"
-        case .scouting: "scouting"
-        case .specReady: "spec_ready"
+        case .backlog: "backlog"
         case .queued: "queued"
+        case .scouting: "scouting"
+        case .inReview: "in_review"
+        case .readyToBuild: "ready_to_build"
         case .done: "done"
         case .rejected: "rejected"
         case .unknown(let raw): raw
+        }
+    }
+
+    /// Whether the task is picked-up work (anything past backlog and not dead).
+    var isQueuedWork: Bool {
+        switch self {
+        case .queued, .scouting, .inReview, .readyToBuild: true
+        default: false
         }
     }
 }
@@ -301,4 +313,43 @@ enum Mode: WireEnum {
 
 struct ModeResponse: Decodable {
     let mode: Mode
+}
+
+/// One event-log entry, decoded leniently for the Activity feed: `kind` plus
+/// whatever identifiers the payload carries. Unknown kinds render as-is.
+struct ActivityEvent: Decodable, Identifiable, Hashable {
+    let seq: Int64
+    let timestamp: Date
+    let kind: String
+    let taskId: String?
+    let sessionId: String?
+    let specId: String?
+    let from: String?
+    let to: String?
+    let source: String?
+    let message: String?
+
+    var id: Int64 { seq }
+
+    enum CodingKeys: String, CodingKey {
+        case seq, timestamp, payload
+    }
+    enum PayloadKeys: String, CodingKey {
+        case kind, taskId, sessionId, specId, from, to, source, message
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try c.decode(Int64.self, forKey: .seq)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        let p = try c.nestedContainer(keyedBy: PayloadKeys.self, forKey: .payload)
+        kind = try p.decodeIfPresent(String.self, forKey: .kind) ?? "unknown"
+        taskId = try? p.decodeIfPresent(String.self, forKey: .taskId)
+        sessionId = try? p.decodeIfPresent(String.self, forKey: .sessionId)
+        specId = try? p.decodeIfPresent(String.self, forKey: .specId)
+        from = try? p.decodeIfPresent(String.self, forKey: .from)
+        to = try? p.decodeIfPresent(String.self, forKey: .to)
+        source = try? p.decodeIfPresent(String.self, forKey: .source)
+        message = try? p.decodeIfPresent(String.self, forKey: .message)
+    }
 }
