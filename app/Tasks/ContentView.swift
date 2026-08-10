@@ -93,6 +93,19 @@ struct ContentView: View {
 
     @ViewBuilder
     private var listColumn: some View {
+        if model.lastRefreshed == nil && model.connectionError == nil {
+            ContentUnavailableView {
+                ProgressView()
+            } description: {
+                Text("Connecting to the tasks server…")
+            }
+        } else {
+            sectionList
+        }
+    }
+
+    @ViewBuilder
+    private var sectionList: some View {
         switch section {
         case .tasks:
             TasksTable(selection: $selectedTask)
