@@ -16,23 +16,40 @@ struct ContentView: View {
     @State private var unreadBoundary: Int64 = 0
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 150, ideal: 180)
-        } content: {
-            listColumn
-                .navigationSplitViewColumnWidth(min: 320, ideal: 420)
-        } detail: {
-            detail
-                .frame(minWidth: 380)
-        }
-        .navigationTitle("Tasks")
-        .navigationSubtitle(subtitle)
-        .toolbar { toolbarContent }
-        .onChange(of: section) { _, next in
-            if next == .activity {
-                unreadBoundary = model.lastSeenSeq
-                model.markActivityRead()
+        split
+            .navigationTitle("Tasks")
+            .navigationSubtitle(subtitle)
+            .toolbar { toolbarContent }
+            .onChange(of: section) { _, next in
+                if next == .activity {
+                    unreadBoundary = model.lastSeenSeq
+                    model.markActivityRead()
+                }
+            }
+    }
+
+    /// Tasks and Queue are list + detail; Activity and Chat are single
+    /// surfaces and get the full width — no dead detail pane.
+    @ViewBuilder
+    private var split: some View {
+        if section == .activity || section == .chat {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            } detail: {
+                sectionList
+                    .frame(minWidth: 500)
+            }
+        } else {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            } content: {
+                listColumn
+                    .navigationSplitViewColumnWidth(min: 320, ideal: 420)
+            } detail: {
+                detail
+                    .frame(minWidth: 380)
             }
         }
     }
@@ -216,10 +233,9 @@ struct ContentView: View {
             }
         case .queue, nil:
             queueDetail
-        case .activity:
-            noSelection("The feed is the whole story")
-        case .chat:
-            noSelection("")
+        case .activity, .chat:
+            // Unreachable — these sections use the two-column layout.
+            EmptyView()
         }
     }
 
@@ -538,6 +554,10 @@ struct ChatView: View {
                         }
                     }
                     .padding(12)
+                    // Full-width section, readable column: bubbles cap out
+                    // instead of stretching across a wide window.
+                    .frame(maxWidth: 720)
+                    .frame(maxWidth: .infinity)
                 }
                 .onChange(of: model.chat.last?.seq) {
                     if let last = model.chat.last?.seq {
@@ -559,6 +579,8 @@ struct ChatView: View {
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(10)
+            .frame(maxWidth: 720)
+            .frame(maxWidth: .infinity)
         }
         .navigationTitle("Chat")
     }
@@ -587,8 +609,7 @@ struct ChatBubble: View {
         HStack {
             if message.role == .user { Spacer(minLength: 60) }
             VStack(alignment: .leading, spacing: 2) {
-                Text(message.content)
-                    .textSelection(.enabled)
+                bubbleContent
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
                     .background(
@@ -603,6 +624,18 @@ struct ChatBubble: View {
                     .padding(.horizontal, 4)
             }
             if message.role != .user { Spacer(minLength: 60) }
+        }
+    }
+
+    /// Assistant replies carry tables, code, and lists — render them.
+    /// User messages stay plain text: short, and styled white-on-accent.
+    @ViewBuilder
+    private var bubbleContent: some View {
+        if message.role == .user {
+            Text(message.content)
+                .textSelection(.enabled)
+        } else {
+            MarkdownView(text: message.content)
         }
     }
 }

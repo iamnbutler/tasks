@@ -39,7 +39,7 @@ struct TaskDetailView: View {
 
                 Divider()
 
-                MarkdownBody(text: task.body)
+                MarkdownView(text: task.body)
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -99,7 +99,7 @@ struct SpecDetailView: View {
 
                 Divider()
 
-                MarkdownBody(text: spec.content)
+                MarkdownView(text: spec.content)
 
                 if entry != nil {
                     Divider()
@@ -324,26 +324,5 @@ struct Callout: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-/// Renders GitHub-flavored markdown-ish text. Inline styles only, newlines
-/// preserved — good enough until a real markdown view earns its place.
-struct MarkdownBody: View {
-    let text: String
-
-    var body: some View {
-        if let attributed = try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
-        {
-            Text(attributed)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            Text(text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 }
