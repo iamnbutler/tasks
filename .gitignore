@@ -14,3 +14,9 @@ Cargo.lock
 # Xcode
 xcuserdata/
 DerivedData/
+
+# Image build staging (Makefile copies these in and removes them after
+# `container build`; a concurrent `git add -A` must never catch one)
+images/base/supervisor
+images/scout/scout-supervisor
+images/builder/builder-supervisor
