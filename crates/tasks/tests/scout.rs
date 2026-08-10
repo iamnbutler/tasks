@@ -47,7 +47,7 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
         body: body.into(),
         labels: vec!["test".into()],
         gh_state: GhState::Open,
-        state: TaskState::New,
+        state: TaskState::Queued,
         priority: 0,
         manual_rank: None,
         dispatch_attempts: 0,
@@ -110,7 +110,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     assert!(spec.files_touched.iter().any(|f| f == "src/stub.rs"));
 
     let stored_task = store.get_task(&task.id).await.unwrap().unwrap();
-    assert_eq!(stored_task.state, TaskState::SpecReady);
+    assert_eq!(stored_task.state, TaskState::InReview);
 
     let stored_spec = store.get_spec(&spec.id).await.unwrap().unwrap();
     assert_eq!(stored_spec.task_id, task.id);
@@ -139,8 +139,8 @@ async fn scout_dispatch_end_to_end_produces_spec() {
             _ => None,
         })
         .collect();
-    assert!(state_changes.contains(&(TaskState::New, TaskState::Scouting)));
-    assert!(state_changes.contains(&(TaskState::Scouting, TaskState::SpecReady)));
+    assert!(state_changes.contains(&(TaskState::Queued, TaskState::Scouting)));
+    assert!(state_changes.contains(&(TaskState::Scouting, TaskState::InReview)));
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn two_scouts_dispatch_concurrently() {
     assert!(spec_b.content.contains("## Spec"));
     for t in [&task_a, &task_b] {
         let stored = store.get_task(&t.id).await.unwrap().unwrap();
-        assert_eq!(stored.state, TaskState::SpecReady, "task {}", t.id);
+        assert_eq!(stored.state, TaskState::InReview, "task {}", t.id);
     }
 }
 
@@ -239,8 +239,8 @@ async fn scout_dispatch_failure_resets_task_to_new() {
     let stored_task = store.get_task(&task.id).await.unwrap().unwrap();
     assert_eq!(
         stored_task.state,
-        TaskState::New,
-        "failed scout should reset task to New for retry"
+        TaskState::Queued,
+        "failed scout should return the task to Queued for retry"
     );
 }
 
@@ -304,7 +304,7 @@ async fn re_scout_after_needs_revision_receives_the_review() {
 
     // Re-dispatch: the task is back in `New`.
     let requeued = store.get_task(&task.id).await.unwrap().unwrap();
-    assert_eq!(requeued.state, TaskState::New);
+    assert_eq!(requeued.state, TaskState::Queued);
     let second = scout.dispatch(requeued, &target).await.expect("second");
 
     assert!(
@@ -390,7 +390,7 @@ async fn a_scout_that_never_reports_back_times_out() {
     );
     assert_eq!(
         store.get_task(&task.id).await.unwrap().unwrap().state,
-        TaskState::New
+        TaskState::Queued
     );
 
     // Cancellation is deallocation: the VM must be gone, or the slot leaks.

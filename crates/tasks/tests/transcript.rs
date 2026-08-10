@@ -38,7 +38,7 @@ async fn insert_project_and_task(store: &Store) -> (Project, Task) {
         body: "Do the thing".into(),
         labels: vec![],
         gh_state: GhState::Open,
-        state: TaskState::New,
+        state: TaskState::Queued,
         priority: 0,
         manual_rank: None,
         dispatch_attempts: 0,

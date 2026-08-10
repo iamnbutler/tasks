@@ -89,7 +89,7 @@ impl Scout {
     /// allocate VM, run scout, persist spec, deallocate VM.
     ///
     /// On success, returns the persisted [`Spec`]. Task state is advanced to
-    /// `SpecReady` and a spec-queue entry is created with status
+    /// `InReview` and a spec-queue entry is created with status
     /// `PendingReview`.
     pub async fn dispatch(&self, task: Task, target: &ScoutTarget) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
@@ -314,7 +314,7 @@ impl Scout {
         self.store.upsert_spec_queue_entry(&queue).await?;
 
         self.store
-            .update_task_state(&task.id, TaskState::SpecReady)
+            .update_task_state(&task.id, TaskState::InReview)
             .await?;
         // A spec proves the task is dispatchable, so its past failures stop
         // counting: a later `needs_revision` re-scout starts from zero strikes.
@@ -345,7 +345,7 @@ impl Scout {
             .append_event(EventPayload::TaskStateChanged {
                 task_id: task.id.clone(),
                 from: TaskState::Scouting,
-                to: TaskState::SpecReady,
+                to: TaskState::InReview,
             })
             .await?;
 
@@ -369,10 +369,10 @@ impl Scout {
             )
             .await?;
 
-        // Back to New so another scout can retry. The orchestrator enforces
-        // the re-explore attempt cap.
+        // Back to Queued — a failure doesn't un-pick the work; the dispatcher
+        // retries it in queue order, up to the attempt cap.
         self.store
-            .update_task_state(&task.id, TaskState::New)
+            .update_task_state(&task.id, TaskState::Queued)
             .await?;
 
         self.store
@@ -386,7 +386,7 @@ impl Scout {
             .append_event(EventPayload::TaskStateChanged {
                 task_id: task.id.clone(),
                 from: TaskState::Scouting,
-                to: TaskState::New,
+                to: TaskState::Queued,
             })
             .await?;
         warn!(task_id = %task.id, %vm_id, reason, "scout failed");
@@ -759,7 +759,7 @@ mod tests {
             body: "The issue body.".into(),
             labels: vec![],
             gh_state: crate::models::GhState::Open,
-            state: TaskState::New,
+            state: TaskState::Backlog,
             priority: 0,
             manual_rank: None,
             dispatch_attempts: 0,

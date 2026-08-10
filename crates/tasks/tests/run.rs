@@ -123,7 +123,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     assert_eq!(ingested, 2);
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2);
-    assert!(tasks.iter().all(|t| t.state == TaskState::New));
+    assert!(tasks.iter().all(|t| t.state == TaskState::Backlog));
     let ingest_events = store
         .events_since(0)
         .await
@@ -144,7 +144,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
         .find(|t| t.gh_issue_number == 1)
         .expect("task for issue 1");
     assert_eq!(closed.gh_state, GhState::Closed);
-    assert_eq!(closed.state, TaskState::New, "our state is ours to set");
+    assert_eq!(closed.state, TaskState::Backlog, "our state is ours to set");
     assert_eq!(
         closed.id,
         tasks
@@ -222,7 +222,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
             .find(|t| t.gh_issue_number == number)
             .unwrap_or_else(|| panic!("task for issue {number}"));
         assert_eq!(task.gh_state, expected, "issue {number}");
-        assert_eq!(task.state, TaskState::New, "our state is ours to set");
+        assert_eq!(task.state, TaskState::Backlog, "our state is ours to set");
         assert_eq!(task.id, id_of(number), "same row, not a re-ingest");
     }
     assert_eq!(project.id, after[0].project_id);
@@ -358,7 +358,7 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
     assert!(store.list_sessions().await.unwrap().is_empty());
     assert_eq!(
         store.get_task(&task.id).await.unwrap().unwrap().state,
-        TaskState::New,
+        TaskState::Queued,
         "an undispatchable task stays queued"
     );
 
@@ -452,7 +452,7 @@ async fn insert_task_with_gh_state(
         body: format!("body of {title}"),
         labels: vec![],
         gh_state,
-        state: TaskState::New,
+        state: TaskState::Queued,
         priority: 0,
         manual_rank: None,
         dispatch_attempts: 0,
@@ -487,6 +487,12 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
     let three = insert_task(&store, &project, 3, "three").await;
     // Closed upstream: never worth a scout, whatever its rank.
     let closed = insert_task_with_gh_state(&store, &project, 4, "closed", GhState::Closed).await;
+    // Backlog: ingested but never picked up — invisible to the dispatcher.
+    let backlog = insert_task(&store, &project, 5, "backlog").await;
+    store
+        .update_task_state(&backlog.id, TaskState::Backlog)
+        .await
+        .unwrap();
 
     // Human-curated order, deliberately not insertion order.
     store
@@ -524,7 +530,7 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
 
     for task in [&three, &one, &two] {
         let stored = store.get_task(&task.id).await.unwrap().unwrap();
-        assert_eq!(stored.state, TaskState::SpecReady, "task {}", task.id);
+        assert_eq!(stored.state, TaskState::InReview, "task {}", task.id);
     }
     let specs = store.list_specs().await.unwrap();
     assert!(specs.iter().all(|s| s.content.contains("## Spec")));
@@ -533,8 +539,14 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
     let stored_closed = store.get_task(&closed.id).await.unwrap().unwrap();
     assert_eq!(
         stored_closed.state,
-        TaskState::New,
+        TaskState::Queued,
         "a closed issue must never be scouted"
+    );
+    let stored_backlog = store.get_task(&backlog.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored_backlog.state,
+        TaskState::Backlog,
+        "backlog work is never dispatched — queue membership is explicit"
     );
 }
 
@@ -566,7 +578,7 @@ async fn pause_blocks_new_dispatches() {
     );
     assert_eq!(
         store.get_task(&second.id).await.unwrap().unwrap().state,
-        TaskState::New
+        TaskState::Queued
     );
 
     // Resuming picks the queued task straight up.
@@ -743,7 +755,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
     );
     assert_eq!(
         store.get_task(&task.id).await.unwrap().unwrap().state,
-        TaskState::New,
+        TaskState::Queued,
         "the stranded task is back in the queue"
     );
 
@@ -764,7 +776,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         .unwrap();
 
     let stored = store.get_task(&task.id).await.unwrap().unwrap();
-    assert_eq!(stored.state, TaskState::SpecReady);
+    assert_eq!(stored.state, TaskState::InReview);
     assert_eq!(
         stored.dispatch_attempts, 0,
         "a crashed server is not the task's fault"
@@ -848,7 +860,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
                 EventPayload::TaskStateChanged {
                     task_id,
                     from: TaskState::Scouting,
-                    to: TaskState::New
+                    to: TaskState::Queued
                 } if *task_id == hung.id
             )
         })
