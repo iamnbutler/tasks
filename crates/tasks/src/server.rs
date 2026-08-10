@@ -825,12 +825,25 @@ mod tests {
         let open_new = insert_task(&store, &project, 1, 0).await;
         let closed_new = insert_task(&store, &project, 2, 0).await;
         let closed_spec_ready = insert_task(&store, &project, 3, 0).await;
+        let retired = insert_task(&store, &project, 4, 0).await;
+        let open_rejected = insert_task(&store, &project, 5, 0).await;
         store
-            .reconcile_closed_issues(&project.id, &[open_new.gh_issue_number])
+            .reconcile_closed_issues(
+                &project.id,
+                &[open_new.gh_issue_number, open_rejected.gh_issue_number],
+            )
             .await
             .unwrap();
         store
             .update_task_state(&closed_spec_ready.id, TaskState::InReview)
+            .await
+            .unwrap();
+        store
+            .update_task_state(&retired.id, TaskState::Done)
+            .await
+            .unwrap();
+        store
+            .update_task_state(&open_rejected.id, TaskState::Rejected)
             .await
             .unwrap();
         let base = spawn(store.clone()).await;
@@ -850,9 +863,17 @@ mod tests {
         assert!(visible.contains(&open_new.id));
         assert!(
             visible.contains(&closed_spec_ready.id),
-            "work that reached a spec stays visible"
+            "in-flight work stays visible even with the issue closed"
         );
         assert!(!visible.contains(&closed_new.id));
+        assert!(
+            !visible.contains(&retired.id),
+            "concluded work behind a closed issue is history, not the working set"
+        );
+        assert!(
+            visible.contains(&open_rejected.id),
+            "a terminal task on a still-open issue is a pending decision, so it shows"
+        );
 
         let all: Vec<TaskId> = http
             .get(format!("{base}/tasks?all=true"))
@@ -865,8 +886,9 @@ mod tests {
             .into_iter()
             .map(|t| t.id)
             .collect();
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 5);
         assert!(all.contains(&closed_new.id));
+        assert!(all.contains(&retired.id));
 
         // The reorder response is the same projection as the default read — a
         // client swaps it in for its list, so the unfiltered variant here
