@@ -566,7 +566,11 @@ struct ChatView: View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
+                    // Non-lazy on purpose: a lazy container tears down and
+                    // rebuilds these rich markdown bubbles continuously
+                    // while scrolling. The conversation is bounded and the
+                    // parses are cached — build once, scroll compositing.
+                    VStack(alignment: .leading, spacing: 12) {
                         if model.chat.isEmpty {
                             ContentUnavailableView(
                                 "Talk to the orchestrator",

@@ -20,7 +20,10 @@ struct MarkdownView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
+        // Deliberately NOT .textSelection(.enabled) here: container-wide
+        // selection turns every table cell and list row into its own AppKit
+        // selectable-text host — hundreds per chat — which is what locked
+        // scrolling up. BlockView opts in per copy-worthy block instead.
     }
 }
 
@@ -102,10 +105,12 @@ private struct BlockView: View {
                 .padding(.top, level <= 2 ? 4 : 2)
         case .paragraph(let text):
             inline(text)
+                .textSelection(.enabled)
         case .code(let code):
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .font(.callout.monospaced())
+                    .textSelection(.enabled)
                     .padding(8)
             }
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
