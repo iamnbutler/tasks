@@ -36,6 +36,35 @@ struct TasksClient: Sendable {
         return response.mode
     }
 
+    func setMode(_ mode: Mode) async throws -> Mode {
+        let response: ModeResponse = try await post("mode", body: ["mode": mode.wire])
+        return response.mode
+    }
+
+    /// Recent events, newest last. `since` is inclusive.
+    func events(since: Int64? = nil, limit: Int = 200) async throws -> [ActivityEvent] {
+        var query = [URLQueryItem(name: "limit", value: String(limit))]
+        if let since {
+            query.append(URLQueryItem(name: "since", value: String(since)))
+        }
+        return try await get("events", query: query)
+    }
+
+    /// backlog -> queued, appended at the end of the ranked order.
+    func queueTask(_ taskId: String) async throws -> TaskItem {
+        try await postEmpty("tasks/\(taskId)/queue")
+    }
+
+    /// queued -> backlog, rank cleared.
+    func dequeueTask(_ taskId: String) async throws -> TaskItem {
+        try await postEmpty("tasks/\(taskId)/dequeue")
+    }
+
+    /// Queue at the front; next dispatch tick picks it up (cap still applies).
+    func scoutNow(_ taskId: String) async throws -> TaskItem {
+        try await postEmpty("tasks/\(taskId)/scout")
+    }
+
     /// Sets manual_rank 1..n in the given order; unlisted tasks go unranked.
     /// Returns the full re-sorted queue.
     func reorderQueue(_ taskIds: [String]) async throws -> [TaskItem] {
@@ -123,6 +152,14 @@ struct TasksClient: Sendable {
             }
             continuation.onTermination = { _ in reader.cancel() }
         }
+    }
+
+    private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
+        var request = URLRequest(url: baseURL.appending(path: path))
+        request.httpMethod = "POST"
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.checkOK(response, body: data)
+        return try Self.makeDecoder().decode(T.self, from: data)
     }
 
     private func post<T: Decodable>(_ path: String, body: some Encodable & Sendable)
