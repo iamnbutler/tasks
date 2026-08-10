@@ -123,6 +123,14 @@ All enums are snake_case strings on the wire:
   for a Builder) → `done`, with `rejected` as the terminal failure state.
   Scout failures and `needs_revision` verdicts return to `queued`, never
   `backlog` — picked-up work stays picked up.
+- There is no "mark done" endpoint, deliberately: **closing the GitHub issue
+  is the done signal.** When a picked-up task's issue closes, the next poll
+  retires it — `queued`/`in_review`/`ready_to_build` become `done` (or
+  `rejected` if the issue was closed as not-planned / duplicate), the task's
+  `manual_rank` clears, and a normal `task_state_changed` event fires. A
+  `scouting` task is left to finish first and retires from `in_review` on the
+  following poll. Clients shouldn't offer a complete/done action; link to the
+  issue instead.
 - `Session.status`: `running`, `scout_succeeded`, `scout_failed`, `cancelled`.
 - `SpecQueueEntry.status`: `pending_review`, `approved`, `needs_revision`,
   `blocked`, `rejected` (only the three verdict values are accepted by the
