@@ -10,7 +10,10 @@ struct MarkdownView: View {
     let text: String
 
     var body: some View {
-        let blocks = MarkdownParser.parse(text)
+        // Cached: SwiftUI re-evaluates body on every scroll frame of a lazy
+        // container (and on every streaming delta), and parsing — especially
+        // AttributedString's markdown init — is far too expensive for that.
+        let blocks = MarkdownCache.blocks(for: text)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 BlockView(block: block)
@@ -18,6 +21,55 @@ struct MarkdownView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
+    }
+}
+
+/// Memoizes the two expensive steps behind rendering: block parsing and
+/// inline `AttributedString(markdown:)`. Keyed by source text — chat
+/// messages, issue bodies, and specs are immutable once written, and the one
+/// mutating case (the streaming live reply) changes the key each delta, so a
+/// stale entry is never served. NSCache bounds memory; main-actor isolation
+/// satisfies strict concurrency (all callers are SwiftUI view bodies).
+@MainActor
+enum MarkdownCache {
+    private final class Box<T> {
+        let value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    private static let parsed: NSCache<NSString, AnyObject> = {
+        let cache = NSCache<NSString, AnyObject>()
+        cache.countLimit = 512
+        return cache
+    }()
+    private static let inlined: NSCache<NSString, AnyObject> = {
+        let cache = NSCache<NSString, AnyObject>()
+        cache.countLimit = 4096
+        return cache
+    }()
+
+    static func blocks(for text: String) -> [MarkdownBlock] {
+        let key = text as NSString
+        if let hit = parsed.object(forKey: key) as? Box<[MarkdownBlock]> {
+            return hit.value
+        }
+        let blocks = MarkdownParser.parse(text)
+        parsed.setObject(Box(blocks), forKey: key)
+        return blocks
+    }
+
+    static func inline(_ text: String) -> AttributedString {
+        let key = text as NSString
+        if let hit = inlined.object(forKey: key) as? Box<AttributedString> {
+            return hit.value
+        }
+        let attributed =
+            (try? AttributedString(
+                markdown: text,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(text)
+        inlined.setObject(Box(attributed), forKey: key)
+        return attributed
     }
 }
 
@@ -112,14 +164,7 @@ private struct BlockView: View {
     }
 
     private func inline(_ text: String) -> Text {
-        if let attributed = try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
-        {
-            Text(attributed)
-        } else {
-            Text(text)
-        }
+        Text(MarkdownCache.inline(text))
     }
 }
 
