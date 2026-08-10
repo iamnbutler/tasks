@@ -80,3 +80,6 @@ env / `.env`:
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
+| `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
+| `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
+| `ORCHESTRATOR_TIMEOUT_SECS` | 600 | wall-clock budget per orchestrator tick |
