@@ -128,6 +128,7 @@ struct ContentView: View {
         List(selection: $selectedQueueTask) {
             let needsYou = tasksIn(.inReview)
             let running = tasksIn(.scouting)
+            let building = tasksIn(.building)
             let upNext = tasksIn(.queued)
             let readyToBuild = tasksIn(.readyToBuild)
 
@@ -150,6 +151,13 @@ struct ContentView: View {
                     }
                 }
             }
+            if !building.isEmpty {
+                Section("Building") {
+                    ForEach(building) { task in
+                        QueueRow(task: task, accessory: .elapsed(model.runningBuild?.startedAt))
+                    }
+                }
+            }
             if !upNext.isEmpty {
                 Section("Up next") {
                     ForEach(upNext) { task in
@@ -168,6 +176,13 @@ struct ContentView: View {
                 Section("Ready to build") {
                     ForEach(readyToBuild) { task in
                         QueueRow(task: task, accessory: .complexity(latestSpec(for: task)?.complexity))
+                            .contextMenu {
+                                if let spec = latestSpec(for: task) {
+                                    Button("Build") {
+                                        Task { await model.buildNow(specId: spec.id) }
+                                    }
+                                }
+                            }
                     }
                 }
             }
@@ -425,6 +440,10 @@ struct ActivityFeed: View {
         case "spec_created": "doc.text"
         case "spec_queue_status_changed": "text.badge.checkmark"
         case "queue_reordered", "spec_queue_reordered": "arrow.up.arrow.down"
+        case "build_requested": "hammer"
+        case "build_started": "hammer.circle"
+        case "build_completed": "checkmark.seal"
+        case "pull_request_opened": "arrow.triangle.branch"
         case "mode_changed": "playpause"
         case "note": "text.bubble"
         case "project_added": "folder.badge.plus"
@@ -457,6 +476,18 @@ struct ActivityFeed: View {
             return "Queue reordered"
         case "spec_queue_reordered":
             return "Spec queue reordered"
+        case "build_requested":
+            return "Build requested"
+        case "build_started":
+            return "Build started"
+        case "build_completed":
+            let status = event.status ?? "finished"
+            return "Build \(status)"
+        case "pull_request_opened":
+            if let pr = event.prNumber {
+                return "Pull request #\(pr) opened"
+            }
+            return "Pull request opened"
         case "mode_changed":
             return "Mode: \(event.from ?? "?") → \(event.to ?? "?")"
         case "note":
@@ -519,6 +550,7 @@ extension TaskState {
         case .scouting: .blue
         case .inReview: .purple
         case .readyToBuild: .teal
+        case .building: .indigo
         case .done: .green
         case .rejected: .red
         case .unknown: .secondary

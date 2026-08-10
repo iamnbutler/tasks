@@ -11,6 +11,7 @@ final class AppModel {
     var tasks: [TaskItem] = []
     var sessions: [ScoutSession] = []
     var specs: [Spec] = []
+    var builds: [BuildItem] = []
     var specQueue: [SpecQueueItem] = []
     var mode: Mode?
     /// Recent event log, newest first, for the Activity feed.
@@ -80,6 +81,22 @@ final class AppModel {
 
     func scoutNow(_ id: String) async {
         await perform { try await self.client.scoutNow(id) }
+    }
+
+    /// The at-most-one build the serial loop is running.
+    var runningBuild: BuildItem? {
+        builds.first { $0.status == .running }
+    }
+
+    /// Queue a one-spec Builder run (the API takes a batch; the UI's unit is
+    /// a task's approved spec). 202 — the queue view reflects progress.
+    func buildNow(specId: String) async {
+        do {
+            _ = try await client.requestBuild(specIds: [specId])
+            await refresh()
+        } catch {
+            connectionError = error.localizedDescription
+        }
     }
 
     func setMode(_ mode: Mode) async {
@@ -162,6 +179,7 @@ final class AppModel {
         async let tasks = Self.attempt { try await c.tasks() }
         async let sessions = Self.attempt { try await c.sessions() }
         async let specs = Self.attempt { try await c.specs() }
+        async let builds = Self.attempt { try await c.builds() }
         async let specQueue = Self.attempt { try await c.specQueue() }
         async let mode = Self.attempt { try await c.mode() }
         async let events = Self.attempt { try await c.events() }
@@ -179,6 +197,7 @@ final class AppModel {
         apply(await tasks) { self.tasks = $0 }
         apply(await sessions) { self.sessions = $0 }
         apply(await specs) { self.specs = $0 }
+        apply(await builds) { self.builds = $0 }
         apply(await specQueue) { self.specQueue = $0 }
         apply(await mode) { self.mode = $0 }
         apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }
