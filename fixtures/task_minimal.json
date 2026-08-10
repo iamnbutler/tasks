@@ -1,0 +1,15 @@
+{
+  "id": "task_2b3c4d5e6f708192a3b4c5d6e7f8091a",
+  "project_id": "proj_0f4b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+  "gh_issue_number": 764,
+  "title": "Untriaged issue",
+  "body": "",
+  "labels": [],
+  "gh_state": "closed",
+  "state": "backlog",
+  "priority": 0,
+  "manual_rank": null,
+  "dispatch_attempts": 0,
+  "ingested_at": "2026-08-02T10:05:00Z",
+  "updated_at": "2026-08-02T10:05:00Z"
+}

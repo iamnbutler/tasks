@@ -1,0 +1,9 @@
+{
+  "seq": 14,
+  "timestamp": "2026-08-09T17:00:00.500Z",
+  "payload": {
+    "kind": "build_completed",
+    "build_id": "build_6f708192a3b4c5d6e7f8091a2b3c4d5e",
+    "status": "succeeded"
+  }
+}

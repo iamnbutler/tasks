@@ -1,0 +1,50 @@
+{
+  "build_status": [
+    "queued",
+    "running",
+    "succeeded",
+    "failed"
+  ],
+  "complexity": [
+    "simple",
+    "medium",
+    "complex"
+  ],
+  "gh_state": [
+    "open",
+    "closed"
+  ],
+  "mode": [
+    "play",
+    "pause",
+    "stop"
+  ],
+  "session_status": [
+    "running",
+    "scout_succeeded",
+    "scout_failed",
+    "cancelled"
+  ],
+  "spec_queue_status": [
+    "pending_review",
+    "approved",
+    "needs_revision",
+    "blocked",
+    "rejected",
+    "built"
+  ],
+  "task_state": [
+    "backlog",
+    "queued",
+    "scouting",
+    "in_review",
+    "ready_to_build",
+    "building",
+    "done",
+    "rejected"
+  ],
+  "transcript_stream": [
+    "stdout",
+    "stderr"
+  ]
+}

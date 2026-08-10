@@ -1,0 +1,7 @@
+{
+  "session_id": "sess_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+  "seq": 42,
+  "timestamp": "2026-08-09T17:04:09.250Z",
+  "stream": "stdout",
+  "line": "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Reading models.rs\"}]}}"
+}

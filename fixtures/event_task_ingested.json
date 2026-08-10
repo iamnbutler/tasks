@@ -1,0 +1,9 @@
+{
+  "seq": 2,
+  "timestamp": "2026-08-09T17:00:00.500Z",
+  "payload": {
+    "kind": "task_ingested",
+    "task_id": "task_1a2b3c4d5e6f708192a3b4c5d6e7f809",
+    "project_id": "proj_0f4b1c2d3e4f5a6b7c8d9e0f1a2b3c4d"
+  }
+}

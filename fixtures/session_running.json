@@ -1,0 +1,11 @@
+{
+  "id": "sess_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+  "task_id": "task_1a2b3c4d5e6f708192a3b4c5d6e7f809",
+  "vm_id": null,
+  "branch": "scout/task_1a2b3c4d",
+  "status": "running",
+  "started_at": "2026-08-09T17:00:00Z",
+  "completed_at": null,
+  "exit_reason": null,
+  "usage": null
+}

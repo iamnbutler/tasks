@@ -519,6 +519,7 @@ extension TaskState {
         case .scouting: .blue
         case .inReview: .purple
         case .readyToBuild: .teal
+        case .building: .indigo
         case .done: .green
         case .rejected: .red
         case .unknown: .secondary
@@ -534,6 +535,7 @@ extension SpecQueueStatus {
         case .needsRevision: .orange
         case .blocked: .gray
         case .rejected: .red
+        case .built: .green
         case .unknown: .secondary
         }
     }

@@ -1,0 +1,19 @@
+{
+  "id": "sess_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+  "task_id": "task_1a2b3c4d5e6f708192a3b4c5d6e7f809",
+  "vm_id": "vm_7c1f9a4e",
+  "branch": "scout/task_1a2b3c4d",
+  "status": "scout_succeeded",
+  "started_at": "2026-08-09T17:00:00Z",
+  "completed_at": "2026-08-09T17:23:41.456Z",
+  "exit_reason": "spec reported",
+  "usage": {
+    "input_tokens": 184320,
+    "output_tokens": 21004,
+    "cache_read_input_tokens": 1204887,
+    "cache_creation_input_tokens": 96512,
+    "total_cost_usd": 4.2175,
+    "duration_ms": 1421000,
+    "num_turns": 87
+  }
+}

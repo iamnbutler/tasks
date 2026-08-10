@@ -1,0 +1,35 @@
+[
+  {
+    "id": "task_1a2b3c4d5e6f708192a3b4c5d6e7f809",
+    "project_id": "proj_0f4b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+    "gh_issue_number": 763,
+    "title": "Golden JSON wire fixtures shared by the Rust API and Swift client tests",
+    "body": "The Swift models are hand-mirrored from models.rs.\n\nNothing catches drift.",
+    "labels": [
+      "enhancement",
+      "testing"
+    ],
+    "gh_state": "open",
+    "state": "in_review",
+    "priority": 3,
+    "manual_rank": 1,
+    "dispatch_attempts": 2,
+    "ingested_at": "2026-08-02T10:00:00Z",
+    "updated_at": "2026-08-09T18:30:00.123Z"
+  },
+  {
+    "id": "task_2b3c4d5e6f708192a3b4c5d6e7f8091a",
+    "project_id": "proj_0f4b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+    "gh_issue_number": 764,
+    "title": "Untriaged issue",
+    "body": "",
+    "labels": [],
+    "gh_state": "closed",
+    "state": "backlog",
+    "priority": 0,
+    "manual_rank": null,
+    "dispatch_attempts": 0,
+    "ingested_at": "2026-08-02T10:05:00Z",
+    "updated_at": "2026-08-02T10:05:00Z"
+  }
+]

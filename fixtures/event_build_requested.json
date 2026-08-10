@@ -1,0 +1,12 @@
+{
+  "seq": 12,
+  "timestamp": "2026-08-09T17:00:00.500Z",
+  "payload": {
+    "kind": "build_requested",
+    "build_id": "build_6f708192a3b4c5d6e7f8091a2b3c4d5e",
+    "spec_ids": [
+      "spec_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+      "spec_5e6f708192a3b4c5d6e7f8091a2b3c4d"
+    ]
+  }
+}

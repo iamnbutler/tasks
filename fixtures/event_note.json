@@ -1,0 +1,9 @@
+{
+  "seq": 17,
+  "timestamp": "2026-08-09T17:00:00.500Z",
+  "payload": {
+    "kind": "note",
+    "source": "scout-dispatcher",
+    "message": "task task_1a2b3c4d rejected after 3 failed dispatches"
+  }
+}

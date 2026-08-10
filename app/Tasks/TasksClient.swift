@@ -184,7 +184,10 @@ struct TasksClient: Sendable {
         return try Self.makeDecoder().decode(T.self, from: data)
     }
 
-    private struct ServerError: Decodable {
+    // Internal, not private, so the wire-fixture tests can assert against the
+    // *production* decoder and error shape. A decoder built inside a test would
+    // prove nothing about what the app actually does.
+    struct ServerError: Decodable {
         let error: String
     }
 
@@ -198,7 +201,7 @@ struct TasksClient: Sendable {
             message: message ?? "HTTP \(http.statusCode)")
     }
 
-    private static func makeDecoder() -> JSONDecoder {
+    static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         decoder.dateDecodingStrategy = .custom { decoder in

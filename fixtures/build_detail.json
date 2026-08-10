@@ -1,0 +1,24 @@
+{
+  "id": "build_6f708192a3b4c5d6e7f8091a2b3c4d5e",
+  "project_id": "proj_0f4b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+  "vm_id": "vm_2e8b3d17",
+  "branch": "build/build_6f708192",
+  "base_branch": "main",
+  "base_sha": "a3b1d0c9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3",
+  "head_sha": "b4c2e1d0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4",
+  "pr_number": 781,
+  "status": "succeeded",
+  "summary": "Adds golden wire fixtures and the tests on both sides of them.",
+  "files_touched": [
+    "fixtures/task.json",
+    "docs/clients.md"
+  ],
+  "exit_reason": null,
+  "created_at": "2026-08-09T19:00:00Z",
+  "started_at": "2026-08-09T19:00:05Z",
+  "completed_at": "2026-08-09T19:41:12.789Z",
+  "spec_ids": [
+    "spec_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+    "spec_5e6f708192a3b4c5d6e7f8091a2b3c4d"
+  ]
+}

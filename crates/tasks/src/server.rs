@@ -340,11 +340,14 @@ struct BuildRequest {
 }
 
 /// A build with its batch, in position order.
+///
+/// Public so `tests/wire_fixtures.rs` can pin the shape it serializes; the
+/// handlers are the only things that construct it.
 #[derive(Debug, Serialize)]
-struct BuildDetail {
+pub struct BuildDetail {
     #[serde(flatten)]
-    build: Build,
-    spec_ids: Vec<SpecId>,
+    pub build: Build,
+    pub spec_ids: Vec<SpecId>,
 }
 
 /// 202, not 200/201-with-result: builds are serial and this only queues one.
@@ -379,9 +382,10 @@ async fn get_build(
 
 // --- mode ---
 
+/// Public for the same reason as [`BuildDetail`].
 #[derive(Debug, Serialize)]
-struct ModeResponse {
-    mode: Mode,
+pub struct ModeResponse {
+    pub mode: Mode,
 }
 
 #[derive(Debug, Deserialize)]

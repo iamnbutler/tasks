@@ -1,0 +1,10 @@
+{
+  "seq": 8,
+  "timestamp": "2026-08-09T17:00:00.500Z",
+  "payload": {
+    "kind": "spec_queue_status_changed",
+    "spec_id": "spec_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+    "from": "pending_review",
+    "to": "approved"
+  }
+}

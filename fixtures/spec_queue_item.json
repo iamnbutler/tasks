@@ -1,0 +1,11 @@
+{
+  "spec_id": "spec_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+  "status": "approved",
+  "rank": 1,
+  "approved_at": "2026-08-09T18:00:00Z",
+  "feedback": "Good. Ship the fixtures before the models drift further.",
+  "blocking_dependencies": [
+    "task_2b3c4d5e6f708192a3b4c5d6e7f8091a"
+  ],
+  "task_id": "task_1a2b3c4d5e6f708192a3b4c5d6e7f809"
+}

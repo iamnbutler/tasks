@@ -60,10 +60,14 @@ the server only.
   shows — that's the "close the issue or re-queue?" decision surface.
   `GET /tasks?all=true` returns every row. Ordering is identical either way.
 - `GET /sessions` / `GET /sessions/{id}` — scout runs.
-- `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
-  render it as Markdown. Also carries `files_touched`, `complexity`,
-  `agent_exit_code`.
-- `GET /spec-queue` — `{entry: {...}, task_id}` items for the review screen.
+- `GET /specs` / `GET /specs/{id}` — `content` is the deliverable; render it as
+  Markdown. Also carries `session_id`, `task_id`, `complexity`,
+  `files_touched`, `created_at`. (This bullet used to say `spec_markdown` and
+  `agent_exit_code`; neither field exists — see *Contract drift* below, which
+  is how it was caught.)
+- `GET /spec-queue` — items for the review screen. The entry is **flattened**,
+  not nested: `{spec_id, status, rank, approved_at, feedback,
+  blocking_dependencies, task_id}`.
 - `POST /builds` `{"spec_ids": [...], "base_branch"?}` — queue a Builder run
   over a set of **approved** specs; **202** with the build (`{..., spec_ids}`).
   Builds are strictly serial — one runs at a time, each cut from a base that
@@ -174,6 +178,40 @@ dropped out of the repository's open set; refetch the task or the list),
 `mode_changed`, `note` (`source`, `message` — free-form breadcrumbs; a
 scrolling activity feed of these is the cheapest useful "what is it doing"
 view).
+
+## Contract drift
+
+Client models are hand-mirrored from `crates/tasks/src/models.rs`, and nothing
+about the language stops them drifting. `fixtures/` is what does: one committed
+JSON file per wire shape, generated from the Rust types and decoded by the
+clients.
+
+- `crates/tasks/tests/wire_fixtures.rs` serializes a deterministic instance of
+  every shape the API returns and asserts a byte-for-byte match. Enum
+  inventories and event kinds come from exhaustive matches, so adding a variant
+  in `models.rs` stops that test file compiling until the variant is accounted
+  for.
+- `app/TasksTests/WireFixtureTests.swift` decodes every one of those files
+  through the app's production decoder.
+
+So a rename fails `cargo test` first, and then keeps failing the app's suite
+until the Swift models catch up. To change the contract deliberately:
+
+```sh
+UPDATE_FIXTURES=1 cargo test -p tasks --test wire_fixtures
+```
+
+then review the fixture diff and update the clients in the same commit. See
+`fixtures/README.md`.
+
+**This does not make runtime parsing strict.** Keep parsing enums leniently —
+the fixtures assert that everything the server can emit today is handled today,
+which is a different claim from "reject anything unrecognized". A client should
+still survive a server that's ahead of it.
+
+New wire shapes (the Builder resources and progress surfaces on the roadmap
+below) should each arrive with a fixture, or the guarantee erodes one endpoint
+at a time.
 
 ## Design constraints worth mirroring in the UI
 
