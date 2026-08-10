@@ -10,10 +10,16 @@
 //! the loop answers whatever user turns arrived since the last assistant
 //! turn, so a crash mid-reply just means the next pass answers again.
 //!
-//! The orchestrator acts through the tasks HTTP API (curl against
-//! `127.0.0.1:<port>`), which keeps every write inside the server's rules —
-//! notably "GitHub writes go through the server". Its child environment has
-//! `GITHUB_TOKEN` explicitly removed: the API is its only pair of hands.
+//! What the orchestrator may *do* is decided by configuration, not code:
+//! `ORCHESTRATOR_CMD` carries Claude Code's permission flags and
+//! `ORCHESTRATOR_WORKDIR` its working directory. Pointed at the real repo
+//! checkout with `--dangerously-skip-permissions`, it is a full development
+//! agent; with the defaults it is an API-only controller. Either way,
+//! *pipeline* writes go through the tasks HTTP API (curl against
+//! `127.0.0.1:<port>`) so state changes stay inside the server's rules, and
+//! the server's own `GITHUB_TOKEN` is stripped from the child env — when the
+//! agent talks to GitHub it authenticates as itself (gh's keychain auth),
+//! not with the server's credential.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -112,26 +118,34 @@ impl Orchestrator {
     /// Run one headless Claude Code turn against the persistent session,
     /// creating the session on first use and healing a lost one by starting
     /// over with a fresh id (context is lost, the chat projection is not).
+    /// The standing prompt rides along on every turn — resume included — so
+    /// prompt updates reach a long-lived session without resetting it.
     async fn run_agent(&self, prompt: &str) -> Result<String, OrchestratorError> {
+        let system = system_prompt(self.config.api_port);
         match self.store.orchestrator_cc_session().await? {
-            None => self.run_fresh(prompt).await,
-            Some(session) => match self.invoke(&["--resume", &session], prompt).await {
+            None => self.run_fresh(&system, prompt).await,
+            Some(session) => match self
+                .invoke(
+                    &["--resume", &session, "--append-system-prompt", &system],
+                    prompt,
+                )
+                .await
+            {
                 Ok(reply) => Ok(reply),
                 Err(e @ OrchestratorError::AgentFailed { .. }) => {
                     warn!(error = %e, "resume failed; starting a fresh orchestrator session");
-                    self.run_fresh(prompt).await
+                    self.run_fresh(&system, prompt).await
                 }
                 Err(e) => Err(e),
             },
         }
     }
 
-    async fn run_fresh(&self, prompt: &str) -> Result<String, OrchestratorError> {
+    async fn run_fresh(&self, system: &str, prompt: &str) -> Result<String, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
-        let system = system_prompt(self.config.api_port);
         let reply = self
             .invoke(
-                &["--session-id", &session, "--append-system-prompt", &system],
+                &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
             )
             .await?;
@@ -159,8 +173,8 @@ impl Orchestrator {
         cmd.args(&base_args)
             .args(extra_args)
             .current_dir(&self.config.workdir)
-            // The API is the orchestrator's only pair of hands. No direct
-            // GitHub writes, so no token.
+            // The server's token stays the server's. When the agent talks to
+            // GitHub it authenticates as itself (gh keychain auth).
             .env_remove("GITHUB_TOKEN")
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
@@ -304,17 +318,23 @@ fn tool_label(item: &serde_json::Value) -> String {
 }
 
 /// The orchestrator's standing instructions. Appended (not replacing) so
-/// Claude Code's own tool discipline stays intact.
+/// Claude Code's own tool discipline stays intact, and passed on every turn
+/// (resume included) so edits here reach a long-lived session.
 fn system_prompt(port: u16) -> String {
     format!(
-        "You are the Orchestrator for a Tasks server — a human-in-the-loop \
-         platform that turns GitHub issues into specs (via Scout agents) and \
-         approved specs into PRs (via Builder agents).\n\n\
-         You are a persistent conversation the human returns to. Answer \
-         questions about pipeline state, and take pipeline actions when — and \
-         only when — the human asks for them. Never invent work for yourself.\n\n\
-         Your only tool for acting is the tasks HTTP API at \
-         http://127.0.0.1:{port} (use curl). Endpoints:\n\
+        "You are the Orchestrator for Tasks — a human-in-the-loop platform \
+         that turns GitHub issues into specs (via Scout agents) and approved \
+         specs into PRs (via Builder agents). You are a persistent \
+         conversation the human returns to. Answer questions, and act when — \
+         and only when — the human asks. Never invent work for yourself.\n\n\
+         Your working directory is the project checkout itself. Within your \
+         permission settings you may read and edit code, run builds and \
+         tests, and use `gh` (e.g. to file issues the human asks for). If a \
+         tool call is denied, say what was denied instead of improvising \
+         around it.\n\n\
+         Pipeline control goes through the tasks HTTP API at \
+         http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
+         state and the activity log honest. Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
@@ -332,12 +352,15 @@ fn system_prompt(port: u16) -> String {
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → done (rejected = terminal). Issue closure on GitHub \
            retires work automatically; there is no manual mark-done.\n\
-         - Never touch GitHub directly — the server is the only thing that \
-           writes there. You have no credentials for it anyway.\n\
          - Reviews are the human's: only submit a verdict they explicitly \
            stated, and quote their feedback verbatim.\n\
-         - Be concise. Plain sentences, not markdown headers. When you took \
-           actions, say exactly which calls you made.\n\
+         - The checkout is shared with the human and other agents. Never \
+           switch branches, stash, or discard changes you did not make; do \
+           your own work on branches and leave the tree as you found it.\n\
+         - Do not restart the tasks server or vm-pool unasked — a restart \
+           orphans in-flight builds.\n\
+         - Be concise. When you took actions, say exactly which calls or \
+           commands you ran.\n\
          - When asked for status, lead with what needs the human's attention: \
            specs awaiting review, failed builds, then everything else."
     )
@@ -351,7 +374,8 @@ mod tests {
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
         let p = system_prompt(4800);
         assert!(p.contains("http://127.0.0.1:4800"));
-        assert!(p.contains("Never touch GitHub directly"));
         assert!(p.contains("only when — the human asks"));
+        assert!(p.contains("Never switch branches"));
+        assert!(p.contains("verdict they explicitly stated"));
     }
 }

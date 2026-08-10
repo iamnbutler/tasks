@@ -164,6 +164,11 @@ pub struct Config {
     pub orchestrator_cmd: String,
     /// Wall-clock budget for one orchestrator tick (`ORCHESTRATOR_TIMEOUT_SECS`).
     pub orchestrator_timeout: Duration,
+    /// Working directory for the orchestrator agent (`ORCHESTRATOR_WORKDIR`).
+    /// Default is a neutral dir under the data dir; point it at a dedicated
+    /// repo clone to run the orchestrator as a full development agent
+    /// (pair with `--dangerously-skip-permissions` in `ORCHESTRATOR_CMD`).
+    pub orchestrator_workdir: Option<PathBuf>,
 }
 
 impl Config {
@@ -217,6 +222,7 @@ impl Config {
                 "a number of seconds",
                 DEFAULT_ORCHESTRATOR_TIMEOUT_SECS,
             )?),
+            orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
         })
     }
 
@@ -800,7 +806,10 @@ pub async fn orchestrator_loop(
         OrchestratorConfig {
             command: config.orchestrator_cmd.clone(),
             timeout: config.orchestrator_timeout,
-            workdir: config.data_dir.join("orchestrator"),
+            workdir: config
+                .orchestrator_workdir
+                .clone()
+                .unwrap_or_else(|| config.data_dir.join("orchestrator")),
             api_port: config.port,
         },
     );
@@ -978,6 +987,7 @@ mod tests {
             github_rest_api_url: None,
             orchestrator_cmd: "true".into(),
             orchestrator_timeout: Duration::from_secs(60),
+            orchestrator_workdir: None,
         }
     }
 
