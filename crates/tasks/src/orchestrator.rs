@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::models::ChatRole;
+use crate::models::{ChatRole, OrchestratorFeedEvent};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -101,6 +101,11 @@ impl Orchestrator {
         self.store
             .append_orchestrator_message(ChatRole::Assistant, content)
             .await?;
+        // The durable message exists now — tell live-feed subscribers the
+        // in-flight view is over (after the append, so a client reacting to
+        // `done` finds the message already fetchable).
+        self.store
+            .publish_orchestrator_feed(OrchestratorFeedEvent::Done);
         Ok(true)
     }
 
@@ -136,6 +141,11 @@ impl Orchestrator {
         Ok(reply)
     }
 
+    /// Run the agent, streaming its stdout as it arrives. stream-json lines
+    /// become live-feed events (text deltas, tool-call labels) and the
+    /// `result` record's text becomes the reply; anything that isn't
+    /// stream-json is collected raw and returned whole, so plain-text agents
+    /// (and test stubs) keep working — they just don't stream.
     async fn invoke(&self, extra_args: &[&str], prompt: &str) -> Result<String, OrchestratorError> {
         let mut parts = self.config.command.split_whitespace();
         let prog = parts.next().unwrap_or("claude").to_string();
@@ -152,34 +162,144 @@ impl Orchestrator {
             // The API is the orchestrator's only pair of hands. No direct
             // GitHub writes, so no token.
             .env_remove("GITHUB_TOKEN")
+            // A timeout drops the read future below, which drops the child —
+            // this makes that drop kill the process instead of leaking it.
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().map_err(OrchestratorError::Spawn)?;
         let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
         let prompt_owned = prompt.to_string();
         tokio::spawn(async move {
             let _ = stdin.write_all(prompt_owned.as_bytes()).await;
             drop(stdin);
         });
+        // Drain stderr concurrently so a chatty agent can't fill the pipe
+        // and deadlock against our stdout read.
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_string(&mut buf).await;
+            buf
+        });
+
+        let read = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut raw = String::new();
+            let mut result_text: Option<String> = None;
+            while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
+                match parse_stream_line(&line) {
+                    StreamLine::Delta(text) => self
+                        .store
+                        .publish_orchestrator_feed(OrchestratorFeedEvent::Delta { text }),
+                    StreamLine::Tools(labels) => {
+                        for label in labels {
+                            self.store
+                                .publish_orchestrator_feed(OrchestratorFeedEvent::Tool { label });
+                        }
+                    }
+                    StreamLine::Result(text) => result_text = Some(text),
+                    StreamLine::Other => {}
+                    StreamLine::NotStreamJson => {
+                        raw.push_str(&line);
+                        raw.push('\n');
+                    }
+                }
+            }
+            let status = child.wait().await.map_err(OrchestratorError::Spawn)?;
+            Ok::<_, OrchestratorError>((status, result_text, raw))
+        };
 
         let secs = self.config.timeout.as_secs();
-        let output = tokio::time::timeout(self.config.timeout, child.wait_with_output())
+        let (status, result_text, raw) = tokio::time::timeout(self.config.timeout, read)
             .await
-            .map_err(|_| OrchestratorError::Timeout { secs })?
-            .map_err(OrchestratorError::Spawn)?;
+            .map_err(|_| OrchestratorError::Timeout { secs })??;
 
-        if !output.status.success() {
+        if !status.success() {
+            let stderr = stderr_task.await.unwrap_or_default();
             return Err(OrchestratorError::AgentFailed {
-                status: output.status,
-                stderr: String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(2000)
-                    .collect(),
+                status,
+                stderr: stderr.chars().take(2000).collect(),
             });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(result_text.unwrap_or(raw))
+    }
+}
+
+/// What one line of agent stdout means for the live feed.
+enum StreamLine {
+    /// Assistant text as it's generated (`--include-partial-messages`).
+    Delta(String),
+    /// Tool invocations from a completed assistant turn.
+    Tools(Vec<String>),
+    /// The final `result` record's reply text.
+    Result(String),
+    /// A stream-json record with nothing for us (init, thinking, tool results).
+    Other,
+    /// Not stream-json at all — a plain-text agent's output.
+    NotStreamJson,
+}
+
+fn parse_stream_line(line: &str) -> StreamLine {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return StreamLine::NotStreamJson;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("stream_event") => match v.pointer("/event/delta/text").and_then(|t| t.as_str()) {
+            Some(text) => StreamLine::Delta(text.to_string()),
+            None => StreamLine::Other,
+        },
+        Some("assistant") => {
+            let labels: Vec<String> = v
+                .pointer("/message/content")
+                .and_then(|c| c.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                        .map(tool_label)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if labels.is_empty() {
+                StreamLine::Other
+            } else {
+                StreamLine::Tools(labels)
+            }
+        }
+        Some("result") => match v.get("result").and_then(|r| r.as_str()) {
+            Some(text) => StreamLine::Result(text.to_string()),
+            None => StreamLine::Other,
+        },
+        Some(_) => StreamLine::Other,
+        // JSON, but not a stream record — treat like plain output.
+        None => StreamLine::NotStreamJson,
+    }
+}
+
+/// One-line human label for a tool call, e.g. `Bash: curl -s .../tasks`.
+fn tool_label(item: &serde_json::Value) -> String {
+    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+    let detail = item
+        .pointer("/input/command")
+        .and_then(|c| c.as_str())
+        .or_else(|| item.pointer("/input/description").and_then(|d| d.as_str()))
+        .unwrap_or("");
+    let label = if detail.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {detail}")
+    };
+    let one_line = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 120 {
+        format!("{}…", one_line.chars().take(119).collect::<String>())
+    } else {
+        one_line
     }
 }
 

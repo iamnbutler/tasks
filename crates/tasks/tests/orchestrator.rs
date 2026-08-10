@@ -111,6 +111,131 @@ async fn a_tick_answers_pending_turns_and_resumes_the_same_session() {
     assert!(!events.is_empty());
 }
 
+/// The streaming path: a stream-json agent's deltas and tool calls surface
+/// on the live feed in order, and the persisted reply is the `result`
+/// record's text — never raw JSON.
+#[tokio::test]
+async fn a_stream_json_agent_feeds_deltas_and_tools_and_lands_the_result() {
+    use tasks::models::OrchestratorFeedEvent as Feed;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("stream.jsonl");
+    tokio::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Check"}}}"#,
+            "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ing"}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"curl -s http://127.0.0.1:4800/tasks"}}]}}"#,
+            "\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"All good."}}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"All good."}"#,
+            "\n",
+        ),
+    )
+    .await
+    .unwrap();
+
+    let stub = tmp.path().join("stream-stub.sh");
+    tokio::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ncat {}\n",
+            common::shell_escape(&fixture.display().to_string())
+        ),
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&stub).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&stub, p).await.unwrap();
+    }
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    // Subscribe before the tick so nothing published during it is missed.
+    let mut feed = store.subscribe_orchestrator_feed();
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "status?")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    assert_eq!(
+        messages[1].content, "All good.",
+        "reply is the result record's text, not raw stream-json"
+    );
+
+    let mut got = Vec::new();
+    while let Ok(event) = feed.try_recv() {
+        got.push(event);
+    }
+    assert_eq!(
+        got,
+        vec![
+            Feed::Delta {
+                text: "Check".into()
+            },
+            Feed::Delta { text: "ing".into() },
+            Feed::Tool {
+                label: "Bash: curl -s http://127.0.0.1:4800/tasks".into()
+            },
+            Feed::Delta {
+                text: "All good.".into()
+            },
+            Feed::Done,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_orchestrator_stream_endpoint_relays_the_feed() {
+    use tasks::models::OrchestratorFeedEvent as Feed;
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let app = tasks::server::router(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut resp = reqwest::Client::new()
+        .get(format!("{base}/orchestrator/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Headers received means the handler ran, which means the subscription
+    // exists — publishing now cannot race it.
+    store.publish_orchestrator_feed(Feed::Delta { text: "hi".into() });
+    store.publish_orchestrator_feed(Feed::Tool {
+        label: "Bash: curl".into(),
+    });
+    store.publish_orchestrator_feed(Feed::Done);
+
+    let mut body = String::new();
+    while !body.contains(r#"{"kind":"done"}"#) {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("feed frame within 5s")
+            .unwrap()
+            .expect("stream still open");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(body.contains(r#"{"kind":"delta","text":"hi"}"#), "{body}");
+    assert!(
+        body.contains(r#"{"kind":"tool","label":"Bash: curl"}"#),
+        "{body}"
+    );
+}
+
 /// A failing agent must settle the tick (error becomes the assistant turn)
 /// rather than retrying a poison prompt forever.
 #[tokio::test]

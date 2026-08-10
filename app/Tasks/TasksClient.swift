@@ -181,6 +181,33 @@ struct TasksClient: Sendable {
         return try await post("orchestrator/messages", body: Body(content: content))
     }
 
+    /// SSE feed of the in-flight orchestrator tick: text deltas, tool-call
+    /// labels, and `done`. Ephemeral — no backfill; a (re)connect only sees
+    /// what happens next, and the durable reply always arrives via
+    /// `orchestratorMessages`. Finishes when the server closes the
+    /// connection; the caller owns reconnect policy.
+    func orchestratorFeed() -> AsyncThrowingStream<OrchestratorFeedFrame, Error> {
+        let url = baseURL.appending(path: "orchestrator/stream")
+        return AsyncThrowingStream { continuation in
+            let reader = Task {
+                do {
+                    let (bytes, response) = try await URLSession.shared.bytes(from: url)
+                    try Self.checkOK(response)
+                    let decoder = Self.makeDecoder()
+                    for try await raw in bytes.lines where raw.hasPrefix("data: ") {
+                        let payload = Data(raw.dropFirst("data: ".count).utf8)
+                        continuation.yield(
+                            try decoder.decode(OrchestratorFeedFrame.self, from: payload))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in reader.cancel() }
+        }
+    }
+
     private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"

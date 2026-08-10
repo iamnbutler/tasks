@@ -417,6 +417,17 @@ struct ChatMessage: Decodable, Identifiable, Hashable {
     var id: Int64 { seq }
 }
 
+/// One frame of `/orchestrator/stream` — the live view of an in-flight tick.
+/// Loose by design: unknown kinds are skipped, and nothing here is durable
+/// (the finished message arrives via `/orchestrator/messages`).
+struct OrchestratorFeedFrame: Decodable, Sendable {
+    let kind: String
+    /// Present when kind == "delta": a chunk of assistant text.
+    let text: String?
+    /// Present when kind == "tool": a one-line tool-call label.
+    let label: String?
+}
+
 enum ChatRole: WireEnum {
     case user, assistant
     case unknown(String)

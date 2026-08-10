@@ -79,6 +79,17 @@ the server only.
   /orchestrator/messages?since=N` returns turns with `seq > N`, oldest first:
   `{seq, role: "user"|"assistant", content, created_at}`. Render an
   "answering…" affordance while the newest turn is the user's.
+- `GET /orchestrator/stream` — SSE live view of the in-flight tick, one JSON
+  frame per `data:` line: `{"kind":"delta","text"}` (assistant text in
+  generation order), `{"kind":"tool","label"}` (a tool call, e.g.
+  `Bash: curl …`), `{"kind":"done"}` (the durable reply is now fetchable).
+  **Ephemeral**: no backfill, a (re)connect only sees what happens next, and
+  a lagged subscriber misses deltas — never the reply, which always lands in
+  `/orchestrator/messages`. Suggested rendering: accumulate deltas into a
+  growing bubble, reset the accumulator on each `tool` frame (pre-tool text
+  is working narration; the segment after the last tool call is the reply),
+  show the latest tool label as status, and swap in the persisted message
+  when it arrives. Skip unknown `kind`s.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
   `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
