@@ -154,6 +154,20 @@ struct TasksClient: Sendable {
         }
     }
 
+    func builds() async throws -> [BuildItem] {
+        try await get("builds")
+    }
+
+    /// Queue a Builder run over approved specs. 202: the response is the
+    /// queued build, not a finished one — the serial loop picks it up.
+    func requestBuild(specIds: [String]) async throws -> BuildItem {
+        struct Body: Encodable {
+            let specIds: [String]
+            enum CodingKeys: String, CodingKey { case specIds = "spec_ids" }
+        }
+        return try await post("builds", body: Body(specIds: specIds))
+    }
+
     private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"
