@@ -45,7 +45,7 @@ use vm_pool_protocol::VmConfig;
 
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
-use crate::github::GitHubClient;
+use crate::github::{GitHubClient, IntakeFilter};
 use crate::models::{GhState, Mode, Project, Spec, Task, TaskId, TaskState};
 use crate::protocol::TasksProtocol;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
@@ -134,6 +134,9 @@ pub struct Config {
     pub github_token: Option<String>,
     /// GraphQL endpoint override (`GITHUB_API_URL`) — GitHub Enterprise, tests.
     pub github_api_url: Option<String>,
+    /// Which fetched issues intake accepts (`TASKS_INTAKE_LABEL`). Unset means
+    /// every open issue, which is the historical behaviour.
+    pub intake: IntakeFilter,
     /// Prefix for derived clone URLs (`GITHUB_CLONE_URL_BASE`); the full URL is
     /// `<base>/<owner>/<repo>.git`.
     pub clone_url_base: String,
@@ -177,6 +180,7 @@ impl Config {
                 .into(),
             github_token: env_string("GITHUB_TOKEN"),
             github_api_url: env_string("GITHUB_API_URL"),
+            intake: IntakeFilter::from_label(env_string("TASKS_INTAKE_LABEL")),
             clone_url_base: env_string("GITHUB_CLONE_URL_BASE")
                 .unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into()),
             scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
@@ -362,11 +366,17 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
         warn!("GITHUB_TOKEN not set — GitHub polling disabled");
         return;
     };
+    // Said once, at startup: a typo in TASKS_INTAKE_LABEL ingests nothing, and
+    // silence is the worst way to learn that.
+    match config.intake.label() {
+        Some(label) => info!(label, "intake restricted to issues carrying this label"),
+        None => info!("intake accepts every open issue (TASKS_INTAKE_LABEL unset)"),
+    }
 
     loop {
         match store.get_mode().await {
             Ok(Mode::Stop) => {}
-            Ok(_) => match poll_once(&store, &github).await {
+            Ok(_) => match poll_once(&store, &github, &config.intake).await {
                 Ok(0) => {}
                 Ok(n) => info!(ingested = n, "poll ingested new tasks"),
                 Err(e) => warn!(error = %e, "poll failed"),
@@ -390,7 +400,27 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 /// of the open set, so absence reconciliation
 /// ([`Store::reconcile_closed_issues`]) is only sound on a complete open set. A
 /// partial fetch would read as a mass closure.
-pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, StoreError> {
+///
+/// `intake` narrows the *upsert* half of the pass and nothing else. Three cases
+/// follow from that, and all three are deliberate:
+///
+/// - An issue that gains the label is ingested on the next poll, as an ordinary
+///   first sighting. There is no special path.
+/// - A task whose issue *loses* the label is kept exactly as it is — same row,
+///   same queue position, same `state`, same `dispatch_attempts` — and simply
+///   stops having its snapshot refreshed. Writing `gh_state = Closed` would
+///   persist a label-derived fact into a field that means "the issue is
+///   closed", and the skipped upsert would never correct it; writing
+///   `state = Rejected` would be the poller overriding human-authoritative
+///   state. Un-labelling is not a retraction mechanism — pulling work back is
+///   the API's job.
+/// - That task still tracks upstream closure correctly, because reconciliation
+///   still sees the complete open set.
+pub async fn poll_once(
+    store: &Store,
+    github: &GitHubClient,
+    intake: &IntakeFilter,
+) -> Result<usize, StoreError> {
     let mut ingested = 0;
     for project in store.list_projects().await? {
         let issues = match github
@@ -408,8 +438,15 @@ pub async fn poll_once(store: &Store, github: &GitHubClient) -> Result<usize, St
             }
         };
 
+        // Before the filter, deliberately: `reconcile_closed_issues` reads
+        // absence from this list as an upstream closure, so it has to describe
+        // every issue GitHub returned, not just the ones we ingest. Filtering
+        // first would close every task whose issue merely lost the label.
         let open_numbers: Vec<u64> = issues.iter().map(|issue| issue.number).collect();
         for issue in issues {
+            if !intake.admits(&issue) {
+                continue;
+            }
             let outcome = store.upsert_gh_issue(&project.id, issue).await?;
             if outcome.is_new() {
                 let task = outcome.into_inner();
@@ -907,6 +944,7 @@ mod tests {
             vm_pool_socket: PathBuf::from(DEFAULT_VM_POOL_SOCKET),
             github_token: None,
             github_api_url: None,
+            intake: IntakeFilter::All,
             clone_url_base: DEFAULT_CLONE_URL_BASE.into(),
             scout_base_branch: "main".into(),
             vm_config: VmConfig::default(),
@@ -1046,7 +1084,9 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github).await.unwrap();
+        poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap();
 
         let state_of = async |id: &TaskId| store.get_task(id).await.unwrap().unwrap();
         let queued = state_of(&queued.id).await;
@@ -1098,7 +1138,9 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github).await.unwrap();
+        poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap();
 
         let after = store.get_task(&task.id).await.unwrap().unwrap();
         assert_eq!(after.state, TaskState::InReview, "still a candidate");

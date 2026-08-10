@@ -22,7 +22,7 @@ use vm_pool_service::Service;
 use tasks_protocol::TasksProtocol;
 
 use tasks::events::EventPayload;
-use tasks::github::GitHubClient;
+use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::models::{
     GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
 };
@@ -82,13 +82,19 @@ fn page(nodes: Vec<Value>) -> Value {
 }
 
 fn issue(number: u64, title: &str, state: &str) -> Value {
+    labelled_issue(number, title, state, &[])
+}
+
+fn labelled_issue(number: u64, title: &str, state: &str, labels: &[&str]) -> Value {
     json!({
         "number": number,
         "title": title,
         "body": format!("body of {number}"),
         "state": state,
         "updatedAt": "2026-08-09T00:00:00Z",
-        "labels": { "nodes": [] },
+        "labels": {
+            "nodes": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+        },
     })
 }
 
@@ -119,7 +125,9 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     let store = Store::open_in_memory().await.unwrap();
     let project = insert_project(&store).await;
 
-    let ingested = run::poll_once(&store, &github).await.unwrap();
+    let ingested = run::poll_once(&store, &github, &IntakeFilter::All)
+        .await
+        .unwrap();
     assert_eq!(ingested, 2);
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2);
@@ -135,7 +143,9 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
 
     // Re-poll: nothing new, and the closed issue's task is marked closed
     // without being re-ingested or losing its id.
-    let ingested = run::poll_once(&store, &github).await.unwrap();
+    let ingested = run::poll_once(&store, &github, &IntakeFilter::All)
+        .await
+        .unwrap();
     assert_eq!(ingested, 0);
     let after = store.list_tasks().await.unwrap();
     assert_eq!(after.len(), 2);
@@ -192,7 +202,12 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     let store = Store::open_in_memory().await.unwrap();
     let project = insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 3);
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        3
+    );
     let before = store.list_tasks().await.unwrap();
     assert!(before.iter().all(|t| t.gh_state == GhState::Open));
     let id_of = |number: u64| {
@@ -205,7 +220,9 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     };
 
     assert_eq!(
-        run::poll_once(&store, &github).await.unwrap(),
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
         0,
         "nothing new to ingest"
     );
@@ -235,7 +252,12 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
 
     // The canned server repeats its last page, so a third poll sees the same
     // open set: no further writes, no duplicate events.
-    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 0);
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(gh_state_changes(&store).await.len(), 2);
 }
 
@@ -252,10 +274,20 @@ async fn a_failed_fetch_reconciles_nothing() {
 
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
-    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 2);
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        2
+    );
 
     // The project is skipped, not failed: intake for other projects goes on.
-    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 0);
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        0
+    );
 
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2);
@@ -281,17 +313,26 @@ async fn a_reopened_issue_polls_back_to_open() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github).await.unwrap(), 1);
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        1
+    );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
 
-    run::poll_once(&store, &github).await.unwrap();
+    run::poll_once(&store, &github, &IntakeFilter::All)
+        .await
+        .unwrap();
     assert_eq!(
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Closed
     );
 
     assert_eq!(
-        run::poll_once(&store, &github).await.unwrap(),
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
         0,
         "a reopened issue is the same task, not a new one"
     );
@@ -303,6 +344,221 @@ async fn a_reopened_issue_polls_back_to_open() {
         vec![(task_id, GhState::Closed)],
         "only the poller-inferred closure needs an event of its own"
     );
+}
+
+// --- intake label filter (#761) ---
+
+/// The label filter narrows intake: an issue without the label is never turned
+/// into a task, whatever else it carries.
+#[tokio::test]
+async fn a_label_filter_ingests_only_labelled_issues() {
+    let url = spawn_fake_github(vec![page(vec![
+        labelled_issue(1, "wanted", "OPEN", &["tasks"]),
+        labelled_issue(2, "bare", "OPEN", &[]),
+        labelled_issue(3, "other labels", "OPEN", &["bug", "docs"]),
+        labelled_issue(4, "wanted among others", "OPEN", &["bug", "TASKS"]),
+    ])])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+    let intake = IntakeFilter::from_label(Some("tasks".into()));
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 2);
+    let mut numbers: Vec<u64> = store
+        .list_tasks()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.gh_issue_number)
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(
+        numbers,
+        vec![1, 4],
+        "case-insensitive, absent-label-skipped"
+    );
+}
+
+/// The default: unchanged behaviour for every deployment that never sets
+/// `TASKS_INTAKE_LABEL`.
+#[tokio::test]
+async fn an_unset_filter_ingests_everything() {
+    let url = spawn_fake_github(vec![page(vec![
+        labelled_issue(1, "wanted", "OPEN", &["tasks"]),
+        labelled_issue(2, "bare", "OPEN", &[]),
+    ])])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.list_tasks().await.unwrap().len(), 2);
+}
+
+/// Labelling an issue after the fact is an ordinary first sighting — no special
+/// path, no backfill.
+#[tokio::test]
+async fn an_issue_that_gains_the_label_is_ingested_on_the_next_poll() {
+    let url = spawn_fake_github(vec![
+        page(vec![labelled_issue(1, "not yet", "OPEN", &[])]),
+        page(vec![labelled_issue(1, "now labelled", "OPEN", &["tasks"])]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+    let intake = IntakeFilter::from_label(Some("tasks".into()));
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 0);
+    assert!(store.list_tasks().await.unwrap().is_empty());
+
+    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].title, "now labelled");
+    assert_eq!(tasks[0].state, TaskState::Backlog);
+}
+
+/// Un-labelling is not a retraction mechanism. The task keeps its row, its
+/// queue position and its state; it just stops having its snapshot refreshed.
+///
+/// The `gh_state` assertion here is the regression guard for the whole design:
+/// it fails the moment the filter is moved ahead of `open_numbers`, because
+/// then absence-reconciliation reads the skipped issue as closed.
+#[tokio::test]
+async fn a_task_whose_issue_loses_the_label_is_kept_and_left_alone() {
+    let url = spawn_fake_github(vec![
+        page(vec![labelled_issue(1, "labelled", "OPEN", &["tasks"])]),
+        page(vec![labelled_issue(1, "renamed upstream", "OPEN", &[])]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+    let intake = IntakeFilter::from_label(Some("tasks".into()));
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    let task_id = store.list_tasks().await.unwrap()[0].id.clone();
+    // Picked up by a human before the label came off.
+    store
+        .update_task_state(&task_id, TaskState::Queued)
+        .await
+        .unwrap();
+    store
+        .set_queue_order(std::slice::from_ref(&task_id))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        run::poll_once(&store, &github, &intake).await.unwrap(),
+        0,
+        "nothing new to ingest"
+    );
+
+    let after = store.get_task(&task_id).await.unwrap().unwrap();
+    assert_eq!(after.gh_state, GhState::Open, "the issue is still open");
+    assert_eq!(after.state, TaskState::Queued, "our state is ours to set");
+    assert_eq!(after.manual_rank, Some(1), "and its queue slot is kept");
+    assert_eq!(after.dispatch_attempts, 0);
+    assert_eq!(
+        after.title, "labelled",
+        "the snapshot simply stops being refreshed"
+    );
+    assert!(gh_state_changes(&store).await.is_empty());
+}
+
+/// The payoff of filtering after the fetch rather than in the query: a task the
+/// filter now skips still tracks upstream closure, because reconciliation keeps
+/// seeing the complete open set.
+#[tokio::test]
+async fn an_unlabelled_task_still_tracks_upstream_closure() {
+    let url = spawn_fake_github(vec![
+        page(vec![labelled_issue(1, "labelled", "OPEN", &["tasks"])]),
+        // Label removed upstream, issue still open: skipped by intake.
+        page(vec![labelled_issue(1, "labelled", "OPEN", &[])]),
+        // And now closed: gone from the open set entirely.
+        page(vec![]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+    let intake = IntakeFilter::from_label(Some("tasks".into()));
+
+    let store = Store::open_in_memory().await.unwrap();
+    insert_project(&store).await;
+
+    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    let task_id = store.list_tasks().await.unwrap()[0].id.clone();
+
+    run::poll_once(&store, &github, &intake).await.unwrap();
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().gh_state,
+        GhState::Open
+    );
+
+    run::poll_once(&store, &github, &intake).await.unwrap();
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().gh_state,
+        GhState::Closed,
+        "absence from the open set is still a closure"
+    );
+    assert_eq!(
+        gh_state_changes(&store).await,
+        vec![(task_id, GhState::Closed)]
+    );
+}
+
+/// The wiring, not just the predicate: `Config.intake` has to reach `poll_once`
+/// through `poll_loop`.
+#[tokio::test]
+async fn poll_loop_honours_the_configured_intake_label() {
+    let github_url = spawn_fake_github(vec![page(vec![
+        labelled_issue(1, "wanted", "OPEN", &["tasks"]),
+        labelled_issue(2, "bare", "OPEN", &[]),
+    ])])
+    .await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    insert_project(&store).await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let mut config = test_config(Path::new("/nonexistent"), Path::new("/nonexistent"), 1);
+    config.github_token = Some("token".into());
+    config.github_api_url = Some(github_url);
+    config.poll_interval = Duration::from_millis(50);
+    config.intake = IntakeFilter::from_label(Some("tasks".into()));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::poll_loop(store.clone(), config, shutdown_rx));
+
+    let s = store.clone();
+    wait_until(Duration::from_secs(10), || {
+        let s = s.clone();
+        async move { !s.list_tasks().await.unwrap().is_empty() }
+    })
+    .await;
+    // Several more passes: asserting the count right after the first sighting
+    // would pass even if the unlabelled issue were merely one tick behind.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1, "the unlabelled issue never arrives");
+    assert_eq!(tasks[0].gh_issue_number, 1);
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("poll loop exits on shutdown")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -384,6 +640,7 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         vm_pool_socket: vm_pool_socket.to_path_buf(),
         github_token: None,
         github_api_url: None,
+        intake: IntakeFilter::All,
         clone_url_base: format!("file://{}", clone_root.display()),
         scout_base_branch: "main".into(),
         vm_config: VmConfig::default(),

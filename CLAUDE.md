@@ -73,6 +73,7 @@ env / `.env`:
 | --- | --- | --- |
 | `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
 | `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
+| `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
 | `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |

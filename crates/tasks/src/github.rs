@@ -14,6 +14,11 @@ use crate::models::GhState;
 const DEFAULT_BASE_URL: &str = "https://api.github.com/graphql";
 const DEFAULT_REST_BASE_URL: &str = "https://api.github.com";
 const PAGE_SIZE: u32 = 100;
+/// Labels requested per issue. GitHub caps an issue at 100 labels, so this is
+/// "all of them" — and it has to be, because [`IntakeFilter`] reads a truncated
+/// label list as "the intake label is absent" and drops the issue from intake
+/// with nothing to say why.
+const LABEL_PAGE_SIZE: u32 = 100;
 const CLOSE_INFO_BATCH: usize = 50;
 
 #[derive(Debug, Error)]
@@ -37,6 +42,59 @@ pub struct GhIssue {
     pub labels: Vec<String>,
     pub state: GhState,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Which fetched issues are allowed into intake (`TASKS_INTAKE_LABEL`).
+///
+/// Applied by [`crate::run::poll_once`] *after* the fetch, never as a `labels:`
+/// argument on the GraphQL query: [`crate::store::Store::reconcile_closed_issues`]
+/// infers upstream closure from absence from the open set, so it must keep
+/// receiving the *complete* open set. Filtering in the query would make every
+/// task whose issue merely lost the label look closed. The cost is that the
+/// poller still pages through every open issue — deliberate; this is not an
+/// API-cost optimization.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum IntakeFilter {
+    /// Every open issue is ingested. The default, and what every deployment
+    /// that never sets `TASKS_INTAKE_LABEL` gets.
+    #[default]
+    All,
+    /// Only issues carrying this label are ingested.
+    Label(String),
+}
+
+impl IntakeFilter {
+    /// Resolve the configured label. Absent, empty, or whitespace-only all read
+    /// as [`IntakeFilter::All`] — a bare `TASKS_INTAKE_LABEL=` in a `.env` means
+    /// "unset", not "a label no issue can carry", which would silently halt all
+    /// intake.
+    pub fn from_label(label: Option<String>) -> Self {
+        match label {
+            Some(label) if !label.trim().is_empty() => Self::Label(label.trim().to_string()),
+            _ => Self::All,
+        }
+    }
+
+    /// Whether this issue may be ingested. Matching is ASCII-case-insensitive:
+    /// GitHub refuses to create two labels differing only in case, so a
+    /// case-sensitive match would just be a footgun (`Tasks` vs `tasks`).
+    pub fn admits(&self, issue: &GhIssue) -> bool {
+        match self {
+            Self::All => true,
+            Self::Label(want) => issue
+                .labels
+                .iter()
+                .any(|have| have.eq_ignore_ascii_case(want)),
+        }
+    }
+
+    /// The configured label, for startup logging.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::Label(label) => Some(label),
+        }
+    }
 }
 
 /// How a specific issue looks right now — state plus GitHub's close reason
@@ -239,7 +297,7 @@ impl GitHubClient {
         after: Option<&str>,
     ) -> Result<(Vec<GhIssue>, Option<String>), GhError> {
         let query = r#"
-        query($owner: String!, $name: String!, $after: String, $first: Int!) {
+        query($owner: String!, $name: String!, $after: String, $first: Int!, $labelFirst: Int!) {
           repository(owner: $owner, name: $name) {
             issues(states: [OPEN], first: $first, after: $after, orderBy: { field: UPDATED_AT, direction: DESC }) {
               pageInfo { hasNextPage endCursor }
@@ -249,7 +307,7 @@ impl GitHubClient {
                 body
                 state
                 updatedAt
-                labels(first: 20) { nodes { name } }
+                labels(first: $labelFirst) { nodes { name } }
               }
             }
           }
@@ -263,6 +321,7 @@ impl GitHubClient {
                 name,
                 after,
                 first: PAGE_SIZE,
+                label_first: LABEL_PAGE_SIZE,
             },
         };
 
@@ -350,6 +409,8 @@ struct Variables<'a> {
     name: &'a str,
     after: Option<&'a str>,
     first: u32,
+    #[serde(rename = "labelFirst")]
+    label_first: u32,
 }
 
 #[derive(Deserialize)]
@@ -590,6 +651,89 @@ mod tests {
             GhError::GraphQl(msg) => assert!(msg.contains("Bad credentials")),
             other => panic!("expected GraphQl error, got {other:?}"),
         }
+    }
+
+    /// The default filter is a no-op: every deployment that never sets
+    /// `TASKS_INTAKE_LABEL` keeps ingesting everything.
+    #[tokio::test]
+    async fn unset_filter_admits_every_issue() {
+        let responses = vec![page(
+            vec![
+                issue(1, "labelled", &["tasks"]),
+                issue(2, "bare", &[]),
+                issue(3, "other", &["bug", "docs"]),
+            ],
+            false,
+            None,
+        )];
+        let (url, _q, _h) = spawn_fake(responses).await;
+        let client = GitHubClient::with_base_url("token", url);
+        let issues = client.list_open_issues("own", "repo").await.unwrap();
+
+        let filter = IntakeFilter::default();
+        assert_eq!(filter, IntakeFilter::All);
+        assert!(issues.iter().all(|i| filter.admits(i)));
+        assert_eq!(filter.label(), None);
+    }
+
+    #[tokio::test]
+    async fn label_filter_admits_only_labelled_issues() {
+        let responses = vec![page(
+            vec![
+                issue(1, "labelled", &["tasks"]),
+                issue(2, "bare", &[]),
+                issue(3, "other labels", &["bug", "docs"]),
+                issue(4, "labelled among others", &["bug", "tasks"]),
+            ],
+            false,
+            None,
+        )];
+        let (url, _q, _h) = spawn_fake(responses).await;
+        let client = GitHubClient::with_base_url("token", url);
+        let issues = client.list_open_issues("own", "repo").await.unwrap();
+
+        let filter = IntakeFilter::from_label(Some("tasks".into()));
+        let admitted: Vec<u64> = issues
+            .iter()
+            .filter(|i| filter.admits(i))
+            .map(|i| i.number)
+            .collect();
+        assert_eq!(admitted, vec![1, 4]);
+        assert_eq!(filter.label(), Some("tasks"));
+    }
+
+    /// GitHub itself refuses two labels differing only in ASCII case, so a
+    /// case-sensitive match would only ever be a configuration footgun.
+    #[tokio::test]
+    async fn label_matching_is_case_insensitive() {
+        let responses = vec![page(vec![issue(1, "shouty", &["TASKS"])], false, None)];
+        let (url, _q, _h) = spawn_fake(responses).await;
+        let client = GitHubClient::with_base_url("token", url);
+        let issues = client.list_open_issues("own", "repo").await.unwrap();
+
+        assert!(IntakeFilter::from_label(Some("tasks".into())).admits(&issues[0]));
+        assert!(IntakeFilter::from_label(Some("Tasks".into())).admits(&issues[0]));
+    }
+
+    /// A blank or whitespace-only value means "unset". The alternative — a label
+    /// no issue can carry — would silently halt all intake.
+    #[tokio::test]
+    async fn blank_label_reads_as_unset() {
+        let responses = vec![page(vec![issue(1, "bare", &[])], false, None)];
+        let (url, _q, _h) = spawn_fake(responses).await;
+        let client = GitHubClient::with_base_url("token", url);
+        let issues = client.list_open_issues("own", "repo").await.unwrap();
+
+        for raw in [None, Some(String::new()), Some("   ".into())] {
+            let filter = IntakeFilter::from_label(raw);
+            assert_eq!(filter, IntakeFilter::All);
+            assert!(filter.admits(&issues[0]));
+        }
+        // Surrounding whitespace on a real label is trimmed, not honoured.
+        assert_eq!(
+            IntakeFilter::from_label(Some("  tasks \n".into())),
+            IntakeFilter::Label("tasks".into())
+        );
     }
 
     #[tokio::test]
