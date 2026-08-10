@@ -52,12 +52,13 @@ the server only.
 - `GET /tasks` — already in queue order; render it as-is, don't re-sort.
   Task: `{id, project_id, gh_issue_number, title, body, labels, gh_state,
   state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at}`.
-  By default the list **omits tasks with `gh_state: "closed"` and
-  `state: "backlog"`** — issues that were closed on GitHub before any work started,
-  i.e. pure intake noise. Every other task stays visible whatever its
-  `gh_state`, so in-flight and historical work never disappears from the list
-  because someone closed the issue behind it. `GET /tasks?all=true` returns
-  every row including the closed intake. Ordering is identical either way.
+  By default the list **omits tasks whose issue is closed on GitHub and whose
+  state is `backlog`, `done`, or `rejected`** — closed-before-any-work intake
+  noise, and work already concluded (closure-derived retirement's output).
+  In-flight work stays visible whatever its `gh_state` (the poller retires it
+  properly), and a `done`/`rejected` task whose issue is still *open* also
+  shows — that's the "close the issue or re-queue?" decision surface.
+  `GET /tasks?all=true` returns every row. Ordering is identical either way.
 - `GET /sessions` / `GET /sessions/{id}` — scout runs.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,

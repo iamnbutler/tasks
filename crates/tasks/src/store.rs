@@ -210,22 +210,28 @@ impl Store {
         rows.into_iter().map(task_from_row).collect()
     }
 
-    /// [`Self::list_tasks`] minus pure intake noise: tasks whose issue is closed
-    /// on GitHub and that never left `new`.
+    /// [`Self::list_tasks`] minus rows whose story is over: tasks whose issue
+    /// is closed on GitHub and that are either untouched intake noise
+    /// (`backlog`) or work already concluded (`done` / `rejected` — closure
+    /// -derived retirement's output).
     ///
-    /// Anything further along the pipeline stays visible whatever GitHub thinks
-    /// of the issue — in-flight and historical work must not vanish from a
-    /// client's list because someone closed the issue behind it. Ordering is
-    /// identical to [`Self::list_tasks`].
+    /// Everything in between stays visible whatever GitHub thinks of the
+    /// issue — in-flight work must not vanish from a client's list because
+    /// someone closed the issue behind it; the poller will retire it properly.
+    /// A terminal task whose issue is still *open* also stays visible: it is
+    /// the "close the issue or re-queue?" decision surface. Full history is
+    /// [`Self::list_tasks`] (`GET /tasks?all=true`). Ordering is identical.
     pub async fn list_active_tasks(&self) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
              state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE NOT (gh_state = ? AND state = ?) \
+             FROM tasks WHERE NOT (gh_state = ? AND state IN (?, ?, ?)) \
              ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
         )
         .bind(GhState::Closed.as_str())
         .bind(TaskState::Backlog.as_str())
+        .bind(TaskState::Done.as_str())
+        .bind(TaskState::Rejected.as_str())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
