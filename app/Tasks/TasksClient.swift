@@ -53,6 +53,47 @@ struct TasksClient: Sendable {
         return try await post("spec-queue/\(specId)/review", body: body)
     }
 
+    /// Catch-up read of a session transcript. `since` is inclusive; a tailing
+    /// client passes `last_seq + 1`. Server default limit 500, cap 2000.
+    func transcript(sessionId: String, since: Int64 = 0, limit: Int = 500)
+        async throws -> [TranscriptLine]
+    {
+        try await get(
+            "sessions/\(sessionId)/transcript",
+            query: [
+                URLQueryItem(name: "since", value: "\(since)"),
+                URLQueryItem(name: "limit", value: "\(limit)"),
+            ])
+    }
+
+    /// SSE tail of a session transcript: the server replays everything from
+    /// `since` (paging internally, no holes), then streams live lines.
+    /// Subscribe only while a session-detail view is open.
+    func transcriptStream(sessionId: String, since: Int64 = 0)
+        -> AsyncThrowingStream<TranscriptLine, Error>
+    {
+        let url = baseURL
+            .appending(path: "sessions/\(sessionId)/transcript/stream")
+            .appending(queryItems: [URLQueryItem(name: "since", value: "\(since)")])
+        return AsyncThrowingStream { continuation in
+            let reader = Task {
+                do {
+                    let (bytes, response) = try await URLSession.shared.bytes(from: url)
+                    try Self.checkOK(response)
+                    let decoder = Self.makeDecoder()
+                    for try await raw in bytes.lines where raw.hasPrefix("data: ") {
+                        let payload = Data(raw.dropFirst("data: ".count).utf8)
+                        continuation.yield(try decoder.decode(TranscriptLine.self, from: payload))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in reader.cancel() }
+        }
+    }
+
     enum SSESignal: Sendable {
         /// Response head received — the server-side subscription exists, so a
         /// snapshot taken now can't miss events (clients.md: stream first,
@@ -96,8 +137,12 @@ struct TasksClient: Sendable {
         return try Self.makeDecoder().decode(T.self, from: data)
     }
 
-    private func get<T: Decodable>(_ path: String) async throws -> T {
-        let (data, response) = try await URLSession.shared.data(from: baseURL.appending(path: path))
+    private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+        var url = baseURL.appending(path: path)
+        if !query.isEmpty {
+            url = url.appending(queryItems: query)
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
         try Self.checkOK(response, body: data)
         return try Self.makeDecoder().decode(T.self, from: data)
     }

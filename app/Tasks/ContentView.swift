@@ -186,6 +186,12 @@ struct TaskRow: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
+            // A closed issue on a non-terminal task usually means the work
+            // shipped outside the pipeline — make that legible.
+            if task.ghState == .closed {
+                StatusBadge(text: "closed", color: .purple)
+                    .help("GitHub issue is closed (as of the last poll)")
+            }
             StatusBadge(text: task.state.wire, color: task.state.color)
         }
         .padding(.vertical, 2)
