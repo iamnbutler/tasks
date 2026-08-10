@@ -406,3 +406,34 @@ enum BuildStatus: WireEnum {
         }
     }
 }
+
+/// One turn in the orchestrator conversation (the Chat pane).
+struct ChatMessage: Decodable, Identifiable, Hashable {
+    let seq: Int64
+    let role: ChatRole
+    let content: String
+    let createdAt: Date
+
+    var id: Int64 { seq }
+}
+
+enum ChatRole: WireEnum {
+    case user, assistant
+    case unknown(String)
+
+    init(wire: String) {
+        switch wire {
+        case "user": self = .user
+        case "assistant": self = .assistant
+        default: self = .unknown(wire)
+        }
+    }
+
+    var wire: String {
+        switch self {
+        case .user: "user"
+        case .assistant: "assistant"
+        case .unknown(let raw): raw
+        }
+    }
+}

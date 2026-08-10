@@ -168,6 +168,19 @@ struct TasksClient: Sendable {
         return try await post("builds", body: Body(specIds: specIds))
     }
 
+    func orchestratorMessages(since: Int64 = 0) async throws -> [ChatMessage] {
+        try await get(
+            "orchestrator/messages",
+            query: [URLQueryItem(name: "since", value: String(since))])
+    }
+
+    /// 202: the message is queued; the orchestrator's reply arrives as an
+    /// `orchestrator_message` event -> refresh.
+    func sendOrchestratorMessage(_ content: String) async throws -> ChatMessage {
+        struct Body: Encodable { let content: String }
+        return try await post("orchestrator/messages", body: Body(content: content))
+    }
+
     private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"

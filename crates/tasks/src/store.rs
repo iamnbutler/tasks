@@ -11,9 +11,10 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Build, BuildId, BuildStatus, Complexity, GhState, Mode, Project, ProjectId, ReviewedSpec,
-    Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorMessage, Project,
+    ProjectId, ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
+    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
+    TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -1795,6 +1796,96 @@ impl Store {
         self.get_build(id)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("build {id}")))
+    }
+
+    // --- orchestrator ---
+
+    /// Append one conversation turn and emit [`EventPayload::OrchestratorMessage`].
+    pub async fn append_orchestrator_message(
+        &self,
+        role: ChatRole,
+        content: &str,
+    ) -> Result<OrchestratorMessage, StoreError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "INSERT INTO orchestrator_messages (role, content, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(role.as_str())
+        .bind(content)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let seq = result.last_insert_rowid();
+        self.append_event(EventPayload::OrchestratorMessage { seq, role })
+            .await?;
+        Ok(OrchestratorMessage {
+            seq,
+            role,
+            content: content.to_string(),
+            created_at: now,
+        })
+    }
+
+    /// Messages with `seq > since`, oldest first.
+    pub async fn orchestrator_messages_since(
+        &self,
+        since: i64,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let role_raw: String = row.try_get("role")?;
+                Ok(OrchestratorMessage {
+                    seq: row.try_get("seq")?,
+                    role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
+                        column: "role",
+                        value: role_raw,
+                    })?,
+                    content: row.try_get("content")?,
+                    created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The user turns the orchestrator has not answered yet: every message
+    /// after the last assistant turn. Empty when the conversation is settled.
+    /// This is the tick condition — DB-derived, so a crash between a user
+    /// message and its reply just means the next loop pass answers it.
+    pub async fn unanswered_orchestrator_messages(
+        &self,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let last_assistant: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM orchestrator_messages WHERE role = ?",
+        )
+        .bind(ChatRole::Assistant.as_str())
+        .fetch_one(&self.pool)
+        .await?
+        .try_get("s")?;
+        self.orchestrator_messages_since(last_assistant).await
+    }
+
+    pub async fn orchestrator_cc_session(&self) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT cc_session_id FROM orchestrator WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("cc_session_id")?)
+    }
+
+    pub async fn set_orchestrator_cc_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // --- mode ---

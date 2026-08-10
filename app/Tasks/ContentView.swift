@@ -114,10 +114,7 @@ struct ContentView: View {
         case .activity:
             ActivityFeed(unreadBoundary: unreadBoundary)
         case .chat:
-            ContentUnavailableView(
-                "No orchestrator yet",
-                systemImage: "bubble.left.and.bubble.right",
-                description: Text("The orchestrator session ships next — this is where you'll talk to it."))
+            ChatView()
         }
     }
 
@@ -444,6 +441,7 @@ struct ActivityFeed: View {
         case "build_started": "hammer.circle"
         case "build_completed": "checkmark.seal"
         case "pull_request_opened": "arrow.triangle.branch"
+        case "orchestrator_message": "bubble.left.and.bubble.right"
         case "mode_changed": "playpause"
         case "note": "text.bubble"
         case "project_added": "folder.badge.plus"
@@ -488,6 +486,8 @@ struct ActivityFeed: View {
                 return "Pull request #\(pr) opened"
             }
             return "Pull request opened"
+        case "orchestrator_message":
+            return "Orchestrator conversation updated"
         case "mode_changed":
             return "Mode: \(event.from ?? "?") → \(event.to ?? "?")"
         case "note":
@@ -496,6 +496,113 @@ struct ActivityFeed: View {
             return "Project added"
         default:
             return event.kind.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
+// MARK: - Chat
+
+/// The orchestrator conversation: a persistent Claude Code session on the
+/// server that can inspect and drive the pipeline over the API when asked.
+struct ChatView: View {
+    @Environment(AppModel.self) private var model
+    @State private var draft = ""
+    @State private var sending = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if model.chat.isEmpty {
+                            ContentUnavailableView(
+                                "Talk to the orchestrator",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: Text(
+                                    "Ask about status, or tell it to queue, scout, or build work."))
+                                .padding(.top, 60)
+                        }
+                        ForEach(model.chat) { message in
+                            ChatBubble(message: message)
+                                .id(message.seq)
+                        }
+                        if awaitingReply {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Orchestrator is thinking…")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 4)
+                            .id(Int64.max)
+                        }
+                    }
+                    .padding(12)
+                }
+                .onChange(of: model.chat.last?.seq) {
+                    if let last = model.chat.last?.seq {
+                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                    }
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                TextField("Message the orchestrator…", text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .onSubmit(send)
+                Button(action: send) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(10)
+        }
+        .navigationTitle("Chat")
+    }
+
+    /// The last turn is the human's: a reply is on its way.
+    private var awaitingReply: Bool {
+        model.chat.last?.role == .user
+    }
+
+    private func send() {
+        let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty, !sending else { return }
+        draft = ""
+        sending = true
+        Task {
+            await model.sendChat(content)
+            sending = false
+        }
+    }
+}
+
+struct ChatBubble: View {
+    let message: ChatMessage
+
+    var body: some View {
+        HStack {
+            if message.role == .user { Spacer(minLength: 60) }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(message.content)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        message.role == .user
+                            ? AnyShapeStyle(Color.accentColor.opacity(0.85))
+                            : AnyShapeStyle(.quaternary.opacity(0.6)),
+                        in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(message.role == .user ? .white : .primary)
+                Text(message.createdAt, style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+            }
+            if message.role != .user { Spacer(minLength: 60) }
         }
     }
 }
