@@ -51,22 +51,20 @@ final class AppModel {
         await refresh()
     }
 
-    /// Optimistic drag-reorder. The response body is deliberately discarded:
-    /// POST /queue/reorder returns the *unfiltered* task list, which is not
-    /// the queue projection GET /tasks serves — consuming it floods the list
-    /// with hidden closed tasks mid-gesture. GET /tasks stays the single
-    /// source of truth; refresh() reconciles either way.
+    /// Optimistic drag-reorder; the server's answer (or a refresh on failure)
+    /// is authoritative. Since #770 the reorder response is the same filtered
+    /// projection as GET /tasks, so applying it directly is safe.
     func moveTasks(from source: IndexSet, to destination: Int) {
         var reordered = tasks
         reordered.move(fromOffsets: source, toOffset: destination)
         tasks = reordered
         Task {
             do {
-                _ = try await client.reorderQueue(reordered.map(\.id))
+                tasks = try await client.reorderQueue(reordered.map(\.id))
             } catch {
                 connectionError = error.localizedDescription
+                await refresh()
             }
-            await refresh()
         }
     }
 
