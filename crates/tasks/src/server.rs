@@ -204,12 +204,15 @@ struct ReorderQueue {
     task_ids: Vec<TaskId>,
 }
 
+/// Returns the same projection as the default `GET /tasks` — a client applies
+/// the response in place of its list, so handing back the unfiltered variant
+/// here would resurrect the closed-intake rows the default read hides.
 async fn reorder_queue(
     State(store): State<Arc<Store>>,
     Json(body): Json<ReorderQueue>,
 ) -> ApiResult<Json<Vec<Task>>> {
     store.set_queue_order(&body.task_ids).await?;
-    Ok(Json(store.list_tasks().await?))
+    Ok(Json(store.list_active_tasks().await?))
 }
 
 // --- sessions ---
@@ -722,6 +725,28 @@ mod tests {
             .collect();
         assert_eq!(all.len(), 3);
         assert!(all.contains(&closed_new.id));
+
+        // The reorder response is the same projection as the default read — a
+        // client swaps it in for its list, so the unfiltered variant here
+        // would resurrect the hidden closed-intake rows.
+        let reordered: Vec<TaskId> = http
+            .post(format!("{base}/queue/reorder"))
+            .json(&serde_json::json!({ "task_ids": [open_new.id] }))
+            .send()
+            .await
+            .unwrap()
+            .json::<Vec<Task>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(reordered.contains(&open_new.id));
+        assert!(reordered.contains(&closed_spec_ready.id));
+        assert!(
+            !reordered.contains(&closed_new.id),
+            "reorder must not resurrect hidden closed tasks"
+        );
     }
 
     #[tokio::test]
