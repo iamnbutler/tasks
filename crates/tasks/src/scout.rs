@@ -489,6 +489,12 @@ impl TranscriptSink {
 }
 
 /// Cut an over-long line on a char boundary and say how much went missing.
+///
+/// The `[tasks: truncated ` prefix is a cross-language contract: a cut
+/// stream-json record is no longer valid JSON, and the app
+/// (`app/Tasks/TranscriptView.swift`) matches this prefix to label the line
+/// "truncated record" rather than dumping a wall of escaped JSON. The wording
+/// after the prefix can change; the prefix can't.
 fn truncate_line(line: String) -> String {
     if line.len() <= MAX_TRANSCRIPT_LINE_BYTES {
         return line;
@@ -866,6 +872,31 @@ mod tests {
 
         let short = "left alone".to_string();
         assert_eq!(truncate_line(short.clone()), short);
+    }
+
+    #[test]
+    fn a_cut_stream_json_record_stops_being_json_but_stays_marked() {
+        // Why the app needs the marker: one `Read` of a moderately large file
+        // is enough to blow the per-line cap, and what's left is no longer a
+        // parseable record — only the marker says why.
+        let record = serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "content": "y".repeat(MAX_TRANSCRIPT_LINE_BYTES),
+                }],
+            },
+        })
+        .to_string();
+        assert!(serde_json::from_str::<serde_json::Value>(&record).is_ok());
+
+        let cut = truncate_line(record);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&cut).is_err(),
+            "a cut record must stop parsing — that's what puts it in the app's raw path"
+        );
+        assert!(cut.contains("[tasks: truncated "));
     }
 
     #[test]
