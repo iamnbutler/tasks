@@ -43,11 +43,12 @@ impl<P: AppProtocol> VmTransport<P> {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "failed to get stdin"))?;
+            .ok_or_else(|| std::io::Error::other("failed to get stdin"))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "failed to get stdout")
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("failed to get stdout"))?;
 
         let (events_tx, events_rx) = mpsc::channel(64);
         tokio::spawn(read_events::<P>(stdout, events_tx));

@@ -164,23 +164,20 @@ pub struct LogLine {
 
 /// Priority level for VM allocation. Higher priority VMs can evict
 /// lower priority ones when the pool is full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// Background/batch work. First to be evicted.
     Low = 0,
     /// Normal interactive work.
+    #[default]
     Normal = 1,
     /// Urgent work. Can evict Low and Normal.
     High = 2,
     /// Critical work. Can evict anything below.
     Critical = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 impl fmt::Display for Priority {
