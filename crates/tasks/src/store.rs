@@ -11,9 +11,10 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Build, BuildId, BuildStatus, Complexity, GhState, Mode, Project, ProjectId, ReviewedSpec,
-    Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorFeedEvent,
+    OrchestratorMessage, Project, ProjectId, ReviewedSpec, Session, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -44,6 +45,11 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 /// agent output is far higher-rate, and a session-detail view that lags briefly
 /// should resync rather than lose its place.
 const TRANSCRIPT_BROADCAST_CAPACITY: usize = 4096;
+
+/// Capacity of the orchestrator live-feed channel. Sized like the transcript
+/// one (token deltas are high-rate); a lagged subscriber just misses deltas —
+/// the durable message arrives via `orchestrator_messages` regardless.
+const ORCHESTRATOR_FEED_CAPACITY: usize = 4096;
 
 /// `exit_reason` written to sessions that were still `running` when the server
 /// came back up.
@@ -92,24 +98,43 @@ pub struct Store {
     pool: SqlitePool,
     event_tx: broadcast::Sender<Event>,
     transcript_tx: broadcast::Sender<TranscriptLine>,
+    orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
 }
 
 impl Store {
     /// Open (creating if necessary) a SQLite database at the given path and run migrations.
+    ///
+    /// WAL + a busy timeout are load-bearing: the pool holds 8 connections
+    /// shared by the poller, the dispatch/build/orchestrator loops, transcript
+    /// batch writes from live scouts, and the API's parallel reads. With the
+    /// defaults (rollback journal, busy_timeout 0) any overlap fails instantly
+    /// with `SQLITE_BUSY` ("database is locked") instead of waiting its turn —
+    /// seen live the first time a scout streamed transcripts while the app
+    /// refreshed.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        let url = format!("sqlite://{}?mode=rwc", path.display());
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+
+        let options = SqliteConnectOptions::new()
+            .filename(path.as_ref())
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            // NORMAL is durable enough under WAL (a power cut can lose the
+            // tail of the log, never corrupt) and avoids an fsync per commit.
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
-            .connect(&url)
+            .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
         Ok(Self {
             pool,
             event_tx,
             transcript_tx,
+            orchestrator_feed_tx,
         })
     }
 
@@ -122,10 +147,12 @@ impl Store {
         MIGRATOR.run(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
+        let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
         Ok(Self {
             pool,
             event_tx,
             transcript_tx,
+            orchestrator_feed_tx,
         })
     }
 
@@ -1023,6 +1050,37 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+
+        // Invariant sweep: no live spec-queue entry may belong to a concluded
+        // task. `retire_task` maintains this inline; rows retired before that
+        // existed (or by any future gap) are healed here at startup, so a
+        // stale approved spec can never sit where `create_build` would
+        // consume it.
+        let stale_spec_rows = sqlx::query(
+            "SELECT q.spec_id, q.status FROM spec_queue q \
+             JOIN specs s ON s.id = q.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE t.state IN (?, ?) AND q.status IN (?, ?, ?, ?)",
+        )
+        .bind(TaskState::Done.as_str())
+        .bind(TaskState::Rejected.as_str())
+        .bind(SpecQueueStatus::PendingReview.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(SpecQueueStatus::NeedsRevision.as_str())
+        .bind(SpecQueueStatus::Blocked.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut drained_specs = Vec::new();
+        for row in stale_spec_rows {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            let from_raw: String = row.try_get("status")?;
+            sqlx::query("UPDATE spec_queue SET status = ?, rank = NULL WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Rejected.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            drained_specs.push((spec_id, SpecQueueStatus::from_str(&from_raw)));
+        }
         tx.commit().await?;
 
         let report = ReconcileReport {
@@ -1059,6 +1117,14 @@ impl Store {
                 task_id,
                 from: TaskState::Building,
                 to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        for (spec_id, from) in drained_specs {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from,
+                to: SpecQueueStatus::Rejected,
             })
             .await?;
         }
@@ -1756,6 +1822,108 @@ impl Store {
         self.get_build(id)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("build {id}")))
+    }
+
+    // --- orchestrator ---
+
+    /// Append one conversation turn and emit [`EventPayload::OrchestratorMessage`].
+    pub async fn append_orchestrator_message(
+        &self,
+        role: ChatRole,
+        content: &str,
+    ) -> Result<OrchestratorMessage, StoreError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "INSERT INTO orchestrator_messages (role, content, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(role.as_str())
+        .bind(content)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let seq = result.last_insert_rowid();
+        self.append_event(EventPayload::OrchestratorMessage { seq, role })
+            .await?;
+        Ok(OrchestratorMessage {
+            seq,
+            role,
+            content: content.to_string(),
+            created_at: now,
+        })
+    }
+
+    /// Publish one moment of an in-flight tick to live-feed subscribers.
+    /// Fire-and-forget: no subscribers, no problem — nothing is persisted.
+    pub fn publish_orchestrator_feed(&self, event: OrchestratorFeedEvent) {
+        let _ = self.orchestrator_feed_tx.send(event);
+    }
+
+    /// Live feed of the in-flight orchestrator tick (`/orchestrator/stream`).
+    /// A lagged subscriber misses deltas, never the durable message.
+    pub fn subscribe_orchestrator_feed(&self) -> broadcast::Receiver<OrchestratorFeedEvent> {
+        self.orchestrator_feed_tx.subscribe()
+    }
+
+    /// Messages with `seq > since`, oldest first.
+    pub async fn orchestrator_messages_since(
+        &self,
+        since: i64,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let role_raw: String = row.try_get("role")?;
+                Ok(OrchestratorMessage {
+                    seq: row.try_get("seq")?,
+                    role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
+                        column: "role",
+                        value: role_raw,
+                    })?,
+                    content: row.try_get("content")?,
+                    created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The user turns the orchestrator has not answered yet: every message
+    /// after the last assistant turn. Empty when the conversation is settled.
+    /// This is the tick condition — DB-derived, so a crash between a user
+    /// message and its reply just means the next loop pass answers it.
+    pub async fn unanswered_orchestrator_messages(
+        &self,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let last_assistant: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM orchestrator_messages WHERE role = ?",
+        )
+        .bind(ChatRole::Assistant.as_str())
+        .fetch_one(&self.pool)
+        .await?
+        .try_get("s")?;
+        self.orchestrator_messages_since(last_assistant).await
+    }
+
+    pub async fn orchestrator_cc_session(&self) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT cc_session_id FROM orchestrator WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("cc_session_id")?)
+    }
+
+    pub async fn set_orchestrator_cc_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // --- mode ---
@@ -3996,5 +4164,45 @@ mod tests {
         );
         let err = store.create_build(&[spec.id], "main").await.unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
+    }
+
+    /// Rows retired before the inline drain existed (or via any future gap)
+    /// are healed at startup: no live queue entry may belong to a concluded
+    /// task.
+    #[tokio::test]
+    async fn startup_reconcile_drains_specs_of_concluded_tasks() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+        // Conclude the task behind the queue's back (as pre-drain retirement did).
+        store
+            .update_task_state(&task.id, TaskState::Done)
+            .await
+            .unwrap();
+
+        store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Rejected
+        );
+
+        // A live task's approved spec is untouched.
+        let (_t2, live) = approved_spec(&store, &project, 2).await;
+        store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&live.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Approved
+        );
     }
 }

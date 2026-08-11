@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    BuildId, BuildStatus, GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId,
+    BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId,
     SpecQueueStatus, TaskId, TaskState,
 };
 
@@ -93,6 +93,12 @@ pub enum EventPayload {
     PullRequestOpened {
         build_id: BuildId,
         pr_number: u64,
+    },
+    /// A turn was appended to the orchestrator conversation. Content is on
+    /// the message row — refetch `/orchestrator/messages?since=`.
+    OrchestratorMessage {
+        seq: i64,
+        role: ChatRole,
     },
     ModeChanged {
         from: Mode,

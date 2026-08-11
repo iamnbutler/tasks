@@ -154,6 +154,60 @@ struct TasksClient: Sendable {
         }
     }
 
+    func builds() async throws -> [BuildItem] {
+        try await get("builds")
+    }
+
+    /// Queue a Builder run over approved specs. 202: the response is the
+    /// queued build, not a finished one — the serial loop picks it up.
+    func requestBuild(specIds: [String]) async throws -> BuildItem {
+        struct Body: Encodable {
+            let specIds: [String]
+            enum CodingKeys: String, CodingKey { case specIds = "spec_ids" }
+        }
+        return try await post("builds", body: Body(specIds: specIds))
+    }
+
+    func orchestratorMessages(since: Int64 = 0) async throws -> [ChatMessage] {
+        try await get(
+            "orchestrator/messages",
+            query: [URLQueryItem(name: "since", value: String(since))])
+    }
+
+    /// 202: the message is queued; the orchestrator's reply arrives as an
+    /// `orchestrator_message` event -> refresh.
+    func sendOrchestratorMessage(_ content: String) async throws -> ChatMessage {
+        struct Body: Encodable { let content: String }
+        return try await post("orchestrator/messages", body: Body(content: content))
+    }
+
+    /// SSE feed of the in-flight orchestrator tick: text deltas, tool-call
+    /// labels, and `done`. Ephemeral — no backfill; a (re)connect only sees
+    /// what happens next, and the durable reply always arrives via
+    /// `orchestratorMessages`. Finishes when the server closes the
+    /// connection; the caller owns reconnect policy.
+    func orchestratorFeed() -> AsyncThrowingStream<OrchestratorFeedFrame, Error> {
+        let url = baseURL.appending(path: "orchestrator/stream")
+        return AsyncThrowingStream { continuation in
+            let reader = Task {
+                do {
+                    let (bytes, response) = try await URLSession.shared.bytes(from: url)
+                    try Self.checkOK(response)
+                    let decoder = Self.makeDecoder()
+                    for try await raw in bytes.lines where raw.hasPrefix("data: ") {
+                        let payload = Data(raw.dropFirst("data: ".count).utf8)
+                        continuation.yield(
+                            try decoder.decode(OrchestratorFeedFrame.self, from: payload))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in reader.cancel() }
+        }
+    }
+
     private func postEmpty<T: Decodable>(_ path: String) async throws -> T {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"

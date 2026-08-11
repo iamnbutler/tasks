@@ -11,6 +11,8 @@ final class AppModel {
     var tasks: [TaskItem] = []
     var sessions: [ScoutSession] = []
     var specs: [Spec] = []
+    var builds: [BuildItem] = []
+    var chat: [ChatMessage] = []
     var specQueue: [SpecQueueItem] = []
     var mode: Mode?
     /// Recent event log, newest first, for the Activity feed.
@@ -33,6 +35,15 @@ final class AppModel {
 
     var connectionError: String?
     var lastRefreshed: Date?
+
+    /// Live view of the in-flight orchestrator tick, from
+    /// `/orchestrator/stream`. `liveReply` is the assistant text generated so
+    /// far (reset on each tool call — pre-tool text is working narration, and
+    /// the segment after the last tool call is the reply that persists);
+    /// `liveActivity` is the latest tool-call label. Both are ephemeral and
+    /// cleared once the durable message lands in `chat`.
+    var liveReply = ""
+    var liveActivity: String?
 
     // Non-private: session-detail views borrow it for transcript tailing.
     let client = TasksClient()
@@ -80,6 +91,35 @@ final class AppModel {
 
     func scoutNow(_ id: String) async {
         await perform { try await self.client.scoutNow(id) }
+    }
+
+    /// The at-most-one build the serial loop is running.
+    var runningBuild: BuildItem? {
+        builds.first { $0.status == .running }
+    }
+
+    /// Send a chat turn to the orchestrator. Appends optimistically; the
+    /// reply arrives via the event-driven refresh.
+    func sendChat(_ content: String) async {
+        do {
+            let sent = try await client.sendOrchestratorMessage(content)
+            if !chat.contains(where: { $0.seq == sent.seq }) {
+                chat.append(sent)
+            }
+        } catch {
+            connectionError = error.localizedDescription
+        }
+    }
+
+    /// Queue a one-spec Builder run (the API takes a batch; the UI's unit is
+    /// a task's approved spec). 202 — the queue view reflects progress.
+    func buildNow(specId: String) async {
+        do {
+            _ = try await client.requestBuild(specIds: [specId])
+            await refresh()
+        } catch {
+            connectionError = error.localizedDescription
+        }
     }
 
     func setMode(_ mode: Mode) async {
@@ -138,6 +178,7 @@ final class AppModel {
     func start() async {
         guard !started else { return }
         started = true
+        Task { await orchestratorFeedLoop() }
         while !Task.isCancelled {
             do {
                 for try await _ in client.eventStream() {
@@ -154,6 +195,38 @@ final class AppModel {
         }
     }
 
+    /// Tail `/orchestrator/stream` forever, mirroring the event loop's
+    /// reconnect policy. A dropped connection just clears the live view —
+    /// the durable reply still arrives through the ordinary refresh.
+    private func orchestratorFeedLoop() async {
+        while !Task.isCancelled {
+            do {
+                for try await frame in client.orchestratorFeed() {
+                    switch frame.kind {
+                    case "delta":
+                        liveReply += frame.text ?? ""
+                    case "tool":
+                        liveActivity = frame.label
+                        liveReply = ""
+                    case "done":
+                        // Keep the reply text visible; the refresh replaces
+                        // it with the persisted message (no flash).
+                        liveActivity = nil
+                    default:
+                        break
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                // Connection errors surface via the event loop's banner.
+            }
+            liveReply = ""
+            liveActivity = nil
+            try? await Task.sleep(for: .seconds(3))
+        }
+    }
+
     /// Every fetch stands alone: one failing endpoint surfaces on the banner
     /// but must not blank the six that succeeded.
     func refresh() async {
@@ -162,6 +235,8 @@ final class AppModel {
         async let tasks = Self.attempt { try await c.tasks() }
         async let sessions = Self.attempt { try await c.sessions() }
         async let specs = Self.attempt { try await c.specs() }
+        async let builds = Self.attempt { try await c.builds() }
+        async let chat = Self.attempt { try await c.orchestratorMessages() }
         async let specQueue = Self.attempt { try await c.specQueue() }
         async let mode = Self.attempt { try await c.mode() }
         async let events = Self.attempt { try await c.events() }
@@ -179,6 +254,15 @@ final class AppModel {
         apply(await tasks) { self.tasks = $0 }
         apply(await sessions) { self.sessions = $0 }
         apply(await specs) { self.specs = $0 }
+        apply(await builds) { self.builds = $0 }
+        apply(await chat) {
+            self.chat = $0
+            // The durable reply has landed — drop the live-tick preview.
+            if $0.last?.role == .assistant {
+                self.liveReply = ""
+                self.liveActivity = nil
+            }
+        }
         apply(await specQueue) { self.specQueue = $0 }
         apply(await mode) { self.mode = $0 }
         apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }
