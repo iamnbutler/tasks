@@ -29,6 +29,7 @@ environment:
   TASKS_DATA_DIR         where tasks.db lives (default ~/.local/state/tasks-v2)
   TASKS_SERVER_PORT      default port for `serve`
   TASKS_POLL_INTERVAL    seconds between GitHub polls (default 60)
+  TASKS_INTAKE_LABEL     ingest only issues carrying this label (default: all)
   SCOUT_MAX_CONCURRENT   scouts running at once (default 2)
   SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)
   SCOUT_TIMEOUT_SECS     wall-clock budget per scout (default 3600)
