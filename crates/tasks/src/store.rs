@@ -1,6 +1,7 @@
 //! SQLite-backed persistence.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -12,9 +13,9 @@ use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
     Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, Project, ProjectId, ReviewedSpec, Session, SessionId, SessionStatus,
-    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TaskState, TranscriptLine, TranscriptStream,
+    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
+    SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -54,6 +55,24 @@ const ORCHESTRATOR_FEED_CAPACITY: usize = 4096;
 /// `exit_reason` written to sessions that were still `running` when the server
 /// came back up.
 const ORPHANED_EXIT_REASON: &str = "orphaned by server restart";
+
+/// How long an interactive checkout of the orchestrator session stays fresh
+/// without a heartbeat renewal. The wrapper script renews every minute, so
+/// this only expires when the interactive client died without releasing —
+/// a killed terminal un-wedges the tick loop by itself within this window.
+pub const ORCHESTRATOR_CHECKOUT_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Whether a checkout heartbeat timestamp is still within
+/// [`ORCHESTRATOR_CHECKOUT_TTL`]. An unparseable timestamp counts as stale —
+/// failing open (ticks resume) beats wedging the loop on bad data.
+fn checkout_heartbeat_fresh(ts: &str) -> bool {
+    DateTime::parse_from_rfc3339(ts)
+        .map(|t| {
+            Utc::now().signed_duration_since(t.with_timezone(&Utc))
+                < chrono::Duration::from_std(ORCHESTRATOR_CHECKOUT_TTL).expect("ttl fits")
+        })
+        .unwrap_or(false)
+}
 
 /// What [`Store::reconcile_orphaned_work`] cleaned up: rows that a previous
 /// process left mid-flight.
@@ -1969,6 +1988,61 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Record the orchestrator agent's effective working directory. Written
+    /// at startup (it's config, not state) so `GET /orchestrator/session`
+    /// can tell clients where to `cd` before an interactive resume.
+    pub async fn set_orchestrator_workdir(&self, workdir: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET workdir = ? WHERE id = 1")
+            .bind(workdir)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The orchestrator session as clients see it: the CC session id (if one
+    /// exists yet), the agent's workdir, and whether a human currently has
+    /// the session checked out for interactive use.
+    pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
+        let row = sqlx::query(
+            "SELECT cc_session_id, workdir, checked_out_at FROM orchestrator WHERE id = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let checked_out_at: Option<String> = row.try_get("checked_out_at")?;
+        Ok(OrchestratorSessionInfo {
+            cc_session_id: row.try_get("cc_session_id")?,
+            workdir: row.try_get("workdir")?,
+            checked_out: checked_out_at
+                .as_deref()
+                .is_some_and(checkout_heartbeat_fresh),
+        })
+    }
+
+    /// Renew the interactive-checkout heartbeat. While it's fresh
+    /// ([`ORCHESTRATOR_CHECKOUT_TTL`]) the headless tick must not run — CC
+    /// sessions have no file locking, so a tick would interleave writes with
+    /// the human's interactive client.
+    pub async fn orchestrator_checkout(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET checked_out_at = ? WHERE id = 1")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// End the interactive checkout; the next tick may resume the session.
+    pub async fn orchestrator_release(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET checked_out_at = NULL WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a human currently has the orchestrator session checked out.
+    pub async fn orchestrator_checked_out(&self) -> Result<bool, StoreError> {
+        Ok(self.orchestrator_session_info().await?.checked_out)
     }
 
     // --- mode ---

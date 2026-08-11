@@ -83,6 +83,16 @@ the server only.
   turns. Render them as compact system lines, not chat bubbles, and render an
   "answering…" affordance while the newest turn is a `user` or `event` turn.
   Tolerate unknown roles.
+- `GET /orchestrator/session` — `{cc_session_id, workdir, checked_out}`: the
+  orchestrator's Claude Code session, resumable interactively with
+  `cd <workdir> && claude --resume <cc_session_id>`. `cc_session_id` is null
+  until the first tick. `POST /orchestrator/session/checkout` (409 while
+  there's no session) marks it interactively held — headless ticks suspend,
+  nudges queue as unanswered turns — and must be re-POSTed at least every 5
+  minutes (it's a heartbeat; a dead client lapses on its own). `POST
+  /orchestrator/session/release` ends the hold; queued input is answered on
+  the next tick. Wrap interactive use: checkout + renew loop, run `claude
+  --resume`, release on exit.
 - `GET /orchestrator/stream` — SSE live view of the in-flight tick, one JSON
   frame per `data:` line: `{"kind":"delta","text"}` (assistant text in
   generation order), `{"kind":"tool","label"}` (a tool call, e.g.

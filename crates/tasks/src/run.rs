@@ -815,15 +815,24 @@ pub async fn orchestrator_loop(
     config: Config,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let workdir = config
+        .orchestrator_workdir
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("orchestrator"));
+    // Advertise the effective workdir so `GET /orchestrator/session` can
+    // tell clients where to `cd` for an interactive resume.
+    if let Err(e) = store
+        .set_orchestrator_workdir(&workdir.display().to_string())
+        .await
+    {
+        warn!(error = %e, "failed to record orchestrator workdir");
+    }
     let orchestrator = Orchestrator::new(
-        store,
+        store.clone(),
         OrchestratorConfig {
             command: config.orchestrator_cmd.clone(),
             timeout: config.orchestrator_timeout,
-            workdir: config
-                .orchestrator_workdir
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("orchestrator")),
+            workdir,
             api_port: config.port,
         },
     );
@@ -831,8 +840,18 @@ pub async fn orchestrator_loop(
         if *shutdown.borrow() {
             return;
         }
-        if let Err(e) = orchestrator.tick().await {
-            warn!(error = %e, "orchestrator tick failed");
+        // While a human has the session checked out interactively, do not
+        // touch it — CC sessions have no file locking, and a headless turn
+        // would interleave with theirs. Input keeps accumulating as
+        // unanswered turns and is answered once the checkout lapses.
+        match store.orchestrator_checked_out().await {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = orchestrator.tick().await {
+                    warn!(error = %e, "orchestrator tick failed");
+                }
+            }
+            Err(e) => warn!(error = %e, "orchestrator checkout state unreadable; skipping tick"),
         }
         tokio::select! {
             _ = tokio::time::sleep(ORCHESTRATOR_TICK) => {}

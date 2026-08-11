@@ -417,6 +417,16 @@ struct ChatMessage: Decodable, Identifiable, Hashable {
     var id: Int64 { seq }
 }
 
+/// `GET /orchestrator/session` — enough to resume the orchestrator's Claude
+/// Code session interactively (`cd workdir && claude --resume ccSessionId`).
+struct OrchestratorSessionInfo: Decodable, Sendable {
+    /// `nil` until the first tick creates the session.
+    let ccSessionId: String?
+    let workdir: String?
+    /// Someone already holds an interactive checkout.
+    let checkedOut: Bool
+}
+
 /// One frame of `/orchestrator/stream` — the live view of an in-flight tick.
 /// Loose by design: unknown kinds are skipped, and nothing here is durable
 /// (the finished message arrives via `/orchestrator/messages`).

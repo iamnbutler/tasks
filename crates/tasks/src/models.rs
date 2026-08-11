@@ -501,6 +501,21 @@ impl ChatRole {
     }
 }
 
+/// The orchestrator's Claude Code session as clients see it
+/// (`GET /orchestrator/session`): enough to resume it interactively
+/// (`cd <workdir> && claude --resume <cc_session_id>`) and whether someone
+/// already has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorSessionInfo {
+    /// `None` until the first tick creates the session.
+    pub cc_session_id: Option<String>,
+    /// The agent's working directory, written at server startup.
+    pub workdir: Option<String>,
+    /// A human holds an interactive checkout (fresh heartbeat); headless
+    /// ticks are suspended while true.
+    pub checked_out: bool,
+}
+
 /// One moment of an in-flight orchestrator tick, streamed over
 /// `GET /orchestrator/stream`. Ephemeral by design: nothing here is
 /// persisted — the durable record is the finished message in

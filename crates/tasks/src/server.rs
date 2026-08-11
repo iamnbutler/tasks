@@ -29,8 +29,9 @@ use tracing::{error, info, warn};
 
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Build, BuildId, ChatRole, Mode, OrchestratorMessage, Project, ProjectId, Session, SessionId,
-    Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
+    Build, BuildId, ChatRole, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project,
+    ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TranscriptLine,
 };
 use crate::store::{Store, StoreError};
 
@@ -52,6 +53,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -77,6 +80,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
@@ -114,6 +118,15 @@ pub fn router(store: Arc<Store>) -> Router {
             get(list_orchestrator_messages).post(send_orchestrator_message),
         )
         .route("/orchestrator/stream", get(stream_orchestrator))
+        .route("/orchestrator/session", get(get_orchestrator_session))
+        .route(
+            "/orchestrator/session/checkout",
+            post(checkout_orchestrator_session),
+        )
+        .route(
+            "/orchestrator/session/release",
+            post(release_orchestrator_session),
+        )
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
         .route("/events", get(list_events))
@@ -416,6 +429,41 @@ async fn list_orchestrator_messages(
     Query(q): Query<MessagesQuery>,
 ) -> ApiResult<Json<Vec<OrchestratorMessage>>> {
     Ok(Json(store.orchestrator_messages_since(q.since).await?))
+}
+
+/// The orchestrator's CC session, for interactive resume
+/// (`cd <workdir> && claude --resume <cc_session_id>`).
+async fn get_orchestrator_session(
+    State(store): State<Arc<Store>>,
+) -> ApiResult<Json<OrchestratorSessionInfo>> {
+    Ok(Json(store.orchestrator_session_info().await?))
+}
+
+/// Renew the interactive-checkout heartbeat. While it's fresh, headless
+/// ticks are suspended (CC sessions have no file locking); nudges still
+/// accumulate as unanswered turns and are answered after release. Callers
+/// re-POST at least once per [`crate::store::ORCHESTRATOR_CHECKOUT_TTL`].
+/// 409 when no CC session exists yet — there is nothing to check out.
+async fn checkout_orchestrator_session(
+    State(store): State<Arc<Store>>,
+) -> ApiResult<Json<OrchestratorSessionInfo>> {
+    let info = store.orchestrator_session_info().await?;
+    if info.cc_session_id.is_none() {
+        return Err(ApiError::Conflict(
+            "no orchestrator session exists yet".into(),
+        ));
+    }
+    store.orchestrator_checkout().await?;
+    Ok(Json(store.orchestrator_session_info().await?))
+}
+
+/// End the interactive checkout; the next tick may resume the session.
+/// Idempotent — releasing an unclaimed session is fine.
+async fn release_orchestrator_session(
+    State(store): State<Arc<Store>>,
+) -> ApiResult<Json<OrchestratorSessionInfo>> {
+    store.orchestrator_release().await?;
+    Ok(Json(store.orchestrator_session_info().await?))
 }
 
 /// SSE feed of the in-flight orchestrator tick: `delta` chunks as the reply

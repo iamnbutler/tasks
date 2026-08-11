@@ -623,6 +623,18 @@ struct ChatView: View {
             .frame(maxWidth: .infinity)
         }
         .navigationTitle("Chat")
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    Task { await model.openOrchestratorInTerminal() }
+                } label: {
+                    Label("Open in Claude Code", systemImage: "terminal")
+                }
+                .help(
+                    "Resume this conversation interactively in Claude Code. "
+                        + "Pipeline nudges pause while you have it open.")
+            }
+        }
     }
 
     /// The last turn is input (human or pipeline event): a reply is on its way.
