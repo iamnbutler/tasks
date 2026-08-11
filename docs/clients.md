@@ -72,13 +72,17 @@ the server only.
   duplicated set, a non-approved spec, specs from two projects, or a spec
   already in an active build. Watch `build_*` events or poll.
 - `POST /orchestrator/messages` `{"content"}` — say something to the
-  orchestrator (a persistent server-side Claude Code session that can inspect
-  and drive the pipeline over this same API, but only when asked). **202**
-  with your message; the reply arrives asynchronously as an
-  `orchestrator_message` event — refetch on it. `GET
-  /orchestrator/messages?since=N` returns turns with `seq > N`, oldest first:
-  `{seq, role: "user"|"assistant", content, created_at}`. Render an
-  "answering…" affordance while the newest turn is the user's.
+  orchestrator (a persistent server-side Claude Code session that inspects
+  and drives the pipeline over this same API). **202** with your message; the
+  reply arrives asynchronously as an `orchestrator_message` event — refetch
+  on it. `GET /orchestrator/messages?since=N` returns turns with `seq > N`,
+  oldest first: `{seq, role: "user"|"assistant"|"event", content,
+  created_at}`. `event` turns are automated pipeline notifications the server
+  injects (specs landing, builds finishing, tasks ingested — debounced into
+  one turn per burst); the orchestrator answers them proactively like user
+  turns. Render them as compact system lines, not chat bubbles, and render an
+  "answering…" affordance while the newest turn is a `user` or `event` turn.
+  Tolerate unknown roles.
 - `GET /orchestrator/stream` — SSE live view of the in-flight tick, one JSON
   frame per `data:` line: `{"kind":"delta","text"}` (assistant text in
   generation order), `{"kind":"tool","label"}` (a tool call, e.g.
