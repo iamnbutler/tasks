@@ -5,9 +5,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tasks::models::ChatRole;
+use chrono::Utc;
+use tasks::events::EventPayload;
+use tasks::models::{ChatRole, GhState, Project, ProjectId, Task, TaskId, TaskState};
 use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
+use tasks::run::orchestrator_nudge_loop;
 use tasks::store::Store;
+use tokio::sync::watch;
 
 mod common;
 
@@ -261,6 +265,168 @@ async fn an_agent_failure_lands_in_the_chat_and_settles_the_tick() {
     // fresh session before giving up.
     let log = tokio::fs::read_to_string(&args_log).await.unwrap();
     assert!(log.lines().count() >= 1);
+}
+
+/// The watermark contract: input appended while the agent is mid-turn (its
+/// seq below the eventual reply's) must stay unanswered, because the prompt
+/// that turn was built from never included it.
+#[tokio::test]
+async fn input_arriving_mid_turn_stays_unanswered() {
+    let store = Store::open_in_memory().await.unwrap();
+    let first = store
+        .append_orchestrator_message(ChatRole::User, "first")
+        .await
+        .unwrap();
+    // The agent is "mid-turn" on `first` when more input lands:
+    let late = store
+        .append_orchestrator_message(ChatRole::Event, "[pipeline] spec landed")
+        .await
+        .unwrap();
+    // The reply only covered `first`.
+    store
+        .append_orchestrator_reply("done", first.seq)
+        .await
+        .unwrap();
+
+    let pending = store.unanswered_orchestrator_messages().await.unwrap();
+    assert_eq!(
+        pending.iter().map(|m| m.seq).collect::<Vec<_>>(),
+        vec![late.seq],
+        "the mid-turn event turn is still pending; the answered one is not"
+    );
+}
+
+/// End to end: pipeline events debounce into ONE `event` turn with
+/// human-readable detail (issue number + title, not ids), noise events don't
+/// nudge at all, and the next tick answers the nudge like any other input.
+#[tokio::test]
+async fn pipeline_events_become_one_event_turn_the_tick_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let stub = write_stub(tmp.path(), &args_log, false).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let nudge_loop = tokio::spawn(orchestrator_nudge_loop(
+        store.clone(),
+        Duration::from_millis(100),
+        Duration::from_secs(2),
+        shutdown_rx,
+    ));
+    // Let the loop subscribe before anything is published.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let project = Project {
+        id: ProjectId::new(),
+        repo_owner: "test".into(),
+        repo_name: "repo".into(),
+        added_at: Utc::now(),
+    };
+    store.insert_project(&project).await.unwrap();
+    let insert = async |number: u64, title: &str| {
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new(),
+            project_id: project.id.clone(),
+            gh_issue_number: number,
+            title: title.into(),
+            body: String::new(),
+            labels: vec![],
+            gh_state: GhState::Open,
+            state: TaskState::Backlog,
+            priority: 0,
+            manual_rank: None,
+            dispatch_attempts: 0,
+            ingested_at: now,
+            updated_at: now,
+        };
+        store.insert_task(&task).await.unwrap();
+        task
+    };
+    let dark_mode = insert(12, "Add dark mode").await;
+    let fix_login = insert(13, "Fix login redirect").await;
+
+    for task in [&dark_mode, &fix_login] {
+        store
+            .append_event(EventPayload::TaskIngested {
+                task_id: task.id.clone(),
+                project_id: project.id.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    // No store lookups needed for this one — pure formatting.
+    store
+        .append_event(EventPayload::PullRequestOpened {
+            build_id: tasks::models::BuildId::from_raw("build_x"),
+            pr_number: 42,
+        })
+        .await
+        .unwrap();
+    // Noise: must not nudge (and must not appear in the turn).
+    store
+        .append_event(EventPayload::QueueReordered { task_ids: vec![] })
+        .await
+        .unwrap();
+
+    // Wait for the debounced event turn.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let event_turns = loop {
+        let turns: Vec<_> = store
+            .orchestrator_messages_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == ChatRole::Event)
+            .collect();
+        if !turns.is_empty() {
+            // Debounce settled — give a beat to catch an (incorrect) second
+            // turn before asserting there is exactly one.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            break store
+                .orchestrator_messages_since(0)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.role == ChatRole::Event)
+                .collect::<Vec<_>>();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no event turn appeared within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(event_turns.len(), 1, "burst debounced into one turn");
+    let turn = &event_turns[0];
+    assert!(turn.content.starts_with("[pipeline]"), "{}", turn.content);
+    assert!(
+        turn.content.contains("#12 \"Add dark mode\""),
+        "{}",
+        turn.content
+    );
+    assert!(
+        turn.content.contains("#13 \"Fix login redirect\""),
+        "{}",
+        turn.content
+    );
+    assert!(turn.content.contains("PR #42 opened"), "{}", turn.content);
+    assert!(!turn.content.contains("reorder"), "{}", turn.content);
+
+    // The tick answers the nudge like any other input.
+    assert!(orch.tick().await.unwrap());
+    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last.role, ChatRole::Assistant);
+    assert!(
+        last.content.contains("reply to: [pipeline]"),
+        "{}",
+        last.content
+    );
+    assert!(!orch.tick().await.unwrap(), "settled after the reply");
+
+    nudge_loop.abort();
 }
 
 #[tokio::test]
