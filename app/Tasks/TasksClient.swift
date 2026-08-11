@@ -161,6 +161,13 @@ struct TasksClient: Sendable {
         try await get("builds")
     }
 
+    /// The three Home briefing slots. Reading is the demand signal: the
+    /// server returns stored copies immediately and regenerates stale
+    /// sections in the background (`briefing_updated` event -> refresh).
+    func briefings() async throws -> [BriefingStatus] {
+        try await get("briefings")
+    }
+
     /// Queue a Builder run over approved specs. 202: the response is the
     /// queued build, not a finished one — the serial loop picks it up.
     func requestBuild(specIds: [String]) async throws -> BuildItem {

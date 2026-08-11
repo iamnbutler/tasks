@@ -567,6 +567,12 @@ mod tests {
         assert!(!nudge_worthy(&EventPayload::QueueReordered {
             task_ids: vec![]
         }));
+        // Briefings are generated ABOUT pipeline activity — nudging on them
+        // would be a feedback loop (nudge → tick → activity → briefing →
+        // nudge). Load-bearing exclusion, not an oversight.
+        assert!(!nudge_worthy(&EventPayload::BriefingUpdated {
+            section: crate::models::BriefingSection::Changes,
+        }));
     }
 
     #[test]

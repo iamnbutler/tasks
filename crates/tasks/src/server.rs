@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRef, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
+use crate::briefing::{self, BriefingStatus, Briefings};
 use crate::events::{Event, EventPayload};
 use crate::models::{
     Build, BuildId, ChatRole, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project,
@@ -89,9 +90,36 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-/// Build the API router over a store. Exposed separately from [`serve`] so
-/// tests can bind their own listener.
+/// Router state: the store plus the optional briefing service. Optional so
+/// `router(store)` (tests, embedded uses) keeps working — without the
+/// service, `GET /briefings` serves stored copies and never regenerates.
+#[derive(Clone)]
+pub struct AppState {
+    store: Arc<Store>,
+    briefings: Option<Arc<Briefings>>,
+}
+
+impl FromRef<AppState> for Arc<Store> {
+    fn from_ref(state: &AppState) -> Self {
+        state.store.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<Briefings>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.briefings.clone()
+    }
+}
+
+/// Build the API router over a store, with no briefing service. Exposed
+/// separately from [`serve`] so tests can bind their own listener.
 pub fn router(store: Arc<Store>) -> Router {
+    router_with_briefings(store, None)
+}
+
+/// Build the full API router. `serve` passes the briefing service so
+/// `GET /briefings` can kick stale-while-revalidate regenerations.
+pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>>) -> Router {
     Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/tasks", get(list_tasks))
@@ -129,26 +157,28 @@ pub fn router(store: Arc<Store>) -> Router {
         )
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
+        .route("/briefings", get(list_briefings))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
-        .with_state(store)
+        .with_state(AppState { store, briefings })
 }
 
 /// Serve the API on loopback at `port`. Runs until the process is killed.
 pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
-    serve_with_shutdown(store, port, std::future::pending()).await
+    serve_with_shutdown(store, None, port, std::future::pending()).await
 }
 
 /// Serve the API on loopback at `port` until `shutdown` resolves, then stop
 /// accepting connections and let the in-flight ones drain.
 pub async fn serve_with_shutdown(
     store: Arc<Store>,
+    briefings: Option<Arc<Briefings>>,
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     info!(addr = %listener.local_addr()?, "tasks api listening");
-    axum::serve(listener, router(store))
+    axum::serve(listener, router_with_briefings(store, briefings))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -625,6 +655,25 @@ fn to_sse(line: &TranscriptLine) -> Option<Result<SseEvent, Infallible>> {
             error!(error = %err, seq = line.seq, "serializing transcript line for sse");
             None
         }
+    }
+}
+
+// --- briefings ---
+
+/// All three Home briefing slots, stale-while-revalidate: whatever is stored
+/// returns immediately, and stale sections kick a single-flight background
+/// regeneration when a briefing service is attached (the production server).
+/// Completion arrives as a `briefing_updated` event — refetch on it. Without
+/// a service (tests, embedded routers) this only ever serves stored copies.
+async fn list_briefings(
+    State(store): State<Arc<Store>>,
+    State(briefings): State<Option<Arc<Briefings>>>,
+) -> ApiResult<Json<Vec<BriefingStatus>>> {
+    match briefings {
+        Some(service) => Ok(Json(service.get_all().await?)),
+        None => Ok(Json(
+            briefing::snapshot(&store, briefing::DEFAULT_TTL).await?,
+        )),
     }
 }
 
@@ -1298,6 +1347,55 @@ mod tests {
                 to: Mode::Play
             }
         );
+    }
+
+    /// The `/briefings` wire shape: always all three sections, snake_case
+    /// keys, RFC3339 timestamps, and — without a briefing service attached —
+    /// stored copies only, never a regeneration.
+    #[tokio::test]
+    async fn briefings_serve_all_three_sections_from_storage() {
+        use crate::models::{Briefing, BriefingSection};
+
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        store
+            .upsert_briefing(&Briefing {
+                section: BriefingSection::Changes,
+                content: "PR [#7](https://github.com/a/b/pull/7) is stale.".into(),
+                generated_at: Utc::now(),
+                event_high_water: 3,
+            })
+            .await
+            .unwrap();
+        let base = spawn(store.clone()).await;
+
+        let body: Vec<Value> = reqwest::get(format!("{base}/briefings"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 3);
+        let sections: Vec<&str> = body
+            .iter()
+            .map(|b| b["section"].as_str().unwrap())
+            .collect();
+        assert_eq!(sections, vec!["state_of_project", "changes", "issues"]);
+
+        let changes = &body[1];
+        assert_eq!(
+            changes["content"].as_str().unwrap(),
+            "PR [#7](https://github.com/a/b/pull/7) is stale."
+        );
+        assert_eq!(changes["stale"], Value::Bool(false));
+        assert_eq!(changes["regenerating"], Value::Bool(false));
+        assert!(changes["generated_at"].as_str().unwrap().contains('T'));
+
+        let never_generated = &body[0];
+        assert_eq!(never_generated["content"], Value::Null);
+        assert_eq!(never_generated["stale"], Value::Bool(true));
+
+        // No service attached: nothing regenerated behind the read.
+        assert_eq!(store.list_briefings().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

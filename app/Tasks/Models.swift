@@ -367,14 +367,21 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
     }
 }
 
-/// Five headline counts over a trailing window of the held event log —
-/// a pure fold, no server surface. See `AppModel.velocity(days:now:)`.
-struct Velocity: Equatable {
-    var ingested = 0
-    var specsProduced = 0
-    var specsApproved = 0
-    var buildsFinished = 0
-    var prsOpened = 0
+/// One Home briefing slot (`GET /briefings`): LLM-written prose served
+/// stale-while-revalidate. All three sections always arrive; a section never
+/// generated has nil content and reads stale. The prose is a cache with a
+/// visible date — `generatedAt` is part of the display, not metadata.
+struct BriefingStatus: Decodable, Identifiable, Hashable {
+    let section: String
+    let content: String?
+    let generatedAt: Date?
+    let stale: Bool
+    let regenerating: Bool
+    /// The last generation failure. The stored prose (if any) still shows —
+    /// "couldn't refresh" beats a blank slot.
+    let error: String?
+
+    var id: String { section }
 }
 
 /// One serial Builder run over a batch of approved specs. `prNumber` is an

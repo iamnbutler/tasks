@@ -43,6 +43,7 @@ use tracing::{info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::VmConfig;
 
+use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
 use crate::github::{GitHubClient, IntakeFilter};
@@ -71,6 +72,16 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
 const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
+/// Default agent command for Home briefing generations. Read-only on
+/// purpose: gh/curl/git-log/git-diff and nothing else — a briefing agent
+/// that can write is a misconfiguration. The quoted permission list is why
+/// `BRIEFING_CMD` gets shell-style splitting (see `briefing::split_command`).
+const DEFAULT_BRIEFING_CMD: &str = "claude --print --allowedTools \
+     \"Bash(gh:*),Bash(curl:*),Bash(git log:*),Bash(git diff:*)\"";
+/// Briefings stay fresh this long (`BRIEFING_TTL_SECS`).
+const DEFAULT_BRIEFING_TTL_SECS: u64 = 900;
+/// Wall-clock budget per briefing generation (`BRIEFING_TIMEOUT_SECS`).
+const DEFAULT_BRIEFING_TIMEOUT_SECS: u64 = 300;
 /// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 /// Debounce for pipeline-event nudges: after the first nudge-worthy event,
@@ -179,6 +190,12 @@ pub struct Config {
     /// repo clone to run the orchestrator as a full development agent
     /// (pair with `--dangerously-skip-permissions` in `ORCHESTRATOR_CMD`).
     pub orchestrator_workdir: Option<PathBuf>,
+    /// Agent command for Home briefing generations (`BRIEFING_CMD`).
+    pub briefing_cmd: String,
+    /// Freshness window for briefings (`BRIEFING_TTL_SECS`).
+    pub briefing_ttl: Duration,
+    /// Wall-clock budget per briefing generation (`BRIEFING_TIMEOUT_SECS`).
+    pub briefing_timeout: Duration,
 }
 
 impl Config {
@@ -234,7 +251,27 @@ impl Config {
                 DEFAULT_ORCHESTRATOR_TIMEOUT_SECS,
             )?),
             orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
+            briefing_cmd: env_string("BRIEFING_CMD").unwrap_or_else(|| DEFAULT_BRIEFING_CMD.into()),
+            briefing_ttl: Duration::from_secs(parse_env(
+                "BRIEFING_TTL_SECS",
+                "a number of seconds",
+                DEFAULT_BRIEFING_TTL_SECS,
+            )?),
+            briefing_timeout: Duration::from_secs(parse_env(
+                "BRIEFING_TIMEOUT_SECS",
+                "a number of seconds",
+                DEFAULT_BRIEFING_TIMEOUT_SECS,
+            )?),
         })
+    }
+
+    /// The working directory both the orchestrator and briefing agents run
+    /// in: `ORCHESTRATOR_WORKDIR` (the repo checkout, in production) or a
+    /// neutral dir under the data dir.
+    fn agent_workdir(&self) -> PathBuf {
+        self.orchestrator_workdir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("orchestrator"))
     }
 
     fn github_client(&self) -> Option<GitHubClient> {
@@ -360,8 +397,18 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         NUDGE_MAX_WAIT,
         shutdown_rx.clone(),
     ));
+    let briefings = Arc::new(Briefings::new(
+        store.clone(),
+        BriefingConfig {
+            command: config.briefing_cmd.clone(),
+            timeout: config.briefing_timeout,
+            ttl: config.briefing_ttl,
+            workdir: config.agent_workdir(),
+            api_port: config.port,
+        },
+    ));
 
-    server::serve_with_shutdown(store, config.port, async {
+    server::serve_with_shutdown(store, Some(briefings), config.port, async {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutdown requested");
     })
@@ -852,10 +899,7 @@ pub async fn orchestrator_loop(
     config: Config,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let workdir = config
-        .orchestrator_workdir
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("orchestrator"));
+    let workdir = config.agent_workdir();
     // Advertise the effective workdir so `GET /orchestrator/session` can
     // tell clients where to `cd` for an interactive resume.
     if let Err(e) = store
@@ -1120,6 +1164,9 @@ mod tests {
             orchestrator_cmd: "true".into(),
             orchestrator_timeout: Duration::from_secs(60),
             orchestrator_workdir: None,
+            briefing_cmd: "true".into(),
+            briefing_ttl: Duration::from_secs(DEFAULT_BRIEFING_TTL_SECS),
+            briefing_timeout: Duration::from_secs(DEFAULT_BRIEFING_TIMEOUT_SECS),
         }
     }
 
