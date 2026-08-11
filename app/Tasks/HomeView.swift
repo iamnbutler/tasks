@@ -1,27 +1,26 @@
 import SwiftUI
 
-/// The launch surface: "what is this project doing right now?" in four
-/// read-only blocks — in flight, needs you, velocity, recent PRs. Every row
-/// points into Queue (or out to GitHub); no review/build/queue actions live
-/// here, so Home and Queue can't become two answers to the same question.
+/// The launch surface: "what is going on, and does anything need me?" —
+/// three LLM-written briefings (state of the project / changes / issues)
+/// with the mechanical rows that must not wait on prose (needs-you, in
+/// flight) between them. Briefings are a cache with a visible date: the "as
+/// of" caption is part of the content, not chrome. Every mechanical row
+/// points into Queue; no review/build/queue actions live here.
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     /// Rows are pointers, not surfaces: this flips the sidebar to Queue.
     let openQueue: () -> Void
 
-    // `static` on purpose: a `private let` instance property would make the
-    // memberwise `HomeView(openQueue:)` init private too.
-    private static let windowDays = 7
-
     var body: some View {
         ScrollView {
-            // Bounded content: a handful of rows per block — plain VStack,
+            // Bounded content: prose plus a handful of rows — plain VStack,
             // not lazy (see Markdown.swift on lazy-container churn).
             VStack(alignment: .leading, spacing: 28) {
-                inFlight
+                briefing("state_of_project", title: "State of the project")
                 needsYou
-                velocity
-                recentPullRequests
+                inFlight
+                briefing("changes", title: "Changes")
+                briefing("issues", title: "Issues")
             }
             .padding(24)
             .frame(maxWidth: 760, alignment: .leading)
@@ -30,35 +29,40 @@ struct HomeView: View {
         .navigationTitle("Home")
     }
 
-    // MARK: In flight
+    // MARK: Briefings
 
     @ViewBuilder
-    private var inFlight: some View {
-        HomeSection("In flight") {
-            let scouts = model.runningSessions
-            let build = model.runningBuild
-            if scouts.isEmpty && build == nil {
-                EmptyLine("Nothing running")
-            }
-            ForEach(scouts) { session in
-                HomeRow(action: openQueue) {
-                    HomeRowBody(
-                        icon: "binoculars",
-                        title: model.title(forTask: session.taskId) ?? "Scout",
-                        subtitle: session.branch,
-                        trailing: elapsed(since: session.startedAt))
-                }
-            }
-            if let build {
-                HomeRow(action: openQueue) {
-                    HomeRowBody(
-                        icon: "hammer",
-                        title: model.label(for: build),
-                        subtitle: build.branch,
-                        trailing: build.startedAt.map { elapsed(since: $0) })
-                }
+    private func briefing(_ section: String, title: String) -> some View {
+        let status = model.briefing(section)
+        HomeSection(title, caption: status.map(caption)) {
+            if let content = status?.content {
+                MarkdownView(text: content)
+                    .textSelection(.enabled)
+            } else if status?.regenerating == true {
+                EmptyLine("Writing the first briefing…")
+            } else {
+                // Failure with no stored copy included: the caption carries
+                // "couldn't refresh", and there is nothing honest to show.
+                EmptyLine("No briefing yet")
             }
         }
+    }
+
+    /// The slot's provenance in one line: age, refresh-in-flight, failure.
+    /// Never blank once content exists — prose without a date would read as
+    /// current, and briefings are exactly the surface that must not lie
+    /// about freshness.
+    private func caption(for status: BriefingStatus) -> String {
+        var parts: [String] = []
+        if let generatedAt = status.generatedAt {
+            parts.append("as of \(elapsed(since: generatedAt))")
+        }
+        if status.regenerating {
+            parts.append("refreshing…")
+        } else if status.error != nil {
+            parts.append("couldn't refresh")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: Needs you
@@ -93,61 +97,32 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Velocity
+    // MARK: In flight
 
     @ViewBuilder
-    private var velocity: some View {
-        HomeSection("Velocity", caption: "Last \(Self.windowDays) days") {
-            if let v = model.velocity(days: Self.windowDays) {
-                // A KPI row, not a chart: five headline numbers in ordinary
-                // ink. No per-counter color (none is good or bad on its own)
-                // and no delta (the wire carries no comparison period, and
-                // inventing one would be the dashboard's first lie).
-                HStack(spacing: 12) {
-                    StatTile(value: v.ingested, label: "Tasks ingested")
-                    StatTile(value: v.specsProduced, label: "Specs produced")
-                    StatTile(value: v.specsApproved, label: "Specs approved")
-                    StatTile(
-                        value: v.buildsFinished, label: "Builds finished",
-                        help: "Trips through the Builder, failures included")
-                    StatTile(
-                        value: v.prsOpened, label: "PRs opened",
-                        help: "Opened, not merged — merge state lives on GitHub")
-                }
-            } else {
-                // Backfill in progress: no numbers beats wrong zeros.
-                EmptyLine("Counting…")
+    private var inFlight: some View {
+        HomeSection("In flight") {
+            let scouts = model.runningSessions
+            let build = model.runningBuild
+            if scouts.isEmpty && build == nil {
+                EmptyLine("Nothing running")
             }
-        }
-    }
-
-    // MARK: Recent pull requests
-
-    @ViewBuilder
-    private var recentPullRequests: some View {
-        HomeSection("Recent pull requests") {
-            let recent = model.recentPullRequests.prefix(8)
-            if recent.isEmpty {
-                EmptyLine("No pull requests yet")
-            }
-            ForEach(recent) { build in
-                if let pr = build.prNumber, let url = model.pullRequestURL(for: build) {
-                    Link(destination: url) {
-                        HomeRowBody(
-                            icon: "arrow.triangle.pull",
-                            title: model.label(for: build),
-                            subtitle: "PR #\(pr) · \(build.branch)",
-                            trailing: elapsed(since: build.finishedOrCreatedAt))
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    // Can't navigate (project vanished): plain text beats a
-                    // dead control.
+            ForEach(scouts) { session in
+                HomeRow(action: openQueue) {
                     HomeRowBody(
-                        icon: "arrow.triangle.pull",
+                        icon: "binoculars",
+                        title: model.title(forTask: session.taskId) ?? "Scout",
+                        subtitle: session.branch,
+                        trailing: elapsed(since: session.startedAt))
+                }
+            }
+            if let build {
+                HomeRow(action: openQueue) {
+                    HomeRowBody(
+                        icon: "hammer",
                         title: model.label(for: build),
                         subtitle: build.branch,
-                        trailing: elapsed(since: build.finishedOrCreatedAt))
+                        trailing: build.startedAt.map { elapsed(since: $0) })
                 }
             }
         }
@@ -178,7 +153,7 @@ private struct HomeSection<Content: View>: View {
                 Text(title)
                     .font(.headline)
                 Spacer()
-                if let caption {
+                if let caption, !caption.isEmpty {
                     Text(caption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -236,28 +211,6 @@ private struct HomeRowBody: View {
         .padding(.horizontal, 8)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
-    }
-}
-
-/// One large number over its label, in ordinary text ink.
-private struct StatTile: View {
-    let value: Int
-    let label: String
-    var help: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("\(value)")
-                .font(.title2.weight(.semibold))
-                .monospacedDigit()
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
-        .help(help ?? label)
     }
 }
 

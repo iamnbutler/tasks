@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId,
-    SpecQueueStatus, TaskId, TaskState,
+    BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
+    SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -104,6 +104,12 @@ pub enum EventPayload {
         from: Mode,
         to: Mode,
     },
+    /// A Home briefing slot was regenerated. Content is on the row — refetch
+    /// `GET /briefings`. Must never nudge the orchestrator (feedback loop:
+    /// briefings are generated *about* pipeline activity).
+    BriefingUpdated {
+        section: BriefingSection,
+    },
     /// Free-form breadcrumb from the orchestrator (or other subsystems) — used
     /// for humans watching the event stream. Not consumed programmatically.
     Note {
@@ -136,6 +142,7 @@ impl EventPayload {
             EventPayload::PullRequestOpened { .. } => "pull_request_opened",
             EventPayload::OrchestratorMessage { .. } => "orchestrator_message",
             EventPayload::ModeChanged { .. } => "mode_changed",
+            EventPayload::BriefingUpdated { .. } => "briefing_updated",
             EventPayload::Note { .. } => "note",
         }
     }
@@ -145,8 +152,8 @@ impl EventPayload {
 mod tests {
     use super::*;
     use crate::models::{
-        BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId, SessionStatus, SpecId,
-        SpecQueueStatus, TaskId, TaskState,
+        BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
+        SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
     };
 
     fn task() -> TaskId {
@@ -217,6 +224,9 @@ mod tests {
             EventPayload::ModeChanged {
                 from: Mode::Play,
                 to: Mode::Pause,
+            },
+            EventPayload::BriefingUpdated {
+                section: BriefingSection::Changes,
             },
             EventPayload::Note {
                 source: "test".into(),
@@ -300,6 +310,7 @@ mod tests {
         "pull_request_opened",
         "orchestrator_message",
         "mode_changed",
+        "briefing_updated",
         "note",
     ];
 }

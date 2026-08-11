@@ -501,6 +501,56 @@ impl ChatRole {
     }
 }
 
+/// The three Home briefing slots. Order here is display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefingSection {
+    /// Active or quiet, what meta-threads are being tackled, where the
+    /// bottleneck is.
+    StateOfProject,
+    /// Open PRs and their real states, staleness, cleanup, risky overlaps.
+    Changes,
+    /// Incoming issues, inferred priority, issue health, what to queue next.
+    Issues,
+}
+
+impl BriefingSection {
+    pub const ALL: [BriefingSection; 3] = [
+        BriefingSection::StateOfProject,
+        BriefingSection::Changes,
+        BriefingSection::Issues,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BriefingSection::StateOfProject => "state_of_project",
+            BriefingSection::Changes => "changes",
+            BriefingSection::Issues => "issues",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "state_of_project" => Some(BriefingSection::StateOfProject),
+            "changes" => Some(BriefingSection::Changes),
+            "issues" => Some(BriefingSection::Issues),
+            _ => None,
+        }
+    }
+}
+
+/// One generated briefing, as persisted. A cache with a visible date: the
+/// GitHub facts inside `content` were queried at `generated_at` and are never
+/// read back as truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Briefing {
+    pub section: BriefingSection,
+    pub content: String,
+    pub generated_at: DateTime<Utc>,
+    /// Newest event seq when generation started — for later regen gating.
+    pub event_high_water: i64,
+}
+
 /// The orchestrator's Claude Code session as clients see it
 /// (`GET /orchestrator/session`): enough to resume it interactively
 /// (`cd <workdir> && claude --resume <cc_session_id>`) and whether someone

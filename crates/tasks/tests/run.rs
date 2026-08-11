@@ -650,6 +650,9 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         orchestrator_cmd: "true".into(),
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
+        briefing_cmd: "true".into(),
+        briefing_ttl: Duration::from_secs(900),
+        briefing_timeout: Duration::from_secs(60),
     }
 }
 

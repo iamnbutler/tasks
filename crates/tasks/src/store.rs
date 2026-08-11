@@ -12,10 +12,10 @@ use tokio::sync::broadcast;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
-    SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode,
+    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId,
+    ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
+    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -2120,6 +2120,60 @@ impl Store {
                 .await?;
         rows.reverse();
         rows.into_iter().map(event_from_row).collect()
+    }
+
+    /// The newest event seq, 0 on an empty log. Recorded as a briefing's
+    /// `event_high_water` so a later regen can ask "did anything move?".
+    pub async fn latest_event_seq(&self) -> Result<i64, StoreError> {
+        let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS seq FROM events")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("seq")?)
+    }
+
+    // --- briefings ---
+
+    /// Every stored briefing. Sections never generated simply have no row —
+    /// the API layer fills in the gaps so clients always see all three.
+    pub async fn list_briefings(&self) -> Result<Vec<Briefing>, StoreError> {
+        let rows =
+            sqlx::query("SELECT section, content, generated_at, event_high_water FROM briefings")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| {
+                let section_raw: String = row.try_get("section")?;
+                Ok(Briefing {
+                    section: BriefingSection::from_str(&section_raw).ok_or(
+                        StoreError::BadEnum {
+                            column: "section",
+                            value: section_raw,
+                        },
+                    )?,
+                    content: row.try_get("content")?,
+                    generated_at: parse_ts(
+                        &row.try_get::<String, _>("generated_at")?,
+                        "generated_at",
+                    )?,
+                    event_high_water: row.try_get("event_high_water")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Replace a section's briefing wholesale. Last write wins — the content
+    /// is a cache, not state, so there is nothing to merge.
+    pub async fn upsert_briefing(&self, briefing: &Briefing) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO briefings (section, content, generated_at, event_high_water)              VALUES (?, ?, ?, ?)              ON CONFLICT(section) DO UPDATE SET                  content = excluded.content,                  generated_at = excluded.generated_at,                  event_high_water = excluded.event_high_water",
+        )
+        .bind(briefing.section.as_str())
+        .bind(&briefing.content)
+        .bind(briefing.generated_at.to_rfc3339())
+        .bind(briefing.event_high_water)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
