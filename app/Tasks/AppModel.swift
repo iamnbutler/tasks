@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -109,6 +110,45 @@ final class AppModel {
         } catch {
             connectionError = error.localizedDescription
         }
+    }
+
+    /// Resume the orchestrator's Claude Code session in Terminal. The wrapper
+    /// script checks the session out (suspending headless ticks — CC sessions
+    /// have no file locking), renews the checkout every minute, and releases
+    /// on exit so nudges queued meanwhile get answered.
+    func openOrchestratorInTerminal() async {
+        do {
+            let info = try await client.orchestratorSession()
+            guard let sessionId = info.ccSessionId else {
+                connectionError = "No orchestrator session yet — say something in Chat first."
+                return
+            }
+            let base = client.baseURL.absoluteString
+            let workdir = info.workdir ?? FileManager.default.homeDirectoryForCurrentUser.path
+            let script = """
+                #!/bin/zsh -li
+                # Interactive checkout of the Tasks orchestrator session.
+                BASE=\(shellQuoted(base))
+                trap 'kill $HEARTBEAT 2>/dev/null; curl -s -X POST "$BASE/orchestrator/session/release" > /dev/null' EXIT
+                curl -s -X POST "$BASE/orchestrator/session/checkout" > /dev/null
+                ( while :; do sleep 60; curl -s -X POST "$BASE/orchestrator/session/checkout" > /dev/null; done ) &
+                HEARTBEAT=$!
+                cd \(shellQuoted(workdir))
+                claude --resume \(shellQuoted(sessionId))
+                """
+            let dir = FileManager.default.temporaryDirectory
+            let file = dir.appending(path: "tasks-orchestrator.command")
+            try script.write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: file.path)
+            NSWorkspace.shared.open(file)
+        } catch {
+            connectionError = error.localizedDescription
+        }
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Queue a one-spec Builder run (the API takes a batch; the UI's unit is

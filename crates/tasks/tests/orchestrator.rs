@@ -429,6 +429,70 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
     nudge_loop.abort();
 }
 
+/// The interactive-checkout lifecycle over HTTP: no session → 409; with a
+/// session, checkout marks it held (suspending ticks) and release clears it.
+#[tokio::test]
+async fn orchestrator_session_checkout_flows_over_http() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let app = tasks::server::router(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+
+    let info: serde_json::Value = http
+        .get(format!("{base}/orchestrator/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["cc_session_id"], serde_json::Value::Null);
+    assert_eq!(info["checked_out"], false);
+
+    // Nothing to check out yet.
+    let resp = http
+        .post(format!("{base}/orchestrator/session/checkout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    store
+        .set_orchestrator_cc_session(Some("cc-session-1"))
+        .await
+        .unwrap();
+    store
+        .set_orchestrator_workdir("/tmp/checkout")
+        .await
+        .unwrap();
+
+    let info: serde_json::Value = http
+        .post(format!("{base}/orchestrator/session/checkout"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["cc_session_id"], "cc-session-1");
+    assert_eq!(info["workdir"], "/tmp/checkout");
+    assert_eq!(info["checked_out"], true);
+    assert!(store.orchestrator_checked_out().await.unwrap());
+
+    let info: serde_json::Value = http
+        .post(format!("{base}/orchestrator/session/release"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["checked_out"], false);
+    assert!(!store.orchestrator_checked_out().await.unwrap());
+}
+
 #[tokio::test]
 async fn messages_flow_over_http() {
     let store = Arc::new(Store::open_in_memory().await.unwrap());

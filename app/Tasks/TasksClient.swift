@@ -181,6 +181,11 @@ struct TasksClient: Sendable {
         return try await post("orchestrator/messages", body: Body(content: content))
     }
 
+    /// The orchestrator's CC session — enough to resume it interactively.
+    func orchestratorSession() async throws -> OrchestratorSessionInfo {
+        try await get("orchestrator/session")
+    }
+
     /// SSE feed of the in-flight orchestrator tick: text deltas, tool-call
     /// labels, and `done`. Ephemeral — no backfill; a (re)connect only sees
     /// what happens next, and the durable reply always arrives via
