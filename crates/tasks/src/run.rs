@@ -46,8 +46,8 @@ use vm_pool_protocol::VmConfig;
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
 use crate::github::GitHubClient;
-use crate::models::{GhState, Mode, Project, Spec, Task, TaskId, TaskState};
-use crate::orchestrator::{Orchestrator, OrchestratorConfig};
+use crate::models::{ChatRole, GhState, Mode, Project, Spec, Task, TaskId, TaskState};
+use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
@@ -71,8 +71,15 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
 const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
-/// How often the orchestrator loop checks for unanswered user turns.
+/// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
+/// Debounce for pipeline-event nudges: after the first nudge-worthy event,
+/// wait for this much quiet so a burst (a poller ingesting ten issues, a
+/// scout finishing + its spec landing) becomes ONE event turn — every nudge
+/// costs an agent turn.
+const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Hard cap on how long a steady event trickle can hold a nudge open.
+const NUDGE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// Wall-clock budget for one scout. ~2.5x the observed 23-minute live run, and
 /// deliberately below vm-pool's own `PoolConfig::vm_timeout` (7200s): if the
 /// app deadline sat at or above the pool's reaper, infrastructure would tear
@@ -343,6 +350,12 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.clone(),
         shutdown_rx.clone(),
     ));
+    let nudge = tokio::spawn(orchestrator_nudge_loop(
+        store.clone(),
+        NUDGE_DEBOUNCE,
+        NUDGE_MAX_WAIT,
+        shutdown_rx.clone(),
+    ));
 
     server::serve_with_shutdown(store, config.port, async {
         let _ = tokio::signal::ctrl_c().await;
@@ -353,6 +366,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let _ = shutdown_tx.send(true);
     let _ = poll.await;
     orchestrate.abort();
+    nudge.abort();
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
         let _ = dispatch.await;
         let _ = build.await;
@@ -823,6 +837,67 @@ pub async fn orchestrator_loop(
         tokio::select! {
             _ = tokio::time::sleep(ORCHESTRATOR_TICK) => {}
             _ = shutdown.changed() => return,
+        }
+    }
+}
+
+/// Turn significant pipeline events into `event` turns in the orchestrator
+/// conversation, so the agent reacts to the pipeline instead of only to the
+/// human. Bursts are debounced ([`NUDGE_DEBOUNCE`] of quiet, capped at
+/// `max_wait`) into one turn; [`orchestrator_loop`]'s next tick answers it.
+///
+/// `debounce`/`max_wait` are parameters so tests can run in milliseconds;
+/// production passes [`NUDGE_DEBOUNCE`]/[`NUDGE_MAX_WAIT`].
+pub async fn orchestrator_nudge_loop(
+    store: Arc<Store>,
+    debounce: Duration,
+    max_wait: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut events = store.subscribe_events();
+    loop {
+        let first = tokio::select! {
+            _ = shutdown.changed() => return,
+            received = events.recv() => match received {
+                Ok(event) if orchestrator::nudge_worthy(&event.payload) => event,
+                Ok(_) => continue,
+                Err(RecvError::Lagged(missed)) => {
+                    warn!(missed, "orchestrator nudge feed lagged; events skipped");
+                    continue;
+                }
+                Err(RecvError::Closed) => return,
+            },
+        };
+
+        // Collect the rest of the burst.
+        let mut batch = vec![first];
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let quiet = tokio::time::sleep(debounce);
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = quiet => break,
+                _ = tokio::time::sleep_until(deadline) => break,
+                received = events.recv() => match received {
+                    Ok(event) if orchestrator::nudge_worthy(&event.payload) => batch.push(event),
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(missed)) => {
+                        warn!(missed, "orchestrator nudge feed lagged; events skipped");
+                    }
+                    Err(RecvError::Closed) => break,
+                },
+            }
+        }
+
+        let content = orchestrator::format_nudge(&store, &batch).await;
+        info!(events = batch.len(), "nudging orchestrator");
+        if let Err(e) = store
+            .append_orchestrator_message(ChatRole::Event, &content)
+            .await
+        {
+            warn!(error = %e, "failed to append orchestrator nudge");
         }
     }
 }

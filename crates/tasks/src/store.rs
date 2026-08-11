@@ -1891,21 +1891,66 @@ impl Store {
             .collect()
     }
 
-    /// The user turns the orchestrator has not answered yet: every message
-    /// after the last assistant turn. Empty when the conversation is settled.
-    /// This is the tick condition — DB-derived, so a crash between a user
-    /// message and its reply just means the next loop pass answers it.
+    /// The input turns (user + event) the orchestrator has not answered yet:
+    /// everything above the `answered_through` watermark. Empty when the
+    /// conversation is settled. This is the tick condition — DB-derived, so a
+    /// crash between an input and its reply just means the next pass answers
+    /// it again. The watermark (not "since the last assistant turn") is what
+    /// keeps input appended *during* a multi-minute agent turn unanswered:
+    /// it lands below the reply's seq but above the watermark.
     pub async fn unanswered_orchestrator_messages(
         &self,
     ) -> Result<Vec<OrchestratorMessage>, StoreError> {
-        let last_assistant: i64 = sqlx::query(
-            "SELECT COALESCE(MAX(seq), 0) AS s FROM orchestrator_messages WHERE role = ?",
+        let watermark: i64 = sqlx::query("SELECT answered_through FROM orchestrator WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?
+            .try_get("answered_through")?;
+        Ok(self
+            .orchestrator_messages_since(watermark)
+            .await?
+            .into_iter()
+            .filter(|m| m.role != ChatRole::Assistant)
+            .collect())
+    }
+
+    /// Append the assistant's reply and advance the answered watermark to
+    /// `answered_through` (the highest input seq the prompt covered) in one
+    /// transaction, so a crash can't record the reply without settling the
+    /// input it answered.
+    pub async fn append_orchestrator_reply(
+        &self,
+        content: &str,
+        answered_through: i64,
+    ) -> Result<OrchestratorMessage, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "INSERT INTO orchestrator_messages (role, content, created_at) VALUES (?, ?, ?)",
         )
         .bind(ChatRole::Assistant.as_str())
-        .fetch_one(&self.pool)
-        .await?
-        .try_get("s")?;
-        self.orchestrator_messages_since(last_assistant).await
+        .bind(content)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        let seq = result.last_insert_rowid();
+        sqlx::query(
+            "UPDATE orchestrator SET answered_through = MAX(answered_through, ?) WHERE id = 1",
+        )
+        .bind(answered_through)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.append_event(EventPayload::OrchestratorMessage {
+            seq,
+            role: ChatRole::Assistant,
+        })
+        .await?;
+        Ok(OrchestratorMessage {
+            seq,
+            role: ChatRole::Assistant,
+            content: content.to_string(),
+            created_at: now,
+        })
     }
 
     pub async fn orchestrator_cc_session(&self) -> Result<Option<String>, StoreError> {

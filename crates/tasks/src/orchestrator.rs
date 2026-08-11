@@ -31,7 +31,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::models::{ChatRole, OrchestratorFeedEvent};
+use crate::events::{Event, EventPayload};
+use crate::models::{BuildStatus, OrchestratorFeedEvent, SessionStatus, SpecQueueStatus};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -73,14 +74,16 @@ impl Orchestrator {
         Self { store, config }
     }
 
-    /// Answer the pending user turns, if any. Returns whether a reply was
-    /// produced. One reply covers every unanswered turn — they are joined
-    /// into one prompt, which is also what makes the tick idempotent.
+    /// Answer the pending input turns (user + event), if any. Returns whether
+    /// a reply was produced. One reply covers every unanswered turn — they
+    /// are joined into one prompt, which is also what makes the tick
+    /// idempotent.
     pub async fn tick(&self) -> Result<bool, OrchestratorError> {
         let pending = self.store.unanswered_orchestrator_messages().await?;
         if pending.is_empty() {
             return Ok(false);
         }
+        let answered_through = pending.last().map(|m| m.seq).unwrap_or(0);
         let prompt = pending
             .iter()
             .map(|m| m.content.as_str())
@@ -105,7 +108,7 @@ impl Orchestrator {
             trimmed
         };
         self.store
-            .append_orchestrator_message(ChatRole::Assistant, content)
+            .append_orchestrator_reply(content, answered_through)
             .await?;
         // The durable message exists now — tell live-feed subscribers the
         // in-flight view is over (after the append, so a client reacting to
@@ -317,6 +320,118 @@ fn tool_label(item: &serde_json::Value) -> String {
     }
 }
 
+/// Which pipeline events deserve a nudge into the orchestrator conversation.
+///
+/// Selective on purpose — every nudge costs an agent turn. Chosen: the
+/// moments a human coworker would want flagged (work arriving, specs landing,
+/// verdicts, builds concluding). Excluded: the orchestrator's own messages
+/// (feedback loop), derivative state transitions, and dispatch-level noise
+/// that the Activity feed already carries.
+pub fn nudge_worthy(payload: &EventPayload) -> bool {
+    match payload {
+        EventPayload::TaskIngested { .. }
+        | EventPayload::SpecCreated { .. }
+        | EventPayload::BuildCompleted { .. }
+        | EventPayload::PullRequestOpened { .. }
+        | EventPayload::ModeChanged { .. } => true,
+        // Success is conveyed by the SpecCreated that accompanies it.
+        EventPayload::SessionCompleted { status, .. } => *status == SessionStatus::ScoutFailed,
+        // Human review verdicts. PendingReview duplicates SpecCreated and
+        // Built duplicates BuildCompleted.
+        EventPayload::SpecQueueStatusChanged { to, .. } => matches!(
+            to,
+            SpecQueueStatus::Approved
+                | SpecQueueStatus::NeedsRevision
+                | SpecQueueStatus::Rejected
+                | SpecQueueStatus::Blocked
+        ),
+        _ => false,
+    }
+}
+
+/// Render a batch of nudge-worthy events as one `event` turn. Events are
+/// identifier-only, so detail comes from store lookups at format time; a row
+/// that has since vanished degrades to its id rather than failing the nudge.
+pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
+    let mut lines = Vec::new();
+    let mut ingested = 0usize;
+    for event in events {
+        match &event.payload {
+            EventPayload::TaskIngested { task_id, .. } => {
+                ingested += 1;
+                lines.push(format!("- New task: {}", task_ref(store, task_id).await));
+            }
+            EventPayload::SpecCreated {
+                spec_id, task_id, ..
+            } => lines.push(format!(
+                "- Spec landed for review: {} ({spec_id})",
+                task_ref(store, task_id).await
+            )),
+            EventPayload::SessionCompleted {
+                session_id,
+                task_id,
+                ..
+            } => {
+                let reason = match store.get_session(session_id).await {
+                    Ok(Some(s)) => s.exit_reason.unwrap_or_else(|| "unknown".into()),
+                    _ => "unknown".into(),
+                };
+                lines.push(format!(
+                    "- Scout FAILED for {}: {reason}",
+                    task_ref(store, task_id).await
+                ));
+            }
+            EventPayload::SpecQueueStatusChanged { spec_id, to, .. } => {
+                let task = match store.get_spec(spec_id).await {
+                    Ok(Some(spec)) => task_ref(store, &spec.task_id).await,
+                    _ => spec_id.to_string(),
+                };
+                lines.push(format!("- Review verdict on {task}: {}", to.as_str()));
+            }
+            EventPayload::BuildCompleted { build_id, status } => {
+                let line = match store.get_build(build_id).await {
+                    Ok(Some(build)) => match status {
+                        BuildStatus::Succeeded => {
+                            format!("- Build {build_id} succeeded (branch {})", build.branch)
+                        }
+                        _ => format!(
+                            "- Build {build_id} FAILED: {}",
+                            build.exit_reason.unwrap_or_else(|| "unknown".into())
+                        ),
+                    },
+                    _ => format!("- Build {build_id}: {}", status.as_str()),
+                };
+                lines.push(line);
+            }
+            EventPayload::PullRequestOpened {
+                build_id,
+                pr_number,
+            } => lines.push(format!("- PR #{pr_number} opened (build {build_id})")),
+            EventPayload::ModeChanged { from, to } => lines.push(format!(
+                "- Mode changed: {} → {}",
+                from.as_str(),
+                to.as_str()
+            )),
+            _ => {}
+        }
+    }
+    if ingested > 1 {
+        lines.push(format!("({ingested} tasks ingested in this batch)"));
+    }
+    format!(
+        "[pipeline] Automated notification — not the human. Recent activity:\n{}",
+        lines.join("\n")
+    )
+}
+
+/// `#<issue> "<title>"` for a task, degrading to the raw id if it's gone.
+async fn task_ref(store: &Store, task_id: &crate::models::TaskId) -> String {
+    match store.get_task(task_id).await {
+        Ok(Some(task)) => format!("#{} \"{}\"", task.gh_issue_number, task.title),
+        _ => task_id.to_string(),
+    }
+}
+
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
@@ -325,8 +440,36 @@ fn system_prompt(port: u16) -> String {
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
          specs into PRs (via Builder agents). You are a persistent \
-         conversation the human returns to. Answer questions, and act when — \
-         and only when — the human asks. Never invent work for yourself.\n\n\
+         conversation the human returns to, and a proactive teammate: besides \
+         the human's messages, you receive automated pipeline notifications \
+         (turns starting with \"[pipeline]\"). Treat those as your cue to act \
+         on the human's behalf — investigate, summarize, prepare — not just \
+         to acknowledge.\n\n\
+         On a [pipeline] turn:\n\
+         - Spec landed → read it (GET /specs/{{id}}) and review it \
+           ADVERSARIALLY: your value is finding what's wrong, not affirming \
+           the work — the scout already believes in it. Hunt for missed \
+           requirements, untested claims, wrong layers, scope creep. Then \
+           zoom out: does this work fit the larger picture of what's in \
+           flight and where the project is going, and is the underlying task \
+           worth doing at all? You are the one place \"why are we doing \
+           this?\" gets asked — did the agent miss the forest for the trees? \
+           Lead with your strongest objection, then say whether you'd \
+           approve. The verdict itself stays the human's.\n\
+         - Scout or build FAILED → investigate (transcript, build row, \
+           events) and report the cause and what you'd do about it.\n\
+         - New tasks → note anything urgent or related to in-flight work; \
+           otherwise a one-line summary is plenty.\n\
+         - PR opened / mode changed / verdicts → keep it to a line unless \
+           something needs attention.\n\
+         The same adversarial posture applies whenever the human asks you to \
+         review a spec, a PR, or an implementation: never be congratulatory — \
+         praise is noise, defects and risks are signal. \"Looks solid\" is \
+         only worth saying after you tried hard to break it and failed, and \
+         then say what you tried.\n\
+         Be brief on notifications — a quiet pipeline deserves a quiet \
+         channel. Never fabricate activity, and never take the gated actions \
+         below without the human.\n\n\
          Your working directory is the project checkout itself. Within your \
          permission settings you may read and edit code, run builds and \
          tests, and use `gh` (e.g. to file issues the human asks for). If a \
@@ -371,10 +514,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nudges_are_selective() {
+        use crate::models::{BuildId, ChatRole, Mode, SessionId, SpecId, TaskId};
+        let task = || TaskId::from_raw("task_1");
+        let sess = || SessionId::from_raw("sess_1");
+        let spec = || SpecId::from_raw("spec_1");
+
+        // The moments a coworker would flag:
+        assert!(nudge_worthy(&EventPayload::SpecCreated {
+            spec_id: spec(),
+            task_id: task(),
+            session_id: sess(),
+        }));
+        assert!(nudge_worthy(&EventPayload::SessionCompleted {
+            session_id: sess(),
+            task_id: task(),
+            status: SessionStatus::ScoutFailed,
+        }));
+        assert!(nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: Some(SpecQueueStatus::PendingReview),
+            to: SpecQueueStatus::Approved,
+        }));
+        assert!(nudge_worthy(&EventPayload::ModeChanged {
+            from: Mode::Play,
+            to: Mode::Pause,
+        }));
+
+        // Feedback loops, duplicates, and noise:
+        assert!(!nudge_worthy(&EventPayload::OrchestratorMessage {
+            seq: 1,
+            role: ChatRole::Assistant,
+        }));
+        assert!(!nudge_worthy(&EventPayload::SessionCompleted {
+            session_id: sess(),
+            task_id: task(),
+            status: SessionStatus::ScoutSucceeded, // SpecCreated covers it
+        }));
+        assert!(!nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: None,
+            to: SpecQueueStatus::PendingReview, // SpecCreated covers it
+        }));
+        assert!(!nudge_worthy(&EventPayload::BuildStarted {
+            build_id: BuildId::from_raw("build_1"),
+        }));
+        assert!(!nudge_worthy(&EventPayload::QueueReordered {
+            task_ids: vec![]
+        }));
+    }
+
+    #[test]
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
         let p = system_prompt(4800);
         assert!(p.contains("http://127.0.0.1:4800"));
-        assert!(p.contains("only when — the human asks"));
+        assert!(p.contains("[pipeline]"));
+        assert!(p.contains("proactive"));
+        assert!(p.contains("ADVERSARIALLY"));
+        assert!(p.contains("why are we doing"));
         assert!(p.contains("Never switch branches"));
         assert!(p.contains("verdict they explicitly stated"));
     }
