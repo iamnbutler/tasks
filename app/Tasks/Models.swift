@@ -430,12 +430,17 @@ struct OrchestratorFeedFrame: Decodable, Sendable {
 
 enum ChatRole: WireEnum {
     case user, assistant
+    /// An automated pipeline notification injected into the conversation
+    /// (spec landed, build finished). The orchestrator answers it like a
+    /// user turn; the app renders it as a system line, not a bubble.
+    case event
     case unknown(String)
 
     init(wire: String) {
         switch wire {
         case "user": self = .user
         case "assistant": self = .assistant
+        case "event": self = .event
         default: self = .unknown(wire)
         }
     }
@@ -444,6 +449,7 @@ enum ChatRole: WireEnum {
         switch self {
         case .user: "user"
         case .assistant: "assistant"
+        case .event: "event"
         case .unknown(let raw): raw
         }
     }

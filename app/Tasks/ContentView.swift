@@ -625,9 +625,12 @@ struct ChatView: View {
         .navigationTitle("Chat")
     }
 
-    /// The last turn is the human's: a reply is on its way.
+    /// The last turn is input (human or pipeline event): a reply is on its way.
     private var awaitingReply: Bool {
-        model.chat.last?.role == .user
+        switch model.chat.last?.role {
+        case .user, .event: true
+        default: false
+        }
     }
 
     /// The in-flight tick, live: the reply streaming into a bubble as it's
@@ -673,6 +676,39 @@ struct ChatBubble: View {
     let message: ChatMessage
 
     var body: some View {
+        if message.role == .event {
+            eventLine
+        } else {
+            bubble
+        }
+    }
+
+    /// Pipeline notifications read as system chrome, not conversation: a
+    /// compact secondary block the eye can skip past.
+    private var eventLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "bolt.horizontal")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Text(eventBody)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+    }
+
+    /// Strip the "[pipeline] Automated notification…" preamble — it's for
+    /// the agent; humans just want the bullets.
+    private var eventBody: String {
+        let lines = message.content.split(separator: "\n", omittingEmptySubsequences: true)
+        let bullets = lines.filter { !$0.hasPrefix("[pipeline]") }
+        return bullets.isEmpty ? message.content : bullets.joined(separator: "\n")
+    }
+
+    private var bubble: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 60) }
             VStack(alignment: .leading, spacing: 2) {

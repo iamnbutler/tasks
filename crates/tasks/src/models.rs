@@ -476,6 +476,10 @@ pub struct OrchestratorMessage {
 pub enum ChatRole {
     User,
     Assistant,
+    /// An automated pipeline notification injected into the conversation
+    /// (spec landed, build finished, tasks ingested). Counts as unanswered
+    /// input like a user turn — the orchestrator reacts to it proactively.
+    Event,
 }
 
 impl ChatRole {
@@ -483,6 +487,7 @@ impl ChatRole {
         match self {
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
+            ChatRole::Event => "event",
         }
     }
 
@@ -490,6 +495,7 @@ impl ChatRole {
         match s {
             "user" => Some(ChatRole::User),
             "assistant" => Some(ChatRole::Assistant),
+            "event" => Some(ChatRole::Event),
             _ => None,
         }
     }
