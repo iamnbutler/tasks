@@ -75,6 +75,25 @@ the server only.
   batch is re-sorted into spec-queue order server-side. 400 on an empty or
   duplicated set, a non-approved spec, specs from two projects, or a spec
   already in an active build. Watch `build_*` events or poll.
+- `POST /orchestrator/messages` `{"content"}` — say something to the
+  orchestrator (a persistent server-side Claude Code session that can inspect
+  and drive the pipeline over this same API, but only when asked). **202**
+  with your message; the reply arrives asynchronously as an
+  `orchestrator_message` event — refetch on it. `GET
+  /orchestrator/messages?since=N` returns turns with `seq > N`, oldest first:
+  `{seq, role: "user"|"assistant", content, created_at}`. Render an
+  "answering…" affordance while the newest turn is the user's.
+- `GET /orchestrator/stream` — SSE live view of the in-flight tick, one JSON
+  frame per `data:` line: `{"kind":"delta","text"}` (assistant text in
+  generation order), `{"kind":"tool","label"}` (a tool call, e.g.
+  `Bash: curl …`), `{"kind":"done"}` (the durable reply is now fetchable).
+  **Ephemeral**: no backfill, a (re)connect only sees what happens next, and
+  a lagged subscriber misses deltas — never the reply, which always lands in
+  `/orchestrator/messages`. Suggested rendering: accumulate deltas into a
+  growing bubble, reset the accumulator on each `tool` frame (pre-tool text
+  is working narration; the segment after the last tool call is the reply),
+  show the latest tool label as status, and swap in the persisted message
+  when it arrives. Skip unknown `kind`s.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
   `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
@@ -175,6 +194,7 @@ dropped out of the repository's open set; refetch the task or the list),
 `build_requested` (`build_id`, `spec_ids`), `build_started`,
 `build_completed` (`build_id`, `status` — refetch the build for detail),
 `pull_request_opened` (`build_id`, `pr_number`),
+`orchestrator_message` (`seq`, `role` — refetch `/orchestrator/messages`),
 `mode_changed`, `note` (`source`, `message` — free-form breadcrumbs; a
 scrolling activity feed of these is the cheapest useful "what is it doing"
 view).

@@ -390,6 +390,9 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         builder_image: "builder:v1".into(),
         builder_timeout: Duration::from_secs(300),
         github_rest_api_url: None,
+        orchestrator_cmd: "true".into(),
+        orchestrator_timeout: Duration::from_secs(60),
+        orchestrator_workdir: None,
     }
 }
 

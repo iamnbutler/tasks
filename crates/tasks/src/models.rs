@@ -461,3 +461,51 @@ impl BuildStatus {
         }
     }
 }
+
+/// One turn in the orchestrator conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorMessage {
+    pub seq: i64,
+    pub role: ChatRole,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(ChatRole::User),
+            "assistant" => Some(ChatRole::Assistant),
+            _ => None,
+        }
+    }
+}
+
+/// One moment of an in-flight orchestrator tick, streamed over
+/// `GET /orchestrator/stream`. Ephemeral by design: nothing here is
+/// persisted — the durable record is the finished message in
+/// `orchestrator_messages` (and Claude Code's own session transcript).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OrchestratorFeedEvent {
+    /// A chunk of assistant text, in generation order.
+    Delta { text: String },
+    /// The agent invoked a tool (e.g. a curl against this API).
+    Tool { label: String },
+    /// The tick finished; fetch `/orchestrator/messages` for the reply.
+    Done,
+}

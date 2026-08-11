@@ -559,6 +559,9 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
     let to: String?
     let source: String?
     let message: String?
+    let buildId: String?
+    let status: String?
+    let prNumber: Int64?
 
     var id: Int64 { seq }
 
@@ -567,6 +570,7 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
     }
     enum PayloadKeys: String, CodingKey {
         case kind, taskId, sessionId, specId, from, to, source, message
+        case buildId, status, prNumber
     }
 
     init(from decoder: any Decoder) throws {
@@ -582,5 +586,94 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
         to = try? p.decodeIfPresent(String.self, forKey: .to)
         source = try? p.decodeIfPresent(String.self, forKey: .source)
         message = try? p.decodeIfPresent(String.self, forKey: .message)
+        buildId = try? p.decodeIfPresent(String.self, forKey: .buildId)
+        status = try? p.decodeIfPresent(String.self, forKey: .status)
+        prNumber = try? p.decodeIfPresent(Int64.self, forKey: .prNumber)
+    }
+}
+
+/// One serial Builder run over a batch of approved specs. `prNumber` is an
+/// identifier — the PR's live state is GitHub's; link out for it.
+struct BuildItem: Decodable, Identifiable, Hashable {
+    let id: String
+    let projectId: String
+    let branch: String
+    let baseBranch: String
+    let baseSha: String?
+    let headSha: String?
+    let prNumber: UInt64?
+    let status: BuildStatus
+    let summary: String?
+    let filesTouched: [String]
+    let exitReason: String?
+    let createdAt: Date
+    let startedAt: Date?
+    let completedAt: Date?
+}
+
+enum BuildStatus: WireEnum {
+    case queued, running, succeeded, failed
+    case unknown(String)
+
+    init(wire: String) {
+        switch wire {
+        case "queued": self = .queued
+        case "running": self = .running
+        case "succeeded": self = .succeeded
+        case "failed": self = .failed
+        default: self = .unknown(wire)
+        }
+    }
+
+    var wire: String {
+        switch self {
+        case .queued: "queued"
+        case .running: "running"
+        case .succeeded: "succeeded"
+        case .failed: "failed"
+        case .unknown(let raw): raw
+        }
+    }
+}
+
+/// One turn in the orchestrator conversation (the Chat pane).
+struct ChatMessage: Decodable, Identifiable, Hashable {
+    let seq: Int64
+    let role: ChatRole
+    let content: String
+    let createdAt: Date
+
+    var id: Int64 { seq }
+}
+
+/// One frame of `/orchestrator/stream` — the live view of an in-flight tick.
+/// Loose by design: unknown kinds are skipped, and nothing here is durable
+/// (the finished message arrives via `/orchestrator/messages`).
+struct OrchestratorFeedFrame: Decodable, Sendable {
+    let kind: String
+    /// Present when kind == "delta": a chunk of assistant text.
+    let text: String?
+    /// Present when kind == "tool": a one-line tool-call label.
+    let label: String?
+}
+
+enum ChatRole: WireEnum {
+    case user, assistant
+    case unknown(String)
+
+    init(wire: String) {
+        switch wire {
+        case "user": self = .user
+        case "assistant": self = .assistant
+        default: self = .unknown(wire)
+        }
+    }
+
+    var wire: String {
+        switch self {
+        case .user: "user"
+        case .assistant: "assistant"
+        case .unknown(let raw): raw
+        }
     }
 }

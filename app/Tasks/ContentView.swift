@@ -8,6 +8,7 @@ struct ContentView: View {
     @Environment(AppModel.self) private var model
     @State private var section: NavSection? = .queue
     @State private var selectedTask: TaskItem.ID?
+    @State private var showTaskInspector = false
     @State private var selectedQueueTask: TaskItem.ID?
     /// Events newer than this get the unread accent while Activity is open.
     /// Captured from `lastSeenSeq` when the section is entered, then the model
@@ -16,23 +17,42 @@ struct ContentView: View {
     @State private var unreadBoundary: Int64 = 0
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 150, ideal: 180)
-        } content: {
-            listColumn
-                .navigationSplitViewColumnWidth(min: 320, ideal: 420)
-        } detail: {
-            detail
-                .frame(minWidth: 380)
-        }
-        .navigationTitle("Tasks")
-        .navigationSubtitle(subtitle)
-        .toolbar { toolbarContent }
-        .onChange(of: section) { _, next in
-            if next == .activity {
-                unreadBoundary = model.lastSeenSeq
-                model.markActivityRead()
+        split
+            .navigationTitle("Tasks")
+            .navigationSubtitle(subtitle)
+            .toolbar { toolbarContent }
+            .onChange(of: section) { _, next in
+                if next == .activity {
+                    unreadBoundary = model.lastSeenSeq
+                    model.markActivityRead()
+                }
+            }
+    }
+
+    /// Queue is list + detail (its detail is where review happens). Tasks,
+    /// Activity, and Chat are single full-width surfaces — Tasks opens its
+    /// detail as a click-to-open, Esc-to-close inspector instead of a
+    /// permanently reserved pane.
+    @ViewBuilder
+    private var split: some View {
+        if section == .queue || section == nil {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            } content: {
+                listColumn
+                    .navigationSplitViewColumnWidth(min: 320, ideal: 420)
+            } detail: {
+                detail
+                    .frame(minWidth: 380)
+            }
+        } else {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 150, ideal: 180)
+            } detail: {
+                sectionList
+                    .frame(minWidth: 500)
             }
         }
     }
@@ -109,16 +129,53 @@ struct ContentView: View {
         switch section {
         case .tasks:
             TasksTable(selection: $selectedTask)
+                .onChange(of: selectedTask) { _, selected in
+                    if selected != nil { showTaskInspector = true }
+                }
+                .inspector(isPresented: $showTaskInspector) {
+                    taskInspector
+                        .inspectorColumnWidth(min: 360, ideal: 460, max: 700)
+                }
         case .queue, nil:
             queueList
         case .activity:
             ActivityFeed(unreadBoundary: unreadBoundary)
         case .chat:
-            ContentUnavailableView(
-                "No orchestrator yet",
-                systemImage: "bubble.left.and.bubble.right",
-                description: Text("The orchestrator session ships next — this is where you'll talk to it."))
+            ChatView()
         }
+    }
+
+    /// The click-to-open task detail. Esc (`.cancelAction`) and the X both
+    /// close it *and* clear the selection, so clicking any row — including
+    /// the same one — reopens it.
+    @ViewBuilder
+    private var taskInspector: some View {
+        if let id = selectedTask, let task = model.task(id) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button {
+                        closeTaskInspector()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.cancelAction)
+                    .help("Close (Esc)")
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+                TaskDetailView(task: task)
+            }
+        } else {
+            ContentUnavailableView("", systemImage: "sidebar.right")
+        }
+    }
+
+    private func closeTaskInspector() {
+        showTaskInspector = false
+        selectedTask = nil
     }
 
     /// The queue, grouped in attention order: verdicts you owe, work running
@@ -128,6 +185,7 @@ struct ContentView: View {
         List(selection: $selectedQueueTask) {
             let needsYou = tasksIn(.inReview)
             let running = tasksIn(.scouting)
+            let building = tasksIn(.building)
             let upNext = tasksIn(.queued)
             let readyToBuild = tasksIn(.readyToBuild)
 
@@ -150,6 +208,13 @@ struct ContentView: View {
                     }
                 }
             }
+            if !building.isEmpty {
+                Section("Building") {
+                    ForEach(building) { task in
+                        QueueRow(task: task, accessory: .elapsed(model.runningBuild?.startedAt))
+                    }
+                }
+            }
             if !upNext.isEmpty {
                 Section("Up next") {
                     ForEach(upNext) { task in
@@ -168,6 +233,13 @@ struct ContentView: View {
                 Section("Ready to build") {
                     ForEach(readyToBuild) { task in
                         QueueRow(task: task, accessory: .complexity(latestSpec(for: task)?.complexity))
+                            .contextMenu {
+                                if let spec = latestSpec(for: task) {
+                                    Button("Build") {
+                                        Task { await model.buildNow(specId: spec.id) }
+                                    }
+                                }
+                            }
                     }
                 }
             }
@@ -196,18 +268,11 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         switch section {
-        case .tasks:
-            if let id = selectedTask, let task = model.task(id) {
-                TaskDetailView(task: task)
-            } else {
-                noSelection("Select a task")
-            }
         case .queue, nil:
             queueDetail
-        case .activity:
-            noSelection("The feed is the whole story")
-        case .chat:
-            noSelection("")
+        case .tasks, .activity, .chat:
+            // Unreachable — these sections use the full-width layout.
+            EmptyView()
         }
     }
 
@@ -425,6 +490,11 @@ struct ActivityFeed: View {
         case "spec_created": "doc.text"
         case "spec_queue_status_changed": "text.badge.checkmark"
         case "queue_reordered", "spec_queue_reordered": "arrow.up.arrow.down"
+        case "build_requested": "hammer"
+        case "build_started": "hammer.circle"
+        case "build_completed": "checkmark.seal"
+        case "pull_request_opened": "arrow.triangle.branch"
+        case "orchestrator_message": "bubble.left.and.bubble.right"
         case "mode_changed": "playpause"
         case "note": "text.bubble"
         case "project_added": "folder.badge.plus"
@@ -457,6 +527,20 @@ struct ActivityFeed: View {
             return "Queue reordered"
         case "spec_queue_reordered":
             return "Spec queue reordered"
+        case "build_requested":
+            return "Build requested"
+        case "build_started":
+            return "Build started"
+        case "build_completed":
+            let status = event.status ?? "finished"
+            return "Build \(status)"
+        case "pull_request_opened":
+            if let pr = event.prNumber {
+                return "Pull request #\(pr) opened"
+            }
+            return "Pull request opened"
+        case "orchestrator_message":
+            return "Orchestrator conversation updated"
         case "mode_changed":
             return "Mode: \(event.from ?? "?") → \(event.to ?? "?")"
         case "note":
@@ -465,6 +549,160 @@ struct ActivityFeed: View {
             return "Project added"
         default:
             return event.kind.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
+// MARK: - Chat
+
+/// The orchestrator conversation: a persistent Claude Code session on the
+/// server that can inspect and drive the pipeline over the API when asked.
+struct ChatView: View {
+    @Environment(AppModel.self) private var model
+    @State private var draft = ""
+    @State private var sending = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    // Non-lazy on purpose: a lazy container tears down and
+                    // rebuilds these rich markdown bubbles continuously
+                    // while scrolling. The conversation is bounded and the
+                    // parses are cached — build once, scroll compositing.
+                    VStack(alignment: .leading, spacing: 12) {
+                        if model.chat.isEmpty {
+                            ContentUnavailableView(
+                                "Talk to the orchestrator",
+                                systemImage: "bubble.left.and.bubble.right",
+                                description: Text(
+                                    "Ask about status, or tell it to queue, scout, or build work."))
+                                .padding(.top, 60)
+                        }
+                        ForEach(model.chat) { message in
+                            ChatBubble(message: message)
+                                .id(message.seq)
+                        }
+                        if awaitingReply {
+                            liveTick
+                                .id(Int64.max)
+                        }
+                    }
+                    .padding(12)
+                    // Full-width section, readable column: bubbles cap out
+                    // instead of stretching across a wide window.
+                    .frame(maxWidth: 720)
+                    .frame(maxWidth: .infinity)
+                }
+                .onChange(of: model.chat.last?.seq) {
+                    if let last = model.chat.last?.seq {
+                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: model.liveReply) {
+                    if awaitingReply {
+                        proxy.scrollTo(Int64.max, anchor: .bottom)
+                    }
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                TextField("Message the orchestrator…", text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .onSubmit(send)
+                Button(action: send) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(10)
+            .frame(maxWidth: 720)
+            .frame(maxWidth: .infinity)
+        }
+        .navigationTitle("Chat")
+    }
+
+    /// The last turn is the human's: a reply is on its way.
+    private var awaitingReply: Bool {
+        model.chat.last?.role == .user
+    }
+
+    /// The in-flight tick, live: the reply streaming into a bubble as it's
+    /// generated, with the agent's current tool call (or "thinking") below.
+    private var liveTick: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !model.liveReply.isEmpty {
+                HStack {
+                    MarkdownView(text: model.liveReply)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            .quaternary.opacity(0.6),
+                            in: RoundedRectangle(cornerRadius: 10))
+                    Spacer(minLength: 60)
+                }
+            }
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(model.liveActivity ?? "Orchestrator is thinking…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 4)
+        }
+    }
+
+    private func send() {
+        let content = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !content.isEmpty, !sending else { return }
+        draft = ""
+        sending = true
+        Task {
+            await model.sendChat(content)
+            sending = false
+        }
+    }
+}
+
+struct ChatBubble: View {
+    let message: ChatMessage
+
+    var body: some View {
+        HStack {
+            if message.role == .user { Spacer(minLength: 60) }
+            VStack(alignment: .leading, spacing: 2) {
+                bubbleContent
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        message.role == .user
+                            ? AnyShapeStyle(Color.accentColor.opacity(0.85))
+                            : AnyShapeStyle(.quaternary.opacity(0.6)),
+                        in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(message.role == .user ? .white : .primary)
+                Text(message.createdAt, style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+            }
+            if message.role != .user { Spacer(minLength: 60) }
+        }
+    }
+
+    /// Assistant replies carry tables, code, and lists — render them.
+    /// User messages stay plain text: short, and styled white-on-accent.
+    @ViewBuilder
+    private var bubbleContent: some View {
+        if message.role == .user {
+            Text(message.content)
+                .textSelection(.enabled)
+        } else {
+            MarkdownView(text: message.content)
         }
     }
 }
