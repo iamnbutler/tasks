@@ -488,7 +488,12 @@ fn system_prompt(port: u16) -> String {
            Builder run (serial; one at a time)\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
          - GET /events?since=N — the activity log, newest last; your best \
-           source for \"what happened\"\n\
+           source for \"what happened\". Without ?since it returns only the \
+           newest 100 — page from since=1 before counting anything. Retired \
+           tasks are hidden from GET /tasks but reachable at GET /tasks/{{id}}. \
+           Nothing on the wire counts merged PRs — pull_request_opened fires \
+           at open; check merge state via gh, or say \"opened\", not \
+           \"shipped\"\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
          Rules:\n\

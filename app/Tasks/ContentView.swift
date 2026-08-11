@@ -1,12 +1,12 @@
 import SwiftUI
 
 enum NavSection: Hashable {
-    case tasks, queue, activity, chat
+    case home, tasks, queue, activity, chat
 }
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
-    @State private var section: NavSection? = .queue
+    @State private var section: NavSection? = .home
     @State private var selectedTask: TaskItem.ID?
     @State private var showTaskInspector = false
     @State private var selectedQueueTask: TaskItem.ID?
@@ -29,13 +29,15 @@ struct ContentView: View {
             }
     }
 
-    /// Queue is list + detail (its detail is where review happens). Tasks,
-    /// Activity, and Chat are single full-width surfaces — Tasks opens its
-    /// detail as a click-to-open, Esc-to-close inspector instead of a
-    /// permanently reserved pane.
+    /// Queue is list + detail (its detail is where review happens). Home,
+    /// Tasks, Activity, and Chat are single full-width surfaces — Tasks opens
+    /// its detail as a click-to-open, Esc-to-close inspector instead of a
+    /// permanently reserved pane. A nil selection means Home — `split`,
+    /// `sectionList`, and `detail` must all agree on that, or the layout and
+    /// its content disagree about which section is showing.
     @ViewBuilder
     private var split: some View {
-        if section == .queue || section == nil {
+        if section == .queue {
             NavigationSplitView {
                 sidebar
                     .navigationSplitViewColumnWidth(min: 150, ideal: 180)
@@ -51,7 +53,10 @@ struct ContentView: View {
                 sidebar
                     .navigationSplitViewColumnWidth(min: 150, ideal: 180)
             } detail: {
-                sectionList
+                // listColumn, not sectionList: full-width sections show
+                // "Connecting…" before the first refresh instead of an
+                // empty shell.
+                listColumn
                     .frame(minWidth: 500)
             }
         }
@@ -86,6 +91,8 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: $section) {
+            Label("Home", systemImage: "house")
+                .tag(NavSection.home)
             Label("Tasks", systemImage: "tray.full")
                 .tag(NavSection.tasks)
             Label("Queue", systemImage: "list.number")
@@ -127,6 +134,8 @@ struct ContentView: View {
     @ViewBuilder
     private var sectionList: some View {
         switch section {
+        case .home, nil:
+            HomeView(openQueue: { section = .queue })
         case .tasks:
             TasksTable(selection: $selectedTask)
                 .onChange(of: selectedTask) { _, selected in
@@ -136,7 +145,7 @@ struct ContentView: View {
                     taskInspector
                         .inspectorColumnWidth(min: 360, ideal: 460, max: 700)
                 }
-        case .queue, nil:
+        case .queue:
             queueList
         case .activity:
             ActivityFeed(unreadBoundary: unreadBoundary)
@@ -268,9 +277,9 @@ struct ContentView: View {
     @ViewBuilder
     private var detail: some View {
         switch section {
-        case .queue, nil:
+        case .queue:
             queueDetail
-        case .tasks, .activity, .chat:
+        case .home, .tasks, .activity, .chat, nil:
             // Unreachable — these sections use the full-width layout.
             EmptyView()
         }
