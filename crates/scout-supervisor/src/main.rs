@@ -289,7 +289,7 @@ fn make_workdir(task_id: &str) -> Result<PathBuf> {
         .unwrap_or_else(|_| std::env::temp_dir());
     let dir = base.join(format!(
         "scout-{task_id}-{}",
-        Uuid::new_v4().simple().to_string()[..8].to_string()
+        &Uuid::new_v4().simple().to_string()[..8]
     ));
     std::fs::create_dir_all(&dir).context("create workdir")?;
     Ok(dir)

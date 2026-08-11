@@ -4107,20 +4107,20 @@ mod tests {
             .await
             .unwrap();
         let err = store
-            .create_build(&[pending.id.clone()], "main")
+            .create_build(std::slice::from_ref(&pending.id), "main")
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
 
         // A spec already in an active build.
         let build = store
-            .create_build(&[spec.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec.id), "main")
             .await
             .unwrap();
         assert_eq!(build.status, BuildStatus::Queued);
         assert_eq!(build.branch, format!("build/{}", build.id));
         let err = store
-            .create_build(&[spec.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec.id), "main")
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("already part of"), "{err}");
@@ -4158,11 +4158,11 @@ mod tests {
         let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
 
         let first = store
-            .create_build(&[spec_a.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec_a.id), "main")
             .await
             .unwrap();
         let _second = store
-            .create_build(&[spec_b.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec_b.id), "main")
             .await
             .unwrap();
 
@@ -4209,7 +4209,7 @@ mod tests {
         store.insert_project(&project).await.unwrap();
         let (task, spec) = approved_spec(&store, &project, 1).await;
         let build = store
-            .create_build(&[spec.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec.id), "main")
             .await
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
@@ -4243,7 +4243,7 @@ mod tests {
             TaskState::Done
         );
         let err = store
-            .create_build(&[spec.id.clone()], "main")
+            .create_build(std::slice::from_ref(&spec.id), "main")
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("built"), "{err}");

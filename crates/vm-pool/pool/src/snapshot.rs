@@ -87,7 +87,7 @@ impl SnapshotStore {
             }
         }
 
-        snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        snapshots.sort_by_key(|a| a.created_at);
         Ok(snapshots)
     }
 

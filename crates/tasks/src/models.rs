@@ -1,4 +1,11 @@
 //! Core domain types.
+//!
+//! The wire enums here deliberately carry an inherent `from_str -> Option`
+//! rather than implementing `std::str::FromStr`: the callers (store row
+//! mappers, API handlers) want an Option to turn into a typed BadEnum error,
+//! not a FromStr::Err, and `parse()` inference noise buys nothing at this
+//! size. Suppressed module-wide because every wire enum hits the same lint.
+#![allow(clippy::should_implement_trait)]
 
 use std::fmt;
 
@@ -13,6 +20,10 @@ macro_rules! id_newtype {
         pub struct $name(String);
 
         impl $name {
+            /// Mint a fresh random id. Deliberately no `Default`: a default
+            /// that returns a different value every call would be a lie —
+            /// two "default" ids must not silently differ.
+            #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
                 Self(format!("{}_{}", $prefix, Uuid::new_v4().simple()))
             }

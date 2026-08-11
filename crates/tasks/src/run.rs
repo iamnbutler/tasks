@@ -886,8 +886,6 @@ fn is_disconnect(error: &ScoutError) -> bool {
     )
 }
 
-/// Where a scout clones from. Derived per project; the token, when set, rides
-/// along as basic auth so private repos clone without a credential helper.
 // --- orchestrator loop ---
 
 /// Answer pending orchestrator turns until `shutdown` flips.
@@ -1111,6 +1109,8 @@ pub async fn build_loop(store: Arc<Store>, config: Config, mut shutdown: watch::
     }
 }
 
+/// Where a scout clones from. Derived per project; the token, when set, rides
+/// along as basic auth so private repos clone without a credential helper.
 fn clone_url(config: &Config, project: &Project) -> String {
     clone_url_for(
         &config.clone_url_base,

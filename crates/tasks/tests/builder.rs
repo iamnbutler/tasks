@@ -229,20 +229,22 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
     assert!(listing.contains("src/built.rs"));
     assert!(!listing.contains("PROMPT.md") && !listing.contains("SUMMARY.md"));
 
-    // The PR request the fake GitHub saw.
-    let prs = h.seen_prs.lock().unwrap();
-    assert_eq!(prs.len(), 1);
-    let pr = &prs[0];
-    assert_eq!(pr["head"], json!(done.branch));
-    assert_eq!(pr["base"], json!("main"));
-    assert_eq!(pr["title"], json!("Build: #7, #9"));
-    let body = pr["body"].as_str().unwrap();
-    assert!(body.contains("Implements #7") && body.contains("Implements #9"));
-    assert!(
-        !body.contains("Closes"),
-        "closing an issue is not ours to write"
-    );
-    drop(prs);
+    // The PR request the fake GitHub saw. Block-scoped (not `drop()`) so the
+    // guard is provably not held across the awaits below.
+    {
+        let prs = h.seen_prs.lock().unwrap();
+        assert_eq!(prs.len(), 1);
+        let pr = &prs[0];
+        assert_eq!(pr["head"], json!(done.branch));
+        assert_eq!(pr["base"], json!("main"));
+        assert_eq!(pr["title"], json!("Build: #7, #9"));
+        let body = pr["body"].as_str().unwrap();
+        assert!(body.contains("Implements #7") && body.contains("Implements #9"));
+        assert!(
+            !body.contains("Closes"),
+            "closing an issue is not ours to write"
+        );
+    }
 
     // The batch drained: specs built, tasks done.
     for (task, spec) in [(&task_a, &spec_a), (&task_b, &spec_b)] {
@@ -270,7 +272,7 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
 
     let build = h
         .store
-        .create_build(&[spec.id.clone()], "main")
+        .create_build(std::slice::from_ref(&spec.id), "main")
         .await
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
