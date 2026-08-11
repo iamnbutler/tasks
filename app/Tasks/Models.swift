@@ -333,6 +333,9 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
     let buildId: String?
     let status: String?
     let prNumber: Int64?
+    /// `build_requested` only: the specs the build serves — the one place
+    /// the wire names a build's work without fetching `/builds/{id}`.
+    let specIds: [String]?
 
     var id: Int64 { seq }
 
@@ -341,7 +344,7 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
     }
     enum PayloadKeys: String, CodingKey {
         case kind, taskId, sessionId, specId, from, to, source, message
-        case buildId, status, prNumber
+        case buildId, status, prNumber, specIds
     }
 
     init(from decoder: any Decoder) throws {
@@ -360,7 +363,18 @@ struct ActivityEvent: Decodable, Identifiable, Hashable {
         buildId = try? p.decodeIfPresent(String.self, forKey: .buildId)
         status = try? p.decodeIfPresent(String.self, forKey: .status)
         prNumber = try? p.decodeIfPresent(Int64.self, forKey: .prNumber)
+        specIds = try? p.decodeIfPresent([String].self, forKey: .specIds)
     }
+}
+
+/// Five headline counts over a trailing window of the held event log —
+/// a pure fold, no server surface. See `AppModel.velocity(days:now:)`.
+struct Velocity: Equatable {
+    var ingested = 0
+    var specsProduced = 0
+    var specsApproved = 0
+    var buildsFinished = 0
+    var prsOpened = 0
 }
 
 /// One serial Builder run over a batch of approved specs. `prNumber` is an
@@ -380,6 +394,10 @@ struct BuildItem: Decodable, Identifiable, Hashable {
     let createdAt: Date
     let startedAt: Date?
     let completedAt: Date?
+
+    /// Sort key for "recent" lists: `completedAt` is null while a build runs,
+    /// and sorting on it alone shuffles in-flight work to the bottom.
+    var finishedOrCreatedAt: Date { completedAt ?? createdAt }
 }
 
 enum BuildStatus: WireEnum {

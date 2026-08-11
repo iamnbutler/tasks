@@ -1674,4 +1674,167 @@ mod tests {
             "no duplicate or skipped seq at the handoff"
         );
     }
+
+    /// `GET /events` without `since` returns the newest N — a fold over that
+    /// page fabricates a quiet week once real events scroll off it. This test
+    /// first proves the naive read genuinely undercounts (otherwise it proves
+    /// nothing), then runs the client's exact paging loop and asserts it
+    /// reconstructs the log gap-free and dupe-free.
+    #[tokio::test]
+    async fn paging_events_reconstructs_the_log_that_newest_n_truncates() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        // 3 countable ingests, then enough noise to push them off a
+        // newest-100 default page.
+        for i in 0..3 {
+            store
+                .append_event(EventPayload::TaskIngested {
+                    task_id: TaskId::from_raw(format!("task_{i}")),
+                    project_id: ProjectId::from_raw("proj_1"),
+                })
+                .await
+                .unwrap();
+        }
+        for i in 0..150 {
+            store
+                .append_event(EventPayload::Note {
+                    source: "test".into(),
+                    message: format!("noise {i}"),
+                })
+                .await
+                .unwrap();
+        }
+        let base = spawn(store).await;
+        let http = reqwest::Client::new();
+
+        let newest_page: Vec<Value> = http
+            .get(format!("{base}/events"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let naive_count = newest_page
+            .iter()
+            .filter(|e| e["payload"]["kind"] == "task_ingested")
+            .count();
+        assert_eq!(
+            naive_count, 0,
+            "the naive newest-N fold must genuinely undercount for this test to prove anything"
+        );
+
+        // The client's paging loop: since = high_water + 1, filter > high_water.
+        let mut log: Vec<Value> = Vec::new();
+        let mut high_water: i64 = 0;
+        loop {
+            let page: Vec<Value> = http
+                .get(format!("{base}/events?since={}&limit=50", high_water + 1))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let fresh: Vec<Value> = page
+                .iter()
+                .filter(|e| e["seq"].as_i64().unwrap() > high_water)
+                .cloned()
+                .collect();
+            if let Some(last) = fresh.last() {
+                high_water = last["seq"].as_i64().unwrap();
+            }
+            let done = page.len() < 50;
+            log.extend(fresh);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(log.len(), 153, "gap-free and dupe-free");
+        let seqs: Vec<i64> = log.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+        assert_eq!(seqs, (1..=153).collect::<Vec<_>>(), "contiguous from 1");
+        let paged_count = log
+            .iter()
+            .filter(|e| e["payload"]["kind"] == "task_ingested")
+            .count();
+        assert_eq!(paged_count, 3, "matches the hand count");
+    }
+
+    /// `GET /tasks` reconciles away closed+concluded work; `GET /tasks/{id}`
+    /// must not — shipped work is exactly the work whose issue has closed,
+    /// and dashboards still need its title.
+    #[tokio::test]
+    async fn retired_tasks_stay_reachable_by_id() {
+        let (store, project) = store_with_project().await;
+        let now = Utc::now();
+        let retired = Task {
+            id: TaskId::new(),
+            project_id: project.id.clone(),
+            gh_issue_number: 900,
+            title: "shipped and closed".into(),
+            body: String::new(),
+            labels: vec![],
+            gh_state: GhState::Closed,
+            state: TaskState::Done,
+            priority: 0,
+            manual_rank: None,
+            dispatch_attempts: 0,
+            ingested_at: now,
+            updated_at: now,
+        };
+        store.insert_task(&retired).await.unwrap();
+        let base = spawn(store).await;
+        let http = reqwest::Client::new();
+
+        let listed: Vec<Task> = http
+            .get(format!("{base}/tasks"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !listed.iter().any(|t| t.id == retired.id),
+            "the working set hides retired work"
+        );
+
+        let fetched: Task = http
+            .get(format!("{base}/tasks/{}", retired.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fetched.title, "shipped and closed");
+    }
+
+    /// The wire timestamp form the Swift date decoder is written against:
+    /// RFC3339 with a `Z` suffix (chrono's serde), not `+00:00`.
+    #[tokio::test]
+    async fn event_timestamps_are_rfc3339_zulu_on_the_wire() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        store
+            .append_event(EventPayload::Note {
+                source: "test".into(),
+                message: "tick".into(),
+            })
+            .await
+            .unwrap();
+        let base = spawn(store).await;
+
+        let events: Vec<Value> = reqwest::Client::new()
+            .get(format!("{base}/events"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ts = events[0]["timestamp"].as_str().unwrap();
+        assert!(
+            ts.ends_with('Z') && ts.contains('T'),
+            "expected RFC3339 Zulu, got {ts}"
+        );
+    }
 }

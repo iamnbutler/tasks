@@ -113,6 +113,30 @@ the server only.
 - `GET /events?since=&limit=` — catch-up (default limit 100);
   `GET /events/stream` — SSE, each `data:` line is one Event JSON.
 
+## Counting the event log
+
+Dashboards that answer "what happened this week" must count the **event log**,
+not the entity lists, and must hold the **whole** log:
+
+- **Don't count from `/tasks`.** The working set reconciles away work whose
+  issue closed — which is exactly the shipped work a dashboard wants to count.
+  (`GET /tasks/{id}` still serves retired tasks; use it to name old work.)
+- **Don't trust `updated_at`** as an activity timestamp — any poll can touch it.
+- **The newest-N trap:** `GET /events` without `since` returns the newest
+  `limit` events. A fold over that page silently undercounts the moment
+  in-window events scroll off it — a fabricated quiet week, not an error.
+  Instead, backfill once by paging `?since=1&limit=500` (advance
+  `since = high_water + 1`; `since` is inclusive, so *also* filter the page on
+  `seq > high_water` — two interleaved syncs must not double-count), then
+  extend with one delta request per refresh.
+- **The counted kinds** are `task_ingested`, `spec_created`,
+  `spec_queue_status_changed` (an approval is `to == "approved"`; a rejection
+  is the **same kind** with a different `to`), `build_completed` (failures
+  included — it counts trips through the pipeline), and `pull_request_opened`.
+- **Nothing on the wire counts merged pull requests.** `pull_request_opened`
+  fires at open; merged/closed state is GitHub's, queried at render time or
+  not shown. Don't present opened PRs as shipped work.
+
 ## Session transcripts
 
 Agent output is a **separate channel from the event log**, on purpose (see

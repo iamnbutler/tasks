@@ -16,8 +16,23 @@ final class AppModel {
     var chat: [ChatMessage] = []
     var specQueue: [SpecQueueItem] = []
     var mode: Mode?
-    /// Recent event log, newest first, for the Activity feed.
-    var events: [ActivityEvent] = []
+    /// The whole event log, held client-side, oldest first. Backfilled once
+    /// by paging `/events?since=1` and extended with one delta request per
+    /// refresh. Held rather than refetched because `GET /events` without
+    /// `since` returns the newest N — a velocity fold over that page would
+    /// fabricate a quiet week the moment in-window events scroll off it.
+    var eventLog: [ActivityEvent] = []
+    /// Whether the initial backfill finished; velocity renders nothing (not
+    /// zeros) until it has the whole log to count.
+    var eventLogComplete = false
+
+    /// What the Activity feed renders: the newest 200, newest first. A slice,
+    /// not the whole log — the unread badge below is counted over what the
+    /// feed will actually show.
+    var events: [ActivityEvent] {
+        Array(eventLog.suffix(200).reversed())
+    }
+
     /// Highest event seq the user has seen in Activity; drives the unread
     /// divider and the sidebar badge. Persisted so "while you were away"
     /// survives relaunch.
@@ -279,7 +294,6 @@ final class AppModel {
         async let chat = Self.attempt { try await c.orchestratorMessages() }
         async let specQueue = Self.attempt { try await c.specQueue() }
         async let mode = Self.attempt { try await c.mode() }
-        async let events = Self.attempt { try await c.events() }
 
         var firstError: String?
         func apply<T>(_ result: Result<T, any Error>?, _ assign: (T) -> Void) {
@@ -305,10 +319,158 @@ final class AppModel {
         }
         apply(await specQueue) { self.specQueue = $0 }
         apply(await mode) { self.mode = $0 }
-        apply(await events) { self.events = $0.sorted { $0.seq > $1.seq } }
 
         connectionError = firstError
+        // Delta-extend the held log (backfilling on the first pass), then
+        // name any newly on-screen shipped work.
+        await extendEventLog()
+        await resolveRetiredTitles()
         lastRefreshed = Date()
+    }
+
+    // MARK: Event log
+
+    /// Backfill (first call) then extend the held log. Pages at 500; `since`
+    /// is inclusive so the loop asks for `high_water + 1` and ALSO filters
+    /// the page on `> high_water` — two interleaved refreshes must not
+    /// double-count an event into velocity.
+    func extendEventLog() async {
+        do {
+            while true {
+                let since = (eventLog.last?.seq ?? 0) + 1
+                let page = try await client.events(since: since, limit: 500)
+                // Re-read the tail AFTER the await: a second refresh can
+                // interleave on the main actor, and filtering against the
+                // pre-await watermark would append its events twice.
+                let tail = eventLog.last?.seq ?? 0
+                let fresh = page.filter { $0.seq > tail }.sorted { $0.seq < $1.seq }
+                eventLog.append(contentsOf: fresh)
+                if page.count < 500 {
+                    eventLogComplete = true
+                    return
+                }
+            }
+        } catch is CancellationError {
+        } catch {
+            if connectionError == nil { connectionError = error.localizedDescription }
+        }
+    }
+
+    /// The five headline counts over a trailing window — a pure fold over the
+    /// held log. `nil` until the backfill finished: rendering zeros off a
+    /// partial log would be the dashboard lying.
+    func velocity(days: Int = 7, now: Date = Date()) -> Velocity? {
+        guard eventLogComplete else { return nil }
+        let cutoff = now.addingTimeInterval(-Double(days) * 86_400)
+        var v = Velocity()
+        for event in eventLog where event.timestamp >= cutoff {
+            switch event.kind {
+            case "task_ingested": v.ingested += 1
+            case "spec_created": v.specsProduced += 1
+            case "spec_queue_status_changed" where event.to == "approved":
+                v.specsApproved += 1
+            case "build_completed": v.buildsFinished += 1
+            case "pull_request_opened": v.prsOpened += 1
+            default: break
+            }
+        }
+        return v
+    }
+
+    // MARK: Home
+
+    var runningSessions: [ScoutSession] {
+        sessions.filter { $0.status == .running }.sorted { $0.startedAt < $1.startedAt }
+    }
+
+    var specsAwaitingReview: [SpecQueueItem] {
+        specQueue.filter { $0.status == .pendingReview }
+    }
+
+    /// When a pending spec landed — a join through `/specs`; nil (rendered as
+    /// nothing, not a fabricated age) when the join misses.
+    func waitingSince(specId: String) -> Date? {
+        spec(specId)?.createdAt
+    }
+
+    var failedBuilds: [BuildItem] {
+        builds.filter { $0.status == .failed }
+            .sorted { $0.finishedOrCreatedAt > $1.finishedOrCreatedAt }
+    }
+
+    var recentPullRequests: [BuildItem] {
+        builds.filter { $0.status == .succeeded && $0.prNumber != nil }
+            .sorted { $0.finishedOrCreatedAt > $1.finishedOrCreatedAt }
+    }
+
+    func pullRequestURL(for build: BuildItem) -> URL? {
+        guard let pr = build.prNumber,
+            let project = projects.first(where: { $0.id == build.projectId })
+        else { return nil }
+        return URL(string: "https://github.com/\(project.slug)/pull/\(pr)")
+    }
+
+    /// The tasks a build serves: its `build_requested` event names the specs
+    /// (the listing projection doesn't), and specs name their tasks.
+    func servedTaskIds(for build: BuildItem) -> [String] {
+        guard
+            let requested = eventLog.last(where: {
+                $0.kind == "build_requested" && $0.buildId == build.id
+            }),
+            let specIds = requested.specIds
+        else { return [] }
+        return specIds.compactMap { spec($0)?.taskId }
+    }
+
+    /// Titles of retired tasks, resolved on demand via `GET /tasks/{id}` and
+    /// cached forever — a retired task's title doesn't change.
+    private var retiredTitles: [String: String] = [:]
+    private var retiredTitleFetchesInFlight: Set<String> = []
+
+    /// `#N title` for a task id, whether it's in the working set or retired.
+    /// A miss returns nil now and triggers a bounded background resolve.
+    func title(forTask id: String) -> String? {
+        if let live = task(id) {
+            return "#\(live.ghIssueNumber) \(live.title)"
+        }
+        return retiredTitles[id]
+    }
+
+    /// One line naming a build's work, falling back to its branch when the
+    /// joins miss (never a dead `build/<uuid>` row if we can help it).
+    func label(for build: BuildItem) -> String {
+        let titles = servedTaskIds(for: build).compactMap { title(forTask: $0) }
+        return titles.isEmpty ? build.branch : titles.joined(separator: " · ")
+    }
+
+    /// Fill `retiredTitles` for the builds Home is showing. Shipped work is
+    /// exactly the work whose issue closed, so a shipped build's task is
+    /// precisely what `GET /tasks` reconciles away — without this, "Recent
+    /// pull requests" shows `build/<uuid>` for almost every row. Bounded by
+    /// what's on screen; the steady state is zero requests.
+    func resolveRetiredTitles() async {
+        let onScreen = recentPullRequests.prefix(8)
+        var missing: Set<String> = []
+        for build in onScreen {
+            for taskId in servedTaskIds(for: build)
+            where task(taskId) == nil
+                && retiredTitles[taskId] == nil
+                && !retiredTitleFetchesInFlight.contains(taskId)
+            {
+                missing.insert(taskId)
+            }
+        }
+        guard !missing.isEmpty else { return }
+        retiredTitleFetchesInFlight.formUnion(missing)
+        for id in missing {
+            do {
+                let retired = try await client.task(id)
+                retiredTitles[id] = "#\(retired.ghIssueNumber) \(retired.title)"
+            } catch {
+                // Leave unresolved; the row falls back to the branch name.
+            }
+            retiredTitleFetchesInFlight.remove(id)
+        }
     }
 
     /// Nil on cancellation (mid-teardown — not an error, not a result).

@@ -30,6 +30,9 @@ struct TasksClient: Sendable {
     func specs() async throws -> [Spec] { try await get("specs") }
     func specQueue() async throws -> [SpecQueueItem] { try await get("spec-queue") }
     func spec(_ id: String) async throws -> Spec { try await get("specs/\(id)") }
+    /// One task by id. Unlike the `tasks()` working set, this serves retired
+    /// work too — Home uses it to name shipped builds.
+    func task(_ id: String) async throws -> TaskItem { try await get("tasks/\(id)") }
 
     func mode() async throws -> Mode {
         let response: ModeResponse = try await get("mode")
