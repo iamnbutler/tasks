@@ -19,12 +19,13 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use chrono::Utc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tracing::{info, warn};
+
+use tasks_api::http::BriefingStatus;
 
 use crate::events::EventPayload;
 use crate::models::{Briefing, BriefingSection};
@@ -71,21 +72,6 @@ pub struct BriefingConfig {
     pub workdir: PathBuf,
     /// Port the tasks API listens on; spliced into the prompt.
     pub api_port: u16,
-}
-
-/// One slot as `GET /briefings` serves it. All three sections are always
-/// present; a never-generated one has no content and reads as stale.
-#[derive(Debug, Clone, Serialize)]
-pub struct BriefingStatus {
-    pub section: BriefingSection,
-    pub content: Option<String>,
-    pub generated_at: Option<DateTime<Utc>>,
-    pub stale: bool,
-    pub regenerating: bool,
-    /// The last generation failure, if the most recent attempt failed. The
-    /// stored content (if any) is still served alongside it — never a blank
-    /// slot, never a fabricated one.
-    pub error: Option<String>,
 }
 
 /// In-memory regeneration bookkeeping. Deliberately not persisted: a crash

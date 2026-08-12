@@ -29,6 +29,7 @@ vm-pool-client.workspace = true
 vm-pool-service.workspace = true
 vm-pool-manager.workspace = true
 tasks-protocol.workspace = true
+tasks-api.workspace = true
 base64.workspace = true
 
 [dev-dependencies]

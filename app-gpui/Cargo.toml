@@ -1,0 +1,15 @@
+[package]
+name = "tasks-gpui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = { package = "gpui-unofficial", version = "1.14.2" }
+# runtime_shaders: compile Metal shaders at runtime so builds don't need the
+# Xcode Metal toolchain.
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.14.2", features = ["font-kit", "runtime_shaders"] }
+gpuikit = "0.5.1"
+smallvec = "1"
+# The server's wire types (models, events, request/response bodies) — the
+# whole point of living in this repo. Path dep so type changes are atomic.
+tasks-api = { path = "../crates/tasks-api" }

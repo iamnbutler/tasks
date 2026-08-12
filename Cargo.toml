@@ -1,9 +1,15 @@
 [workspace]
 resolver = "2"
+# app-gpui is deliberately NOT a workspace member: it drags the gpui stack
+# into every `cargo test --workspace` otherwise. It builds standalone (own
+# Cargo.lock) and reaches the shared wire types via a path dep on
+# crates/tasks-api.
+exclude = ["app-gpui"]
 members = [
     "crates/builder-supervisor",
     "crates/scout-supervisor",
     "crates/tasks",
+    "crates/tasks-api",
     "crates/tasks-protocol",
     "crates/vm-pool/client",
     "crates/vm-pool/pool",
@@ -57,3 +63,4 @@ vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
 
 # tasks internal
 tasks-protocol = { path = "crates/tasks-protocol" }
+tasks-api = { path = "crates/tasks-api" }

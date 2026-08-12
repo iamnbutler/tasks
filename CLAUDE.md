@@ -30,8 +30,13 @@ implementation.
 
 ## Project structure
 
-- `crates/tasks/` — the server binary: models, SQLite store, event log,
-  GitHub polling (read-only intake), scout dispatcher, HTTP API + SSE
+- `crates/tasks/` — the server binary: SQLite store, event log, GitHub
+  polling (read-only intake), scout dispatcher, HTTP API + SSE
+- `crates/tasks-api/` — wire types for the HTTP API (models, events,
+  request/response bodies), shared by the server and native clients.
+  Dependency-light (serde/chrono/uuid) on purpose; enums are strict —
+  clients ship from this repo, so skew is a build error, not a runtime
+  fallback
 - `crates/tasks-protocol/` — ScoutCommand/ScoutEvent, the `AppProtocol` impl
   shared between server and Scout VMs
 - `crates/scout-supervisor/` — PID 1 inside Scout VMs: clone, branch, run the

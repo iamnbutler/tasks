@@ -1,0 +1,15 @@
+[package]
+name = "tasks-api"
+description = "Wire types for the tasks HTTP API — shared by the server and native clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
