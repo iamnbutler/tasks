@@ -13,3 +13,8 @@ smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.
 tasks-api = { path = "../crates/tasks-api" }
+tasks-client = { path = "../crates/tasks-client" }
+# Bridges the client's blocking streams/calls into gpui: unbounded channel
+# from the SSE thread, StreamExt::next on the foreground executor.
+futures = "0.3"
+chrono = "0.4"

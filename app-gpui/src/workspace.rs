@@ -1,9 +1,13 @@
 //! The root workspace view.
 //!
 //! Follows Zed's workspace/dock split: the workspace owns UI state
-//! (active section, per-sidebar open/width) and registers action handlers;
-//! chrome components (`TitleBar`, `Sidebar`) are presentation-only and talk
-//! back by dispatching actions, never by reaching into workspace state.
+//! (active section, per-sidebar open/width, selection) and registers action
+//! handlers; chrome components (`TitleBar`, `Sidebar`) are presentation-only
+//! and talk back by dispatching actions, never by reaching into workspace
+//! state. Server state lives in [`AppState`]; the workspace observes it and
+//! re-renders.
+
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{actions, div, px, Context, Div, Entity, Focusable, MouseButton, Window};
@@ -12,8 +16,10 @@ use gpuikit::elements::input::text_area;
 use gpuikit::input::InputState;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
+use tasks_client::api::models::{BuildStatus, Mode, SessionStatus, TaskId, TaskState};
 
 use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
+use crate::state::AppState;
 
 const FONT: &str = "Menlo";
 
@@ -49,22 +55,53 @@ impl Section {
 }
 
 pub struct Workspace {
-    section: Section,
-    left_sidebar: SidebarState,
-    right_sidebar: SidebarState,
+    pub(crate) section: Section,
+    pub(crate) left_sidebar: SidebarState,
+    pub(crate) right_sidebar: SidebarState,
     /// Which sidebar is currently being drag-resized, if any.
-    resizing: Option<SidebarSide>,
-    input: Entity<InputState>,
+    pub(crate) resizing: Option<SidebarSide>,
+    pub(crate) app_state: Entity<AppState>,
+    /// Task shown in the inspector (right sidebar).
+    pub(crate) selected_task: Option<TaskId>,
+    /// Chat composer (placeholder until the chat slice lands).
+    pub(crate) input: Entity<InputState>,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let app_state = cx.new(AppState::new);
+        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+
+        // Live elapsed clocks (running scouts/builds) tick once a second —
+        // but only when something is actually running.
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| loop {
+            executor.timer(Duration::from_secs(1)).await;
+            let alive = this
+                .update(cx, |this: &mut Workspace, cx| {
+                    let state = this.app_state.read(cx);
+                    let live = state
+                        .sessions
+                        .iter()
+                        .any(|session| session.status == SessionStatus::Running)
+                        || state
+                            .builds
+                            .iter()
+                            .any(|build| build.status == BuildStatus::Running);
+                    if live {
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                return;
+            }
+        })
+        .detach();
+
         let input = cx.new(|cx| {
             let mut state = InputState::new_multiline(cx);
-            state.set_content(
-                "The composer input for chat / review notes lands here.\n\nType away — this is gpuikit's InputState + text_area on gpui 1.14.2.",
-                cx,
-            );
+            state.set_content("Talk to the orchestrator…", cx);
             state
         });
         window.focus(&input.focus_handle(cx), cx);
@@ -74,6 +111,8 @@ impl Workspace {
             left_sidebar: SidebarState::new(true),
             right_sidebar: SidebarState::new(false),
             resizing: None,
+            app_state,
+            selected_task: None,
             input,
         }
     }
@@ -88,6 +127,20 @@ impl Workspace {
     fn toggle_sidebar(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
         let state = self.sidebar_mut(side);
         state.open = !state.open;
+        cx.notify();
+    }
+
+    // --- selection (called from section rows) ---
+
+    pub(crate) fn select_task(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        self.selected_task = Some(id);
+        self.right_sidebar.open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_task = None;
+        self.right_sidebar.open = false;
         cx.notify();
     }
 
@@ -106,6 +159,8 @@ impl Workspace {
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.app_state.read(cx).mode;
+
         title_bar()
             .child_left(
                 Self::title_bar_button("toggle-left-sidebar", Icons::panel_left())
@@ -123,7 +178,29 @@ impl Workspace {
                 )),
             )
             .child_center(div().child("tasks"))
-            .child_right(Self::title_bar_button("settings", Icons::gear()).disabled(true))
+            .child_right(
+                Self::title_bar_button("mode-play", Icons::play())
+                    .selected(mode == Some(Mode::Play))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.app_state
+                            .update(cx, |state, cx| state.set_mode(Mode::Play, cx));
+                    })),
+            )
+            .child_right(
+                Self::title_bar_button("mode-pause", Icons::pause())
+                    .selected(mode == Some(Mode::Pause))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.app_state
+                            .update(cx, |state, cx| state.set_mode(Mode::Pause, cx));
+                    })),
+            )
+            .child_right(
+                Self::title_bar_button("refresh", Icons::reload()).on_click(cx.listener(
+                    |this, _event, _window, cx| {
+                        this.app_state.update(cx, |state, cx| state.refresh(cx));
+                    },
+                )),
+            )
             .child_right(
                 Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
                     .selected(self.right_sidebar.open)
@@ -135,13 +212,37 @@ impl Workspace {
 
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (text, text_muted, selected_bg, hover_bg) = (
+        let (text, text_muted, selected_bg, hover_bg, badge_bg) = (
             theme.fg(),
             theme.fg_muted(),
             theme.surface_tertiary(),
             theme.surface_secondary(),
+            theme.surface_tertiary(),
         );
         let active = self.section;
+
+        let state = self.app_state.read(cx);
+        let queued_work = state
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.state,
+                    TaskState::Queued
+                        | TaskState::Scouting
+                        | TaskState::InReview
+                        | TaskState::ReadyToBuild
+                        | TaskState::Building
+                )
+            })
+            .count();
+        let banner = if let Some(error) = &state.error {
+            Some((error.clone(), true))
+        } else if state.loaded && !state.connected {
+            Some(("Reconnecting to the tasks server…".to_string(), false))
+        } else {
+            None
+        };
 
         sidebar(SidebarSide::Left, self.left_sidebar.width)
             .on_resize_start({
@@ -155,11 +256,16 @@ impl Workspace {
                     }
                 }
             })
-            .child(div().flex().flex_col().pt(px(8.)).children(
+            .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
                 Section::ALL.into_iter().enumerate().map(|(ix, section)| {
                     let selected = section == active;
+                    let badge = (section == Section::Queue && queued_work > 0)
+                        .then(|| queued_work.to_string());
                     div()
                         .id(ix)
+                        .flex()
+                        .flex_row()
+                        .items_center()
                         .mx(px(6.))
                         .px(px(10.))
                         .py(px(5.))
@@ -171,17 +277,48 @@ impl Workspace {
                             this.section = section;
                             cx.notify();
                         }))
-                        .text_sm()
-                        .text_color(if selected { text } else { text_muted })
-                        .child(section.label())
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(if selected { text } else { text_muted })
+                                .child(section.label()),
+                        )
+                        .when_some(badge, |el, badge| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .rounded_full()
+                                    .bg(badge_bg)
+                                    .text_xs()
+                                    .text_color(text_muted)
+                                    .child(badge),
+                            )
+                        })
                 }),
             ))
+            .child(div().flex_1())
+            .when_some(banner, |el, (message, is_error)| {
+                el.child(
+                    div()
+                        .m(px(6.))
+                        .p(px(8.))
+                        .rounded(px(5.))
+                        .bg(cx.theme().surface_secondary())
+                        .text_xs()
+                        .text_color(if is_error {
+                            gpui::hsla(30. / 360., 0.9, 0.6, 1.)
+                        } else {
+                            cx.theme().fg_muted()
+                        })
+                        .child(message),
+                )
+            })
     }
 
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (text, text_muted) = (theme.fg(), theme.fg_muted());
-
+        let inspector = self.render_inspector(cx);
         sidebar(SidebarSide::Right, self.right_sidebar.width)
             .on_resize_start({
                 let entity = cx.entity().downgrade();
@@ -194,51 +331,109 @@ impl Workspace {
                     }
                 }
             })
+            .child(inspector)
+    }
+
+    fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let state = self.app_state.read(cx);
+        let messages: Vec<_> = state
+            .orchestrator_messages
+            .iter()
+            .map(|message| (message.seq, message.role, message.content.clone()))
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
             .child(
                 div()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .text_color(text)
-                    .child("Inspector"),
+                    .id("chat-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .p(px(12.))
+                    .gap(px(8.))
+                    .children(messages.into_iter().map(|(seq, role, content)| {
+                        use tasks_client::api::models::ChatRole;
+                        let bubble = div()
+                            .max_w(px(720.))
+                            .p(px(8.))
+                            .rounded(px(8.))
+                            .text_sm()
+                            .child(content);
+                        div()
+                            .id(seq as usize)
+                            .flex()
+                            .flex_row()
+                            .map(|el| match role {
+                                ChatRole::User => el.justify_end().child(
+                                    bubble
+                                        .bg(cx.theme().accent_bg())
+                                        .text_color(cx.theme().fg()),
+                                ),
+                                ChatRole::Assistant => el.child(
+                                    bubble
+                                        .bg(cx.theme().surface_secondary())
+                                        .text_color(cx.theme().fg()),
+                                ),
+                                ChatRole::Event => {
+                                    el.child(bubble.text_color(cx.theme().fg_muted()).text_xs())
+                                }
+                            })
+                    })),
             )
             .child(
                 div()
-                    .px(px(12.))
+                    .flex_none()
+                    .p(px(8.))
+                    .border_t_1()
+                    .border_color(theme.border_subtle())
                     .text_sm()
-                    .text_color(text_muted)
-                    .child("Task detail / review pane placeholder."),
+                    .child(text_area(&self.input, cx).size_full()),
             )
     }
 
     fn render_center(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let (text, editor_bg) = (theme.fg(), theme.bg());
+        let theme = cx.theme().clone();
+        let loaded = self.app_state.read(cx).loaded;
 
-        div()
+        let mut pane = div()
             .flex()
             .flex_col()
             .flex_grow(1.)
             .h_full()
             .overflow_hidden()
-            .bg(editor_bg)
-            .child(
+            .bg(theme.bg());
+
+        if !loaded {
+            return pane.child(
                 div()
-                    .px(px(16.))
-                    .py(px(10.))
-                    .text_color(text)
-                    .child(self.section.label()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_grow(1.)
-                    .overflow_hidden()
                     .p(px(16.))
                     .text_sm()
-                    .text_color(text)
-                    .child(text_area(&self.input, cx).size_full()),
-            )
+                    .text_color(theme.fg_muted())
+                    .child("Connecting to the tasks server…"),
+            );
+        }
+
+        pane = pane.child(
+            div()
+                .flex_none()
+                .px(px(16.))
+                .py(px(10.))
+                .text_color(theme.fg())
+                .child(self.section.label()),
+        );
+
+        match self.section {
+            Section::Home => pane.child(self.render_home(cx)),
+            Section::Tasks => pane.child(self.render_tasks(cx)),
+            Section::Queue => pane.child(self.render_queue(cx)),
+            Section::Activity => pane.child(self.render_activity(cx)),
+            Section::Chat => pane.child(self.render_chat(cx)),
+        }
     }
 }
 
