@@ -413,13 +413,14 @@ const TRANSCRIPT_QUEUE_CAPACITY: usize = 1024;
 const TRANSCRIPT_BATCH: usize = 64;
 
 /// The wire enum meets the domain enum here, at the dispatcher boundary, so
-/// neither `models` nor `store` has to know about the protocol crate.
-impl From<LogStream> for TranscriptStream {
-    fn from(s: LogStream) -> Self {
-        match s {
-            LogStream::Stdout => TranscriptStream::Stdout,
-            LogStream::Stderr => TranscriptStream::Stderr,
-        }
+/// neither `models` nor `store` has to know about the protocol crate. A free
+/// function rather than `From`: both enums live in other crates (tasks-api,
+/// tasks-protocol), so the orphan rule forbids the impl here — and neither of
+/// those crates may know about the other.
+fn transcript_stream(s: LogStream) -> TranscriptStream {
+    match s {
+        LogStream::Stdout => TranscriptStream::Stdout,
+        LogStream::Stderr => TranscriptStream::Stderr,
     }
 }
 
@@ -596,7 +597,7 @@ async fn drain_scout_events(
                     {
                         *usage_out = Some(usage);
                     }
-                    sink.push(stream.into(), line);
+                    sink.push(transcript_stream(stream), line);
                 }
                 ScoutEvent::ImplementationFinished { exit_code: c } => {
                     exit_code = Some(c);

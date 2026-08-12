@@ -1,17 +1,17 @@
 //! tasks: human-in-the-loop agent orchestration server.
 //!
-//! This library is split into modules: `models` (domain types), `store` (SQLite
-//! persistence). More modules land as we implement each step of the Diamond 1 plan.
+//! Domain and wire types live in the `tasks-api` crate (re-exported here as
+//! `models` and `events`) so native clients can share them without depending
+//! on the server stack.
 
 pub mod briefing;
 pub mod builder;
-pub mod events;
 pub mod github;
-pub mod models;
 pub mod orchestrator;
 pub mod run;
 pub mod scout;
 pub mod server;
 pub mod store;
 
+pub use tasks_api::{events, models};
 pub use tasks_protocol as protocol;

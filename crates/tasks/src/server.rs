@@ -20,14 +20,18 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
 use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
-use crate::briefing::{self, BriefingStatus, Briefings};
+use tasks_api::http::{
+    BriefingStatus, BuildDetail, BuildRequest, CreateProject, ErrorResponse, ModeResponse,
+    ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, SetMode,
+};
+
+use crate::briefing::{self, Briefings};
 use crate::events::{Event, EventPayload};
 use crate::models::{
     Build, BuildId, ChatRole, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project,
@@ -84,7 +88,13 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: self.to_string(),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -189,12 +199,6 @@ async fn list_projects(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Pr
     Ok(Json(store.list_projects().await?))
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateProject {
-    repo_owner: String,
-    repo_name: String,
-}
-
 async fn create_project(
     State(store): State<Arc<Store>>,
     Json(body): Json<CreateProject>,
@@ -279,11 +283,6 @@ async fn scout_task_now(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-struct ReorderQueue {
-    task_ids: Vec<TaskId>,
-}
-
 /// Returns the same projection as the default `GET /tasks` — a client applies
 /// the response in place of its list, so handing back the unfiltered variant
 /// here would resurrect the closed-intake rows the default read hides.
@@ -335,27 +334,12 @@ async fn list_spec_queue(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<
     Ok(Json(store.list_spec_queue().await?))
 }
 
-#[derive(Debug, Deserialize)]
-struct ReorderSpecQueue {
-    spec_ids: Vec<SpecId>,
-}
-
 async fn reorder_spec_queue(
     State(store): State<Arc<Store>>,
     Json(body): Json<ReorderSpecQueue>,
 ) -> ApiResult<Json<Vec<SpecQueueItem>>> {
     store.set_spec_queue_order(&body.spec_ids).await?;
     Ok(Json(store.list_spec_queue().await?))
-}
-
-/// Review verdict. `status` is taken as a string rather than a
-/// [`SpecQueueStatus`] so an unknown value is a 400 from us instead of a
-/// deserialization rejection.
-#[derive(Debug, Deserialize)]
-struct ReviewRequest {
-    status: String,
-    #[serde(default)]
-    feedback: Option<String>,
 }
 
 async fn review_spec(
@@ -378,22 +362,6 @@ async fn review_spec(
 }
 
 // --- builds ---
-
-#[derive(Debug, Deserialize)]
-struct BuildRequest {
-    spec_ids: Vec<SpecId>,
-    /// Branch the batch is cut from and PR'd against. Defaults to `main`.
-    #[serde(default)]
-    base_branch: Option<String>,
-}
-
-/// A build with its batch, in position order.
-#[derive(Debug, Serialize)]
-struct BuildDetail {
-    #[serde(flatten)]
-    build: Build,
-    spec_ids: Vec<SpecId>,
-}
 
 /// 202, not 200/201-with-result: builds are serial and this only queues one.
 /// Watch `build_started` / `build_completed` on the event stream, or poll
@@ -426,11 +394,6 @@ async fn get_build(
 }
 
 // --- orchestrator ---
-
-#[derive(Debug, Deserialize)]
-struct SendMessage {
-    content: String,
-}
 
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
@@ -524,16 +487,6 @@ async fn stream_orchestrator(
 }
 
 // --- mode ---
-
-#[derive(Debug, Serialize)]
-struct ModeResponse {
-    mode: Mode,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetMode {
-    mode: String,
-}
 
 async fn get_mode(State(store): State<Arc<Store>>) -> ApiResult<Json<ModeResponse>> {
     Ok(Json(ModeResponse {
@@ -733,7 +686,7 @@ async fn stream_events(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::models::{
