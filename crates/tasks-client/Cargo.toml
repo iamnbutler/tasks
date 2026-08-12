@@ -1,0 +1,20 @@
+[package]
+name = "tasks-client"
+description = "Typed blocking client for the tasks HTTP API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tasks-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tasks.workspace = true
+tokio.workspace = true
+axum.workspace = true
+chrono.workspace = true
