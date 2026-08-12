@@ -10,6 +10,7 @@ members = [
     "crates/scout-supervisor",
     "crates/tasks",
     "crates/tasks-api",
+    "crates/tasks-client",
     "crates/tasks-protocol",
     "crates/vm-pool/client",
     "crates/vm-pool/pool",
@@ -51,6 +52,9 @@ axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tempfile = "3"
 base64 = "0.22"
+# Blocking HTTP for tasks-client: the API is loopback-only plain http, so no
+# TLS and no async runtime — a GUI client calls from its own worker threads.
+ureq = { version = "2", default-features = false, features = ["json"] }
 
 dirs = "6"
 
@@ -64,3 +68,4 @@ vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
 # tasks internal
 tasks-protocol = { path = "crates/tasks-protocol" }
 tasks-api = { path = "crates/tasks-api" }
+tasks = { path = "crates/tasks" }
