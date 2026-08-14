@@ -113,8 +113,8 @@ impl Workspace {
         .detach();
 
         let input = cx.new(|cx| {
-            // Chat convention: enter sends, shift-enter for a newline.
-            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::Enter);
+            // Cmd-enter sends everywhere in this app; enter is a newline.
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
             state.set_placeholder("Talk to the orchestrator…", cx);
             state
         });
