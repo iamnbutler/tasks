@@ -14,7 +14,11 @@ use smallvec::SmallVec;
 
 pub const DEFAULT_SIDEBAR_WIDTH: Pixels = px(240.);
 pub const MIN_SIDEBAR_WIDTH: Pixels = px(160.);
-pub const MAX_SIDEBAR_WIDTH: Pixels = px(420.);
+
+/// A sidebar may take up to this share of the window — reading surfaces
+/// like the inspector's spec view need real width, so the ceiling is
+/// proportional, not a fixed pixel count.
+pub const MAX_SIDEBAR_FRACTION: f32 = 0.5;
 
 const RESIZE_HANDLE_WIDTH: Pixels = px(5.);
 
@@ -38,8 +42,16 @@ impl SidebarState {
         }
     }
 
-    pub fn set_width(&mut self, width: Pixels) {
-        self.width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    pub fn with_width(mut self, width: Pixels) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Clamp to the legal range for the current window: at least
+    /// [`MIN_SIDEBAR_WIDTH`], at most [`MAX_SIDEBAR_FRACTION`] of it.
+    pub fn set_width(&mut self, width: Pixels, viewport_width: Pixels) {
+        let max = viewport_width * MAX_SIDEBAR_FRACTION;
+        self.width = width.clamp(MIN_SIDEBAR_WIDTH, max.max(MIN_SIDEBAR_WIDTH));
     }
 }
 

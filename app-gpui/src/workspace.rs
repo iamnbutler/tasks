@@ -109,7 +109,9 @@ impl Workspace {
         Self {
             section: Section::Home,
             left_sidebar: SidebarState::new(true),
-            right_sidebar: SidebarState::new(false),
+            // The inspector is a reading surface (specs, task bodies) —
+            // default it wide, like the Swift app's 460pt ideal.
+            right_sidebar: SidebarState::new(false).with_width(px(460.)),
             resizing: None,
             app_state,
             selected_task: None,
@@ -441,6 +443,13 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_width = window.viewport_size().width;
 
+        // Re-clamp on every frame so a shrunk window can't leave a sidebar
+        // owning more than its share.
+        let left_width = self.left_sidebar.width;
+        self.left_sidebar.set_width(left_width, viewport_width);
+        let right_width = self.right_sidebar.width;
+        self.right_sidebar.set_width(right_width, viewport_width);
+
         div()
             .key_context("Workspace")
             .flex()
@@ -464,7 +473,7 @@ impl Render for Workspace {
                                 SidebarSide::Left => event.position.x,
                                 SidebarSide::Right => viewport_width - event.position.x,
                             };
-                            this.sidebar_mut(side).set_width(width);
+                            this.sidebar_mut(side).set_width(width, viewport_width);
                             cx.notify();
                         }
                     },
