@@ -16,10 +16,12 @@ use gpui::{
 };
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
-use gpuikit::input::InputState;
+use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
-use tasks_client::api::models::{BuildStatus, Mode, SessionStatus, TaskId, TaskState};
+use tasks_client::api::models::{
+    BuildStatus, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
+};
 
 use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
 use crate::state::AppState;
@@ -66,8 +68,11 @@ pub struct Workspace {
     pub(crate) app_state: Entity<AppState>,
     /// Task shown in the inspector (right sidebar).
     pub(crate) selected_task: Option<TaskId>,
-    /// Chat composer (placeholder until the chat slice lands).
+    /// Chat composer.
     pub(crate) input: Entity<InputState>,
+    /// Review-form composer in the inspector — feedback for a re-scout or a
+    /// question for the orchestrator, depending on which button submits it.
+    pub(crate) review_input: Entity<InputState>,
     /// Scroll state for the chat list — bottom-aligned, so the view opens
     /// at the newest message and follows new ones.
     chat_list: ListState,
@@ -108,10 +113,34 @@ impl Workspace {
         .detach();
 
         let input = cx.new(|cx| {
-            let mut state = InputState::new_multiline(cx);
-            state.set_content("Talk to the orchestrator…", cx);
+            // Chat convention: enter sends, shift-enter for a newline.
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::Enter);
+            state.set_placeholder("Talk to the orchestrator…", cx);
             state
         });
+        let review_input = cx.new(|cx| {
+            // Compose convention: cmd-enter fires the primary action (Ask),
+            // plain enter stays a newline — feedback is often multi-line.
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("Feedback or a question about this spec…", cx);
+            state
+        });
+        // The composers gate their submit buttons on content, so keystrokes
+        // must re-render the workspace, not just the input element.
+        cx.observe(&input, |_, _, cx| cx.notify()).detach();
+        cx.observe(&review_input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&input, |this, _, event: &InputStateEvent, cx| {
+            if matches!(event, InputStateEvent::Submit) {
+                this.send_chat(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&review_input, |this, _, event: &InputStateEvent, cx| {
+            if matches!(event, InputStateEvent::Submit) {
+                this.ask_about_selected_spec(cx);
+            }
+        })
+        .detach();
         window.focus(&input.focus_handle(cx), cx);
 
         Self {
@@ -124,6 +153,7 @@ impl Workspace {
             app_state,
             selected_task: None,
             input,
+            review_input,
             chat_list: ListState::new(0, ListAlignment::Bottom, px(1024.)),
             chat_len: 0,
         }
@@ -145,9 +175,66 @@ impl Workspace {
     // --- selection (called from section rows) ---
 
     pub(crate) fn select_task(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        if self.selected_task.as_ref() != Some(&id) {
+            // Draft feedback is about one spec — don't carry it to another.
+            self.review_input
+                .update(cx, |input, cx| input.set_content("", cx));
+        }
         self.selected_task = Some(id);
         self.right_sidebar.open = true;
         cx.notify();
+    }
+
+    /// Send a message into the orchestrator conversation and jump to Chat so
+    /// the reply is visible as it streams in.
+    pub(crate) fn ask_orchestrator(&mut self, message: String, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, cx| state.send_orchestrator_message(message, cx));
+        self.section = Section::Chat;
+        cx.notify();
+    }
+
+    /// Submit the chat composer, if it has content.
+    pub(crate) fn send_chat(&mut self, cx: &mut Context<Self>) {
+        let content = self.input.read(cx).content().trim().to_string();
+        if content.is_empty() {
+            return;
+        }
+        self.input.update(cx, |input, cx| input.set_content("", cx));
+        self.app_state
+            .update(cx, |state, cx| state.send_orchestrator_message(content, cx));
+    }
+
+    /// Submit the review draft as a question about the selected task's
+    /// pending spec — the review form's primary (cmd-enter) action. No-op
+    /// without a selected task, a pending spec, or draft text.
+    pub(crate) fn ask_about_selected_spec(&mut self, cx: &mut Context<Self>) {
+        let Some((number, title, spec_id)) = ({
+            let state = self.app_state.read(cx);
+            self.selected_task
+                .as_ref()
+                .and_then(|id| state.task(id))
+                .and_then(|task| {
+                    let spec = state.latest_spec(&task.id)?;
+                    state
+                        .spec_queue
+                        .iter()
+                        .any(|item| {
+                            item.entry.spec_id == spec.id
+                                && item.entry.status == SpecQueueStatus::PendingReview
+                        })
+                        .then(|| (task.gh_issue_number, task.title.clone(), spec.id.clone()))
+                })
+        }) else {
+            return;
+        };
+        let Some(text) = self.take_review_draft(cx) else {
+            return;
+        };
+        let message = format!(
+            "Re: task #{number} \"{title}\" — its spec ({spec_id}) is pending review.\n\n{text}"
+        );
+        self.ask_orchestrator(message, cx);
     }
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
@@ -410,8 +497,40 @@ impl Workspace {
                     .p(px(8.))
                     .border_t_1()
                     .border_color(theme.border_subtle())
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(8.))
                     .text_sm()
-                    .child(text_area(&self.input, cx).size_full()),
+                    .child(
+                        // The multiline input fills its parent, so the parent
+                        // must own a height — unsized, it collapses to zero.
+                        div()
+                            .flex_1()
+                            .h(px(64.))
+                            .child(text_area(&self.input, cx).size_full()),
+                    )
+                    .child(
+                        div()
+                            .id("chat-send")
+                            .flex_none()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.border_secondary())
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme.fg())
+                            .hover({
+                                let hover_bg = theme.surface_secondary();
+                                move |el| el.bg(hover_bg)
+                            })
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.send_chat(cx);
+                            }))
+                            .child("Send"),
+                    ),
             )
     }
 
@@ -437,14 +556,19 @@ impl Workspace {
             );
         }
 
-        pane = pane.child(
-            div()
-                .flex_none()
-                .px(px(16.))
-                .py(px(10.))
-                .text_color(theme.fg())
-                .child(self.section.label()),
-        );
+        // Chat is a full-height conversation — the sidebar already names it,
+        // so it skips the header rather than spending a row on the word
+        // "Chat".
+        if self.section != Section::Chat {
+            pane = pane.child(
+                div()
+                    .flex_none()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .text_color(theme.fg())
+                    .child(self.section.label()),
+            );
+        }
 
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
         // never `size_full`: 100% of the pane plus the header above it
@@ -490,6 +614,8 @@ impl Render for Workspace {
             .flex_col()
             .size_full()
             .font_family(FONT)
+            // Themed default so nothing bottoms out at gpui's black.
+            .text_color(cx.theme().fg())
             .on_action(cx.listener(|this, _: &ToggleLeftDock, _window, cx| {
                 this.toggle_sidebar(SidebarSide::Left, cx);
             }))

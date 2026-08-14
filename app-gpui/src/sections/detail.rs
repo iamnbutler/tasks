@@ -5,6 +5,7 @@
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, ClickEvent, Context, Hsla};
+use gpuikit::elements::input::text_area;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState};
 
@@ -224,39 +225,21 @@ impl Workspace {
         }
         if let Some((spec_id, _, _)) = &task.pending_spec {
             any_action = true;
-            // Needs-revision requires written feedback (it's the message the
-            // re-scout sees) — that lands with the review form slice.
-            actions = actions
-                .child(self.action_button(
-                    "approve-spec",
-                    "Approve",
-                    Some(gpui::hsla(135. / 360., 0.55, 0.45, 1.)),
-                    cx.listener({
-                        let id = spec_id.clone();
-                        move |this, _: &ClickEvent, _window, cx| {
-                            let id = id.clone();
-                            this.app_state.update(cx, |state, cx| {
-                                state.review_spec(id, SpecQueueStatus::Approved, None, cx)
-                            });
-                        }
-                    }),
-                    cx,
-                ))
-                .child(self.action_button(
-                    "reject-spec",
-                    "Reject",
-                    Some(gpui::hsla(0., 0.75, 0.55, 1.)),
-                    cx.listener({
-                        let id = spec_id.clone();
-                        move |this, _: &ClickEvent, _window, cx| {
-                            let id = id.clone();
-                            this.app_state.update(cx, |state, cx| {
-                                state.review_spec(id, SpecQueueStatus::Rejected, None, cx)
-                            });
-                        }
-                    }),
-                    cx,
-                ));
+            actions = actions.child(self.action_button(
+                "approve-spec",
+                "Approve",
+                Some(gpui::hsla(135. / 360., 0.55, 0.45, 1.)),
+                cx.listener({
+                    let id = spec_id.clone();
+                    move |this, _: &ClickEvent, _window, cx| {
+                        let id = id.clone();
+                        this.app_state.update(cx, |state, cx| {
+                            state.review_spec(id, SpecQueueStatus::Approved, None, cx)
+                        });
+                    }
+                }),
+                cx,
+            ));
         }
         if let Some(url) = task.github_url.clone() {
             any_action = true;
@@ -270,6 +253,98 @@ impl Workspace {
         }
         if any_action {
             pane = pane.child(actions);
+        }
+
+        // Review form: one draft, three exits. "Request Changes" renders a
+        // needs_revision verdict — the text travels with the spec to the
+        // re-scout. "Ask" routes the text (plus task/spec context) into the
+        // orchestrator conversation for anything that isn't a verdict yet:
+        // "is this already done?", "should we close this?". Reject lives
+        // here, quieter than Approve — in practice you ask before you reject.
+        if let Some((spec_id, _, _)) = &task.pending_spec {
+            let has_text = !self.review_input.read(cx).content().trim().is_empty();
+            pane = pane.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .h(px(72.))
+                            .p(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.border_secondary())
+                            .bg(theme.bg())
+                            .text_sm()
+                            .child(text_area(&self.review_input, cx).size_full()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(self.form_button(
+                                "request-changes",
+                                "Request Changes",
+                                gpui::hsla(35. / 360., 0.80, 0.55, 1.),
+                                has_text,
+                                cx.listener({
+                                    let id = spec_id.clone();
+                                    move |this, _: &ClickEvent, _window, cx| {
+                                        let Some(text) = this.take_review_draft(cx) else {
+                                            return;
+                                        };
+                                        let id = id.clone();
+                                        this.app_state.update(cx, |state, cx| {
+                                            state.review_spec(
+                                                id,
+                                                SpecQueueStatus::NeedsRevision,
+                                                Some(text),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                                cx,
+                            ))
+                            .child(self.form_button(
+                                "ask-orchestrator",
+                                "Ask Orchestrator",
+                                theme.fg(),
+                                has_text,
+                                cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.ask_about_selected_spec(cx);
+                                }),
+                                cx,
+                            ))
+                            .child(div().flex_1())
+                            .child(self.form_button(
+                                "reject-spec",
+                                "Reject",
+                                gpui::hsla(0., 0.75, 0.55, 1.),
+                                true,
+                                cx.listener({
+                                    let id = spec_id.clone();
+                                    move |this, _: &ClickEvent, _window, cx| {
+                                        let feedback = this.take_review_draft(cx);
+                                        let id = id.clone();
+                                        this.app_state.update(cx, |state, cx| {
+                                            state.review_spec(
+                                                id,
+                                                SpecQueueStatus::Rejected,
+                                                feedback,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                                cx,
+                            )),
+                    ),
+            );
         }
 
         if let Some((_, complexity, content)) = task.pending_spec {
@@ -299,6 +374,55 @@ impl Workspace {
         }
 
         pane.into_any_element()
+    }
+
+    /// The trimmed review draft, clearing the composer — `None` if empty.
+    pub(crate) fn take_review_draft(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let text = self.review_input.read(cx).content().trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        self.review_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        Some(text)
+    }
+
+    /// A submit button for the review form; renders inert and dimmed until
+    /// the draft has text.
+    fn form_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        color: Hsla,
+        enabled: bool,
+        on_click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let base = div()
+            .id(id)
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.border_secondary())
+            .text_xs();
+        if enabled {
+            base.text_color(color)
+                .cursor_pointer()
+                .hover({
+                    let hover_bg = theme.surface_secondary();
+                    move |el| el.bg(hover_bg)
+                })
+                .on_click(on_click)
+                .child(label)
+                .into_any_element()
+        } else {
+            base.text_color(theme.fg_muted())
+                .opacity(0.5)
+                .child(label)
+                .into_any_element()
+        }
     }
 
     fn action_button(

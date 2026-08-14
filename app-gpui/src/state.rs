@@ -288,6 +288,11 @@ impl AppState {
         self.run(cx, move |client| client.review_spec(&id, verdict, feedback));
     }
 
+    /// 202 from the server; the reply lands via `orchestrator_message` events.
+    pub fn send_orchestrator_message(&mut self, content: String, cx: &mut Context<Self>) {
+        self.run(cx, move |client| client.send_orchestrator_message(content));
+    }
+
     // --- projections the sections read ---
 
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
