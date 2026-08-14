@@ -38,7 +38,8 @@ use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Actor, BuildStatus, OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
+    Actor, BuildStatus, Obligation, OrchestratorFeedEvent, SessionEndReason, SessionStatus,
+    SpecQueueStatus,
 };
 use crate::store::{Store, StoreError};
 
@@ -540,6 +541,25 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
     )
 }
 
+/// Render standing obligations as one `event` turn.
+///
+/// Worded to be unmistakable from a notification, because the two behave
+/// differently and the orchestrator should treat them differently: a nudge is
+/// news that happened once, an obligation is work still owed and will keep
+/// coming back until it is discharged by an actual decision.
+pub fn format_obligations(obligations: &[Obligation]) -> String {
+    let lines: Vec<String> = obligations
+        .iter()
+        .map(|o| format!("- {}", o.summary))
+        .collect();
+    format!(
+        "[pipeline] Standing obligations — not notifications. These are \
+         derived from pipeline state and will keep appearing until they are \
+         resolved, so act on them rather than acknowledging them:\n{}",
+        lines.join("\n")
+    )
+}
+
 /// `#<issue> "<title>"` for a task, degrading to the raw id if it's gone.
 async fn task_ref(store: &Store, task_id: &crate::models::TaskId) -> String {
     match store.get_task(task_id).await {
@@ -561,6 +581,11 @@ fn system_prompt(port: u16) -> String {
          (turns starting with \"[pipeline]\"). Treat those as your cue to act \
          on the human's behalf — investigate, summarize, prepare — not just \
          to acknowledge.\n\n\
+         Two kinds of automated turn arrive, and they mean different things. \
+         A *notification* reports something that happened, once. A *standing \
+         obligation* is work the pipeline is still owed, derived from its \
+         state — it will keep reappearing until it is actually resolved, so \
+         acknowledging one changes nothing. Act on those.\n\n\
          On a [pipeline] turn:\n\
          - Spec landed → read it (GET /specs/{{id}}) and review it \
            ADVERSARIALLY: your value is finding what's wrong, not affirming \

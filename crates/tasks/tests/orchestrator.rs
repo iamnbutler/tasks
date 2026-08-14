@@ -517,6 +517,95 @@ async fn the_actor_header_decides_who_a_write_belongs_to() {
     );
 }
 
+/// End to end: an obligation reaches the conversation as an *input* turn the
+/// tick answers (unlike a seam, which is written for the reader only), stops
+/// repeating while it is fresh, and stays open until a decision — not a
+/// mention — discharges it.
+#[tokio::test]
+async fn standing_obligations_reach_the_conversation_and_persist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let stub = write_stub(tmp.path(), &args_log, false).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let spec = seed_pending_spec(&store).await;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let loop_handle = tokio::spawn(tasks::run::obligation_loop(
+        store.clone(),
+        Duration::from_millis(0),  // nothing is "fresh" here
+        Duration::from_secs(3600), // ...and one mention is enough
+        Duration::from_millis(20),
+        shutdown_rx,
+    ));
+
+    // The obligation lands as a turn.
+    let turn = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let messages = store.orchestrator_messages_since(0).await.unwrap();
+            if let Some(m) = messages.iter().find(|m| m.role == ChatRole::Event) {
+                return m.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an obligation turn was appended");
+    assert!(
+        turn.content.contains("Standing obligations"),
+        "distinguishable from a notification: {}",
+        turn.content
+    );
+    assert!(turn.content.contains("waiting for a verdict"));
+
+    // It is input — the tick owes it a reply, unlike a session seam.
+    let pending = store.unanswered_orchestrator_messages().await.unwrap();
+    assert!(pending.iter().any(|m| m.seq == turn.seq));
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+    assert!(orch.tick().await.unwrap());
+
+    // Answering is not deciding: the obligation is still open.
+    assert!(
+        !store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a reply does not discharge an obligation — only a decision does"
+    );
+
+    // And it is not repeated while the reminder interval holds.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let event_turns = store
+        .orchestrator_messages_since(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == ChatRole::Event)
+        .count();
+    assert_eq!(event_turns, 1, "one mention, not one per tick");
+
+    // A verdict is what ends it.
+    store
+        .review_spec(
+            &spec.id,
+            SpecQueueStatus::Approved,
+            None,
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = loop_handle.await;
+}
+
 /// A spec sitting in `pending_review`, with the task and session behind it.
 async fn seed_pending_spec(store: &Store) -> Spec {
     let now = Utc::now();

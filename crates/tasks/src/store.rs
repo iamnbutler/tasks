@@ -14,10 +14,11 @@ use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, Decision,
-    DecisionAction, DecisionInput, GhState, Mode, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
-    SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
-    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    DecisionAction, DecisionInput, GhState, Mode, Obligation, ObligationKind,
+    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo,
+    Project, ProjectId, ReviewedSpec, Session, SessionEndReason, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Builder runs a batch of specs may cost before the batch is retired.
@@ -2103,6 +2104,120 @@ impl Store {
         }
     }
 
+    // --- obligations ---
+
+    /// Everything the pipeline is owed right now, oldest first.
+    ///
+    /// Computed, never stored. `grace` keeps freshly-landed work out of the
+    /// result so the ordinary nudge gets first crack at it — an obligation
+    /// surfacing means the notification path did not do its job, which is
+    /// exactly the case worth catching.
+    pub async fn open_obligations(
+        &self,
+        grace: chrono::Duration,
+    ) -> Result<Vec<Obligation>, StoreError> {
+        let cutoff = (Utc::now() - grace).to_rfc3339();
+        let mut obligations = Vec::new();
+
+        // A spec awaiting a verdict that nobody has recorded one for. The
+        // decisions check is belt-and-braces today (a verdict moves the
+        // status off pending_review), and it is the honest predicate: the
+        // obligation is discharged by a *decision*, not by being mentioned.
+        let rows = sqlx::query(
+            "SELECT q.spec_id, s.created_at, t.gh_issue_number, t.title              FROM spec_queue q              JOIN specs s ON s.id = q.spec_id              JOIN tasks t ON t.id = s.task_id              WHERE q.status = ? AND s.created_at <= ?                AND NOT EXISTS (SELECT 1 FROM decisions d                                WHERE d.subject_kind = 'spec' AND d.subject_id = q.spec_id)              ORDER BY s.created_at",
+        )
+        .bind(SpecQueueStatus::PendingReview.as_str())
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::ReviewSpec,
+                subject_id: row.try_get("spec_id")?,
+                summary: format!(
+                    "#{} \"{}\" has been waiting for a verdict since {}",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                    since.format("%Y-%m-%d %H:%M UTC"),
+                ),
+                since,
+            });
+        }
+
+        // A batch that ran out of build attempts. Stopped work stays visible
+        // until someone decides about it, rather than parking silently.
+        let rows = sqlx::query(
+            "SELECT q.spec_id, s.created_at, t.gh_issue_number, t.title              FROM spec_queue q              JOIN specs s ON s.id = q.spec_id              JOIN tasks t ON t.id = s.task_id              WHERE q.status = ? ORDER BY s.created_at",
+        )
+        .bind(SpecQueueStatus::Blocked.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::UnblockSpec,
+                subject_id: row.try_get("spec_id")?,
+                summary: format!(
+                    "#{} \"{}\" is blocked: it used up its build attempts and nothing will retry it",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                ),
+                since,
+            });
+        }
+
+        obligations.sort_by_key(|o| o.since);
+        Ok(obligations)
+    }
+
+    /// Narrow a set of obligations to the ones not mentioned recently.
+    /// Purely a rate limit — an obligation left out here is still open.
+    pub async fn obligations_due_for_reminder(
+        &self,
+        obligations: Vec<Obligation>,
+        interval: chrono::Duration,
+    ) -> Result<Vec<Obligation>, StoreError> {
+        let cutoff = (Utc::now() - interval).to_rfc3339();
+        let mut due = Vec::new();
+        for obligation in obligations {
+            let row = sqlx::query(
+                "SELECT last_surfaced_at FROM obligation_reminders                  WHERE kind = ? AND subject_id = ?",
+            )
+            .bind(obligation.kind.as_str())
+            .bind(&obligation.subject_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let quiet = match row {
+                Some(row) => row.try_get::<String, _>("last_surfaced_at")? > cutoff,
+                None => false,
+            };
+            if !quiet {
+                due.push(obligation);
+            }
+        }
+        Ok(due)
+    }
+
+    /// Record that these obligations were just mentioned.
+    pub async fn mark_obligations_surfaced(
+        &self,
+        obligations: &[Obligation],
+    ) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        for obligation in obligations {
+            sqlx::query(
+                "INSERT INTO obligation_reminders (kind, subject_id, last_surfaced_at)                  VALUES (?, ?, ?)                  ON CONFLICT(kind, subject_id) DO UPDATE SET last_surfaced_at = excluded.last_surfaced_at",
+            )
+            .bind(obligation.kind.as_str())
+            .bind(&obligation.subject_id)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     // --- decisions ---
 
     /// The ledger, newest first. `subject` narrows to one spec or build.
@@ -3766,6 +3881,119 @@ mod tests {
         (task, spec)
     }
 
+    /// The bug this whole mechanism exists for: a spec whose nudge was
+    /// consumed by a turn that then failed is invisible forever. Derived
+    /// obligations mean the state itself keeps pointing at it, and only a
+    /// real decision makes it stop.
+    #[tokio::test]
+    async fn an_unreviewed_spec_stays_owed_until_someone_decides() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        let none = chrono::Duration::zero();
+
+        let open = store.open_obligations(none).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, ObligationKind::ReviewSpec);
+        assert_eq!(open[0].subject_id, spec.id.to_string());
+
+        // Fresh work is left alone: the ordinary nudge gets first crack, and
+        // an obligation surfacing means that path already failed.
+        assert!(
+            store
+                .open_obligations(chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Being *told* discharges nothing — the reminder only goes quiet.
+        store.mark_obligations_surfaced(&open).await.unwrap();
+        assert_eq!(
+            store.open_obligations(none).await.unwrap().len(),
+            1,
+            "still owed after being mentioned"
+        );
+        assert!(
+            store
+                .obligations_due_for_reminder(
+                    store.open_obligations(none).await.unwrap(),
+                    chrono::Duration::hours(1)
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "but not repeated inside the reminder interval"
+        );
+        assert_eq!(
+            store
+                .obligations_due_for_reminder(
+                    store.open_obligations(none).await.unwrap(),
+                    chrono::Duration::zero()
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "and it comes back once the interval lapses"
+        );
+
+        // A decision is what discharges it.
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        assert!(store.open_obligations(none).await.unwrap().is_empty());
+    }
+
+    /// Work that stopped must stay visible rather than parking silently —
+    /// which is the whole of "don't get blocked, keep working".
+    #[tokio::test]
+    async fn a_blocked_spec_is_standing_work() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            store
+                .finalize_build_failed(&build.id, "boom")
+                .await
+                .unwrap();
+        }
+
+        let open = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, ObligationKind::UnblockSpec);
+        assert!(
+            open[0].summary.contains("blocked"),
+            "says what is wrong: {}",
+            open[0].summary
+        );
+    }
+
     /// The ledger is the record of authority, so it must commit with the
     /// state it explains — and an autonomous verdict with no stated reason is
     /// refused outright, since the case for letting the orchestrator decide
@@ -3917,7 +4145,11 @@ mod tests {
 
         // Retired means unbuildable — the loop cannot pick it up again.
         let err = store
-            .create_build(std::slice::from_ref(&spec.id), "main", DecisionInput::human())
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");

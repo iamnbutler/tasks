@@ -598,6 +598,43 @@ pub struct OrchestratorSessionInfo {
     pub context_tokens: Option<i64>,
 }
 
+/// Something the pipeline is owed, computed from its state.
+///
+/// Obligations are never stored: they exist for exactly as long as the state
+/// that implies them, and disappear when the work is done rather than when
+/// someone is told about it. That is the difference between a notification
+/// and an obligation, and it is why a dropped tick can no longer strand a
+/// spec — nothing was consumed, so the next pass sees the same thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Obligation {
+    pub kind: ObligationKind,
+    /// The spec, build, or task the obligation is about.
+    pub subject_id: String,
+    /// One human-readable line, for the turn that surfaces it.
+    pub summary: String,
+    /// When the state implying this obligation came about.
+    pub since: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObligationKind {
+    /// A spec is waiting for a verdict and no decision has been recorded.
+    ReviewSpec,
+    /// A batch burned through its build attempts and stopped. Nothing will
+    /// pick it up again until someone decides what to do.
+    UnblockSpec,
+}
+
+impl ObligationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ObligationKind::ReviewSpec => "review_spec",
+            ObligationKind::UnblockSpec => "unblock_spec",
+        }
+    }
+}
+
 /// Who caused a state change.
 ///
 /// The API is loopback and unauthenticated by design, so this is attribution,
