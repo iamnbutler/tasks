@@ -649,11 +649,7 @@ async fn list_events(
         return Err(ApiError::BadRequest("limit must be positive".into()));
     }
     let events = match query.since {
-        Some(since) => {
-            let mut events = store.events_since(since).await?;
-            events.truncate(limit as usize);
-            events
-        }
+        Some(since) => store.events_since(since, limit).await?,
         None => store.recent_events(limit).await?,
     };
     Ok(Json(events))
@@ -811,7 +807,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 400);
 
-        let events = store.events_since(0).await.unwrap();
+        let events = store.all_events().await.unwrap();
         assert_eq!(
             events[0].payload,
             EventPayload::ProjectAdded {
@@ -921,7 +917,7 @@ mod tests {
             .unwrap();
         assert_eq!(a2.manual_rank, Some(1));
         let queue_events = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -1291,7 +1287,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 400);
 
-        let events = store.events_since(0).await.unwrap();
+        let events = store.all_events().await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].payload,

@@ -131,7 +131,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     assert!(session.branch.starts_with("scout/"));
 
     // Sanity: event log captured the transitions
-    let events = store.events_since(0).await.unwrap();
+    let events = store.all_events().await.unwrap();
     let state_changes: Vec<_> = events
         .iter()
         .filter_map(|e| match &e.payload {

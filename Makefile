@@ -1,9 +1,21 @@
-# Container image pipeline. Prereqs (make check-toolchain):
+# Container image pipeline. These targets cross-compile macOS -> Linux and are
+# the only place the cross linker is pinned. Prereqs (make check-toolchain):
 #   brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
 #   rustup target add aarch64-unknown-linux-gnu
 #   apple/container CLI (`container system start` before building images)
+#
+# Plain `cargo build` / `cargo test --workspace` are native builds and need
+# none of the above — including on an aarch64 Linux host, where the target
+# triple below happens to be the host triple.
 
 LINUX_TARGET := aarch64-unknown-linux-gnu
+CROSS_LINKER := $(LINUX_TARGET)-gcc
+# Cargo's `[target.*]` config keys are host-blind, so the pin has to live here
+# rather than in .cargo/config.toml: on an aarch64 Linux host that triple is
+# the host triple and the macOS-only linker above does not exist. The env var
+# name is derived from the triple by cargo's own uppercase/underscore rule, so
+# changing LINUX_TARGET can't silently desync the two.
+CROSS_ENV := CARGO_TARGET_$(shell echo $(LINUX_TARGET) | tr 'a-z-' 'A-Z_')_LINKER=$(CROSS_LINKER)
 SCOUT_BIN := target/$(LINUX_TARGET)/release/scout-supervisor
 BUILDER_BIN := target/$(LINUX_TARGET)/release/builder-supervisor
 VM_SUPERVISOR_BIN := target/$(LINUX_TARGET)/release/supervisor
@@ -48,18 +60,18 @@ test-cargo:
 	cargo test --workspace
 
 check-toolchain:
-	@which $(LINUX_TARGET)-gcc >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }
+	@which $(CROSS_LINKER) >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }
 	@rustup target list --installed | grep -q $(LINUX_TARGET) || { echo "missing rust target: rustup target add $(LINUX_TARGET)"; exit 1; }
 	@which container >/dev/null || { echo "missing apple/container CLI"; exit 1; }
 
 scout-supervisor-linux: check-toolchain
-	cargo build --release --target $(LINUX_TARGET) -p scout-supervisor
+	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p scout-supervisor
 
 builder-supervisor-linux: check-toolchain
-	cargo build --release --target $(LINUX_TARGET) -p builder-supervisor
+	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p builder-supervisor
 
 vm-supervisor-linux: check-toolchain
-	cargo build --release --target $(LINUX_TARGET) -p vm-pool-supervisor
+	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p vm-pool-supervisor
 
 image-base: vm-supervisor-linux
 	cp $(VM_SUPERVISOR_BIN) images/base/supervisor

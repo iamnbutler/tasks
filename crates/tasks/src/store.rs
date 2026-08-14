@@ -2101,14 +2101,27 @@ impl Store {
         self.event_tx.subscribe()
     }
 
-    /// Return all events with seq >= `since`, ordered by seq ascending.
-    pub async fn events_since(&self, since: i64) -> Result<Vec<Event>, StoreError> {
-        let rows =
-            sqlx::query("SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq")
-                .bind(since)
-                .fetch_all(&self.pool)
-                .await?;
+    /// Return up to `limit` events with seq >= `since`, ordered by seq
+    /// ascending. The bound is in SQL so a client paging forward through the
+    /// log reads one page per request rather than the whole log each time.
+    pub async fn events_since(&self, since: i64, limit: i64) -> Result<Vec<Event>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq LIMIT ?",
+        )
+        .bind(since)
+        // SQLite reads a negative LIMIT as unbounded, so a caller-supplied
+        // `-1` would mean "the whole log" — the opposite of what it looks
+        // like. Clamp here so the bound doesn't depend on caller validation.
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(event_from_row).collect()
+    }
+
+    /// Return the entire event log, ordered by seq ascending. Callers that
+    /// want a page want `events_since`; this one is unbounded on purpose.
+    pub async fn all_events(&self) -> Result<Vec<Event>, StoreError> {
+        self.events_since(0, i64::MAX).await
     }
 
     /// Return the last N events, ordered by seq ascending.
@@ -3224,7 +3237,7 @@ mod tests {
         store.insert_task(&untouched).await.unwrap();
 
         // Seqs are a 1-based AUTOINCREMENT, so the next one is count + 1.
-        let next_seq = store.events_since(0).await.unwrap().len() as i64 + 1;
+        let next_seq = store.all_events().await.unwrap().len() as i64 + 1;
         let report = store.reconcile_orphaned_work().await.unwrap();
         assert_eq!(
             report,
@@ -3276,7 +3289,7 @@ mod tests {
         );
 
         let payloads: Vec<_> = store
-            .events_since(next_seq)
+            .events_since(next_seq, i64::MAX)
             .await
             .unwrap()
             .into_iter()
@@ -3304,12 +3317,12 @@ mod tests {
     async fn reconcile_orphaned_work_is_a_no_op_on_a_clean_store() {
         let store = Store::open_in_memory().await.unwrap();
         seed_spec(&store, 1).await;
-        let before = store.events_since(0).await.unwrap().len();
+        let before = store.all_events().await.unwrap().len();
 
         let report = store.reconcile_orphaned_work().await.unwrap();
         assert!(report.is_empty());
         assert_eq!(report, ReconcileReport::default());
-        assert_eq!(store.events_since(0).await.unwrap().len(), before);
+        assert_eq!(store.all_events().await.unwrap().len(), before);
     }
 
     #[tokio::test]
@@ -3485,7 +3498,7 @@ mod tests {
             .unwrap();
 
         let payloads: Vec<_> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -3578,7 +3591,7 @@ mod tests {
         };
         let appended = store.append_event(payload.clone()).await.unwrap();
 
-        let history = store.events_since(0).await.unwrap();
+        let history = store.all_events().await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].seq, appended.seq);
         assert_eq!(history[0].payload, payload);
@@ -3625,9 +3638,52 @@ mod tests {
         }
 
         let mid = seqs[2];
-        let tail = store.events_since(mid).await.unwrap();
+        let tail = store.events_since(mid, i64::MAX).await.unwrap();
         assert_eq!(tail.len(), 3);
         assert_eq!(tail.first().unwrap().seq, mid);
+    }
+
+    #[tokio::test]
+    async fn events_since_bounds_the_read_by_limit() {
+        let store = Store::open_in_memory().await.unwrap();
+        for _ in 0..50 {
+            store
+                .append_event(EventPayload::Note {
+                    source: "test".into(),
+                    message: "hello".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // A page is exactly `limit` long and starts at `since`, inclusive.
+        let page = store.events_since(1, 5).await.unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // Paging forward from the last seq + 1 continues where it left off.
+        let next = store
+            .events_since(page.last().unwrap().seq + 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(next.first().unwrap().seq, 6);
+
+        // Asking for more than remains returns what's left.
+        let tail = store.events_since(48, 100).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![48, 49, 50]
+        );
+
+        // SQLite treats a negative LIMIT as unbounded; the store clamps so
+        // neither 0 nor -1 can turn a page into a full-log read.
+        assert!(store.events_since(1, 0).await.unwrap().is_empty());
+        assert!(store.events_since(1, -1).await.unwrap().is_empty());
+
+        // The unbounded read has its own name.
+        assert_eq!(store.all_events().await.unwrap().len(), 50);
     }
 
     #[tokio::test]
@@ -3671,7 +3727,7 @@ mod tests {
         }
 
         let store = Store::open(&path).await.unwrap();
-        let history = store.events_since(0).await.unwrap();
+        let history = store.all_events().await.unwrap();
         assert_eq!(history.len(), 1);
         match &history[0].payload {
             EventPayload::Note { message, .. } => assert_eq!(message, "first"),
@@ -3979,7 +4035,7 @@ mod tests {
         assert_eq!(retired.manual_rank, None);
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -4026,7 +4082,7 @@ mod tests {
         );
 
         // Neither attempt left a trace.
-        assert!(store.events_since(0).await.unwrap().is_empty());
+        assert!(store.all_events().await.unwrap().is_empty());
 
         let err = store
             .retire_task(&reopened.id, TaskState::Backlog)
@@ -4256,7 +4312,7 @@ mod tests {
         assert!(matches!(err, StoreError::Invalid(_)));
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()

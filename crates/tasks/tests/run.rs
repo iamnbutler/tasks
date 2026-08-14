@@ -133,7 +133,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     assert_eq!(tasks.len(), 2);
     assert!(tasks.iter().all(|t| t.state == TaskState::Backlog));
     let ingest_events = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -170,7 +170,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
 /// Every `task_gh_state_changed` on the log, oldest first.
 async fn gh_state_changes(store: &Store) -> Vec<(TaskId, GhState)> {
     store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -732,7 +732,7 @@ async fn insert_task_with_gh_state(
 /// Task ids in the order the dispatcher started sessions for them.
 async fn dispatch_order(store: &Store) -> Vec<TaskId> {
     store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -922,7 +922,7 @@ async fn three_failed_dispatches_reject_the_task() {
     );
 
     let payloads: Vec<_> = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -1108,7 +1108,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
     assert_eq!(timed_out.len(), 3, "three sessions ended on the deadline");
 
     let payloads: Vec<_> = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()

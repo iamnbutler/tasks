@@ -111,7 +111,7 @@ async fn a_tick_answers_pending_turns_and_resumes_the_same_session() {
     );
 
     // Both unanswered turns folded into one reply each time.
-    let events = store.events_since(0).await.unwrap();
+    let events = store.all_events().await.unwrap();
     assert!(!events.is_empty());
 }
 
