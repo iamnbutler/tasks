@@ -8,9 +8,14 @@ SCOUT_BIN := target/$(LINUX_TARGET)/release/scout-supervisor
 BUILDER_BIN := target/$(LINUX_TARGET)/release/builder-supervisor
 VM_SUPERVISOR_BIN := target/$(LINUX_TARGET)/release/supervisor
 
+# Where cargo puts debug binaries, honouring an environment override.
+# abspath because tests run with cwd set to their own package.
+CARGO_TARGET_DIR ?= target
+TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
+
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
-        app run
+        app run check-nextest test-bins test test-ci test-cargo
 
 # Version identity stamped into the app (shown in About Tasks): version is
 # 0.1.<commit count>, build is the short SHA, "-dirty" when uncommitted
@@ -34,6 +39,36 @@ app:
 run: app
 	@pkill -x Tasks 2>/dev/null || true
 	open ~/Applications/Tasks.app
+
+# Tests. Binaries are built once, here, and the suite only execs them —
+# nothing shells out to `cargo build` mid-test (that used to block on the
+# build-directory lock, so anything else touching it stalled the run).
+#
+# nextest does not run doctests at all, and does not say so in its summary,
+# so both `test` and `test-ci` finish with an explicit doctest pass.
+
+check-nextest:
+	@command -v cargo-nextest >/dev/null || { \
+		echo "missing cargo-nextest: cargo install cargo-nextest --locked"; \
+		echo "(or run 'make test-cargo' to use plain cargo test)"; exit 1; }
+
+# Prebuild the binaries the tasks suite execs, so TASKS_TEST_BIN_DIR is
+# populated before the first test process starts.
+test-bins:
+	cargo build -p scout-supervisor -p builder-supervisor
+
+test: check-nextest test-bins
+	TASKS_TEST_BIN_DIR=$(TEST_BIN_DIR) cargo nextest run --workspace
+	cargo test --doc --workspace
+
+test-ci: check-nextest test-bins
+	TASKS_TEST_BIN_DIR=$(TEST_BIN_DIR) cargo nextest run --workspace --profile ci
+	cargo test --doc --workspace
+
+# The no-prerequisites path. Deliberately does not export TASKS_TEST_BIN_DIR,
+# so the build-on-demand fallback stays exercised.
+test-cargo:
+	cargo test --workspace
 
 check-toolchain:
 	@which $(LINUX_TARGET)-gcc >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }

@@ -26,7 +26,7 @@ use vm_pool_client::Client;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stub_agent_path, write_supervisor_wrapper,
+    make_fixture_repo, spawn_vm_pool, stub_agent_path, workspace_bin, write_supervisor_wrapper,
 };
 
 async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Project, Task) {
@@ -60,8 +60,8 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
 
 #[tokio::test]
 async fn scout_dispatch_end_to_end_produces_spec() {
-    // 1. Build binaries
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    // 1. Locate binaries
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
 
     // 2. Set up tmpdir, fixture repo, wrapper
     let tmp = tempfile::tempdir().unwrap();
@@ -145,7 +145,7 @@ async fn scout_dispatch_end_to_end_produces_spec() {
 
 #[tokio::test]
 async fn two_scouts_dispatch_concurrently() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());
@@ -203,7 +203,7 @@ async fn two_scouts_dispatch_concurrently() {
 
 #[tokio::test]
 async fn scout_dispatch_failure_resets_task_to_new() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());
@@ -251,7 +251,7 @@ async fn scout_dispatch_failure_resets_task_to_new() {
 /// run's spec content *is* the prompt the scout was given.
 #[tokio::test]
 async fn re_scout_after_needs_revision_receives_the_review() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());
@@ -332,7 +332,7 @@ async fn re_scout_after_needs_revision_receives_the_review() {
 /// rather than holding its slot forever.
 #[tokio::test]
 async fn a_scout_that_never_reports_back_times_out() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());
