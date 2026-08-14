@@ -10,7 +10,10 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{actions, div, px, Context, Div, Entity, Focusable, MouseButton, Window};
+use gpui::{
+    actions, div, list, px, Context, Div, Entity, Focusable, ListAlignment, ListState, MouseButton,
+    Window,
+};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::input::InputState;
@@ -65,6 +68,11 @@ pub struct Workspace {
     pub(crate) selected_task: Option<TaskId>,
     /// Chat composer (placeholder until the chat slice lands).
     pub(crate) input: Entity<InputState>,
+    /// Scroll state for the chat list — bottom-aligned, so the view opens
+    /// at the newest message and follows new ones.
+    chat_list: ListState,
+    /// Message count the list was last synced to.
+    chat_len: usize,
 }
 
 impl Workspace {
@@ -116,6 +124,8 @@ impl Workspace {
             app_state,
             selected_task: None,
             input,
+            chat_list: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+            chat_len: 0,
         }
     }
 
@@ -337,56 +347,63 @@ impl Workspace {
     }
 
     fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let state = self.app_state.read(cx);
-        let messages: Vec<_> = state
-            .orchestrator_messages
-            .iter()
-            .map(|message| (message.seq, message.role, message.content.clone()))
-            .collect();
+        let theme = cx.theme().clone();
+
+        // Zed's agent-panel pattern: a bottom-aligned `list` starts at the
+        // newest message and stays pinned there as new ones land; item
+        // count is synced in `Render::render` via splice.
+        let app_state = self.app_state.clone();
+        let messages = list(self.chat_list.clone(), move |ix, _window, cx| {
+            use tasks_client::api::models::ChatRole;
+            let theme = cx.theme().clone();
+            let state = app_state.read(cx);
+            let Some(message) = state.orchestrator_messages.get(ix) else {
+                return div().into_any_element();
+            };
+            let (role, content) = (message.role, message.content.clone());
+
+            let bubble = div()
+                .max_w(px(720.))
+                .p(px(8.))
+                .rounded(px(8.))
+                .text_sm()
+                .child(content);
+            div()
+                .w_full()
+                .px(px(12.))
+                .py(px(4.))
+                .flex()
+                .flex_row()
+                .map(|el| match role {
+                    ChatRole::User => el
+                        .justify_end()
+                        .child(bubble.bg(theme.accent_bg()).text_color(theme.fg())),
+                    ChatRole::Assistant => {
+                        el.child(bubble.bg(theme.surface_secondary()).text_color(theme.fg()))
+                    }
+                    ChatRole::Event => el.child(bubble.text_color(theme.fg_muted()).text_xs()),
+                })
+                .into_any_element()
+        });
 
         div()
             .flex()
             .flex_col()
             .size_full()
-            .child(
-                div()
-                    .id("chat-scroll")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .p(px(12.))
-                    .gap(px(8.))
-                    .children(messages.into_iter().map(|(seq, role, content)| {
-                        use tasks_client::api::models::ChatRole;
-                        let bubble = div()
-                            .max_w(px(720.))
-                            .p(px(8.))
-                            .rounded(px(8.))
-                            .text_sm()
-                            .child(content);
+            .map(|el| {
+                if self.chat_len == 0 {
+                    el.child(
                         div()
-                            .id(seq as usize)
-                            .flex()
-                            .flex_row()
-                            .map(|el| match role {
-                                ChatRole::User => el.justify_end().child(
-                                    bubble
-                                        .bg(cx.theme().accent_bg())
-                                        .text_color(cx.theme().fg()),
-                                ),
-                                ChatRole::Assistant => el.child(
-                                    bubble
-                                        .bg(cx.theme().surface_secondary())
-                                        .text_color(cx.theme().fg()),
-                                ),
-                                ChatRole::Event => {
-                                    el.child(bubble.text_color(cx.theme().fg_muted()).text_xs())
-                                }
-                            })
-                    })),
-            )
+                            .flex_1()
+                            .p(px(16.))
+                            .text_sm()
+                            .text_color(theme.fg_muted())
+                            .child("Talk to the orchestrator — the conversation lands here."),
+                    )
+                } else {
+                    el.child(messages.flex_1().min_h(px(0.)).w_full().py(px(8.)))
+                }
+            })
             .child(
                 div()
                     .flex_none()
@@ -429,13 +446,17 @@ impl Workspace {
                 .child(self.section.label()),
         );
 
-        match self.section {
-            Section::Home => pane.child(self.render_home(cx)),
-            Section::Tasks => pane.child(self.render_tasks(cx)),
-            Section::Queue => pane.child(self.render_queue(cx)),
-            Section::Activity => pane.child(self.render_activity(cx)),
-            Section::Chat => pane.child(self.render_chat(cx)),
-        }
+        // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
+        // never `size_full`: 100% of the pane plus the header above it
+        // overflows the clip and cuts off the bottom (chat's composer).
+        let body = match self.section {
+            Section::Home => self.render_home(cx).into_any_element(),
+            Section::Tasks => self.render_tasks(cx).into_any_element(),
+            Section::Queue => self.render_queue(cx).into_any_element(),
+            Section::Activity => self.render_activity(cx).into_any_element(),
+            Section::Chat => self.render_chat(cx).into_any_element(),
+        };
+        pane.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body))
     }
 }
 
@@ -449,6 +470,19 @@ impl Render for Workspace {
         self.left_sidebar.set_width(left_width, viewport_width);
         let right_width = self.right_sidebar.width;
         self.right_sidebar.set_width(right_width, viewport_width);
+
+        // Sync the chat list's item count with the message log (append-only,
+        // so a shrink means the server was reset — start over).
+        let messages_len = self.app_state.read(cx).orchestrator_messages.len();
+        if messages_len != self.chat_len {
+            if messages_len < self.chat_len {
+                self.chat_list.reset(messages_len);
+            } else {
+                self.chat_list
+                    .splice(self.chat_len..self.chat_len, messages_len - self.chat_len);
+            }
+            self.chat_len = messages_len;
+        }
 
         div()
             .key_context("Workspace")
