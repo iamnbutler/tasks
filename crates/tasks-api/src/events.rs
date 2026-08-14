@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionEndReason,
-    SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    Actor, BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
+    SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -59,10 +59,19 @@ pub enum EventPayload {
         task_id: TaskId,
         session_id: SessionId,
     },
+    /// A spec's review state changed. `actor` is who decided — the
+    /// orchestrator must never be nudged about its own verdicts — and
+    /// `decision_seq` points into the decisions ledger for the rationale.
+    /// Both are absent only on transitions nobody chose (a Builder run
+    /// marking specs `built`).
     SpecQueueStatusChanged {
         spec_id: SpecId,
         from: Option<SpecQueueStatus>,
         to: SpecQueueStatus,
+        #[serde(default)]
+        actor: Option<Actor>,
+        #[serde(default)]
+        decision_seq: Option<i64>,
     },
     /// The human-curated task queue was reordered. `task_ids` is the new order,
     /// front to back; tasks not listed were left unranked.
@@ -77,6 +86,10 @@ pub enum EventPayload {
     BuildRequested {
         build_id: BuildId,
         spec_ids: Vec<SpecId>,
+        #[serde(default)]
+        actor: Option<Actor>,
+        #[serde(default)]
+        decision_seq: Option<i64>,
     },
     /// The serial build loop claimed the build; a Builder VM is running it.
     BuildStarted {
@@ -165,7 +178,7 @@ impl EventPayload {
 mod tests {
     use super::*;
     use crate::models::{
-        BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
+        Actor, BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
         SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
     };
 
@@ -212,12 +225,16 @@ mod tests {
                 spec_id: SpecId::from_raw("spec_1"),
                 from: None,
                 to: SpecQueueStatus::PendingReview,
+                actor: None,
+                decision_seq: None,
             },
             EventPayload::QueueReordered { task_ids: vec![] },
             EventPayload::SpecQueueReordered { spec_ids: vec![] },
             EventPayload::BuildRequested {
                 build_id: BuildId::from_raw("build_1"),
                 spec_ids: vec![SpecId::from_raw("spec_1")],
+                actor: Some(Actor::Human),
+                decision_seq: Some(1),
             },
             EventPayload::BuildStarted {
                 build_id: BuildId::from_raw("build_1"),
@@ -285,11 +302,15 @@ mod tests {
             spec_id: SpecId::from_raw("spec_1"),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         };
         let rejected = EventPayload::SpecQueueStatusChanged {
             spec_id: SpecId::from_raw("spec_1"),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Rejected,
+            actor: Some(Actor::Human),
+            decision_seq: Some(2),
         };
         let approved_wire = serde_json::to_value(&approved).unwrap();
         let rejected_wire = serde_json::to_value(&rejected).unwrap();
@@ -305,6 +326,8 @@ mod tests {
         let wire = serde_json::to_value(EventPayload::BuildRequested {
             build_id: BuildId::from_raw("build_1"),
             spec_ids: vec![SpecId::from_raw("spec_a"), SpecId::from_raw("spec_b")],
+            actor: Some(Actor::Human),
+            decision_seq: None,
         })
         .unwrap();
         assert_eq!(wire["spec_ids"], serde_json::json!(["spec_a", "spec_b"]));

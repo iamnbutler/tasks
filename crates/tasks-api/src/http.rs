@@ -36,8 +36,19 @@ pub struct ReorderSpecQueue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub status: String,
+    /// Sent onward to a scout on `needs_revision` — what to change.
     #[serde(default)]
     pub feedback: Option<String>,
+    /// Why this verdict was rendered. Distinct from `feedback`: that is
+    /// addressed to the scout, this is the decision record. Required when
+    /// the caller is the orchestrator — an autonomous verdict with no stated
+    /// reason is not auditable, so the server refuses it.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// What the decider checked, free-form JSON (staleness, overlaps,
+    /// verification claims). Stored verbatim on the decision.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// Body of `POST /builds`.
@@ -47,6 +58,13 @@ pub struct BuildRequest {
     /// Branch the batch is cut from and PR'd against. Defaults to `main`.
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// Why this batch, now. Required of the orchestrator — batching and
+    /// ordering are judgment calls, so the reasoning is the record.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// What the decider checked, free-form JSON. Stored on the decision.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// A build with its batch, in position order — the shape of

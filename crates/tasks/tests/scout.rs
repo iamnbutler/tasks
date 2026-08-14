@@ -17,7 +17,8 @@ use chrono::Utc;
 use vm_pool_protocol::VmConfig;
 
 use tasks::models::{
-    GhState, Project, ProjectId, SessionStatus, SpecQueueStatus, Task, TaskId, TaskState,
+    DecisionInput, GhState, Project, ProjectId, SessionStatus, SpecQueueStatus, Task, TaskId,
+    TaskState,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
 use tasks::store::Store;
@@ -298,6 +299,7 @@ async fn re_scout_after_needs_revision_receives_the_review() {
             &first.id,
             SpecQueueStatus::NeedsRevision,
             Some(FEEDBACK.to_string()),
+            DecisionInput::human(),
         )
         .await
         .unwrap();

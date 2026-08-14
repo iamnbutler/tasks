@@ -275,6 +275,9 @@ impl Client {
             &ReviewRequest {
                 status: verdict.as_str().to_string(),
                 feedback,
+                // The client speaks for the human, who owes no explanation.
+                rationale: None,
+                evidence: None,
             },
         )
     }
@@ -303,6 +306,8 @@ impl Client {
             &BuildRequest {
                 spec_ids,
                 base_branch,
+                rationale: None,
+                evidence: None,
             },
         )
     }

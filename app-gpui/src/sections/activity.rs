@@ -56,9 +56,17 @@ impl Workspace {
                     EventPayload::SpecCreated { task_id, .. } => {
                         format!("Spec landed for “{}”", title_for(task_id))
                     }
-                    EventPayload::SpecQueueStatusChanged { to, .. } => {
-                        format!("Spec review: {}", title_case(to.as_str()))
-                    }
+                    // Who decided is the point of the ledger, so say it here
+                    // too. No actor means nobody chose it — a spec landing,
+                    // a batch running out of build attempts.
+                    EventPayload::SpecQueueStatusChanged { to, actor, .. } => match actor {
+                        Some(actor) => format!(
+                            "Spec review: {} (by {})",
+                            title_case(to.as_str()),
+                            actor.as_str()
+                        ),
+                        None => format!("Spec review: {}", title_case(to.as_str())),
+                    },
                     EventPayload::QueueReordered { task_ids } => {
                         format!("Queue reordered ({} tasks)", task_ids.len())
                     }

@@ -8,8 +8,9 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+# Decision evidence is free-form JSON by design — what a decider checked is
+# not a fixed shape, and typing it would be guessing. `Value` is the honest
+# type for that, and any HTTP client of these types already links serde_json.
+serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

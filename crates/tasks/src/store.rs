@@ -8,16 +8,21 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode,
-    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo,
-    Project, ProjectId, ReviewedSpec, Session, SessionEndReason, SessionId, SessionStatus,
-    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TaskState, TranscriptLine, TranscriptStream,
+    Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, Decision,
+    DecisionAction, DecisionInput, GhState, Mode, OrchestratorFeedEvent, OrchestratorMessage,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
+    SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
+    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
+
+/// Builder runs a batch of specs may cost before the batch is retired.
+/// Mirrors `MAX_DISPATCH_ATTEMPTS` for scouts, one diamond along.
+const MAX_BUILD_ATTEMPTS: i64 = 3;
 
 /// Result of upserting an external record into our domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +124,16 @@ pub struct Store {
     event_tx: broadcast::Sender<Event>,
     transcript_tx: broadcast::Sender<TranscriptLine>,
     orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
+    /// Secret the orchestrator presents to be attributed as itself. Minted
+    /// per boot and held only in memory: it is handed to the agent through
+    /// its environment (never argv, which is world-readable via `ps`, and
+    /// never the prompt, which is persisted).
+    ///
+    /// Not authentication — the API is loopback and unauthenticated by
+    /// design. It exists so the orchestrator cannot silently be mistaken for
+    /// the human, which matters because the self-nudge filter trusts the
+    /// actor field.
+    actor_token: std::sync::Arc<str>,
 }
 
 impl Store {
@@ -155,6 +170,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
+            actor_token: Uuid::new_v4().to_string().into(),
         })
     }
 
@@ -173,6 +189,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
+            actor_token: Uuid::new_v4().to_string().into(),
         })
     }
 
@@ -713,10 +730,14 @@ impl Store {
         })
         .await?;
         for (spec_id, from) in drained {
+            // Retirement follows the issue closing upstream: the world
+            // changed, nobody decided.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from,
                 to: SpecQueueStatus::Rejected,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1141,10 +1162,14 @@ impl Store {
             .await?;
         }
         for (spec_id, from) in drained_specs {
+            // Retirement follows the issue closing upstream: the world
+            // changed, nobody decided.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from,
                 to: SpecQueueStatus::Rejected,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1336,11 +1361,12 @@ impl Store {
         spec_id: &SpecId,
         status: SpecQueueStatus,
         feedback: Option<String>,
+        decision: DecisionInput,
     ) -> Result<SpecQueueEntry, StoreError> {
-        let next_task_state = match status {
-            SpecQueueStatus::Approved => TaskState::ReadyToBuild,
-            SpecQueueStatus::Rejected => TaskState::Rejected,
-            SpecQueueStatus::NeedsRevision => TaskState::Queued,
+        let (next_task_state, action) = match status {
+            SpecQueueStatus::Approved => (TaskState::ReadyToBuild, DecisionAction::Approve),
+            SpecQueueStatus::Rejected => (TaskState::Rejected, DecisionAction::Reject),
+            SpecQueueStatus::NeedsRevision => (TaskState::Queued, DecisionAction::NeedsRevision),
             // `Built` is how the approved queue drains — assigned by a
             // successful Builder run, never rendered by a reviewer.
             SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked | SpecQueueStatus::Built => {
@@ -1350,6 +1376,7 @@ impl Store {
                 )));
             }
         };
+        require_rationale(&decision)?;
 
         let entry = self
             .get_spec_queue_entry(spec_id)
@@ -1371,6 +1398,12 @@ impl Store {
         };
 
         let mut tx = self.pool.begin().await?;
+        // The ledger row lands in the same transaction as the change it
+        // authorizes: events are appended after commit, which is fine for
+        // telemetry but would let a crash leave a verdict with no recorded
+        // reason.
+        let decision_seq =
+            insert_decision(&mut tx, "spec", spec_id.as_str(), action, &decision, now).await?;
         sqlx::query(
             "UPDATE spec_queue SET status = ?, approved_at = ?, feedback = ? \
              WHERE spec_id = ?",
@@ -1393,6 +1426,8 @@ impl Store {
             spec_id: spec_id.clone(),
             from: Some(entry.status),
             to: status,
+            actor: Some(decision.actor),
+            decision_seq: Some(decision_seq),
         })
         .await?;
         if task.state != next_task_state {
@@ -1430,12 +1465,14 @@ impl Store {
         &self,
         spec_ids: &[SpecId],
         base_branch: &str,
+        decision: DecisionInput,
     ) -> Result<Build, StoreError> {
         if spec_ids.is_empty() {
             return Err(StoreError::Invalid(
                 "a build needs at least one spec".into(),
             ));
         }
+        require_rationale(&decision)?;
         let mut seen = std::collections::HashSet::new();
         for id in spec_ids {
             if !seen.insert(id.as_str()) {
@@ -1544,11 +1581,22 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        let decision_seq = insert_decision(
+            &mut tx,
+            "build",
+            build.id.as_str(),
+            DecisionAction::RequestBuild,
+            &decision,
+            build.created_at,
+        )
+        .await?;
         tx.commit().await?;
 
         self.append_event(EventPayload::BuildRequested {
             build_id: build.id.clone(),
             spec_ids: resolved.iter().map(|(id, _, _, _)| id.clone()).collect(),
+            actor: Some(decision.actor),
+            decision_seq: Some(decision_seq),
         })
         .await?;
 
@@ -1752,10 +1800,14 @@ impl Store {
         tx.commit().await?;
 
         for spec_id in built_specs {
+            // `built` is how the queue drains — earned by a Builder run,
+            // never rendered by a reviewer.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from: Some(SpecQueueStatus::Approved),
                 to: SpecQueueStatus::Built,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1802,6 +1854,35 @@ impl Store {
             .execute(&mut *tx)
             .await?;
 
+        // Count the strike against every spec in the batch, and retire the
+        // ones that have run out. Without this the batch stays `approved`
+        // forever, which is harmless while a human decides what to rebuild
+        // and a runaway loop the moment anything dispatches automatically.
+        sqlx::query(
+            "UPDATE spec_queue SET build_attempts = build_attempts + 1              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
+        )
+        .bind(id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let exhausted = sqlx::query(
+            "SELECT spec_id FROM spec_queue              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)                AND status = ? AND build_attempts >= ?",
+        )
+        .bind(id.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(MAX_BUILD_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut blocked = Vec::new();
+        for row in exhausted {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            sqlx::query("UPDATE spec_queue SET status = ? WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Blocked.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            blocked.push(spec_id);
+        }
+
         let task_rows = sqlx::query(
             "SELECT DISTINCT t.id FROM build_specs bs \
              JOIN specs s ON s.id = bs.spec_id \
@@ -1830,6 +1911,19 @@ impl Store {
                 task_id,
                 from: TaskState::Building,
                 to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        // Nobody decided this — the attempt cap did — so it carries no actor,
+        // which is also what keeps it nudge-worthy. Running out of retries is
+        // exactly the moment a human or the orchestrator should hear about it.
+        for spec_id in blocked {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from: Some(SpecQueueStatus::Approved),
+                to: SpecQueueStatus::Blocked,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1961,6 +2055,17 @@ impl Store {
         .bind(answered_through)
         .execute(&mut *tx)
         .await?;
+        // Point any decisions the orchestrator made during this turn at the
+        // prose explaining them. The reasoning is written last — the verdict
+        // is curled mid-turn — so the ledger can only be indexed backwards,
+        // here, once the turn it belongs to exists.
+        sqlx::query(
+            "UPDATE decisions SET transcript_seq = ?              WHERE actor = ? AND transcript_seq IS NULL",
+        )
+        .bind(seq)
+        .bind(Actor::Orchestrator.as_str())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         self.append_event(EventPayload::OrchestratorMessage {
             seq,
@@ -1980,6 +2085,47 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.try_get("cc_session_id")?)
+    }
+
+    /// The secret the orchestrator presents to be attributed as itself.
+    pub fn actor_token(&self) -> &str {
+        &self.actor_token
+    }
+
+    /// Resolve an `X-Tasks-Actor` header value. The expected form is
+    /// `orchestrator <token>`; anything else — absent, malformed, wrong
+    /// token — is [`Actor::Human`], because the human is the caller who
+    /// never has to prove anything.
+    pub fn resolve_actor(&self, header: Option<&str>) -> Actor {
+        match header.and_then(|h| h.split_once(' ')) {
+            Some(("orchestrator", token)) if token == &*self.actor_token => Actor::Orchestrator,
+            _ => Actor::Human,
+        }
+    }
+
+    // --- decisions ---
+
+    /// The ledger, newest first. `subject` narrows to one spec or build.
+    pub async fn decisions(
+        &self,
+        subject: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<Decision>, StoreError> {
+        let rows = match subject {
+            Some((kind, id)) => sqlx::query(
+                "SELECT * FROM decisions WHERE subject_kind = ? AND subject_id = ?                  ORDER BY seq DESC LIMIT ?",
+            )
+            .bind(kind)
+            .bind(id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?,
+            None => sqlx::query("SELECT * FROM decisions ORDER BY seq DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+        };
+        rows.into_iter().map(decision_from_row).collect()
     }
 
     // --- orchestrator session ledger ---
@@ -2474,6 +2620,82 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
         seq: row.try_get("seq")?,
         timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
         payload: serde_json::from_str(&payload_raw)?,
+    })
+}
+
+/// An autonomous verdict with no stated reason is not auditable, and the
+/// whole case for letting the orchestrator decide rests on being able to see
+/// why afterwards. Humans owe no explanation — they are the ones the record
+/// is for.
+fn require_rationale(decision: &DecisionInput) -> Result<(), StoreError> {
+    let missing = decision
+        .rationale
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty());
+    if decision.actor == Actor::Orchestrator && missing {
+        return Err(StoreError::Invalid(
+            "an orchestrator decision must carry a rationale".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Append a ledger row inside the caller's transaction, returning its seq.
+///
+/// `transcript_seq` is deliberately left NULL: the orchestrator curls its
+/// verdicts mid-turn, so the prose explaining one does not exist yet. It is
+/// backfilled when that turn's reply lands.
+async fn insert_decision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    now: DateTime<Utc>,
+) -> Result<i64, StoreError> {
+    let evidence = decision
+        .evidence
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let result = sqlx::query(
+        "INSERT INTO decisions             (subject_kind, subject_id, action, actor, rationale, evidence, created_at)          VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(subject_kind)
+    .bind(subject_id)
+    .bind(action.as_str())
+    .bind(decision.actor.as_str())
+    .bind(decision.rationale.as_deref())
+    .bind(evidence)
+    .bind(now.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+fn decision_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Decision, StoreError> {
+    let action_raw: String = row.try_get("action")?;
+    let actor_raw: String = row.try_get("actor")?;
+    let evidence_raw: Option<String> = row.try_get("evidence")?;
+    Ok(Decision {
+        seq: row.try_get("seq")?,
+        subject_kind: row.try_get("subject_kind")?,
+        subject_id: row.try_get("subject_id")?,
+        action: DecisionAction::from_str(&action_raw).ok_or(StoreError::BadEnum {
+            column: "action",
+            value: action_raw,
+        })?,
+        actor: Actor::from_str(&actor_raw).ok_or(StoreError::BadEnum {
+            column: "actor",
+            value: actor_raw,
+        })?,
+        rationale: row.try_get("rationale")?,
+        evidence: evidence_raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        transcript_seq: row.try_get("transcript_seq")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
     })
 }
 
@@ -3544,13 +3766,192 @@ mod tests {
         (task, spec)
     }
 
+    /// The ledger is the record of authority, so it must commit with the
+    /// state it explains — and an autonomous verdict with no stated reason is
+    /// refused outright, since the case for letting the orchestrator decide
+    /// rests entirely on being able to see why afterwards.
+    #[tokio::test]
+    async fn an_orchestrator_verdict_needs_a_reason_and_lands_in_the_ledger() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+
+        let err = store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Orchestrator,
+                    rationale: Some("   ".into()), // whitespace is not a reason
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");
+        // Refused means refused: no verdict, and nothing in the ledger.
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::PendingReview
+        );
+        assert!(store.decisions(None, 10).await.unwrap().is_empty());
+
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Orchestrator,
+                    rationale: Some("verification is falsifiable; base is clean".into()),
+                    evidence: Some(serde_json::json!({ "commits_behind": 3 })),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ledger = store.decisions(None, 10).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].actor, Actor::Orchestrator);
+        assert_eq!(ledger[0].action, DecisionAction::Approve);
+        assert_eq!(
+            ledger[0].evidence,
+            Some(serde_json::json!({"commits_behind": 3}))
+        );
+        assert_eq!(
+            ledger[0].transcript_seq, None,
+            "the reasoning does not exist yet — the verdict was curled mid-turn"
+        );
+
+        // The turn ends, and the ledger gains its index into the prose.
+        store
+            .append_orchestrator_reply("Approved it because…", 0, Some("sess-a"))
+            .await
+            .unwrap();
+        let ledger = store.decisions(None, 10).await.unwrap();
+        let reply_seq = store
+            .orchestrator_messages_since(0)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .seq;
+        assert_eq!(ledger[0].transcript_seq, Some(reply_seq));
+
+        // A human's verdict is never backfilled onto the orchestrator's prose.
+        let (_t2, spec2) = seed_spec(&store, 2).await;
+        store
+            .review_spec(
+                &spec2.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_orchestrator_reply("unrelated turn", 0, Some("sess-a"))
+            .await
+            .unwrap();
+        let human = store
+            .decisions(Some(("spec", spec2.id.as_str())), 10)
+            .await
+            .unwrap();
+        assert_eq!(human[0].actor, Actor::Human);
+        assert_eq!(human[0].transcript_seq, None);
+    }
+
+    /// A failed build used to return its specs to `approved` with no counter,
+    /// so anything dispatching automatically would retry a poison batch
+    /// forever. Strikes accumulate; the third retires the spec and says so.
+    #[tokio::test]
+    async fn a_batch_that_keeps_failing_is_retired() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        for attempt in 1..=MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            store
+                .finalize_build_failed(&build.id, "builder exited 1")
+                .await
+                .unwrap();
+
+            let status = store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if attempt < MAX_BUILD_ATTEMPTS {
+                assert_eq!(
+                    status,
+                    SpecQueueStatus::Approved,
+                    "attempt {attempt} of {MAX_BUILD_ATTEMPTS} keeps it eligible"
+                );
+            } else {
+                assert_eq!(status, SpecQueueStatus::Blocked, "out of attempts");
+            }
+        }
+
+        // Retired means unbuildable — the loop cannot pick it up again.
+        let err = store
+            .create_build(std::slice::from_ref(&spec.id), "main", DecisionInput::human())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");
+
+        // And it is announced with no actor, because nobody chose it — which
+        // is what keeps it nudge-worthy.
+        let payloads: Vec<_> = store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec.id.clone(),
+            from: Some(SpecQueueStatus::Approved),
+            to: SpecQueueStatus::Blocked,
+            actor: None,
+            decision_seq: None,
+        }));
+    }
+
     #[tokio::test]
     async fn review_spec_approve_readies_task_for_build() {
         let store = Store::open_in_memory().await.unwrap();
         let (task, spec) = seed_spec(&store, 1).await;
 
         let entry = store
-            .review_spec(&spec.id, SpecQueueStatus::Approved, Some("ship it".into()))
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                Some("ship it".into()),
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(entry.status, SpecQueueStatus::Approved);
@@ -3571,7 +3972,12 @@ mod tests {
 
         let (rejected_task, rejected_spec) = seed_spec(&store, 1).await;
         store
-            .review_spec(&rejected_spec.id, SpecQueueStatus::Rejected, None)
+            .review_spec(
+                &rejected_spec.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3594,6 +4000,7 @@ mod tests {
                 &revise_spec.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("more detail".into()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3614,12 +4021,20 @@ mod tests {
         let (_, spec) = seed_spec(&store, 1).await;
 
         for bad in [SpecQueueStatus::PendingReview, SpecQueueStatus::Blocked] {
-            let err = store.review_spec(&spec.id, bad, None).await.unwrap_err();
+            let err = store
+                .review_spec(&spec.id, bad, None, DecisionInput::human())
+                .await
+                .unwrap_err();
             assert!(matches!(err, StoreError::Invalid(_)), "{bad:?}");
         }
 
         let err = store
-            .review_spec(&SpecId::new(), SpecQueueStatus::Approved, None)
+            .review_spec(
+                &SpecId::new(),
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
@@ -3635,7 +4050,12 @@ mod tests {
             .unwrap();
 
         store
-            .review_spec(&spec.id, SpecQueueStatus::Approved, None)
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
 
@@ -3650,6 +4070,8 @@ mod tests {
             spec_id: spec.id.clone(),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         }));
         assert!(payloads.contains(&EventPayload::TaskStateChanged {
             task_id: task.id.clone(),
@@ -3899,6 +4321,7 @@ mod tests {
                 &first.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("fix it".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3959,6 +4382,7 @@ mod tests {
                 &second.id,
                 SpecQueueStatus::Rejected,
                 Some("no".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3977,6 +4401,7 @@ mod tests {
                 &spec_a.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("a only".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -4287,12 +4712,19 @@ mod tests {
 
         // Empty and duplicated sets.
         assert!(matches!(
-            store.create_build(&[], "main").await.unwrap_err(),
+            store
+                .create_build(&[], "main", DecisionInput::human())
+                .await
+                .unwrap_err(),
             StoreError::Invalid(_)
         ));
         assert!(matches!(
             store
-                .create_build(&[spec.id.clone(), spec.id.clone()], "main")
+                .create_build(
+                    &[spec.id.clone(), spec.id.clone()],
+                    "main",
+                    DecisionInput::human()
+                )
                 .await
                 .unwrap_err(),
             StoreError::Invalid(_)
@@ -4301,24 +4733,41 @@ mod tests {
         // A non-approved spec.
         let (_t2, pending) = approved_spec(&store, &project, 2).await;
         store
-            .review_spec(&pending.id, SpecQueueStatus::Rejected, None)
+            .review_spec(
+                &pending.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         let err = store
-            .create_build(std::slice::from_ref(&pending.id), "main")
+            .create_build(
+                std::slice::from_ref(&pending.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
 
         // A spec already in an active build.
         let build = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(build.status, BuildStatus::Queued);
         assert_eq!(build.branch, format!("build/{}", build.id));
         let err = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("already part of"), "{err}");
@@ -4338,7 +4787,11 @@ mod tests {
             .unwrap();
 
         let build = store
-            .create_build(&[spec_a.id.clone(), spec_b.id.clone()], "main")
+            .create_build(
+                &[spec_a.id.clone(), spec_b.id.clone()],
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4356,11 +4809,19 @@ mod tests {
         let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
 
         let first = store
-            .create_build(std::slice::from_ref(&spec_a.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec_a.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         let _second = store
-            .create_build(std::slice::from_ref(&spec_b.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec_b.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
 
@@ -4407,7 +4868,11 @@ mod tests {
         store.insert_project(&project).await.unwrap();
         let (task, spec) = approved_spec(&store, &project, 1).await;
         let build = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
@@ -4441,14 +4906,23 @@ mod tests {
             TaskState::Done
         );
         let err = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("built"), "{err}");
 
         // Built is not a verdict a reviewer can render.
         let err = store
-            .review_spec(&spec.id, SpecQueueStatus::Built, None)
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Built,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)));
@@ -4477,8 +4951,14 @@ mod tests {
         store.insert_project(&project).await.unwrap();
         let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
         let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
-        let running = store.create_build(&[spec_a.id], "main").await.unwrap();
-        let queued = store.create_build(&[spec_b.id], "main").await.unwrap();
+        let running = store
+            .create_build(&[spec_a.id], "main", DecisionInput::human())
+            .await
+            .unwrap();
+        let queued = store
+            .create_build(&[spec_b.id], "main", DecisionInput::human())
+            .await
+            .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
 
         let report = store.reconcile_orphaned_work().await.unwrap();
@@ -4533,7 +5013,10 @@ mod tests {
                 .status,
             SpecQueueStatus::Rejected
         );
-        let err = store.create_build(&[spec.id], "main").await.unwrap_err();
+        let err = store
+            .create_build(&[spec.id], "main", DecisionInput::human())
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
     }
 

@@ -598,6 +598,118 @@ pub struct OrchestratorSessionInfo {
     pub context_tokens: Option<i64>,
 }
 
+/// Who caused a state change.
+///
+/// The API is loopback and unauthenticated by design, so this is attribution,
+/// not authentication: the orchestrator proves itself by presenting a token
+/// the server minted for it, which stops it *accidentally* passing as the
+/// human but would not stop a local process forging either identity.
+///
+/// It is load-bearing anyway, and not only for the audit trail — the
+/// orchestrator must not be notified about its own actions, and that filter
+/// is only as correct as this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Actor {
+    /// The default: anything that did not prove otherwise.
+    #[default]
+    Human,
+    Orchestrator,
+}
+
+impl Actor {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Actor::Human => "human",
+            Actor::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Actor::Human),
+            "orchestrator" => Some(Actor::Orchestrator),
+            _ => None,
+        }
+    }
+}
+
+/// What a decision did. Narrower than [`SpecQueueStatus`] on purpose: only
+/// transitions someone *chose* are decisions, so `built` (assigned by a
+/// successful Builder run) is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionAction {
+    Approve,
+    NeedsRevision,
+    Reject,
+    RequestBuild,
+}
+
+impl DecisionAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecisionAction::Approve => "approve",
+            DecisionAction::NeedsRevision => "needs_revision",
+            DecisionAction::Reject => "reject",
+            DecisionAction::RequestBuild => "request_build",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(DecisionAction::Approve),
+            "needs_revision" => Some(DecisionAction::NeedsRevision),
+            "reject" => Some(DecisionAction::Reject),
+            "request_build" => Some(DecisionAction::RequestBuild),
+            _ => None,
+        }
+    }
+}
+
+/// One entry in the append-only decisions ledger.
+///
+/// The ledger indexes the conversation rather than replacing it: the
+/// orchestrator's reasoning stays prose in `orchestrator_messages`, and
+/// `transcript_seq` says where. That is the deal a long-lived accumulating
+/// session forces — a verdict that depended on the whole conversation cannot
+/// be replayed, so it has to be readable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub seq: i64,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub action: DecisionAction,
+    pub actor: Actor,
+    pub rationale: Option<String>,
+    pub evidence: Option<serde_json::Value>,
+    /// The orchestrator turn carrying the reasoning. `None` for human
+    /// verdicts, and briefly `None` for an orchestrator's own until the turn
+    /// it was made during finishes.
+    pub transcript_seq: Option<i64>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The decision behind a state change, supplied by whoever made it.
+///
+/// Threaded into the store alongside the change itself so the ledger row and
+/// the state it explains commit together — a decision that can go missing is
+/// not an audit trail.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct DecisionInput {
+    pub actor: Actor,
+    pub rationale: Option<String>,
+    pub evidence: Option<serde_json::Value>,
+}
+
+impl DecisionInput {
+    /// A human acting with no stated reason — the common case from the app,
+    /// and the default for anything that did not identify itself.
+    pub fn human() -> Self {
+        Self::default()
+    }
+}
+
 /// Why an orchestrator session stopped being the live one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

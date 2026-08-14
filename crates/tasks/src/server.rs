@@ -34,9 +34,9 @@ use tasks_api::http::{
 use crate::briefing::{self, Briefings};
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Build, BuildId, ChatRole, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project,
-    ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TranscriptLine,
+    Actor, Build, BuildId, ChatRole, Decision, DecisionInput, Mode, OrchestratorMessage,
+    OrchestratorSessionInfo, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine,
 };
 use crate::store::{Store, StoreError};
 
@@ -150,6 +150,7 @@ pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>
         .route("/spec-queue/reorder", post(reorder_spec_queue))
         .route("/spec-queue/{spec_id}/review", post(review_spec))
         .route("/builds", get(list_builds).post(request_build))
+        .route("/decisions", get(list_decisions))
         .route("/builds/{build_id}", get(get_build))
         .route(
             "/orchestrator/messages",
@@ -334,6 +335,41 @@ async fn list_spec_queue(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<
     Ok(Json(store.list_spec_queue().await?))
 }
 
+/// Header the orchestrator identifies itself with: `orchestrator <token>`,
+/// where the token was minted for it at boot and handed over in its
+/// environment. Everything else is the human.
+const ACTOR_HEADER: &str = "x-tasks-actor";
+
+fn actor_of(store: &Store, headers: &axum::http::HeaderMap) -> Actor {
+    store.resolve_actor(headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()))
+}
+
+/// The decisions ledger. `?spec=` / `?build=` narrow to one subject; the
+/// default is the whole ledger, newest first.
+async fn list_decisions(
+    State(store): State<Arc<Store>>,
+    Query(q): Query<DecisionQuery>,
+) -> ApiResult<Json<Vec<Decision>>> {
+    let subject = match (q.spec.as_deref(), q.build.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest("pass spec or build, not both".into()));
+        }
+        (Some(id), None) => Some(("spec", id)),
+        (None, Some(id)) => Some(("build", id)),
+        (None, None) => None,
+    };
+    Ok(Json(
+        store.decisions(subject, q.limit.unwrap_or(100)).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DecisionQuery {
+    spec: Option<String>,
+    build: Option<String>,
+    limit: Option<i64>,
+}
+
 async fn reorder_spec_queue(
     State(store): State<Arc<Store>>,
     Json(body): Json<ReorderSpecQueue>,
@@ -345,12 +381,20 @@ async fn reorder_spec_queue(
 async fn review_spec(
     State(store): State<Arc<Store>>,
     Path(spec_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ReviewRequest>,
 ) -> ApiResult<Json<SpecQueueItem>> {
     let status = SpecQueueStatus::from_str(&body.status)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown status: {}", body.status)))?;
     let id = SpecId::from_raw(spec_id);
-    let entry = store.review_spec(&id, status, body.feedback).await?;
+    let decision = DecisionInput {
+        actor: actor_of(&store, &headers),
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let entry = store
+        .review_spec(&id, status, body.feedback, decision)
+        .await?;
     let spec = store
         .get_spec(&id)
         .await?
@@ -368,10 +412,18 @@ async fn review_spec(
 /// `GET /builds/{id}`.
 async fn request_build(
     State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<BuildRequest>,
 ) -> ApiResult<(StatusCode, Json<BuildDetail>)> {
     let base_branch = body.base_branch.as_deref().unwrap_or("main");
-    let build = store.create_build(&body.spec_ids, base_branch).await?;
+    let decision = DecisionInput {
+        actor: actor_of(&store, &headers),
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let build = store
+        .create_build(&body.spec_ids, base_branch, decision)
+        .await?;
     let spec_ids = store.build_spec_ids(&build.id).await?;
     Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })))
 }

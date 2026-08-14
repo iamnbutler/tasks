@@ -8,7 +8,8 @@ use std::time::Duration;
 use chrono::Utc;
 use tasks::events::EventPayload;
 use tasks::models::{
-    ChatRole, GhState, Project, ProjectId, SessionEndReason, Task, TaskId, TaskState,
+    ChatRole, Complexity, GhState, Project, ProjectId, Session, SessionEndReason, SessionId,
+    SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
 use tasks::run::orchestrator_nudge_loop;
@@ -433,6 +434,149 @@ async fn a_usage_reporting_agent_advances_the_context_gauge() {
     // The reply itself is attributed to the session that produced it.
     let messages = store.orchestrator_messages_since(0).await.unwrap();
     assert_eq!(messages.last().unwrap().content, "ok");
+}
+
+/// Attribution over the wire: a caller presenting the minted token is the
+/// orchestrator and owes a rationale; everyone else is the human and owes
+/// nothing. Getting this wrong would misroute the self-nudge filter, so it is
+/// checked end to end rather than at the store.
+#[tokio::test]
+async fn the_actor_header_decides_who_a_write_belongs_to() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let spec = seed_pending_spec(&store).await;
+    let token = store.actor_token().to_string();
+
+    let app = tasks::server::router(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+    let review_url = format!("{base}/spec-queue/{}/review", spec.id);
+
+    // Presenting the token without a reason is refused.
+    let resp = http
+        .post(&review_url)
+        .header("X-Tasks-Actor", format!("orchestrator {token}"))
+        .json(&serde_json::json!({"status": "approved"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an autonomous verdict needs a rationale"
+    );
+
+    // A wrong token is simply the human, who owes no reason.
+    let resp = http
+        .post(&review_url)
+        .header("X-Tasks-Actor", "orchestrator not-the-token")
+        .json(&serde_json::json!({"status": "approved"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let decisions: Vec<serde_json::Value> = http
+        .get(format!("{base}/decisions?spec={}", spec.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 1, "the refused attempt left no trace");
+    assert_eq!(decisions[0]["actor"], "human");
+    assert_eq!(decisions[0]["action"], "approve");
+
+    // And with the real token plus a reason, the ledger says orchestrator.
+    let resp = http
+        .post(format!("{base}/builds"))
+        .header("X-Tasks-Actor", format!("orchestrator {token}"))
+        .json(&serde_json::json!({
+            "spec_ids": [spec.id],
+            "rationale": "only approved spec; base is clean",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let decisions: Vec<serde_json::Value> = http
+        .get(format!("{base}/decisions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(decisions[0]["actor"], "orchestrator");
+    assert_eq!(decisions[0]["action"], "request_build");
+    assert_eq!(
+        decisions[0]["rationale"],
+        "only approved spec; base is clean"
+    );
+}
+
+/// A spec sitting in `pending_review`, with the task and session behind it.
+async fn seed_pending_spec(store: &Store) -> Spec {
+    let now = Utc::now();
+    let project = Project {
+        id: ProjectId::new(),
+        repo_owner: "test".into(),
+        repo_name: "repo".into(),
+        added_at: now,
+    };
+    store.insert_project(&project).await.unwrap();
+    let task = Task {
+        id: TaskId::new(),
+        project_id: project.id.clone(),
+        gh_issue_number: 1,
+        title: "a task".into(),
+        body: "body".into(),
+        labels: vec![],
+        gh_state: GhState::Open,
+        state: TaskState::InReview,
+        priority: 0,
+        manual_rank: None,
+        dispatch_attempts: 0,
+        ingested_at: now,
+        updated_at: now,
+    };
+    store.insert_task(&task).await.unwrap();
+    let session = Session {
+        id: SessionId::new(),
+        task_id: task.id.clone(),
+        vm_id: None,
+        branch: "scout/1".into(),
+        status: SessionStatus::ScoutSucceeded,
+        started_at: now,
+        completed_at: Some(now),
+        exit_reason: None,
+        usage: None,
+    };
+    store.insert_session(&session).await.unwrap();
+    let spec = Spec {
+        id: SpecId::new(),
+        session_id: session.id,
+        task_id: task.id,
+        content: "## Spec\n\nDo the thing.".into(),
+        complexity: Complexity::Simple,
+        files_touched: vec![],
+        created_at: now,
+    };
+    store.insert_spec(&spec).await.unwrap();
+    store
+        .upsert_spec_queue_entry(&SpecQueueEntry {
+            spec_id: spec.id.clone(),
+            status: SpecQueueStatus::PendingReview,
+            rank: None,
+            approved_at: None,
+            feedback: None,
+            blocking_dependencies: vec![],
+        })
+        .await
+        .unwrap();
+    spec
 }
 
 /// The watermark contract: input appended while the agent is mid-turn (its

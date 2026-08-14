@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    BuildStatus, OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
+    Actor, BuildStatus, OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
 use crate::store::{Store, StoreError};
 
@@ -244,6 +244,11 @@ impl Orchestrator {
             // The server's token stays the server's. When the agent talks to
             // GitHub it authenticates as itself (gh keychain auth).
             .env_remove("GITHUB_TOKEN")
+            // How the agent proves its writes are its own. Passed through the
+            // environment rather than argv (world-readable via `ps`) or the
+            // prompt (persisted), and referenced by name in the standing
+            // instructions so the value itself never lands in the transcript.
+            .env("TASKS_ACTOR_TOKEN", self.store.actor_token())
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
             .kill_on_drop(true)
@@ -438,15 +443,24 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
         | EventPayload::ModeChanged { .. } => true,
         // Success is conveyed by the SpecCreated that accompanies it.
         EventPayload::SessionCompleted { status, .. } => *status == SessionStatus::ScoutFailed,
-        // Human review verdicts. PendingReview duplicates SpecCreated and
-        // Built duplicates BuildCompleted.
-        EventPayload::SpecQueueStatusChanged { to, .. } => matches!(
-            to,
-            SpecQueueStatus::Approved
-                | SpecQueueStatus::NeedsRevision
-                | SpecQueueStatus::Rejected
-                | SpecQueueStatus::Blocked
-        ),
+        // Review verdicts — but never the orchestrator's own. Being told
+        // what you just did is not news: it costs a turn to acknowledge, and
+        // worse, invites second-guessing a verdict already rendered. This is
+        // the one filter that gets more load-bearing as autonomy grows, since
+        // every autonomous verdict would otherwise echo straight back.
+        // PendingReview duplicates SpecCreated; Built duplicates
+        // BuildCompleted; Blocked carries no actor (the attempt cap decided)
+        // and is exactly when someone should hear about it.
+        EventPayload::SpecQueueStatusChanged { to, actor, .. } => {
+            *actor != Some(Actor::Orchestrator)
+                && matches!(
+                    to,
+                    SpecQueueStatus::Approved
+                        | SpecQueueStatus::NeedsRevision
+                        | SpecQueueStatus::Rejected
+                        | SpecQueueStatus::Blocked
+                )
+        }
         _ => false,
     }
 }
@@ -579,15 +593,27 @@ fn system_prompt(port: u16) -> String {
          around it.\n\n\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
-         state and the activity log honest. Endpoints:\n\
+         state and the activity log honest.\n\n\
+         Identify yourself on every write: pass \
+         `-H \"X-Tasks-Actor: orchestrator $TASKS_ACTOR_TOKEN\"` (the token is \
+         in your environment — never print it). Writes carrying it are \
+         recorded as yours, which is what keeps you from being notified about \
+         your own actions, and what makes the decisions ledger worth reading. \
+         Every write you make that way must also carry a `rationale` — the \
+         server rejects one without it, because a decision nobody can review \
+         afterwards is not one you were trusted to make.\n\n\
+         Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
-         - POST /spec-queue/{{id}}/review {{\"status\":\"approved|needs_revision|rejected\",\"feedback\"}} \
+         - POST /spec-queue/{{id}}/review \
+           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}} \
            — ONLY when the human has explicitly given a verdict\n\
-         - POST /builds {{\"spec_ids\":[...]}} — batch approved specs into one \
-           Builder run (serial; one at a time)\n\
+         - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
+           specs into one Builder run (serial; one at a time)\n\
+         - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
+           and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
          - GET /events?since=N — the activity log, newest last; your best \
            source for \"what happened\". Without ?since it returns only the \
@@ -642,10 +668,21 @@ mod tests {
             spec_id: spec(),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         }));
         assert!(nudge_worthy(&EventPayload::ModeChanged {
             from: Mode::Play,
             to: Mode::Pause,
+        }));
+        // Running out of build attempts has no actor — nobody chose it — and
+        // is precisely when someone should hear about it.
+        assert!(nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: Some(SpecQueueStatus::Approved),
+            to: SpecQueueStatus::Blocked,
+            actor: None,
+            decision_seq: None,
         }));
 
         // Feedback loops, duplicates, and noise:
@@ -662,6 +699,19 @@ mod tests {
             spec_id: spec(),
             from: None,
             to: SpecQueueStatus::PendingReview, // SpecCreated covers it
+            actor: None,
+            decision_seq: None,
+        }));
+        // The echo: the orchestrator's own verdict coming back at it. Being
+        // told what you just did costs a turn and invites second-guessing a
+        // decision already made — and under autonomy every verdict would do
+        // this.
+        assert!(!nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: Some(SpecQueueStatus::PendingReview),
+            to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Orchestrator),
+            decision_seq: Some(7),
         }));
         assert!(!nudge_worthy(&EventPayload::BuildStarted {
             build_id: BuildId::from_raw("build_1"),
