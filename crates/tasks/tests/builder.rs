@@ -36,7 +36,7 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stub_builder_agent_path,
+    make_fixture_repo, spawn_vm_pool, stub_builder_agent_path, workspace_bin,
     write_builder_supervisor_wrapper,
 };
 
@@ -149,7 +149,7 @@ struct Harness {
 
 async fn harness(agent_cmd: &str) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
-    let supervisor_bin = cargo_build("builder-supervisor").await;
+    let supervisor_bin = workspace_bin("builder-supervisor").await;
     let wrapper =
         write_builder_supervisor_wrapper(tmp.path(), &supervisor_bin, agent_cmd, tmp.path()).await;
     let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;

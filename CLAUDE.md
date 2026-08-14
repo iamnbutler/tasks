@@ -52,6 +52,13 @@ implementation.
 
 - Tests use real processes and real SQLite (in-memory or tempfile). No mocks.
   HTTP tests bind real servers on `127.0.0.1:0`.
+- **Tests exec binaries; they never build them.** A `cargo build` inside a
+  test blocks on the build-directory lock, so a background `cargo check`
+  (rust-analyzer, another terminal) stalls the whole suite. For a binary in
+  the test's own package use `env!("CARGO_BIN_EXE_<name>")`; for one from
+  another package use `common::workspace_bin(name)` in `crates/tasks/tests`,
+  which reads `TASKS_TEST_BIN_DIR` (exported by `make test`) and only builds
+  as a memoized fallback.
 - Errors: `thiserror` enums per module. Logging: `tracing`.
 - Rust edition 2024, `cargo fmt` + `cargo clippy --workspace --all-targets`
   clean before committing.
@@ -61,7 +68,7 @@ implementation.
 ```sh
 cargo run -p tasks -- serve            # poller + scout dispatcher + HTTP API
 cargo run -p tasks -- add-project owner/repo
-cargo test --workspace
+make test                              # see Tests below
 ```
 
 `serve` runs the Diamond 1 loop (`crates/tasks/src/run.rs`): GitHub intake,
@@ -70,6 +77,28 @@ scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates
 Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
 polling, an unreachable vm-pool disables dispatch and reconnects periodically,
 and the API stays up either way.
+
+### Tests
+
+```sh
+make test        # prebuild + cargo-nextest (default profile) + doctests
+make test-ci     # same, --profile ci: no fail-fast, retries, quieter slow threshold
+make test-cargo  # plain `cargo test --workspace`, no prerequisites
+```
+
+`make test` needs `cargo install cargo-nextest --locked`; `make test-cargo` is
+the fallback if you don't have it, and is also what keeps the build-on-demand
+path in `workspace_bin` honest. Both nextest targets prebuild the supervisor
+binaries and export `TASKS_TEST_BIN_DIR` so no test shells out to cargo.
+
+Two gotchas worth knowing. **nextest does not run doctests** — silently, with
+no skip count in its summary — so both targets end with `cargo test --doc
+--workspace`; anything else that runs the suite must too. And two scout
+timeout tests leave a stray child holding the output pipe, so they report as
+LEAK; that is expected (`leak-timeout` is `result = "pass"`), and the profile
+deliberately keeps the period short rather than waiting the leak out, which
+would cost seconds and hide a real leak. Tuning lives in
+`.config/nextest.toml`.
 
 Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`). Config via
 env / `.env`:

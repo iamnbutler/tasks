@@ -31,7 +31,7 @@ use tasks::store::Store;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until,
+    make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until, workspace_bin,
     write_supervisor_wrapper,
 };
 
@@ -682,7 +682,7 @@ async fn dispatch_harness_with_agent(
     Config,
     Arc<Service<SupervisorRuntime, TasksProtocol>>,
 ) {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let clone_root = tmp.path().join("repos");
     make_fixture_repo(&clone_root.join("test"), "repo.git").await;
