@@ -355,9 +355,30 @@ impl Client {
 
     // --- orchestrator ---
 
-    /// Messages with `seq > since`.
+    /// Turns after `since`, oldest first — the incremental catch-up a client
+    /// should use once it has opened the conversation. The server caps the
+    /// page, so a client far behind calls this until it comes back short.
     pub fn orchestrator_messages(&self, since: i64) -> Result<Vec<OrchestratorMessage>> {
         self.get_json("/orchestrator/messages", &[("since", since.to_string())])
+    }
+
+    /// The newest `limit` turns — how a client opens the conversation
+    /// without dragging the whole history across.
+    pub fn orchestrator_messages_latest(&self, limit: i64) -> Result<Vec<OrchestratorMessage>> {
+        self.get_json("/orchestrator/messages", &[("limit", limit.to_string())])
+    }
+
+    /// The `limit` turns immediately before `before`, oldest first — paging
+    /// backwards through history that is kept but not held in memory.
+    pub fn orchestrator_messages_before(
+        &self,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<OrchestratorMessage>> {
+        self.get_json(
+            "/orchestrator/messages",
+            &[("before", before.to_string()), ("limit", limit.to_string())],
+        )
     }
 
     /// 202: the reply arrives asynchronously — watch `orchestrator_message`

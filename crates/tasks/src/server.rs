@@ -38,7 +38,7 @@ use crate::models::{
     OrchestratorSessionInfo, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem,
     SpecQueueStatus, Task, TaskId, TranscriptLine,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError};
 
 /// How many events `/events` returns when the caller doesn't ask for a count.
 const DEFAULT_EVENT_LIMIT: i64 = 100;
@@ -449,8 +449,12 @@ async fn get_build(
 
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
-    #[serde(default)]
-    since: i64,
+    /// Incremental catch-up: turns after this seq, oldest first.
+    since: Option<i64>,
+    /// Page backwards: the turns immediately before this seq.
+    before: Option<i64>,
+    /// Page size, clamped to [`MESSAGE_PAGE_MAX`].
+    limit: Option<i64>,
 }
 
 /// 202: the message is queued; the orchestrator loop answers it. Watch
@@ -469,11 +473,30 @@ async fn send_orchestrator_message(
     Ok((StatusCode::ACCEPTED, Json(message)))
 }
 
+/// The conversation, always bounded.
+///
+/// `?since=` catches a client up, `?before=` pages backwards, and neither
+/// opens on the newest window. The history is kept forever — it is the read
+/// that is capped, because the app refetches on every event and an unbounded
+/// one made bytes grow as messages x events.
 async fn list_orchestrator_messages(
     State(store): State<Arc<Store>>,
     Query(q): Query<MessagesQuery>,
 ) -> ApiResult<Json<Vec<OrchestratorMessage>>> {
-    Ok(Json(store.orchestrator_messages_since(q.since).await?))
+    if q.since.is_some() && q.before.is_some() {
+        return Err(ApiError::BadRequest(
+            "pass since or before, not both".into(),
+        ));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(MESSAGE_PAGE_DEFAULT)
+        .clamp(1, MESSAGE_PAGE_MAX);
+    let messages = match q.since {
+        Some(since) => store.orchestrator_messages_since(since, limit).await?,
+        None => store.orchestrator_messages_window(q.before, limit).await?,
+    };
+    Ok(Json(messages))
 }
 
 /// The orchestrator's CC session, for interactive resume

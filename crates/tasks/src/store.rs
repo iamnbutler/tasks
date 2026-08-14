@@ -25,6 +25,17 @@ use crate::models::{
 /// Mirrors `MAX_DISPATCH_ATTEMPTS` for scouts, one diamond along.
 const MAX_BUILD_ATTEMPTS: i64 = 3;
 
+/// Input turns one tick folds into a single prompt. Truncation here is safe
+/// (see [`Store::unanswered_orchestrator_messages`]) and keeps a burst from
+/// spending the context window on a wall of pipeline notices.
+const MAX_TURNS_PER_TICK: i64 = 50;
+
+/// Conversation page size when a client does not ask for one.
+pub const MESSAGE_PAGE_DEFAULT: i64 = 200;
+/// Ceiling on a client-requested page. The conversation is kept forever; what
+/// must stay bounded is any single read of it.
+pub const MESSAGE_PAGE_MAX: i64 = 1000;
+
 /// Result of upserting an external record into our domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpsertOutcome<T> {
@@ -1979,31 +1990,51 @@ impl Store {
         self.orchestrator_feed_tx.subscribe()
     }
 
-    /// Messages with `seq > since`, oldest first.
+    /// Messages with `seq > since`, oldest first, at most `limit`.
+    ///
+    /// The cap is not optional. This read had none, and the app refetches
+    /// from seq 0 on every SSE event — so bytes grew as messages × events,
+    /// and autonomy raises both terms at once.
     pub async fn orchestrator_messages_since(
         &self,
         since: i64,
+        limit: i64,
     ) -> Result<Vec<OrchestratorMessage>, StoreError> {
         let rows = sqlx::query(
-            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq",
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq LIMIT ?",
         )
         .bind(since)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let role_raw: String = row.try_get("role")?;
-                Ok(OrchestratorMessage {
-                    seq: row.try_get("seq")?,
-                    role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
-                        column: "role",
-                        value: role_raw,
-                    })?,
-                    content: row.try_get("content")?,
-                    created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(orchestrator_message_row).collect()
+    }
+
+    /// The newest `limit` messages (optionally those before `before`),
+    /// returned oldest-first so they render in order.
+    ///
+    /// This is how a client opens the conversation and how it pages
+    /// backwards through it. The history itself is never trimmed — the table
+    /// is the durable record and storage is cheap; it is the *read* that has
+    /// to be bounded.
+    pub async fn orchestrator_messages_window(
+        &self,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE (?1 IS NULL OR seq < ?1) ORDER BY seq DESC LIMIT ?2",
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages: Vec<_> = rows
+            .into_iter()
+            .map(orchestrator_message_row)
+            .collect::<Result<_, _>>()?;
+        messages.reverse();
+        Ok(messages)
     }
 
     /// The input turns (user + event) the orchestrator has not answered yet:
@@ -2020,8 +2051,12 @@ impl Store {
             .fetch_one(&self.pool)
             .await?
             .try_get("answered_through")?;
+        // Capping the prompt cannot lose input: the tick advances the
+        // watermark only to the highest seq it actually included, so anything
+        // truncated here is still unanswered on the next pass. A backlog
+        // drains in batches instead of building one enormous prompt.
         Ok(self
-            .orchestrator_messages_since(watermark)
+            .orchestrator_messages_since(watermark, MAX_TURNS_PER_TICK)
             .await?
             .into_iter()
             .filter(|m| m.role.is_input())
@@ -2786,6 +2821,21 @@ async fn insert_decision(
     .execute(&mut **tx)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+fn orchestrator_message_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<OrchestratorMessage, StoreError> {
+    let role_raw: String = row.try_get("role")?;
+    Ok(OrchestratorMessage {
+        seq: row.try_get("seq")?,
+        role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
+            column: "role",
+            value: role_raw,
+        })?,
+        content: row.try_get("content")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+    })
 }
 
 fn decision_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Decision, StoreError> {
@@ -3881,6 +3931,55 @@ mod tests {
         (task, spec)
     }
 
+    /// The conversation is kept forever; every read of it is bounded. A
+    /// client opens on the newest window, pages backwards through history,
+    /// and catches up incrementally — never refetching what it already has.
+    #[tokio::test]
+    async fn the_conversation_is_read_in_bounded_pages() {
+        let store = Store::open_in_memory().await.unwrap();
+        for i in 0..10 {
+            store
+                .append_orchestrator_message(ChatRole::User, &format!("turn {i}"))
+                .await
+                .unwrap();
+        }
+
+        // Opening shows the newest, in reading order.
+        let window = store.orchestrator_messages_window(None, 3).await.unwrap();
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn 7", "turn 8", "turn 9"]
+        );
+
+        // Paging backwards from its first seq gives the previous page.
+        let older = store
+            .orchestrator_messages_window(Some(window[0].seq), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["turn 4", "turn 5", "turn 6"]
+        );
+
+        // Catching up returns only what is new, and stays capped.
+        let newest = window.last().unwrap().seq;
+        assert!(
+            store
+                .orchestrator_messages_since(newest, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.orchestrator_messages_since(0, 4).await.unwrap().len(),
+            4,
+            "a client far behind drains in pages rather than one huge read"
+        );
+    }
+
     /// The bug this whole mechanism exists for: a spec whose nudge was
     /// consumed by a turn that then failed is invisible forever. Derived
     /// obligations mean the state itself keeps pointing at it, and only a
@@ -4063,7 +4162,7 @@ mod tests {
             .unwrap();
         let ledger = store.decisions(None, 10).await.unwrap();
         let reply_seq = store
-            .orchestrator_messages_since(0)
+            .orchestrator_messages_since(0, 1000)
             .await
             .unwrap()
             .last()

@@ -75,7 +75,7 @@ async fn a_tick_answers_pending_turns_and_resumes_the_same_session() {
         .unwrap();
     assert!(orch.tick().await.unwrap());
 
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[1].role, ChatRole::Assistant);
     assert!(
@@ -175,7 +175,7 @@ async fn a_stream_json_agent_feeds_deltas_and_tools_and_lands_the_result() {
         .unwrap();
     assert!(orch.tick().await.unwrap());
 
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(
         messages[1].content, "All good.",
         "reply is the result record's text, not raw stream-json"
@@ -259,7 +259,7 @@ async fn an_agent_failure_lands_in_the_chat_and_settles_the_tick() {
         .unwrap();
     assert!(orch.tick().await.unwrap());
 
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.len(), 2);
     assert!(messages[1].content.contains("orchestrator error"));
     // Settled — a second tick does nothing.
@@ -316,7 +316,7 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
     assert!(orch.tick().await.unwrap());
 
     // The chat carries the seam, between the question and the fresh reply.
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     let seam = messages
         .iter()
         .find(|m| m.role == ChatRole::System)
@@ -432,7 +432,7 @@ async fn a_usage_reporting_agent_advances_the_context_gauge() {
         "input + cache_read + cache_creation, not input_tokens alone"
     );
     // The reply itself is attributed to the session that produced it.
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.last().unwrap().content, "ok");
 }
 
@@ -541,7 +541,7 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
     // The obligation lands as a turn.
     let turn = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let messages = store.orchestrator_messages_since(0).await.unwrap();
+            let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
             if let Some(m) = messages.iter().find(|m| m.role == ChatRole::Event) {
                 return m.clone();
             }
@@ -576,7 +576,7 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
     // And it is not repeated while the reminder interval holds.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let event_turns = store
-        .orchestrator_messages_since(0)
+        .orchestrator_messages_since(0, 1000)
         .await
         .unwrap()
         .into_iter()
@@ -775,7 +775,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let event_turns = loop {
         let turns: Vec<_> = store
-            .orchestrator_messages_since(0)
+            .orchestrator_messages_since(0, 1000)
             .await
             .unwrap()
             .into_iter()
@@ -786,7 +786,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
             // turn before asserting there is exactly one.
             tokio::time::sleep(Duration::from_millis(300)).await;
             break store
-                .orchestrator_messages_since(0)
+                .orchestrator_messages_since(0, 1000)
                 .await
                 .unwrap()
                 .into_iter()
@@ -817,7 +817,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
 
     // The tick answers the nudge like any other input.
     assert!(orch.tick().await.unwrap());
-    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     let last = messages.last().unwrap();
     assert_eq!(last.role, ChatRole::Assistant);
     assert!(
