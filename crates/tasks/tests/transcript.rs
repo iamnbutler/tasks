@@ -137,7 +137,7 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
 
     // Transcripts are a separate channel: nothing from them may reach the
     // event log, which every client refetches on.
-    let events = store.events_since(0).await.unwrap();
+    let events = store.all_events().await.unwrap();
     assert!(
         !events
             .iter()

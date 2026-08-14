@@ -1318,7 +1318,7 @@ mod tests {
         assert_eq!(state_of(&backlog.id).await.state, TaskState::Backlog);
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
