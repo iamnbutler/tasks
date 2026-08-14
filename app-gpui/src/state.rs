@@ -22,6 +22,10 @@ use tasks_client::{Client, ClientError, EventStreamItem};
 /// holds the whole log (the Swift app did, to reconstruct joins the API now
 /// serves directly).
 const ACTIVITY_LIMIT: i64 = 200;
+/// Turns loaded when the conversation is first opened. Everything after that
+/// arrives incrementally, so the pane keeps growing with the conversation —
+/// this bounds the cold start, not the history.
+const CHAT_WINDOW: i64 = 200;
 
 pub struct AppState {
     client: Client,
@@ -70,7 +74,11 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn fetch(client: &Client) -> Self {
+    /// `chat_since` is the newest turn already held: the conversation is
+    /// fetched incrementally from there, because a refresh runs on every
+    /// SSE event and refetching the whole history each time made transfer
+    /// grow as messages x events. `None` opens on the newest window.
+    fn fetch(client: &Client, chat_since: Option<i64>) -> Self {
         let mut snapshot = Self::default();
         let mut error: Option<String> = None;
         fn take<T>(
@@ -105,7 +113,10 @@ impl Snapshot {
         take(
             &mut snapshot.orchestrator_messages,
             &mut error,
-            client.orchestrator_messages(0),
+            match chat_since {
+                Some(since) => client.orchestrator_messages(since),
+                None => client.orchestrator_messages_latest(CHAT_WINDOW),
+            },
         );
         take(&mut snapshot.mode, &mut error, client.mode());
         snapshot.error = error;
@@ -196,9 +207,12 @@ impl AppState {
         }
         self.refreshing = true;
         let client = self.client.clone();
+        // Only what we do not already have. The first pass opens on a
+        // window; every later one asks for turns after the newest held.
+        let chat_since = self.orchestrator_messages.last().map(|m| m.seq);
         let fetch = cx
             .background_executor()
-            .spawn(async move { Snapshot::fetch(&client) });
+            .spawn(async move { Snapshot::fetch(&client, chat_since) });
         cx.spawn(async move |this, cx| {
             let snapshot = fetch.await;
             this.update(cx, |state, cx| state.apply(snapshot, cx)).ok();
@@ -220,9 +234,18 @@ impl AppState {
             spec_queue,
             builds,
             activity,
-            briefings,
-            orchestrator_messages
+            briefings
         );
+        // Appended, not replaced: a refresh carries only the new turns, and
+        // history stays in the pane rather than being refetched to sit there.
+        if let Some(messages) = snapshot.orchestrator_messages {
+            match self.orchestrator_messages.last().map(|m| m.seq) {
+                None => self.orchestrator_messages = messages,
+                Some(newest) => self
+                    .orchestrator_messages
+                    .extend(messages.into_iter().filter(|m| m.seq > newest)),
+            }
+        }
         if let Some(mode) = snapshot.mode {
             self.mode = Some(mode);
         }

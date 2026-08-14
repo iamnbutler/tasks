@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::models::GhState;
+use crate::models::{CloseReason, GhState};
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com/graphql";
 const DEFAULT_REST_BASE_URL: &str = "https://api.github.com";
@@ -106,6 +106,28 @@ pub struct IssueCloseInfo {
     pub state_reason: Option<String>,
 }
 
+/// How a pull request looks right now, queried live and never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrState {
+    pub state: GhState,
+    pub merged: bool,
+    /// GitHub's mergeability verdict, or `None` while it is still computing
+    /// one. Unknown is not the same as conflicted.
+    pub mergeable: Option<bool>,
+}
+
+impl PrState {
+    /// One word for a brief line: what a reader needs to know about this PR.
+    pub fn label(&self) -> &'static str {
+        match (self.state, self.merged, self.mergeable) {
+            (_, true, _) => "merged",
+            (GhState::Closed, false, _) => "closed unmerged",
+            (GhState::Open, false, Some(false)) => "open, conflicts",
+            (GhState::Open, false, _) => "open",
+        }
+    }
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
     token: String,
@@ -179,6 +201,87 @@ impl GitHubClient {
         body.get("number")
             .and_then(|n| n.as_u64())
             .ok_or_else(|| GhError::Shape("pull request response missing `number`".into()))
+    }
+
+    /// File an issue. Returns its number — the identifier we may persist;
+    /// everything else about the issue stays GitHub's and is read back by the
+    /// poller like any other issue.
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        name: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<u64, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/issues", self.rest_base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "title": title,
+                "body": body,
+                "labels": labels,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!("create issue: {status}: {msg}")));
+        }
+        body.get("number")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GhError::Shape("issue response missing `number`".into()))
+    }
+
+    /// Close an issue, stating why.
+    ///
+    /// The write happens here; the *fact* that the issue is closed is still
+    /// learned from the poller reading GitHub's open set, exactly as for an
+    /// issue a human closed in the browser. Nothing is marked closed locally
+    /// in anticipation — write path and read path stay separate.
+    pub async fn close_issue(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        reason: CloseReason,
+    ) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "state": "closed",
+                "state_reason": reason.as_str(),
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)")
+                .to_string();
+            return Err(GhError::Rest(format!(
+                "close issue {number}: {status}: {msg}"
+            )));
+        }
+        Ok(())
     }
 
     /// Fetch all OPEN issues for a repository, paging as needed.
@@ -288,6 +391,96 @@ impl GitHubClient {
             "fetched issue close info"
         );
         Ok(out)
+    }
+
+    /// How a pull request looks right now. Read at decision time, returned to
+    /// the caller, and never persisted — `pr_number` is the only part of a PR
+    /// this system owns.
+    pub async fn pull_request_state(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<PrState, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls/{number}", self.rest_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!(
+                "pull request {number}: {status}: {msg}"
+            )));
+        }
+        Ok(PrState {
+            state: match body.get("state").and_then(|s| s.as_str()) {
+                Some("open") => GhState::Open,
+                _ => GhState::Closed,
+            },
+            merged: body
+                .get("merged")
+                .and_then(|m| m.as_bool())
+                .unwrap_or(false),
+            // Null while GitHub is still computing the merge commit; that is
+            // "unknown", not "conflicted", and the distinction matters to a
+            // reader deciding whether to act.
+            mergeable: body.get("mergeable").and_then(|m| m.as_bool()),
+        })
+    }
+
+    /// Names of the entries directly inside `path` on `git_ref`.
+    ///
+    /// A missing directory is an empty listing rather than an error: the
+    /// caller asks in order to compare against what is already there, and
+    /// "nothing is there" is a perfectly good answer.
+    pub async fn list_directory(
+        &self,
+        owner: &str,
+        name: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Vec<String>, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/contents/{path}?ref={git_ref}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!("contents {path}: {status}: {msg}")));
+        }
+        // A file rather than a directory answers with an object, not an array.
+        let Some(entries) = body.as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+            .map(str::to_owned)
+            .collect())
     }
 
     async fn fetch_page(

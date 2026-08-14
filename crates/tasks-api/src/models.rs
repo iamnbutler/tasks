@@ -491,6 +491,14 @@ pub enum ChatRole {
     /// (spec landed, build finished, tasks ingested). Counts as unanswered
     /// input like a user turn — the orchestrator reacts to it proactively.
     Event,
+    /// A server-written note about the conversation itself — currently only
+    /// the seam where one Claude Code session ended and another began.
+    ///
+    /// Deliberately *not* input: the durable transcript looks continuous
+    /// across a boundary the agent no longer remembers, so the reader needs
+    /// to see it, but making the orchestrator answer "you just restarted"
+    /// would spend a turn acknowledging its own amnesia.
+    System,
 }
 
 impl ChatRole {
@@ -499,6 +507,7 @@ impl ChatRole {
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
             ChatRole::Event => "event",
+            ChatRole::System => "system",
         }
     }
 
@@ -507,8 +516,16 @@ impl ChatRole {
             "user" => Some(ChatRole::User),
             "assistant" => Some(ChatRole::Assistant),
             "event" => Some(ChatRole::Event),
+            "system" => Some(ChatRole::System),
             _ => None,
         }
+    }
+
+    /// Whether a turn with this role is *input* the orchestrator owes a reply
+    /// to. The tick condition is built on this, so it is the one place the
+    /// answer lives.
+    pub fn is_input(&self) -> bool {
+        matches!(self, ChatRole::User | ChatRole::Event)
     }
 }
 
@@ -575,6 +592,380 @@ pub struct OrchestratorSessionInfo {
     /// A human holds an interactive checkout (fresh heartbeat); headless
     /// ticks are suspended while true.
     pub checked_out: bool,
+    /// Size of the current session's context as of its last turn, in tokens.
+    /// `None` before the session has taken a turn, or when the agent isn't
+    /// emitting stream-json usage (plain-text agents, test stubs).
+    pub context_tokens: Option<i64>,
+}
+
+/// Something the pipeline is owed, computed from its state.
+///
+/// Obligations are never stored: they exist for exactly as long as the state
+/// that implies them, and disappear when the work is done rather than when
+/// someone is told about it. That is the difference between a notification
+/// and an obligation, and it is why a dropped tick can no longer strand a
+/// spec — nothing was consumed, so the next pass sees the same thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Obligation {
+    pub kind: ObligationKind,
+    /// The spec, build, or task the obligation is about.
+    pub subject_id: String,
+    /// One human-readable line, for the turn that surfaces it.
+    pub summary: String,
+    /// When the state implying this obligation came about.
+    pub since: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObligationKind {
+    /// A spec is waiting for a verdict and no decision has been recorded.
+    ReviewSpec,
+    /// A batch burned through its build attempts and stopped. Nothing will
+    /// pick it up again until someone decides what to do.
+    UnblockSpec,
+}
+
+impl ObligationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ObligationKind::ReviewSpec => "review_spec",
+            ObligationKind::UnblockSpec => "unblock_spec",
+        }
+    }
+}
+
+/// Who caused a state change.
+///
+/// The API is loopback and unauthenticated by design, so this is attribution,
+/// not authentication: the orchestrator proves itself by presenting a token
+/// the server minted for it, which stops it *accidentally* passing as the
+/// human but would not stop a local process forging either identity.
+///
+/// It is load-bearing anyway, and not only for the audit trail — the
+/// orchestrator must not be notified about its own actions, and that filter
+/// is only as correct as this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Actor {
+    /// The default: anything that did not prove otherwise.
+    #[default]
+    Human,
+    Orchestrator,
+}
+
+impl Actor {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Actor::Human => "human",
+            Actor::Orchestrator => "orchestrator",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(Actor::Human),
+            "orchestrator" => Some(Actor::Orchestrator),
+            _ => None,
+        }
+    }
+}
+
+/// What a decision did. Narrower than [`SpecQueueStatus`] on purpose: only
+/// transitions someone *chose* are decisions, so `built` (assigned by a
+/// successful Builder run) is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionAction {
+    Approve,
+    NeedsRevision,
+    Reject,
+    RequestBuild,
+    /// A task was moved from the backlog into the queue, where a Scout will
+    /// pick it up. Recorded because it is where spend begins.
+    QueueTask,
+    /// An issue was filed — work that would otherwise have been lost.
+    CaptureWork,
+    /// An issue was closed: finished, or judged no longer worth doing.
+    RetireWork,
+}
+
+impl DecisionAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecisionAction::Approve => "approve",
+            DecisionAction::NeedsRevision => "needs_revision",
+            DecisionAction::Reject => "reject",
+            DecisionAction::RequestBuild => "request_build",
+            DecisionAction::QueueTask => "queue_task",
+            DecisionAction::CaptureWork => "capture_work",
+            DecisionAction::RetireWork => "retire_work",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(DecisionAction::Approve),
+            "needs_revision" => Some(DecisionAction::NeedsRevision),
+            "reject" => Some(DecisionAction::Reject),
+            "request_build" => Some(DecisionAction::RequestBuild),
+            "queue_task" => Some(DecisionAction::QueueTask),
+            "capture_work" => Some(DecisionAction::CaptureWork),
+            "retire_work" => Some(DecisionAction::RetireWork),
+            _ => None,
+        }
+    }
+}
+
+/// Something the orchestrator can do without being asked.
+///
+/// Deliberately five separate switches rather than one autonomy dial. The
+/// axis that matters is reversibility, and it does not line up with how
+/// dramatic a capability sounds: filing an issue is undone by closing it,
+/// while auto-approving a spec costs a Builder run and a PR someone has to
+/// read. `dispatch_builds` live with `auto_review_specs` in shadow is a
+/// coherent and probably desirable state that a single play/pause switch
+/// cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// File an issue for discovered work.
+    CaptureWork,
+    /// Close an issue: done, or no longer worth doing.
+    RetireWork,
+    /// Move a task from backlog into the queue, where a Scout will pick it up.
+    QueueTasks,
+    /// Batch approved specs into a Builder run.
+    DispatchBuilds,
+    /// Render a review verdict on a spec.
+    AutoReviewSpecs,
+}
+
+impl Capability {
+    /// Every capability, in the order the charter is meant to be flipped:
+    /// additive and trivially reversible first, irreversible-ish last.
+    pub const ALL: [Capability; 5] = [
+        Capability::CaptureWork,
+        Capability::RetireWork,
+        Capability::QueueTasks,
+        Capability::DispatchBuilds,
+        Capability::AutoReviewSpecs,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "capture_work",
+            Capability::RetireWork => "retire_work",
+            Capability::QueueTasks => "queue_tasks",
+            Capability::DispatchBuilds => "dispatch_builds",
+            Capability::AutoReviewSpecs => "auto_review_specs",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "capture_work" => Some(Capability::CaptureWork),
+            "retire_work" => Some(Capability::RetireWork),
+            "queue_tasks" => Some(Capability::QueueTasks),
+            "dispatch_builds" => Some(Capability::DispatchBuilds),
+            "auto_review_specs" => Some(Capability::AutoReviewSpecs),
+            _ => None,
+        }
+    }
+
+    /// One line for the generated authority section of the system prompt.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "file issues for work you discover",
+            Capability::RetireWork => "close issues that are done or no longer worth doing",
+            Capability::QueueTasks => "move tasks from the backlog into the queue",
+            Capability::DispatchBuilds => "batch approved specs into Builder runs",
+            Capability::AutoReviewSpecs => "render review verdicts on specs",
+        }
+    }
+}
+
+/// How much of a capability the orchestrator actually has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharterLevel {
+    /// Refused at the endpoint. The default, and where everything starts.
+    #[default]
+    Off,
+    /// The call is accepted, the decision is recorded, and nothing happens.
+    ///
+    /// Narrated, not silent: the orchestrator explains its reasoning in the
+    /// conversation as it always does, and the ledger keeps the verdict it
+    /// would have rendered. After a week the question "did shadow agree with
+    /// me?" is a query, which is what makes flipping a capability an evidence
+    /// decision rather than a nerve one.
+    Shadow,
+    /// Applied.
+    Live,
+}
+
+impl CharterLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CharterLevel::Off => "off",
+            CharterLevel::Shadow => "shadow",
+            CharterLevel::Live => "live",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(CharterLevel::Off),
+            "shadow" => Some(CharterLevel::Shadow),
+            "live" => Some(CharterLevel::Live),
+            _ => None,
+        }
+    }
+}
+
+/// One capability's standing, as the charter records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharterEntry {
+    pub capability: Capability,
+    pub level: CharterLevel,
+    /// Actions of this kind the orchestrator may take per day. `None` is
+    /// uncapped — fine for reversible capabilities, and the reason this is a
+    /// cap rather than a gate: it protects against a runaway loop, not
+    /// against a bad judgment.
+    pub daily_limit: Option<i64>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Why work is being retired, mapped onto GitHub's `state_reason`.
+///
+/// The two are not variations on a theme. "Completed" has a cheap evidence
+/// standard — a merged PR or a named commit, queried live — and the
+/// orchestrator has already been wrong by asserting opened PRs as shipped
+/// work. "Not planned" is a recalibration judgment with no such standard, and
+/// it is the more valuable of the two precisely because nobody ever gets round
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+impl CloseReason {
+    /// GitHub's `state_reason` spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloseReason::Completed => "completed",
+            CloseReason::NotPlanned => "not_planned",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "completed" => Some(CloseReason::Completed),
+            "not_planned" => Some(CloseReason::NotPlanned),
+            _ => None,
+        }
+    }
+}
+
+/// One entry in the append-only decisions ledger.
+///
+/// The ledger indexes the conversation rather than replacing it: the
+/// orchestrator's reasoning stays prose in `orchestrator_messages`, and
+/// `transcript_seq` says where. That is the deal a long-lived accumulating
+/// session forces — a verdict that depended on the whole conversation cannot
+/// be replayed, so it has to be readable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub seq: i64,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub action: DecisionAction,
+    pub actor: Actor,
+    pub rationale: Option<String>,
+    pub evidence: Option<serde_json::Value>,
+    /// The orchestrator turn carrying the reasoning. `None` for human
+    /// verdicts, and briefly `None` for an orchestrator's own until the turn
+    /// it was made during finishes.
+    pub transcript_seq: Option<i64>,
+    /// Whether the state actually changed. `false` for a shadow decision: the
+    /// judgment is real and recorded, the effect never happened. Reading the
+    /// two as one would turn an evaluation into a history.
+    #[serde(default = "crate::models::default_true")]
+    pub enforced: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+/// The decision behind a state change, supplied by whoever made it.
+///
+/// Threaded into the store alongside the change itself so the ledger row and
+/// the state it explains commit together — a decision that can go missing is
+/// not an audit trail.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct DecisionInput {
+    pub actor: Actor,
+    pub rationale: Option<String>,
+    pub evidence: Option<serde_json::Value>,
+}
+
+impl DecisionInput {
+    /// A human acting with no stated reason — the common case from the app,
+    /// and the default for anything that did not identify itself.
+    pub fn human() -> Self {
+        Self::default()
+    }
+}
+
+/// Why an orchestrator session stopped being the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndReason {
+    /// `--resume` failed and the context was lost involuntarily. The chat
+    /// projection survives; the agent's memory does not.
+    ResumeFailed,
+    /// Deliberately retired — context pressure, seeded forward on our terms.
+    Rotated,
+}
+
+impl SessionEndReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionEndReason::ResumeFailed => "resume_failed",
+            SessionEndReason::Rotated => "rotated",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "resume_failed" => Some(SessionEndReason::ResumeFailed),
+            "rotated" => Some(SessionEndReason::Rotated),
+            _ => None,
+        }
+    }
+}
+
+/// One Claude Code session the orchestrator has lived in. The ledger these
+/// rows form is what makes context loss legible: the chat projection is
+/// continuous across boundaries the agent itself does not survive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorSession {
+    pub cc_session_id: String,
+    pub started_at: DateTime<Utc>,
+    /// `None` for the live session.
+    pub ended_at: Option<DateTime<Utc>>,
+    pub end_reason: Option<SessionEndReason>,
+    /// Context size at this session's last turn — the reading a rotation
+    /// threshold is compared against.
+    pub last_context_tokens: Option<i64>,
+    /// The continuation note this session was seeded into its successor
+    /// with. Unwritten until owned rotation lands.
+    pub summary: Option<String>,
+    pub summary_generated_at: Option<DateTime<Utc>>,
 }
 
 /// One moment of an in-flight orchestrator tick, streamed over

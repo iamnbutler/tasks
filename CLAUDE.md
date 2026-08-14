@@ -14,12 +14,29 @@ implementation.
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
   through the server, never through agents.
-- **Manual queue is human-authoritative, and queue membership is explicit.**
+- **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
   explicitly queued tasks (`POST /tasks/{id}/queue` or `/scout`) reach a
   Scout, and picked-up work stays picked up (failures and `needs_revision`
-  return to `queued`, not `backlog`).
+  return to `queued`, not `backlog`). The invariant is a *cost guard*: adding
+  a repo with 11,000 issues must not bill 11,000 Scout runs. It is not a
+  human-judgment gate, so deliberate per-task queueing by an accountable actor
+  is fine — the orchestrator may do it when `queue_tasks` is live in the
+  charter, bounded by that capability's daily budget.
+- **What the orchestrator may do lives in `orchestrator_charter`, never in a
+  prompt.** Five independently switchable capabilities (`capture_work`,
+  `retire_work`, `queue_tasks`, `dispatch_builds`, `auto_review_specs`), each
+  `off` | `shadow` | `live`, human-writable only. The system prompt's
+  authority section is *generated* from those rows every turn and the server
+  enforces the same rows on the endpoints — one statement of authority, and
+  not one a long conversation can talk itself out of. `shadow` is a server
+  behaviour, not an instruction: the call is accepted, the decision is
+  recorded with `enforced = 0`, and nothing is applied. Ships as
+  `queue_tasks`/`dispatch_builds`/`capture_work` live (the first two already
+  worked; the third replaces an ungoverned `gh` write) and
+  `auto_review_specs`/`retire_work` shadow. The human is never gated — this
+  governs autonomy, not the owner.
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
