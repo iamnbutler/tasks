@@ -20,3 +20,6 @@ DerivedData/
 images/base/supervisor
 images/scout/scout-supervisor
 images/builder/builder-supervisor
+
+# local scratch dumps of the API (curl output)
+/.*.json
