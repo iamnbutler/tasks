@@ -1,4 +1,7 @@
 mod components;
+mod sections;
+mod state;
+mod time;
 mod workspace;
 
 use gpui::{
