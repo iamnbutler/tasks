@@ -1,6 +1,6 @@
 # Writing a Tasks client
 
-How a UI (SwiftUI app, TUI, CLI, Claude Code session) should talk to the
+How a UI (gpui app, TUI, CLI, Claude Code session) should talk to the
 Tasks server. The HTTP API on `127.0.0.1:4800` (`TASKS_SERVER_PORT`) is the
 only interface — clients never touch SQLite, GitHub, or vm-pool directly.
 
