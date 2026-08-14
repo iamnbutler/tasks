@@ -18,7 +18,8 @@ use tasks_protocol::TasksProtocol;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stream_json_agent_path, write_supervisor_wrapper,
+    make_fixture_repo, spawn_vm_pool, stream_json_agent_path, workspace_bin,
+    write_supervisor_wrapper,
 };
 
 async fn insert_project_and_task(store: &Store) -> (Project, Task) {
@@ -53,7 +54,7 @@ async fn insert_project_and_task(store: &Store) -> (Project, Task) {
 /// final `result` record is costed onto the session.
 #[tokio::test]
 async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());
@@ -155,7 +156,7 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
 /// a client that refetches on `session_completed` must not find a truncated one.
 #[tokio::test]
 async fn the_transcript_is_complete_before_the_session_completes() {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
     let repo_url = format!("file://{}", repo.display());

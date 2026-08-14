@@ -1,0 +1,29 @@
+# cargo-nextest configuration. `make test` runs the default profile,
+# `make test-ci` runs `ci`. Profiles inherit from `default`, so `ci` only
+# states its differences.
+
+[profile.default]
+# 5s is the *visibility* threshold, not the kill threshold: it is low enough
+# that the suite's slow tail (the scout timeout tests) gets named on every
+# run, which is the point of `final-status-level = "slow"`. A "safe" 30s
+# period makes that setting a silent no-op on this suite.
+#
+# The kill threshold is 12 x 5s = 60s, ~5x the slowest legitimate test.
+slow-timeout = { period = "5s", terminate-after = 12 }
+
+# Two tests leak a child process (a stray `sleep`) that keeps the output pipe
+# open after the test itself has finished. A period long enough to outlast it
+# would both cost that wall-clock time and silently reclassify a real leak as
+# a pass, so keep it short: 1s is 10x the nextest default (enough that a
+# benign late-closing child is not flagged) and leaves the known leaks visible.
+leak-timeout = { period = "1s", result = "pass" }
+
+# Name the slow tests at the end of every run.
+final-status-level = "slow"
+
+[profile.ci]
+# CI wants the whole picture from one run, and tolerance for the flakiness
+# that comes with spawning real processes.
+fail-fast = false
+retries = 2
+slow-timeout = { period = "15s", terminate-after = 4 }

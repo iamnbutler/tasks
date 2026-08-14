@@ -21,31 +21,11 @@ use vm_pool_protocol::{VmCommand, VmEvent};
 type TVmCommand = VmCommand<TasksProtocol>;
 type TVmEvent = VmEvent<TasksProtocol>;
 
-async fn build_supervisor() -> PathBuf {
-    let output = Command::new("cargo")
-        .args(["build", "-p", "builder-supervisor", "--message-format=json"])
-        .output()
-        .await
-        .expect("cargo build");
-    assert!(
-        output.status.success(),
-        "builder-supervisor build failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find_map(|msg| {
-            let reason = msg.get("reason")?.as_str()?;
-            let target_name = msg.get("target")?.get("name")?.as_str()?;
-            if reason == "compiler-artifact" && target_name == "builder-supervisor" {
-                Some(PathBuf::from(msg.get("executable")?.as_str()?))
-            } else {
-                None
-            }
-        })
-        .expect("builder-supervisor binary path in cargo output")
+/// Path to the builder-supervisor binary. Cargo builds it for us as a
+/// dependency of this test target and hands over the path — tests exec
+/// binaries, they never build them.
+fn supervisor_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_builder-supervisor"))
 }
 
 async fn run_git(dir: &Path, args: &[&str]) -> String {
@@ -164,7 +144,7 @@ async fn drain(sup: &mut SupervisorProc) -> BuildEvent {
 
 #[tokio::test]
 async fn a_build_ships_a_bundle_that_reconstructs_the_branch() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_bin();
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path()).await;
     let repo_url = format!("file://{}", repo.display());
@@ -235,7 +215,7 @@ async fn a_build_ships_a_bundle_that_reconstructs_the_branch() {
 /// base` is the Builder's missing-SPEC.md.
 #[tokio::test]
 async fn an_empty_branch_is_a_failure() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_bin();
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path()).await;
     let repo_url = format!("file://{}", repo.display());
@@ -257,7 +237,7 @@ async fn an_empty_branch_is_a_failure() {
 
 #[tokio::test]
 async fn a_clone_error_fails_before_started() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_bin();
     let tmp = tempfile::tempdir().unwrap();
 
     let mut sup = SupervisorProc::spawn(&binary, "true", tmp.path()).await;
@@ -279,7 +259,7 @@ async fn a_clone_error_fails_before_started() {
 /// is refused with a terminal Failed, never acted on.
 #[tokio::test]
 async fn a_scout_command_is_refused_not_acted_on() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_bin();
     let tmp = tempfile::tempdir().unwrap();
 
     let mut sup = SupervisorProc::spawn(&binary, "true", tmp.path()).await;
