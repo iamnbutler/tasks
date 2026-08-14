@@ -9,31 +9,7 @@ BUILDER_BIN := target/$(LINUX_TARGET)/release/builder-supervisor
 VM_SUPERVISOR_BIN := target/$(LINUX_TARGET)/release/supervisor
 
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
-        vm-supervisor-linux image-base image-agent image-scout image-builder images \
-        app run
-
-# Version identity stamped into the app (shown in About Tasks): version is
-# 0.1.<commit count>, build is the short SHA, "-dirty" when uncommitted
-# changes were present. Answers "is what I'm running fresh?" at a glance.
-APP_VERSION := 0.1.$(shell git rev-list --count HEAD)
-APP_COMMIT := $(shell git rev-parse --short HEAD)$(shell git diff --quiet 2>/dev/null || echo "-dirty")
-
-# Build the mac app and install it to ~/Applications, replacing any existing
-# copy. Uses xcodebuild's own answer for where the product landed, so this
-# shares DerivedData (and its build cache) with Xcode.
-app:
-	xcodebuild -project app/Tasks.xcodeproj -scheme Tasks -configuration Debug -quiet \
-		MARKETING_VERSION=$(APP_VERSION) CURRENT_PROJECT_VERSION=$(APP_COMMIT) build
-	@built="$$(xcodebuild -project app/Tasks.xcodeproj -scheme Tasks -configuration Debug -showBuildSettings 2>/dev/null | awk '/ BUILT_PRODUCTS_DIR =/{print $$3; exit}')"; \
-	mkdir -p ~/Applications; \
-	rm -rf ~/Applications/Tasks.app; \
-	ditto "$$built/Tasks.app" ~/Applications/Tasks.app; \
-	echo "installed ~/Applications/Tasks.app"
-
-# Build, install, and (re)launch.
-run: app
-	@pkill -x Tasks 2>/dev/null || true
-	open ~/Applications/Tasks.app
+        vm-supervisor-linux image-base image-agent image-scout image-builder images
 
 check-toolchain:
 	@which $(LINUX_TARGET)-gcc >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }
