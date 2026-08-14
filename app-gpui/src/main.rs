@@ -1,4 +1,5 @@
 mod components;
+mod issue_composer;
 mod sections;
 mod state;
 mod time;
@@ -10,7 +11,7 @@ use gpui::{
 };
 use gpuikit::input::bind_input_keys;
 
-use workspace::{ToggleLeftDock, ToggleRightDock, Workspace};
+use workspace::{NewIssue, ToggleLeftDock, ToggleRightDock, Workspace};
 
 fn main() {
     Application::with_platform(gpui_platform::current_platform(false))
@@ -25,6 +26,7 @@ fn main() {
                 KeyBinding::new("cmd-b", ToggleLeftDock, ws),
                 KeyBinding::new("cmd-r", ToggleRightDock, ws),
                 KeyBinding::new("cmd-alt-b", ToggleRightDock, ws),
+                KeyBinding::new("cmd-n", NewIssue, ws),
             ]);
 
             cx.open_window(

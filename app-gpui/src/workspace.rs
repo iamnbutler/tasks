@@ -12,7 +12,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     actions, div, list, px, Context, Div, Entity, Focusable, ListAlignment, ListState, MouseButton,
-    Window,
+    Window, WindowHandle,
 };
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
@@ -24,11 +24,12 @@ use tasks_client::api::models::{
 };
 
 use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
+use crate::issue_composer::{self, IssueComposer};
 use crate::state::AppState;
 
 const FONT: &str = "Menlo";
 
-actions!(workspace, [ToggleLeftDock, ToggleRightDock]);
+actions!(workspace, [ToggleLeftDock, ToggleRightDock, NewIssue]);
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Section {
@@ -73,6 +74,12 @@ pub struct Workspace {
     /// Review-form composer in the inspector — feedback for a re-scout or a
     /// question for the orchestrator, depending on which button submits it.
     pub(crate) review_input: Entity<InputState>,
+    /// Issue-draft composer shown in the cmd-n window. Owned here, not by
+    /// the window, so a dismissed draft survives to the next cmd-n.
+    pub(crate) issue_input: Entity<InputState>,
+    /// The cmd-n "new issue" window, if it has been opened. May be stale
+    /// (window closed) — probed with `update` before re-fronting.
+    issue_window: Option<WindowHandle<IssueComposer>>,
     /// Scroll state for the chat list — bottom-aligned, so the view opens
     /// at the newest message and follows new ones.
     chat_list: ListState,
@@ -141,6 +148,13 @@ impl Workspace {
             }
         })
         .detach();
+        // The issue composer window subscribes to this itself — its submit
+        // and dismiss both live in that window's context.
+        let issue_input = cx.new(|cx| {
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("Describe the issue…", cx);
+            state
+        });
         window.focus(&input.focus_handle(cx), cx);
 
         Self {
@@ -154,6 +168,8 @@ impl Workspace {
             selected_task: None,
             input,
             review_input,
+            issue_input,
+            issue_window: None,
             chat_list: ListState::new(0, ListAlignment::Bottom, px(1024.)),
             chat_len: 0,
         }
@@ -241,6 +257,42 @@ impl Workspace {
         self.selected_task = None;
         self.right_sidebar.open = false;
         cx.notify();
+    }
+
+    /// Cmd-n: open the issue composer window, or re-front it if it's
+    /// already up (one drafting surface, like Zed's quick capture — not a
+    /// window per draft).
+    fn open_issue_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.issue_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let app_state = self.app_state.clone();
+        let input = self.issue_input.clone();
+        let workspace = cx.entity().downgrade();
+        // Opening a window re-enters the platform — deferred off this
+        // window's event dispatch, the way Zed opens its windows.
+        cx.spawn(async move |this, cx| {
+            let handle = cx
+                .update(|cx| {
+                    let options = issue_composer::window_options(cx);
+                    cx.open_window(options, |window, cx| {
+                        cx.new(|cx| IssueComposer::new(app_state, input, workspace, window, cx))
+                    })
+                })
+                .ok();
+            if let Some(handle) = handle {
+                this.update(cx, |this: &mut Workspace, _| {
+                    this.issue_window = Some(handle)
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     // Chrome
@@ -621,6 +673,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleRightDock, _window, cx| {
                 this.toggle_sidebar(SidebarSide::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewIssue, _window, cx| {
+                this.open_issue_window(cx);
             }))
             // Drag-resize tracking: the handle only starts the drag; from
             // then on the pointer outruns it, so movement is tracked here at
