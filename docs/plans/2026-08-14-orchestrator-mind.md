@@ -353,6 +353,31 @@ attention at the right moment.
 This is the direct answer to intuition-per-token, and it converts "caught it
 because it happened to remember" into "caught it because it was told".
 
+**As built** (`crates/tasks/src/brief.rs`). Briefs ride the turns where a
+decision is made — a spec landing, an obligation coming due — so their cost
+tracks decisions rather than time, and every line in one block is read from a
+single snapshot so the facts agree with each other.
+
+Two of the plan's items shipped in a different form than written:
+
+- *Sequence-number clashes* generalize the migration case: a filename whose
+  numeric prefix is already taken, checked both against the base branch (one
+  contents call per affected directory) and against other live specs. The
+  second half is the one file-overlap cannot see — `0009_a.sql` and
+  `0009_b.sql` share no path.
+- *Base staleness was not built*, because nothing records the commit a spec was
+  written against. `builds.base_sha` exists; specs have no equivalent, and
+  inventing one from the scout session's timestamp would be a guess dressed as
+  a fact. Recording a base SHA on the spec is the prerequisite; until then the
+  brief does not claim to know.
+
+One property turned out to be load-bearing and is worth stating: **silence in a
+brief means unchecked, not fine.** A clean spec gets an explicit "nothing
+found" line, a GitHub failure gets a line saying what was skipped, and the
+system prompt says the same thing. The failure mode this avoids is the
+orchestrator learning to read a short brief as an all-clear, which would make
+the feature actively worse than foraging.
+
 ### 6. Charter + shadow capabilities
 
 `orchestrator_charter`: one row per capability with level `off` | `shadow` |

@@ -47,6 +47,7 @@ use tracing::{info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::VmConfig;
 
+use crate::brief::Brief;
 use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
@@ -397,12 +398,14 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     ));
     let nudge = tokio::spawn(orchestrator_nudge_loop(
         store.clone(),
+        config.clone(),
         NUDGE_DEBOUNCE,
         NUDGE_MAX_WAIT,
         shutdown_rx.clone(),
     ));
     let obligations = tokio::spawn(obligation_loop(
         store.clone(),
+        config.clone(),
         OBLIGATION_GRACE,
         OBLIGATION_REMINDER,
         OBLIGATION_TICK,
@@ -960,12 +963,16 @@ pub async fn orchestrator_loop(
 /// production passes [`NUDGE_DEBOUNCE`]/[`NUDGE_MAX_WAIT`].
 pub async fn orchestrator_nudge_loop(
     store: Arc<Store>,
+    config: Config,
     debounce: Duration,
     max_wait: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
+    // Built once: the brief's GitHub half degrades to a stated omission when
+    // there is no token, rather than disabling the loop.
+    let github = config.github_client();
     let mut events = store.subscribe_events();
     loop {
         let first = tokio::select! {
@@ -1001,7 +1008,8 @@ pub async fn orchestrator_nudge_loop(
             }
         }
 
-        let content = orchestrator::format_nudge(&store, &batch).await;
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let content = orchestrator::format_nudge(&store, &brief, &batch).await;
         info!(events = batch.len(), "nudging orchestrator");
         if let Err(e) = store
             .append_orchestrator_message(ChatRole::Event, &content)
@@ -1037,6 +1045,7 @@ const OBLIGATION_TICK: Duration = Duration::from_secs(60);
 /// waiting since Tuesday.
 pub async fn obligation_loop(
     store: Arc<Store>,
+    config: Config,
     grace: Duration,
     reminder: Duration,
     tick: Duration,
@@ -1044,6 +1053,7 @@ pub async fn obligation_loop(
 ) {
     let grace = chrono::Duration::from_std(grace).expect("grace fits");
     let interval = chrono::Duration::from_std(reminder).expect("interval fits");
+    let github = config.github_client();
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
@@ -1072,7 +1082,8 @@ pub async fn obligation_loop(
         }
 
         info!(obligations = due.len(), "surfacing standing obligations");
-        let content = orchestrator::format_obligations(&due);
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let content = orchestrator::format_obligations(&store, &brief, &due).await;
         if let Err(e) = store
             .append_orchestrator_message(ChatRole::Event, &content)
             .await

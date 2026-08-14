@@ -140,6 +140,37 @@ pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'\''"#))
 }
 
+/// A [`Config`] with nothing external wired up — no GitHub token, no vm-pool
+/// worth talking to. Enough for the loops that only read `github_client()`
+/// (which is then `None`, so briefs stay DB-derived) and `scout_base_branch`.
+/// Tests that need real dispatch build their own; see `tests/run.rs`.
+pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
+    tasks::run::Config {
+        data_dir: data_dir.to_path_buf(),
+        port: 0,
+        poll_interval: Duration::from_secs(3600),
+        scout_max_concurrent: 1,
+        scout_image: "agent:v1".into(),
+        scout_timeout: Duration::from_secs(300),
+        vm_pool_socket: data_dir.join("vm-pool.sock"),
+        github_token: None,
+        github_api_url: None,
+        intake: tasks::github::IntakeFilter::All,
+        clone_url_base: "https://github.com".into(),
+        scout_base_branch: "main".into(),
+        vm_config: Default::default(),
+        builder_image: "builder:v1".into(),
+        builder_timeout: Duration::from_secs(300),
+        github_rest_api_url: None,
+        orchestrator_cmd: "true".into(),
+        orchestrator_timeout: Duration::from_secs(60),
+        orchestrator_workdir: None,
+        briefing_cmd: "true".into(),
+        briefing_ttl: Duration::from_secs(900),
+        briefing_timeout: Duration::from_secs(60),
+    }
+}
+
 pub fn stub_agent_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

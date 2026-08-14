@@ -36,10 +36,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::brief::Brief;
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Actor, BuildStatus, Obligation, OrchestratorFeedEvent, SessionEndReason, SessionStatus,
-    SpecQueueStatus,
+    Actor, BuildStatus, Obligation, ObligationKind, OrchestratorFeedEvent, SessionEndReason,
+    SessionStatus, SpecQueueStatus,
 };
 use crate::store::{Store, StoreError};
 
@@ -469,9 +470,15 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
 /// Render a batch of nudge-worthy events as one `event` turn. Events are
 /// identifier-only, so detail comes from store lookups at format time; a row
 /// that has since vanished degrades to its id rather than failing the nudge.
-pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
+///
+/// A spec landing carries a computed brief, because this is the turn on which
+/// it will actually be judged and the facts are cheaper to hand over than to
+/// go and find. The obligation path briefs too, but that path is the safety
+/// net — briefing only there would leave the common case foraging.
+pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) -> String {
     let mut lines = Vec::new();
     let mut ingested = 0usize;
+    let mut briefed_specs: Vec<crate::models::SpecId> = Vec::new();
     for event in events {
         match &event.payload {
             EventPayload::TaskIngested { task_id, .. } => {
@@ -480,10 +487,13 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
             }
             EventPayload::SpecCreated {
                 spec_id, task_id, ..
-            } => lines.push(format!(
-                "- Spec landed for review: {} ({spec_id})",
-                task_ref(store, task_id).await
-            )),
+            } => {
+                lines.push(format!(
+                    "- Spec landed for review: {} ({spec_id})",
+                    task_ref(store, task_id).await
+                ));
+                briefed_specs.push(spec_id.clone());
+            }
             EventPayload::SessionCompleted {
                 session_id,
                 task_id,
@@ -535,10 +545,24 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
     if ingested > 1 {
         lines.push(format!("({ingested} tasks ingested in this batch)"));
     }
-    format!(
+    let notification = format!(
         "[pipeline] Automated notification — not the human. Recent activity:\n{}",
         lines.join("\n")
-    )
+    );
+    let mut sections = Vec::new();
+    for spec_id in &briefed_specs {
+        sections.push((
+            spec_heading(store, spec_id).await,
+            spec_facts(brief, spec_id).await,
+        ));
+    }
+    if !briefed_specs.is_empty() {
+        sections.push(("In flight:".to_string(), pipeline_facts(brief).await));
+    }
+    match Brief::render(&sections) {
+        Some(block) => format!("{notification}\n\n{block}"),
+        None => notification,
+    }
 }
 
 /// Render standing obligations as one `event` turn.
@@ -547,17 +571,81 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
 /// differently and the orchestrator should treat them differently: a nudge is
 /// news that happened once, an obligation is work still owed and will keep
 /// coming back until it is discharged by an actual decision.
-pub fn format_obligations(obligations: &[Obligation]) -> String {
+pub async fn format_obligations(
+    store: &Store,
+    brief: &Brief<'_>,
+    obligations: &[Obligation],
+) -> String {
     let lines: Vec<String> = obligations
         .iter()
         .map(|o| format!("- {}", o.summary))
         .collect();
-    format!(
+    let header = format!(
         "[pipeline] Standing obligations — not notifications. These are \
          derived from pipeline state and will keep appearing until they are \
          resolved, so act on them rather than acknowledging them:\n{}",
         lines.join("\n")
-    )
+    );
+
+    let mut sections = Vec::new();
+    for obligation in obligations {
+        let spec_id = crate::models::SpecId::from_raw(&obligation.subject_id);
+        let facts = match obligation.kind {
+            ObligationKind::ReviewSpec => spec_facts(brief, &spec_id).await,
+            ObligationKind::UnblockSpec => match brief.for_blocked_spec(&spec_id).await {
+                Ok(facts) => facts,
+                Err(e) => vec![brief_unavailable(&e)],
+            },
+        };
+        sections.push((spec_heading(store, &spec_id).await, facts));
+    }
+    if !obligations.is_empty() {
+        sections.push(("In flight:".to_string(), pipeline_facts(brief).await));
+    }
+    match Brief::render(&sections) {
+        Some(block) => format!("{header}\n\n{block}"),
+        None => header,
+    }
+}
+
+/// `On #812 "title" (spec_…):` — what the facts beneath it are about.
+async fn spec_heading(store: &Store, spec_id: &crate::models::SpecId) -> String {
+    match store.get_spec(spec_id).await {
+        Ok(Some(spec)) => format!("On {} ({spec_id}):", task_ref(store, &spec.task_id).await),
+        _ => format!("On {spec_id}:"),
+    }
+}
+
+/// Facts for a spec under judgment, never silently empty.
+///
+/// A brief that finds nothing and a brief that never ran produce the same
+/// absence of lines, and those mean opposite things to a reader deciding how
+/// hard to look. So a clean result says it is clean.
+async fn spec_facts(brief: &Brief<'_>, spec_id: &crate::models::SpecId) -> Vec<String> {
+    match brief.for_spec(spec_id).await {
+        Ok(facts) if facts.is_empty() => vec![
+            "no file overlap with other live specs or recent builds, no numbering \
+             clashes, and no prior verdicts on this task"
+                .into(),
+        ],
+        Ok(facts) => facts,
+        Err(e) => vec![brief_unavailable(&e)],
+    }
+}
+
+async fn pipeline_facts(brief: &Brief<'_>) -> Vec<String> {
+    match brief.pipeline().await {
+        Ok(facts) => facts,
+        Err(e) => vec![brief_unavailable(&e)],
+    }
+}
+
+/// A brief that could not be computed says so. Failing loudly here is cheap —
+/// the turn still happens — and failing quietly would teach the orchestrator
+/// to read silence as safety.
+fn brief_unavailable(e: &StoreError) -> String {
+    warn!(error = %e, "computing brief failed");
+    format!("the server could not compute these facts ({e}) — check by hand")
 }
 
 /// `#<issue> "<title>"` for a task, degrading to the raw id if it's gone.
@@ -586,6 +674,13 @@ fn system_prompt(port: u16) -> String {
          obligation* is work the pipeline is still owed, derived from its \
          state — it will keep reappearing until it is actually resolved, so \
          acknowledging one changes nothing. Act on those.\n\n\
+         Both may carry a \"[brief]\" block: lookups the server ran for you — \
+         file overlap with other live specs and recent builds, sequence-number \
+         clashes against the base branch, PR state, prior verdicts on the same \
+         task. Those are facts, not a verdict, and they are deliberately narrow: \
+         a brief tells you what it checked, and everything it does not mention \
+         is unchecked rather than fine. Trust it instead of re-deriving it, and \
+         spend the reading you saved on the spec itself.\n\n\
          On a [pipeline] turn:\n\
          - Spec landed → read it (GET /specs/{{id}}) and review it \
            ADVERSARIALLY: your value is finding what's wrong, not affirming \
@@ -640,13 +735,14 @@ fn system_prompt(port: u16) -> String {
          - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
            and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
-         - GET /events?since=N — the activity log, newest last; your best \
-           source for \"what happened\". Without ?since it returns only the \
-           newest 100 — page from since=1 before counting anything. Retired \
-           tasks are hidden from GET /tasks but reachable at GET /tasks/{{id}}. \
-           Nothing on the wire counts merged PRs — pull_request_opened fires \
-           at open; check merge state via gh, or say \"opened\", not \
-           \"shipped\"\n\
+         - GET /events?since=N — the activity log, newest last. Reach for it \
+           when you need history the brief does not cover, and page a bounded \
+           window: it is a log, not a state snapshot, and re-deriving the \
+           present from it costs far more of your context than asking for the \
+           present directly. Retired tasks are hidden from GET /tasks but \
+           reachable at GET /tasks/{{id}}. Nothing on the wire counts merged \
+           PRs — pull_request_opened fires at open; check merge state via gh, \
+           or say \"opened\", not \"shipped\"\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
          Rules:\n\
@@ -762,5 +858,13 @@ mod tests {
         assert!(p.contains("why are we doing"));
         assert!(p.contains("Never switch branches"));
         assert!(p.contains("verdict they explicitly stated"));
+        // The brief replaces foraging, so the prompt has to introduce it —
+        // including the part that keeps it honest: silence is unchecked, not
+        // clean.
+        assert!(p.contains("[brief]"));
+        assert!(p.contains("unchecked rather than fine"));
+        // And it must no longer send the agent to re-derive the present from
+        // the whole event log, which is what the brief exists to replace.
+        assert!(!p.contains("since=1"));
     }
 }

@@ -106,6 +106,28 @@ pub struct IssueCloseInfo {
     pub state_reason: Option<String>,
 }
 
+/// How a pull request looks right now, queried live and never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrState {
+    pub state: GhState,
+    pub merged: bool,
+    /// GitHub's mergeability verdict, or `None` while it is still computing
+    /// one. Unknown is not the same as conflicted.
+    pub mergeable: Option<bool>,
+}
+
+impl PrState {
+    /// One word for a brief line: what a reader needs to know about this PR.
+    pub fn label(&self) -> &'static str {
+        match (self.state, self.merged, self.mergeable) {
+            (_, true, _) => "merged",
+            (GhState::Closed, false, _) => "closed unmerged",
+            (GhState::Open, false, Some(false)) => "open, conflicts",
+            (GhState::Open, false, _) => "open",
+        }
+    }
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
     token: String,
@@ -288,6 +310,96 @@ impl GitHubClient {
             "fetched issue close info"
         );
         Ok(out)
+    }
+
+    /// How a pull request looks right now. Read at decision time, returned to
+    /// the caller, and never persisted — `pr_number` is the only part of a PR
+    /// this system owns.
+    pub async fn pull_request_state(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<PrState, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls/{number}", self.rest_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!(
+                "pull request {number}: {status}: {msg}"
+            )));
+        }
+        Ok(PrState {
+            state: match body.get("state").and_then(|s| s.as_str()) {
+                Some("open") => GhState::Open,
+                _ => GhState::Closed,
+            },
+            merged: body
+                .get("merged")
+                .and_then(|m| m.as_bool())
+                .unwrap_or(false),
+            // Null while GitHub is still computing the merge commit; that is
+            // "unknown", not "conflicted", and the distinction matters to a
+            // reader deciding whether to act.
+            mergeable: body.get("mergeable").and_then(|m| m.as_bool()),
+        })
+    }
+
+    /// Names of the entries directly inside `path` on `git_ref`.
+    ///
+    /// A missing directory is an empty listing rather than an error: the
+    /// caller asks in order to compare against what is already there, and
+    /// "nothing is there" is a perfectly good answer.
+    pub async fn list_directory(
+        &self,
+        owner: &str,
+        name: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Vec<String>, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/contents/{path}?ref={git_ref}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!("contents {path}: {status}: {msg}")));
+        }
+        // A file rather than a directory answers with an object, not an array.
+        let Some(entries) = body.as_array() else {
+            return Ok(Vec::new());
+        };
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+            .map(str::to_owned)
+            .collect())
     }
 
     async fn fetch_page(

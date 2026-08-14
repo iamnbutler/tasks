@@ -532,6 +532,7 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let loop_handle = tokio::spawn(tasks::run::obligation_loop(
         store.clone(),
+        common::offline_config(tmp.path()),
         Duration::from_millis(0),  // nothing is "fresh" here
         Duration::from_secs(3600), // ...and one mention is enough
         Duration::from_millis(20),
@@ -711,6 +712,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let nudge_loop = tokio::spawn(orchestrator_nudge_loop(
         store.clone(),
+        common::offline_config(tmp.path()),
         Duration::from_millis(100),
         Duration::from_secs(2),
         shutdown_rx,
