@@ -78,6 +78,15 @@ impl Workspace {
                     EventPayload::OrchestratorMessage { role, .. } => {
                         format!("Orchestrator: {} turn", role.as_str())
                     }
+                    EventPayload::OrchestratorSessionStarted {
+                        replacing, reason, ..
+                    } => match (replacing, reason) {
+                        (Some(_), Some(reason)) => format!(
+                            "Orchestrator session restarted ({})",
+                            reason.as_str().replace('_', " ")
+                        ),
+                        _ => "Orchestrator session started".to_string(),
+                    },
                     EventPayload::ModeChanged { from, to } => {
                         format!("Mode {} → {}", from.as_str(), to.as_str())
                     }

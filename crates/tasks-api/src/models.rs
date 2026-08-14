@@ -491,6 +491,14 @@ pub enum ChatRole {
     /// (spec landed, build finished, tasks ingested). Counts as unanswered
     /// input like a user turn — the orchestrator reacts to it proactively.
     Event,
+    /// A server-written note about the conversation itself — currently only
+    /// the seam where one Claude Code session ended and another began.
+    ///
+    /// Deliberately *not* input: the durable transcript looks continuous
+    /// across a boundary the agent no longer remembers, so the reader needs
+    /// to see it, but making the orchestrator answer "you just restarted"
+    /// would spend a turn acknowledging its own amnesia.
+    System,
 }
 
 impl ChatRole {
@@ -499,6 +507,7 @@ impl ChatRole {
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
             ChatRole::Event => "event",
+            ChatRole::System => "system",
         }
     }
 
@@ -507,8 +516,16 @@ impl ChatRole {
             "user" => Some(ChatRole::User),
             "assistant" => Some(ChatRole::Assistant),
             "event" => Some(ChatRole::Event),
+            "system" => Some(ChatRole::System),
             _ => None,
         }
+    }
+
+    /// Whether a turn with this role is *input* the orchestrator owes a reply
+    /// to. The tick condition is built on this, so it is the one place the
+    /// answer lives.
+    pub fn is_input(&self) -> bool {
+        matches!(self, ChatRole::User | ChatRole::Event)
     }
 }
 
@@ -575,6 +592,57 @@ pub struct OrchestratorSessionInfo {
     /// A human holds an interactive checkout (fresh heartbeat); headless
     /// ticks are suspended while true.
     pub checked_out: bool,
+    /// Size of the current session's context as of its last turn, in tokens.
+    /// `None` before the session has taken a turn, or when the agent isn't
+    /// emitting stream-json usage (plain-text agents, test stubs).
+    pub context_tokens: Option<i64>,
+}
+
+/// Why an orchestrator session stopped being the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndReason {
+    /// `--resume` failed and the context was lost involuntarily. The chat
+    /// projection survives; the agent's memory does not.
+    ResumeFailed,
+    /// Deliberately retired — context pressure, seeded forward on our terms.
+    Rotated,
+}
+
+impl SessionEndReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionEndReason::ResumeFailed => "resume_failed",
+            SessionEndReason::Rotated => "rotated",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "resume_failed" => Some(SessionEndReason::ResumeFailed),
+            "rotated" => Some(SessionEndReason::Rotated),
+            _ => None,
+        }
+    }
+}
+
+/// One Claude Code session the orchestrator has lived in. The ledger these
+/// rows form is what makes context loss legible: the chat projection is
+/// continuous across boundaries the agent itself does not survive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorSession {
+    pub cc_session_id: String,
+    pub started_at: DateTime<Utc>,
+    /// `None` for the live session.
+    pub ended_at: Option<DateTime<Utc>>,
+    pub end_reason: Option<SessionEndReason>,
+    /// Context size at this session's last turn — the reading a rotation
+    /// threshold is compared against.
+    pub last_context_tokens: Option<i64>,
+    /// The continuation note this session was seeded into its successor
+    /// with. Unwritten until owned rotation lands.
+    pub summary: Option<String>,
+    pub summary_generated_at: Option<DateTime<Utc>>,
 }
 
 /// One moment of an in-flight orchestrator tick, streamed over

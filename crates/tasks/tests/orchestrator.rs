@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tasks::events::EventPayload;
-use tasks::models::{ChatRole, GhState, Project, ProjectId, Task, TaskId, TaskState};
+use tasks::models::{
+    ChatRole, GhState, Project, ProjectId, SessionEndReason, Task, TaskId, TaskState,
+};
 use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
 use tasks::run::orchestrator_nudge_loop;
 use tasks::store::Store;
@@ -267,6 +269,172 @@ async fn an_agent_failure_lands_in_the_chat_and_settles_the_tick() {
     assert!(log.lines().count() >= 1);
 }
 
+/// Losing the agent's context must stop being invisible. A failed `--resume`
+/// ends the session in the ledger, writes a seam the reader can see, and
+/// starts a fresh session — and the seam must NOT become input, or the new
+/// session spends its first turn acknowledging its own amnesia.
+#[tokio::test]
+async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+
+    // First tick: no session yet, so this one succeeds and is adopted.
+    let good = write_stub(tmp.path(), &args_log, false).await;
+    let orch = orchestrator(store.clone(), &good, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "hello")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+    let first_session = store.orchestrator_cc_session().await.unwrap().unwrap();
+
+    // Second tick: an agent that refuses to resume but is happy to start
+    // fresh — exactly the shape of a lost Claude Code session.
+    let picky = tmp.path().join("picky.sh");
+    tokio::fs::write(
+        &picky,
+        "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--resume\" ]; then\n    \
+         cat > /dev/null; echo 'no such session' >&2; exit 1\n  fi\ndone\n\
+         cat > /dev/null\necho 'starting over'\n",
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&picky).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&picky, p).await.unwrap();
+    }
+    let orch = orchestrator(store.clone(), &picky, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "still there?")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    // The chat carries the seam, between the question and the fresh reply.
+    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    let seam = messages
+        .iter()
+        .find(|m| m.role == ChatRole::System)
+        .expect("a seam turn was written");
+    assert!(
+        seam.content.contains("context"),
+        "the seam says what was lost: {}",
+        seam.content
+    );
+    assert_eq!(
+        messages.last().unwrap().content,
+        "starting over",
+        "the fresh session's reply lands after the seam"
+    );
+
+    // ...but it is not input: the conversation is settled, so no tick fires
+    // to answer the notice of the restart.
+    assert!(
+        store
+            .unanswered_orchestrator_messages()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!orch.tick().await.unwrap());
+
+    // The ledger records both regimes, and which one died how.
+    let second_session = store.orchestrator_cc_session().await.unwrap().unwrap();
+    assert_ne!(second_session, first_session, "a new session was adopted");
+    let sessions = store.orchestrator_sessions().await.unwrap();
+    let old = sessions
+        .iter()
+        .find(|s| s.cc_session_id == first_session)
+        .unwrap();
+    assert_eq!(old.end_reason, Some(SessionEndReason::ResumeFailed));
+    assert!(old.ended_at.is_some());
+    let new = sessions
+        .iter()
+        .find(|s| s.cc_session_id == second_session)
+        .unwrap();
+    assert!(new.ended_at.is_none(), "the new session is live");
+
+    // And the seam is on the wire for anything watching.
+    let events = store.events_since(0, 200).await.unwrap();
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::OrchestratorSessionStarted {
+                session_id,
+                replacing,
+                ..
+            } => Some((session_id.clone(), replacing.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![
+            (first_session.clone(), None),
+            (second_session.clone(), Some(first_session)),
+        ]
+    );
+}
+
+/// The context gauge: an agent reporting stream-json usage advances it, and
+/// the reading is the whole input side — cached tokens included, since on a
+/// long resumed session the cache is nearly all of it.
+#[tokio::test]
+async fn a_usage_reporting_agent_advances_the_context_gauge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("stream.jsonl");
+    tokio::fs::write(
+        &fixture,
+        concat!(
+            r#"{"type":"result","subtype":"success","result":"ok","usage":"#,
+            r#"{"input_tokens":1200,"cache_read_input_tokens":180000,"#,
+            r#""cache_creation_input_tokens":800,"output_tokens":450}}"#,
+            "\n",
+        ),
+    )
+    .await
+    .unwrap();
+    let stub = tmp.path().join("usage-stub.sh");
+    tokio::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\ncat {}\n",
+            common::shell_escape(&fixture.display().to_string())
+        ),
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&stub).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&stub, p).await.unwrap();
+    }
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "status?")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    let info = store.orchestrator_session_info().await.unwrap();
+    assert_eq!(
+        info.context_tokens,
+        Some(182_000),
+        "input + cache_read + cache_creation, not input_tokens alone"
+    );
+    // The reply itself is attributed to the session that produced it.
+    let messages = store.orchestrator_messages_since(0).await.unwrap();
+    assert_eq!(messages.last().unwrap().content, "ok");
+}
+
 /// The watermark contract: input appended while the agent is mid-turn (its
 /// seq below the eventual reply's) must stay unanswered, because the prompt
 /// that turn was built from never included it.
@@ -284,7 +452,7 @@ async fn input_arriving_mid_turn_stays_unanswered() {
         .unwrap();
     // The reply only covered `first`.
     store
-        .append_orchestrator_reply("done", first.seq)
+        .append_orchestrator_reply("done", first.seq, None)
         .await
         .unwrap();
 
@@ -460,7 +628,7 @@ async fn orchestrator_session_checkout_flows_over_http() {
     assert_eq!(resp.status(), 409);
 
     store
-        .set_orchestrator_cc_session(Some("cc-session-1"))
+        .begin_orchestrator_session("cc-session-1", None, None)
         .await
         .unwrap();
     store

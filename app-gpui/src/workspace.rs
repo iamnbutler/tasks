@@ -469,6 +469,13 @@ impl Workspace {
                         el.child(bubble.bg(theme.surface_secondary()).text_color(theme.fg()))
                     }
                     ChatRole::Event => el.child(bubble.text_color(theme.fg_muted()).text_xs()),
+                    // A session seam. The conversation reads as continuous
+                    // here but the orchestrator's memory does not, so it is
+                    // centered like a divider rather than sitting in the
+                    // flow of turns.
+                    ChatRole::System => el
+                        .justify_center()
+                        .child(bubble.text_color(theme.fg_muted()).text_xs()),
                 })
                 .into_any_element()
         });

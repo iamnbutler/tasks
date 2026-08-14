@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
-    SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionEndReason,
+    SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -100,6 +100,18 @@ pub enum EventPayload {
         seq: i64,
         role: ChatRole,
     },
+    /// The orchestrator started living in a new Claude Code session.
+    /// `replacing` is `None` only for the very first session; otherwise this
+    /// is a seam, and `reason` says whether we chose it or suffered it.
+    ///
+    /// Never nudge-worthy: the seam is already a visible turn in the chat,
+    /// and notifying the new session that it just lost its memory would
+    /// spend its first turn on that.
+    OrchestratorSessionStarted {
+        session_id: String,
+        replacing: Option<String>,
+        reason: Option<SessionEndReason>,
+    },
     ModeChanged {
         from: Mode,
         to: Mode,
@@ -141,6 +153,7 @@ impl EventPayload {
             EventPayload::BuildCompleted { .. } => "build_completed",
             EventPayload::PullRequestOpened { .. } => "pull_request_opened",
             EventPayload::OrchestratorMessage { .. } => "orchestrator_message",
+            EventPayload::OrchestratorSessionStarted { .. } => "orchestrator_session_started",
             EventPayload::ModeChanged { .. } => "mode_changed",
             EventPayload::BriefingUpdated { .. } => "briefing_updated",
             EventPayload::Note { .. } => "note",
@@ -152,8 +165,8 @@ impl EventPayload {
 mod tests {
     use super::*;
     use crate::models::{
-        BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
-        SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+        BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
+        SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
     };
 
     fn task() -> TaskId {
@@ -220,6 +233,11 @@ mod tests {
             EventPayload::OrchestratorMessage {
                 seq: 1,
                 role: ChatRole::User,
+            },
+            EventPayload::OrchestratorSessionStarted {
+                session_id: "sess-b".into(),
+                replacing: Some("sess-a".into()),
+                reason: Some(SessionEndReason::ResumeFailed),
             },
             EventPayload::ModeChanged {
                 from: Mode::Play,

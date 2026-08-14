@@ -3,8 +3,13 @@
 //! Per the load-bearing rule, this is not an agentic loop of our own — every
 //! tick shells out to headless Claude Code and *resumes one long-lived CC
 //! session*, so the orchestrator accumulates context across turns the same
-//! way an interactive session would. Our side owns only the chat projection
-//! (`orchestrator_messages`) and the session id.
+//! way an interactive session would. Our side owns the chat projection
+//! (`orchestrator_messages`), the session id, and the session *ledger*
+//! (`orchestrator_sessions`) — one row per session it has lived in, with the
+//! context size each reached. The ledger exists because that accumulated
+//! context is the point of a long-lived conversation, and losing it used to
+//! be invisible: the chat reads as continuous across a boundary the agent
+//! itself does not survive.
 //!
 //! The tick condition is DB-derived ([`Store::unanswered_orchestrator_messages`]):
 //! the loop answers whatever user turns arrived since the last assistant
@@ -32,7 +37,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
-use crate::models::{BuildStatus, OrchestratorFeedEvent, SessionStatus, SpecQueueStatus};
+use crate::models::{
+    BuildStatus, OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
+};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -91,14 +98,21 @@ impl Orchestrator {
             .join("\n\n");
         info!(turns = pending.len(), "orchestrator tick");
 
-        let reply = match self.run_agent(&prompt).await {
-            Ok(reply) => reply,
+        let (reply, session_id) = match self.run_agent(&prompt).await {
+            Ok(turn) => {
+                info!(
+                    session = %turn.session_id,
+                    context_tokens = ?turn.context_tokens,
+                    "orchestrator turn complete"
+                );
+                (turn.text, Some(turn.session_id))
+            }
             Err(e) => {
                 // The error becomes the assistant turn: the chat must never
                 // dangle silently, and persisting it also settles the tick
                 // condition so the loop doesn't retry a poison prompt forever.
                 warn!(error = %e, "orchestrator agent failed");
-                format!("(orchestrator error: {e})")
+                (format!("(orchestrator error: {e})"), None)
             }
         };
         let trimmed = reply.trim();
@@ -108,7 +122,7 @@ impl Orchestrator {
             trimmed
         };
         self.store
-            .append_orchestrator_reply(content, answered_through)
+            .append_orchestrator_reply(content, answered_through, session_id.as_deref())
             .await?;
         // The durable message exists now — tell live-feed subscribers the
         // in-flight view is over (after the append, so a client reacting to
@@ -120,13 +134,21 @@ impl Orchestrator {
 
     /// Run one headless Claude Code turn against the persistent session,
     /// creating the session on first use and healing a lost one by starting
-    /// over with a fresh id (context is lost, the chat projection is not).
+    /// over with a fresh id.
+    ///
+    /// Healing is not free and must not be silent: the accumulated context is
+    /// what makes the orchestrator worth having, so a failed resume closes the
+    /// old session in the ledger and writes a seam into the conversation
+    /// before the replacement takes its first turn. The chat projection
+    /// survives either way — it is only the agent's memory of it that doesn't.
+    ///
     /// The standing prompt rides along on every turn — resume included — so
-    /// prompt updates reach a long-lived session without resetting it.
-    async fn run_agent(&self, prompt: &str) -> Result<String, OrchestratorError> {
+    /// prompt updates reach a long-lived session without resetting it, and a
+    /// fresh session is re-armed with its instructions on turn one.
+    async fn run_agent(&self, prompt: &str) -> Result<Turn, OrchestratorError> {
         let system = system_prompt(self.config.api_port);
         match self.store.orchestrator_cc_session().await? {
-            None => self.run_fresh(&system, prompt).await,
+            None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
                 .invoke(
                     &["--resume", &session, "--append-system-prompt", &system],
@@ -134,28 +156,67 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok(reply) => Ok(reply),
+                Ok((text, context_tokens)) => {
+                    if let Some(tokens) = context_tokens {
+                        self.store
+                            .record_orchestrator_context_tokens(&session, tokens)
+                            .await?;
+                    }
+                    Ok(Turn {
+                        text,
+                        context_tokens,
+                        session_id: session,
+                    })
+                }
                 Err(e @ OrchestratorError::AgentFailed { .. }) => {
                     warn!(error = %e, "resume failed; starting a fresh orchestrator session");
-                    self.run_fresh(&system, prompt).await
+                    // The context is gone the moment resume fails, so the
+                    // seam is recorded here rather than after a replacement
+                    // succeeds — a fresh start that *also* fails must not
+                    // erase the fact that memory was lost.
+                    self.store
+                        .end_orchestrator_session(&session, SessionEndReason::ResumeFailed)
+                        .await?;
+                    self.start_session(&system, prompt, Some(&session)).await
                 }
                 Err(e) => Err(e),
             },
         }
     }
 
-    async fn run_fresh(&self, system: &str, prompt: &str) -> Result<String, OrchestratorError> {
+    /// Take the first turn in a brand-new Claude Code session, adopting it as
+    /// the live one only once that turn succeeds. `replacing` is `Some` when
+    /// this is a seam rather than a first start.
+    async fn start_session(
+        &self,
+        system: &str,
+        prompt: &str,
+        replacing: Option<&str>,
+    ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
-        let reply = self
+        let (text, context_tokens) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
             )
             .await?;
         self.store
-            .set_orchestrator_cc_session(Some(&session))
+            .begin_orchestrator_session(
+                &session,
+                replacing,
+                replacing.map(|_| SessionEndReason::ResumeFailed),
+            )
             .await?;
-        Ok(reply)
+        if let Some(tokens) = context_tokens {
+            self.store
+                .record_orchestrator_context_tokens(&session, tokens)
+                .await?;
+        }
+        Ok(Turn {
+            text,
+            context_tokens,
+            session_id: session,
+        })
     }
 
     /// Run the agent, streaming its stdout as it arrives. stream-json lines
@@ -163,7 +224,11 @@ impl Orchestrator {
     /// `result` record's text becomes the reply; anything that isn't
     /// stream-json is collected raw and returned whole, so plain-text agents
     /// (and test stubs) keep working — they just don't stream.
-    async fn invoke(&self, extra_args: &[&str], prompt: &str) -> Result<String, OrchestratorError> {
+    async fn invoke(
+        &self,
+        extra_args: &[&str],
+        prompt: &str,
+    ) -> Result<(String, Option<i64>), OrchestratorError> {
         let mut parts = self.config.command.split_whitespace();
         let prog = parts.next().unwrap_or("claude").to_string();
         let base_args: Vec<String> = parts.map(str::to_string).collect();
@@ -209,6 +274,7 @@ impl Orchestrator {
             let mut lines = BufReader::new(stdout).lines();
             let mut raw = String::new();
             let mut result_text: Option<String> = None;
+            let mut context_tokens: Option<i64> = None;
             while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
                 match parse_stream_line(&line) {
                     StreamLine::Delta(text) => self
@@ -220,7 +286,10 @@ impl Orchestrator {
                                 .publish_orchestrator_feed(OrchestratorFeedEvent::Tool { label });
                         }
                     }
-                    StreamLine::Result(text) => result_text = Some(text),
+                    StreamLine::Result { text, tokens } => {
+                        result_text = Some(text);
+                        context_tokens = tokens;
+                    }
                     StreamLine::Other => {}
                     StreamLine::NotStreamJson => {
                         raw.push_str(&line);
@@ -229,13 +298,14 @@ impl Orchestrator {
                 }
             }
             let status = child.wait().await.map_err(OrchestratorError::Spawn)?;
-            Ok::<_, OrchestratorError>((status, result_text, raw))
+            Ok::<_, OrchestratorError>((status, result_text, raw, context_tokens))
         };
 
         let secs = self.config.timeout.as_secs();
-        let (status, result_text, raw) = tokio::time::timeout(self.config.timeout, read)
-            .await
-            .map_err(|_| OrchestratorError::Timeout { secs })??;
+        let (status, result_text, raw, context_tokens) =
+            tokio::time::timeout(self.config.timeout, read)
+                .await
+                .map_err(|_| OrchestratorError::Timeout { secs })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -244,8 +314,19 @@ impl Orchestrator {
                 stderr: stderr.chars().take(2000).collect(),
             });
         }
-        Ok(result_text.unwrap_or(raw))
+        Ok((result_text.unwrap_or(raw), context_tokens))
     }
+}
+
+/// One completed agent turn.
+struct Turn {
+    text: String,
+    /// Absolute context size reported by the agent, when it reports one.
+    context_tokens: Option<i64>,
+    /// The Claude Code session this turn ran in, stamped onto the durable
+    /// reply so a verdict can be traced back to the memory regime that
+    /// produced it.
+    session_id: String,
 }
 
 /// What one line of agent stdout means for the live feed.
@@ -254,8 +335,9 @@ enum StreamLine {
     Delta(String),
     /// Tool invocations from a completed assistant turn.
     Tools(Vec<String>),
-    /// The final `result` record's reply text.
-    Result(String),
+    /// The final `result` record: the reply text, and the context size that
+    /// produced it when the agent reports usage.
+    Result { text: String, tokens: Option<i64> },
     /// A stream-json record with nothing for us (init, thinking, tool results).
     Other,
     /// Not stream-json at all — a plain-text agent's output.
@@ -290,13 +372,33 @@ fn parse_stream_line(line: &str) -> StreamLine {
             }
         }
         Some("result") => match v.get("result").and_then(|r| r.as_str()) {
-            Some(text) => StreamLine::Result(text.to_string()),
+            Some(text) => StreamLine::Result {
+                text: text.to_string(),
+                tokens: context_tokens(v.get("usage")),
+            },
             None => StreamLine::Other,
         },
         Some(_) => StreamLine::Other,
         // JSON, but not a stream record — treat like plain output.
         None => StreamLine::NotStreamJson,
     }
+}
+
+/// Context size from a stream-json `usage` object: every input-side token the
+/// model had to read this turn, cached or not.
+///
+/// The sum is what matters. `input_tokens` alone under-reports by whatever
+/// the cache served — which, on a long-lived resumed session, is nearly all
+/// of it. And because this is an absolute measurement rather than a running
+/// total, it stays honest across turns the server never drove (an interactive
+/// checkout) without any reconciliation.
+fn context_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
+    let usage = usage?;
+    let field = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_read_input_tokens")
+        + field("cache_creation_input_tokens");
+    (total > 0).then_some(total)
 }
 
 /// One-line human label for a tool call, e.g. `Bash: curl -s .../tasks`.

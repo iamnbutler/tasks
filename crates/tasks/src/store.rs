@@ -13,9 +13,10 @@ use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
     Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode,
-    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId,
-    ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
-    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo,
+    Project, ProjectId, ReviewedSpec, Session, SessionEndReason, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Result of upserting an external record into our domain.
@@ -1928,7 +1929,7 @@ impl Store {
             .orchestrator_messages_since(watermark)
             .await?
             .into_iter()
-            .filter(|m| m.role != ChatRole::Assistant)
+            .filter(|m| m.role.is_input())
             .collect())
     }
 
@@ -1940,15 +1941,17 @@ impl Store {
         &self,
         content: &str,
         answered_through: i64,
+        cc_session_id: Option<&str>,
     ) -> Result<OrchestratorMessage, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "INSERT INTO orchestrator_messages (role, content, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO orchestrator_messages (role, content, created_at, cc_session_id)              VALUES (?, ?, ?, ?)",
         )
         .bind(ChatRole::Assistant.as_str())
         .bind(content)
         .bind(now.to_rfc3339())
+        .bind(cc_session_id)
         .execute(&mut *tx)
         .await?;
         let seq = result.last_insert_rowid();
@@ -1979,15 +1982,122 @@ impl Store {
         Ok(row.try_get("cc_session_id")?)
     }
 
-    pub async fn set_orchestrator_cc_session(
+    // --- orchestrator session ledger ---
+
+    /// Close out the live session and write the seam into the conversation,
+    /// in one transaction.
+    ///
+    /// Called the moment the loss is *known* — a failed `--resume` — not when
+    /// its replacement succeeds, because the context is already gone either
+    /// way and the record should survive a fresh start that also fails. The
+    /// seam is a [`ChatRole::System`] turn, so it is visible to the reader
+    /// without becoming input the orchestrator owes a reply to.
+    pub async fn end_orchestrator_session(
         &self,
-        session_id: Option<&str>,
+        cc_session_id: &str,
+        reason: SessionEndReason,
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
+        let now = Utc::now();
+        let seam = match reason {
+            SessionEndReason::ResumeFailed => {
+                "(session restarted — resuming the previous one failed, so its accumulated \
+                 context is gone. The conversation above is intact; the orchestrator's memory \
+                 of it is not.)"
+            }
+            SessionEndReason::Rotated => {
+                "(session rotated — the previous context was retired deliberately and seeded \
+                 forward as a summary.)"
+            }
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE orchestrator_sessions SET ended_at = ?, end_reason = ?              WHERE cc_session_id = ? AND ended_at IS NULL",
+        )
+        .bind(now.to_rfc3339())
+        .bind(reason.as_str())
+        .bind(cc_session_id)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "INSERT INTO orchestrator_messages (role, content, created_at, cc_session_id)              VALUES (?, ?, ?, ?)",
+        )
+        .bind(ChatRole::System.as_str())
+        .bind(seam)
+        .bind(now.to_rfc3339())
+        .bind(cc_session_id)
+        .execute(&mut *tx)
+        .await?;
+        let seq = result.last_insert_rowid();
+        tx.commit().await?;
+        self.append_event(EventPayload::OrchestratorMessage {
+            seq,
+            role: ChatRole::System,
+        })
+        .await?;
         Ok(())
+    }
+
+    /// Adopt a newly created Claude Code session as the live one: open its
+    /// ledger row and point the singleton at it, in one transaction.
+    ///
+    /// Deliberately called only *after* the session's first turn succeeds, so
+    /// a failed start leaves the previous session id in place and the next
+    /// tick retries rather than stranding the conversation on a session
+    /// Claude Code never created.
+    pub async fn begin_orchestrator_session(
+        &self,
+        cc_session_id: &str,
+        replacing: Option<&str>,
+        reason: Option<SessionEndReason>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO orchestrator_sessions (cc_session_id, started_at) VALUES (?, ?)")
+            .bind(cc_session_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
+            .bind(cc_session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.append_event(EventPayload::OrchestratorSessionStarted {
+            session_id: cc_session_id.to_string(),
+            replacing: replacing.map(str::to_string),
+            reason,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record the context size reported by a finished turn. This is the gauge
+    /// a rotation threshold reads: an absolute measurement, not a running
+    /// total, so it stays honest across turns the server never drove (an
+    /// interactive checkout) and across an agent that isn't reporting usage
+    /// at all (the column simply stops advancing).
+    pub async fn record_orchestrator_context_tokens(
+        &self,
+        cc_session_id: &str,
+        tokens: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE orchestrator_sessions SET last_context_tokens = ? WHERE cc_session_id = ?",
+        )
+        .bind(tokens)
+        .bind(cc_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The session ledger, newest first.
+    pub async fn orchestrator_sessions(&self) -> Result<Vec<OrchestratorSession>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(orchestrator_session_row).collect()
     }
 
     /// Record the orchestrator agent's effective working directory. Written
@@ -2006,7 +2116,7 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT cc_session_id, workdir, checked_out_at FROM orchestrator WHERE id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2017,6 +2127,7 @@ impl Store {
             checked_out: checked_out_at
                 .as_deref()
                 .is_some_and(checkout_heartbeat_fresh),
+            context_tokens: row.try_get("last_context_tokens")?,
         })
     }
 
@@ -2363,6 +2474,37 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
         seq: row.try_get("seq")?,
         timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
         payload: serde_json::from_str(&payload_raw)?,
+    })
+}
+
+fn orchestrator_session_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<OrchestratorSession, StoreError> {
+    let end_reason_raw: Option<String> = row.try_get("end_reason")?;
+    let end_reason = end_reason_raw
+        .map(|raw| {
+            SessionEndReason::from_str(&raw).ok_or(StoreError::BadEnum {
+                column: "end_reason",
+                value: raw,
+            })
+        })
+        .transpose()?;
+    let ended_at: Option<String> = row.try_get("ended_at")?;
+    let summary_generated_at: Option<String> = row.try_get("summary_generated_at")?;
+    Ok(OrchestratorSession {
+        cc_session_id: row.try_get("cc_session_id")?,
+        started_at: parse_ts(&row.try_get::<String, _>("started_at")?, "started_at")?,
+        ended_at: ended_at
+            .as_deref()
+            .map(|s| parse_ts(s, "ended_at"))
+            .transpose()?,
+        end_reason,
+        last_context_tokens: row.try_get("last_context_tokens")?,
+        summary: row.try_get("summary")?,
+        summary_generated_at: summary_generated_at
+            .as_deref()
+            .map(|s| parse_ts(s, "summary_generated_at"))
+            .transpose()?,
     })
 }
 
