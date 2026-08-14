@@ -43,6 +43,24 @@ impl Workspace {
                         title_for(task_id),
                         gh_state.as_str()
                     ),
+                    EventPayload::IssueCaptured {
+                        gh_issue_number,
+                        actor,
+                        ..
+                    } => format!(
+                        "Filed issue #{gh_issue_number} ({})",
+                        actor.as_str()
+                    ),
+                    EventPayload::IssueClosed {
+                        gh_issue_number,
+                        reason,
+                        actor,
+                        ..
+                    } => format!(
+                        "Closed issue #{gh_issue_number} as {} ({})",
+                        reason.as_str().replace('_', " "),
+                        actor.as_str()
+                    ),
                     EventPayload::SessionStarted { task_id, .. } => {
                         format!("Scout started on “{}”", title_for(task_id))
                     }

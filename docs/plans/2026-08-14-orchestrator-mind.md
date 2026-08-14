@@ -397,6 +397,49 @@ decision row is written with `enforced=false`. The human's existing
 interception loop becomes the calibration data: after a week, *did shadow
 match me?* Flip on evidence, not nerve.
 
+**As built** (migration `0015`, `orchestrator_charter` + `decisions.enforced`).
+Two things landed differently from the sketch, both in the same direction —
+away from trusting the prompt:
+
+- **Shadow is a server behaviour, not an instruction.** The orchestrator calls
+  the endpoint exactly as it would when live; the server records the decision
+  with `enforced = 0`, applies nothing, and answers `{"shadowed": true}` rather
+  than a normal success body. Telling the agent to narrate instead of acting
+  would have made the calibration data depend on prompt compliance, which is
+  precisely the thing that degrades — and shadow exists to evaluate a
+  capability nobody trusts yet.
+- **A shadow verdict discharges its obligation.** Obligations are defined as
+  "no decision row", and a shadow row is a decision row. This is right: the
+  orchestrator has done everything it is permitted to do, and re-reminding it
+  forever would be nagging about work it cannot finish. What remains is the
+  human's turn.
+
+Spend budgets are per-capability daily caps counted from the ledger, and they
+count *enforced* rows only — a shadow decision changed nothing in the world, so
+charging it against the budget would starve the evaluation of the thing being
+evaluated.
+
+**Shipped defaults** (decided 2026-08-14, revising "everything starts off").
+Starting everything at `off` turned out to be the wrong safe: the orchestrator
+can already queue, dispatch, and — when told to — review, so an all-off charter
+would have *removed* function rather than governed it, which is the opposite of
+the direction this design is meant to go. What ships instead:
+
+| Capability | Level | Why |
+| --- | --- | --- |
+| `queue_tasks` | live, 10/day | Already worked; the cap is the new part |
+| `dispatch_builds` | live | Already worked; specs are human-approved |
+| `capture_work` | live, 5/day | *Stricter* than the status quo — the alternative is an ungoverned `gh issue create` |
+| `auto_review_specs` | shadow | Today's only guard is prompt text; `live` would grant more than existed |
+| `retire_work` | shadow | Genuinely new, and the judgment with no cheap evidence standard |
+
+The one real regression is that "approve spec X" relayed through the
+conversation now answers `shadowed: true` instead of applying — the server
+cannot distinguish a relayed instruction from an autonomous verdict, and
+inventing a flag that says "the human told me to" would hand the charter's
+keys to the thing it governs. The human clicks instead, and the shadow row
+starts the calibration record that decides when `auto_review_specs` flips.
+
 **Flip order.** `capture_work` first — it is additive, trivially reversible,
 addresses information loss happening right now, and generates calibration data
 in a domain where being wrong costs one closeable issue. Then `retire_work`

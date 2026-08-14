@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::models::GhState;
+use crate::models::{CloseReason, GhState};
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com/graphql";
 const DEFAULT_REST_BASE_URL: &str = "https://api.github.com";
@@ -201,6 +201,87 @@ impl GitHubClient {
         body.get("number")
             .and_then(|n| n.as_u64())
             .ok_or_else(|| GhError::Shape("pull request response missing `number`".into()))
+    }
+
+    /// File an issue. Returns its number — the identifier we may persist;
+    /// everything else about the issue stays GitHub's and is read back by the
+    /// poller like any other issue.
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        name: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<u64, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/issues", self.rest_base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "title": title,
+                "body": body,
+                "labels": labels,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!("create issue: {status}: {msg}")));
+        }
+        body.get("number")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GhError::Shape("issue response missing `number`".into()))
+    }
+
+    /// Close an issue, stating why.
+    ///
+    /// The write happens here; the *fact* that the issue is closed is still
+    /// learned from the poller reading GitHub's open set, exactly as for an
+    /// issue a human closed in the browser. Nothing is marked closed locally
+    /// in anticipation — write path and read path stay separate.
+    pub async fn close_issue(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        reason: CloseReason,
+    ) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "state": "closed",
+                "state_reason": reason.as_str(),
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)")
+                .to_string();
+            return Err(GhError::Rest(format!(
+                "close issue {number}: {status}: {msg}"
+            )));
+        }
+        Ok(())
     }
 
     /// Fetch all OPEN issues for a repository, paging as needed.

@@ -681,6 +681,13 @@ pub enum DecisionAction {
     NeedsRevision,
     Reject,
     RequestBuild,
+    /// A task was moved from the backlog into the queue, where a Scout will
+    /// pick it up. Recorded because it is where spend begins.
+    QueueTask,
+    /// An issue was filed — work that would otherwise have been lost.
+    CaptureWork,
+    /// An issue was closed: finished, or judged no longer worth doing.
+    RetireWork,
 }
 
 impl DecisionAction {
@@ -690,6 +697,9 @@ impl DecisionAction {
             DecisionAction::NeedsRevision => "needs_revision",
             DecisionAction::Reject => "reject",
             DecisionAction::RequestBuild => "request_build",
+            DecisionAction::QueueTask => "queue_task",
+            DecisionAction::CaptureWork => "capture_work",
+            DecisionAction::RetireWork => "retire_work",
         }
     }
 
@@ -699,6 +709,161 @@ impl DecisionAction {
             "needs_revision" => Some(DecisionAction::NeedsRevision),
             "reject" => Some(DecisionAction::Reject),
             "request_build" => Some(DecisionAction::RequestBuild),
+            "queue_task" => Some(DecisionAction::QueueTask),
+            "capture_work" => Some(DecisionAction::CaptureWork),
+            "retire_work" => Some(DecisionAction::RetireWork),
+            _ => None,
+        }
+    }
+}
+
+/// Something the orchestrator can do without being asked.
+///
+/// Deliberately five separate switches rather than one autonomy dial. The
+/// axis that matters is reversibility, and it does not line up with how
+/// dramatic a capability sounds: filing an issue is undone by closing it,
+/// while auto-approving a spec costs a Builder run and a PR someone has to
+/// read. `dispatch_builds` live with `auto_review_specs` in shadow is a
+/// coherent and probably desirable state that a single play/pause switch
+/// cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// File an issue for discovered work.
+    CaptureWork,
+    /// Close an issue: done, or no longer worth doing.
+    RetireWork,
+    /// Move a task from backlog into the queue, where a Scout will pick it up.
+    QueueTasks,
+    /// Batch approved specs into a Builder run.
+    DispatchBuilds,
+    /// Render a review verdict on a spec.
+    AutoReviewSpecs,
+}
+
+impl Capability {
+    /// Every capability, in the order the charter is meant to be flipped:
+    /// additive and trivially reversible first, irreversible-ish last.
+    pub const ALL: [Capability; 5] = [
+        Capability::CaptureWork,
+        Capability::RetireWork,
+        Capability::QueueTasks,
+        Capability::DispatchBuilds,
+        Capability::AutoReviewSpecs,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "capture_work",
+            Capability::RetireWork => "retire_work",
+            Capability::QueueTasks => "queue_tasks",
+            Capability::DispatchBuilds => "dispatch_builds",
+            Capability::AutoReviewSpecs => "auto_review_specs",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "capture_work" => Some(Capability::CaptureWork),
+            "retire_work" => Some(Capability::RetireWork),
+            "queue_tasks" => Some(Capability::QueueTasks),
+            "dispatch_builds" => Some(Capability::DispatchBuilds),
+            "auto_review_specs" => Some(Capability::AutoReviewSpecs),
+            _ => None,
+        }
+    }
+
+    /// One line for the generated authority section of the system prompt.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "file issues for work you discover",
+            Capability::RetireWork => "close issues that are done or no longer worth doing",
+            Capability::QueueTasks => "move tasks from the backlog into the queue",
+            Capability::DispatchBuilds => "batch approved specs into Builder runs",
+            Capability::AutoReviewSpecs => "render review verdicts on specs",
+        }
+    }
+}
+
+/// How much of a capability the orchestrator actually has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharterLevel {
+    /// Refused at the endpoint. The default, and where everything starts.
+    #[default]
+    Off,
+    /// The call is accepted, the decision is recorded, and nothing happens.
+    ///
+    /// Narrated, not silent: the orchestrator explains its reasoning in the
+    /// conversation as it always does, and the ledger keeps the verdict it
+    /// would have rendered. After a week the question "did shadow agree with
+    /// me?" is a query, which is what makes flipping a capability an evidence
+    /// decision rather than a nerve one.
+    Shadow,
+    /// Applied.
+    Live,
+}
+
+impl CharterLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CharterLevel::Off => "off",
+            CharterLevel::Shadow => "shadow",
+            CharterLevel::Live => "live",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(CharterLevel::Off),
+            "shadow" => Some(CharterLevel::Shadow),
+            "live" => Some(CharterLevel::Live),
+            _ => None,
+        }
+    }
+}
+
+/// One capability's standing, as the charter records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharterEntry {
+    pub capability: Capability,
+    pub level: CharterLevel,
+    /// Actions of this kind the orchestrator may take per day. `None` is
+    /// uncapped — fine for reversible capabilities, and the reason this is a
+    /// cap rather than a gate: it protects against a runaway loop, not
+    /// against a bad judgment.
+    pub daily_limit: Option<i64>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Why work is being retired, mapped onto GitHub's `state_reason`.
+///
+/// The two are not variations on a theme. "Completed" has a cheap evidence
+/// standard — a merged PR or a named commit, queried live — and the
+/// orchestrator has already been wrong by asserting opened PRs as shipped
+/// work. "Not planned" is a recalibration judgment with no such standard, and
+/// it is the more valuable of the two precisely because nobody ever gets round
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+impl CloseReason {
+    /// GitHub's `state_reason` spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloseReason::Completed => "completed",
+            CloseReason::NotPlanned => "not_planned",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "completed" => Some(CloseReason::Completed),
+            "not_planned" => Some(CloseReason::NotPlanned),
             _ => None,
         }
     }
@@ -724,7 +889,16 @@ pub struct Decision {
     /// verdicts, and briefly `None` for an orchestrator's own until the turn
     /// it was made during finishes.
     pub transcript_seq: Option<i64>,
+    /// Whether the state actually changed. `false` for a shadow decision: the
+    /// judgment is real and recorded, the effect never happened. Reading the
+    /// two as one would turn an evaluation into a history.
+    #[serde(default = "crate::models::default_true")]
+    pub enforced: bool,
     pub created_at: DateTime<Utc>,
+}
+
+pub(crate) fn default_true() -> bool {
+    true
 }
 
 /// The decision behind a state change, supplied by whoever made it.

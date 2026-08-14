@@ -27,16 +27,19 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildRequest, CreateProject, ErrorResponse, ModeResponse,
-    ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, SetMode,
+    BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
+    ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
+    SetCharter, SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
 use crate::events::{Event, EventPayload};
+use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
-    Actor, Build, BuildId, ChatRole, Decision, DecisionInput, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine,
+    Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason, Decision,
+    DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo,
+    Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
+    TaskId, TranscriptLine,
 };
 use crate::store::{MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError};
 
@@ -60,8 +63,19 @@ pub enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     Conflict(String),
+    /// The caller is not allowed to do this. Today that means the charter
+    /// says a capability is off, or the orchestrator reached for something
+    /// only the human may set.
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     Internal(String),
+    /// The server is running without something this route needs — today, a
+    /// GitHub token. Distinct from an internal error: nothing went wrong, the
+    /// capability simply is not configured, and the caller should stop asking
+    /// rather than retry.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl From<StoreError> for ApiError {
@@ -86,7 +100,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
             status,
@@ -100,13 +116,16 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-/// Router state: the store plus the optional briefing service. Optional so
-/// `router(store)` (tests, embedded uses) keeps working — without the
-/// service, `GET /briefings` serves stored copies and never regenerates.
+/// Router state: the store plus the services that need credentials or
+/// background work. Both optional so `router(store)` (tests, embedded uses)
+/// keeps working — without the briefing service `GET /briefings` serves stored
+/// copies and never regenerates, and without a GitHub client the endpoints
+/// that write upstream answer 503 instead of pretending.
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Store>,
     briefings: Option<Arc<Briefings>>,
+    github: Option<Arc<GitHubClient>>,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -121,15 +140,27 @@ impl FromRef<AppState> for Option<Arc<Briefings>> {
     }
 }
 
-/// Build the API router over a store, with no briefing service. Exposed
-/// separately from [`serve`] so tests can bind their own listener.
+impl FromRef<AppState> for Option<Arc<GitHubClient>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.github.clone()
+    }
+}
+
+/// Build the API router over a store alone. Exposed separately from [`serve`]
+/// so tests can bind their own listener.
 pub fn router(store: Arc<Store>) -> Router {
-    router_with_briefings(store, None)
+    router_with_services(store, None, None)
 }
 
 /// Build the full API router. `serve` passes the briefing service so
-/// `GET /briefings` can kick stale-while-revalidate regenerations.
-pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>>) -> Router {
+/// `GET /briefings` can kick stale-while-revalidate regenerations, and the
+/// GitHub client so issue writes can go through the server rather than
+/// through an agent's own credential.
+pub fn router_with_services(
+    store: Arc<Store>,
+    briefings: Option<Arc<Briefings>>,
+    github: Option<Arc<GitHubClient>>,
+) -> Router {
     Router::new()
         .route("/projects", get(list_projects).post(create_project))
         .route("/tasks", get(list_tasks))
@@ -137,6 +168,8 @@ pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>
         .route("/tasks/{task_id}/queue", post(queue_task))
         .route("/tasks/{task_id}/dequeue", post(dequeue_task))
         .route("/tasks/{task_id}/scout", post(scout_task_now))
+        .route("/tasks/{task_id}/close", post(close_task))
+        .route("/issues", post(capture_issue))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/transcript", get(list_transcript))
@@ -151,6 +184,8 @@ pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>
         .route("/spec-queue/{spec_id}/review", post(review_spec))
         .route("/builds", get(list_builds).post(request_build))
         .route("/decisions", get(list_decisions))
+        .route("/charter", get(get_charter))
+        .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
         .route(
             "/orchestrator/messages",
@@ -171,12 +206,16 @@ pub fn router_with_briefings(store: Arc<Store>, briefings: Option<Arc<Briefings>
         .route("/briefings", get(list_briefings))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
-        .with_state(AppState { store, briefings })
+        .with_state(AppState {
+            store,
+            briefings,
+            github,
+        })
 }
 
 /// Serve the API on loopback at `port`. Runs until the process is killed.
 pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
-    serve_with_shutdown(store, None, port, std::future::pending()).await
+    serve_with_shutdown(store, None, None, port, std::future::pending()).await
 }
 
 /// Serve the API on loopback at `port` until `shutdown` resolves, then stop
@@ -184,12 +223,13 @@ pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
 pub async fn serve_with_shutdown(
     store: Arc<Store>,
     briefings: Option<Arc<Briefings>>,
+    github: Option<Arc<GitHubClient>>,
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     info!(addr = %listener.local_addr()?, "tasks api listening");
-    axum::serve(listener, router_with_briefings(store, briefings))
+    axum::serve(listener, router_with_services(store, briefings, github))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -261,8 +301,10 @@ async fn get_task(
 async fn queue_task(
     State(store): State<Arc<Store>>,
     Path(task_id): Path<String>,
-) -> ApiResult<Json<Task>> {
-    Ok(Json(store.queue_task(&TaskId::from_raw(task_id)).await?))
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let id = TaskId::from_raw(task_id);
+    queue_under_charter(&store, &headers, &id, false).await
 }
 
 /// Return a queued (not yet running) task to the backlog.
@@ -278,10 +320,307 @@ async fn dequeue_task(
 async fn scout_task_now(
     State(store): State<Arc<Store>>,
     Path(task_id): Path<String>,
-) -> ApiResult<Json<Task>> {
-    Ok(Json(
-        store.push_task_to_front(&TaskId::from_raw(task_id)).await?,
-    ))
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    let id = TaskId::from_raw(task_id);
+    queue_under_charter(&store, &headers, &id, true).await
+}
+
+/// Queue a task, or record that the orchestrator would have.
+///
+/// Queueing is where spend begins — a queued task becomes a Scout run —
+/// which is why it is a charter capability at all. The ledger row is written
+/// after the queueing rather than inside it: queueing is trivially reversible,
+/// so the row is there for the budget and the audit trail, not to authorize
+/// anything.
+async fn queue_under_charter(
+    store: &Store,
+    headers: &axum::http::HeaderMap,
+    id: &TaskId,
+    front: bool,
+) -> ApiResult<Response> {
+    let actor = actor_of(store, headers);
+    let authority = authorize(
+        store,
+        actor,
+        Capability::QueueTasks,
+        DecisionAction::QueueTask,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "task",
+                id.as_str(),
+                DecisionAction::QueueTask,
+                DecisionInput {
+                    actor,
+                    rationale: Some("queued in shadow".into()),
+                    evidence: None,
+                },
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the task was not queued"));
+    }
+    let task = if front {
+        store.push_task_to_front(id).await?
+    } else {
+        store.queue_task(id).await?
+    };
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "task",
+                id.as_str(),
+                DecisionAction::QueueTask,
+                DecisionInput {
+                    actor,
+                    rationale: Some(if front { "scout now" } else { "queued" }.into()),
+                    evidence: None,
+                },
+                true,
+            )
+            .await?;
+    }
+    Ok(Json(task).into_response())
+}
+
+// --- custodial writes: filing and retiring work ---
+
+/// File an issue upstream and start tracking it.
+///
+/// This exists so the capability stops living outside the system. The
+/// orchestrator can already file issues with its own `gh` credential — that is
+/// the same side channel the `Closes #N` incident went through, and it leaves
+/// no decision row, no event, and nothing to cap. Routing the write here
+/// restores "GitHub writes go through the server, never through agents".
+///
+/// The task lands in `backlog`: capturing work and choosing to work on it are
+/// separate capabilities, deliberately.
+async fn capture_issue(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CaptureIssue>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot file issues".into())
+    })?;
+    if body.title.trim().is_empty() {
+        return Err(ApiError::BadRequest("title must be non-empty".into()));
+    }
+    let actor = actor_of(&store, &headers);
+    // Provenance is what makes a captured issue auditable from GitHub alone,
+    // so an autonomous capture without it is refused rather than filed
+    // anonymously.
+    if actor == Actor::Orchestrator
+        && body
+            .provenance
+            .as_deref()
+            .is_none_or(|p| p.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "an orchestrator capture must say where the work was discovered".into(),
+        ));
+    }
+    let project = resolve_project(&store, body.project_id).await?;
+
+    if authorize(
+        &store,
+        actor,
+        Capability::CaptureWork,
+        DecisionAction::CaptureWork,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        // Nothing exists to point at — the issue was never filed — so the
+        // subject is the title. A shadow row is a record of judgment, not a
+        // foreign key.
+        let seq = store
+            .record_decision(
+                "capture",
+                &body.title,
+                DecisionAction::CaptureWork,
+                DecisionInput {
+                    actor,
+                    rationale: body.rationale,
+                    evidence: body.evidence,
+                },
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no issue was filed"));
+    }
+
+    let number = github
+        .create_issue(
+            &project.repo_owner,
+            &project.repo_name,
+            &body.title,
+            &issue_body(&body.body, actor, body.provenance.as_deref()),
+            &body.labels,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("filing the issue failed: {e}")))?;
+
+    // The issue exists upstream now, so a failure past this point loses
+    // tracking, not work — the poller picks the issue up on its next pass
+    // either way.
+    let task = store
+        .capture_issue(
+            &project.id,
+            GhIssue {
+                number,
+                title: body.title,
+                body: body.body,
+                labels: body.labels,
+                state: GhState::Open,
+                updated_at: Utc::now(),
+            },
+            DecisionInput {
+                actor,
+                rationale: body.rationale,
+                evidence: body.evidence,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(task)).into_response())
+}
+
+/// Close the GitHub issue behind a task.
+///
+/// Returns 202, not the updated task: the task is *not* retired here. Closure
+/// is GitHub's fact, and the poller observes it on its next pass through the
+/// path that already handles an issue closed in a browser. Marking it locally
+/// would persist a GitHub-owned fact and make a failed close look successful.
+async fn close_task(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(task_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CloseTaskRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot close issues".into())
+    })?;
+    let reason = CloseReason::from_str(&body.reason)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown reason: {}", body.reason)))?;
+    let id = TaskId::from_raw(task_id);
+    let actor = actor_of(&store, &headers);
+    if authorize(
+        &store,
+        actor,
+        Capability::RetireWork,
+        DecisionAction::RetireWork,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "task",
+                id.as_str(),
+                DecisionAction::RetireWork,
+                DecisionInput {
+                    actor,
+                    rationale: body.rationale,
+                    evidence: body.evidence,
+                },
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the issue is still open"));
+    }
+    let task = store
+        .get_task(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("task {id}")))?;
+    let project = store
+        .get_project(&task.project_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("project {}", task.project_id)))?;
+
+    github
+        .close_issue(
+            &project.repo_owner,
+            &project.repo_name,
+            task.gh_issue_number,
+            reason,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("closing the issue failed: {e}")))?;
+
+    store
+        .record_issue_closed(
+            &id,
+            reason,
+            DecisionInput {
+                actor,
+                rationale: body.rationale,
+                evidence: body.evidence,
+            },
+        )
+        .await?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// The answer to a shadowed write: nothing changed, and here is the ledger
+/// row saying what would have.
+///
+/// A distinct shape rather than the usual body, because returning the normal
+/// success response for a call that did nothing is how a shadow evaluation
+/// quietly becomes a lie. Only the orchestrator can ever see this — a human
+/// is never shadowed — so no typed client has to handle it.
+fn shadowed(decision_seq: i64, effect: &str) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(ShadowAck {
+            shadowed: true,
+            decision_seq,
+            note: format!(
+                "recorded, not applied: {effect}. This capability is in shadow —                  say what you decided and why in the conversation; the human acts on it."
+            ),
+        }),
+    )
+        .into_response()
+}
+
+/// The project a write targets: the one named, or the only one there is.
+/// Guessing between several would be a coin flip with a GitHub write attached.
+async fn resolve_project(store: &Store, id: Option<ProjectId>) -> ApiResult<Project> {
+    match id {
+        Some(id) => store
+            .get_project(&id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("project {id}"))),
+        None => {
+            let mut projects = store.list_projects().await?;
+            match projects.len() {
+                1 => Ok(projects.remove(0)),
+                0 => Err(ApiError::BadRequest("no projects configured".into())),
+                n => Err(ApiError::BadRequest(format!(
+                    "{n} projects configured — name one with project_id"
+                ))),
+            }
+        }
+    }
+}
+
+/// The issue body as filed: what the caller wrote, plus a footer saying who
+/// filed it and why they were looking. Appended server-side so it cannot be
+/// left off, and kept out of the stored `body` so the poller's refresh from
+/// GitHub does not fight with it.
+fn issue_body(body: &str, actor: Actor, provenance: Option<&str>) -> String {
+    let who = match actor {
+        Actor::Orchestrator => "Filed by the Tasks orchestrator",
+        Actor::Human => "Filed via Tasks",
+    };
+    match provenance.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => format!("{body}\n\n---\n{who} — {p}."),
+        None => format!("{body}\n\n---\n{who}."),
+    }
 }
 
 /// Returns the same projection as the default `GET /tasks` — a client applies
@@ -344,6 +683,90 @@ fn actor_of(store: &Store, headers: &axum::http::HeaderMap) -> Actor {
     store.resolve_actor(headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()))
 }
 
+// --- the charter: what the orchestrator may do ---
+
+/// What a caller is allowed to do with a capability, right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Authority {
+    /// Apply it. Every human write, and an orchestrator write on a `live`
+    /// capability.
+    Perform,
+    /// Record the judgment, change nothing. The orchestrator on `shadow`.
+    Shadow,
+}
+
+/// Decide whether this caller may take this action, and how.
+///
+/// The human is never gated: they are the accountable party, and a tool that
+/// asks its owner for permission is just slower. For the orchestrator the
+/// charter decides, and the check lives here rather than in the prompt on
+/// purpose — prompt text is precisely what a restarted or overlong session
+/// misweighs, and "authority the model can talk itself into" is not authority.
+///
+/// The daily cap is a mechanical floor, not a judgment: it bounds a runaway
+/// loop, and it is checked only for actions that will actually be applied.
+async fn authorize(
+    store: &Store,
+    actor: Actor,
+    capability: Capability,
+    action: DecisionAction,
+) -> ApiResult<Authority> {
+    if actor == Actor::Human {
+        return Ok(Authority::Perform);
+    }
+    let entry = store.charter_entry(capability).await?;
+    match entry.level {
+        CharterLevel::Off => Err(ApiError::Forbidden(format!(
+            "{} is off in the charter — say what you would do and why, and leave it to the human",
+            capability.as_str()
+        ))),
+        CharterLevel::Shadow => Ok(Authority::Shadow),
+        CharterLevel::Live => {
+            if let Some(limit) = entry.daily_limit {
+                let used = store.orchestrator_actions_today(action).await?;
+                if used >= limit {
+                    return Err(ApiError::Forbidden(format!(
+                        "{} has used its {limit}/day budget ({used} so far) — \
+                         it resets at midnight UTC",
+                        capability.as_str()
+                    )));
+                }
+            }
+            Ok(Authority::Perform)
+        }
+    }
+}
+
+/// The charter as it stands. Readable by anyone; the orchestrator's own
+/// authority section is generated from this same data every turn.
+async fn get_charter(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<CharterEntry>>> {
+    Ok(Json(store.charter().await?))
+}
+
+/// Change what the orchestrator may do. Human-only, and enforced as such:
+/// a capability that could widen its own charter would not be a charter.
+async fn set_charter(
+    State(store): State<Arc<Store>>,
+    Path(capability): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetCharter>,
+) -> ApiResult<Json<CharterEntry>> {
+    if actor_of(&store, &headers) != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "the charter is the human's to set".into(),
+        ));
+    }
+    let capability = Capability::from_str(&capability)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown capability: {capability}")))?;
+    let level = CharterLevel::from_str(&body.level)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown level: {}", body.level)))?;
+    Ok(Json(
+        store
+            .set_charter(capability, level, body.daily_limit)
+            .await?,
+    ))
+}
+
 /// The decisions ledger. `?spec=` / `?build=` narrow to one subject; the
 /// default is the whole ledger, newest first.
 async fn list_decisions(
@@ -383,15 +806,27 @@ async fn review_spec(
     Path(spec_id): Path<String>,
     headers: axum::http::HeaderMap,
     Json(body): Json<ReviewRequest>,
-) -> ApiResult<Json<SpecQueueItem>> {
+) -> ApiResult<Response> {
     let status = SpecQueueStatus::from_str(&body.status)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown status: {}", body.status)))?;
     let id = SpecId::from_raw(spec_id);
+    let actor = actor_of(&store, &headers);
     let decision = DecisionInput {
-        actor: actor_of(&store, &headers),
+        actor,
         rationale: body.rationale,
         evidence: body.evidence,
     };
+    let action = review_action(status)?;
+    if authorize(&store, actor, Capability::AutoReviewSpecs, action).await? == Authority::Shadow {
+        // A shadow verdict still discharges the review obligation: the
+        // orchestrator has done everything it is allowed to do, and
+        // re-reminding it forever would be nagging about work it cannot
+        // finish. What remains is the human's turn.
+        let seq = store
+            .record_decision("spec", id.as_str(), action, decision, false)
+            .await?;
+        return Ok(shadowed(seq, "the spec's status is unchanged"));
+    }
     let entry = store
         .review_spec(&id, status, body.feedback, decision)
         .await?;
@@ -402,7 +837,22 @@ async fn review_spec(
     Ok(Json(SpecQueueItem {
         entry,
         task_id: spec.task_id,
-    }))
+    })
+    .into_response())
+}
+
+/// The ledger action a verdict corresponds to. Rejects the statuses that are
+/// not verdicts before anything is recorded.
+fn review_action(status: SpecQueueStatus) -> ApiResult<DecisionAction> {
+    match status {
+        SpecQueueStatus::Approved => Ok(DecisionAction::Approve),
+        SpecQueueStatus::Rejected => Ok(DecisionAction::Reject),
+        SpecQueueStatus::NeedsRevision => Ok(DecisionAction::NeedsRevision),
+        other => Err(ApiError::BadRequest(format!(
+            "{} is not a review outcome",
+            other.as_str()
+        ))),
+    }
 }
 
 // --- builds ---
@@ -414,18 +864,45 @@ async fn request_build(
     State(store): State<Arc<Store>>,
     headers: axum::http::HeaderMap,
     Json(body): Json<BuildRequest>,
-) -> ApiResult<(StatusCode, Json<BuildDetail>)> {
+) -> ApiResult<Response> {
     let base_branch = body.base_branch.as_deref().unwrap_or("main");
+    let actor = actor_of(&store, &headers);
     let decision = DecisionInput {
-        actor: actor_of(&store, &headers),
+        actor,
         rationale: body.rationale,
         evidence: body.evidence,
     };
+    if authorize(
+        &store,
+        actor,
+        Capability::DispatchBuilds,
+        DecisionAction::RequestBuild,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let subject = body
+            .spec_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let seq = store
+            .record_decision(
+                "build",
+                &subject,
+                DecisionAction::RequestBuild,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no Builder run was queued"));
+    }
     let build = store
         .create_build(&body.spec_ids, base_branch, decision)
         .await?;
     let spec_ids = store.build_spec_ids(&build.id).await?;
-    Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })))
+    Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })).into_response())
 }
 
 async fn list_builds(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Build>>> {

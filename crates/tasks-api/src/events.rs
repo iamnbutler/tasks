@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    Actor, BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
+    Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode, ProjectId,
     SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
@@ -44,6 +44,25 @@ pub enum EventPayload {
     TaskGhStateChanged {
         task_id: TaskId,
         gh_state: GhState,
+    },
+    /// An issue was filed *through the server* — discovered work that would
+    /// otherwise have been lost. Distinct from `TaskIngested`, which is the
+    /// poller finding an issue somebody else wrote.
+    IssueCaptured {
+        task_id: TaskId,
+        gh_issue_number: u64,
+        actor: Actor,
+        decision_seq: Option<i64>,
+    },
+    /// An issue was closed through the server. The task is *not* retired here:
+    /// closure is GitHub's fact, and the poller observes it on the next pass
+    /// exactly as it would for an issue closed in the browser.
+    IssueClosed {
+        task_id: TaskId,
+        gh_issue_number: u64,
+        reason: CloseReason,
+        actor: Actor,
+        decision_seq: Option<i64>,
     },
     SessionStarted {
         session_id: SessionId,
@@ -155,6 +174,8 @@ impl EventPayload {
             EventPayload::TaskIngested { .. } => "task_ingested",
             EventPayload::TaskStateChanged { .. } => "task_state_changed",
             EventPayload::TaskGhStateChanged { .. } => "task_gh_state_changed",
+            EventPayload::IssueCaptured { .. } => "issue_captured",
+            EventPayload::IssueClosed { .. } => "issue_closed",
             EventPayload::SessionStarted { .. } => "session_started",
             EventPayload::SessionCompleted { .. } => "session_completed",
             EventPayload::SpecCreated { .. } => "spec_created",
@@ -178,8 +199,9 @@ impl EventPayload {
 mod tests {
     use super::*;
     use crate::models::{
-        Actor, BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId,
-        SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+        Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode,
+        ProjectId, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
+        TaskState,
     };
 
     fn task() -> TaskId {
@@ -206,6 +228,19 @@ mod tests {
             EventPayload::TaskGhStateChanged {
                 task_id: task(),
                 gh_state: GhState::Closed,
+            },
+            EventPayload::IssueCaptured {
+                task_id: task(),
+                gh_issue_number: 900,
+                actor: Actor::Orchestrator,
+                decision_seq: Some(3),
+            },
+            EventPayload::IssueClosed {
+                task_id: task(),
+                gh_issue_number: 900,
+                reason: CloseReason::NotPlanned,
+                actor: Actor::Human,
+                decision_seq: None,
             },
             EventPayload::SessionStarted {
                 session_id: SessionId::from_raw("sess_1"),

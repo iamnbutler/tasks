@@ -13,12 +13,12 @@ use uuid::Uuid;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, Decision,
-    DecisionAction, DecisionInput, GhState, Mode, Obligation, ObligationKind,
-    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo,
-    Project, ProjectId, ReviewedSpec, Session, SessionEndReason, SessionId, SessionStatus,
-    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TaskState, TranscriptLine, TranscriptStream,
+    Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
+    CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
+    GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
+    SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
+    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
 
 /// Builder runs a batch of specs may cost before the batch is retired.
@@ -574,6 +574,91 @@ impl Store {
         };
         self.insert_task(&task).await?;
         Ok(UpsertOutcome::Inserted(task))
+    }
+
+    /// Record an issue this system filed: the task row plus the ledger entry
+    /// explaining why it exists.
+    ///
+    /// The GitHub write is the caller's ([`crate::server`] performs it, per
+    /// "GitHub writes go through the server, never through agents"); by the
+    /// time this runs the issue exists upstream and we are writing down what
+    /// we already did. The task lands in `backlog` like any other intake —
+    /// capturing work and deciding to work on it are separate capabilities,
+    /// and the poller will refresh the row from GitHub on its next pass.
+    pub async fn capture_issue(
+        &self,
+        project_id: &ProjectId,
+        issue: GhIssue,
+        decision: DecisionInput,
+    ) -> Result<Task, StoreError> {
+        require_rationale(&decision)?;
+        let number = issue.number;
+        let task = self.upsert_gh_issue(project_id, issue).await?.into_inner();
+
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let decision_seq = insert_decision(
+            &mut tx,
+            "task",
+            task.id.as_str(),
+            DecisionAction::CaptureWork,
+            &decision,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::IssueCaptured {
+            task_id: task.id.clone(),
+            gh_issue_number: number,
+            actor: decision.actor,
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+        Ok(task)
+    }
+
+    /// Record that an issue was closed through the server.
+    ///
+    /// Deliberately writes no task state. Closure is GitHub's fact: the poller
+    /// sees the issue leave the open set and retires the task through the
+    /// existing path, exactly as for an issue closed in a browser. Pre-marking
+    /// it here would persist a GitHub-owned fact and, worse, would make a
+    /// failed-then-retried close look successful.
+    pub async fn record_issue_closed(
+        &self,
+        task_id: &TaskId,
+        reason: CloseReason,
+        decision: DecisionInput,
+    ) -> Result<(), StoreError> {
+        require_rationale(&decision)?;
+        let task = self
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let decision_seq = insert_decision(
+            &mut tx,
+            "task",
+            task_id.as_str(),
+            DecisionAction::RetireWork,
+            &decision,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::IssueClosed {
+            task_id: task.id,
+            gh_issue_number: task.gh_issue_number,
+            reason,
+            actor: decision.actor,
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+        Ok(())
     }
 
     /// Mark every task of `project_id` whose issue has vanished from the
@@ -2278,6 +2363,148 @@ impl Store {
         rows.into_iter().map(decision_from_row).collect()
     }
 
+    /// Append a ledger row on its own, for decisions whose state change does
+    /// not go through a store method that already writes one.
+    ///
+    /// Two callers, both deliberate. A **shadow** decision (`enforced =
+    /// false`) describes something that never happened — a capture whose
+    /// issue was never filed — so the subject may not be a row at all; the
+    /// claim is that a judgment was rendered, which is the entire product of
+    /// shadow mode. A **queue** decision is recorded after the fact rather
+    /// than inside the queueing transaction: unlike a verdict, it is trivially
+    /// reversible, and the row exists to feed the budget and the audit trail
+    /// rather than to authorize anything.
+    pub async fn record_decision(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: DecisionAction,
+        decision: DecisionInput,
+        enforced: bool,
+    ) -> Result<i64, StoreError> {
+        require_rationale(&decision)?;
+        let mut tx = self.pool.begin().await?;
+        let seq = insert_decision_at(
+            &mut tx,
+            subject_kind,
+            subject_id,
+            action,
+            &decision,
+            enforced,
+            Utc::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(seq)
+    }
+
+    // --- charter ---
+
+    /// Every capability and its standing, in flip order.
+    ///
+    /// A capability missing from the table reads as `off`. That is the safe
+    /// direction and it means adding a capability to the enum does not
+    /// silently grant it before its migration lands.
+    pub async fn charter(&self) -> Result<Vec<CharterEntry>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM orchestrator_charter")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut found: std::collections::HashMap<String, CharterEntry> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let entry = charter_from_row(row)?;
+            found.insert(entry.capability.as_str().to_string(), entry);
+        }
+        Ok(Capability::ALL
+            .iter()
+            .map(|capability| {
+                found.remove(capability.as_str()).unwrap_or(CharterEntry {
+                    capability: *capability,
+                    level: CharterLevel::Off,
+                    daily_limit: None,
+                    updated_at: DateTime::UNIX_EPOCH,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn charter_entry(&self, capability: Capability) -> Result<CharterEntry, StoreError> {
+        let row = sqlx::query("SELECT * FROM orchestrator_charter WHERE capability = ?")
+            .bind(capability.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => charter_from_row(row),
+            None => Ok(CharterEntry {
+                capability,
+                level: CharterLevel::Off,
+                daily_limit: None,
+                updated_at: DateTime::UNIX_EPOCH,
+            }),
+        }
+    }
+
+    /// Set a capability's standing. Human-authoritative: the server never
+    /// calls this on the orchestrator's behalf, and there is no endpoint that
+    /// lets the orchestrator widen its own charter.
+    pub async fn set_charter(
+        &self,
+        capability: Capability,
+        level: CharterLevel,
+        daily_limit: Option<i64>,
+    ) -> Result<CharterEntry, StoreError> {
+        let params = daily_limit
+            .map(|limit| serde_json::to_string(&serde_json::json!({ "daily_limit": limit })))
+            .transpose()?;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO orchestrator_charter (capability, level, params, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(capability) DO UPDATE SET \
+               level = excluded.level, params = excluded.params, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(capability.as_str())
+        .bind(level.as_str())
+        .bind(params)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(CharterEntry {
+            capability,
+            level,
+            daily_limit,
+            updated_at: now,
+        })
+    }
+
+    /// How many decisions of this kind the orchestrator has had *applied*
+    /// today (UTC).
+    ///
+    /// Shadow decisions are excluded deliberately: a cap exists to bound
+    /// effects on the world, and a shadowed decision had none. Counting them
+    /// would make an evaluation run out of budget, which is exactly backwards.
+    pub async fn orchestrator_actions_today(
+        &self,
+        action: DecisionAction,
+    ) -> Result<i64, StoreError> {
+        let since = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight");
+        let since = DateTime::<Utc>::from_naive_utc_and_offset(since, Utc).to_rfc3339();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decisions \
+             WHERE action = ? AND actor = ? AND enforced = 1 AND created_at >= ?",
+        )
+        .bind(action.as_str())
+        .bind(Actor::Orchestrator.as_str())
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     // --- orchestrator session ledger ---
 
     /// Close out the live session and write the seam into the conversation,
@@ -2803,13 +3030,27 @@ async fn insert_decision(
     decision: &DecisionInput,
     now: DateTime<Utc>,
 ) -> Result<i64, StoreError> {
+    insert_decision_at(tx, subject_kind, subject_id, action, decision, true, now).await
+}
+
+/// As [`insert_decision`], but says whether the state actually changed.
+/// `enforced = false` is a shadow decision: recorded judgment, no effect.
+async fn insert_decision_at(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    enforced: bool,
+    now: DateTime<Utc>,
+) -> Result<i64, StoreError> {
     let evidence = decision
         .evidence
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
     let result = sqlx::query(
-        "INSERT INTO decisions             (subject_kind, subject_id, action, actor, rationale, evidence, created_at)          VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO decisions             (subject_kind, subject_id, action, actor, rationale, evidence, enforced, created_at)          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(subject_kind)
     .bind(subject_id)
@@ -2817,6 +3058,7 @@ async fn insert_decision(
     .bind(decision.actor.as_str())
     .bind(decision.rationale.as_deref())
     .bind(evidence)
+    .bind(enforced as i64)
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await?;
@@ -2835,6 +3077,29 @@ fn orchestrator_message_row(
         })?,
         content: row.try_get("content")?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+    })
+}
+
+fn charter_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CharterEntry, StoreError> {
+    let capability_raw: String = row.try_get("capability")?;
+    let level_raw: String = row.try_get("level")?;
+    let params_raw: Option<String> = row.try_get("params")?;
+    let daily_limit = params_raw
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?
+        .and_then(|params| params.get("daily_limit").and_then(|v| v.as_i64()));
+    Ok(CharterEntry {
+        capability: Capability::from_str(&capability_raw).ok_or(StoreError::BadEnum {
+            column: "capability",
+            value: capability_raw,
+        })?,
+        level: CharterLevel::from_str(&level_raw).ok_or(StoreError::BadEnum {
+            column: "level",
+            value: level_raw,
+        })?,
+        daily_limit,
+        updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
 }
 
@@ -2860,6 +3125,7 @@ fn decision_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Decision, StoreErro
             .map(serde_json::from_str)
             .transpose()?,
         transcript_seq: row.try_get("transcript_seq")?,
+        enforced: row.try_get::<i64, _>("enforced")? != 0,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
     })
 }

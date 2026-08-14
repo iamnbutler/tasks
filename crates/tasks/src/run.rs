@@ -422,10 +422,19 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         },
     ));
 
-    server::serve_with_shutdown(store, Some(briefings), config.port, async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("shutdown requested");
-    })
+    // The API's own GitHub client: issue writes go through the server, so
+    // without a token those routes answer 503 rather than falling back to an
+    // agent's credential.
+    server::serve_with_shutdown(
+        store,
+        Some(briefings),
+        config.github_client().map(Arc::new),
+        config.port,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown requested");
+        },
+    )
     .await?;
 
     let _ = shutdown_tx.send(true);

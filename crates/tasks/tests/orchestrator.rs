@@ -445,6 +445,19 @@ async fn the_actor_header_decides_who_a_write_belongs_to() {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let spec = seed_pending_spec(&store).await;
     let token = store.actor_token().to_string();
+    // This test is about *who* a write belongs to, not whether it is allowed,
+    // so grant the two capabilities it exercises. The charter is checked
+    // before the body is validated — permission first, then validity — which
+    // is why they have to be live for a 400 to be reachable at all.
+    for capability in [
+        tasks::models::Capability::AutoReviewSpecs,
+        tasks::models::Capability::DispatchBuilds,
+    ] {
+        store
+            .set_charter(capability, tasks::models::CharterLevel::Live, None)
+            .await
+            .unwrap();
+    }
 
     let app = tasks::server::router(store.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

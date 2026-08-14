@@ -7,13 +7,84 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BriefingSection, Build, Mode, SpecId, TaskId};
+use crate::models::{BriefingSection, Build, Mode, ProjectId, SpecId, TaskId};
 
 /// Body of `POST /projects`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateProject {
     pub repo_owner: String,
     pub repo_name: String,
+}
+
+/// The answer to a write the charter shadowed: the decision was recorded and
+/// nothing happened. Deliberately not the normal success body — a shadow run
+/// whose responses look like real ones is an evaluation that lies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowAck {
+    /// Always `true`; present so a caller can branch on one field.
+    pub shadowed: bool,
+    /// The ledger row holding the judgment that was not applied.
+    pub decision_seq: i64,
+    /// What did not happen, in words, for the agent reading the response.
+    pub note: String,
+}
+
+/// Body of `POST /charter/{capability}` — set what the orchestrator may do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetCharter {
+    /// `off`, `shadow`, or `live`.
+    pub level: String,
+    /// Actions per day, or `null` for uncapped. A mechanical floor against a
+    /// runaway loop; it is not a judgment about whether any one action is a
+    /// good idea.
+    #[serde(default)]
+    pub daily_limit: Option<i64>,
+}
+
+/// Body of `POST /issues` — file an issue upstream and track it here.
+///
+/// The write happens on the server rather than through an agent's own `gh`
+/// credential, which is what makes it show up in the ledger, in the event log,
+/// and under whatever caps the charter sets. An agent filing issues out of band
+/// is not a smaller version of this; it is the ungoverned version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureIssue {
+    /// Which repository. Optional when exactly one project is configured —
+    /// the common case, and one less thing for a caller to get wrong.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Where this came from — "discovered while reviewing spec_… for #812".
+    /// Required of the orchestrator and rendered into the issue body, so the
+    /// capture is auditable from GitHub alone and a human can judge whether
+    /// the instinct is set too loose.
+    #[serde(default)]
+    pub provenance: Option<String>,
+    /// Why this is worth filing. Required of the orchestrator.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /tasks/{task_id}/close` — retire work upstream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloseTaskRequest {
+    /// `completed` or `not_planned`. Not cosmetic: `completed` claims the work
+    /// was done and wants evidence to match, `not_planned` is a recalibration.
+    pub reason: String,
+    /// Why. Required of the orchestrator — "no longer relevant" is the one
+    /// custodial call with no cheap evidence standard, so the reasoning is the
+    /// only thing a human can review it by.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// What was checked: the merged PR, the commit that did it. Free-form
+    /// JSON, stored verbatim on the decision.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// Body of `POST /queue/reorder`: the complete queue order, front to back.

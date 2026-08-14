@@ -39,8 +39,8 @@ use uuid::Uuid;
 use crate::brief::Brief;
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Actor, BuildStatus, Obligation, ObligationKind, OrchestratorFeedEvent, SessionEndReason,
-    SessionStatus, SpecQueueStatus,
+    Actor, BuildStatus, CharterEntry, CharterLevel, Obligation, ObligationKind,
+    OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
 use crate::store::{Store, StoreError};
 
@@ -148,7 +148,12 @@ impl Orchestrator {
     /// prompt updates reach a long-lived session without resetting it, and a
     /// fresh session is re-armed with its instructions on turn one.
     async fn run_agent(&self, prompt: &str) -> Result<Turn, OrchestratorError> {
-        let system = system_prompt(self.config.api_port);
+        // Re-read every turn: the charter is the one statement of what the
+        // orchestrator may do, and it reaches a long-lived session only
+        // through the prompt. A human flipping a capability takes effect on
+        // the next turn, without restarting anything.
+        let charter = self.store.charter().await?;
+        let system = system_prompt(self.config.api_port, &charter);
         match self.store.orchestrator_cc_session().await? {
             None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
@@ -463,6 +468,13 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
                         | SpecQueueStatus::Blocked
                 )
         }
+        // The custodial writes, under the same echo rule. A human filing or
+        // retiring something is news worth having; the orchestrator's own
+        // captures coming back at it would turn a capture spree into a turn
+        // per issue.
+        EventPayload::IssueCaptured { actor, .. } | EventPayload::IssueClosed { actor, .. } => {
+            *actor != Actor::Orchestrator
+        }
         _ => false,
     }
 }
@@ -534,6 +546,17 @@ pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) ->
                 build_id,
                 pr_number,
             } => lines.push(format!("- PR #{pr_number} opened (build {build_id})")),
+            EventPayload::IssueCaptured { task_id, .. } => {
+                lines.push(format!("- Issue filed: {}", task_ref(store, task_id).await))
+            }
+            EventPayload::IssueClosed {
+                gh_issue_number,
+                reason,
+                ..
+            } => lines.push(format!(
+                "- Issue #{gh_issue_number} closed as {}",
+                reason.as_str().replace('_', " ")
+            )),
             EventPayload::ModeChanged { from, to } => lines.push(format!(
                 "- Mode changed: {} → {}",
                 from.as_str(),
@@ -656,10 +679,58 @@ async fn task_ref(store: &Store, task_id: &crate::models::TaskId) -> String {
     }
 }
 
+/// What the orchestrator may do, rendered from the charter rows.
+///
+/// Generated rather than written, because two statements of authority is one
+/// too many: hand-written prose saying "reviews are the human's" would
+/// contradict a charter that says otherwise, and a session under context
+/// pressure picks whichever it likes. This is also why the server enforces the
+/// same rows — the prompt tells it what is true, the endpoint makes it true.
+///
+/// An empty charter reads as everything off, which is the safe direction.
+fn authority_section(charter: &[CharterEntry]) -> String {
+    let mut live = Vec::new();
+    let mut shadow = Vec::new();
+    for entry in charter {
+        let line = match entry.daily_limit {
+            Some(limit) => format!("{} (up to {limit}/day)", entry.capability.describe()),
+            None => entry.capability.describe().to_string(),
+        };
+        match entry.level {
+            CharterLevel::Live => live.push(line),
+            CharterLevel::Shadow => shadow.push(line),
+            CharterLevel::Off => {}
+        }
+    }
+    let mut out = String::from(
+        "What you may do (set by the human; this list is the whole of it, and \
+         the server enforces it — anything not listed here is the human's, so \
+         make the case and leave it):\n",
+    );
+    if live.is_empty() {
+        out.push_str("- Act on your own: nothing yet.\n");
+    } else {
+        for line in live {
+            out.push_str(&format!("- Act on your own: {line}\n"));
+        }
+    }
+    for line in shadow {
+        out.push_str(&format!(
+            "- Decide but do not act: {line}. Call the endpoint as you would \
+             normally; the server records your judgment and applies nothing, \
+             and answers with `shadowed: true` so you know it did not happen. \
+             Then say in the conversation what you decided and why — that \
+             narration is the point of this mode, and the human acts on it.\n"
+        ));
+    }
+    out
+}
+
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
-fn system_prompt(port: u16) -> String {
+fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
+    let authority = authority_section(charter);
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
@@ -704,13 +775,17 @@ fn system_prompt(port: u16) -> String {
          only worth saying after you tried hard to break it and failed, and \
          then say what you tried.\n\
          Be brief on notifications — a quiet pipeline deserves a quiet \
-         channel. Never fabricate activity, and never take the gated actions \
-         below without the human.\n\n\
+         channel. Never fabricate activity.\n\n\
+         {authority}\n\n\
          Your working directory is the project checkout itself. Within your \
          permission settings you may read and edit code, run builds and \
-         tests, and use `gh` (e.g. to file issues the human asks for). If a \
-         tool call is denied, say what was denied instead of improvising \
-         around it.\n\n\
+         tests, and use `gh` to READ GitHub (issues, PRs, merge state). Do \
+         not write to GitHub with `gh` — no filing, closing, commenting, or \
+         editing PR bodies. Those go through the API below, which is what \
+         puts them in the ledger and under whatever limits are set; a `gh` \
+         write is the same action with the accountability removed. If a tool \
+         call is denied, say what was denied instead of improvising around \
+         it.\n\n\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
          state and the activity log honest.\n\n\
@@ -728,10 +803,21 @@ fn system_prompt(port: u16) -> String {
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
          - POST /spec-queue/{{id}}/review \
-           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}} \
-           — ONLY when the human has explicitly given a verdict\n\
+           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
          - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
            specs into one Builder run (serial; one at a time)\n\
+         - POST /issues \
+           {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\"}} — file an \
+           issue. `provenance` says where the work was discovered (\"while \
+           reviewing spec_… for #812\") and is rendered into the issue body; \
+           the server refuses a capture without it. Lands in the backlog, not \
+           the queue\n\
+         - POST /tasks/{{id}}/close \
+           {{\"reason\":\"completed|not_planned\",\"rationale\",\"evidence\"}} — \
+           close the issue upstream. `completed` claims the work is done and \
+           wants evidence to match (a merged PR, a named commit — queried, \
+           never inferred from pipeline activity); `not_planned` is a \
+           recalibration\n\
          - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
            and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
@@ -749,8 +835,6 @@ fn system_prompt(port: u16) -> String {
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → done (rejected = terminal). Issue closure on GitHub \
            retires work automatically; there is no manual mark-done.\n\
-         - Reviews are the human's: only submit a verdict they explicitly \
-           stated, and quote their feedback verbatim.\n\
          - The checkout is shared with the human and other agents. Never \
            switch branches, stash, or discard changes you did not make; do \
            your own work on branches and leave the tree as you found it.\n\
@@ -834,6 +918,26 @@ mod tests {
             actor: Some(Actor::Orchestrator),
             decision_seq: Some(7),
         }));
+        // Custodial writes echo the same way a verdict does.
+        assert!(nudge_worthy(&EventPayload::IssueCaptured {
+            task_id: task(),
+            gh_issue_number: 900,
+            actor: Actor::Human,
+            decision_seq: None,
+        }));
+        assert!(!nudge_worthy(&EventPayload::IssueCaptured {
+            task_id: task(),
+            gh_issue_number: 900,
+            actor: Actor::Orchestrator,
+            decision_seq: Some(2),
+        }));
+        assert!(!nudge_worthy(&EventPayload::IssueClosed {
+            task_id: task(),
+            gh_issue_number: 900,
+            reason: crate::models::CloseReason::Completed,
+            actor: Actor::Orchestrator,
+            decision_seq: Some(3),
+        }));
         assert!(!nudge_worthy(&EventPayload::BuildStarted {
             build_id: BuildId::from_raw("build_1"),
         }));
@@ -850,21 +954,65 @@ mod tests {
 
     #[test]
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
-        let p = system_prompt(4800);
+        let p = system_prompt(4800, &[]);
         assert!(p.contains("http://127.0.0.1:4800"));
         assert!(p.contains("[pipeline]"));
         assert!(p.contains("proactive"));
         assert!(p.contains("ADVERSARIALLY"));
         assert!(p.contains("why are we doing"));
         assert!(p.contains("Never switch branches"));
-        assert!(p.contains("verdict they explicitly stated"));
         // The brief replaces foraging, so the prompt has to introduce it —
         // including the part that keeps it honest: silence is unchecked, not
         // clean.
         assert!(p.contains("[brief]"));
         assert!(p.contains("unchecked rather than fine"));
+        // The custodial writes go through the server, and the `gh` side
+        // channel is closed by instruction — the one statement that keeps the
+        // ledger from being quietly incomplete.
+        assert!(p.contains("POST /issues"));
+        assert!(p.contains("Do not write to GitHub with `gh`"));
         // And it must no longer send the agent to re-derive the present from
         // the whole event log, which is what the brief exists to replace.
         assert!(!p.contains("since=1"));
+    }
+
+    /// The authority section is generated, so an empty charter must read as
+    /// "nothing" — and must not leave behind hand-written prose making its own
+    /// claims about what is allowed. Two statements of authority is one too
+    /// many.
+    #[test]
+    fn authority_comes_from_the_charter_and_nowhere_else() {
+        use crate::models::Capability;
+
+        let entry = |capability, level, daily_limit| CharterEntry {
+            capability,
+            level,
+            daily_limit,
+            updated_at: chrono::Utc::now(),
+        };
+
+        let empty = system_prompt(4800, &[]);
+        assert!(empty.contains("Act on your own: nothing yet"), "{empty}");
+        assert!(!empty.contains("Decide but do not act"), "{empty}");
+
+        let p = system_prompt(
+            4800,
+            &[
+                entry(Capability::CaptureWork, CharterLevel::Live, Some(5)),
+                entry(Capability::RetireWork, CharterLevel::Off, None),
+                entry(Capability::AutoReviewSpecs, CharterLevel::Shadow, None),
+            ],
+        );
+        assert!(p.contains("Act on your own: file issues"), "{p}");
+        assert!(p.contains("up to 5/day"), "{p}");
+        assert!(
+            p.contains("Decide but do not act: render review verdicts"),
+            "{p}"
+        );
+        assert!(p.contains("shadowed: true"), "{p}");
+        // Off is simply absent — the catch-all sentence covers it, and listing
+        // every denial would grow with the enum for no benefit.
+        assert!(!p.contains("close issues that are done"), "{p}");
+        assert!(p.contains("anything not listed here is the human's"), "{p}");
     }
 }
