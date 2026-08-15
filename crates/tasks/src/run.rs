@@ -1557,6 +1557,8 @@ pub async fn orchestrator_loop(
             command: config.orchestrator_cmd.clone(),
             timeout: config.orchestrator_timeout,
             workdir,
+            workdir_is_checkout: config.orchestrator_workdir.is_some(),
+            github_configured: config.github_token.is_some(),
             api_port: config.port,
             curl_config: config.orchestrator_curl_config(),
         },

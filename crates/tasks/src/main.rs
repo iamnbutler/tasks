@@ -50,7 +50,8 @@ reload flags:
 reload exit codes:
   3 busy (work in flight)   4 drain timed out   5 the swap did not land
 
-environment:
+environment (also read from .env — the data dir's, then the nearest one at or
+above the cwd, then the nearest above this binary; the real environment wins):
   TASKS_DATA_DIR         where tasks.db lives (default ~/.local/state/tasks-v2)
   TASKS_SERVER_PORT      default port for `serve`
   TASKS_POLL_INTERVAL    seconds between GitHub polls (default 60)
@@ -64,12 +65,32 @@ environment:
   GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com)
 ";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Two orderings here are load-bearing, which is why `main` is not itself the
+/// `#[tokio::main]` function.
+///
+/// `.env` is read *before* the subscriber exists, because a `.env` may set
+/// `RUST_LOG` — so what it did is reported afterwards rather than logged as it
+/// happens. And it is read *before* the runtime starts, because
+/// [`std::env::set_var`] is unsafe for exactly one reason, another thread
+/// reading the environment concurrently, and an `#[tokio::main]` body is
+/// already running on a thread pool by the time its first statement does.
+///
+/// It runs for every subcommand, not just `serve`: `reload` and `status`
+/// resolve `TASKS_DATA_DIR` too, and a `.env` that moved the data dir for one
+/// and not the others would mean two answers to "which server?".
+fn main() -> Result<()> {
+    let env_sources = tasks::env_file::load();
+
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
+    tasks::env_file::report(&env_sources);
 
+    dispatch()
+}
+
+#[tokio::main]
+async fn dispatch() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]).await,

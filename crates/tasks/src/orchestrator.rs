@@ -74,6 +74,29 @@ pub struct OrchestratorConfig {
     /// Working directory for the agent process — somewhere neutral under the
     /// data dir, not a checkout it could edit.
     pub workdir: PathBuf,
+    /// Whether [`Self::workdir`] is a repo checkout (`ORCHESTRATOR_WORKDIR`
+    /// was set) rather than the neutral dir under the data dir.
+    ///
+    /// It exists only to keep the system prompt honest, and that is not a
+    /// cosmetic concern. The prompt used to assert "your working directory is
+    /// the project checkout itself" unconditionally, so a server booted
+    /// without `ORCHESTRATOR_WORKDIR` told a curl-only agent it could read
+    /// code, edit files and run tests. The agent believed it — spent a turn
+    /// reaching for `python3`, `Write` and a heredoc, had all three denied,
+    /// and reported the denials as a tooling failure. It was right; the
+    /// prompt was lying to it. Anything the prompt claims about the
+    /// environment has to be derived from the environment.
+    pub workdir_is_checkout: bool,
+    /// Whether the server booted with a GitHub credential.
+    ///
+    /// Same principle as [`Self::workdir_is_checkout`], applied to the other
+    /// half of the same incident: without a token every GitHub-backed write
+    /// 500s, intake is off, and a build that succeeds cannot open its PR —
+    /// while the charter still says the orchestrator may file, close, comment
+    /// and merge. Charter authority and server capability are different
+    /// facts, and an agent that only learns the difference from a failed call
+    /// spends a turn diagnosing infrastructure instead of reporting it.
+    pub github_configured: bool,
     /// Port the tasks API listens on; spliced into the system prompt.
     pub api_port: u16,
     /// Where the agent's curl config — its actor credential — is written
@@ -182,7 +205,13 @@ impl Orchestrator {
         // through the prompt. A human flipping a capability takes effect on
         // the next turn, without restarting anything.
         let charter = self.store.charter().await?;
-        let system = system_prompt(self.config.api_port, &charter, &self.config.curl_config);
+        let system = system_prompt(
+            self.config.api_port,
+            &charter,
+            &self.config.curl_config,
+            self.config.workdir_is_checkout,
+            self.config.github_configured,
+        );
         match self.store.orchestrator_cc_session().await? {
             None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
@@ -888,8 +917,68 @@ fn authority_section(charter: &[CharterEntry]) -> String {
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
-fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> String {
+/// What the agent can reach on the machine it runs on.
+///
+/// Generated, for the same reason [`authority_section`] is: a hand-written
+/// sentence about the environment is a claim nobody re-checks when the
+/// environment changes, and this one survived a config change that made it
+/// false. The rule is that the prompt describes what is, and when what is
+/// isn't much, it says so plainly rather than hedging — an agent told it has
+/// no checkout asks for what it needs, where an agent left to discover the
+/// same thing through denials burns a turn on workarounds first.
+fn workdir_section(is_checkout: bool) -> &'static str {
+    if is_checkout {
+        "Your working directory is the project checkout itself. Within your \
+         permission settings you may read and edit code, run builds and \
+         tests, and use `gh` to READ GitHub (issues, PRs, merge state). Do \
+         not write to GitHub with `gh` — no filing, closing, commenting, or \
+         editing PR bodies. Those go through the API below, which is what \
+         puts them in the ledger and under whatever limits are set; a `gh` \
+         write is the same action with the accountability removed. If a tool \
+         call is denied, say what was denied instead of improvising around it."
+    } else {
+        "Your working directory is a scratch directory under the tasks data \
+         dir — it is not a checkout, and it is empty. You have no copy of the \
+         code to read or edit, no build or test to run, and no `gh`. The \
+         HTTP API below, over curl, is the whole of what you can reach. So \
+         when a question turns on what the code actually does, say what you \
+         would need looked at and leave it to the human rather than reasoning \
+         from memory as though you had checked. If a tool call is denied, say \
+         what was denied instead of improvising around it."
+    }
+}
+
+/// What this boot cannot do regardless of what the charter permits, or empty
+/// when nothing is degraded.
+///
+/// Deliberately phrased as "and there is nothing you can do about it": the
+/// failure this comes from had an orchestrator correctly identify a missing
+/// token and then keep offering to retry. A degradation the agent can neither
+/// route around nor fix is one it should hand to the human immediately.
+fn degradation_section(github_configured: bool) -> String {
+    if github_configured {
+        return String::new();
+    }
+    "This server booted without a GitHub credential, so the GitHub half of \
+     the pipeline is inert: filing, closing, commenting, labelling and \
+     merging all fail, issue intake is not running, and a build that succeeds \
+     will still not be able to open its pull request. Nothing you can do \
+     fixes this and retrying will not help — when it blocks you, say so \
+     plainly and tell the human the server needs restarting somewhere \
+     `GITHUB_TOKEN` is set.\n\n"
+        .to_string()
+}
+
+fn system_prompt(
+    port: u16,
+    charter: &[CharterEntry],
+    curl_config: &Path,
+    workdir_is_checkout: bool,
+    github_configured: bool,
+) -> String {
     let authority = authority_section(charter);
+    let workdir = workdir_section(workdir_is_checkout);
+    let degradation = degradation_section(github_configured);
     let curl_config = curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
@@ -945,15 +1034,8 @@ fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> Str
          Be brief on notifications — a quiet pipeline deserves a quiet \
          channel. Never fabricate activity.\n\n\
          {authority}\n\n\
-         Your working directory is the project checkout itself. Within your \
-         permission settings you may read and edit code, run builds and \
-         tests, and use `gh` to READ GitHub (issues, PRs, merge state). Do \
-         not write to GitHub with `gh` — no filing, closing, commenting, or \
-         editing PR bodies. Those go through the API below, which is what \
-         puts them in the ledger and under whatever limits are set; a `gh` \
-         write is the same action with the accountability removed. If a tool \
-         call is denied, say what was denied instead of improvising around \
-         it.\n\n\
+         {degradation}\
+         {workdir}\n\n\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
          state and the activity log honest.\n\n\
@@ -1175,7 +1257,60 @@ mod tests {
     }
 
     fn prompt(port: u16, charter: &[CharterEntry]) -> String {
-        system_prompt(port, charter, Path::new("/data/orchestrator-curl.conf"))
+        system_prompt(
+            port,
+            charter,
+            Path::new("/data/orchestrator-curl.conf"),
+            true,
+            true,
+        )
+    }
+
+    /// A degraded boot has to reach the agent as a statement, not as a 500 on
+    /// its third call. Nothing is said when nothing is wrong.
+    #[test]
+    fn a_missing_github_token_is_stated_up_front() {
+        assert_eq!(degradation_section(true), "");
+
+        let degraded = degradation_section(false);
+        assert!(
+            degraded.contains("without a GitHub credential"),
+            "{degraded}"
+        );
+        assert!(degraded.contains("retrying will not help"), "{degraded}");
+        assert!(degraded.contains("GITHUB_TOKEN"), "{degraded}");
+
+        let p = system_prompt(
+            4800,
+            &[],
+            Path::new("/data/orchestrator-curl.conf"),
+            false,
+            false,
+        );
+        assert!(p.contains("without a GitHub credential"), "{p}");
+        let healthy = prompt(4800, &[]);
+        assert!(!healthy.contains("GitHub credential"), "{healthy}");
+    }
+
+    /// The regression test for the prompt that lied. A server booted without
+    /// `ORCHESTRATOR_WORKDIR` — which is every server started by anything
+    /// other than a shell that exported it — ran a curl-only agent in an
+    /// empty scratch directory while telling it that it had the checkout.
+    #[test]
+    fn the_prompt_claims_a_checkout_only_when_there_is_one() {
+        let with = workdir_section(true);
+        assert!(with.contains("the project checkout itself"), "{with}");
+        assert!(with.contains("read and edit code"), "{with}");
+
+        let without = workdir_section(false);
+        assert!(!without.contains("project checkout itself"), "{without}");
+        assert!(!without.contains("read and edit code"), "{without}");
+        assert!(without.contains("it is not a checkout"), "{without}");
+        // Both modes keep the rule that produced the useful half of the
+        // failure: the agent said exactly what had been denied.
+        for section in [with, without] {
+            assert!(section.contains("say what was denied"), "{section}");
+        }
     }
 
     #[test]

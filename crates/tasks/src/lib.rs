@@ -7,6 +7,7 @@
 pub mod brief;
 pub mod briefing;
 pub mod builder;
+pub mod env_file;
 pub mod github;
 pub mod orchestrator;
 pub mod pidfile;
