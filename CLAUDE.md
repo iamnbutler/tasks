@@ -76,6 +76,10 @@ implementation.
   fallback
 - `crates/tasks-protocol/` — ScoutCommand/ScoutEvent, the `AppProtocol` impl
   shared between server and Scout VMs
+- `crates/build-stamp/` — `build.rs` helper that stamps a build identity
+  (`0.1.<commit count>` + short SHA, env-overridable) into a binary. Used by
+  the server, `tasks-client` and `app-gpui`; one implementation on purpose,
+  since `GET /version` compares those numbers across processes
 - `crates/scout-supervisor/` — PID 1 inside Scout VMs: clone, branch, run the
   agent, report the spec back
 - `crates/vm-pool/` — vendored VM infrastructure (protocol, pool, service,

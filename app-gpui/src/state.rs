@@ -19,6 +19,8 @@ use tasks_client::api::models::{
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
+use crate::about;
+
 /// Activity keeps the newest slice, refetched per event — the client never
 /// holds the whole log (the Swift app did, to reconstruct joins the API now
 /// serves directly).
@@ -92,6 +94,12 @@ pub struct AppState {
     /// Last transport/API failure worth a banner. Cleared on reconnect and
     /// on any fully-successful refresh.
     pub error: Option<String>,
+    /// "This app is older than the server supports" — the answer to a whole
+    /// class of failures that otherwise arrive as unrelated decode errors.
+    /// Set by the connect-time preflight; outranks [`AppState::error`] in the
+    /// banner, because when this app is under the floor, whatever failed
+    /// underneath is the symptom.
+    pub build_warning: Option<String>,
 
     refreshing: bool,
     /// An event arrived while a refresh was in flight — go again after.
@@ -172,7 +180,10 @@ impl AppState {
     /// the reconnecting SSE iterator, and every `Connected` triggers a full
     /// snapshot — so nothing that happened while disconnected is missed.
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let client = Client::from_env();
+        // The About version, not the client crate's own stamp: a warning that
+        // names a number the user can't find on screen is most of the way to
+        // no warning at all.
+        let client = Client::from_env().with_client_version(about::VERSION);
 
         let (tx, mut rx) = mpsc::unbounded();
         {
@@ -255,6 +266,7 @@ impl AppState {
             connected: false,
             loaded: false,
             error: None,
+            build_warning: None,
             refreshing: false,
             dirty: false,
         }
@@ -265,6 +277,10 @@ impl AppState {
             EventStreamItem::Connected => {
                 self.connected = true;
                 self.error = None;
+                // Every connect, not just the first: a reconnect is usually a
+                // server that restarted into a new build, which is exactly
+                // when this app can become the stale one.
+                self.check_build(cx);
                 self.refresh(cx);
             }
             // Identifier-only invalidation signal: never fold the payload
@@ -374,6 +390,26 @@ impl AppState {
             .last()
             .map(|m| m.seq)
             .unwrap_or(0)
+    }
+
+    /// Ask the server whether this build is one it still expects to talk to,
+    /// on the background executor. A transport failure is not reported here —
+    /// "can't reach the server" is already the disconnect banner's job, and
+    /// the verdict is only interesting when the server answered.
+    fn check_build(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let check = cx
+            .background_executor()
+            .spawn(async move { client.preflight() });
+        cx.spawn(async move |this, cx| {
+            let warning = check.await.ok().and_then(|verdict| verdict.warning());
+            this.update(cx, |state: &mut AppState, cx| {
+                state.build_warning = warning;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Full snapshot on the background executor, applied on completion.

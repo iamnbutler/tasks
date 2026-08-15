@@ -4,6 +4,62 @@ How a UI (gpui app, TUI, CLI, Claude Code session) should talk to the
 Tasks server. The HTTP API on `127.0.0.1:4800` (`TASKS_SERVER_PORT`) is the
 only interface — clients never touch SQLite, GitHub, or vm-pool directly.
 
+## Check the build on connect
+
+Both ends ship from one tree, so the wire types are shared and skew is
+normally a build error. What that doesn't cover is two *processes* from
+different commits: a server rebuilt and restarted under an app that wasn't.
+The symptom is a pile of unrelated failures — a strict enum that doesn't know
+a variant, a field that isn't there — which reads as "the server is broken"
+when the fact is "your app is old".
+
+`GET /version` is the answer. Unauthenticated, store-free and first in the
+router, so it also answers while the rest of the process is still starting:
+
+```json
+{ "version": "0.1.163", "commit": "1a7b6c8", "min_client_version": "0.1.0" }
+```
+
+`version` is `0.1.<commit count>`; `commit` is the short SHA (`-dirty` for an
+uncommitted tree). Both are `unknown`/the crate version if the binary was
+built without git in reach — that itself tells you it wasn't a `make` install.
+Compare versions **numerically, component-wise**: `0.1.100` is newer than
+`0.1.9`, and string comparison gets that backwards.
+
+`min_client_version` is the oldest client the server expects to speak to. It
+moves by hand and only for an actual wire break — it deliberately doesn't
+follow `version`, since a floor equal to the current build declares every
+client stale and conveys nothing.
+
+**Under-minimum clients are warned, never refused.** Every route keeps
+answering. In a single-user system the value here is the diagnosis; a 426 on
+every route would turn one legible sentence back into the wall of failed
+requests this exists to replace.
+
+From `tasks-client`, that's one call on every `Connected`:
+
+```rust
+let client = Client::from_env().with_client_version(about::VERSION);
+// ... on each EventStreamItem::Connected, from a worker thread:
+if let Some(warning) = client.preflight().ok().and_then(|v| v.warning()) {
+    // "This client build (0.1.120) is older than the server supports
+    //  (needs 0.1.140, server is 0.1.163) — rebuild the client (`make app`)."
+}
+```
+
+Check it on *every* connect, not just the first: a reconnect is usually a
+server that restarted into a new build. `warning()` is `None` when there is
+nothing certain to say — including when either build is unidentifiable, since
+a warning that fires on merely unlabelled builds gets trained out of use.
+
+A **404** from `/version` is a verdict rather than an error: that server
+predates the route, so it is the stale one (`Preflight::ServerUnversioned`).
+Only a transport failure is an `Err`, and that is the "can't reach the server"
+case a client already handles. There is no `min_server_version` and no warning
+for a client merely *newer* than the server — the 404 is today's only
+reverse-direction signal, though `Preflight::server()` vs `client_version()`
+has the data if you want it.
+
 ## The idiomatic client loop
 
 Tasks is event-sourced at the edge: every write the server performs appends

@@ -11,9 +11,11 @@
 //! so there is no hand-mirrored wire layer and version skew is a build error.
 
 mod sse;
+mod version;
 
 pub use sse::{EventStream, EventStreamItem, OrchestratorFeed, TranscriptTail};
 pub use tasks_api as api;
+pub use version::{CLIENT_COMMIT, CLIENT_VERSION, Preflight};
 
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ use tasks_api::models::{
     OrchestratorSessionInfo, Project, Session, SessionId, Spec, SpecId, SpecQueueItem,
     SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
+use tasks_api::version::VersionInfo;
 use thiserror::Error;
 
 /// The server's default port (`TASKS_SERVER_PORT`).
@@ -93,6 +96,10 @@ pub struct Client {
     /// Agent for SSE streams: no overall timeout (streams are open-ended),
     /// read timeout tuned to the server's keep-alive cadence.
     pub(crate) streams: ureq::Agent,
+    /// The build [`Client::preflight`] reports as "this client". Defaults to
+    /// this crate's own stamp; an app overrides it with the version it shows
+    /// in About, so the warning names a number the user can see.
+    client_version: String,
 }
 
 impl Client {
@@ -112,7 +119,18 @@ impl Client {
             streams: ureq::AgentBuilder::new()
                 .timeout_read(STREAM_READ_TIMEOUT)
                 .build(),
+            client_version: CLIENT_VERSION.to_string(),
         }
+    }
+
+    /// Report `version` as this client's build in [`Client::preflight`].
+    ///
+    /// Pass whatever the UI shows the user (the app passes its About
+    /// version): a warning that names a number nobody can find on screen is
+    /// most of the way to no warning at all.
+    pub fn with_client_version(mut self, version: impl Into<String>) -> Self {
+        self.client_version = version.into();
+        self
     }
 
     /// Port from `TASKS_SERVER_PORT` — the same variable the server reads —
@@ -168,6 +186,32 @@ impl Client {
             .call()
             .map_err(map_ureq)?
             .into_json()?)
+    }
+
+    // --- version ---
+
+    /// The server's build identity. Cheap and store-free at the other end, so
+    /// this also answers while the server is still starting up.
+    pub fn server_version(&self) -> Result<VersionInfo> {
+        self.get_json("/version", &[])
+    }
+
+    /// Check this client's build against the server's floor. Call it on
+    /// connect (and on every reconnect — a reconnect is usually a server that
+    /// restarted into a new build) and put [`Preflight::warning`] in a banner.
+    ///
+    /// A 404 is a *verdict*, not an error: a server without `/version`
+    /// predates the route, which makes it the stale end of the pair. Only a
+    /// transport failure — nothing listening, connection reset — is `Err`,
+    /// and that is the caller's existing "can't reach the server" case.
+    pub fn preflight(&self) -> Result<Preflight> {
+        match self.server_version() {
+            Ok(server) => Ok(Preflight::judge(&self.client_version, server)),
+            Err(ClientError::Api { status: 404, .. }) => Ok(Preflight::ServerUnversioned {
+                client: self.client_version.clone(),
+            }),
+            Err(err) => Err(err),
+        }
     }
 
     // --- projects ---

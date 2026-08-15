@@ -15,6 +15,7 @@ pub mod server;
 pub mod store;
 mod teardown;
 pub mod transcript;
+pub mod version;
 
 pub use tasks_api::{events, models};
 pub use tasks_protocol as protocol;
