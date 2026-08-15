@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use tasks_api::events::Event;
-use tasks_api::models::{OrchestratorFeedEvent, SessionId, TranscriptLine};
+use tasks_api::models::{OrchestratorFeedEvent, TranscriptLine, TranscriptOwner};
 
 use crate::{Client, ClientError, Result, map_ureq};
 
@@ -194,26 +194,41 @@ impl Iterator for EventStream {
     }
 }
 
-/// Gapless live tail of one session's transcript: the server replays from
-/// `since` before going live, and every reconnect resumes from the last
-/// delivered seq, so nothing is skipped. Yields `Err` on drops (the caller's
-/// "connection lost" signal) and keeps going; ends on terminal errors.
+/// Gapless live tail of one run's transcript — a scout session or a build:
+/// the server replays from `since` before going live, and every reconnect
+/// resumes from the last delivered seq, so nothing is skipped. Yields `Err` on
+/// drops (the caller's "connection lost" signal) and keeps going; ends on
+/// terminal errors.
 pub struct TranscriptTail {
     client: Client,
-    session_id: SessionId,
+    owner: TranscriptOwner,
     /// Next seq to ask for — last delivered + 1 (`since` is inclusive).
     next_since: i64,
     link: Link,
 }
 
 impl TranscriptTail {
-    pub(crate) fn new(client: Client, session_id: SessionId, since: i64) -> Self {
+    pub(crate) fn new(client: Client, owner: TranscriptOwner, since: i64) -> Self {
         Self {
             client,
-            session_id,
+            owner,
             next_since: since,
             link: Link::Start,
         }
+    }
+
+    /// The route this tail reconnects to, derived from the owner rather than
+    /// remembered separately: two resources, two routes, one cursor.
+    fn stream_path(&self) -> String {
+        let collection = match self.owner {
+            TranscriptOwner::Session { .. } => "sessions",
+            TranscriptOwner::Build { .. } => "builds",
+        };
+        format!(
+            "/{collection}/{}/transcript/stream?since={}",
+            self.owner.id(),
+            self.next_since
+        )
     }
 }
 
@@ -225,10 +240,7 @@ impl Iterator for TranscriptTail {
             match &mut self.link {
                 Link::Ended => return None,
                 Link::Start | Link::Down => {
-                    let path = format!(
-                        "/sessions/{}/transcript/stream?since={}",
-                        self.session_id, self.next_since
-                    );
+                    let path = self.stream_path();
                     if let Err(err) = self.link.connect(&self.client, &path) {
                         return Some(Err(err));
                     }

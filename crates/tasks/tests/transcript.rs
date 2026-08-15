@@ -10,7 +10,8 @@ use vm_pool_client::Client;
 use vm_pool_protocol::VmConfig;
 
 use tasks::models::{
-    GhState, Project, ProjectId, SessionStatus, Task, TaskId, TaskState, TranscriptStream,
+    GhState, Project, ProjectId, SessionStatus, Task, TaskId, TaskState, TranscriptOwner,
+    TranscriptStream,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
 use tasks::store::Store;
@@ -94,7 +95,10 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
         .expect("dispatch");
 
     let session_id = spec.session_id.clone();
-    let lines = store.transcript_since(&session_id, 0, 1000).await.unwrap();
+    let lines = store
+        .transcript_since(&TranscriptOwner::session(&session_id), 0, 1000)
+        .await
+        .unwrap();
     assert!(!lines.is_empty(), "the run recorded no transcript at all");
 
     // Dense, 1-based, in order — that is what `?since=` paging relies on.
@@ -117,7 +121,9 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
         "tool calls missing from the transcript:\n{joined}"
     );
     assert!(
-        lines.iter().all(|l| l.session_id == session_id),
+        lines
+            .iter()
+            .all(|l| l.owner == TranscriptOwner::session(&session_id)),
         "another session's lines leaked in"
     );
     assert!(
@@ -208,7 +214,7 @@ async fn the_transcript_is_complete_before_the_session_completes() {
     assert!(saw_completion, "no session_completed event was appended");
 
     let lines = store
-        .transcript_since(&spec.session_id, 0, 1000)
+        .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
         .await
         .unwrap();
     assert!(

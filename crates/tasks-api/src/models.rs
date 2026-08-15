@@ -205,15 +205,55 @@ pub struct SessionUsage {
     pub num_turns: Option<u64>,
 }
 
-/// One line of agent output, as persisted. `seq` is dense per session and
-/// assigned at persist time, so readers can page and tail with `?since=`.
+/// One line of agent output, as persisted. `seq` is dense **per owner** and
+/// assigned at persist time, so readers can page and tail with `?since=`. A
+/// client paging several runs must keep one cursor per owner: a build's first
+/// line is seq 1 no matter what its specs' scout sessions recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptLine {
-    pub session_id: SessionId,
+    pub owner: TranscriptOwner,
     pub seq: i64,
     pub timestamp: DateTime<Utc>,
     pub stream: TranscriptStream,
     pub line: String,
+}
+
+/// Which run produced a transcript line. Two variants rather than one opaque
+/// id because they are two resources behind two routes — a reader holding a
+/// line should not have to guess which one to fetch more from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptOwner {
+    Session { session_id: SessionId },
+    Build { build_id: BuildId },
+}
+
+impl TranscriptOwner {
+    pub fn session(id: &SessionId) -> Self {
+        TranscriptOwner::Session {
+            session_id: id.clone(),
+        }
+    }
+
+    pub fn build(id: &BuildId) -> Self {
+        TranscriptOwner::Build {
+            build_id: id.clone(),
+        }
+    }
+
+    /// The owning row's id, whichever side of the arc is set.
+    pub fn id(&self) -> &str {
+        match self {
+            TranscriptOwner::Session { session_id } => session_id.as_str(),
+            TranscriptOwner::Build { build_id } => build_id.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for TranscriptOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.id())
+    }
 }
 
 /// Which pipe a transcript line came from. Mirrors `tasks_protocol::LogStream`

@@ -28,7 +28,7 @@ use tasks_api::http::{
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
     OrchestratorSessionInfo, Project, Session, SessionId, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use thiserror::Error;
 
@@ -286,22 +286,34 @@ impl Client {
         self.get_json(&format!("/sessions/{id}"), &[])
     }
 
-    /// Catch-up read. `since` is inclusive — a tailing caller passes
-    /// `last_seq + 1`. Prefer [`Client::stream_transcript`] for live tails.
+    /// Catch-up read of a scout session's transcript. `since` is inclusive — a
+    /// tailing caller passes `last_seq + 1`. Prefer
+    /// [`Client::stream_transcript`] for live tails.
     pub fn transcript(
         &self,
         id: &SessionId,
         since: Option<i64>,
         limit: Option<i64>,
     ) -> Result<Vec<TranscriptLine>> {
-        let mut query = Vec::new();
-        if let Some(since) = since {
-            query.push(("since", since.to_string()));
-        }
-        if let Some(limit) = limit {
-            query.push(("limit", limit.to_string()));
-        }
-        self.get_json(&format!("/sessions/{id}/transcript"), &query)
+        self.get_json(
+            &format!("/sessions/{id}/transcript"),
+            &transcript_query(since, limit),
+        )
+    }
+
+    /// The same read for a build. `seq` restarts at 1 per owner, so a caller
+    /// paging both a build and its specs' scout sessions needs one cursor per
+    /// owner — never one per task.
+    pub fn build_transcript(
+        &self,
+        id: &BuildId,
+        since: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<TranscriptLine>> {
+        self.get_json(
+            &format!("/builds/{id}/transcript"),
+            &transcript_query(since, limit),
+        )
     }
 
     // --- specs & the review queue ---
@@ -488,7 +500,12 @@ impl Client {
     /// last delivered seq. Ends only on a terminal (HTTP) error — the caller
     /// decides when a completed session's tail is no longer worth holding.
     pub fn stream_transcript(&self, id: &SessionId, since: i64) -> TranscriptTail {
-        TranscriptTail::new(self.clone(), id.clone(), since)
+        TranscriptTail::new(self.clone(), TranscriptOwner::session(id), since)
+    }
+
+    /// The same tail for a build.
+    pub fn stream_build_transcript(&self, id: &BuildId, since: i64) -> TranscriptTail {
+        TranscriptTail::new(self.clone(), TranscriptOwner::build(id), since)
     }
 
     /// The in-flight orchestrator tick (deltas, tool labels, done).
@@ -497,4 +514,17 @@ impl Client {
     pub fn stream_orchestrator(&self) -> OrchestratorFeed {
         OrchestratorFeed::new(self.clone())
     }
+}
+
+/// `?since=&limit=` for the two transcript reads — omitted entirely when the
+/// caller passed nothing, so the server's defaults apply.
+fn transcript_query(since: Option<i64>, limit: Option<i64>) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    if let Some(since) = since {
+        query.push(("since", since.to_string()));
+    }
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+    query
 }

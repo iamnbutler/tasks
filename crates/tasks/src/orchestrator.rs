@@ -963,6 +963,9 @@ fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> Str
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
+         - GET /builds/{{id}}/transcript?since=N — the builder agent's own \
+           output, line by line. Read this FIRST when a build failed: the \
+           build row says it failed, the transcript says why\n\
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
          - POST /spec-queue/{{id}}/review \
            {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
