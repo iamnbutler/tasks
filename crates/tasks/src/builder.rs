@@ -168,6 +168,24 @@ impl Builder {
             Err(e) => Err(e.into()),
         };
 
+        // The agent phase ends here — before teardown, and long before the
+        // push and the PR that `completed_at` waits for. Stamped on the
+        // send-error and timeout paths too, since those are exactly the
+        // durations someone will want to read afterwards. Best-effort: a store
+        // hiccup must not skip the deallocation below.
+        //
+        // Above the flush deliberately: draining a queued transcript is our
+        // bookkeeping, not the agent's work, and an 8 MiB tail would otherwise
+        // be charged to the interval the run budget bounds — the exact
+        // conflation `agent_finished_at` exists to end.
+        if let Err(e) = self
+            .store
+            .set_build_agent_finished(&build.id, Utc::now())
+            .await
+        {
+            warn!(build_id = %build.id, error = %e, "could not stamp the agent phase end");
+        }
+
         // Close the queue and let the writer finish *before* the build row is
         // finalized, so a client refetching on `build_completed` finds the
         // whole transcript rather than a truncated one. This has to happen
@@ -176,19 +194,6 @@ impl Builder {
         // cancelled and whatever is queued here is all that survives. The
         // silent failure this whole thing exists for is exactly that path.
         crate::transcript::flush(sink, writer, build.id.as_str()).await;
-
-        // The agent phase ends here — before teardown, and long before the
-        // push and the PR that `completed_at` waits for. Stamped on the
-        // send-error and timeout paths too, since those are exactly the
-        // durations someone will want to read afterwards. Best-effort: a store
-        // hiccup must not skip the deallocation below.
-        if let Err(e) = self
-            .store
-            .set_build_agent_finished(&build.id, Utc::now())
-            .await
-        {
-            warn!(build_id = %build.id, error = %e, "could not stamp the agent phase end");
-        }
 
         crate::teardown::deallocate_bounded(
             &self.client,

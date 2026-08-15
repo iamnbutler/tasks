@@ -5616,7 +5616,7 @@ mod tests {
         );
     }
 
-    /// Existing session transcripts survive the rebuild in 0020 with their
+    /// Existing session transcripts survive the rebuild in 0021 with their
     /// seqs intact — the migration copies rows, and a dropped or renumbered
     /// one would silently break every `?since=` cursor a client holds.
     ///
@@ -5631,8 +5631,8 @@ mod tests {
         let all: Vec<_> = MIGRATOR.migrations.iter().cloned().collect();
         let split = all
             .iter()
-            .position(|m| m.version == 20)
-            .expect("0020_build_transcripts is in the migration set");
+            .position(|m| m.version == 21)
+            .expect("0021_build_transcripts is in the migration set");
         let mut prefix = Migrator::DEFAULT;
         prefix.migrations = all[..split].to_vec().into();
 
