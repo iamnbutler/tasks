@@ -1,0 +1,11 @@
+[package]
+name = "build-stamp"
+description = "Stamps a build identity (0.1.<commit count> + short SHA) into a binary from build.rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No dependencies on purpose: this is a build-dependency of nearly everything
+# here, and anything it pulls in is paid before the first line compiles.
+[dependencies]

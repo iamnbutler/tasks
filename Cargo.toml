@@ -6,6 +6,7 @@ resolver = "2"
 # crates/tasks-api.
 exclude = ["app-gpui"]
 members = [
+    "crates/build-stamp",
     "crates/builder-supervisor",
     "crates/scout-supervisor",
     "crates/tasks",
@@ -66,6 +67,9 @@ vm-pool-service = { path = "crates/vm-pool/service", version = "0.1.0-alpha.1" }
 vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
 
 # tasks internal
+# build-dependency only: one implementation of the version stamp, so the
+# server, the client and About can be compared to each other at all.
+build-stamp = { path = "crates/build-stamp" }
 tasks-protocol = { path = "crates/tasks-protocol" }
 tasks-api = { path = "crates/tasks-api" }
 tasks = { path = "crates/tasks" }

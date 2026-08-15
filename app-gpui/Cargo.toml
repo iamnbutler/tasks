@@ -18,3 +18,8 @@ tasks-client = { path = "../crates/tasks-client" }
 # from the SSE thread, StreamExt::next on the foreground executor.
 futures = "0.3"
 chrono = "0.4"
+
+[build-dependencies]
+# The version stamp About shows, shared with the server and tasks-client so
+# the three numbers are comparable at all.
+build-stamp = { path = "../crates/build-stamp" }

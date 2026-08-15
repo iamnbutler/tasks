@@ -387,7 +387,12 @@ impl Workspace {
                 )
             })
             .count();
-        let banner = if let Some(error) = &state.error {
+        // The build warning outranks the error: when this app is older than
+        // the server supports, whatever failed underneath is the symptom and
+        // "your app is old" is the cause.
+        let banner = if let Some(warning) = &state.build_warning {
+            Some((warning.clone(), true))
+        } else if let Some(error) = &state.error {
             Some((error.clone(), true))
         } else if state.loaded && !state.connected {
             Some(("Reconnecting to the tasks server…".to_string(), false))

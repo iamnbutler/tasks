@@ -165,6 +165,9 @@ pub fn router_with_services(
     github: Option<Arc<GitHubClient>>,
 ) -> Router {
     Router::new()
+        // First on purpose: no state, no store, no auth — the one route that
+        // answers while everything else might still be wrong.
+        .route("/version", get(get_version))
         .route("/projects", get(list_projects).post(create_project))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
@@ -242,10 +245,26 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    info!(addr = %listener.local_addr()?, "tasks api listening");
+    info!(
+        addr = %listener.local_addr()?,
+        version = crate::version::VERSION,
+        commit = crate::version::COMMIT,
+        "tasks api listening"
+    );
     axum::serve(listener, router_with_services(store, briefings, github))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+// --- version ---
+
+/// Which build is running, and the oldest client it expects to speak to.
+///
+/// No `State` and no store access, deliberately: this is the route a client
+/// preflights before anything else, and the one a restart can poll to find out
+/// whether the new process is up *and* is the build that was just made.
+async fn get_version() -> Json<tasks_api::version::VersionInfo> {
+    Json(crate::version::info())
 }
 
 // --- projects ---
