@@ -8,6 +8,11 @@
 //! its own event-stream subscription filtered by its VM id, so N scouts can
 //! explore N tasks in parallel over one vm-pool connection (share via
 //! `Arc<Scout>` or clone the underlying [`ClientHandle`]).
+//!
+//! A dispatch is two halves: setting the run up (state, session row, VM,
+//! `Start`) and then [`Scout::follow`]ing it (drain → deallocate →
+//! finalize). [`Scout::reattach`] re-enters the second half for a run a
+//! previous process started, which is the whole of what a restart costs now.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,15 +20,16 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use thiserror::Error;
 use tracing::{info, warn};
-use vm_pool_client::{ClientError, ClientHandle, EventStream};
-use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
+use vm_pool_client::{ClientError, ClientHandle};
+use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::events::EventPayload;
 use crate::models::{
     Complexity, ReviewedSpec, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage, Spec,
-    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
+    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner, TranscriptStream,
 };
 use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
+use crate::reattach::{AppEvents, Origin};
 use crate::store::{Store, StoreError};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
@@ -35,6 +41,14 @@ pub enum ScoutError {
     Client(#[from] ClientError),
     #[error("scout failed: {0}")]
     ScoutFailed(String),
+    /// The session could not be picked up after a restart: no VM recorded, the
+    /// pool no longer has it, and nothing terminal in the replay. The run is
+    /// lost, but — see [`crate::run::record_outcome`] — it is *not* the task's
+    /// fault, so it must not burn a dispatch attempt. Reconciliation never
+    /// charged one either; three restarts would otherwise reject a perfectly
+    /// good task.
+    #[error("scout could not be resumed: {0}")]
+    NotResumable(String),
     /// The run ended without a spec but left notes behind. Still an error —
     /// so [`crate::run::record_outcome`] ticks the attempt count and a scout
     /// that dies at the same point every time cannot retry forever — but a
@@ -64,6 +78,16 @@ pub struct ScoutConfig {
     /// VM is deallocated and the dispatch fails with [`ScoutError::Timeout`].
     pub timeout: Duration,
 }
+
+/// Least wall-clock budget a resumed run is given, however long the server was
+/// down for.
+///
+/// The budget is otherwise measured from the run's original start, so a
+/// restart cannot hand a hung scout a fresh hour. This floor covers the
+/// opposite case: after a long outage the replay may already carry the
+/// terminal event, and a budget of zero would deallocate the VM before that
+/// outcome could be read.
+const RESUME_MIN_BUDGET: Duration = Duration::from_secs(30);
 
 /// The repository a single dispatch explores. Per-project, so one dispatcher
 /// serves every tracked project.
@@ -199,11 +223,111 @@ impl Scout {
             )
             .await
         {
-            self.finalize_failed(&session_id, &task, &vm_id, format!("send: {e}"))
+            self.finalize_failed(&session_id, &task, Some(&vm_id), format!("send: {e}"))
                 .await?;
             return Err(e.into());
         }
 
+        let remaining = self.config.timeout.saturating_sub(started.elapsed());
+        let app = AppEvents::live(&mut events, vm_id.clone());
+        self.follow(&session_id, &task, &vm_id, app, remaining, None)
+            .await
+    }
+
+    /// Pick up a scout a previous process left running.
+    ///
+    /// **This always concludes `session`** — on success, on failure, and on
+    /// "not resumable". [`Store::reconcile_orphaned_work_except`] skips rows
+    /// handed to a reattach, so returning while leaving one `running` would
+    /// strand it until someone noticed by hand.
+    ///
+    /// Everything that can go wrong degrades to the old behaviour rather than
+    /// to a wedge: no VM on the row, an attach that fails, a VM the pool no
+    /// longer has and no terminal event to show for it — each concludes the
+    /// session exactly as reconciliation would have.
+    pub async fn reattach(&self, session: Session, task: Task) -> Result<Spec, ScoutError> {
+        let session_id = session.id.clone();
+        let Some(vm_id) = session.vm_id.clone().map(VmId::new) else {
+            let reason = "the session records no VM".to_string();
+            self.finalize_failed(&session_id, &task, None, reason.clone())
+                .await?;
+            return Err(ScoutError::NotResumable(reason));
+        };
+        info!(session_id = %session_id, task_id = %task.id, %vm_id, "reattaching to a scout");
+
+        // `attach` hands back the subscription it took *before* the snapshot;
+        // taking one here would be the wrong one.
+        let (mut events, resume) = match crate::reattach::attach(&self.client, &vm_id).await {
+            Ok(attached) => attached,
+            Err(e) => {
+                let reason = format!("attach failed: {e}");
+                self.finalize_failed(&session_id, &task, Some(&vm_id), reason.clone())
+                    .await?;
+                return Err(ScoutError::NotResumable(reason));
+            }
+        };
+
+        // `present: false` is not "lost": the pool may have reaped the VM
+        // after the run finished, in which case the terminal event is right
+        // there in the replay and the whole run is still recoverable. Only
+        // gone *and* silent is an orphan.
+        if !resume.present && !resume.replay.iter().any(is_terminal) {
+            let reason = "the VM is gone and its run never reported an outcome".to_string();
+            self.finalize_failed(&session_id, &task, Some(&vm_id), reason.clone())
+                .await?;
+            return Err(ScoutError::NotResumable(reason));
+        }
+
+        // The budget is wall-clock from the original start, not from here —
+        // a restart must not hand a hung scout a fresh hour. The floor exists
+        // for the other case: after a long outage the replay may already hold
+        // the terminal event, and a zero budget would deallocate a VM whose
+        // outcome is in hand.
+        let elapsed = (Utc::now() - session.started_at)
+            .to_std()
+            .unwrap_or_default();
+        let remaining = self
+            .config
+            .timeout
+            .saturating_sub(elapsed)
+            .max(RESUME_MIN_BUDGET);
+
+        // Rebuilt from the row and the notes table rather than from the
+        // replay, because a bounded window is exactly what drops the oldest
+        // events — `Started` first of all. This is why the branch is persisted
+        // on arrival, and why checkpoints are persisted as they land.
+        let state = DrainState {
+            branch: (!session.branch.is_empty()).then(|| session.branch.clone()),
+            checkpoint: self
+                .store
+                .get_scout_notes(&session_id)
+                .await?
+                .map(|notes| notes.notes),
+            resumed: true,
+            ..DrainState::default()
+        };
+
+        let app = AppEvents::resumed(&mut events, vm_id.clone(), resume);
+        self.follow(&session_id, &task, &vm_id, app, remaining, Some(state))
+            .await
+    }
+
+    /// The second half of a run, shared by [`Scout::dispatch`] and
+    /// [`Scout::reattach`]: drain to a terminal event, deallocate, finalize.
+    ///
+    /// `resumed` carries what a reattachment already knows from the session
+    /// row (the branch, the last checkpoint) — `None` for a fresh dispatch,
+    /// which starts from nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn follow(
+        &self,
+        session_id: &SessionId,
+        task: &Task,
+        vm_id: &VmId,
+        mut events: AppEvents<'_>,
+        budget: Duration,
+        resumed: Option<DrainState>,
+    ) -> Result<Spec, ScoutError> {
         // Drain events until terminal Completed / Failed, or until the budget
         // runs out. `saturating_sub` means an already-blown budget fires
         // immediately instead of wrapping.
@@ -211,25 +335,43 @@ impl Scout {
         // writer beside it. Both survive: the sink is owner-addressed, and the
         // notes it salvages are still keyed to this session and task.
         let (mut sink, writer) =
-            spawn_transcript_writer(self.store.clone(), TranscriptOwner::session(&session_id));
+            spawn_transcript_writer(self.store.clone(), TranscriptOwner::session(session_id));
         let (mut checkpoints, checkpoint_writer) =
             spawn_checkpoint_writer(self.store.clone(), session_id.clone(), task.id.clone());
         // Everything the drain loop learns lives out here, not inside the
         // future: `tokio::time::timeout` *drops* that future at the deadline,
         // and the deadline is the case this whole feature exists for. State
         // held inside it would be destroyed exactly when it is needed.
-        let mut state = DrainState::default();
-        let remaining = self.config.timeout.saturating_sub(started.elapsed());
+        let mut state = resumed.unwrap_or_default();
+        if state.resumed {
+            // One marker instead of the replayed transcript tail. There is no
+            // durable watermark saying what the dead process already wrote, so
+            // re-persisting the replay would silently double the tail; a
+            // stated gap beats a doubled one.
+            sink.push(
+                TranscriptStream::Stderr,
+                "[tasks] this run was picked back up after a server restart; \
+                 output emitted while no server was listening is not repeated here"
+                    .into(),
+            );
+        }
         let result = match tokio::time::timeout(
-            remaining,
-            drain_scout_events(&mut events, &vm_id, &mut sink, &mut checkpoints, &mut state),
+            budget,
+            drain_scout_events(
+                &self.store,
+                session_id,
+                &mut events,
+                &mut sink,
+                &mut checkpoints,
+                &mut state,
+            ),
         )
         .await
         {
             Ok(result) => result,
             Err(_elapsed) => {
                 let secs = self.config.timeout.as_secs();
-                self.note_timeout(&task, &vm_id, secs).await;
+                self.note_timeout(task, vm_id, secs).await;
                 Err(ScoutError::Timeout { secs })
             }
         };
@@ -257,7 +399,7 @@ impl Scout {
         // Recorded on the failure path too: a scout that burned tokens and then
         // died is the case most worth costing.
         if let Some(usage) = &state.usage
-            && let Err(e) = self.store.update_session_usage(&session_id, usage).await
+            && let Err(e) = self.store.update_session_usage(session_id, usage).await
         {
             warn!(session_id = %session_id, error = %e, "recording session usage failed");
         }
@@ -271,7 +413,7 @@ impl Scout {
         crate::teardown::deallocate_bounded(
             &self.client,
             &self.store,
-            &vm_id,
+            vm_id,
             &format!("scout for task {}", task.id),
             crate::teardown::DEALLOCATE_TIMEOUT,
         )
@@ -284,8 +426,8 @@ impl Scout {
                 files_touched,
             }) => {
                 self.finalize_succeeded(
-                    &session_id,
-                    &task,
+                    session_id,
+                    task,
                     branch,
                     spec_markdown,
                     files_touched,
@@ -300,8 +442,8 @@ impl Scout {
                 files_touched,
             }) => {
                 self.finalize_stopped_early(
-                    &session_id,
-                    &task,
+                    session_id,
+                    task,
                     branch,
                     &reason,
                     notes_markdown,
@@ -324,8 +466,8 @@ impl Scout {
                 match state.checkpoint.take() {
                     Some(notes) => {
                         self.finalize_stopped_early(
-                            &session_id,
-                            &task,
+                            session_id,
+                            task,
                             branch,
                             &reason,
                             notes,
@@ -334,7 +476,7 @@ impl Scout {
                         .await?
                     }
                     None => {
-                        self.finalize_failed(&session_id, &task, &vm_id, reason)
+                        self.finalize_failed(session_id, task, Some(vm_id), reason)
                             .await?
                     }
                 }
@@ -514,11 +656,13 @@ impl Scout {
         Ok(())
     }
 
+    /// `vm_id` is `None` when there is no VM to name — a session row that
+    /// never recorded one. It is a log field only.
     async fn finalize_failed(
         &self,
         session_id: &SessionId,
         task: &Task,
-        vm_id: &VmId,
+        vm_id: Option<&VmId>,
         reason: String,
     ) -> Result<(), ScoutError> {
         let now = Utc::now();
@@ -551,7 +695,7 @@ impl Scout {
                 to: TaskState::Queued,
             })
             .await?;
-        warn!(task_id = %task.id, %vm_id, reason, "scout failed");
+        warn!(task_id = %task.id, ?vm_id, reason, "scout failed");
         Ok(())
     }
 }
@@ -587,6 +731,9 @@ struct DrainState {
     /// salvage — the VM is destroyed, and the supervisor never gets to say
     /// anything more.
     checkpoint: Option<String>,
+    /// Whether this state was rebuilt for a run picked back up after a
+    /// restart, rather than accumulated from the start of one.
+    resumed: bool,
 }
 
 /// Depth of the checkpoint hand-off queue. Small on purpose: checkpoints
@@ -671,27 +818,50 @@ fn parse_usage(line: &str) -> Option<SessionUsage> {
     })
 }
 
-/// Consume this dispatch's own event subscription until its VM reports a
-/// terminal Completed/Failed. Events from other VMs (concurrent scouts) are
-/// ignored; service errors for our requests surface as [`ClientError`] on the
-/// calls themselves, not on this stream.
+/// Whether a scout event ends the run. Used to decide whether a VM the pool
+/// no longer has still left a recoverable outcome behind.
+fn is_terminal(event: &TaskEvent) -> bool {
+    matches!(
+        event,
+        TaskEvent::Scout(
+            ScoutEvent::Completed { .. }
+                | ScoutEvent::StoppedEarly { .. }
+                | ScoutEvent::Failed { .. }
+        )
+    )
+}
+
+/// Consume this run's events — the replay first if there is one, then live —
+/// until its VM reports a terminal Completed/Failed. Events from other VMs
+/// (concurrent scouts) are filtered out by [`AppEvents`]; service errors for
+/// our requests surface as [`ClientError`] on the calls themselves, not here.
+///
+/// A replayed event may already have been acted on by the process that died,
+/// so it is used to rebuild state and never to append output — see
+/// [`Origin`].
 async fn drain_scout_events(
-    events: &mut EventStream<TasksProtocol>,
-    target_vm: &VmId,
+    store: &Store,
+    session_id: &SessionId,
+    events: &mut AppEvents<'_>,
     sink: &mut TranscriptSink,
     checkpoints: &mut CheckpointSink,
     state: &mut DrainState,
 ) -> Result<DrainOutcome, ScoutError> {
     loop {
-        let event = events.recv().await.ok_or(ScoutError::StreamClosed)?;
+        let (origin, event) = events.next().await.ok_or(ScoutError::StreamClosed)?;
 
         match event {
-            ServiceEvent::VmApp {
-                vm_id,
-                event: TaskEvent::Scout(app),
-            } if &vm_id == target_vm => match app {
+            TaskEvent::Scout(app) => match app {
                 ScoutEvent::Started { branch: b } => {
-                    state.branch = Some(b);
+                    state.branch = Some(b.clone());
+                    // Persisted here rather than at finalize: a bounded replay
+                    // window drops the *oldest* events, and `Started` is the
+                    // first one a run emits. A reattachment therefore has to
+                    // be able to read the branch off the row, which means the
+                    // row has to have it from the moment it is known.
+                    if let Err(e) = store.update_session_branch(session_id, &b).await {
+                        warn!(session_id = %session_id, error = %e, "persisting the scout branch failed");
+                    }
                 }
                 ScoutEvent::Progress { stream, line } => {
                     // The result record is the last thing the agent prints; it
@@ -702,11 +872,19 @@ async fn drain_scout_events(
                     {
                         state.usage = Some(usage);
                     }
-                    sink.push(transcript_stream(stream), line);
+                    // Replayed output is the tail of a transcript the previous
+                    // process already wrote, with no watermark saying how much
+                    // of it landed. Persisting it again would duplicate that
+                    // tail silently; `follow` states the gap once instead.
+                    if origin == Origin::Live {
+                        sink.push(transcript_stream(stream), line);
+                    }
                 }
                 // Kept twice over: persisted (so it survives this process
                 // dying) and held in `state` (so it survives this future being
-                // dropped at the deadline). Neither covers the other.
+                // dropped at the deadline). Neither covers the other. A
+                // replayed checkpoint is worth re-persisting — the write is an
+                // upsert of the newest notes, not an append.
                 ScoutEvent::Checkpoint { notes_markdown } => {
                     checkpoints.push(notes_markdown.clone());
                     state.checkpoint = Some(notes_markdown);
@@ -738,9 +916,8 @@ async fn drain_scout_events(
                     return Err(ScoutError::ScoutFailed(reason));
                 }
             },
-            _other => {
-                // Another VM's events, or pool-level chatter — not ours.
-            }
+            // A Builder VM's traffic on the same connection. Not ours.
+            TaskEvent::Build(_) => {}
         }
     }
 }

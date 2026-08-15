@@ -234,6 +234,39 @@ pub enum ServiceCommand<P: AppProtocol = NullProtocol> {
     SubscribeLogs { vm_id: Option<VmId> },
     /// Unsubscribe from log streaming.
     UnsubscribeLogs,
+    /// Pick up a VM a previous client was following.
+    ///
+    /// A client that goes away is invisible from inside the VM: the workload
+    /// keeps running and keeps emitting events, and the service keeps logging
+    /// them. This asks for that log back — the application events recorded for
+    /// `vm_id` with sequence number `since_seq` or higher, newest `limit` of
+    /// them — plus whether the pool still holds the VM.
+    ///
+    /// `limit` is the caller's, deliberately: the reply is one line on a
+    /// line-oriented socket, and a long-running agent emits thousands of
+    /// events. The newest are kept, because a terminal event is by
+    /// construction the last one emitted.
+    Attach {
+        vm_id: VmId,
+        since_seq: u64,
+        limit: usize,
+    },
+}
+
+/// One application event as it was recorded in the event log, carrying the
+/// sequence number it was appended under.
+///
+/// `seq` is what lets a client splice a replay against live traffic without
+/// double-delivering: every live event whose `seq` is covered by the replay
+/// has already been handed over.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "P::Event: Serialize",
+    deserialize = "P::Event: DeserializeOwned",
+))]
+pub struct ReplayedEvent<P: AppProtocol = NullProtocol> {
+    pub seq: u64,
+    pub event: P::Event,
 }
 
 /// Events emitted by vm-pool service to Tasks.
@@ -273,7 +306,34 @@ pub enum ServiceEvent<P: AppProtocol = NullProtocol> {
     /// Acknowledgment that an application command was forwarded to a VM.
     CommandSent { vm_id: VmId },
     /// Application event forwarded from a VM.
-    VmApp { vm_id: VmId, event: P::Event },
+    ///
+    /// `seq` is the event log's sequence number, which a reattaching client
+    /// compares against its replay watermark. `#[serde(default)]` so a peer
+    /// that predates [`ServiceCommand::Attach`] still decodes — it just reads
+    /// every event as seq 0, which is exactly what it did before.
+    VmApp {
+        vm_id: VmId,
+        event: P::Event,
+        #[serde(default)]
+        seq: u64,
+    },
+    /// Response to [`ServiceCommand::Attach`].
+    ///
+    /// `present` is whether the pool still holds the VM. It is read *before*
+    /// the replay, so a VM that finishes in between reports `present: true`
+    /// alongside its terminal event — the safe way round, since the caller
+    /// then reads the outcome instead of writing the work off.
+    ///
+    /// `present: false` is not the same as "lost": if the pool reaped the VM
+    /// after the workload finished, the terminal event is still in `replay`.
+    ///
+    /// `dropped` counts events the `limit` cut off the front of.
+    VmAttached {
+        vm_id: VmId,
+        present: bool,
+        replay: Vec<ReplayedEvent<P>>,
+        dropped: u64,
+    },
 }
 
 /// Wire envelope for a command sent from a client to the service over the
@@ -466,6 +526,62 @@ mod tests {
                 stream: OutputStream::Stdout,
                 data: "hello\n".into(),
             },
+            seq: 17,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServiceEvent<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    /// A peer that predates attach sends `vm_app` without a `seq`. It must
+    /// still decode — the field defaults, and such a peer has no replay to
+    /// splice against anyway.
+    #[test]
+    fn service_event_vm_app_decodes_without_a_seq() {
+        let json = r#"{"type":"vm_app","vm_id":"vm-abc",
+            "event":{"type":"command_completed","exit_code":0}}"#;
+        let parsed: ServiceEvent<ShellProtocol> = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            ServiceEvent::VmApp {
+                vm_id: VmId::new("vm-abc"),
+                event: ShellEvent::CommandCompleted { exit_code: 0 },
+                seq: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn service_command_attach_roundtrip() {
+        let cmd: ServiceCommand<ShellProtocol> = ServiceCommand::Attach {
+            vm_id: VmId::new("vm-abc"),
+            since_seq: 12,
+            limit: 256,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: ServiceCommand<ShellProtocol> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn service_event_vm_attached_roundtrip() {
+        let event: ServiceEvent<ShellProtocol> = ServiceEvent::VmAttached {
+            vm_id: VmId::new("vm-abc"),
+            present: true,
+            replay: vec![
+                ReplayedEvent {
+                    seq: 4,
+                    event: ShellEvent::Output {
+                        stream: OutputStream::Stdout,
+                        data: "working\n".into(),
+                    },
+                },
+                ReplayedEvent {
+                    seq: 9,
+                    event: ShellEvent::CommandCompleted { exit_code: 0 },
+                },
+            ],
+            dropped: 3,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ServiceEvent<ShellProtocol> = serde_json::from_str(&json).unwrap();
@@ -686,6 +802,7 @@ mod tests {
                 stream: OutputStream::Stdout,
                 data: "hello\n".into(),
             },
+            seq: 1,
         });
         assert!(resp.is_push());
         let json = serde_json::to_string(&resp).unwrap();
