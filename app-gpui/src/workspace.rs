@@ -55,6 +55,15 @@ actions!(
     ]
 );
 
+/// Owned snapshot of the in-flight tick for one trailing-row render —
+/// extracted so no borrow of the app state is held while the markdown cache
+/// needs `cx`.
+struct OrchestratorTickView {
+    started_at: chrono::DateTime<chrono::Utc>,
+    text: String,
+    tool: Option<String>,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 pub enum Section {
     Home,
@@ -109,6 +118,10 @@ pub struct Workspace {
     chat_list: ListState,
     /// Message count the list was last synced to.
     chat_len: usize,
+    /// Whether the list currently carries the in-flight tick's trailing item.
+    chat_tick: bool,
+    /// Tick revision the trailing item was last measured at.
+    chat_tick_revision: u64,
     /// Parsed-markdown entities for every reading surface, so re-renders
     /// don't re-parse. `RefCell` because most render paths hold `&self`.
     markdown: RefCell<MarkdownCache>,
@@ -119,10 +132,10 @@ impl Workspace {
         let app_state = cx.new(AppState::new);
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
 
-        // Live elapsed clocks (running scouts/builds) tick once a second —
-        // but only when something is actually running. Either way the view
-        // re-renders every 30s so relative timestamps ("5m") don't go stale
-        // in a quiet window.
+        // Live elapsed clocks (running scouts/builds, and the orchestrator
+        // tick in flight) tick once a second — but only when something is
+        // actually running. Either way the view re-renders every 30s so
+        // relative timestamps ("5m") don't go stale in a quiet window.
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let mut ticks: u64 = 0;
@@ -139,8 +152,9 @@ impl Workspace {
                             || state
                                 .builds
                                 .iter()
-                                .any(|build| build.status == BuildStatus::Running);
-                        if live || ticks % 30 == 0 {
+                                .any(|build| build.status == BuildStatus::Running)
+                            || state.orchestrator_tick.is_some();
+                        if live || ticks.is_multiple_of(30) {
                             cx.notify();
                         }
                     })
@@ -227,6 +241,8 @@ impl Workspace {
             issue_window: None,
             chat_list,
             chat_len: 0,
+            chat_tick: false,
+            chat_tick_revision: 0,
             markdown: RefCell::new(MarkdownCache::new()),
         }
     }
@@ -463,6 +479,12 @@ impl Workspace {
                 )
             })
             .count();
+        // A proactive tick is invisible from every section but Chat, so the
+        // Chat row wears the clock. Same slot the Queue count uses.
+        let tick_elapsed = state
+            .orchestrator_tick
+            .as_ref()
+            .map(|tick| time::elapsed(tick.started_at));
         let banner = if let Some(error) = &state.error {
             Some((error.clone(), true))
         } else if state.loaded && !state.connected {
@@ -486,8 +508,11 @@ impl Workspace {
             .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
                 Section::ALL.into_iter().enumerate().map(|(ix, section)| {
                     let selected = section == active;
-                    let badge = (section == Section::Queue && queued_work > 0)
-                        .then(|| queued_work.to_string());
+                    let badge = match section {
+                        Section::Queue if queued_work > 0 => Some(queued_work.to_string()),
+                        Section::Chat => tick_elapsed.clone(),
+                        _ => None,
+                    };
                     div()
                         .id(ix)
                         .flex()
@@ -560,18 +585,89 @@ impl Workspace {
             .child(inspector)
     }
 
+    /// The provisional view of the tick in flight, rendered as the list's
+    /// trailing item so tail-following pins to it: a muted status line, then
+    /// whatever markdown has arrived. The line leads with an elapsed clock
+    /// because a clock reads as working and a spinner reads as hung — and
+    /// because the clock is correct through extended thinking and slow tool
+    /// calls, when no text is arriving at all.
+    fn render_tick(&self, tick: OrchestratorTickView, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let clock = time::elapsed(tick.started_at);
+        let status = match &tick.tool {
+            Some(label) => format!("{clock} · {label}"),
+            None => format!("{clock} · working…"),
+        };
+        let body = (!tick.text.is_empty()).then(|| {
+            let entity = self
+                .markdown
+                .borrow_mut()
+                .entity("chat:live", &tick.text, cx);
+            div()
+                .px(px(2.))
+                .text_sm()
+                .text_color(theme.fg())
+                .child(markdown_block(&entity, cx))
+        });
+        div()
+            .w_full()
+            .px(px(12.))
+            .py(px(6.))
+            .child(
+                div()
+                    .max_w(CHAT_MAX_WIDTH)
+                    .w_full()
+                    .mx_auto()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_xs().text_color(theme.fg_muted()).child(status))
+                    .children(body),
+            )
+            .into_any_element()
+    }
+
     /// One conversation row. User turns render as cards (their text is
     /// verbatim, not markdown); assistant turns render as full-width
     /// markdown on the pane background, Zed's agent-panel layout. Event and
     /// system rows are quiet one-liners. Every substantive row gets a
-    /// hover-revealed timestamp + copy affordance.
+    /// hover-revealed timestamp + copy affordance. Past the durable
+    /// messages, the one trailing item is the in-flight tick, if any.
     fn render_chat_message(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        let Some(message) = self.app_state.read(cx).orchestrator_messages.get(ix) else {
-            return div().into_any_element();
+        // Owned projection first — the markdown cache needs `cx` mutably
+        // after the state borrow ends.
+        let (message, tick) = {
+            let state = self.app_state.read(cx);
+            match state.orchestrator_messages.get(ix) {
+                Some(message) => (
+                    Some((
+                        message.seq,
+                        message.role,
+                        message.created_at,
+                        message.content.clone(),
+                    )),
+                    None,
+                ),
+                None => (
+                    None,
+                    state
+                        .orchestrator_tick
+                        .as_ref()
+                        .map(|tick| OrchestratorTickView {
+                            started_at: tick.started_at,
+                            text: tick.text.clone(),
+                            tool: tick.tool.clone(),
+                        }),
+                ),
+            }
         };
-        let (seq, role, created_at) = (message.seq, message.role, message.created_at);
-        let content = message.content.clone();
+        let Some((seq, role, created_at, content)) = message else {
+            return match tick {
+                Some(tick) => self.render_tick(tick, cx),
+                None => div().into_any_element(),
+            };
+        };
 
         let body: gpui::AnyElement = match role {
             ChatRole::User => div()
@@ -709,7 +805,7 @@ impl Workspace {
             .flex_col()
             .size_full()
             .map(|el| {
-                if self.chat_len == 0 {
+                if self.chat_len == 0 && !self.chat_tick {
                     el.child(self.render_chat_empty_state(cx))
                 } else {
                     el.child(
@@ -738,7 +834,10 @@ impl Workspace {
                     )
                 }
             })
-            .when(awaiting_reply, |el| {
+            // The in-flight tick renders as the list's trailing item; this
+            // fixed row covers only the gap it can't — input landed, tick
+            // not yet started (or a feed that streams nothing at all).
+            .when(awaiting_reply && !self.chat_tick, |el| {
                 el.child(
                     div().flex_none().w_full().px(px(12.)).pb(px(4.)).child(
                         div()
@@ -912,19 +1011,49 @@ impl Render for Workspace {
         let right_width = self.right_sidebar.width;
         self.right_sidebar.set_width(right_width, viewport_width);
 
-        // Sync the chat list's item count with the message log (append-only,
-        // so a shrink means the server was reset — start over).
-        let messages_len = self.app_state.read(cx).orchestrator_messages.len();
-        if messages_len != self.chat_len {
-            if messages_len < self.chat_len {
-                self.chat_list.reset(messages_len);
-                // Seqs started over — cached parses belong to the old world.
-                self.markdown.borrow_mut().clear();
-            } else {
+        // Sync the chat list with the message log (append-only, so a shrink
+        // means the server was reset — start over) plus the one trailing item
+        // the in-flight tick rides on.
+        let (messages_len, tick_shown, tick_revision) = {
+            let state = self.app_state.read(cx);
+            (
+                state.orchestrator_messages.len(),
+                state.orchestrator_tick.is_some(),
+                state.tick_revision,
+            )
+        };
+        if messages_len < self.chat_len {
+            self.chat_list.reset(messages_len + usize::from(tick_shown));
+            // Seqs started over — cached parses belong to the old world.
+            self.markdown.borrow_mut().clear();
+            self.chat_len = messages_len;
+            self.chat_tick = tick_shown;
+            self.chat_tick_revision = tick_revision;
+        } else {
+            if messages_len > self.chat_len {
+                // At `chat_len`, which is *above* the trailing item: turns
+                // that land mid-tick sit over the reply still being written.
                 self.chat_list
                     .splice(self.chat_len..self.chat_len, messages_len - self.chat_len);
+                self.chat_len = messages_len;
             }
-            self.chat_len = messages_len;
+            if tick_shown != self.chat_tick {
+                // The trailing item appearing or retiring is structural.
+                let end = self.chat_len + usize::from(self.chat_tick);
+                self.chat_list
+                    .splice(self.chat_len..end, usize::from(tick_shown));
+                self.chat_tick = tick_shown;
+                self.chat_tick_revision = tick_revision;
+            } else if tick_shown && tick_revision != self.chat_tick_revision {
+                // Content growth is not: `remeasure_items` re-measures the
+                // one growing item while preserving the logical scroll top,
+                // which is what keeps the tail pin from stuttering as text
+                // streams in. (`splice` would also remeasure, but resets the
+                // offset within the item.)
+                self.chat_list
+                    .remeasure_items(self.chat_len..self.chat_len + 1);
+                self.chat_tick_revision = tick_revision;
+            }
         }
 
         div()

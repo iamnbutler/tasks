@@ -189,6 +189,7 @@ async fn a_stream_json_agent_feeds_deltas_and_tools_and_lands_the_result() {
     assert_eq!(
         got,
         vec![
+            Feed::Started,
             Feed::Delta {
                 text: "Check".into()
             },
@@ -201,6 +202,47 @@ async fn a_stream_json_agent_feeds_deltas_and_tools_and_lands_the_result() {
             },
             Feed::Done,
         ]
+    );
+}
+
+/// The case the start signal exists for: a tick nobody in front of a screen
+/// asked for, running an agent that does not stream. `[Started, Done]` is
+/// then the *only* thing a client can show — without `Started` the whole tick
+/// is invisible until its reply lands. And a no-op tick must announce
+/// nothing, or a client shows a clock for work that never began.
+#[tokio::test]
+async fn a_proactive_tick_announces_itself_before_generating_anything() {
+    use tasks::models::OrchestratorFeedEvent as Feed;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let stub = write_stub(tmp.path(), &args_log, false).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let mut feed = store.subscribe_orchestrator_feed();
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+
+    // Nothing pending: the tick is a no-op and says so by saying nothing.
+    assert!(!orch.tick().await.unwrap());
+    assert!(
+        feed.try_recv().is_err(),
+        "a no-op tick must not announce itself"
+    );
+
+    // An event turn — pipeline news, not a human's message.
+    store
+        .append_orchestrator_message(ChatRole::Event, "spec pending review for #7")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    let mut got = Vec::new();
+    while let Ok(event) = feed.try_recv() {
+        got.push(event);
+    }
+    assert_eq!(
+        got,
+        vec![Feed::Started, Feed::Done],
+        "a plain-text agent streams nothing, so the lifecycle is the signal"
     );
 }
 
@@ -222,6 +264,7 @@ async fn the_orchestrator_stream_endpoint_relays_the_feed() {
     assert_eq!(resp.status(), 200);
     // Headers received means the handler ran, which means the subscription
     // exists — publishing now cannot race it.
+    store.publish_orchestrator_feed(Feed::Started);
     store.publish_orchestrator_feed(Feed::Delta { text: "hi".into() });
     store.publish_orchestrator_feed(Feed::Tool {
         label: "Bash: curl".into(),
@@ -237,6 +280,7 @@ async fn the_orchestrator_stream_endpoint_relays_the_feed() {
             .expect("stream still open");
         body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    assert!(body.contains(r#"{"kind":"started"}"#), "{body}");
     assert!(body.contains(r#"{"kind":"delta","text":"hi"}"#), "{body}");
     assert!(
         body.contains(r#"{"kind":"tool","label":"Bash: curl"}"#),

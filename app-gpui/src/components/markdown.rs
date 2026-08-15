@@ -83,6 +83,9 @@ fn style(cx: &App) -> MarkdownStyle {
 
     let mut style = MarkdownStyle::new()
         .code_font(FONT)
+        // Every surface this style serves renders agent- or GitHub-authored
+        // markdown, where a single newline is an intended break.
+        .soft_break_as_hard_break(true)
         .link_color(theme.accent())
         .code_colors(theme.surface_secondary(), theme.border_subtle())
         .block_quote_colors(theme.border_secondary(), theme.fg_muted())
