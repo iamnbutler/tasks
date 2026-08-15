@@ -6,6 +6,10 @@
 //!   seconds it upserts each project's open issues into tasks.
 //! - [`dispatch_loop`] — picks the next task in queue order and hands it to a
 //!   [`Scout`], up to `SCOUT_MAX_CONCURRENT` at a time.
+//! - [`obligation_loop`] — recomputes what the pipeline is owed and says so,
+//!   until a decision discharges it. The nudge loop tells the orchestrator
+//!   something happened once; this one guarantees the work is not lost when
+//!   that message dies with a failed turn.
 //! - the HTTP control API ([`crate::server`]).
 //!
 //! Both loops read the operating mode from the store on every pass, so a
@@ -43,6 +47,7 @@ use tracing::{info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::VmConfig;
 
+use crate::brief::Brief;
 use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
@@ -393,8 +398,17 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     ));
     let nudge = tokio::spawn(orchestrator_nudge_loop(
         store.clone(),
+        config.clone(),
         NUDGE_DEBOUNCE,
         NUDGE_MAX_WAIT,
+        shutdown_rx.clone(),
+    ));
+    let obligations = tokio::spawn(obligation_loop(
+        store.clone(),
+        config.clone(),
+        OBLIGATION_GRACE,
+        OBLIGATION_REMINDER,
+        OBLIGATION_TICK,
         shutdown_rx.clone(),
     ));
     let briefings = Arc::new(Briefings::new(
@@ -408,16 +422,26 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         },
     ));
 
-    server::serve_with_shutdown(store, Some(briefings), config.port, async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("shutdown requested");
-    })
+    // The API's own GitHub client: issue writes go through the server, so
+    // without a token those routes answer 503 rather than falling back to an
+    // agent's credential.
+    server::serve_with_shutdown(
+        store,
+        Some(briefings),
+        config.github_client().map(Arc::new),
+        config.port,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutdown requested");
+        },
+    )
     .await?;
 
     let _ = shutdown_tx.send(true);
     let _ = poll.await;
     orchestrate.abort();
     nudge.abort();
+    obligations.abort();
     if tokio::time::timeout(SHUTDOWN_GRACE, async {
         let _ = dispatch.await;
         let _ = build.await;
@@ -948,12 +972,16 @@ pub async fn orchestrator_loop(
 /// production passes [`NUDGE_DEBOUNCE`]/[`NUDGE_MAX_WAIT`].
 pub async fn orchestrator_nudge_loop(
     store: Arc<Store>,
+    config: Config,
     debounce: Duration,
     max_wait: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
+    // Built once: the brief's GitHub half degrades to a stated omission when
+    // there is no token, rather than disabling the loop.
+    let github = config.github_client();
     let mut events = store.subscribe_events();
     loop {
         let first = tokio::select! {
@@ -989,13 +1017,93 @@ pub async fn orchestrator_nudge_loop(
             }
         }
 
-        let content = orchestrator::format_nudge(&store, &batch).await;
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let content = orchestrator::format_nudge(&store, &brief, &batch).await;
         info!(events = batch.len(), "nudging orchestrator");
         if let Err(e) = store
             .append_orchestrator_message(ChatRole::Event, &content)
             .await
         {
             warn!(error = %e, "failed to append orchestrator nudge");
+        }
+    }
+}
+
+/// How long freshly-landed work gets before it counts as an obligation. Long
+/// enough that the ordinary nudge, a tick, and a review all fit inside it —
+/// an obligation surfacing means that path failed, which is the case worth
+/// catching rather than the common one.
+const OBLIGATION_GRACE: Duration = Duration::from_secs(15 * 60);
+/// How often a still-open obligation is mentioned again. Standing work should
+/// be persistent, not nagging.
+const OBLIGATION_REMINDER: Duration = Duration::from_secs(30 * 60);
+/// How often state is reconciled. Cheap (two indexed queries), and the
+/// interval only bounds how quickly a *missed* nudge is noticed.
+const OBLIGATION_TICK: Duration = Duration::from_secs(60);
+
+/// Surface what the pipeline is owed, forever, until it is actually done.
+///
+/// This is the half of the orchestrator's input that cannot be lost. The
+/// nudge loop is a latency optimization — it says something happened, once,
+/// and if that turn dies with a timeout the message is still consumed by the
+/// watermark. Obligations are recomputed from state every pass, so the worst
+/// a failure costs is the reminder interval.
+///
+/// Not mode-gated: an obligation is a fact about the pipeline, and Pause
+/// stopping *new* work is not a reason to stop saying that a spec has been
+/// waiting since Tuesday.
+pub async fn obligation_loop(
+    store: Arc<Store>,
+    config: Config,
+    grace: Duration,
+    reminder: Duration,
+    tick: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let grace = chrono::Duration::from_std(grace).expect("grace fits");
+    let interval = chrono::Duration::from_std(reminder).expect("interval fits");
+    let github = config.github_client();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(tick) => {}
+        }
+
+        let open = match store.open_obligations(grace).await {
+            Ok(open) => open,
+            Err(e) => {
+                warn!(error = %e, "reconciling obligations failed");
+                continue;
+            }
+        };
+        if open.is_empty() {
+            continue;
+        }
+        let due = match store.obligations_due_for_reminder(open, interval).await {
+            Ok(due) => due,
+            Err(e) => {
+                warn!(error = %e, "filtering obligation reminders failed");
+                continue;
+            }
+        };
+        if due.is_empty() {
+            continue;
+        }
+
+        info!(obligations = due.len(), "surfacing standing obligations");
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let content = orchestrator::format_obligations(&store, &brief, &due).await;
+        if let Err(e) = store
+            .append_orchestrator_message(ChatRole::Event, &content)
+            .await
+        {
+            warn!(error = %e, "failed to append obligation turn");
+            continue;
+        }
+        // Only after the turn is durable: a failed append must re-remind next
+        // pass rather than going quiet for the full interval.
+        if let Err(e) = store.mark_obligations_surfaced(&due).await {
+            warn!(error = %e, "failed to record obligation reminders");
         }
     }
 }
@@ -1318,7 +1426,7 @@ mod tests {
         assert_eq!(state_of(&backlog.id).await.state, TaskState::Backlog);
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()

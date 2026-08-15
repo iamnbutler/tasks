@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
-    SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode, ProjectId,
+    SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -45,6 +45,25 @@ pub enum EventPayload {
         task_id: TaskId,
         gh_state: GhState,
     },
+    /// An issue was filed *through the server* — discovered work that would
+    /// otherwise have been lost. Distinct from `TaskIngested`, which is the
+    /// poller finding an issue somebody else wrote.
+    IssueCaptured {
+        task_id: TaskId,
+        gh_issue_number: u64,
+        actor: Actor,
+        decision_seq: Option<i64>,
+    },
+    /// An issue was closed through the server. The task is *not* retired here:
+    /// closure is GitHub's fact, and the poller observes it on the next pass
+    /// exactly as it would for an issue closed in the browser.
+    IssueClosed {
+        task_id: TaskId,
+        gh_issue_number: u64,
+        reason: CloseReason,
+        actor: Actor,
+        decision_seq: Option<i64>,
+    },
     SessionStarted {
         session_id: SessionId,
         task_id: TaskId,
@@ -59,10 +78,19 @@ pub enum EventPayload {
         task_id: TaskId,
         session_id: SessionId,
     },
+    /// A spec's review state changed. `actor` is who decided — the
+    /// orchestrator must never be nudged about its own verdicts — and
+    /// `decision_seq` points into the decisions ledger for the rationale.
+    /// Both are absent only on transitions nobody chose (a Builder run
+    /// marking specs `built`).
     SpecQueueStatusChanged {
         spec_id: SpecId,
         from: Option<SpecQueueStatus>,
         to: SpecQueueStatus,
+        #[serde(default)]
+        actor: Option<Actor>,
+        #[serde(default)]
+        decision_seq: Option<i64>,
     },
     /// The human-curated task queue was reordered. `task_ids` is the new order,
     /// front to back; tasks not listed were left unranked.
@@ -77,6 +105,10 @@ pub enum EventPayload {
     BuildRequested {
         build_id: BuildId,
         spec_ids: Vec<SpecId>,
+        #[serde(default)]
+        actor: Option<Actor>,
+        #[serde(default)]
+        decision_seq: Option<i64>,
     },
     /// The serial build loop claimed the build; a Builder VM is running it.
     BuildStarted {
@@ -99,6 +131,18 @@ pub enum EventPayload {
     OrchestratorMessage {
         seq: i64,
         role: ChatRole,
+    },
+    /// The orchestrator started living in a new Claude Code session.
+    /// `replacing` is `None` only for the very first session; otherwise this
+    /// is a seam, and `reason` says whether we chose it or suffered it.
+    ///
+    /// Never nudge-worthy: the seam is already a visible turn in the chat,
+    /// and notifying the new session that it just lost its memory would
+    /// spend its first turn on that.
+    OrchestratorSessionStarted {
+        session_id: String,
+        replacing: Option<String>,
+        reason: Option<SessionEndReason>,
     },
     ModeChanged {
         from: Mode,
@@ -130,6 +174,8 @@ impl EventPayload {
             EventPayload::TaskIngested { .. } => "task_ingested",
             EventPayload::TaskStateChanged { .. } => "task_state_changed",
             EventPayload::TaskGhStateChanged { .. } => "task_gh_state_changed",
+            EventPayload::IssueCaptured { .. } => "issue_captured",
+            EventPayload::IssueClosed { .. } => "issue_closed",
             EventPayload::SessionStarted { .. } => "session_started",
             EventPayload::SessionCompleted { .. } => "session_completed",
             EventPayload::SpecCreated { .. } => "spec_created",
@@ -141,6 +187,7 @@ impl EventPayload {
             EventPayload::BuildCompleted { .. } => "build_completed",
             EventPayload::PullRequestOpened { .. } => "pull_request_opened",
             EventPayload::OrchestratorMessage { .. } => "orchestrator_message",
+            EventPayload::OrchestratorSessionStarted { .. } => "orchestrator_session_started",
             EventPayload::ModeChanged { .. } => "mode_changed",
             EventPayload::BriefingUpdated { .. } => "briefing_updated",
             EventPayload::Note { .. } => "note",
@@ -152,8 +199,9 @@ impl EventPayload {
 mod tests {
     use super::*;
     use crate::models::{
-        BriefingSection, BuildId, BuildStatus, ChatRole, GhState, Mode, ProjectId, SessionId,
-        SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+        Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode,
+        ProjectId, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
+        TaskState,
     };
 
     fn task() -> TaskId {
@@ -181,6 +229,19 @@ mod tests {
                 task_id: task(),
                 gh_state: GhState::Closed,
             },
+            EventPayload::IssueCaptured {
+                task_id: task(),
+                gh_issue_number: 900,
+                actor: Actor::Orchestrator,
+                decision_seq: Some(3),
+            },
+            EventPayload::IssueClosed {
+                task_id: task(),
+                gh_issue_number: 900,
+                reason: CloseReason::NotPlanned,
+                actor: Actor::Human,
+                decision_seq: None,
+            },
             EventPayload::SessionStarted {
                 session_id: SessionId::from_raw("sess_1"),
                 task_id: task(),
@@ -199,12 +260,16 @@ mod tests {
                 spec_id: SpecId::from_raw("spec_1"),
                 from: None,
                 to: SpecQueueStatus::PendingReview,
+                actor: None,
+                decision_seq: None,
             },
             EventPayload::QueueReordered { task_ids: vec![] },
             EventPayload::SpecQueueReordered { spec_ids: vec![] },
             EventPayload::BuildRequested {
                 build_id: BuildId::from_raw("build_1"),
                 spec_ids: vec![SpecId::from_raw("spec_1")],
+                actor: Some(Actor::Human),
+                decision_seq: Some(1),
             },
             EventPayload::BuildStarted {
                 build_id: BuildId::from_raw("build_1"),
@@ -220,6 +285,11 @@ mod tests {
             EventPayload::OrchestratorMessage {
                 seq: 1,
                 role: ChatRole::User,
+            },
+            EventPayload::OrchestratorSessionStarted {
+                session_id: "sess-b".into(),
+                replacing: Some("sess-a".into()),
+                reason: Some(SessionEndReason::ResumeFailed),
             },
             EventPayload::ModeChanged {
                 from: Mode::Play,
@@ -267,11 +337,15 @@ mod tests {
             spec_id: SpecId::from_raw("spec_1"),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         };
         let rejected = EventPayload::SpecQueueStatusChanged {
             spec_id: SpecId::from_raw("spec_1"),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Rejected,
+            actor: Some(Actor::Human),
+            decision_seq: Some(2),
         };
         let approved_wire = serde_json::to_value(&approved).unwrap();
         let rejected_wire = serde_json::to_value(&rejected).unwrap();
@@ -287,6 +361,8 @@ mod tests {
         let wire = serde_json::to_value(EventPayload::BuildRequested {
             build_id: BuildId::from_raw("build_1"),
             spec_ids: vec![SpecId::from_raw("spec_a"), SpecId::from_raw("spec_b")],
+            actor: Some(Actor::Human),
+            decision_seq: None,
         })
         .unwrap();
         assert_eq!(wire["spec_ids"], serde_json::json!(["spec_a", "spec_b"]));

@@ -2,9 +2,10 @@
 //! git repos, a real vm-pool service. No mocks — see CLAUDE.md.
 #![allow(dead_code)] // each test file uses a subset
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -13,8 +14,40 @@ use vm_pool_service::{Service, ServiceConfig};
 
 use tasks_protocol::TasksProtocol;
 
+/// Binaries this suite has already located, keyed by package name. The cell
+/// is what makes concurrent callers for the same binary wait on one build
+/// instead of racing several.
+static WORKSPACE_BINS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<PathBuf>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Path to a binary from another workspace package.
+///
+/// These tests exec binaries they do not own, so `CARGO_BIN_EXE_*` is not
+/// available to them. `make test` prebuilds them and exports
+/// `TASKS_TEST_BIN_DIR`; this reads that. Without it — a bare `cargo test
+/// --workspace` — it falls back to building, once per binary per test
+/// process.
+pub async fn workspace_bin(package: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var("TASKS_TEST_BIN_DIR") {
+        let candidate = Path::new(&dir).join(package);
+        if candidate.is_file() {
+            return candidate;
+        }
+        // A stale export degrades to a build rather than failing the suite.
+        eprintln!("warning: TASKS_TEST_BIN_DIR={dir} has no {package}; building it");
+    }
+
+    // Hold the std mutex only long enough to clone the cell out — never
+    // across the await below.
+    let cell = {
+        let mut bins = WORKSPACE_BINS.lock().unwrap();
+        bins.entry(package.to_string()).or_default().clone()
+    };
+    cell.get_or_init(|| cargo_build(package)).await.clone()
+}
+
 /// Build a cargo target by package name and return its executable path.
-pub async fn cargo_build(package: &str) -> PathBuf {
+async fn cargo_build(package: &str) -> PathBuf {
     let output = Command::new("cargo")
         .args(["build", "-p", package, "--message-format=json"])
         .output()
@@ -105,6 +138,37 @@ pub async fn write_supervisor_wrapper(
 
 pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'\''"#))
+}
+
+/// A [`Config`] with nothing external wired up — no GitHub token, no vm-pool
+/// worth talking to. Enough for the loops that only read `github_client()`
+/// (which is then `None`, so briefs stay DB-derived) and `scout_base_branch`.
+/// Tests that need real dispatch build their own; see `tests/run.rs`.
+pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
+    tasks::run::Config {
+        data_dir: data_dir.to_path_buf(),
+        port: 0,
+        poll_interval: Duration::from_secs(3600),
+        scout_max_concurrent: 1,
+        scout_image: "agent:v1".into(),
+        scout_timeout: Duration::from_secs(300),
+        vm_pool_socket: data_dir.join("vm-pool.sock"),
+        github_token: None,
+        github_api_url: None,
+        intake: tasks::github::IntakeFilter::All,
+        clone_url_base: "https://github.com".into(),
+        scout_base_branch: "main".into(),
+        vm_config: Default::default(),
+        builder_image: "builder:v1".into(),
+        builder_timeout: Duration::from_secs(300),
+        github_rest_api_url: None,
+        orchestrator_cmd: "true".into(),
+        orchestrator_timeout: Duration::from_secs(60),
+        orchestrator_workdir: None,
+        briefing_cmd: "true".into(),
+        briefing_ttl: Duration::from_secs(900),
+        briefing_timeout: Duration::from_secs(60),
+    }
 }
 
 pub fn stub_agent_path() -> PathBuf {

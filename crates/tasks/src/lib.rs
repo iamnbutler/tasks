@@ -4,6 +4,7 @@
 //! `models` and `events`) so native clients can share them without depending
 //! on the server stack.
 
+pub mod brief;
 pub mod briefing;
 pub mod builder;
 pub mod github;

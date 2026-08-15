@@ -339,6 +339,9 @@ impl Scout {
                 spec_id: spec.id.clone(),
                 from: None,
                 to: SpecQueueStatus::PendingReview,
+                // A spec arriving is not a verdict on it.
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         self.store

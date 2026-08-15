@@ -31,7 +31,7 @@ use tasks::store::Store;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until,
+    make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until, workspace_bin,
     write_supervisor_wrapper,
 };
 
@@ -133,7 +133,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     assert_eq!(tasks.len(), 2);
     assert!(tasks.iter().all(|t| t.state == TaskState::Backlog));
     let ingest_events = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -170,7 +170,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
 /// Every `task_gh_state_changed` on the log, oldest first.
 async fn gh_state_changes(store: &Store) -> Vec<(TaskId, GhState)> {
     store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -682,7 +682,7 @@ async fn dispatch_harness_with_agent(
     Config,
     Arc<Service<SupervisorRuntime, TasksProtocol>>,
 ) {
-    let supervisor_bin = cargo_build("scout-supervisor").await;
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let clone_root = tmp.path().join("repos");
     make_fixture_repo(&clone_root.join("test"), "repo.git").await;
@@ -732,7 +732,7 @@ async fn insert_task_with_gh_state(
 /// Task ids in the order the dispatcher started sessions for them.
 async fn dispatch_order(store: &Store) -> Vec<TaskId> {
     store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -922,7 +922,7 @@ async fn three_failed_dispatches_reject_the_task() {
     );
 
     let payloads: Vec<_> = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()
@@ -1108,7 +1108,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
     assert_eq!(timed_out.len(), 3, "three sessions ended on the deadline");
 
     let payloads: Vec<_> = store
-        .events_since(0)
+        .all_events()
         .await
         .unwrap()
         .into_iter()

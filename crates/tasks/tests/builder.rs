@@ -26,8 +26,8 @@ use tokio::process::Command;
 use tasks::builder::{Builder, BuilderConfig};
 use tasks::github::GitHubClient;
 use tasks::models::{
-    BuildStatus, Complexity, GhState, Project, ProjectId, Session, SessionId, SessionStatus, Spec,
-    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, Session, SessionId,
+    SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::store::Store;
 use tasks_protocol::TasksProtocol;
@@ -36,7 +36,7 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    cargo_build, make_fixture_repo, spawn_vm_pool, stub_builder_agent_path,
+    make_fixture_repo, spawn_vm_pool, stub_builder_agent_path, workspace_bin,
     write_builder_supervisor_wrapper,
 };
 
@@ -149,7 +149,7 @@ struct Harness {
 
 async fn harness(agent_cmd: &str) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
-    let supervisor_bin = cargo_build("builder-supervisor").await;
+    let supervisor_bin = workspace_bin("builder-supervisor").await;
     let wrapper =
         write_builder_supervisor_wrapper(tmp.path(), &supervisor_bin, agent_cmd, tmp.path()).await;
     let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
@@ -204,7 +204,11 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
 
     let build = h
         .store
-        .create_build(&[spec_a.id.clone(), spec_b.id.clone()], "main")
+        .create_build(
+            &[spec_a.id.clone(), spec_b.id.clone()],
+            "main",
+            DecisionInput::human(),
+        )
         .await
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
@@ -272,7 +276,11 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
 
     let build = h
         .store
-        .create_build(std::slice::from_ref(&spec.id), "main")
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
         .await
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
@@ -311,7 +319,11 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
         "no PR for a failed build"
     );
 
-    let again = h.store.create_build(&[spec.id], "main").await.unwrap();
+    let again = h
+        .store
+        .create_build(&[spec.id], "main", DecisionInput::human())
+        .await
+        .unwrap();
     assert_eq!(
         h.store.claim_next_queued_build().await.unwrap().unwrap().id,
         again.id

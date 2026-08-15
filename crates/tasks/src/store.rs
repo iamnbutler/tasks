@@ -8,15 +8,33 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::models::{
-    Briefing, BriefingSection, Build, BuildId, BuildStatus, ChatRole, Complexity, GhState, Mode,
-    OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId,
-    ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
+    Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
+    CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
+    GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
+    SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
     SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
+
+/// Builder runs a batch of specs may cost before the batch is retired.
+/// Mirrors `MAX_DISPATCH_ATTEMPTS` for scouts, one diamond along.
+const MAX_BUILD_ATTEMPTS: i64 = 3;
+
+/// Input turns one tick folds into a single prompt. Truncation here is safe
+/// (see [`Store::unanswered_orchestrator_messages`]) and keeps a burst from
+/// spending the context window on a wall of pipeline notices.
+const MAX_TURNS_PER_TICK: i64 = 50;
+
+/// Conversation page size when a client does not ask for one.
+pub const MESSAGE_PAGE_DEFAULT: i64 = 200;
+/// Ceiling on a client-requested page. The conversation is kept forever; what
+/// must stay bounded is any single read of it.
+pub const MESSAGE_PAGE_MAX: i64 = 1000;
 
 /// Result of upserting an external record into our domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +136,16 @@ pub struct Store {
     event_tx: broadcast::Sender<Event>,
     transcript_tx: broadcast::Sender<TranscriptLine>,
     orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
+    /// Secret the orchestrator presents to be attributed as itself. Minted
+    /// per boot and held only in memory: it is handed to the agent through
+    /// its environment (never argv, which is world-readable via `ps`, and
+    /// never the prompt, which is persisted).
+    ///
+    /// Not authentication — the API is loopback and unauthenticated by
+    /// design. It exists so the orchestrator cannot silently be mistaken for
+    /// the human, which matters because the self-nudge filter trusts the
+    /// actor field.
+    actor_token: std::sync::Arc<str>,
 }
 
 impl Store {
@@ -154,6 +182,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
+            actor_token: Uuid::new_v4().to_string().into(),
         })
     }
 
@@ -172,6 +201,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
+            actor_token: Uuid::new_v4().to_string().into(),
         })
     }
 
@@ -546,6 +576,91 @@ impl Store {
         Ok(UpsertOutcome::Inserted(task))
     }
 
+    /// Record an issue this system filed: the task row plus the ledger entry
+    /// explaining why it exists.
+    ///
+    /// The GitHub write is the caller's ([`crate::server`] performs it, per
+    /// "GitHub writes go through the server, never through agents"); by the
+    /// time this runs the issue exists upstream and we are writing down what
+    /// we already did. The task lands in `backlog` like any other intake —
+    /// capturing work and deciding to work on it are separate capabilities,
+    /// and the poller will refresh the row from GitHub on its next pass.
+    pub async fn capture_issue(
+        &self,
+        project_id: &ProjectId,
+        issue: GhIssue,
+        decision: DecisionInput,
+    ) -> Result<Task, StoreError> {
+        require_rationale(&decision)?;
+        let number = issue.number;
+        let task = self.upsert_gh_issue(project_id, issue).await?.into_inner();
+
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let decision_seq = insert_decision(
+            &mut tx,
+            "task",
+            task.id.as_str(),
+            DecisionAction::CaptureWork,
+            &decision,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::IssueCaptured {
+            task_id: task.id.clone(),
+            gh_issue_number: number,
+            actor: decision.actor,
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+        Ok(task)
+    }
+
+    /// Record that an issue was closed through the server.
+    ///
+    /// Deliberately writes no task state. Closure is GitHub's fact: the poller
+    /// sees the issue leave the open set and retires the task through the
+    /// existing path, exactly as for an issue closed in a browser. Pre-marking
+    /// it here would persist a GitHub-owned fact and, worse, would make a
+    /// failed-then-retried close look successful.
+    pub async fn record_issue_closed(
+        &self,
+        task_id: &TaskId,
+        reason: CloseReason,
+        decision: DecisionInput,
+    ) -> Result<(), StoreError> {
+        require_rationale(&decision)?;
+        let task = self
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let decision_seq = insert_decision(
+            &mut tx,
+            "task",
+            task_id.as_str(),
+            DecisionAction::RetireWork,
+            &decision,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::IssueClosed {
+            task_id: task.id,
+            gh_issue_number: task.gh_issue_number,
+            reason,
+            actor: decision.actor,
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Mark every task of `project_id` whose issue has vanished from the
     /// repository's open set as closed. Returns the ids it changed.
     ///
@@ -712,10 +827,14 @@ impl Store {
         })
         .await?;
         for (spec_id, from) in drained {
+            // Retirement follows the issue closing upstream: the world
+            // changed, nobody decided.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from,
                 to: SpecQueueStatus::Rejected,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1140,10 +1259,14 @@ impl Store {
             .await?;
         }
         for (spec_id, from) in drained_specs {
+            // Retirement follows the issue closing upstream: the world
+            // changed, nobody decided.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from,
                 to: SpecQueueStatus::Rejected,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1335,11 +1458,12 @@ impl Store {
         spec_id: &SpecId,
         status: SpecQueueStatus,
         feedback: Option<String>,
+        decision: DecisionInput,
     ) -> Result<SpecQueueEntry, StoreError> {
-        let next_task_state = match status {
-            SpecQueueStatus::Approved => TaskState::ReadyToBuild,
-            SpecQueueStatus::Rejected => TaskState::Rejected,
-            SpecQueueStatus::NeedsRevision => TaskState::Queued,
+        let (next_task_state, action) = match status {
+            SpecQueueStatus::Approved => (TaskState::ReadyToBuild, DecisionAction::Approve),
+            SpecQueueStatus::Rejected => (TaskState::Rejected, DecisionAction::Reject),
+            SpecQueueStatus::NeedsRevision => (TaskState::Queued, DecisionAction::NeedsRevision),
             // `Built` is how the approved queue drains — assigned by a
             // successful Builder run, never rendered by a reviewer.
             SpecQueueStatus::PendingReview | SpecQueueStatus::Blocked | SpecQueueStatus::Built => {
@@ -1349,6 +1473,7 @@ impl Store {
                 )));
             }
         };
+        require_rationale(&decision)?;
 
         let entry = self
             .get_spec_queue_entry(spec_id)
@@ -1370,6 +1495,12 @@ impl Store {
         };
 
         let mut tx = self.pool.begin().await?;
+        // The ledger row lands in the same transaction as the change it
+        // authorizes: events are appended after commit, which is fine for
+        // telemetry but would let a crash leave a verdict with no recorded
+        // reason.
+        let decision_seq =
+            insert_decision(&mut tx, "spec", spec_id.as_str(), action, &decision, now).await?;
         sqlx::query(
             "UPDATE spec_queue SET status = ?, approved_at = ?, feedback = ? \
              WHERE spec_id = ?",
@@ -1392,6 +1523,8 @@ impl Store {
             spec_id: spec_id.clone(),
             from: Some(entry.status),
             to: status,
+            actor: Some(decision.actor),
+            decision_seq: Some(decision_seq),
         })
         .await?;
         if task.state != next_task_state {
@@ -1429,12 +1562,14 @@ impl Store {
         &self,
         spec_ids: &[SpecId],
         base_branch: &str,
+        decision: DecisionInput,
     ) -> Result<Build, StoreError> {
         if spec_ids.is_empty() {
             return Err(StoreError::Invalid(
                 "a build needs at least one spec".into(),
             ));
         }
+        require_rationale(&decision)?;
         let mut seen = std::collections::HashSet::new();
         for id in spec_ids {
             if !seen.insert(id.as_str()) {
@@ -1543,11 +1678,22 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
+        let decision_seq = insert_decision(
+            &mut tx,
+            "build",
+            build.id.as_str(),
+            DecisionAction::RequestBuild,
+            &decision,
+            build.created_at,
+        )
+        .await?;
         tx.commit().await?;
 
         self.append_event(EventPayload::BuildRequested {
             build_id: build.id.clone(),
             spec_ids: resolved.iter().map(|(id, _, _, _)| id.clone()).collect(),
+            actor: Some(decision.actor),
+            decision_seq: Some(decision_seq),
         })
         .await?;
 
@@ -1751,10 +1897,14 @@ impl Store {
         tx.commit().await?;
 
         for spec_id in built_specs {
+            // `built` is how the queue drains — earned by a Builder run,
+            // never rendered by a reviewer.
             self.append_event(EventPayload::SpecQueueStatusChanged {
                 spec_id,
                 from: Some(SpecQueueStatus::Approved),
                 to: SpecQueueStatus::Built,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1801,6 +1951,35 @@ impl Store {
             .execute(&mut *tx)
             .await?;
 
+        // Count the strike against every spec in the batch, and retire the
+        // ones that have run out. Without this the batch stays `approved`
+        // forever, which is harmless while a human decides what to rebuild
+        // and a runaway loop the moment anything dispatches automatically.
+        sqlx::query(
+            "UPDATE spec_queue SET build_attempts = build_attempts + 1              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
+        )
+        .bind(id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let exhausted = sqlx::query(
+            "SELECT spec_id FROM spec_queue              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)                AND status = ? AND build_attempts >= ?",
+        )
+        .bind(id.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(MAX_BUILD_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut blocked = Vec::new();
+        for row in exhausted {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            sqlx::query("UPDATE spec_queue SET status = ? WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Blocked.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            blocked.push(spec_id);
+        }
+
         let task_rows = sqlx::query(
             "SELECT DISTINCT t.id FROM build_specs bs \
              JOIN specs s ON s.id = bs.spec_id \
@@ -1829,6 +2008,19 @@ impl Store {
                 task_id,
                 from: TaskState::Building,
                 to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        // Nobody decided this — the attempt cap did — so it carries no actor,
+        // which is also what keeps it nudge-worthy. Running out of retries is
+        // exactly the moment a human or the orchestrator should hear about it.
+        for spec_id in blocked {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id,
+                from: Some(SpecQueueStatus::Approved),
+                to: SpecQueueStatus::Blocked,
+                actor: None,
+                decision_seq: None,
             })
             .await?;
         }
@@ -1883,31 +2075,51 @@ impl Store {
         self.orchestrator_feed_tx.subscribe()
     }
 
-    /// Messages with `seq > since`, oldest first.
+    /// Messages with `seq > since`, oldest first, at most `limit`.
+    ///
+    /// The cap is not optional. This read had none, and the app refetches
+    /// from seq 0 on every SSE event — so bytes grew as messages × events,
+    /// and autonomy raises both terms at once.
     pub async fn orchestrator_messages_since(
         &self,
         since: i64,
+        limit: i64,
     ) -> Result<Vec<OrchestratorMessage>, StoreError> {
         let rows = sqlx::query(
-            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq",
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE seq > ? ORDER BY seq LIMIT ?",
         )
         .bind(since)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                let role_raw: String = row.try_get("role")?;
-                Ok(OrchestratorMessage {
-                    seq: row.try_get("seq")?,
-                    role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
-                        column: "role",
-                        value: role_raw,
-                    })?,
-                    content: row.try_get("content")?,
-                    created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(orchestrator_message_row).collect()
+    }
+
+    /// The newest `limit` messages (optionally those before `before`),
+    /// returned oldest-first so they render in order.
+    ///
+    /// This is how a client opens the conversation and how it pages
+    /// backwards through it. The history itself is never trimmed — the table
+    /// is the durable record and storage is cheap; it is the *read* that has
+    /// to be bounded.
+    pub async fn orchestrator_messages_window(
+        &self,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<OrchestratorMessage>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, role, content, created_at FROM orchestrator_messages              WHERE (?1 IS NULL OR seq < ?1) ORDER BY seq DESC LIMIT ?2",
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages: Vec<_> = rows
+            .into_iter()
+            .map(orchestrator_message_row)
+            .collect::<Result<_, _>>()?;
+        messages.reverse();
+        Ok(messages)
     }
 
     /// The input turns (user + event) the orchestrator has not answered yet:
@@ -1924,11 +2136,15 @@ impl Store {
             .fetch_one(&self.pool)
             .await?
             .try_get("answered_through")?;
+        // Capping the prompt cannot lose input: the tick advances the
+        // watermark only to the highest seq it actually included, so anything
+        // truncated here is still unanswered on the next pass. A backlog
+        // drains in batches instead of building one enormous prompt.
         Ok(self
-            .orchestrator_messages_since(watermark)
+            .orchestrator_messages_since(watermark, MAX_TURNS_PER_TICK)
             .await?
             .into_iter()
-            .filter(|m| m.role != ChatRole::Assistant)
+            .filter(|m| m.role.is_input())
             .collect())
     }
 
@@ -1940,15 +2156,17 @@ impl Store {
         &self,
         content: &str,
         answered_through: i64,
+        cc_session_id: Option<&str>,
     ) -> Result<OrchestratorMessage, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "INSERT INTO orchestrator_messages (role, content, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO orchestrator_messages (role, content, created_at, cc_session_id)              VALUES (?, ?, ?, ?)",
         )
         .bind(ChatRole::Assistant.as_str())
         .bind(content)
         .bind(now.to_rfc3339())
+        .bind(cc_session_id)
         .execute(&mut *tx)
         .await?;
         let seq = result.last_insert_rowid();
@@ -1956,6 +2174,17 @@ impl Store {
             "UPDATE orchestrator SET answered_through = MAX(answered_through, ?) WHERE id = 1",
         )
         .bind(answered_through)
+        .execute(&mut *tx)
+        .await?;
+        // Point any decisions the orchestrator made during this turn at the
+        // prose explaining them. The reasoning is written last — the verdict
+        // is curled mid-turn — so the ledger can only be indexed backwards,
+        // here, once the turn it belongs to exists.
+        sqlx::query(
+            "UPDATE decisions SET transcript_seq = ?              WHERE actor = ? AND transcript_seq IS NULL",
+        )
+        .bind(seq)
+        .bind(Actor::Orchestrator.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1979,15 +2208,419 @@ impl Store {
         Ok(row.try_get("cc_session_id")?)
     }
 
-    pub async fn set_orchestrator_cc_session(
+    /// The secret the orchestrator presents to be attributed as itself.
+    pub fn actor_token(&self) -> &str {
+        &self.actor_token
+    }
+
+    /// Resolve an `X-Tasks-Actor` header value. The expected form is
+    /// `orchestrator <token>`; anything else — absent, malformed, wrong
+    /// token — is [`Actor::Human`], because the human is the caller who
+    /// never has to prove anything.
+    pub fn resolve_actor(&self, header: Option<&str>) -> Actor {
+        match header.and_then(|h| h.split_once(' ')) {
+            Some(("orchestrator", token)) if token == &*self.actor_token => Actor::Orchestrator,
+            _ => Actor::Human,
+        }
+    }
+
+    // --- obligations ---
+
+    /// Everything the pipeline is owed right now, oldest first.
+    ///
+    /// Computed, never stored. `grace` keeps freshly-landed work out of the
+    /// result so the ordinary nudge gets first crack at it — an obligation
+    /// surfacing means the notification path did not do its job, which is
+    /// exactly the case worth catching.
+    pub async fn open_obligations(
         &self,
-        session_id: Option<&str>,
+        grace: chrono::Duration,
+    ) -> Result<Vec<Obligation>, StoreError> {
+        let cutoff = (Utc::now() - grace).to_rfc3339();
+        let mut obligations = Vec::new();
+
+        // A spec awaiting a verdict that nobody has recorded one for. The
+        // decisions check is belt-and-braces today (a verdict moves the
+        // status off pending_review), and it is the honest predicate: the
+        // obligation is discharged by a *decision*, not by being mentioned.
+        let rows = sqlx::query(
+            "SELECT q.spec_id, s.created_at, t.gh_issue_number, t.title              FROM spec_queue q              JOIN specs s ON s.id = q.spec_id              JOIN tasks t ON t.id = s.task_id              WHERE q.status = ? AND s.created_at <= ?                AND NOT EXISTS (SELECT 1 FROM decisions d                                WHERE d.subject_kind = 'spec' AND d.subject_id = q.spec_id)              ORDER BY s.created_at",
+        )
+        .bind(SpecQueueStatus::PendingReview.as_str())
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::ReviewSpec,
+                subject_id: row.try_get("spec_id")?,
+                summary: format!(
+                    "#{} \"{}\" has been waiting for a verdict since {}",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                    since.format("%Y-%m-%d %H:%M UTC"),
+                ),
+                since,
+            });
+        }
+
+        // A batch that ran out of build attempts. Stopped work stays visible
+        // until someone decides about it, rather than parking silently.
+        let rows = sqlx::query(
+            "SELECT q.spec_id, s.created_at, t.gh_issue_number, t.title              FROM spec_queue q              JOIN specs s ON s.id = q.spec_id              JOIN tasks t ON t.id = s.task_id              WHERE q.status = ? ORDER BY s.created_at",
+        )
+        .bind(SpecQueueStatus::Blocked.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::UnblockSpec,
+                subject_id: row.try_get("spec_id")?,
+                summary: format!(
+                    "#{} \"{}\" is blocked: it used up its build attempts and nothing will retry it",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                ),
+                since,
+            });
+        }
+
+        obligations.sort_by_key(|o| o.since);
+        Ok(obligations)
+    }
+
+    /// Narrow a set of obligations to the ones not mentioned recently.
+    /// Purely a rate limit — an obligation left out here is still open.
+    pub async fn obligations_due_for_reminder(
+        &self,
+        obligations: Vec<Obligation>,
+        interval: chrono::Duration,
+    ) -> Result<Vec<Obligation>, StoreError> {
+        let cutoff = (Utc::now() - interval).to_rfc3339();
+        let mut due = Vec::new();
+        for obligation in obligations {
+            let row = sqlx::query(
+                "SELECT last_surfaced_at FROM obligation_reminders                  WHERE kind = ? AND subject_id = ?",
+            )
+            .bind(obligation.kind.as_str())
+            .bind(&obligation.subject_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let quiet = match row {
+                Some(row) => row.try_get::<String, _>("last_surfaced_at")? > cutoff,
+                None => false,
+            };
+            if !quiet {
+                due.push(obligation);
+            }
+        }
+        Ok(due)
+    }
+
+    /// Record that these obligations were just mentioned.
+    pub async fn mark_obligations_surfaced(
+        &self,
+        obligations: &[Obligation],
     ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
-            .bind(session_id)
+        let now = Utc::now().to_rfc3339();
+        for obligation in obligations {
+            sqlx::query(
+                "INSERT INTO obligation_reminders (kind, subject_id, last_surfaced_at)                  VALUES (?, ?, ?)                  ON CONFLICT(kind, subject_id) DO UPDATE SET last_surfaced_at = excluded.last_surfaced_at",
+            )
+            .bind(obligation.kind.as_str())
+            .bind(&obligation.subject_id)
+            .bind(&now)
             .execute(&self.pool)
             .await?;
+        }
         Ok(())
+    }
+
+    // --- decisions ---
+
+    /// The ledger, newest first. `subject` narrows to one spec or build.
+    pub async fn decisions(
+        &self,
+        subject: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<Decision>, StoreError> {
+        let rows = match subject {
+            Some((kind, id)) => sqlx::query(
+                "SELECT * FROM decisions WHERE subject_kind = ? AND subject_id = ?                  ORDER BY seq DESC LIMIT ?",
+            )
+            .bind(kind)
+            .bind(id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?,
+            None => sqlx::query("SELECT * FROM decisions ORDER BY seq DESC LIMIT ?")
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+        };
+        rows.into_iter().map(decision_from_row).collect()
+    }
+
+    /// Append a ledger row on its own, for decisions whose state change does
+    /// not go through a store method that already writes one.
+    ///
+    /// Two callers, both deliberate. A **shadow** decision (`enforced =
+    /// false`) describes something that never happened — a capture whose
+    /// issue was never filed — so the subject may not be a row at all; the
+    /// claim is that a judgment was rendered, which is the entire product of
+    /// shadow mode. A **queue** decision is recorded after the fact rather
+    /// than inside the queueing transaction: unlike a verdict, it is trivially
+    /// reversible, and the row exists to feed the budget and the audit trail
+    /// rather than to authorize anything.
+    pub async fn record_decision(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: DecisionAction,
+        decision: DecisionInput,
+        enforced: bool,
+    ) -> Result<i64, StoreError> {
+        require_rationale(&decision)?;
+        let mut tx = self.pool.begin().await?;
+        let seq = insert_decision_at(
+            &mut tx,
+            subject_kind,
+            subject_id,
+            action,
+            &decision,
+            enforced,
+            Utc::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(seq)
+    }
+
+    // --- charter ---
+
+    /// Every capability and its standing, in flip order.
+    ///
+    /// A capability missing from the table reads as `off`. That is the safe
+    /// direction and it means adding a capability to the enum does not
+    /// silently grant it before its migration lands.
+    pub async fn charter(&self) -> Result<Vec<CharterEntry>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM orchestrator_charter")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut found: std::collections::HashMap<String, CharterEntry> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let entry = charter_from_row(row)?;
+            found.insert(entry.capability.as_str().to_string(), entry);
+        }
+        Ok(Capability::ALL
+            .iter()
+            .map(|capability| {
+                found.remove(capability.as_str()).unwrap_or(CharterEntry {
+                    capability: *capability,
+                    level: CharterLevel::Off,
+                    daily_limit: None,
+                    updated_at: DateTime::UNIX_EPOCH,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn charter_entry(&self, capability: Capability) -> Result<CharterEntry, StoreError> {
+        let row = sqlx::query("SELECT * FROM orchestrator_charter WHERE capability = ?")
+            .bind(capability.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => charter_from_row(row),
+            None => Ok(CharterEntry {
+                capability,
+                level: CharterLevel::Off,
+                daily_limit: None,
+                updated_at: DateTime::UNIX_EPOCH,
+            }),
+        }
+    }
+
+    /// Set a capability's standing. Human-authoritative: the server never
+    /// calls this on the orchestrator's behalf, and there is no endpoint that
+    /// lets the orchestrator widen its own charter.
+    pub async fn set_charter(
+        &self,
+        capability: Capability,
+        level: CharterLevel,
+        daily_limit: Option<i64>,
+    ) -> Result<CharterEntry, StoreError> {
+        let params = daily_limit
+            .map(|limit| serde_json::to_string(&serde_json::json!({ "daily_limit": limit })))
+            .transpose()?;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO orchestrator_charter (capability, level, params, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(capability) DO UPDATE SET \
+               level = excluded.level, params = excluded.params, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(capability.as_str())
+        .bind(level.as_str())
+        .bind(params)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(CharterEntry {
+            capability,
+            level,
+            daily_limit,
+            updated_at: now,
+        })
+    }
+
+    /// How many decisions of this kind the orchestrator has had *applied*
+    /// today (UTC).
+    ///
+    /// Shadow decisions are excluded deliberately: a cap exists to bound
+    /// effects on the world, and a shadowed decision had none. Counting them
+    /// would make an evaluation run out of budget, which is exactly backwards.
+    pub async fn orchestrator_actions_today(
+        &self,
+        action: DecisionAction,
+    ) -> Result<i64, StoreError> {
+        let since = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight");
+        let since = DateTime::<Utc>::from_naive_utc_and_offset(since, Utc).to_rfc3339();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM decisions \
+             WHERE action = ? AND actor = ? AND enforced = 1 AND created_at >= ?",
+        )
+        .bind(action.as_str())
+        .bind(Actor::Orchestrator.as_str())
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    // --- orchestrator session ledger ---
+
+    /// Close out the live session and write the seam into the conversation,
+    /// in one transaction.
+    ///
+    /// Called the moment the loss is *known* — a failed `--resume` — not when
+    /// its replacement succeeds, because the context is already gone either
+    /// way and the record should survive a fresh start that also fails. The
+    /// seam is a [`ChatRole::System`] turn, so it is visible to the reader
+    /// without becoming input the orchestrator owes a reply to.
+    pub async fn end_orchestrator_session(
+        &self,
+        cc_session_id: &str,
+        reason: SessionEndReason,
+    ) -> Result<(), StoreError> {
+        let now = Utc::now();
+        let seam = match reason {
+            SessionEndReason::ResumeFailed => {
+                "(session restarted — resuming the previous one failed, so its accumulated \
+                 context is gone. The conversation above is intact; the orchestrator's memory \
+                 of it is not.)"
+            }
+            SessionEndReason::Rotated => {
+                "(session rotated — the previous context was retired deliberately and seeded \
+                 forward as a summary.)"
+            }
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE orchestrator_sessions SET ended_at = ?, end_reason = ?              WHERE cc_session_id = ? AND ended_at IS NULL",
+        )
+        .bind(now.to_rfc3339())
+        .bind(reason.as_str())
+        .bind(cc_session_id)
+        .execute(&mut *tx)
+        .await?;
+        let result = sqlx::query(
+            "INSERT INTO orchestrator_messages (role, content, created_at, cc_session_id)              VALUES (?, ?, ?, ?)",
+        )
+        .bind(ChatRole::System.as_str())
+        .bind(seam)
+        .bind(now.to_rfc3339())
+        .bind(cc_session_id)
+        .execute(&mut *tx)
+        .await?;
+        let seq = result.last_insert_rowid();
+        tx.commit().await?;
+        self.append_event(EventPayload::OrchestratorMessage {
+            seq,
+            role: ChatRole::System,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Adopt a newly created Claude Code session as the live one: open its
+    /// ledger row and point the singleton at it, in one transaction.
+    ///
+    /// Deliberately called only *after* the session's first turn succeeds, so
+    /// a failed start leaves the previous session id in place and the next
+    /// tick retries rather than stranding the conversation on a session
+    /// Claude Code never created.
+    pub async fn begin_orchestrator_session(
+        &self,
+        cc_session_id: &str,
+        replacing: Option<&str>,
+        reason: Option<SessionEndReason>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO orchestrator_sessions (cc_session_id, started_at) VALUES (?, ?)")
+            .bind(cc_session_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE orchestrator SET cc_session_id = ? WHERE id = 1")
+            .bind(cc_session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.append_event(EventPayload::OrchestratorSessionStarted {
+            session_id: cc_session_id.to_string(),
+            replacing: replacing.map(str::to_string),
+            reason,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Record the context size reported by a finished turn. This is the gauge
+    /// a rotation threshold reads: an absolute measurement, not a running
+    /// total, so it stays honest across turns the server never drove (an
+    /// interactive checkout) and across an agent that isn't reporting usage
+    /// at all (the column simply stops advancing).
+    pub async fn record_orchestrator_context_tokens(
+        &self,
+        cc_session_id: &str,
+        tokens: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE orchestrator_sessions SET last_context_tokens = ? WHERE cc_session_id = ?",
+        )
+        .bind(tokens)
+        .bind(cc_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The session ledger, newest first.
+    pub async fn orchestrator_sessions(&self) -> Result<Vec<OrchestratorSession>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(orchestrator_session_row).collect()
     }
 
     /// Record the orchestrator agent's effective working directory. Written
@@ -2006,7 +2639,7 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT cc_session_id, workdir, checked_out_at FROM orchestrator WHERE id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2017,6 +2650,7 @@ impl Store {
             checked_out: checked_out_at
                 .as_deref()
                 .is_some_and(checkout_heartbeat_fresh),
+            context_tokens: row.try_get("last_context_tokens")?,
         })
     }
 
@@ -2101,14 +2735,27 @@ impl Store {
         self.event_tx.subscribe()
     }
 
-    /// Return all events with seq >= `since`, ordered by seq ascending.
-    pub async fn events_since(&self, since: i64) -> Result<Vec<Event>, StoreError> {
-        let rows =
-            sqlx::query("SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq")
-                .bind(since)
-                .fetch_all(&self.pool)
-                .await?;
+    /// Return up to `limit` events with seq >= `since`, ordered by seq
+    /// ascending. The bound is in SQL so a client paging forward through the
+    /// log reads one page per request rather than the whole log each time.
+    pub async fn events_since(&self, since: i64, limit: i64) -> Result<Vec<Event>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, timestamp, payload FROM events WHERE seq >= ? ORDER BY seq LIMIT ?",
+        )
+        .bind(since)
+        // SQLite reads a negative LIMIT as unbounded, so a caller-supplied
+        // `-1` would mean "the whole log" — the opposite of what it looks
+        // like. Clamp here so the bound doesn't depend on caller validation.
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(event_from_row).collect()
+    }
+
+    /// Return the entire event log, ordered by seq ascending. Callers that
+    /// want a page want `events_since`; this one is unbounded on purpose.
+    pub async fn all_events(&self) -> Result<Vec<Event>, StoreError> {
+        self.events_since(0, i64::MAX).await
     }
 
     /// Return the last N events, ordered by seq ascending.
@@ -2350,6 +2997,167 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
         seq: row.try_get("seq")?,
         timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
         payload: serde_json::from_str(&payload_raw)?,
+    })
+}
+
+/// An autonomous verdict with no stated reason is not auditable, and the
+/// whole case for letting the orchestrator decide rests on being able to see
+/// why afterwards. Humans owe no explanation — they are the ones the record
+/// is for.
+fn require_rationale(decision: &DecisionInput) -> Result<(), StoreError> {
+    let missing = decision
+        .rationale
+        .as_deref()
+        .is_none_or(|r| r.trim().is_empty());
+    if decision.actor == Actor::Orchestrator && missing {
+        return Err(StoreError::Invalid(
+            "an orchestrator decision must carry a rationale".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Append a ledger row inside the caller's transaction, returning its seq.
+///
+/// `transcript_seq` is deliberately left NULL: the orchestrator curls its
+/// verdicts mid-turn, so the prose explaining one does not exist yet. It is
+/// backfilled when that turn's reply lands.
+async fn insert_decision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    now: DateTime<Utc>,
+) -> Result<i64, StoreError> {
+    insert_decision_at(tx, subject_kind, subject_id, action, decision, true, now).await
+}
+
+/// As [`insert_decision`], but says whether the state actually changed.
+/// `enforced = false` is a shadow decision: recorded judgment, no effect.
+async fn insert_decision_at(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    enforced: bool,
+    now: DateTime<Utc>,
+) -> Result<i64, StoreError> {
+    let evidence = decision
+        .evidence
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let result = sqlx::query(
+        "INSERT INTO decisions             (subject_kind, subject_id, action, actor, rationale, evidence, enforced, created_at)          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(subject_kind)
+    .bind(subject_id)
+    .bind(action.as_str())
+    .bind(decision.actor.as_str())
+    .bind(decision.rationale.as_deref())
+    .bind(evidence)
+    .bind(enforced as i64)
+    .bind(now.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.last_insert_rowid())
+}
+
+fn orchestrator_message_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<OrchestratorMessage, StoreError> {
+    let role_raw: String = row.try_get("role")?;
+    Ok(OrchestratorMessage {
+        seq: row.try_get("seq")?,
+        role: ChatRole::from_str(&role_raw).ok_or(StoreError::BadEnum {
+            column: "role",
+            value: role_raw,
+        })?,
+        content: row.try_get("content")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+    })
+}
+
+fn charter_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CharterEntry, StoreError> {
+    let capability_raw: String = row.try_get("capability")?;
+    let level_raw: String = row.try_get("level")?;
+    let params_raw: Option<String> = row.try_get("params")?;
+    let daily_limit = params_raw
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?
+        .and_then(|params| params.get("daily_limit").and_then(|v| v.as_i64()));
+    Ok(CharterEntry {
+        capability: Capability::from_str(&capability_raw).ok_or(StoreError::BadEnum {
+            column: "capability",
+            value: capability_raw,
+        })?,
+        level: CharterLevel::from_str(&level_raw).ok_or(StoreError::BadEnum {
+            column: "level",
+            value: level_raw,
+        })?,
+        daily_limit,
+        updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
+    })
+}
+
+fn decision_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Decision, StoreError> {
+    let action_raw: String = row.try_get("action")?;
+    let actor_raw: String = row.try_get("actor")?;
+    let evidence_raw: Option<String> = row.try_get("evidence")?;
+    Ok(Decision {
+        seq: row.try_get("seq")?,
+        subject_kind: row.try_get("subject_kind")?,
+        subject_id: row.try_get("subject_id")?,
+        action: DecisionAction::from_str(&action_raw).ok_or(StoreError::BadEnum {
+            column: "action",
+            value: action_raw,
+        })?,
+        actor: Actor::from_str(&actor_raw).ok_or(StoreError::BadEnum {
+            column: "actor",
+            value: actor_raw,
+        })?,
+        rationale: row.try_get("rationale")?,
+        evidence: evidence_raw
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        transcript_seq: row.try_get("transcript_seq")?,
+        enforced: row.try_get::<i64, _>("enforced")? != 0,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+    })
+}
+
+fn orchestrator_session_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<OrchestratorSession, StoreError> {
+    let end_reason_raw: Option<String> = row.try_get("end_reason")?;
+    let end_reason = end_reason_raw
+        .map(|raw| {
+            SessionEndReason::from_str(&raw).ok_or(StoreError::BadEnum {
+                column: "end_reason",
+                value: raw,
+            })
+        })
+        .transpose()?;
+    let ended_at: Option<String> = row.try_get("ended_at")?;
+    let summary_generated_at: Option<String> = row.try_get("summary_generated_at")?;
+    Ok(OrchestratorSession {
+        cc_session_id: row.try_get("cc_session_id")?,
+        started_at: parse_ts(&row.try_get::<String, _>("started_at")?, "started_at")?,
+        ended_at: ended_at
+            .as_deref()
+            .map(|s| parse_ts(s, "ended_at"))
+            .transpose()?,
+        end_reason,
+        last_context_tokens: row.try_get("last_context_tokens")?,
+        summary: row.try_get("summary")?,
+        summary_generated_at: summary_generated_at
+            .as_deref()
+            .map(|s| parse_ts(s, "summary_generated_at"))
+            .transpose()?,
     })
 }
 
@@ -3224,7 +4032,7 @@ mod tests {
         store.insert_task(&untouched).await.unwrap();
 
         // Seqs are a 1-based AUTOINCREMENT, so the next one is count + 1.
-        let next_seq = store.events_since(0).await.unwrap().len() as i64 + 1;
+        let next_seq = store.all_events().await.unwrap().len() as i64 + 1;
         let report = store.reconcile_orphaned_work().await.unwrap();
         assert_eq!(
             report,
@@ -3276,7 +4084,7 @@ mod tests {
         );
 
         let payloads: Vec<_> = store
-            .events_since(next_seq)
+            .events_since(next_seq, i64::MAX)
             .await
             .unwrap()
             .into_iter()
@@ -3304,12 +4112,12 @@ mod tests {
     async fn reconcile_orphaned_work_is_a_no_op_on_a_clean_store() {
         let store = Store::open_in_memory().await.unwrap();
         seed_spec(&store, 1).await;
-        let before = store.events_since(0).await.unwrap().len();
+        let before = store.all_events().await.unwrap().len();
 
         let report = store.reconcile_orphaned_work().await.unwrap();
         assert!(report.is_empty());
         assert_eq!(report, ReconcileReport::default());
-        assert_eq!(store.events_since(0).await.unwrap().len(), before);
+        assert_eq!(store.all_events().await.unwrap().len(), before);
     }
 
     #[tokio::test]
@@ -3389,13 +4197,358 @@ mod tests {
         (task, spec)
     }
 
+    /// The conversation is kept forever; every read of it is bounded. A
+    /// client opens on the newest window, pages backwards through history,
+    /// and catches up incrementally — never refetching what it already has.
+    #[tokio::test]
+    async fn the_conversation_is_read_in_bounded_pages() {
+        let store = Store::open_in_memory().await.unwrap();
+        for i in 0..10 {
+            store
+                .append_orchestrator_message(ChatRole::User, &format!("turn {i}"))
+                .await
+                .unwrap();
+        }
+
+        // Opening shows the newest, in reading order.
+        let window = store.orchestrator_messages_window(None, 3).await.unwrap();
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn 7", "turn 8", "turn 9"]
+        );
+
+        // Paging backwards from its first seq gives the previous page.
+        let older = store
+            .orchestrator_messages_window(Some(window[0].seq), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["turn 4", "turn 5", "turn 6"]
+        );
+
+        // Catching up returns only what is new, and stays capped.
+        let newest = window.last().unwrap().seq;
+        assert!(
+            store
+                .orchestrator_messages_since(newest, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.orchestrator_messages_since(0, 4).await.unwrap().len(),
+            4,
+            "a client far behind drains in pages rather than one huge read"
+        );
+    }
+
+    /// The bug this whole mechanism exists for: a spec whose nudge was
+    /// consumed by a turn that then failed is invisible forever. Derived
+    /// obligations mean the state itself keeps pointing at it, and only a
+    /// real decision makes it stop.
+    #[tokio::test]
+    async fn an_unreviewed_spec_stays_owed_until_someone_decides() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        let none = chrono::Duration::zero();
+
+        let open = store.open_obligations(none).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, ObligationKind::ReviewSpec);
+        assert_eq!(open[0].subject_id, spec.id.to_string());
+
+        // Fresh work is left alone: the ordinary nudge gets first crack, and
+        // an obligation surfacing means that path already failed.
+        assert!(
+            store
+                .open_obligations(chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Being *told* discharges nothing — the reminder only goes quiet.
+        store.mark_obligations_surfaced(&open).await.unwrap();
+        assert_eq!(
+            store.open_obligations(none).await.unwrap().len(),
+            1,
+            "still owed after being mentioned"
+        );
+        assert!(
+            store
+                .obligations_due_for_reminder(
+                    store.open_obligations(none).await.unwrap(),
+                    chrono::Duration::hours(1)
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "but not repeated inside the reminder interval"
+        );
+        assert_eq!(
+            store
+                .obligations_due_for_reminder(
+                    store.open_obligations(none).await.unwrap(),
+                    chrono::Duration::zero()
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "and it comes back once the interval lapses"
+        );
+
+        // A decision is what discharges it.
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        assert!(store.open_obligations(none).await.unwrap().is_empty());
+    }
+
+    /// Work that stopped must stay visible rather than parking silently —
+    /// which is the whole of "don't get blocked, keep working".
+    #[tokio::test]
+    async fn a_blocked_spec_is_standing_work() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            store
+                .finalize_build_failed(&build.id, "boom")
+                .await
+                .unwrap();
+        }
+
+        let open = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, ObligationKind::UnblockSpec);
+        assert!(
+            open[0].summary.contains("blocked"),
+            "says what is wrong: {}",
+            open[0].summary
+        );
+    }
+
+    /// The ledger is the record of authority, so it must commit with the
+    /// state it explains — and an autonomous verdict with no stated reason is
+    /// refused outright, since the case for letting the orchestrator decide
+    /// rests entirely on being able to see why afterwards.
+    #[tokio::test]
+    async fn an_orchestrator_verdict_needs_a_reason_and_lands_in_the_ledger() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+
+        let err = store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Orchestrator,
+                    rationale: Some("   ".into()), // whitespace is not a reason
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");
+        // Refused means refused: no verdict, and nothing in the ledger.
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::PendingReview
+        );
+        assert!(store.decisions(None, 10).await.unwrap().is_empty());
+
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Orchestrator,
+                    rationale: Some("verification is falsifiable; base is clean".into()),
+                    evidence: Some(serde_json::json!({ "commits_behind": 3 })),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ledger = store.decisions(None, 10).await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].actor, Actor::Orchestrator);
+        assert_eq!(ledger[0].action, DecisionAction::Approve);
+        assert_eq!(
+            ledger[0].evidence,
+            Some(serde_json::json!({"commits_behind": 3}))
+        );
+        assert_eq!(
+            ledger[0].transcript_seq, None,
+            "the reasoning does not exist yet — the verdict was curled mid-turn"
+        );
+
+        // The turn ends, and the ledger gains its index into the prose.
+        store
+            .append_orchestrator_reply("Approved it because…", 0, Some("sess-a"))
+            .await
+            .unwrap();
+        let ledger = store.decisions(None, 10).await.unwrap();
+        let reply_seq = store
+            .orchestrator_messages_since(0, 1000)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .seq;
+        assert_eq!(ledger[0].transcript_seq, Some(reply_seq));
+
+        // A human's verdict is never backfilled onto the orchestrator's prose.
+        let (_t2, spec2) = seed_spec(&store, 2).await;
+        store
+            .review_spec(
+                &spec2.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_orchestrator_reply("unrelated turn", 0, Some("sess-a"))
+            .await
+            .unwrap();
+        let human = store
+            .decisions(Some(("spec", spec2.id.as_str())), 10)
+            .await
+            .unwrap();
+        assert_eq!(human[0].actor, Actor::Human);
+        assert_eq!(human[0].transcript_seq, None);
+    }
+
+    /// A failed build used to return its specs to `approved` with no counter,
+    /// so anything dispatching automatically would retry a poison batch
+    /// forever. Strikes accumulate; the third retires the spec and says so.
+    #[tokio::test]
+    async fn a_batch_that_keeps_failing_is_retired() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        for attempt in 1..=MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            store
+                .finalize_build_failed(&build.id, "builder exited 1")
+                .await
+                .unwrap();
+
+            let status = store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if attempt < MAX_BUILD_ATTEMPTS {
+                assert_eq!(
+                    status,
+                    SpecQueueStatus::Approved,
+                    "attempt {attempt} of {MAX_BUILD_ATTEMPTS} keeps it eligible"
+                );
+            } else {
+                assert_eq!(status, SpecQueueStatus::Blocked, "out of attempts");
+            }
+        }
+
+        // Retired means unbuildable — the loop cannot pick it up again.
+        let err = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");
+
+        // And it is announced with no actor, because nobody chose it — which
+        // is what keeps it nudge-worthy.
+        let payloads: Vec<_> = store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec.id.clone(),
+            from: Some(SpecQueueStatus::Approved),
+            to: SpecQueueStatus::Blocked,
+            actor: None,
+            decision_seq: None,
+        }));
+    }
+
     #[tokio::test]
     async fn review_spec_approve_readies_task_for_build() {
         let store = Store::open_in_memory().await.unwrap();
         let (task, spec) = seed_spec(&store, 1).await;
 
         let entry = store
-            .review_spec(&spec.id, SpecQueueStatus::Approved, Some("ship it".into()))
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                Some("ship it".into()),
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(entry.status, SpecQueueStatus::Approved);
@@ -3416,7 +4569,12 @@ mod tests {
 
         let (rejected_task, rejected_spec) = seed_spec(&store, 1).await;
         store
-            .review_spec(&rejected_spec.id, SpecQueueStatus::Rejected, None)
+            .review_spec(
+                &rejected_spec.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3439,6 +4597,7 @@ mod tests {
                 &revise_spec.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("more detail".into()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3459,12 +4618,20 @@ mod tests {
         let (_, spec) = seed_spec(&store, 1).await;
 
         for bad in [SpecQueueStatus::PendingReview, SpecQueueStatus::Blocked] {
-            let err = store.review_spec(&spec.id, bad, None).await.unwrap_err();
+            let err = store
+                .review_spec(&spec.id, bad, None, DecisionInput::human())
+                .await
+                .unwrap_err();
             assert!(matches!(err, StoreError::Invalid(_)), "{bad:?}");
         }
 
         let err = store
-            .review_spec(&SpecId::new(), SpecQueueStatus::Approved, None)
+            .review_spec(
+                &SpecId::new(),
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
@@ -3480,12 +4647,17 @@ mod tests {
             .unwrap();
 
         store
-            .review_spec(&spec.id, SpecQueueStatus::Approved, None)
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
 
         let payloads: Vec<_> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -3495,6 +4667,8 @@ mod tests {
             spec_id: spec.id.clone(),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         }));
         assert!(payloads.contains(&EventPayload::TaskStateChanged {
             task_id: task.id.clone(),
@@ -3578,7 +4752,7 @@ mod tests {
         };
         let appended = store.append_event(payload.clone()).await.unwrap();
 
-        let history = store.events_since(0).await.unwrap();
+        let history = store.all_events().await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].seq, appended.seq);
         assert_eq!(history[0].payload, payload);
@@ -3625,9 +4799,52 @@ mod tests {
         }
 
         let mid = seqs[2];
-        let tail = store.events_since(mid).await.unwrap();
+        let tail = store.events_since(mid, i64::MAX).await.unwrap();
         assert_eq!(tail.len(), 3);
         assert_eq!(tail.first().unwrap().seq, mid);
+    }
+
+    #[tokio::test]
+    async fn events_since_bounds_the_read_by_limit() {
+        let store = Store::open_in_memory().await.unwrap();
+        for _ in 0..50 {
+            store
+                .append_event(EventPayload::Note {
+                    source: "test".into(),
+                    message: "hello".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // A page is exactly `limit` long and starts at `since`, inclusive.
+        let page = store.events_since(1, 5).await.unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // Paging forward from the last seq + 1 continues where it left off.
+        let next = store
+            .events_since(page.last().unwrap().seq + 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(next.first().unwrap().seq, 6);
+
+        // Asking for more than remains returns what's left.
+        let tail = store.events_since(48, 100).await.unwrap();
+        assert_eq!(
+            tail.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![48, 49, 50]
+        );
+
+        // SQLite treats a negative LIMIT as unbounded; the store clamps so
+        // neither 0 nor -1 can turn a page into a full-log read.
+        assert!(store.events_since(1, 0).await.unwrap().is_empty());
+        assert!(store.events_since(1, -1).await.unwrap().is_empty());
+
+        // The unbounded read has its own name.
+        assert_eq!(store.all_events().await.unwrap().len(), 50);
     }
 
     #[tokio::test]
@@ -3671,7 +4888,7 @@ mod tests {
         }
 
         let store = Store::open(&path).await.unwrap();
-        let history = store.events_since(0).await.unwrap();
+        let history = store.all_events().await.unwrap();
         assert_eq!(history.len(), 1);
         match &history[0].payload {
             EventPayload::Note { message, .. } => assert_eq!(message, "first"),
@@ -3701,6 +4918,7 @@ mod tests {
                 &first.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("fix it".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3761,6 +4979,7 @@ mod tests {
                 &second.id,
                 SpecQueueStatus::Rejected,
                 Some("no".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3779,6 +4998,7 @@ mod tests {
                 &spec_a.id,
                 SpecQueueStatus::NeedsRevision,
                 Some("a only".to_string()),
+                DecisionInput::human(),
             )
             .await
             .unwrap();
@@ -3979,7 +5199,7 @@ mod tests {
         assert_eq!(retired.manual_rank, None);
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -4026,7 +5246,7 @@ mod tests {
         );
 
         // Neither attempt left a trace.
-        assert!(store.events_since(0).await.unwrap().is_empty());
+        assert!(store.all_events().await.unwrap().is_empty());
 
         let err = store
             .retire_task(&reopened.id, TaskState::Backlog)
@@ -4089,12 +5309,19 @@ mod tests {
 
         // Empty and duplicated sets.
         assert!(matches!(
-            store.create_build(&[], "main").await.unwrap_err(),
+            store
+                .create_build(&[], "main", DecisionInput::human())
+                .await
+                .unwrap_err(),
             StoreError::Invalid(_)
         ));
         assert!(matches!(
             store
-                .create_build(&[spec.id.clone(), spec.id.clone()], "main")
+                .create_build(
+                    &[spec.id.clone(), spec.id.clone()],
+                    "main",
+                    DecisionInput::human()
+                )
                 .await
                 .unwrap_err(),
             StoreError::Invalid(_)
@@ -4103,24 +5330,41 @@ mod tests {
         // A non-approved spec.
         let (_t2, pending) = approved_spec(&store, &project, 2).await;
         store
-            .review_spec(&pending.id, SpecQueueStatus::Rejected, None)
+            .review_spec(
+                &pending.id,
+                SpecQueueStatus::Rejected,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         let err = store
-            .create_build(std::slice::from_ref(&pending.id), "main")
+            .create_build(
+                std::slice::from_ref(&pending.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
 
         // A spec already in an active build.
         let build = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(build.status, BuildStatus::Queued);
         assert_eq!(build.branch, format!("build/{}", build.id));
         let err = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("already part of"), "{err}");
@@ -4140,7 +5384,11 @@ mod tests {
             .unwrap();
 
         let build = store
-            .create_build(&[spec_a.id.clone(), spec_b.id.clone()], "main")
+            .create_build(
+                &[spec_a.id.clone(), spec_b.id.clone()],
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4158,11 +5406,19 @@ mod tests {
         let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
 
         let first = store
-            .create_build(std::slice::from_ref(&spec_a.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec_a.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         let _second = store
-            .create_build(std::slice::from_ref(&spec_b.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec_b.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
 
@@ -4209,7 +5465,11 @@ mod tests {
         store.insert_project(&project).await.unwrap();
         let (task, spec) = approved_spec(&store, &project, 1).await;
         let build = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
@@ -4243,20 +5503,29 @@ mod tests {
             TaskState::Done
         );
         let err = store
-            .create_build(std::slice::from_ref(&spec.id), "main")
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("built"), "{err}");
 
         // Built is not a verdict a reviewer can render.
         let err = store
-            .review_spec(&spec.id, SpecQueueStatus::Built, None)
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Built,
+                None,
+                DecisionInput::human(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(_)));
 
         let payloads: Vec<EventPayload> = store
-            .events_since(0)
+            .all_events()
             .await
             .unwrap()
             .into_iter()
@@ -4279,8 +5548,14 @@ mod tests {
         store.insert_project(&project).await.unwrap();
         let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
         let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
-        let running = store.create_build(&[spec_a.id], "main").await.unwrap();
-        let queued = store.create_build(&[spec_b.id], "main").await.unwrap();
+        let running = store
+            .create_build(&[spec_a.id], "main", DecisionInput::human())
+            .await
+            .unwrap();
+        let queued = store
+            .create_build(&[spec_b.id], "main", DecisionInput::human())
+            .await
+            .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
 
         let report = store.reconcile_orphaned_work().await.unwrap();
@@ -4335,7 +5610,10 @@ mod tests {
                 .status,
             SpecQueueStatus::Rejected
         );
-        let err = store.create_build(&[spec.id], "main").await.unwrap_err();
+        let err = store
+            .create_build(&[spec.id], "main", DecisionInput::human())
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("rejected"), "{err}");
     }
 

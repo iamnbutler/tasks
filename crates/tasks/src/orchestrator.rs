@@ -3,8 +3,13 @@
 //! Per the load-bearing rule, this is not an agentic loop of our own — every
 //! tick shells out to headless Claude Code and *resumes one long-lived CC
 //! session*, so the orchestrator accumulates context across turns the same
-//! way an interactive session would. Our side owns only the chat projection
-//! (`orchestrator_messages`) and the session id.
+//! way an interactive session would. Our side owns the chat projection
+//! (`orchestrator_messages`), the session id, and the session *ledger*
+//! (`orchestrator_sessions`) — one row per session it has lived in, with the
+//! context size each reached. The ledger exists because that accumulated
+//! context is the point of a long-lived conversation, and losing it used to
+//! be invisible: the chat reads as continuous across a boundary the agent
+//! itself does not survive.
 //!
 //! The tick condition is DB-derived ([`Store::unanswered_orchestrator_messages`]):
 //! the loop answers whatever user turns arrived since the last assistant
@@ -31,8 +36,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::brief::Brief;
 use crate::events::{Event, EventPayload};
-use crate::models::{BuildStatus, OrchestratorFeedEvent, SessionStatus, SpecQueueStatus};
+use crate::models::{
+    Actor, BuildStatus, CharterEntry, CharterLevel, Obligation, ObligationKind,
+    OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
+};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -91,14 +100,21 @@ impl Orchestrator {
             .join("\n\n");
         info!(turns = pending.len(), "orchestrator tick");
 
-        let reply = match self.run_agent(&prompt).await {
-            Ok(reply) => reply,
+        let (reply, session_id) = match self.run_agent(&prompt).await {
+            Ok(turn) => {
+                info!(
+                    session = %turn.session_id,
+                    context_tokens = ?turn.context_tokens,
+                    "orchestrator turn complete"
+                );
+                (turn.text, Some(turn.session_id))
+            }
             Err(e) => {
                 // The error becomes the assistant turn: the chat must never
                 // dangle silently, and persisting it also settles the tick
                 // condition so the loop doesn't retry a poison prompt forever.
                 warn!(error = %e, "orchestrator agent failed");
-                format!("(orchestrator error: {e})")
+                (format!("(orchestrator error: {e})"), None)
             }
         };
         let trimmed = reply.trim();
@@ -108,7 +124,7 @@ impl Orchestrator {
             trimmed
         };
         self.store
-            .append_orchestrator_reply(content, answered_through)
+            .append_orchestrator_reply(content, answered_through, session_id.as_deref())
             .await?;
         // The durable message exists now — tell live-feed subscribers the
         // in-flight view is over (after the append, so a client reacting to
@@ -120,13 +136,26 @@ impl Orchestrator {
 
     /// Run one headless Claude Code turn against the persistent session,
     /// creating the session on first use and healing a lost one by starting
-    /// over with a fresh id (context is lost, the chat projection is not).
+    /// over with a fresh id.
+    ///
+    /// Healing is not free and must not be silent: the accumulated context is
+    /// what makes the orchestrator worth having, so a failed resume closes the
+    /// old session in the ledger and writes a seam into the conversation
+    /// before the replacement takes its first turn. The chat projection
+    /// survives either way — it is only the agent's memory of it that doesn't.
+    ///
     /// The standing prompt rides along on every turn — resume included — so
-    /// prompt updates reach a long-lived session without resetting it.
-    async fn run_agent(&self, prompt: &str) -> Result<String, OrchestratorError> {
-        let system = system_prompt(self.config.api_port);
+    /// prompt updates reach a long-lived session without resetting it, and a
+    /// fresh session is re-armed with its instructions on turn one.
+    async fn run_agent(&self, prompt: &str) -> Result<Turn, OrchestratorError> {
+        // Re-read every turn: the charter is the one statement of what the
+        // orchestrator may do, and it reaches a long-lived session only
+        // through the prompt. A human flipping a capability takes effect on
+        // the next turn, without restarting anything.
+        let charter = self.store.charter().await?;
+        let system = system_prompt(self.config.api_port, &charter);
         match self.store.orchestrator_cc_session().await? {
-            None => self.run_fresh(&system, prompt).await,
+            None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
                 .invoke(
                     &["--resume", &session, "--append-system-prompt", &system],
@@ -134,28 +163,67 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok(reply) => Ok(reply),
+                Ok((text, context_tokens)) => {
+                    if let Some(tokens) = context_tokens {
+                        self.store
+                            .record_orchestrator_context_tokens(&session, tokens)
+                            .await?;
+                    }
+                    Ok(Turn {
+                        text,
+                        context_tokens,
+                        session_id: session,
+                    })
+                }
                 Err(e @ OrchestratorError::AgentFailed { .. }) => {
                     warn!(error = %e, "resume failed; starting a fresh orchestrator session");
-                    self.run_fresh(&system, prompt).await
+                    // The context is gone the moment resume fails, so the
+                    // seam is recorded here rather than after a replacement
+                    // succeeds — a fresh start that *also* fails must not
+                    // erase the fact that memory was lost.
+                    self.store
+                        .end_orchestrator_session(&session, SessionEndReason::ResumeFailed)
+                        .await?;
+                    self.start_session(&system, prompt, Some(&session)).await
                 }
                 Err(e) => Err(e),
             },
         }
     }
 
-    async fn run_fresh(&self, system: &str, prompt: &str) -> Result<String, OrchestratorError> {
+    /// Take the first turn in a brand-new Claude Code session, adopting it as
+    /// the live one only once that turn succeeds. `replacing` is `Some` when
+    /// this is a seam rather than a first start.
+    async fn start_session(
+        &self,
+        system: &str,
+        prompt: &str,
+        replacing: Option<&str>,
+    ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
-        let reply = self
+        let (text, context_tokens) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
             )
             .await?;
         self.store
-            .set_orchestrator_cc_session(Some(&session))
+            .begin_orchestrator_session(
+                &session,
+                replacing,
+                replacing.map(|_| SessionEndReason::ResumeFailed),
+            )
             .await?;
-        Ok(reply)
+        if let Some(tokens) = context_tokens {
+            self.store
+                .record_orchestrator_context_tokens(&session, tokens)
+                .await?;
+        }
+        Ok(Turn {
+            text,
+            context_tokens,
+            session_id: session,
+        })
     }
 
     /// Run the agent, streaming its stdout as it arrives. stream-json lines
@@ -163,7 +231,11 @@ impl Orchestrator {
     /// `result` record's text becomes the reply; anything that isn't
     /// stream-json is collected raw and returned whole, so plain-text agents
     /// (and test stubs) keep working — they just don't stream.
-    async fn invoke(&self, extra_args: &[&str], prompt: &str) -> Result<String, OrchestratorError> {
+    async fn invoke(
+        &self,
+        extra_args: &[&str],
+        prompt: &str,
+    ) -> Result<(String, Option<i64>), OrchestratorError> {
         let mut parts = self.config.command.split_whitespace();
         let prog = parts.next().unwrap_or("claude").to_string();
         let base_args: Vec<String> = parts.map(str::to_string).collect();
@@ -179,6 +251,11 @@ impl Orchestrator {
             // The server's token stays the server's. When the agent talks to
             // GitHub it authenticates as itself (gh keychain auth).
             .env_remove("GITHUB_TOKEN")
+            // How the agent proves its writes are its own. Passed through the
+            // environment rather than argv (world-readable via `ps`) or the
+            // prompt (persisted), and referenced by name in the standing
+            // instructions so the value itself never lands in the transcript.
+            .env("TASKS_ACTOR_TOKEN", self.store.actor_token())
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
             .kill_on_drop(true)
@@ -209,6 +286,7 @@ impl Orchestrator {
             let mut lines = BufReader::new(stdout).lines();
             let mut raw = String::new();
             let mut result_text: Option<String> = None;
+            let mut context_tokens: Option<i64> = None;
             while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
                 match parse_stream_line(&line) {
                     StreamLine::Delta(text) => self
@@ -220,7 +298,10 @@ impl Orchestrator {
                                 .publish_orchestrator_feed(OrchestratorFeedEvent::Tool { label });
                         }
                     }
-                    StreamLine::Result(text) => result_text = Some(text),
+                    StreamLine::Result { text, tokens } => {
+                        result_text = Some(text);
+                        context_tokens = tokens;
+                    }
                     StreamLine::Other => {}
                     StreamLine::NotStreamJson => {
                         raw.push_str(&line);
@@ -229,13 +310,14 @@ impl Orchestrator {
                 }
             }
             let status = child.wait().await.map_err(OrchestratorError::Spawn)?;
-            Ok::<_, OrchestratorError>((status, result_text, raw))
+            Ok::<_, OrchestratorError>((status, result_text, raw, context_tokens))
         };
 
         let secs = self.config.timeout.as_secs();
-        let (status, result_text, raw) = tokio::time::timeout(self.config.timeout, read)
-            .await
-            .map_err(|_| OrchestratorError::Timeout { secs })??;
+        let (status, result_text, raw, context_tokens) =
+            tokio::time::timeout(self.config.timeout, read)
+                .await
+                .map_err(|_| OrchestratorError::Timeout { secs })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -244,8 +326,19 @@ impl Orchestrator {
                 stderr: stderr.chars().take(2000).collect(),
             });
         }
-        Ok(result_text.unwrap_or(raw))
+        Ok((result_text.unwrap_or(raw), context_tokens))
     }
+}
+
+/// One completed agent turn.
+struct Turn {
+    text: String,
+    /// Absolute context size reported by the agent, when it reports one.
+    context_tokens: Option<i64>,
+    /// The Claude Code session this turn ran in, stamped onto the durable
+    /// reply so a verdict can be traced back to the memory regime that
+    /// produced it.
+    session_id: String,
 }
 
 /// What one line of agent stdout means for the live feed.
@@ -254,8 +347,9 @@ enum StreamLine {
     Delta(String),
     /// Tool invocations from a completed assistant turn.
     Tools(Vec<String>),
-    /// The final `result` record's reply text.
-    Result(String),
+    /// The final `result` record: the reply text, and the context size that
+    /// produced it when the agent reports usage.
+    Result { text: String, tokens: Option<i64> },
     /// A stream-json record with nothing for us (init, thinking, tool results).
     Other,
     /// Not stream-json at all — a plain-text agent's output.
@@ -290,13 +384,33 @@ fn parse_stream_line(line: &str) -> StreamLine {
             }
         }
         Some("result") => match v.get("result").and_then(|r| r.as_str()) {
-            Some(text) => StreamLine::Result(text.to_string()),
+            Some(text) => StreamLine::Result {
+                text: text.to_string(),
+                tokens: context_tokens(v.get("usage")),
+            },
             None => StreamLine::Other,
         },
         Some(_) => StreamLine::Other,
         // JSON, but not a stream record — treat like plain output.
         None => StreamLine::NotStreamJson,
     }
+}
+
+/// Context size from a stream-json `usage` object: every input-side token the
+/// model had to read this turn, cached or not.
+///
+/// The sum is what matters. `input_tokens` alone under-reports by whatever
+/// the cache served — which, on a long-lived resumed session, is nearly all
+/// of it. And because this is an absolute measurement rather than a running
+/// total, it stays honest across turns the server never drove (an interactive
+/// checkout) without any reconciliation.
+fn context_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
+    let usage = usage?;
+    let field = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let total = field("input_tokens")
+        + field("cache_read_input_tokens")
+        + field("cache_creation_input_tokens");
+    (total > 0).then_some(total)
 }
 
 /// One-line human label for a tool call, e.g. `Bash: curl -s .../tasks`.
@@ -336,15 +450,31 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
         | EventPayload::ModeChanged { .. } => true,
         // Success is conveyed by the SpecCreated that accompanies it.
         EventPayload::SessionCompleted { status, .. } => *status == SessionStatus::ScoutFailed,
-        // Human review verdicts. PendingReview duplicates SpecCreated and
-        // Built duplicates BuildCompleted.
-        EventPayload::SpecQueueStatusChanged { to, .. } => matches!(
-            to,
-            SpecQueueStatus::Approved
-                | SpecQueueStatus::NeedsRevision
-                | SpecQueueStatus::Rejected
-                | SpecQueueStatus::Blocked
-        ),
+        // Review verdicts — but never the orchestrator's own. Being told
+        // what you just did is not news: it costs a turn to acknowledge, and
+        // worse, invites second-guessing a verdict already rendered. This is
+        // the one filter that gets more load-bearing as autonomy grows, since
+        // every autonomous verdict would otherwise echo straight back.
+        // PendingReview duplicates SpecCreated; Built duplicates
+        // BuildCompleted; Blocked carries no actor (the attempt cap decided)
+        // and is exactly when someone should hear about it.
+        EventPayload::SpecQueueStatusChanged { to, actor, .. } => {
+            *actor != Some(Actor::Orchestrator)
+                && matches!(
+                    to,
+                    SpecQueueStatus::Approved
+                        | SpecQueueStatus::NeedsRevision
+                        | SpecQueueStatus::Rejected
+                        | SpecQueueStatus::Blocked
+                )
+        }
+        // The custodial writes, under the same echo rule. A human filing or
+        // retiring something is news worth having; the orchestrator's own
+        // captures coming back at it would turn a capture spree into a turn
+        // per issue.
+        EventPayload::IssueCaptured { actor, .. } | EventPayload::IssueClosed { actor, .. } => {
+            *actor != Actor::Orchestrator
+        }
         _ => false,
     }
 }
@@ -352,9 +482,15 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
 /// Render a batch of nudge-worthy events as one `event` turn. Events are
 /// identifier-only, so detail comes from store lookups at format time; a row
 /// that has since vanished degrades to its id rather than failing the nudge.
-pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
+///
+/// A spec landing carries a computed brief, because this is the turn on which
+/// it will actually be judged and the facts are cheaper to hand over than to
+/// go and find. The obligation path briefs too, but that path is the safety
+/// net — briefing only there would leave the common case foraging.
+pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) -> String {
     let mut lines = Vec::new();
     let mut ingested = 0usize;
+    let mut briefed_specs: Vec<crate::models::SpecId> = Vec::new();
     for event in events {
         match &event.payload {
             EventPayload::TaskIngested { task_id, .. } => {
@@ -363,10 +499,13 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
             }
             EventPayload::SpecCreated {
                 spec_id, task_id, ..
-            } => lines.push(format!(
-                "- Spec landed for review: {} ({spec_id})",
-                task_ref(store, task_id).await
-            )),
+            } => {
+                lines.push(format!(
+                    "- Spec landed for review: {} ({spec_id})",
+                    task_ref(store, task_id).await
+                ));
+                briefed_specs.push(spec_id.clone());
+            }
             EventPayload::SessionCompleted {
                 session_id,
                 task_id,
@@ -407,6 +546,17 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
                 build_id,
                 pr_number,
             } => lines.push(format!("- PR #{pr_number} opened (build {build_id})")),
+            EventPayload::IssueCaptured { task_id, .. } => {
+                lines.push(format!("- Issue filed: {}", task_ref(store, task_id).await))
+            }
+            EventPayload::IssueClosed {
+                gh_issue_number,
+                reason,
+                ..
+            } => lines.push(format!(
+                "- Issue #{gh_issue_number} closed as {}",
+                reason.as_str().replace('_', " ")
+            )),
             EventPayload::ModeChanged { from, to } => lines.push(format!(
                 "- Mode changed: {} → {}",
                 from.as_str(),
@@ -418,10 +568,107 @@ pub async fn format_nudge(store: &Store, events: &[Event]) -> String {
     if ingested > 1 {
         lines.push(format!("({ingested} tasks ingested in this batch)"));
     }
-    format!(
+    let notification = format!(
         "[pipeline] Automated notification — not the human. Recent activity:\n{}",
         lines.join("\n")
-    )
+    );
+    let mut sections = Vec::new();
+    for spec_id in &briefed_specs {
+        sections.push((
+            spec_heading(store, spec_id).await,
+            spec_facts(brief, spec_id).await,
+        ));
+    }
+    if !briefed_specs.is_empty() {
+        sections.push(("In flight:".to_string(), pipeline_facts(brief).await));
+    }
+    match Brief::render(&sections) {
+        Some(block) => format!("{notification}\n\n{block}"),
+        None => notification,
+    }
+}
+
+/// Render standing obligations as one `event` turn.
+///
+/// Worded to be unmistakable from a notification, because the two behave
+/// differently and the orchestrator should treat them differently: a nudge is
+/// news that happened once, an obligation is work still owed and will keep
+/// coming back until it is discharged by an actual decision.
+pub async fn format_obligations(
+    store: &Store,
+    brief: &Brief<'_>,
+    obligations: &[Obligation],
+) -> String {
+    let lines: Vec<String> = obligations
+        .iter()
+        .map(|o| format!("- {}", o.summary))
+        .collect();
+    let header = format!(
+        "[pipeline] Standing obligations — not notifications. These are \
+         derived from pipeline state and will keep appearing until they are \
+         resolved, so act on them rather than acknowledging them:\n{}",
+        lines.join("\n")
+    );
+
+    let mut sections = Vec::new();
+    for obligation in obligations {
+        let spec_id = crate::models::SpecId::from_raw(&obligation.subject_id);
+        let facts = match obligation.kind {
+            ObligationKind::ReviewSpec => spec_facts(brief, &spec_id).await,
+            ObligationKind::UnblockSpec => match brief.for_blocked_spec(&spec_id).await {
+                Ok(facts) => facts,
+                Err(e) => vec![brief_unavailable(&e)],
+            },
+        };
+        sections.push((spec_heading(store, &spec_id).await, facts));
+    }
+    if !obligations.is_empty() {
+        sections.push(("In flight:".to_string(), pipeline_facts(brief).await));
+    }
+    match Brief::render(&sections) {
+        Some(block) => format!("{header}\n\n{block}"),
+        None => header,
+    }
+}
+
+/// `On #812 "title" (spec_…):` — what the facts beneath it are about.
+async fn spec_heading(store: &Store, spec_id: &crate::models::SpecId) -> String {
+    match store.get_spec(spec_id).await {
+        Ok(Some(spec)) => format!("On {} ({spec_id}):", task_ref(store, &spec.task_id).await),
+        _ => format!("On {spec_id}:"),
+    }
+}
+
+/// Facts for a spec under judgment, never silently empty.
+///
+/// A brief that finds nothing and a brief that never ran produce the same
+/// absence of lines, and those mean opposite things to a reader deciding how
+/// hard to look. So a clean result says it is clean.
+async fn spec_facts(brief: &Brief<'_>, spec_id: &crate::models::SpecId) -> Vec<String> {
+    match brief.for_spec(spec_id).await {
+        Ok(facts) if facts.is_empty() => vec![
+            "no file overlap with other live specs or recent builds, no numbering \
+             clashes, and no prior verdicts on this task"
+                .into(),
+        ],
+        Ok(facts) => facts,
+        Err(e) => vec![brief_unavailable(&e)],
+    }
+}
+
+async fn pipeline_facts(brief: &Brief<'_>) -> Vec<String> {
+    match brief.pipeline().await {
+        Ok(facts) => facts,
+        Err(e) => vec![brief_unavailable(&e)],
+    }
+}
+
+/// A brief that could not be computed says so. Failing loudly here is cheap —
+/// the turn still happens — and failing quietly would teach the orchestrator
+/// to read silence as safety.
+fn brief_unavailable(e: &StoreError) -> String {
+    warn!(error = %e, "computing brief failed");
+    format!("the server could not compute these facts ({e}) — check by hand")
 }
 
 /// `#<issue> "<title>"` for a task, degrading to the raw id if it's gone.
@@ -432,10 +679,58 @@ async fn task_ref(store: &Store, task_id: &crate::models::TaskId) -> String {
     }
 }
 
+/// What the orchestrator may do, rendered from the charter rows.
+///
+/// Generated rather than written, because two statements of authority is one
+/// too many: hand-written prose saying "reviews are the human's" would
+/// contradict a charter that says otherwise, and a session under context
+/// pressure picks whichever it likes. This is also why the server enforces the
+/// same rows — the prompt tells it what is true, the endpoint makes it true.
+///
+/// An empty charter reads as everything off, which is the safe direction.
+fn authority_section(charter: &[CharterEntry]) -> String {
+    let mut live = Vec::new();
+    let mut shadow = Vec::new();
+    for entry in charter {
+        let line = match entry.daily_limit {
+            Some(limit) => format!("{} (up to {limit}/day)", entry.capability.describe()),
+            None => entry.capability.describe().to_string(),
+        };
+        match entry.level {
+            CharterLevel::Live => live.push(line),
+            CharterLevel::Shadow => shadow.push(line),
+            CharterLevel::Off => {}
+        }
+    }
+    let mut out = String::from(
+        "What you may do (set by the human; this list is the whole of it, and \
+         the server enforces it — anything not listed here is the human's, so \
+         make the case and leave it):\n",
+    );
+    if live.is_empty() {
+        out.push_str("- Act on your own: nothing yet.\n");
+    } else {
+        for line in live {
+            out.push_str(&format!("- Act on your own: {line}\n"));
+        }
+    }
+    for line in shadow {
+        out.push_str(&format!(
+            "- Decide but do not act: {line}. Call the endpoint as you would \
+             normally; the server records your judgment and applies nothing, \
+             and answers with `shadowed: true` so you know it did not happen. \
+             Then say in the conversation what you decided and why — that \
+             narration is the point of this mode, and the human acts on it.\n"
+        ));
+    }
+    out
+}
+
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
-fn system_prompt(port: u16) -> String {
+fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
+    let authority = authority_section(charter);
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
@@ -445,6 +740,18 @@ fn system_prompt(port: u16) -> String {
          (turns starting with \"[pipeline]\"). Treat those as your cue to act \
          on the human's behalf — investigate, summarize, prepare — not just \
          to acknowledge.\n\n\
+         Two kinds of automated turn arrive, and they mean different things. \
+         A *notification* reports something that happened, once. A *standing \
+         obligation* is work the pipeline is still owed, derived from its \
+         state — it will keep reappearing until it is actually resolved, so \
+         acknowledging one changes nothing. Act on those.\n\n\
+         Both may carry a \"[brief]\" block: lookups the server ran for you — \
+         file overlap with other live specs and recent builds, sequence-number \
+         clashes against the base branch, PR state, prior verdicts on the same \
+         task. Those are facts, not a verdict, and they are deliberately narrow: \
+         a brief tells you what it checked, and everything it does not mention \
+         is unchecked rather than fine. Trust it instead of re-deriving it, and \
+         spend the reading you saved on the spec itself.\n\n\
          On a [pipeline] turn:\n\
          - Spec landed → read it (GET /specs/{{id}}) and review it \
            ADVERSARIALLY: your value is finding what's wrong, not affirming \
@@ -468,40 +775,66 @@ fn system_prompt(port: u16) -> String {
          only worth saying after you tried hard to break it and failed, and \
          then say what you tried.\n\
          Be brief on notifications — a quiet pipeline deserves a quiet \
-         channel. Never fabricate activity, and never take the gated actions \
-         below without the human.\n\n\
+         channel. Never fabricate activity.\n\n\
+         {authority}\n\n\
          Your working directory is the project checkout itself. Within your \
          permission settings you may read and edit code, run builds and \
-         tests, and use `gh` (e.g. to file issues the human asks for). If a \
-         tool call is denied, say what was denied instead of improvising \
-         around it.\n\n\
+         tests, and use `gh` to READ GitHub (issues, PRs, merge state). Do \
+         not write to GitHub with `gh` — no filing, closing, commenting, or \
+         editing PR bodies. Those go through the API below, which is what \
+         puts them in the ledger and under whatever limits are set; a `gh` \
+         write is the same action with the accountability removed. If a tool \
+         call is denied, say what was denied instead of improvising around \
+         it.\n\n\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
-         state and the activity log honest. Endpoints:\n\
+         state and the activity log honest.\n\n\
+         Identify yourself on every write: pass \
+         `-H \"X-Tasks-Actor: orchestrator $TASKS_ACTOR_TOKEN\"` (the token is \
+         in your environment — never print it). Writes carrying it are \
+         recorded as yours, which is what keeps you from being notified about \
+         your own actions, and what makes the decisions ledger worth reading. \
+         Every write you make that way must also carry a `rationale` — the \
+         server rejects one without it, because a decision nobody can review \
+         afterwards is not one you were trusted to make.\n\n\
+         Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
-         - POST /spec-queue/{{id}}/review {{\"status\":\"approved|needs_revision|rejected\",\"feedback\"}} \
-           — ONLY when the human has explicitly given a verdict\n\
-         - POST /builds {{\"spec_ids\":[...]}} — batch approved specs into one \
-           Builder run (serial; one at a time)\n\
+         - POST /spec-queue/{{id}}/review \
+           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
+         - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
+           specs into one Builder run (serial; one at a time)\n\
+         - POST /issues \
+           {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\"}} — file an \
+           issue. `provenance` says where the work was discovered (\"while \
+           reviewing spec_… for #812\") and is rendered into the issue body; \
+           the server refuses a capture without it. Lands in the backlog, not \
+           the queue\n\
+         - POST /tasks/{{id}}/close \
+           {{\"reason\":\"completed|not_planned\",\"rationale\",\"evidence\"}} — \
+           close the issue upstream. `completed` claims the work is done and \
+           wants evidence to match (a merged PR, a named commit — queried, \
+           never inferred from pipeline activity); `not_planned` is a \
+           recalibration\n\
+         - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
+           and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
-         - GET /events?since=N — the activity log, newest last; your best \
-           source for \"what happened\". Without ?since it returns only the \
-           newest 100 — page from since=1 before counting anything. Retired \
-           tasks are hidden from GET /tasks but reachable at GET /tasks/{{id}}. \
-           Nothing on the wire counts merged PRs — pull_request_opened fires \
-           at open; check merge state via gh, or say \"opened\", not \
-           \"shipped\"\n\
+         - GET /events?since=N — the activity log, newest last. Reach for it \
+           when you need history the brief does not cover, and page a bounded \
+           window: it is a log, not a state snapshot, and re-deriving the \
+           present from it costs far more of your context than asking for the \
+           present directly. Retired tasks are hidden from GET /tasks but \
+           reachable at GET /tasks/{{id}}. Nothing on the wire counts merged \
+           PRs — pull_request_opened fires at open; check merge state via gh, \
+           or say \"opened\", not \"shipped\"\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → done (rejected = terminal). Issue closure on GitHub \
            retires work automatically; there is no manual mark-done.\n\
-         - Reviews are the human's: only submit a verdict they explicitly \
-           stated, and quote their feedback verbatim.\n\
          - The checkout is shared with the human and other agents. Never \
            switch branches, stash, or discard changes you did not make; do \
            your own work on branches and leave the tree as you found it.\n\
@@ -540,10 +873,21 @@ mod tests {
             spec_id: spec(),
             from: Some(SpecQueueStatus::PendingReview),
             to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Human),
+            decision_seq: Some(1),
         }));
         assert!(nudge_worthy(&EventPayload::ModeChanged {
             from: Mode::Play,
             to: Mode::Pause,
+        }));
+        // Running out of build attempts has no actor — nobody chose it — and
+        // is precisely when someone should hear about it.
+        assert!(nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: Some(SpecQueueStatus::Approved),
+            to: SpecQueueStatus::Blocked,
+            actor: None,
+            decision_seq: None,
         }));
 
         // Feedback loops, duplicates, and noise:
@@ -560,6 +904,39 @@ mod tests {
             spec_id: spec(),
             from: None,
             to: SpecQueueStatus::PendingReview, // SpecCreated covers it
+            actor: None,
+            decision_seq: None,
+        }));
+        // The echo: the orchestrator's own verdict coming back at it. Being
+        // told what you just did costs a turn and invites second-guessing a
+        // decision already made — and under autonomy every verdict would do
+        // this.
+        assert!(!nudge_worthy(&EventPayload::SpecQueueStatusChanged {
+            spec_id: spec(),
+            from: Some(SpecQueueStatus::PendingReview),
+            to: SpecQueueStatus::Approved,
+            actor: Some(Actor::Orchestrator),
+            decision_seq: Some(7),
+        }));
+        // Custodial writes echo the same way a verdict does.
+        assert!(nudge_worthy(&EventPayload::IssueCaptured {
+            task_id: task(),
+            gh_issue_number: 900,
+            actor: Actor::Human,
+            decision_seq: None,
+        }));
+        assert!(!nudge_worthy(&EventPayload::IssueCaptured {
+            task_id: task(),
+            gh_issue_number: 900,
+            actor: Actor::Orchestrator,
+            decision_seq: Some(2),
+        }));
+        assert!(!nudge_worthy(&EventPayload::IssueClosed {
+            task_id: task(),
+            gh_issue_number: 900,
+            reason: crate::models::CloseReason::Completed,
+            actor: Actor::Orchestrator,
+            decision_seq: Some(3),
         }));
         assert!(!nudge_worthy(&EventPayload::BuildStarted {
             build_id: BuildId::from_raw("build_1"),
@@ -577,13 +954,65 @@ mod tests {
 
     #[test]
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
-        let p = system_prompt(4800);
+        let p = system_prompt(4800, &[]);
         assert!(p.contains("http://127.0.0.1:4800"));
         assert!(p.contains("[pipeline]"));
         assert!(p.contains("proactive"));
         assert!(p.contains("ADVERSARIALLY"));
         assert!(p.contains("why are we doing"));
         assert!(p.contains("Never switch branches"));
-        assert!(p.contains("verdict they explicitly stated"));
+        // The brief replaces foraging, so the prompt has to introduce it —
+        // including the part that keeps it honest: silence is unchecked, not
+        // clean.
+        assert!(p.contains("[brief]"));
+        assert!(p.contains("unchecked rather than fine"));
+        // The custodial writes go through the server, and the `gh` side
+        // channel is closed by instruction — the one statement that keeps the
+        // ledger from being quietly incomplete.
+        assert!(p.contains("POST /issues"));
+        assert!(p.contains("Do not write to GitHub with `gh`"));
+        // And it must no longer send the agent to re-derive the present from
+        // the whole event log, which is what the brief exists to replace.
+        assert!(!p.contains("since=1"));
+    }
+
+    /// The authority section is generated, so an empty charter must read as
+    /// "nothing" — and must not leave behind hand-written prose making its own
+    /// claims about what is allowed. Two statements of authority is one too
+    /// many.
+    #[test]
+    fn authority_comes_from_the_charter_and_nowhere_else() {
+        use crate::models::Capability;
+
+        let entry = |capability, level, daily_limit| CharterEntry {
+            capability,
+            level,
+            daily_limit,
+            updated_at: chrono::Utc::now(),
+        };
+
+        let empty = system_prompt(4800, &[]);
+        assert!(empty.contains("Act on your own: nothing yet"), "{empty}");
+        assert!(!empty.contains("Decide but do not act"), "{empty}");
+
+        let p = system_prompt(
+            4800,
+            &[
+                entry(Capability::CaptureWork, CharterLevel::Live, Some(5)),
+                entry(Capability::RetireWork, CharterLevel::Off, None),
+                entry(Capability::AutoReviewSpecs, CharterLevel::Shadow, None),
+            ],
+        );
+        assert!(p.contains("Act on your own: file issues"), "{p}");
+        assert!(p.contains("up to 5/day"), "{p}");
+        assert!(
+            p.contains("Decide but do not act: render review verdicts"),
+            "{p}"
+        );
+        assert!(p.contains("shadowed: true"), "{p}");
+        // Off is simply absent — the catch-all sentence covers it, and listing
+        // every denial would grow with the enum for no benefit.
+        assert!(!p.contains("close issues that are done"), "{p}");
+        assert!(p.contains("anything not listed here is the human's"), "{p}");
     }
 }

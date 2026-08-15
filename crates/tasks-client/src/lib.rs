@@ -21,12 +21,14 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildRequest, CreateProject, ErrorResponse, ModeResponse,
-    ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, SetMode,
+    BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
+    ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
+    SetCharter, SetMode,
 };
 use tasks_api::models::{
-    Build, BuildId, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project, Session,
-    SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
+    Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
+    OrchestratorSessionInfo, Project, Session, SessionId, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine,
 };
 use thiserror::Error;
 
@@ -150,6 +152,15 @@ impl Client {
             .into_json()?)
     }
 
+    /// A write whose only answer is "accepted" — no body to decode.
+    fn post_json_accepted<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        self.calls
+            .post(&self.url(path))
+            .send_json(body)
+            .map_err(map_ureq)?;
+        Ok(())
+    }
+
     fn post_empty<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         Ok(self
             .calls
@@ -207,6 +218,56 @@ impl Client {
     /// "Scout now": queue at the front; the dispatch loop picks it up.
     pub fn scout_task_now(&self, id: &TaskId) -> Result<Task> {
         self.post_empty(&format!("/tasks/{id}/scout"))
+    }
+
+    /// File an issue upstream and track it. Lands in the backlog — capturing
+    /// work and queueing it are separate steps.
+    pub fn capture_issue(&self, issue: CaptureIssue) -> Result<Task> {
+        self.post_json("/issues", &issue)
+    }
+
+    /// Close the GitHub issue behind a task.
+    ///
+    /// 202, and nothing to apply: the task is not retired here. The poller
+    /// observes the closure on its next pass, exactly as it would for an issue
+    /// closed in a browser.
+    pub fn close_task(
+        &self,
+        id: &TaskId,
+        reason: CloseReason,
+        rationale: Option<String>,
+    ) -> Result<()> {
+        self.post_json_accepted(
+            &format!("/tasks/{id}/close"),
+            &CloseTaskRequest {
+                reason: reason.as_str().to_string(),
+                rationale,
+                evidence: None,
+            },
+        )
+    }
+
+    // --- charter ---
+
+    /// What the orchestrator may currently do.
+    pub fn charter(&self) -> Result<Vec<CharterEntry>> {
+        self.get_json("/charter", &[])
+    }
+
+    /// Set one capability's standing. Human-only at the server.
+    pub fn set_charter(
+        &self,
+        capability: Capability,
+        level: CharterLevel,
+        daily_limit: Option<i64>,
+    ) -> Result<CharterEntry> {
+        self.post_json(
+            &format!("/charter/{}", capability.as_str()),
+            &SetCharter {
+                level: level.as_str().to_string(),
+                daily_limit,
+            },
+        )
     }
 
     /// `task_ids` is the complete queue order, front to back. Returns the
@@ -275,6 +336,9 @@ impl Client {
             &ReviewRequest {
                 status: verdict.as_str().to_string(),
                 feedback,
+                // The client speaks for the human, who owes no explanation.
+                rationale: None,
+                evidence: None,
             },
         )
     }
@@ -303,6 +367,8 @@ impl Client {
             &BuildRequest {
                 spec_ids,
                 base_branch,
+                rationale: None,
+                evidence: None,
             },
         )
     }
@@ -350,9 +416,30 @@ impl Client {
 
     // --- orchestrator ---
 
-    /// Messages with `seq > since`.
+    /// Turns after `since`, oldest first — the incremental catch-up a client
+    /// should use once it has opened the conversation. The server caps the
+    /// page, so a client far behind calls this until it comes back short.
     pub fn orchestrator_messages(&self, since: i64) -> Result<Vec<OrchestratorMessage>> {
         self.get_json("/orchestrator/messages", &[("since", since.to_string())])
+    }
+
+    /// The newest `limit` turns — how a client opens the conversation
+    /// without dragging the whole history across.
+    pub fn orchestrator_messages_latest(&self, limit: i64) -> Result<Vec<OrchestratorMessage>> {
+        self.get_json("/orchestrator/messages", &[("limit", limit.to_string())])
+    }
+
+    /// The `limit` turns immediately before `before`, oldest first — paging
+    /// backwards through history that is kept but not held in memory.
+    pub fn orchestrator_messages_before(
+        &self,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<OrchestratorMessage>> {
+        self.get_json(
+            "/orchestrator/messages",
+            &[("before", before.to_string()), ("limit", limit.to_string())],
+        )
     }
 
     /// 202: the reply arrives asynchronously — watch `orchestrator_message`
