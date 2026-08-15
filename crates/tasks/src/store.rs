@@ -16,9 +16,10 @@ use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
     CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
     GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
-    SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
-    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptOwner,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, ScoutNotes,
+    Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
+    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
+    TranscriptOwner,
     TranscriptStream,
 };
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
@@ -120,7 +121,8 @@ fn checkout_heartbeat_fresh(ts: &str) -> bool {
 /// process left mid-flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReconcileReport {
-    /// `running` sessions failed as orphaned.
+    /// `running` sessions concluded as orphaned — `scout_stopped_early` for
+    /// the ones that had checkpointed, `scout_failed` for the rest.
     pub sessions: usize,
     /// `scouting` tasks put back in the queue as `new`.
     pub tasks: usize,
@@ -1181,9 +1183,103 @@ impl Store {
         self.transcript_tx.subscribe()
     }
 
+    // --- scout notes (salvage) ---
+
+    /// Record what a scout run has written down so far, superseding whatever
+    /// that session recorded before.
+    ///
+    /// Called on every checkpoint as it arrives — not once at the end —
+    /// because the two deaths this exists for (a VM deallocated at the
+    /// deadline, a server restart) never reach any end-of-run code path.
+    ///
+    /// Nothing here creates a [`Spec`], a queue entry or a review path, and
+    /// nothing should: these notes are unverified exploration, and the moment
+    /// they can reach a reviewer they start looking finished.
+    pub async fn upsert_scout_notes(&self, notes: &ScoutNotes) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO scout_notes (session_id, task_id, reason, notes, files_touched, \
+             updated_at) VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+               reason = excluded.reason, \
+               notes = excluded.notes, \
+               files_touched = excluded.files_touched, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(notes.session_id.as_str())
+        .bind(notes.task_id.as_str())
+        .bind(&notes.reason)
+        .bind(&notes.notes)
+        .bind(serde_json::to_string(&notes.files_touched)?)
+        .bind(notes.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_scout_notes(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ScoutNotes>, StoreError> {
+        let row = sqlx::query(
+            "SELECT session_id, task_id, reason, notes, files_touched, updated_at \
+             FROM scout_notes WHERE session_id = ?",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(scout_notes_from_row).transpose()
+    }
+
+    /// The salvage worth carrying into this task's next scout, if any.
+    ///
+    /// The newest notes belonging to a session that *stopped early* — not
+    /// "the latest session's notes". An interrupted run followed by one that
+    /// died on a clone error still has exploration worth carrying, and the
+    /// clone failure has nothing to say about it.
+    ///
+    /// Suppressed once a scout has concluded since: a spec supersedes the
+    /// notes that led to it, and re-quoting stale leads at a scout that
+    /// already has a reviewed spec in its prompt is noise.
+    pub async fn salvage_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<ScoutNotes>, StoreError> {
+        let row = sqlx::query(
+            "SELECT n.session_id, n.task_id, n.reason, n.notes, n.files_touched, n.updated_at \
+             FROM scout_notes n JOIN sessions s ON s.id = n.session_id \
+             WHERE n.task_id = ? AND s.status = ? \
+             ORDER BY n.updated_at DESC, n.rowid DESC LIMIT 1",
+        )
+        .bind(task_id.as_str())
+        .bind(SessionStatus::ScoutStoppedEarly.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(notes) = row.map(scout_notes_from_row).transpose()? else {
+            return Ok(None);
+        };
+
+        let concluded_since: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE task_id = ? AND status = ? \
+             AND completed_at > ? LIMIT 1",
+        )
+        .bind(task_id.as_str())
+        .bind(SessionStatus::ScoutSucceeded.as_str())
+        .bind(notes.updated_at.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(concluded_since.is_none().then_some(notes))
+    }
+
     // --- reconciliation ---
 
-    /// Fail every `running` session and requeue every `scouting` task.
+    /// Conclude every `running` session and requeue every `scouting` task.
+    ///
+    /// A session that had checkpointed (`scout_notes` has a row for it) ends
+    /// as `scout_stopped_early` rather than `scout_failed`: it left
+    /// exploration behind, and the next attempt should be given it. That
+    /// distinction is only answerable here because checkpoints are persisted
+    /// as they arrive — notes held in memory would have died with the process
+    /// that orphaned these rows.
     ///
     /// Meant to be called once at startup, before any loop runs. One process
     /// owns all dispatch, so at that moment a `running` session cannot be live:
@@ -1205,16 +1301,29 @@ impl Store {
         let now = Utc::now();
 
         let mut tx = self.pool.begin().await?;
-        let session_rows = sqlx::query("SELECT id, task_id FROM sessions WHERE status = ?")
-            .bind(SessionStatus::Running.as_str())
-            .fetch_all(&mut *tx)
-            .await?;
+        // The LEFT JOIN is what separates a session that checkpointed from one
+        // that went silent. Notes are persisted on arrival precisely so this
+        // question survives the restart that orphaned the row.
+        let session_rows = sqlx::query(
+            "SELECT s.id, s.task_id, n.session_id IS NOT NULL AS salvaged \
+             FROM sessions s LEFT JOIN scout_notes n ON n.session_id = s.id \
+             WHERE s.status = ?",
+        )
+        .bind(SessionStatus::Running.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
         let orphaned_sessions = session_rows
             .into_iter()
             .map(|row| {
+                let status = if row.try_get::<i64, _>("salvaged")? != 0 {
+                    SessionStatus::ScoutStoppedEarly
+                } else {
+                    SessionStatus::ScoutFailed
+                };
                 Ok::<_, StoreError>((
                     SessionId::from_raw(row.try_get::<String, _>("id")?),
                     TaskId::from_raw(row.try_get::<String, _>("task_id")?),
+                    status,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1249,15 +1358,16 @@ impl Store {
             .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
             .collect::<Result<Vec<_>, _>>()?;
 
-        if !orphaned_sessions.is_empty() {
+        // One statement per session rather than one bulk UPDATE, because the
+        // status now depends on whether that session left anything behind.
+        for (session_id, _, status) in &orphaned_sessions {
             sqlx::query(
-                "UPDATE sessions SET status = ?, completed_at = ?, exit_reason = ? \
-                 WHERE status = ?",
+                "UPDATE sessions SET status = ?, completed_at = ?, exit_reason = ? WHERE id = ?",
             )
-            .bind(SessionStatus::ScoutFailed.as_str())
+            .bind(status.as_str())
             .bind(now.to_rfc3339())
             .bind(ORPHANED_EXIT_REASON)
-            .bind(SessionStatus::Running.as_str())
+            .bind(session_id.as_str())
             .execute(&mut *tx)
             .await?;
         }
@@ -1330,11 +1440,11 @@ impl Store {
             builds: orphaned_builds.len(),
         };
 
-        for (session_id, task_id) in orphaned_sessions {
+        for (session_id, task_id, status) in orphaned_sessions {
             self.append_event(EventPayload::SessionCompleted {
                 session_id,
                 task_id,
-                status: SessionStatus::ScoutFailed,
+                status,
             })
             .await?;
         }
@@ -3289,6 +3399,18 @@ fn transcript_line_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TranscriptLi
     })
 }
 
+fn scout_notes_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ScoutNotes, StoreError> {
+    let files_raw: String = row.try_get("files_touched")?;
+    Ok(ScoutNotes {
+        session_id: SessionId::from_raw(row.try_get::<String, _>("session_id")?),
+        task_id: TaskId::from_raw(row.try_get::<String, _>("task_id")?),
+        reason: row.try_get("reason")?,
+        notes: row.try_get("notes")?,
+        files_touched: serde_json::from_str(&files_raw)?,
+        updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
+    })
+}
+
 fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
     let status_raw: String = row.try_get("status")?;
     let files_raw: String = row.try_get("files_touched")?;
@@ -4536,6 +4658,204 @@ mod tests {
                 .unwrap()
                 .dispatch_attempts,
             1
+        );
+    }
+
+    // --- scout notes (salvage) ---
+
+    /// Insert a session for `task` in a given terminal state.
+    async fn seed_session(store: &Store, task: &Task, status: SessionStatus) -> SessionId {
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: "scout/x".into(),
+            status,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        session.id
+    }
+
+    fn notes_for(session_id: &SessionId, task: &Task, body: &str, at: DateTime<Utc>) -> ScoutNotes {
+        ScoutNotes {
+            session_id: session_id.clone(),
+            task_id: task.id.clone(),
+            reason: None,
+            notes: body.into(),
+            files_touched: vec![],
+            updated_at: at,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_checkpoint_supersedes_the_last_and_none_becomes_a_spec() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = task_with(&project.id, 1, 0);
+        store.insert_task(&task).await.unwrap();
+        let session = seed_session(&store, &task, SessionStatus::Running).await;
+
+        let now = Utc::now();
+        store
+            .upsert_scout_notes(&notes_for(&session, &task, "first pass", now))
+            .await
+            .unwrap();
+        store
+            .upsert_scout_notes(&ScoutNotes {
+                reason: Some("agent exited 1".into()),
+                files_touched: vec!["src/lib.rs".into()],
+                ..notes_for(
+                    &session,
+                    &task,
+                    "first pass\nsecond pass",
+                    now + chrono::Duration::seconds(30),
+                )
+            })
+            .await
+            .unwrap();
+
+        let stored = store.get_scout_notes(&session).await.unwrap().unwrap();
+        assert_eq!(stored.notes, "first pass\nsecond pass");
+        assert_eq!(stored.reason.as_deref(), Some("agent exited 1"));
+        assert_eq!(stored.files_touched, vec!["src/lib.rs".to_string()]);
+
+        // The load-bearing negative: salvage exists in exactly one place, and
+        // no path leads from it to a reviewer.
+        assert!(store.list_specs().await.unwrap().is_empty());
+        assert!(store.list_spec_queue().await.unwrap().is_empty());
+    }
+
+    /// The newest *stopped-early* notes, not the latest session's notes: an
+    /// interrupted run followed by one that died on a clone error still has
+    /// exploration worth carrying, and the clone failure has nothing to add.
+    #[tokio::test]
+    async fn salvage_survives_a_later_run_that_failed_with_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = task_with(&project.id, 1, 0);
+        store.insert_task(&task).await.unwrap();
+
+        let interrupted = seed_session(&store, &task, SessionStatus::ScoutStoppedEarly).await;
+        store
+            .upsert_scout_notes(&notes_for(&interrupted, &task, "worth keeping", Utc::now()))
+            .await
+            .unwrap();
+        // A later attempt that never got off the ground.
+        seed_session(&store, &task, SessionStatus::ScoutFailed).await;
+
+        let salvage = store.salvage_for_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(salvage.notes, "worth keeping");
+        assert_eq!(salvage.session_id, interrupted);
+
+        // Never across tasks.
+        let other = task_with(&project.id, 2, 0);
+        store.insert_task(&other).await.unwrap();
+        assert!(store.salvage_for_task(&other.id).await.unwrap().is_none());
+    }
+
+    /// A concluded scout supersedes the notes that led to it: the next
+    /// attempt gets the reviewed spec instead, and re-quoting stale leads
+    /// beside it is noise.
+    #[tokio::test]
+    async fn salvage_stops_once_a_scout_has_concluded_since() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = task_with(&project.id, 1, 0);
+        store.insert_task(&task).await.unwrap();
+
+        let interrupted = seed_session(&store, &task, SessionStatus::ScoutStoppedEarly).await;
+        let earlier = Utc::now() - chrono::Duration::hours(1);
+        store
+            .upsert_scout_notes(&notes_for(&interrupted, &task, "old leads", earlier))
+            .await
+            .unwrap();
+        assert!(store.salvage_for_task(&task.id).await.unwrap().is_some());
+
+        seed_session(&store, &task, SessionStatus::ScoutSucceeded).await;
+        assert!(
+            store.salvage_for_task(&task.id).await.unwrap().is_none(),
+            "a spec supersedes the notes that led to it"
+        );
+    }
+
+    /// The orphan sweep's whole reason for reading this table: after a
+    /// restart, a session that checkpointed and one that went silent are
+    /// indistinguishable from the `sessions` row alone.
+    #[tokio::test]
+    async fn reconcile_marks_a_checkpointed_orphan_stopped_early_not_failed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let checkpointed = task_with(&project.id, 1, 0);
+        store.insert_task(&checkpointed).await.unwrap();
+        store
+            .update_task_state(&checkpointed.id, TaskState::Scouting)
+            .await
+            .unwrap();
+        let with_notes = seed_session(&store, &checkpointed, SessionStatus::Running).await;
+        store
+            .upsert_scout_notes(&notes_for(
+                &with_notes,
+                &checkpointed,
+                "got halfway",
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        let silent_task = task_with(&project.id, 2, 0);
+        store.insert_task(&silent_task).await.unwrap();
+        store
+            .update_task_state(&silent_task.id, TaskState::Scouting)
+            .await
+            .unwrap();
+        let silent = seed_session(&store, &silent_task, SessionStatus::Running).await;
+
+        let report = store.reconcile_orphaned_work().await.unwrap();
+        assert_eq!(report.sessions, 2);
+
+        assert_eq!(
+            store
+                .get_session(&with_notes)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::ScoutStoppedEarly
+        );
+        assert_eq!(
+            store.get_session(&silent).await.unwrap().unwrap().status,
+            SessionStatus::ScoutFailed
+        );
+        // Both tasks are requeued either way — a crash is not the task's fault.
+        for t in [&checkpointed, &silent_task] {
+            assert_eq!(
+                store.get_task(&t.id).await.unwrap().unwrap().state,
+                TaskState::Queued
+            );
+        }
+        // And the salvage is now reachable by the next dispatch.
+        assert!(
+            store
+                .salvage_for_task(&checkpointed.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .salvage_for_task(&silent_task.id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

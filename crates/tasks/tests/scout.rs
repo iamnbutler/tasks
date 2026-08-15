@@ -401,3 +401,265 @@ async fn a_scout_that_never_reports_back_times_out() {
         "timed-out scout left its VM allocated"
     );
 }
+
+/// #835 end to end: a scout that dies before concluding leaves salvage behind,
+/// and that salvage never touches the review queue.
+///
+/// The two `assert!(...is_empty())` calls are the regression guard for the
+/// whole design. The obvious fix for a lost run — report the partial spec — is
+/// worse than the bug it fixes, because a half-explored spec entering the
+/// queue looks finished. Keep them.
+#[tokio::test]
+async fn an_interrupted_scout_is_salvaged_without_producing_a_spec() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        common::interrupted_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) =
+        insert_project_and_task(&store, "Runs out of road", "The issue body.").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    let err = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("a run without a spec is not a success");
+    assert!(
+        matches!(err, tasks::scout::ScoutError::StoppedEarly(_)),
+        "stopping early is its own outcome, not a generic failure: {err:?}"
+    );
+
+    // Nothing reviewable exists. This is the invariant.
+    assert!(
+        store.list_specs().await.unwrap().is_empty(),
+        "a half-explored run must not produce a spec"
+    );
+    assert!(
+        store.list_spec_queue().await.unwrap().is_empty(),
+        "and must not reach the review queue by any other route"
+    );
+
+    // A third terminal outcome, neither success nor failure.
+    let sessions = store.list_sessions().await.unwrap();
+    let session = sessions.last().expect("a session row");
+    assert_eq!(session.status, SessionStatus::ScoutStoppedEarly);
+    assert!(
+        session
+            .exit_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not a spec yet")),
+        "exit_reason: {:?}",
+        session.exit_reason
+    );
+
+    // The salvage itself, in the one place it lives.
+    let notes = store
+        .get_scout_notes(&session.id)
+        .await
+        .unwrap()
+        .expect("notes were salvaged");
+    assert!(notes.notes.contains("src/parse.rs"), "{}", notes.notes);
+    assert!(notes.notes.contains("Nothing below is a spec"));
+    assert!(notes.reason.is_some());
+    assert!(notes.files_touched.contains(&"src/half.rs".to_string()));
+
+    // The task is picked up still, and the attempt is on the record.
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Queued);
+}
+
+/// The salvage's only consumer: the next attempt's prompt. The echo-prompt
+/// agent copies its whole stdin into SPEC.md, so the second run's spec content
+/// *is* the prompt the second scout was handed.
+#[tokio::test]
+async fn the_next_scout_is_handed_the_field_notes_as_unverified_leads() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Two tries", "The issue body.").await;
+    let scout_config = ScoutConfig {
+        image: "agent:v1".into(),
+        vm_config: VmConfig::default(),
+        timeout: Duration::from_secs(300),
+    };
+
+    // First attempt: interrupted, so it leaves notes.
+    {
+        let wrapper = write_supervisor_wrapper(
+            tmp.path(),
+            &supervisor_bin,
+            common::interrupted_agent_path().to_str().unwrap(),
+            &workdir_root,
+        )
+        .await;
+        let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+        let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+        let scout = Scout::new(store.clone(), client.handle(), scout_config.clone());
+        scout
+            .dispatch(task.clone(), &target)
+            .await
+            .expect_err("interrupted");
+    }
+
+    // Second attempt: the prompt should carry the first run's notes.
+    let requeued = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(requeued.state, TaskState::Queued);
+
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        common::echo_prompt_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+    let scout = Scout::new(store.clone(), client.handle(), scout_config);
+    let spec = scout.dispatch(requeued, &target).await.expect("second run");
+
+    assert!(
+        spec.content
+            .contains("## Field notes from an interrupted attempt"),
+        "the second prompt is missing the salvage:\n{}",
+        spec.content
+    );
+    assert!(
+        spec.content.contains("The parser lives in `src/parse.rs`"),
+        "the notes themselves should be quoted"
+    );
+    assert!(
+        spec.content.contains("Nothing below has been verified."),
+        "salvage must arrive labelled as unverified"
+    );
+
+    // And once a scout concludes, the stale leads stop being handed out.
+    assert!(
+        store.salvage_for_task(&task.id).await.unwrap().is_none(),
+        "a spec supersedes the notes that led to it"
+    );
+}
+
+/// The headline case: the deadline. The VM is destroyed where it stands, so
+/// nothing on its disk is recoverable and the supervisor never gets to report
+/// anything — the last checkpoint the dispatcher already holds is the entire
+/// salvage. That state lives outside the drain future precisely because
+/// `tokio::time::timeout` drops it here.
+///
+/// The error keeps its shape: a salvaged timeout is still `Timeout`, and
+/// `exit_reason` still says "timed out". CLAUDE.md and two other tests pin it.
+#[tokio::test]
+async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+
+    // 3s against a 1s checkpoint interval: one checkpoint reaches the host,
+    // then the deadline lands. The agent's own `sleep 10` outlives it — see
+    // the note in `a_scout_that_never_reports_back_times_out`.
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        common::notes_then_hangs_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Hangs mid-thought", "body").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(3),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    let err = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("should time out");
+    assert!(
+        matches!(err, tasks::scout::ScoutError::Timeout { secs: 3 }),
+        "a salvaged timeout is still a timeout: {err:?}"
+    );
+
+    let sessions = store.list_sessions().await.unwrap();
+    let session = sessions.last().expect("a session row");
+    assert_eq!(session.status, SessionStatus::ScoutStoppedEarly);
+    assert!(
+        session
+            .exit_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("timed out")),
+        "the timeout must not be rebranded: {:?}",
+        session.exit_reason
+    );
+
+    let notes = store
+        .get_scout_notes(&session.id)
+        .await
+        .unwrap()
+        .expect("the streamed checkpoint outlived the VM");
+    assert!(
+        notes.notes.contains("this is all I have"),
+        "notes: {}",
+        notes.notes
+    );
+
+    // Everything the plain timeout path already guaranteed still holds.
+    assert!(store.list_specs().await.unwrap().is_empty());
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::Queued
+    );
+    assert!(
+        service.pool.list().await.is_empty(),
+        "cancellation is deallocation; the slot must come back"
+    );
+}

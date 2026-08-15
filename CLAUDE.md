@@ -10,6 +10,15 @@ implementation.
 - **The Scout/Builder information barrier is inviolable.** Builders never see
   Scout code — the spec is the deliverable. Specs are text, so a Builder run
   can batch N specs into one branch. Never propose reusing Scout branches.
+- **Salvage is never a spec.** A Scout writes two files with two meanings:
+  `SPEC.md` means "I concluded", `NOTES.md` means "here is what I have so
+  far". Notes stream back as checkpoints during the run (the VM is destroyed
+  at the deadline, so nothing collected at the end survives) and land in
+  `scout_notes` — one row per session, no `Spec`, no queue entry, no review
+  path. Their only consumer is the next attempt's prompt, where they are
+  quoted as explicitly unverified leads. Reporting a partial spec *as* a spec
+  would be worse than losing the run, because a half-explored spec in the
+  review queue looks finished. Promoting notes into a spec stays a human act.
 - **Never persist a GitHub-owned fact** (PR mergeable/SHA/CI, issue
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
@@ -157,9 +166,9 @@ binaries and export `TASKS_TEST_BIN_DIR` so no test shells out to cargo.
 
 Two gotchas worth knowing. **nextest does not run doctests** — silently, with
 no skip count in its summary — so both targets end with `cargo test --doc
---workspace`; anything else that runs the suite must too. And two scout
-timeout tests leave a stray child holding the output pipe, so they report as
-LEAK; that is expected (`leak-timeout` is `result = "pass"`), and the profile
+--workspace`; anything else that runs the suite must too. And the scout
+timeout tests (three of them) leave a stray child holding the output pipe, so
+they report as LEAK; that is expected (`leak-timeout` is `result = "pass"`), and the profile
 deliberately keeps the period short rather than waiting the leak out, which
 would cost seconds and hide a real leak. Tuning lives in
 `.config/nextest.toml`.
@@ -175,6 +184,7 @@ env / `.env`:
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
 | `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
+| `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |

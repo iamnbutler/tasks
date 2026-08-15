@@ -45,4 +45,11 @@ ENV CARGO_BUILD_JOBS=1
 # "requires --verbose" and every scout fails at the agent step.
 ENV SCOUT_AGENT_CMD="claude --print --output-format stream-json --verbose --dangerously-skip-permissions"
 
+# How often the supervisor polls NOTES.md and streams it back as a checkpoint.
+# Set here rather than in the server's env because it is read *inside* the VM.
+# 30s is far finer than the failure it insures against (a whole scout run
+# lost), and a scout's VM is destroyed at the deadline — whatever the host
+# already received is all there will ever be.
+ENV SCOUT_CHECKPOINT_INTERVAL_SECS=30
+
 ENTRYPOINT ["/usr/local/bin/scout-supervisor"]

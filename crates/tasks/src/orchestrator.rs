@@ -565,8 +565,13 @@ pub fn nudge_worthy(payload: &EventPayload) -> bool {
         | EventPayload::BuildCompleted { .. }
         | EventPayload::PullRequestOpened { .. }
         | EventPayload::ModeChanged { .. } => true,
-        // Success is conveyed by the SpecCreated that accompanies it.
-        EventPayload::SessionCompleted { status, .. } => *status == SessionStatus::ScoutFailed,
+        // Success is conveyed by the SpecCreated that accompanies it. A run
+        // that stopped early has no SpecCreated to convey anything, and is
+        // exactly the kind of half-finished state worth flagging.
+        EventPayload::SessionCompleted { status, .. } => matches!(
+            status,
+            SessionStatus::ScoutFailed | SessionStatus::ScoutStoppedEarly
+        ),
         // Review verdicts — but never the orchestrator's own. Being told
         // what you just did is not news: it costs a turn to acknowledge, and
         // worse, invites second-guessing a verdict already rendered. This is
@@ -1066,6 +1071,13 @@ mod tests {
             session_id: sess(),
             task_id: task(),
             status: SessionStatus::ScoutFailed,
+        }));
+        // A run that stopped early has no SpecCreated to convey it, and half
+        // an exploration is exactly the state worth a second pair of eyes.
+        assert!(nudge_worthy(&EventPayload::SessionCompleted {
+            session_id: sess(),
+            task_id: task(),
+            status: SessionStatus::ScoutStoppedEarly,
         }));
         assert!(nudge_worthy(&EventPayload::SpecQueueStatusChanged {
             spec_id: spec(),

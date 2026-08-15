@@ -27,7 +27,7 @@ use tasks_api::http::{
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, Session, SessionId, Spec, SpecId, SpecQueueItem,
+    OrchestratorSessionInfo, Project, ScoutNotes, Session, SessionId, Spec, SpecId, SpecQueueItem,
     SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use thiserror::Error;
@@ -284,6 +284,22 @@ impl Client {
 
     pub fn session(&self, id: &SessionId) -> Result<Session> {
         self.get_json(&format!("/sessions/{id}"), &[])
+    }
+
+    /// Salvage from a session that stopped early: what the scout had written
+    /// down when it was interrupted.
+    ///
+    /// `None` rather than an error for the 404, because having no notes is
+    /// the ordinary case — a session that concluded has none, and neither
+    /// does one that left nothing behind. **Not a spec**: these notes were
+    /// never reviewed and carry no verdict, so anything rendering them should
+    /// say so.
+    pub fn session_notes(&self, id: &SessionId) -> Result<Option<ScoutNotes>> {
+        match self.get_json::<ScoutNotes>(&format!("/sessions/{id}/notes"), &[]) {
+            Ok(notes) => Ok(Some(notes)),
+            Err(ClientError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Catch-up read of a scout session's transcript. `since` is inclusive — a
