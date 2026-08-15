@@ -362,6 +362,10 @@ impl Scout {
         vm_id: &VmId,
         reason: String,
     ) -> Result<(), ScoutError> {
+        // Failure reasons quote git, and git quotes the credentialed clone URL
+        // back at us. One call here covers all three destinations below:
+        // `sessions.exit_reason`, the event log, and the log line.
+        let reason = crate::redact::redact_owned(reason);
         let now = Utc::now();
         self.store
             .update_session_completion(
@@ -451,7 +455,11 @@ impl TranscriptSink {
         if self.capped {
             return;
         }
-        let line = truncate_line(line);
+        // Scrub *before* truncating. `Store::append_transcript_lines` is the
+        // guarantee; this call closes the one edge it can't see — a 32 KiB cut
+        // landing inside `x-access-token:<token>@` strands a token prefix with
+        // no `@` behind it, which no later pass can recognise as a credential.
+        let line = truncate_line(crate::redact::redact_owned(line));
         if self.bytes + line.len() > MAX_TRANSCRIPT_BYTES_PER_SESSION {
             self.capped = true;
             // Best-effort: if even this doesn't fit the queue, the log still
@@ -936,6 +944,44 @@ mod tests {
         }
         assert_eq!(recorded, fits + 1, "capped pushes must not be recorded");
         assert!(last.contains("transcript truncated"));
+    }
+
+    /// #840: the sink scrubs before it truncates. Truncating first can cut the
+    /// middle of `x-access-token:<token>@`, and what's left is a token prefix
+    /// with no `@` behind it — unrecognisable as a credential to the store's
+    /// own scrub, or to anything downstream.
+    #[test]
+    fn a_credential_straddling_the_line_cap_is_scrubbed_not_stranded() {
+        let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        // Positioned so the 32 KiB cut lands inside the token itself.
+        let raw = format!(
+            "{}https://x-access-token:{token}@github.com/o/r.git",
+            "x".repeat(MAX_TRANSCRIPT_LINE_BYTES - 40)
+        );
+
+        // The trap, stated as an assertion: truncation alone strands the token.
+        assert!(
+            truncate_line(raw.clone()).contains("ghp_0123456789"),
+            "the fixture no longer straddles the cut"
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(TRANSCRIPT_QUEUE_CAPACITY);
+        let mut sink = TranscriptSink {
+            tx,
+            bytes: 0,
+            capped: false,
+            dropped: 0,
+            dropped_total: 0,
+        };
+        sink.push(TranscriptStream::Stdout, raw);
+
+        let (_, recorded) = rx.try_recv().expect("the line was queued");
+        assert!(
+            !recorded.contains("ghp_"),
+            "a token prefix survived the cut: {}",
+            &recorded[recorded.len().saturating_sub(120)..]
+        );
+        assert!(recorded.contains("https://***@github.com/o/r.git"));
     }
 
     #[test]

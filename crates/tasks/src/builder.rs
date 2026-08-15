@@ -27,6 +27,7 @@ use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 use crate::github::{GhError, GitHubClient};
 use crate::models::{Build, Project, Spec, Task};
 use crate::protocol::{BuildCommand, BuildEvent, TaskCommand, TaskEvent, TasksProtocol};
+use crate::redact::{redact, redact_line};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -227,7 +228,11 @@ impl Builder {
                         self.store.set_build_base_sha(build_id, &base_sha).await?;
                     }
                     BuildEvent::Progress { line, .. } => {
-                        debug!(build_id = %build_id, "{line}");
+                        // Builder output isn't persisted yet, but a log file is
+                        // a file: git echoes the credentialed clone URL its VM
+                        // was handed. When #825 gives this a transcript sink,
+                        // `Store::append_transcript_lines` covers that path.
+                        debug!(build_id = %build_id, "{}", redact_line(&line));
                     }
                     BuildEvent::ImplementationFinished { exit_code } => {
                         info!(build_id = %build_id, exit_code, "builder agent finished");
@@ -385,36 +390,6 @@ async fn git_stdout(dir: &std::path::Path, args: &[&str]) -> Result<String, Buil
         ))));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Strip credentials from URLs embedded in text — clone URLs carry
-/// `x-access-token:<token>@`, and git repeats the URL in its errors, which
-/// flow into `exit_reason`, the event log, and the API.
-///
-/// Credential-aware rather than naive: only the userinfo of a `scheme://`
-/// URL's authority is stripped. An `@` later in a path is left alone.
-pub fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(idx) = rest.find("://") {
-        let (before, after) = rest.split_at(idx + 3);
-        out.push_str(before);
-        // Authority runs to the first `/`, `?`, `#`, whitespace, or quote.
-        let authority_end = after
-            .find(['/', '?', '#', ' ', '\t', '\n', '\r', '\'', '"'])
-            .unwrap_or(after.len());
-        let authority = &after[..authority_end];
-        match authority.rfind('@') {
-            Some(at) => {
-                out.push_str("***@");
-                out.push_str(&authority[at + 1..]);
-            }
-            None => out.push_str(authority),
-        }
-        rest = &after[authority_end..];
-    }
-    out.push_str(rest);
-    out
 }
 
 /// The Builder prompt: concatenated spec markdown plus issue title/number.
@@ -658,25 +633,5 @@ mod tests {
         let (_, body) = pr_text(&batch, &outcome);
         assert!(!body.contains("Closes"));
         assert!(body.starts_with("Implements #763. Adds golden fixtures."));
-    }
-
-    #[test]
-    fn redact_strips_credentials_but_not_path_ats() {
-        assert_eq!(
-            redact(
-                "fatal: could not read from 'https://x-access-token:ghp_abc123@github.com/o/r.git'"
-            ),
-            "fatal: could not read from 'https://***@github.com/o/r.git'"
-        );
-        assert_eq!(
-            redact("https://user@host/path and /a/path@with-at stays"),
-            "https://***@host/path and /a/path@with-at stays"
-        );
-        // No credentials, no change.
-        assert_eq!(
-            redact("https://github.com/o/r.git plain"),
-            "https://github.com/o/r.git plain"
-        );
-        assert_eq!(redact("no urls at all"), "no urls at all");
     }
 }

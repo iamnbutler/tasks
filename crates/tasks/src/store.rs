@@ -8,6 +8,7 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
@@ -115,6 +116,105 @@ impl ReconcileReport {
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Rows rewritten per transaction by a one-shot repair. Small enough that the
+/// sweep never holds a write lock long enough to matter to a live scout.
+const MAINTENANCE_BATCH: i64 = 500;
+
+/// Run the one-shot repairs a migration asked for, then forget them.
+///
+/// The seam exists for repairs a migration *cannot* express in SQL — the
+/// credential sweep below needs `redact`, and SQLite has no regex, so the
+/// alternative was a second implementation of the redaction rules that could
+/// disagree with the first. Don't reach for this for anything plain SQL can
+/// do.
+///
+/// An unrecognised marker is logged and **left in place**: it means a newer
+/// binary wrote this database, and dropping the row would silently lose a
+/// repair that binary still intends to perform.
+async fn run_pending_maintenance(pool: &SqlitePool) -> Result<(), StoreError> {
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pending_maintenance ORDER BY requested_at, name")
+            .fetch_all(pool)
+            .await?;
+    for name in names {
+        match name.as_str() {
+            "redact_transcripts" => {
+                let scrubbed = sweep_transcript_credentials(pool).await?;
+                if scrubbed > 0 {
+                    warn!(
+                        rows = scrubbed,
+                        "scrubbed credentials out of historical transcript lines; \
+                         those lines were readable over the API, so rotate GITHUB_TOKEN"
+                    );
+                }
+            }
+            other => {
+                warn!(
+                    marker = other,
+                    "unrecognised pending_maintenance marker, leaving it in place; \
+                     a newer binary probably wrote this database"
+                );
+                continue;
+            }
+        }
+        sqlx::query("DELETE FROM pending_maintenance WHERE name = ?")
+            .bind(&name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Rewrite transcript lines written before the scrub moved onto the write
+/// path (#840). Returns how many rows changed.
+///
+/// `LIKE '%://%@%'` only narrows the scan — `redact` still decides row by row,
+/// so `/a/path@with-at` survives the sweep exactly as it survives the write
+/// path. Paging is keyset on the primary key rather than `OFFSET`: a rewritten
+/// row still matches the prefilter, but nothing here should depend on that.
+async fn sweep_transcript_credentials(pool: &SqlitePool) -> Result<u64, StoreError> {
+    let mut cursor = (String::new(), i64::MIN);
+    let mut scrubbed = 0u64;
+    loop {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT session_id, seq, line FROM transcript_lines \
+             WHERE (session_id > ? OR (session_id = ? AND seq > ?)) \
+             AND line LIKE '%://%@%' \
+             ORDER BY session_id, seq LIMIT ?",
+        )
+        .bind(&cursor.0)
+        .bind(&cursor.0)
+        .bind(cursor.1)
+        .bind(MAINTENANCE_BATCH)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(scrubbed);
+        }
+        let batch_len = rows.len() as i64;
+        let mut tx = pool.begin().await?;
+        for (session_id, seq, line) in rows {
+            let redacted = crate::redact::redact(&line);
+            if redacted != line {
+                sqlx::query(
+                    "UPDATE transcript_lines SET line = ? WHERE session_id = ? AND seq = ?",
+                )
+                .bind(&redacted)
+                .bind(&session_id)
+                .bind(seq)
+                .execute(&mut *tx)
+                .await?;
+                scrubbed += 1;
+            }
+            cursor = (session_id, seq);
+        }
+        tx.commit().await?;
+        if batch_len < MAINTENANCE_BATCH {
+            return Ok(scrubbed);
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlx: {0}")]
@@ -174,6 +274,7 @@ impl Store {
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
+        run_pending_maintenance(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -193,6 +294,7 @@ impl Store {
             .connect("sqlite::memory:")
             .await?;
         MIGRATOR.run(&pool).await?;
+        run_pending_maintenance(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -1023,6 +1125,13 @@ impl Store {
         let mut persisted = Vec::with_capacity(lines.len());
         for (offset, (stream, line)) in lines.iter().enumerate() {
             let seq = next + offset as i64;
+            // Scrubbed here rather than at each producer: this is the one
+            // choke point every transcript passes through, so a token never
+            // reaches the table — which covers a copy of `tasks.db` as well as
+            // the API, and means no future reader can forget. The row and the
+            // broadcast copy are built from the same scrubbed text, so a live
+            // tail and a catch-up read see identical bytes.
+            let line = crate::redact::redact_line(line);
             sqlx::query(
                 "INSERT INTO transcript_lines (session_id, seq, timestamp, stream, line) \
                  VALUES (?, ?, ?, ?, ?)",
@@ -1031,7 +1140,7 @@ impl Store {
             .bind(seq)
             .bind(now.to_rfc3339())
             .bind(stream.as_str())
-            .bind(line)
+            .bind(line.as_ref())
             .execute(&mut *tx)
             .await?;
             persisted.push(TranscriptLine {
@@ -1039,7 +1148,7 @@ impl Store {
                 seq,
                 timestamp: now,
                 stream: *stream,
-                line: line.clone(),
+                line: line.into_owned(),
             });
         }
         tx.commit().await?;
@@ -5292,6 +5401,175 @@ mod tests {
                 .unwrap()[0]
                 .line,
             "hello"
+        );
+    }
+
+    // --- credential scrubbing (#840) ---
+
+    const CREDENTIALED: &str =
+        "fatal: could not read from 'https://x-access-token:ghp_secret123@github.com/o/r.git'";
+    const SCRUBBED: &str = "fatal: could not read from 'https://***@github.com/o/r.git'";
+
+    /// A running session to hang transcript lines off.
+    async fn seed_session(store: &Store, number: u64) -> SessionId {
+        let (task, _) = seed_spec(store, number).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id,
+            vm_id: None,
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        session.id
+    }
+
+    /// Write a line the way a pre-fix build did: straight in, no scrub.
+    async fn insert_raw_line(store: &Store, session_id: &SessionId, seq: i64, line: &str) {
+        sqlx::query(
+            "INSERT INTO transcript_lines (session_id, seq, timestamp, stream, line) \
+             VALUES (?, ?, ?, 'stdout', ?)",
+        )
+        .bind(session_id.as_str())
+        .bind(seq)
+        .bind(Utc::now().to_rfc3339())
+        .bind(line)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    /// `open_in_memory` runs maintenance too, so the marker is already gone by
+    /// the time a test body starts. Put it back the way the migration does.
+    async fn rearm_marker(store: &Store, name: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO pending_maintenance (name, requested_at) \
+             VALUES (?, '1970-01-01T00:00:00Z')",
+        )
+        .bind(name)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn pending_markers(store: &Store) -> Vec<String> {
+        sqlx::query_scalar("SELECT name FROM pending_maintenance ORDER BY name")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transcript_lines_are_scrubbed_on_the_way_in() {
+        let store = Store::open_in_memory().await.unwrap();
+        let session_id = seed_session(&store, 1).await;
+        let mut rx = store.subscribe_transcript();
+
+        let persisted = store
+            .append_transcript_lines(
+                &session_id,
+                &[
+                    (TranscriptStream::Stderr, CREDENTIALED.into()),
+                    // A bare `@` in a path is not a credential.
+                    (TranscriptStream::Stdout, "reading /a/path@with-at".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted[0].line, SCRUBBED);
+        assert_eq!(persisted[1].line, "reading /a/path@with-at");
+
+        // The broadcast copy and a catch-up read must be the same bytes.
+        assert_eq!(rx.try_recv().unwrap().line, SCRUBBED);
+        let read_back = store.transcript_since(&session_id, 0, 10).await.unwrap();
+        assert_eq!(read_back[0].line, SCRUBBED);
+        assert_eq!(read_back[1].line, "reading /a/path@with-at");
+
+        // Nothing token-shaped anywhere in the table, however it got there.
+        let all: Vec<String> = sqlx::query_scalar("SELECT line FROM transcript_lines")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            all.iter().all(|l| !l.contains("ghp_")),
+            "a credential reached the table: {all:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_rewrites_rows_written_before_the_fix() {
+        let store = Store::open_in_memory().await.unwrap();
+        let session_id = seed_session(&store, 1).await;
+        insert_raw_line(&store, &session_id, 1, CREDENTIALED).await;
+        insert_raw_line(&store, &session_id, 2, "reading /a/path@with-at").await;
+        insert_raw_line(&store, &session_id, 3, "https://github.com/o/r.git plain").await;
+
+        rearm_marker(&store, "redact_transcripts").await;
+        run_pending_maintenance(&store.pool).await.unwrap();
+
+        let lines = store.transcript_since(&session_id, 0, 10).await.unwrap();
+        assert_eq!(lines[0].line, SCRUBBED);
+        // The prefilter narrows the scan; `redact` still decides per row.
+        assert_eq!(lines[1].line, "reading /a/path@with-at");
+        assert_eq!(lines[2].line, "https://github.com/o/r.git plain");
+
+        // Consumed: the scan happens on one boot and never again.
+        assert!(pending_markers(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_runs_once_and_not_on_every_open() {
+        let store = Store::open_in_memory().await.unwrap();
+        let session_id = seed_session(&store, 1).await;
+        rearm_marker(&store, "redact_transcripts").await;
+        run_pending_maintenance(&store.pool).await.unwrap();
+
+        // A row that appears after the marker was consumed is the write path's
+        // problem, not the sweep's — a second boot must not rescan the table.
+        insert_raw_line(&store, &session_id, 1, CREDENTIALED).await;
+        run_pending_maintenance(&store.pool).await.unwrap();
+        let lines = store.transcript_since(&session_id, 0, 10).await.unwrap();
+        assert_eq!(lines[0].line, CREDENTIALED);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_pages_past_its_batch_size() {
+        let store = Store::open_in_memory().await.unwrap();
+        // Two sessions, so paging has to carry the keyset across the boundary
+        // rather than only advancing `seq`.
+        let a = seed_session(&store, 1).await;
+        let b = seed_session(&store, 2).await;
+        let rows = MAINTENANCE_BATCH + 7;
+        for seq in 1..=rows {
+            let session = if seq % 2 == 0 { &a } else { &b };
+            insert_raw_line(&store, session, seq, CREDENTIALED).await;
+        }
+
+        rearm_marker(&store, "redact_transcripts").await;
+        run_pending_maintenance(&store.pool).await.unwrap();
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transcript_lines WHERE line LIKE '%ghp_%'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0, "the sweep stopped at its first batch");
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_marker_is_left_in_place() {
+        let store = Store::open_in_memory().await.unwrap();
+        // Written by a newer binary: dropping it would silently lose a repair.
+        rearm_marker(&store, "a_repair_from_the_future").await;
+        rearm_marker(&store, "redact_transcripts").await;
+        run_pending_maintenance(&store.pool).await.unwrap();
+        assert_eq!(
+            pending_markers(&store).await,
+            vec!["a_repair_from_the_future"]
         );
     }
 
