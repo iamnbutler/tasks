@@ -27,7 +27,36 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
-        check-nextest test-bins test test-ci test-cargo
+        check-nextest test-bins test test-ci test-cargo app run
+
+# Version identity stamped into the app (shown in About Tasks): version is
+# 0.1.<commit count>, build is the short SHA, "-dirty" when uncommitted
+# changes were present. Answers "is what I'm running fresh?" at a glance.
+# app-gpui/build.rs computes the same two values on its own for a bare
+# `cargo run`; passing them here is what makes an installed bundle exact.
+APP_VERSION := 0.1.$(shell git rev-list --count HEAD)
+APP_COMMIT := $(shell git rev-parse --short HEAD)$(shell git diff --quiet 2>/dev/null || echo "-dirty")
+
+# Build the mac app and install it to ~/Applications, replacing any existing
+# copy. app-gpui is not a workspace member and has its own target/ directory,
+# so the binary comes from there, not the root target/. There is no Xcode
+# project any more, so the bundle is assembled by hand around it.
+app:
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "make app builds a macOS .app bundle; this is $$(uname -s)"; exit 1; }
+	cd app-gpui && TASKS_GPUI_VERSION=$(APP_VERSION) TASKS_GPUI_COMMIT=$(APP_COMMIT) \
+		cargo build --release
+	@bundle="$$HOME/Applications/Tasks.app"; \
+	rm -rf "$$bundle"; \
+	mkdir -p "$$bundle/Contents/MacOS" "$$bundle/Contents/Resources"; \
+	cp app-gpui/target/release/tasks-gpui "$$bundle/Contents/MacOS/Tasks"; \
+	sed -e 's/@VERSION@/$(APP_VERSION)/' -e 's/@COMMIT@/$(APP_COMMIT)/' \
+		app-gpui/Info.plist.in > "$$bundle/Contents/Info.plist"; \
+	echo "installed $$bundle ($(APP_VERSION), $(APP_COMMIT))"
+
+# Build, install, and (re)launch.
+run: app
+	@pkill -x Tasks 2>/dev/null || true
+	open ~/Applications/Tasks.app
 
 # Tests. Binaries are built once, here, and the suite only execs them —
 # nothing shells out to `cargo build` mid-test (that used to block on the

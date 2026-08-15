@@ -27,7 +27,7 @@ use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
 use crate::issue_composer::{self, IssueComposer};
 use crate::state::AppState;
 
-const FONT: &str = "Menlo";
+pub(crate) const FONT: &str = "Menlo";
 
 actions!(workspace, [ToggleLeftDock, ToggleRightDock, NewIssue]);
 

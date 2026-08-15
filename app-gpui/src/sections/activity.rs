@@ -47,10 +47,7 @@ impl Workspace {
                         gh_issue_number,
                         actor,
                         ..
-                    } => format!(
-                        "Filed issue #{gh_issue_number} ({})",
-                        actor.as_str()
-                    ),
+                    } => format!("Filed issue #{gh_issue_number} ({})", actor.as_str()),
                     EventPayload::IssueClosed {
                         gh_issue_number,
                         reason,

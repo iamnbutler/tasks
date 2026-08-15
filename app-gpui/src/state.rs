@@ -226,16 +226,7 @@ impl AppState {
                 $(if let Some(value) = snapshot.$field { self.$field = value; })+
             };
         }
-        merge!(
-            projects,
-            tasks,
-            sessions,
-            specs,
-            spec_queue,
-            builds,
-            activity,
-            briefings
-        );
+        merge!(projects, tasks, sessions, specs, spec_queue, builds, activity, briefings);
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
         if let Some(messages) = snapshot.orchestrator_messages {
