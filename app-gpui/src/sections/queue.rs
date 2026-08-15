@@ -1,5 +1,6 @@
 //! The Queue section: picked-up work grouped in attention order, mirroring
-//! the Swift app — Needs you / Running / Building / Up next / Ready to build.
+//! the Swift app — Needs you / Running / Building / Awaiting merge / Up next /
+//! Ready to build.
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context};
@@ -84,6 +85,16 @@ impl Workspace {
             })
             .collect();
         groups.push(("Building", building));
+
+        // Between Building and Up next: the work is done but not shipped, and
+        // the poller is still driving it.
+        let awaiting_merge: Vec<_> = state
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::AwaitingMerge)
+            .map(row)
+            .collect();
+        groups.push(("Awaiting merge", awaiting_merge));
 
         let up_next: Vec<_> = state
             .tasks

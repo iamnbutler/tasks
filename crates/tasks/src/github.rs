@@ -134,6 +134,13 @@ pub struct PrState {
     /// GitHub's mergeability verdict, or `None` while it is still computing
     /// one. Unknown is not the same as conflicted.
     pub mergeable: Option<bool>,
+    /// The commit the merge produced — evidence for closing the issue the PR
+    /// implements.
+    ///
+    /// **Populated on open PRs too**, from GitHub's speculative test merge, so
+    /// its presence says nothing about whether anything landed. Check `merged`
+    /// first, always.
+    pub merge_commit_sha: Option<String>,
 }
 
 impl PrState {
@@ -793,6 +800,10 @@ impl GitHubClient {
             // "unknown", not "conflicted", and the distinction matters to a
             // reader deciding whether to act.
             mergeable: body.get("mergeable").and_then(|m| m.as_bool()),
+            merge_commit_sha: body
+                .get("merge_commit_sha")
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
         })
     }
 

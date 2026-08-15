@@ -534,6 +534,7 @@ impl Workspace {
                         | TaskState::InReview
                         | TaskState::ReadyToBuild
                         | TaskState::Building
+                        | TaskState::AwaitingMerge
                 )
             })
             .count();

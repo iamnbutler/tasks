@@ -290,9 +290,11 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
                 .status,
             SpecQueueStatus::Built
         );
+        // Not `done`: a PR that opened is a claim, not a delivery. The
+        // batch parks here until the poller reads the pull request.
         assert_eq!(
             h.store.get_task(&task.id).await.unwrap().unwrap().state,
-            TaskState::Done
+            TaskState::AwaitingMerge
         );
     }
 }

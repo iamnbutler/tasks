@@ -23,6 +23,18 @@ implementation.
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
   through the server, never through agents.
+- **`done` means shipped, and it is written in exactly one place.** A build
+  that opens a PR has made a claim, not a delivery, so it parks its batch in
+  `awaiting_merge`; the only thing that writes `done` is closure-derived
+  retirement, so `done` always means "the issue is closed upstream". Each poll
+  reads the unresolved PR (`watch_merges`) and either closes the issue as
+  completed — through the server, under `retire_work`, with the merge commit
+  as evidence — or unwinds the batch back to `ready_to_build` with a build
+  attempt charged. Unwinding restores the *option* to rebuild; nothing
+  dispatches a build by itself, which is what keeps that safe. The cost is one
+  REST call per open Builder PR per poll, forever, and that is the right
+  price: the moment it is cached in a `last_checked` column, the thing being
+  cached is a GitHub-owned fact with a timestamp on it.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only

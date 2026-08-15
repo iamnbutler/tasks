@@ -654,12 +654,22 @@ pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) ->
                     task_ref(store, task_id).await
                 ));
             }
-            EventPayload::SpecQueueStatusChanged { spec_id, to, .. } => {
+            EventPayload::SpecQueueStatusChanged {
+                spec_id, from, to, ..
+            } => {
                 let task = match store.get_spec(spec_id).await {
                     Ok(Some(spec)) => task_ref(store, &spec.task_id).await,
                     _ => spec_id.to_string(),
                 };
-                lines.push(format!("- Review verdict on {task}: {}", to.as_str()));
+                // `built → approved` is the one transition nobody rendered a
+                // verdict on: a Builder's PR was closed unmerged and the batch
+                // went back on the shelf.
+                lines.push(match (from, to) {
+                    (Some(SpecQueueStatus::Built), SpecQueueStatus::Approved) => {
+                        format!("- PR closed unmerged: {task} is ready to build again")
+                    }
+                    _ => format!("- Review verdict on {task}: {}", to.as_str()),
+                });
             }
             EventPayload::BuildCompleted { build_id, status } => {
                 let line = match store.get_build(build_id).await {
@@ -1041,15 +1051,21 @@ fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> Str
            window: it is a log, not a state snapshot, and re-deriving the \
            present from it costs far more of your context than asking for the \
            present directly. Retired tasks are hidden from GET /tasks but \
-           reachable at GET /tasks/{{id}}. Nothing on the wire counts merged \
-           PRs — pull_request_opened fires at open; check merge state via gh, \
-           or say \"opened\", not \"shipped\"\n\
+           reachable at GET /tasks/{{id}}. pull_request_opened fires at open \
+           and says nothing about landing: a task in awaiting_merge has an \
+           unresolved PR, so say \"opened\", not \"shipped\", until the poller \
+           moves it to done\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
-           building → done (rejected = terminal). Issue closure on GitHub \
-           retires work automatically; there is no manual mark-done.\n\
+           building → awaiting_merge → done (rejected = terminal). Issue \
+           closure on GitHub retires work automatically; there is no manual \
+           mark-done.\n\
+         - done means shipped. A build that opens a PR parks its tasks in \
+           awaiting_merge, not done: the poller reads the PR and either closes \
+           the issue as completed (merged) or returns the batch to \
+           ready_to_build (closed unmerged). Never call an opened PR done.\n\
          - The checkout is shared with the human and other agents. Never \
            switch branches, stash, or discard changes you did not make; do \
            your own work on branches and leave the tree as you found it.\n\
