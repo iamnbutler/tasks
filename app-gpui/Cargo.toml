@@ -9,6 +9,11 @@ gpui = { package = "gpui-unofficial", version = "1.14.2" }
 # Xcode Metal toolchain.
 gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.14.2", features = ["font-kit", "runtime_shaders"] }
 gpuikit = "0.6"
+# Held to gpuikit's line on purpose: it already pulls 0.12 in, so this adds no
+# transitive dependencies. Two parsers in one binary would eventually mean two
+# answers for the same source (`Cargo.lock` is gitignored repo-wide, so the
+# resolve happens fresh on every clone).
+pulldown-cmark = { version = "0.12", default-features = false }
 smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.

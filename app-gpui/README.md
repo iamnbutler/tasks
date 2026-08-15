@@ -43,6 +43,20 @@ components are built and how data moves):
   exhaustive match, so a new event kind is a compile error), Chat
   (orchestrator conversation, read-only so far), and `detail.rs` (the
   inspector with per-state actions: queue/dequeue/scout, approve/reject).
+- **`markdown/`** — the markdown engine, on the two surfaces that carry
+  markdown: the orchestrator chat bubble and the inspector's spec and issue
+  body. `blocks.rs` turns source into a flat `Vec<Block>` (pure — no gpui, no
+  theme, no `App`, so the interesting cases are testable without a window);
+  `render.rs` turns blocks into elements, one `StyledText` per block with
+  highlight ranges, so emphasis, inline code and links stay *inline* rather
+  than becoming stacked blocks (the visible defect in `gpuikit::markdown`
+  0.6.0, which also renders inline code with its backticks and reparses on
+  every call). `mod.rs` holds `MarkdownStore` — a `Global` caching parses by
+  namespaced key, LRU-capped — plus the two style profiles, `chat_style` and
+  `doc_style`. The profiles differ only in type scale and in which surface
+  colour a code chip sits on; parsing is identical. It reuses gpuikit's
+  `MarkdownStyle`/`TextStyle` vocabulary verbatim, so adopting an improved
+  upstream is a call-site swap rather than a rewrite.
 - **`components/`** — presentation-only chrome. Components never reach into
   workspace state; they talk back by dispatching actions (title bar toggle
   buttons) or via callbacks the workspace hands them (sidebar resize).

@@ -10,6 +10,7 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState};
 
 use crate::components::{status_badge, task_state_color, title_case};
+use crate::markdown;
 use crate::time;
 use crate::workspace::Workspace;
 
@@ -347,7 +348,10 @@ impl Workspace {
             );
         }
 
-        if let Some((_, complexity, content)) = task.pending_spec {
+        // Spec and body are markdown; the two are mutually exclusive, which is
+        // what keeps their `InteractiveText` ids from colliding in a frame.
+        if let Some((spec_id, complexity, content)) = task.pending_spec {
+            let style = markdown::doc_style(cx);
             pane = pane
                 .child(
                     div()
@@ -362,14 +366,21 @@ impl Workspace {
                         .bg(theme.bg())
                         .text_xs()
                         .text_color(theme.fg())
-                        .child(content),
+                        .child(
+                            markdown::markdown(markdown::spec_key(&spec_id), &content, style, cx)
+                                .full_width(),
+                        ),
                 );
         } else if !task.body.is_empty() {
+            // The body stays muted — the pane's existing hierarchy puts it
+            // below the spec, not beside it.
+            let mut style = markdown::doc_style(cx);
+            style.body.color = Some(theme.fg_muted());
             pane = pane.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.fg_muted())
-                    .child(task.body.clone()),
+                div().text_xs().text_color(theme.fg_muted()).child(
+                    markdown::markdown(markdown::task_body_key(&task.id), &task.body, style, cx)
+                        .full_width(),
+                ),
             );
         }
 

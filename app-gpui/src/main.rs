@@ -1,6 +1,7 @@
 mod about;
 mod components;
 mod issue_composer;
+mod markdown;
 mod menus;
 mod sections;
 mod state;

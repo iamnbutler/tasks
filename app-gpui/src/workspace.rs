@@ -25,6 +25,7 @@ use tasks_client::api::models::{
 
 use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
 use crate::issue_composer::{self, IssueComposer};
+use crate::markdown;
 use crate::state::AppState;
 
 pub(crate) const FONT: &str = "Menlo";
@@ -499,14 +500,28 @@ impl Workspace {
             let Some(message) = state.orchestrator_messages.get(ix) else {
                 return div().into_any_element();
             };
-            let (role, content) = (message.role, message.content.clone());
+            // Copied out first: `state` holds `&App` and the markdown store
+            // needs `&mut App`, so the read has to end before the call below.
+            // Moving the markdown call above this line stops compiling.
+            let (seq, role, content) = (message.seq, message.role, message.content.clone());
 
-            let bubble = div()
-                .max_w(px(720.))
-                .p(px(8.))
-                .rounded(px(8.))
-                .text_sm()
-                .child(content);
+            let bubble = div().max_w(px(720.)).p(px(8.)).rounded(px(8.)).text_sm();
+            let bubble = match role {
+                // Agent and human turns are markdown. `Event`/`System` rows
+                // are the pipeline's own one-line status sentences, not
+                // markdown — a stray underscore in a task title should not
+                // restyle them.
+                ChatRole::User | ChatRole::Assistant => {
+                    let style = markdown::chat_style(cx);
+                    bubble.child(markdown::markdown(
+                        markdown::chat_key(seq),
+                        &content,
+                        style,
+                        cx,
+                    ))
+                }
+                ChatRole::Event | ChatRole::System => bubble.child(content),
+            };
             div()
                 .w_full()
                 .px(px(12.))
