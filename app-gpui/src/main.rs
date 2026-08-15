@@ -1,5 +1,6 @@
 mod about;
 mod components;
+mod issue_composer;
 mod menus;
 mod sections;
 mod state;
@@ -12,7 +13,7 @@ use gpui::{
 };
 use gpuikit::input::bind_input_keys;
 
-use workspace::{ToggleLeftDock, ToggleRightDock, Workspace};
+use workspace::{NewIssue, ToggleLeftDock, ToggleRightDock, Workspace};
 
 /// The main window, so `Close Window` can't strand the app: clicking the Dock
 /// icon reopens it rather than stacking a second one.
@@ -40,6 +41,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-b", ToggleLeftDock, ws),
             KeyBinding::new("cmd-r", ToggleRightDock, ws),
+            KeyBinding::new("cmd-n", NewIssue, ws),
         ]);
 
         // Bindings before the bar: gpui reads shortcuts out of the keymap
