@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use chrono::Utc;
 use thiserror::Error;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -145,17 +146,46 @@ impl Builder {
                 .await
                 {
                     Ok(result) => result,
-                    Err(_elapsed) => Err(BuilderError::Timeout {
-                        secs: self.config.timeout.as_secs(),
-                    }),
+                    Err(_elapsed) => {
+                        // Said here rather than only in `dispatch`'s failure
+                        // warn, which runs *after* teardown: in the incident
+                        // that was 15:37 to 17:50 of silence between the
+                        // budget expiring and anyone being told.
+                        warn!(
+                            build_id = %build.id,
+                            secs = self.config.timeout.as_secs(),
+                            "build budget exhausted; tearing the VM down"
+                        );
+                        Err(BuilderError::Timeout {
+                            secs: self.config.timeout.as_secs(),
+                        })
+                    }
                 }
             }
             Err(e) => Err(e.into()),
         };
 
-        if let Err(e) = self.client.deallocate(&vm_id).await {
-            warn!(%vm_id, error = %e, "failed to deallocate builder VM");
+        // The agent phase ends here — before teardown, and long before the
+        // push and the PR that `completed_at` waits for. Stamped on the
+        // send-error and timeout paths too, since those are exactly the
+        // durations someone will want to read afterwards. Best-effort: a store
+        // hiccup must not skip the deallocation below.
+        if let Err(e) = self
+            .store
+            .set_build_agent_finished(&build.id, Utc::now())
+            .await
+        {
+            warn!(build_id = %build.id, error = %e, "could not stamp the agent phase end");
         }
+
+        crate::teardown::deallocate_bounded(
+            &self.client,
+            &self.store,
+            &vm_id,
+            &format!("build {}", build.id),
+            crate::teardown::DEALLOCATE_TIMEOUT,
+        )
+        .await;
         let outcome = result?;
 
         // Egress: unbundle, verify, push — then the PR.

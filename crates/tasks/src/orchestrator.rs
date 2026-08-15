@@ -26,7 +26,7 @@
 //! agent talks to GitHub it authenticates as itself (gh's keychain auth),
 //! not with the server's credential.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ use crate::models::{
     Actor, BuildStatus, CharterEntry, CharterLevel, Obligation, ObligationKind,
     OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{ACTOR_HEADER, Store, StoreError};
 
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
@@ -50,6 +50,11 @@ pub enum OrchestratorError {
     Store(#[from] StoreError),
     #[error("spawn agent: {0}")]
     Spawn(std::io::Error),
+    #[error("writing the actor credential to {path}: {source}")]
+    ActorConfig {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("agent exited with {status}: {stderr}")]
     AgentFailed {
         status: std::process::ExitStatus,
@@ -71,6 +76,11 @@ pub struct OrchestratorConfig {
     pub workdir: PathBuf,
     /// Port the tasks API listens on; spliced into the system prompt.
     pub api_port: u16,
+    /// Where the agent's curl config — its actor credential — is written
+    /// before every turn. Under the data dir, never the workdir: in
+    /// production the workdir is a repo checkout the agent commits from, and
+    /// a secret there is one `git add -A` from being published.
+    pub curl_config: PathBuf,
 }
 
 pub struct Orchestrator {
@@ -110,7 +120,8 @@ impl Orchestrator {
             Ok(turn) => {
                 info!(
                     session = %turn.session_id,
-                    context_tokens = ?turn.context_tokens,
+                    context_tokens = ?turn.usage.context_tokens,
+                    tick_tokens = ?turn.usage.tick_tokens,
                     "orchestrator turn complete"
                 );
                 (turn.text, Some(turn.session_id))
@@ -159,7 +170,7 @@ impl Orchestrator {
         // through the prompt. A human flipping a capability takes effect on
         // the next turn, without restarting anything.
         let charter = self.store.charter().await?;
-        let system = system_prompt(self.config.api_port, &charter);
+        let system = system_prompt(self.config.api_port, &charter, &self.config.curl_config);
         match self.store.orchestrator_cc_session().await? {
             None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
@@ -169,15 +180,17 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok((text, context_tokens)) => {
-                    if let Some(tokens) = context_tokens {
-                        self.store
-                            .record_orchestrator_context_tokens(&session, tokens)
-                            .await?;
-                    }
+                Ok((text, usage)) => {
+                    self.store
+                        .record_orchestrator_usage(
+                            &session,
+                            usage.context_tokens,
+                            usage.tick_tokens,
+                        )
+                        .await?;
                     Ok(Turn {
                         text,
-                        context_tokens,
+                        usage,
                         session_id: session,
                     })
                 }
@@ -207,7 +220,7 @@ impl Orchestrator {
         replacing: Option<&str>,
     ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
-        let (text, context_tokens) = self
+        let (text, usage) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
@@ -220,14 +233,12 @@ impl Orchestrator {
                 replacing.map(|_| SessionEndReason::ResumeFailed),
             )
             .await?;
-        if let Some(tokens) = context_tokens {
-            self.store
-                .record_orchestrator_context_tokens(&session, tokens)
-                .await?;
-        }
+        self.store
+            .record_orchestrator_usage(&session, usage.context_tokens, usage.tick_tokens)
+            .await?;
         Ok(Turn {
             text,
-            context_tokens,
+            usage,
             session_id: session,
         })
     }
@@ -241,7 +252,7 @@ impl Orchestrator {
         &self,
         extra_args: &[&str],
         prompt: &str,
-    ) -> Result<(String, Option<i64>), OrchestratorError> {
+    ) -> Result<(String, TurnUsage), OrchestratorError> {
         let mut parts = self.config.command.split_whitespace();
         let prog = parts.next().unwrap_or("claude").to_string();
         let base_args: Vec<String> = parts.map(str::to_string).collect();
@@ -250,6 +261,17 @@ impl Orchestrator {
             .await
             .map_err(OrchestratorError::Spawn)?;
 
+        // Rewritten before every spawn: the token is minted per boot, so a
+        // stale file is useless. An agent that cannot identify itself must
+        // not run at all — an unattributed write is recorded as the human's,
+        // which is the charter going silently unenforced.
+        write_curl_config(&self.config.curl_config, self.store.actor_token())
+            .await
+            .map_err(|source| OrchestratorError::ActorConfig {
+                path: self.config.curl_config.display().to_string(),
+                source,
+            })?;
+
         let mut cmd = tokio::process::Command::new(&prog);
         cmd.args(&base_args)
             .args(extra_args)
@@ -257,11 +279,11 @@ impl Orchestrator {
             // The server's token stays the server's. When the agent talks to
             // GitHub it authenticates as itself (gh keychain auth).
             .env_remove("GITHUB_TOKEN")
-            // How the agent proves its writes are its own. Passed through the
-            // environment rather than argv (world-readable via `ps`) or the
-            // prompt (persisted), and referenced by name in the standing
-            // instructions so the value itself never lands in the transcript.
-            .env("TASKS_ACTOR_TOKEN", self.store.actor_token())
+            // The credential is a file now (`curl -K`), and this is not just
+            // "stop setting it": the server's own environment could carry a
+            // `TASKS_ACTOR_TOKEN`, and inheriting one would revive the shell
+            // expansion that a static allowlist cannot run.
+            .env_remove("TASKS_ACTOR_TOKEN")
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
             .kill_on_drop(true)
@@ -292,21 +314,29 @@ impl Orchestrator {
             let mut lines = BufReader::new(stdout).lines();
             let mut raw = String::new();
             let mut result_text: Option<String> = None;
-            let mut context_tokens: Option<i64> = None;
+            let mut usage = TurnUsage::default();
             while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
                 match parse_stream_line(&line) {
                     StreamLine::Delta(text) => self
                         .store
                         .publish_orchestrator_feed(OrchestratorFeedEvent::Delta { text }),
-                    StreamLine::Tools(labels) => {
-                        for label in labels {
+                    StreamLine::Assistant {
+                        tools,
+                        context_tokens,
+                    } => {
+                        for label in tools {
                             self.store
                                 .publish_orchestrator_feed(OrchestratorFeedEvent::Tool { label });
                         }
+                        // Last main-chain reading wins: the final assistant
+                        // turn is the context the next tick resumes from.
+                        if context_tokens.is_some() {
+                            usage.context_tokens = context_tokens;
+                        }
                     }
-                    StreamLine::Result { text, tokens } => {
+                    StreamLine::Result { text, tick_tokens } => {
                         result_text = Some(text);
-                        context_tokens = tokens;
+                        usage.tick_tokens = tick_tokens;
                     }
                     StreamLine::Other => {}
                     StreamLine::NotStreamJson => {
@@ -316,14 +346,13 @@ impl Orchestrator {
                 }
             }
             let status = child.wait().await.map_err(OrchestratorError::Spawn)?;
-            Ok::<_, OrchestratorError>((status, result_text, raw, context_tokens))
+            Ok::<_, OrchestratorError>((status, result_text, raw, usage))
         };
 
         let secs = self.config.timeout.as_secs();
-        let (status, result_text, raw, context_tokens) =
-            tokio::time::timeout(self.config.timeout, read)
-                .await
-                .map_err(|_| OrchestratorError::Timeout { secs })??;
+        let (status, result_text, raw, usage) = tokio::time::timeout(self.config.timeout, read)
+            .await
+            .map_err(|_| OrchestratorError::Timeout { secs })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -332,30 +361,54 @@ impl Orchestrator {
                 stderr: stderr.chars().take(2000).collect(),
             });
         }
-        Ok((result_text.unwrap_or(raw), context_tokens))
+        Ok((result_text.unwrap_or(raw), usage))
     }
 }
 
 /// One completed agent turn.
 struct Turn {
     text: String,
-    /// Absolute context size reported by the agent, when it reports one.
-    context_tokens: Option<i64>,
+    /// What the turn held and what it cost.
+    usage: TurnUsage,
     /// The Claude Code session this turn ran in, stamped onto the durable
     /// reply so a verdict can be traced back to the memory regime that
     /// produced it.
     session_id: String,
 }
 
+/// The two token readings a turn produces. They share arithmetic and mean
+/// entirely different things, which is exactly why they are separate fields:
+/// deduplicating them back into one number is the bug this split fixed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TurnUsage {
+    /// How much context the session is *holding*: the input side of the last
+    /// main-chain assistant record's `usage`, i.e. the prompt behind a single
+    /// model call. An absolute reading, and the one a rotation threshold
+    /// compares against. `None` when the agent reports no usage at all
+    /// (plain-text agents, test stubs).
+    context_tokens: Option<i64>,
+    /// What this tick *spent*: the `result` record's aggregate over every
+    /// internal turn of the invocation, each of which re-reads the cached
+    /// prefix. A cost signal — never a context size.
+    tick_tokens: Option<i64>,
+}
+
 /// What one line of agent stdout means for the live feed.
 enum StreamLine {
     /// Assistant text as it's generated (`--include-partial-messages`).
     Delta(String),
-    /// Tool invocations from a completed assistant turn.
-    Tools(Vec<String>),
-    /// The final `result` record: the reply text, and the context size that
-    /// produced it when the agent reports usage.
-    Result { text: String, tokens: Option<i64> },
+    /// A completed assistant turn: its tool invocations (for the feed) and,
+    /// for main-chain turns only, the context that produced it.
+    Assistant {
+        tools: Vec<String>,
+        context_tokens: Option<i64>,
+    },
+    /// The final `result` record: the reply text, and what the whole
+    /// invocation cost when the agent reports usage.
+    Result {
+        text: String,
+        tick_tokens: Option<i64>,
+    },
     /// A stream-json record with nothing for us (init, thinking, tool results).
     Other,
     /// Not stream-json at all — a plain-text agent's output.
@@ -372,7 +425,7 @@ fn parse_stream_line(line: &str) -> StreamLine {
             None => StreamLine::Other,
         },
         Some("assistant") => {
-            let labels: Vec<String> = v
+            let tools: Vec<String> = v
                 .pointer("/message/content")
                 .and_then(|c| c.as_array())
                 .map(|items| {
@@ -383,16 +436,23 @@ fn parse_stream_line(line: &str) -> StreamLine {
                         .collect()
                 })
                 .unwrap_or_default();
-            if labels.is_empty() {
-                StreamLine::Other
-            } else {
-                StreamLine::Tools(labels)
+            // A sub-agent turn (`Task`) is a conversation of its own with a
+            // context of its own; reading it as the session's would make the
+            // gauge jump for reasons unrelated to this session's memory. Its
+            // tool labels are still worth showing in the feed — only the
+            // gauge filters.
+            let sidechain = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+            StreamLine::Assistant {
+                tools,
+                context_tokens: (!sidechain)
+                    .then(|| input_side_tokens(v.pointer("/message/usage")))
+                    .flatten(),
             }
         }
         Some("result") => match v.get("result").and_then(|r| r.as_str()) {
             Some(text) => StreamLine::Result {
                 text: text.to_string(),
-                tokens: context_tokens(v.get("usage")),
+                tick_tokens: input_side_tokens(v.get("usage")),
             },
             None => StreamLine::Other,
         },
@@ -402,21 +462,72 @@ fn parse_stream_line(line: &str) -> StreamLine {
     }
 }
 
-/// Context size from a stream-json `usage` object: every input-side token the
-/// model had to read this turn, cached or not.
+/// Every input-side token in a stream-json `usage` object, cached or not.
 ///
-/// The sum is what matters. `input_tokens` alone under-reports by whatever
-/// the cache served — which, on a long-lived resumed session, is nearly all
-/// of it. And because this is an absolute measurement rather than a running
-/// total, it stays honest across turns the server never drove (an interactive
-/// checkout) without any reconciliation.
-fn context_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
+/// The sum is what matters: `input_tokens` alone under-reports by whatever the
+/// cache served, which on a long-lived resumed session is nearly all of it.
+///
+/// What this sum *means* is decided entirely by whose `usage` it is, and the
+/// two callers are not measuring the same thing. On an `assistant` record it
+/// is the prompt behind one model call — a context size. On the `result`
+/// record it is an aggregate over every internal turn of the invocation, each
+/// re-reading the cached prefix — a bill. Shared arithmetic, opposite
+/// meanings; do not fold the call sites back together.
+fn input_side_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
     let usage = usage?;
     let field = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
     let total = field("input_tokens")
         + field("cache_read_input_tokens")
         + field("cache_creation_input_tokens");
     (total > 0).then_some(total)
+}
+
+/// The curl config the agent presents as its identity: a comment header and
+/// exactly one option.
+///
+/// One option, deliberately. `-K` is not scoped to a host — everything in the
+/// file applies to whatever URL that invocation names — so anything else in
+/// here would be sent wherever the agent points curl. A unit test pins the
+/// count.
+fn curl_config_contents(token: &str) -> String {
+    format!(
+        "# Written by the tasks server before each orchestrator turn.\n\
+         # It is the orchestrator's actor credential: writes carrying this\n\
+         # header are attributed to it and gated by the charter.\n\
+         # `-K` applies this to whatever URL curl is given, so this file\n\
+         # holds the header and nothing else.\n\
+         header = \"{ACTOR_HEADER}: orchestrator {token}\"\n"
+    )
+}
+
+/// Write the curl config at `path`, atomically and 0600.
+///
+/// Written to a sibling temp file opened `create_new` *with* the mode (never
+/// chmod-after: the window would be short, but the file is a credential) and
+/// then renamed, so a turn can never read a half-written config. A leftover
+/// temp file from a crashed write is removed first — `open` will not lower an
+/// existing file's mode.
+async fn write_curl_config(path: &Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("tmp");
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .await?;
+    file.write_all(curl_config_contents(token).as_bytes())
+        .await?;
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await
 }
 
 /// One-line human label for a tool call, e.g. `Bash: curl -s .../tasks`.
@@ -760,8 +871,9 @@ fn authority_section(charter: &[CharterEntry]) -> String {
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
-fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
+fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> String {
     let authority = authority_section(charter);
+    let curl_config = curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
@@ -828,14 +940,25 @@ fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
          state and the activity log honest.\n\n\
-         Identify yourself on every write: pass \
-         `-H \"X-Tasks-Actor: orchestrator $TASKS_ACTOR_TOKEN\"` (the token is \
-         in your environment — never print it). Writes carrying it are \
-         recorded as yours, which is what keeps you from being notified about \
-         your own actions, and what makes the decisions ledger worth reading. \
-         Every write you make that way must also carry a `rationale` — the \
-         server rejects one without it, because a decision nobody can review \
-         afterwards is not one you were trusted to make.\n\n\
+         Identify yourself on every write: pass `-K {curl_config}` to curl. \
+         That file is a curl config the server rewrites for you before every \
+         turn; it holds one line, the header that says this write is yours. \
+         Do not read it, print it, copy it, or pass it to anything else, and \
+         never use it against any host other than http://127.0.0.1:{port} — \
+         `-K` applies its header to whatever URL you name. Writes carrying it \
+         are recorded as yours, which is what keeps you from being notified \
+         about your own actions, and what makes the decisions ledger worth \
+         reading. If you cannot make an identified write — the file is \
+         missing, curl is denied — say so and stop; do not fall back to an \
+         unidentified one, which is recorded as the human's and escapes \
+         everything that governs you. Every write you make must also carry a \
+         `rationale` — the server rejects one without it, because a decision \
+         nobody can review afterwards is not one you were trusted to make. \
+         For example:\n\
+         curl -sS -K {curl_config} -X POST \
+         http://127.0.0.1:{port}/spec-queue/spec_abc/review \
+         -H 'Content-Type: application/json' \
+         -d '{{\"status\":\"approved\",\"rationale\":\"why\"}}'\n\n\
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
@@ -1024,9 +1147,13 @@ mod tests {
         }));
     }
 
+    fn prompt(port: u16, charter: &[CharterEntry]) -> String {
+        system_prompt(port, charter, Path::new("/data/orchestrator-curl.conf"))
+    }
+
     #[test]
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
-        let p = system_prompt(4800, &[]);
+        let p = prompt(4800, &[]);
         assert!(p.contains("http://127.0.0.1:4800"));
         assert!(p.contains("[pipeline]"));
         assert!(p.contains("proactive"));
@@ -1048,6 +1175,87 @@ mod tests {
         assert!(!p.contains("since=1"));
     }
 
+    /// The two readings are taken off different records and mean different
+    /// things; this pins which is which, because the arithmetic is shared and
+    /// nothing else would catch them being swapped back.
+    #[test]
+    fn usage_is_read_per_record_and_sidechains_do_not_count() {
+        let assistant = |line: &str| match parse_stream_line(line) {
+            StreamLine::Assistant { context_tokens, .. } => context_tokens,
+            other => panic!(
+                "expected an assistant record, got {}",
+                match other {
+                    StreamLine::Delta(_) => "delta",
+                    StreamLine::Result { .. } => "result",
+                    StreamLine::Other => "other",
+                    StreamLine::NotStreamJson => "not stream-json",
+                    StreamLine::Assistant { .. } => unreachable!(),
+                }
+            ),
+        };
+
+        // Context: the input side of THIS record's usage, cache included.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","message":{"content":[],"usage":
+                   {"input_tokens":1200,"cache_read_input_tokens":180000,
+                    "cache_creation_input_tokens":800,"output_tokens":450}}}"#
+            ),
+            Some(182_000)
+        );
+        // A sub-agent turn has its own conversation and its own context.
+        // Reading it would report a number unrelated to this session.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[],
+                   "usage":{"input_tokens":900000}}}"#
+            ),
+            None
+        );
+        // An explicit null parent is main-chain, not a sidechain.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[],
+                   "usage":{"input_tokens":5}}}"#
+            ),
+            Some(5)
+        );
+        // No usage at all: no reading. Not zero — zero would stall or clear a
+        // gauge that has a perfectly good previous value.
+        assert_eq!(
+            assistant(r#"{"type":"assistant","message":{"content":[]}}"#),
+            None
+        );
+
+        // Tool labels reach the feed from a sidechain turn all the same.
+        match parse_stream_line(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":
+               [{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],
+               "usage":{"input_tokens":900000}}}"#,
+        ) {
+            StreamLine::Assistant {
+                tools,
+                context_tokens,
+            } => {
+                assert_eq!(tools, vec!["Bash: ls".to_string()]);
+                assert_eq!(context_tokens, None, "only the gauge filters");
+            }
+            _ => panic!("expected an assistant record"),
+        }
+
+        // And the `result` record is the tick's bill, not a context size.
+        match parse_stream_line(
+            r#"{"type":"result","subtype":"success","result":"ok","usage":
+               {"input_tokens":2000,"cache_read_input_tokens":2700000}}"#,
+        ) {
+            StreamLine::Result { text, tick_tokens } => {
+                assert_eq!(text, "ok");
+                assert_eq!(tick_tokens, Some(2_702_000));
+            }
+            _ => panic!("expected a result record"),
+        }
+    }
+
     /// The authority section is generated, so an empty charter must read as
     /// "nothing" — and must not leave behind hand-written prose making its own
     /// claims about what is allowed. Two statements of authority is one too
@@ -1063,11 +1271,11 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let empty = system_prompt(4800, &[]);
+        let empty = prompt(4800, &[]);
         assert!(empty.contains("Act on your own: nothing yet"), "{empty}");
         assert!(!empty.contains("Decide but do not act"), "{empty}");
 
-        let p = system_prompt(
+        let p = prompt(
             4800,
             &[
                 entry(Capability::CaptureWork, CharterLevel::Live, Some(5)),
@@ -1086,5 +1294,74 @@ mod tests {
         // every denial would grow with the enum for no benefit.
         assert!(!p.contains("close issues that are done"), "{p}");
         assert!(p.contains("anything not listed here is the human's"), "{p}");
+    }
+
+    /// The credential the agent can actually present. The old scheme asked it
+    /// to interpolate `$TASKS_ACTOR_TOKEN` into a `-H` argument, which Claude
+    /// Code refuses to run under a static `Bash(curl:*)` allowlist — so the
+    /// safest deployment was the one where nothing could be attributed and
+    /// the charter was inert.
+    #[test]
+    fn the_prompt_asks_for_the_config_file_and_never_a_shell_variable() {
+        let p = prompt(4800, &[]);
+        assert!(p.contains("-K /data/orchestrator-curl.conf"), "{p}");
+        assert!(
+            !p.contains("TASKS_ACTOR_TOKEN") && !p.contains('$'),
+            "a command with a variable in it is not statically verifiable: {p}"
+        );
+        // The two things `-K` makes possible to get wrong: pointing it at
+        // another host, and giving up on attribution instead of stopping.
+        assert!(
+            p.contains("never use it against any host other than"),
+            "{p}"
+        );
+        assert!(p.contains("recorded as the human's"), "{p}");
+    }
+
+    #[test]
+    fn the_curl_config_holds_the_header_and_nothing_else() {
+        let rendered = curl_config_contents("tok-123");
+        let options: Vec<&str> = rendered
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            options,
+            vec![r#"header = "X-Tasks-Actor: orchestrator tok-123""#],
+            "-K is not scoped to a host, so anything else here would be sent \
+             wherever curl is pointed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_is_written_0600_in_place_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("orchestrator-curl.conf");
+
+        write_curl_config(&path, "first").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file is a credential");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("first"));
+
+        // Rewritten every turn: replacing must work even though `create_new`
+        // is what gives the temp file its mode.
+        write_curl_config(&path, "second").await.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("second") && !contents.contains("first"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the temp file is renamed, not left behind"
+        );
+
+        // And a leftover temp file from a crashed write does not wedge it.
+        std::fs::write(path.with_extension("tmp"), "junk").unwrap();
+        write_curl_config(&path, "third").await.unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
     }
 }
