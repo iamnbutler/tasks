@@ -28,6 +28,7 @@ use tasks::github::GitHubClient;
 use tasks::models::{
     BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, Session, SessionId,
     SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    TranscriptOwner, TranscriptStream,
 };
 use tasks::store::Store;
 use tasks_protocol::TasksProtocol;
@@ -36,8 +37,8 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    make_fixture_repo, spawn_vm_pool, stub_builder_agent_path, workspace_bin,
-    write_builder_supervisor_wrapper,
+    make_fixture_repo, silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path,
+    workspace_bin, write_builder_supervisor_wrapper,
 };
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -257,6 +258,27 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
         );
     }
 
+    // A successful build is transcribed too — the endpoint is not a
+    // failure-only diagnostic.
+    let lines = h
+        .store
+        .transcript_since(&TranscriptOwner::build(&done.id), 0, 1000)
+        .await
+        .unwrap();
+    assert!(!lines.is_empty(), "a successful build recorded nothing");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.line.contains("[stub-builder] starting")),
+        "the agent's own output is missing: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.line == "[tasks] builder agent exited with code 0"),
+        "the exit-code line is missing from a successful build"
+    );
+
     // The batch drained: specs built, tasks done.
     for (task, spec) in [(&task_a, &spec_a), (&task_b, &spec_b)] {
         assert_eq!(
@@ -341,5 +363,89 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
     assert_eq!(
         h.store.claim_next_queued_build().await.unwrap().unwrap().id,
         again.id
+    );
+}
+
+/// The issue (#825) in one test: a build burns its run, commits nothing, and
+/// fails. Before this change all it left behind was `exit_reason: "no
+/// commits"` and two timestamps — nothing that said *why*. Now the agent's
+/// own account of it is readable through the store, complete by the time the
+/// build row is final.
+#[tokio::test]
+async fn a_silent_build_failure_leaves_a_readable_transcript() {
+    let h = harness(silent_builder_agent_path().to_str().unwrap()).await;
+    let (_task, spec) = seed_approved(&h.store, &h.project, 7, "Doomed thing").await;
+
+    let build = h
+        .store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+
+    let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+    assert!(format!("{err}").contains("no commits"), "{err}");
+
+    // The build row is final and says only that it failed …
+    let after = h.store.get_build(&build.id).await.unwrap().unwrap();
+    assert_eq!(after.status, BuildStatus::Failed);
+
+    // … and the transcript, flushed before that row was finalized, says why.
+    let owner = TranscriptOwner::build(&build.id);
+    let lines = h.store.transcript_since(&owner, 0, 1000).await.unwrap();
+    assert!(
+        !lines.is_empty(),
+        "the failure left no transcript — this is exactly the bug"
+    );
+    assert!(lines.iter().all(|l| l.owner == owner));
+
+    // Dense and 1-based, which is what `?since=` paging relies on.
+    assert_eq!(
+        lines.iter().map(|l| l.seq).collect::<Vec<_>>(),
+        (1..=lines.len() as i64).collect::<Vec<_>>()
+    );
+
+    // Both pipes, kept apart: the agent's reason went to stderr, its
+    // stream-json to stdout.
+    let on = |stream| {
+        lines
+            .iter()
+            .filter(move |l| l.stream == stream)
+            .map(|l| l.line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let stdout = on(TranscriptStream::Stdout);
+    let stderr = on(TranscriptStream::Stderr);
+    assert!(
+        stdout.contains(r#""type":"assistant""#),
+        "stream-json missing from stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("giving up without committing"),
+        "the agent's stated reason is missing from stderr:\n{stderr}"
+    );
+
+    // The server's own line puts the exit status in the same ordered stream.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.line == "[tasks] builder agent exited with code 3"),
+        "no exit-code line: {lines:?}"
+    );
+
+    // Nothing leaked onto the spec's scout session — seqs restart per owner,
+    // and a build's lines belong to the build.
+    assert!(
+        h.store
+            .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
+            .await
+            .unwrap()
+            .is_empty(),
+        "build output was written onto the scout session"
     );
 }

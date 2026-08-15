@@ -26,9 +26,10 @@ use vm_pool_client::{ClientError, ClientHandle, EventStream};
 use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 
 use crate::github::{GhError, GitHubClient};
-use crate::models::{Build, Project, Spec, Task};
+use crate::models::{Build, Project, Spec, Task, TranscriptOwner, TranscriptStream};
 use crate::protocol::{BuildCommand, BuildEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
+use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
 #[derive(Debug, Error)]
 pub enum BuilderError {
@@ -136,12 +137,14 @@ impl Builder {
 
         // From here every path must deallocate, so the drain result is held
         // rather than `?`'d.
+        let (mut sink, writer) =
+            spawn_transcript_writer(self.store.clone(), TranscriptOwner::build(&build.id));
         let result = match send {
             Ok(()) => {
                 let remaining = self.config.timeout.saturating_sub(started.elapsed());
                 match tokio::time::timeout(
                     remaining,
-                    self.drain_build_events(&mut events, &vm_id, &build.id),
+                    self.drain_build_events(&mut events, &vm_id, &build.id, &mut sink),
                 )
                 .await
                 {
@@ -170,6 +173,11 @@ impl Builder {
         // send-error and timeout paths too, since those are exactly the
         // durations someone will want to read afterwards. Best-effort: a store
         // hiccup must not skip the deallocation below.
+        //
+        // Above the flush deliberately: draining a queued transcript is our
+        // bookkeeping, not the agent's work, and an 8 MiB tail would otherwise
+        // be charged to the interval the run budget bounds — the exact
+        // conflation `agent_finished_at` exists to end.
         if let Err(e) = self
             .store
             .set_build_agent_finished(&build.id, Utc::now())
@@ -177,6 +185,15 @@ impl Builder {
         {
             warn!(build_id = %build.id, error = %e, "could not stamp the agent phase end");
         }
+
+        // Close the queue and let the writer finish *before* the build row is
+        // finalized, so a client refetching on `build_completed` finds the
+        // whole transcript rather than a truncated one. This has to happen
+        // before `result?` escapes to `dispatch`'s failure finalization — and
+        // on the timeout path especially, where the drain future was
+        // cancelled and whatever is queued here is all that survives. The
+        // silent failure this whole thing exists for is exactly that path.
+        crate::transcript::flush(sink, writer, build.id.as_str()).await;
 
         crate::teardown::deallocate_bounded(
             &self.client,
@@ -239,12 +256,14 @@ impl Builder {
     }
 
     /// Consume this dispatch's event subscription until its VM reports a
-    /// terminal Completed/Failed.
+    /// terminal Completed/Failed, recording every line the agent emits into
+    /// `sink` on the way past.
     async fn drain_build_events(
         &self,
         events: &mut EventStream<TasksProtocol>,
         target_vm: &VmId,
         build_id: &crate::models::BuildId,
+        sink: &mut TranscriptSink,
     ) -> Result<BuildOutcome, BuilderError> {
         loop {
             let event = events.recv().await.ok_or(BuilderError::StreamClosed)?;
@@ -256,11 +275,19 @@ impl Builder {
                     BuildEvent::Started { base_sha } => {
                         self.store.set_build_base_sha(build_id, &base_sha).await?;
                     }
-                    BuildEvent::Progress { line, .. } => {
+                    BuildEvent::Progress { stream, line } => {
                         debug!(build_id = %build_id, "{line}");
+                        sink.push(transcript_stream(stream), line);
                     }
                     BuildEvent::ImplementationFinished { exit_code } => {
                         info!(build_id = %build_id, exit_code, "builder agent finished");
+                        // The server's own line, in the agent's stream: an
+                        // exit code buried in a log file is not in the same
+                        // ordered record as the output that explains it.
+                        sink.push(
+                            TranscriptStream::Stderr,
+                            format!("[tasks] builder agent exited with code {exit_code}"),
+                        );
                     }
                     BuildEvent::Completed {
                         base_sha,

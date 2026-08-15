@@ -11,7 +11,7 @@ use tasks::store::Store;
 use tasks_api::events::EventPayload;
 use tasks_api::models::{
     GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
-    TranscriptStream,
+    TranscriptOwner, TranscriptStream,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -188,7 +188,7 @@ fn transcript_tail_replays_then_follows() {
     server
         .runtime
         .block_on(server.store.append_transcript_lines(
-            &session.id,
+            &TranscriptOwner::session(&session.id),
             &[
                 (TranscriptStream::Stdout, "first".into()),
                 (TranscriptStream::Stderr, "second".into()),
@@ -209,12 +209,10 @@ fn transcript_tail_replays_then_follows() {
     // Live: a line appended after the tail attached still arrives.
     server
         .runtime
-        .block_on(
-            server.store.append_transcript_lines(
-                &session.id,
-                &[(TranscriptStream::Stdout, "third".into())],
-            ),
-        )
+        .block_on(server.store.append_transcript_lines(
+            &TranscriptOwner::session(&session.id),
+            &[(TranscriptStream::Stdout, "third".into())],
+        ))
         .unwrap();
     let third = tail.next().unwrap().unwrap();
     assert_eq!((third.seq, third.line.as_str()), (3, "third"));
