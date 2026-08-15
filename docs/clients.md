@@ -107,6 +107,11 @@ the server only.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
   `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
+  A build has **two durations**, and they are not interchangeable:
+  `agent_finished_at - started_at` is the agent phase — what the run budget
+  bounds, and what to render as "took" — while `completed_at` also includes
+  VM teardown and, on success, the branch push and the PR. When they differ
+  by a lot, the gap is infrastructure, not the agent.
   `pr_number` is an identifier, not a state: the PR's mergeability/CI/open
   state is GitHub's — link out (`https://github.com/{owner}/{repo}/pull/N`),
   don't expect it here.

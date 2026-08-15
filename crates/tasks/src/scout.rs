@@ -217,13 +217,20 @@ impl Scout {
             warn!(session_id = %session_id, error = %e, "recording session usage failed");
         }
 
-        // Always try to deallocate. Ignore errors — the pool's health loop
-        // will reap if we die mid-call. For a timeout this *is* the cancel:
-        // there is deliberately no in-band Cancel command, so freeing the slot
-        // means destroying the VM.
-        if let Err(e) = self.client.deallocate(&vm_id).await {
-            warn!(%vm_id, error = %e, "failed to deallocate scout VM");
-        }
+        // Always try to deallocate, and never wait forever on it — the same
+        // unbounded call that stalled the build queue holds a scout
+        // concurrency slot here. Failures are not the dispatch's problem: the
+        // pool's health loop reaps if we die mid-call. For a timeout this
+        // *is* the cancel — there is deliberately no in-band Cancel command,
+        // so freeing the slot means destroying the VM.
+        crate::teardown::deallocate_bounded(
+            &self.client,
+            &self.store,
+            &vm_id,
+            &format!("scout for task {}", task.id),
+            crate::teardown::DEALLOCATE_TIMEOUT,
+        )
+        .await;
 
         match result {
             Ok(DrainOutcome {

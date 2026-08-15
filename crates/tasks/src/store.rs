@@ -1729,6 +1729,7 @@ impl Store {
             exit_reason: None,
             created_at: Utc::now(),
             started_at: None,
+            agent_finished_at: None,
             completed_at: None,
         };
         let branch = format!("build/{}", build.id);
@@ -1858,7 +1859,7 @@ impl Store {
         let row = sqlx::query(
             "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
              pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, completed_at FROM builds WHERE id = ?",
+             started_at, agent_finished_at, completed_at FROM builds WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -1871,7 +1872,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
              pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, completed_at FROM builds ORDER BY created_at DESC, rowid DESC",
+             started_at, agent_finished_at, completed_at \
+             FROM builds ORDER BY created_at DESC, rowid DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1893,6 +1895,28 @@ impl Store {
     pub async fn set_build_vm(&self, id: &BuildId, vm_id: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE builds SET vm_id = ? WHERE id = ?")
             .bind(vm_id)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Stamp the end of the agent phase — the moment the drain concluded,
+    /// however it concluded.
+    ///
+    /// Separate from `completed_at`, which the finalizers write after teardown
+    /// and (on success) after the push and the PR. That interval is real work
+    /// and belongs on the clock somewhere, but it is not what the run budget
+    /// bounds, so charging it to the agent made a build that timed out on
+    /// schedule look like one that ran for hours. The finalizers must not
+    /// overwrite this.
+    pub async fn set_build_agent_finished(
+        &self,
+        id: &BuildId,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builds SET agent_finished_at = ? WHERE id = ?")
+            .bind(at.to_rfc3339())
             .bind(id.as_str())
             .execute(&self.pool)
             .await?;
@@ -3121,6 +3145,7 @@ fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
         exit_reason: row.try_get("exit_reason")?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
         started_at: opt_ts("started_at")?,
+        agent_finished_at: opt_ts("agent_finished_at")?,
         completed_at: opt_ts("completed_at")?,
     })
 }
@@ -5746,6 +5771,55 @@ mod tests {
         );
         let next = store.claim_next_queued_build().await.unwrap().unwrap();
         assert_eq!(next.status, BuildStatus::Running);
+    }
+
+    /// A build has two durations, and conflating them is what made an
+    /// on-schedule timeout read as an 84-minute run. The stamp belongs to the
+    /// agent phase and the finalizers must leave it alone.
+    #[tokio::test]
+    async fn the_agent_phase_ends_on_its_own_clock() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_task, spec) = approved_spec(&store, &project, 1).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.agent_finished_at, None, "no agent has finished yet");
+
+        let agent_finished = Utc::now();
+        store
+            .set_build_agent_finished(&build.id, agent_finished)
+            .await
+            .unwrap();
+        let failed = store
+            .finalize_build_failed(&build.id, "build timed out after 3600s")
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.agent_finished_at.map(|t| t.timestamp_millis()),
+            Some(agent_finished.timestamp_millis()),
+            "finalizing must not overwrite the agent's clock"
+        );
+        assert!(
+            failed.completed_at.unwrap() >= failed.agent_finished_at.unwrap(),
+            "teardown happens between the two"
+        );
+
+        // `build_from_row` reads by name, so a SELECT that forgot the column
+        // is a runtime error rather than a compile one — and the list path is
+        // the one integration tests don't exercise.
+        let listed = store.list_builds().await.unwrap();
+        assert_eq!(
+            listed[0].agent_finished_at.map(|t| t.timestamp_millis()),
+            Some(agent_finished.timestamp_millis())
+        );
     }
 
     #[tokio::test]

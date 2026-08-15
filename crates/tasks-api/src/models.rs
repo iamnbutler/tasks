@@ -436,6 +436,13 @@ pub struct Build {
     pub exit_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
+    /// When the Builder agent phase ended — the drain concluding, before VM
+    /// teardown and before the push and PR. This, minus `started_at`, is the
+    /// interval the run budget bounds, and the one to render as "took".
+    pub agent_finished_at: Option<DateTime<Utc>>,
+    /// When the build row reached its terminal state: after teardown, and on
+    /// success after the branch was pushed and the PR opened. Always at or
+    /// after `agent_finished_at`.
     pub completed_at: Option<DateTime<Utc>>,
 }
 

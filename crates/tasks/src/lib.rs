@@ -13,6 +13,7 @@ pub mod run;
 pub mod scout;
 pub mod server;
 pub mod store;
+mod teardown;
 
 pub use tasks_api::{events, models};
 pub use tasks_protocol as protocol;
