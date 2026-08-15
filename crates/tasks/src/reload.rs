@@ -251,7 +251,7 @@ async fn start(
         return Err(exec_foreground(binary, port, &opts.data_dir));
     }
 
-    let log_path = opts.data_dir.join("serve.log");
+    let log_path = tasks_api::paths::serve_log(&opts.data_dir);
     tokio::fs::create_dir_all(&opts.data_dir).await?;
     let log = std::fs::OpenOptions::new()
         .create(true)

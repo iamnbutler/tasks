@@ -6,29 +6,19 @@
 //! is gone and overwrites the record. That is the same shape as `running`
 //! session rows and startup reconciliation — the file is a hint, the world is
 //! the authority.
+//!
+//! The record itself — its shape, its path, and how to read it — lives in
+//! [`tasks_api::paths`], because clients read it too. What stays here is what
+//! only a *local* process can answer: writing it, removing our own, and
+//! whether a pid is alive.
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
 
-/// Name of the file under the data dir.
-pub const FILE_NAME: &str = "tasks.pid";
-
-/// What a serving process publishes about itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PidFile {
-    pub pid: u32,
-    pub port: u16,
-    pub started_at: DateTime<Utc>,
-    /// The binary that is serving — the fact that makes "did my new build
-    /// actually take over?" answerable without a `ps` puzzle.
-    pub exe: PathBuf,
-}
-
-pub fn path(data_dir: &Path) -> PathBuf {
-    data_dir.join(FILE_NAME)
-}
+pub use tasks_api::paths::{
+    PID_FILE_NAME as FILE_NAME, PidFile, pid_file as path, read_pid_file as read,
+};
 
 /// Publish this process as the server under `data_dir`.
 pub async fn write(data_dir: &Path, port: u16) -> std::io::Result<PidFile> {
@@ -42,14 +32,6 @@ pub async fn write(data_dir: &Path, port: u16) -> std::io::Result<PidFile> {
     let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
     tokio::fs::write(path(data_dir), json).await?;
     Ok(file)
-}
-
-/// Read the record, if there is a parseable one. A corrupt or absent file is
-/// simply "nobody published anything" — this is a hint, and a hint that fails
-/// to parse must not stop a server from starting.
-pub fn read(data_dir: &Path) -> Option<PidFile> {
-    let raw = std::fs::read_to_string(path(data_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 /// The record, but only if the process it names is still alive. This is the
@@ -121,14 +103,6 @@ mod tests {
         assert_eq!(written, read_back);
         assert_eq!(read_back.pid, std::process::id());
         assert_eq!(read_back.port, 4801);
-    }
-
-    #[test]
-    fn missing_and_corrupt_files_read_as_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read(dir.path()).is_none());
-        std::fs::write(path(dir.path()), "not json").unwrap();
-        assert!(read(dir.path()).is_none());
     }
 
     #[tokio::test]
