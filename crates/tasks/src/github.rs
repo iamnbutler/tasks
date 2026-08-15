@@ -33,6 +33,26 @@ pub enum GhError {
     Shape(String),
 }
 
+/// Unwrap a REST response, turning a non-2xx into a [`GhError::Rest`] that
+/// carries GitHub's own `message`.
+///
+/// GitHub's failure messages are the useful half of a failed write — "Pull
+/// Request is not mergeable", "Resource not accessible by integration" — and
+/// dropping them for the bare status is what makes a permissions problem look
+/// identical to a conflict.
+async fn rest_ok(resp: reqwest::Response, what: &str) -> Result<serde_json::Value, GhError> {
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = body
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no message)");
+        return Err(GhError::Rest(format!("{what}: {status}: {msg}")));
+    }
+    Ok(body)
+}
+
 /// Normalized GitHub issue, ready for upsert into tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhIssue {
@@ -160,10 +180,13 @@ impl GitHubClient {
         self
     }
 
-    /// Open a pull request — the system's only GitHub write, and it lives on
-    /// the server. Returns the PR *number*: an immutable identifier we may
-    /// persist. The PR's state/mergeability/checks are GitHub's and are not
-    /// read here, let alone stored.
+    /// Open a pull request. Returns the PR *number*: an immutable identifier
+    /// we may persist. The PR's state/mergeability/checks are GitHub's and are
+    /// not read here, let alone stored.
+    ///
+    /// Every GitHub write in this file lives on the server for the same
+    /// reason — an agent writing through its own credential leaves no ledger
+    /// row, no event, and nothing the charter can reach.
     pub async fn create_pull_request(
         &self,
         owner: &str,
@@ -281,6 +304,342 @@ impl GitHubClient {
                 "close issue {number}: {status}: {msg}"
             )));
         }
+        Ok(())
+    }
+
+    /// Reopen a closed issue.
+    ///
+    /// The inverse of [`GitHubClient::close_issue`], and the reason closing can
+    /// be trusted with autonomy at all: a wrong retirement costs a reopen, not
+    /// an apology. Same read/write split — the poller learns the issue is open
+    /// again on its next pass, nothing is marked locally in anticipation.
+    pub async fn reopen_issue(&self, owner: &str, name: &str, number: u64) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({ "state": "open" }))
+            .send()
+            .await?;
+        rest_ok(resp, &format!("reopen issue {number}")).await?;
+        Ok(())
+    }
+
+    /// Comment on an issue or a pull request. Returns the comment id.
+    ///
+    /// One method for both: GitHub's `/issues/{n}/comments` accepts a PR
+    /// number, because a PR is an issue with a branch attached and they share
+    /// one number space. A separate `pull_request_comment` would be the same
+    /// HTTP call with a misleading name.
+    ///
+    /// Note this is the *conversation* comment, not a review comment pinned to
+    /// a diff line — that is a different resource, and worth adding only when
+    /// something here actually wants to annotate a hunk.
+    pub async fn create_issue_comment(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<u64, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}/comments",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("comment on {number}")).await?;
+        body.get("id")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GhError::Shape("comment response missing `id`".into()))
+    }
+
+    /// The SHA at the tip of a pull request's branch, right now.
+    pub async fn pull_request_head_sha(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<String, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls/{number}", self.rest_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("read pull request {number}")).await?;
+        body.get("head")
+            .and_then(|h| h.get("sha"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| GhError::Shape("pull request response missing `head.sha`".into()))
+    }
+
+    /// Comment on a specific line of a pull request's diff.
+    ///
+    /// Different resource from [`GitHubClient::create_issue_comment`], and
+    /// different in kind: a thread comment is about the PR, this is about a
+    /// line, and a review that names a file and a line survives where "the
+    /// CARGO=/nonexistent-cargo test was dropped" in a chat log does not.
+    ///
+    /// The head SHA is read here rather than taken from the caller. GitHub
+    /// anchors the comment to a commit, and a SHA that arrived through a
+    /// prompt is exactly the sort of GitHub-owned fact this codebase refuses
+    /// to carry around: by the time it is used the branch may have moved.
+    ///
+    /// `line` is the line number in the file *after* the change, and the file
+    /// must appear in the diff. GitHub returns 422 otherwise, which is the
+    /// right outcome — a review comment on an unchanged line is one nobody
+    /// sees in the review UI.
+    pub async fn create_review_comment(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        path: &str,
+        line: u64,
+        body: &str,
+    ) -> Result<u64, GhError> {
+        let commit_sha = self.pull_request_head_sha(owner, name, number).await?;
+        let url = format!(
+            "{}/repos/{owner}/{name}/pulls/{number}/comments",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({
+                "body": body,
+                "commit_id": commit_sha,
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+            }))
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("review comment on {number} {path}:{line}")).await?;
+        body.get("id")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| GhError::Shape("review comment response missing `id`".into()))
+    }
+
+    /// Read an issue's current title and body.
+    ///
+    /// Exists for the edit path: rewriting a body without first reading it is
+    /// how a correction becomes a deletion. The caller keeps the old text for
+    /// the ledger.
+    pub async fn issue_body(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<(String, String), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("read issue {number}")).await?;
+        Ok((
+            body.get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            body.get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        ))
+    }
+
+    /// Rewrite an issue's title and/or body.
+    ///
+    /// The one write here that destroys rather than appends. An issue filed on
+    /// a theory that later turns out wrong is worse than no issue — the next
+    /// reader inherits the superseded reasoning as if it still held — so this
+    /// has to exist. What keeps it honest is upstream: the caller records the
+    /// previous text on the decision, because the thing worth auditing is the
+    /// diff, not the fact that an edit occurred.
+    pub async fn update_issue(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let mut payload = serde_json::Map::new();
+        if let Some(title) = title {
+            payload.insert("title".into(), serde_json::Value::String(title.into()));
+        }
+        if let Some(body) = body {
+            payload.insert("body".into(), serde_json::Value::String(body.into()));
+        }
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::Value::Object(payload))
+            .send()
+            .await?;
+        rest_ok(resp, &format!("edit issue {number}")).await?;
+        Ok(())
+    }
+
+    /// Replace an issue's labels.
+    ///
+    /// PUT, not POST: the complete set, so removing a label is expressible.
+    /// Pair it with [`GitHubClient::list_labels`] — labelling from a guessed
+    /// vocabulary creates near-duplicates (`bug` vs `bugs`) that quietly
+    /// fragment every future filter.
+    pub async fn set_issue_labels(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        labels: &[String],
+    ) -> Result<(), GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}/labels",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({ "labels": labels }))
+            .send()
+            .await?;
+        rest_ok(resp, &format!("set labels on {number}")).await?;
+        Ok(())
+    }
+
+    /// The repository's label vocabulary: name and description.
+    ///
+    /// A read, but it belongs next to the writes it serves. Without it the
+    /// only honest thing an agent can do is file with no labels at all, which
+    /// is what has been happening.
+    pub async fn list_labels(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Vec<(String, String)>, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/labels?per_page=100",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, "list labels").await?;
+        let arr = body
+            .as_array()
+            .ok_or_else(|| GhError::Shape("labels response is not an array".into()))?;
+        Ok(arr
+            .iter()
+            .filter_map(|l| {
+                Some((
+                    l.get("name")?.as_str()?.to_string(),
+                    l.get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    /// Merge a pull request. Returns the merge commit SHA.
+    ///
+    /// `method` is `merge`, `squash`, or `rebase`. GitHub refuses the call
+    /// outright when the PR is not mergeable — behind a failing required
+    /// check, conflicted, already merged — which is the behaviour we want:
+    /// mergeability is a GitHub-owned fact, so it is asked at the moment of
+    /// merging rather than read from anything we stored.
+    pub async fn merge_pull_request(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        method: &str,
+        commit_title: Option<&str>,
+    ) -> Result<String, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/pulls/{number}/merge",
+            self.rest_base_url
+        );
+        let mut payload = serde_json::json!({ "merge_method": method });
+        if let Some(title) = commit_title {
+            payload["commit_title"] = serde_json::Value::String(title.to_string());
+        }
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&payload)
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("merge pull request {number}")).await?;
+        body.get("sha")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| GhError::Shape("merge response missing `sha`".into()))
+    }
+
+    /// Close a pull request without merging it.
+    ///
+    /// Distinct from [`GitHubClient::close_issue`] because PRs live under
+    /// `/pulls` and take no `state_reason` — the reason belongs in a comment,
+    /// which is why this is worth having alongside `create_issue_comment`
+    /// rather than instead of it.
+    pub async fn close_pull_request(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<(), GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls/{number}", self.rest_base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({ "state": "closed" }))
+            .send()
+            .await?;
+        rest_ok(resp, &format!("close pull request {number}")).await?;
         Ok(())
     }
 

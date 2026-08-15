@@ -27,9 +27,10 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
-    ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
-    SetCharter, SetMode, ShadowAck,
+    AbandonPullRequest, BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest,
+    CommentRequest, CreateProject, EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest,
+    ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
+    ReviewRequest, SendMessage, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
@@ -169,7 +170,18 @@ pub fn router_with_services(
         .route("/tasks/{task_id}/dequeue", post(dequeue_task))
         .route("/tasks/{task_id}/scout", post(scout_task_now))
         .route("/tasks/{task_id}/close", post(close_task))
+        .route("/tasks/{task_id}/reopen", post(reopen_task))
         .route("/issues", post(capture_issue))
+        .route("/issues/{number}/comments", post(comment_on_work))
+        .route("/issues/{number}/edit", post(edit_issue))
+        .route("/issues/{number}/labels", post(set_issue_labels))
+        .route("/labels", get(list_labels))
+        .route(
+            "/pull-requests/{number}/review-comments",
+            post(create_review_comment),
+        )
+        .route("/pull-requests/{number}/merge", post(merge_pull_request))
+        .route("/pull-requests/{number}/close", post(abandon_pull_request))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/transcript", get(list_transcript))
@@ -564,6 +576,599 @@ async fn close_task(
         )
         .await?;
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// Reopen the GitHub issue behind a retired task.
+///
+/// Symmetric with [`close_task`], and governed by the same capability: the
+/// power to retire work and the power to take that back are the same power,
+/// and splitting them would mean a charter could switch off the recourse while
+/// leaving the mistake-making half `live`.
+///
+/// Returns 202 for the same reason `close_task` does — open-or-closed is
+/// GitHub's fact, and the poller reads it back on its next pass.
+async fn reopen_task(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(task_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ReopenTaskRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot reopen issues".into())
+    })?;
+    let id = TaskId::from_raw(task_id);
+    let actor = actor_of(&store, &headers);
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        actor,
+        Capability::RetireWork,
+        DecisionAction::ReopenWork,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "task",
+                id.as_str(),
+                DecisionAction::ReopenWork,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the issue is still closed"));
+    }
+    let task = store
+        .get_task(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("task {id}")))?;
+    let project = store
+        .get_project(&task.project_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("project {}", task.project_id)))?;
+
+    github
+        .reopen_issue(
+            &project.repo_owner,
+            &project.repo_name,
+            task.gh_issue_number,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("reopening the issue failed: {e}")))?;
+
+    store
+        .record_decision(
+            "task",
+            id.as_str(),
+            DecisionAction::ReopenWork,
+            decision,
+            true,
+        )
+        .await?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// Comment on an issue or a pull request.
+///
+/// The lightest write in the system and the one whose absence hurt most: an
+/// agent that can form a review verdict but has nowhere to put it hands the
+/// verdict back as prose, and a human re-reads and re-types work that was
+/// already done. That is the shadow-mode failure arriving by a different road.
+///
+/// `number` is a GitHub issue-or-PR number, not a task id, because that is
+/// what the thing being commented on actually is — and a PR opened by a
+/// Builder has no task of its own to address.
+async fn comment_on_work(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CommentRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot comment".into())
+    })?;
+    if body.body.trim().is_empty() {
+        return Err(ApiError::BadRequest("a comment must say something".into()));
+    }
+    let actor = actor_of(&store, &headers);
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        actor,
+        Capability::CommentOnWork,
+        DecisionAction::CommentOnWork,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::CommentOnWork,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "nothing was posted"));
+    }
+
+    let comment_id = github
+        .create_issue_comment(
+            &project.repo_owner,
+            &project.repo_name,
+            number,
+            &attributed(&body.body, actor),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("commenting failed: {e}")))?;
+
+    let seq = store
+        .record_decision(
+            "gh",
+            &number.to_string(),
+            DecisionAction::CommentOnWork,
+            decision,
+            true,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "comment_id": comment_id, "decision_seq": seq })),
+    )
+        .into_response())
+}
+
+/// Merge a pull request.
+///
+/// The one write here whose recourse is a revert rather than an edit, so it
+/// asks for more: the orchestrator must state a rationale, and mergeability is
+/// never read from anything we stored — GitHub refuses the call itself when a
+/// required check is failing or the branch conflicts, which is the check we
+/// want and the only one that cannot go stale.
+async fn merge_pull_request(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<MergePullRequest>,
+) -> ApiResult<Response> {
+    let github = github
+        .ok_or_else(|| ApiError::Unavailable("no GITHUB_TOKEN: the server cannot merge".into()))?;
+    let method = body.method.as_deref().unwrap_or("squash");
+    if !matches!(method, "merge" | "squash" | "rebase") {
+        return Err(ApiError::BadRequest(format!(
+            "unknown merge method: {method} (merge, squash, or rebase)"
+        )));
+    }
+    let actor = actor_of(&store, &headers);
+    if actor == Actor::Orchestrator
+        && body
+            .rationale
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "an autonomous merge must say why it is safe to land".into(),
+        ));
+    }
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        actor,
+        Capability::LandBuilds,
+        DecisionAction::MergeBuild,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::MergeBuild,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the pull request is still open"));
+    }
+
+    let sha = github
+        .merge_pull_request(
+            &project.repo_owner,
+            &project.repo_name,
+            number,
+            method,
+            body.commit_title.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("merging failed: {e}")))?;
+
+    let seq = store
+        .record_decision(
+            "gh",
+            &number.to_string(),
+            DecisionAction::MergeBuild,
+            decision,
+            true,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "merged_sha": sha, "decision_seq": seq })).into_response())
+}
+
+/// Close a pull request without merging it.
+///
+/// Abandoning a Builder run throws away work that cost a VM hour, so the
+/// orchestrator has to say why. No `state_reason` exists on the PR resource —
+/// if the reason should be visible on GitHub, post it with
+/// [`comment_on_work`] first.
+async fn abandon_pull_request(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AbandonPullRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot close pull requests".into())
+    })?;
+    let actor = actor_of(&store, &headers);
+    if actor == Actor::Orchestrator
+        && body
+            .rationale
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "abandoning a build must say why the branch will not land".into(),
+        ));
+    }
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        actor,
+        Capability::LandBuilds,
+        DecisionAction::AbandonBuild,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::AbandonBuild,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the pull request is still open"));
+    }
+
+    github
+        .close_pull_request(&project.repo_owner, &project.repo_name, number)
+        .await
+        .map_err(|e| ApiError::Internal(format!("closing the pull request failed: {e}")))?;
+
+    store
+        .record_decision(
+            "gh",
+            &number.to_string(),
+            DecisionAction::AbandonBuild,
+            decision,
+            true,
+        )
+        .await?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// Comment on one line of a pull request's diff.
+///
+/// Separate from [`comment_on_work`] because it is a different resource and a
+/// different kind of statement: a thread comment is about the PR, this points
+/// at code. "The `CARGO=/nonexistent-cargo` test was dropped" is worth far
+/// more anchored to the line that dropped it than said in a chat log the
+/// reviewer has to hold in their head until they next open the PR.
+async fn create_review_comment(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ReviewCommentRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot comment".into())
+    })?;
+    if body.body.trim().is_empty() {
+        return Err(ApiError::BadRequest("a comment must say something".into()));
+    }
+    let actor = actor_of(&store, &headers);
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let subject = format!("{number}#{}:{}", body.path, body.line);
+    if authorize(
+        &store,
+        actor,
+        Capability::CommentOnWork,
+        DecisionAction::ReviewComment,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &subject,
+                DecisionAction::ReviewComment,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "nothing was posted"));
+    }
+
+    let comment_id = github
+        .create_review_comment(
+            &project.repo_owner,
+            &project.repo_name,
+            number,
+            &body.path,
+            body.line,
+            &attributed(&body.body, actor),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("review comment failed: {e}")))?;
+
+    let seq = store
+        .record_decision(
+            "gh",
+            &subject,
+            DecisionAction::ReviewComment,
+            decision,
+            true,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "comment_id": comment_id, "decision_seq": seq })),
+    )
+        .into_response())
+}
+
+/// Rewrite an issue's title or body.
+///
+/// The only write here that destroys rather than appends, and the reason it
+/// exists anyway: an issue filed on a theory that later collapses is worse
+/// than no issue, because the next reader inherits the superseded reasoning as
+/// though it still held.
+///
+/// What keeps that safe is not a permission check. The server reads the
+/// current text first and stores it on the decision, unasked — "the
+/// orchestrator edited #835" is not an auditable record, the diff is, and a
+/// ledger that only names the event leaves nothing to recover from.
+async fn edit_issue(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<EditIssueRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot edit issues".into())
+    })?;
+    if body.title.is_none() && body.body.is_none() {
+        return Err(ApiError::BadRequest(
+            "an edit must change the title, the body, or both".into(),
+        ));
+    }
+    let actor = actor_of(&store, &headers);
+    if actor == Actor::Orchestrator
+        && body
+            .rationale
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "an edit must say what changed and why the earlier text no longer holds".into(),
+        ));
+    }
+    let project = resolve_project(&store, body.project_id).await?;
+
+    if authorize(
+        &store,
+        actor,
+        Capability::CurateWork,
+        DecisionAction::EditIssue,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::EditIssue,
+                DecisionInput {
+                    actor,
+                    rationale: body.rationale,
+                    evidence: body.evidence,
+                },
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the issue is unchanged"));
+    }
+
+    // Read before write, so the ledger keeps what is about to be overwritten.
+    let (old_title, old_body) = github
+        .issue_body(&project.repo_owner, &project.repo_name, number)
+        .await
+        .map_err(|e| ApiError::Internal(format!("reading the issue failed: {e}")))?;
+
+    github
+        .update_issue(
+            &project.repo_owner,
+            &project.repo_name,
+            number,
+            body.title.as_deref(),
+            body.body.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("editing the issue failed: {e}")))?;
+
+    let evidence = serde_json::json!({
+        "replaced": { "title": old_title, "body": old_body },
+        "caller_evidence": body.evidence,
+    });
+    let seq = store
+        .record_decision(
+            "gh",
+            &number.to_string(),
+            DecisionAction::EditIssue,
+            DecisionInput {
+                actor,
+                rationale: body.rationale,
+                evidence: Some(evidence),
+            },
+            true,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "decision_seq": seq })).into_response())
+}
+
+/// Replace an issue's labels.
+///
+/// The complete set rather than an addition, so removing one is expressible.
+async fn set_issue_labels(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetLabelsRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot set labels".into())
+    })?;
+    let actor = actor_of(&store, &headers);
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        actor,
+        Capability::CurateWork,
+        DecisionAction::LabelIssue,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::LabelIssue,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the labels are unchanged"));
+    }
+
+    github
+        .set_issue_labels(
+            &project.repo_owner,
+            &project.repo_name,
+            number,
+            &body.labels,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("setting labels failed: {e}")))?;
+
+    store
+        .record_decision(
+            "gh",
+            &number.to_string(),
+            DecisionAction::LabelIssue,
+            decision,
+            true,
+        )
+        .await?;
+    Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// The repository's label vocabulary.
+///
+/// A read, but it is the one that makes labelling possible at all: with no way
+/// to ask what labels exist, the only honest thing a caller can do is file
+/// with none, which is exactly what has been happening.
+async fn list_labels(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<Json<Vec<LabelInfo>>> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot read labels".into())
+    })?;
+    let project = resolve_project(&store, q.project_id).await?;
+    let labels = github
+        .list_labels(&project.repo_owner, &project.repo_name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("reading labels failed: {e}")))?;
+    Ok(Json(
+        labels
+            .into_iter()
+            .map(|(name, description)| LabelInfo { name, description })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectQuery {
+    #[serde(default)]
+    project_id: Option<ProjectId>,
+}
+
+/// Sign a comment with who wrote it.
+///
+/// A human's comment goes up verbatim — it is theirs, under their account,
+/// and a footer would be noise. An orchestrator comment is the system talking
+/// in public under the owner's name, and a reader on GitHub with no access to
+/// the ledger should not have to guess which it was.
+fn attributed(body: &str, actor: Actor) -> String {
+    match actor {
+        Actor::Human => body.to_string(),
+        Actor::Orchestrator => format!("{body}\n\n---\nPosted by the Tasks orchestrator."),
+    }
 }
 
 /// The answer to a shadowed write: nothing changed, and here is the ledger

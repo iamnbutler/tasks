@@ -851,6 +851,39 @@ fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
            wants evidence to match (a merged PR, a named commit — queried, \
            never inferred from pipeline activity); `not_planned` is a \
            recalibration\n\
+         - POST /tasks/{{id}}/reopen {{\"rationale\",\"evidence\"}} — undo a \
+           close. Reopening contradicts a decision already in the ledger, so \
+           say what changed\n\
+         - POST /issues/{{number}}/comments {{\"body\",\"rationale\"}} — comment \
+           on an issue or a pull request. `number` is the GitHub number, and \
+           a PR takes the same route: they share one number space. This is \
+           where a review verdict belongs — a verdict you only narrate here is \
+           one the human has to re-read and re-type\n\
+         - POST /pull-requests/{{number}}/merge \
+           {{\"method\":\"squash|merge|rebase\",\"rationale\",\"evidence\"}} — \
+           merge. Mergeability is GitHub's fact and GitHub checks it at merge \
+           time: it refuses on a failing required check or a conflict, so do \
+           not pre-screen from anything stored here. Rationale is mandatory; \
+           this is the one write whose recourse is a revert\n\
+         - POST /pull-requests/{{number}}/close {{\"rationale\"}} — close a PR \
+           unmerged. Say why on the PR first, with a comment; the close itself \
+           carries no reason GitHub will show\n\
+         - POST /pull-requests/{{number}}/review-comments \
+           {{\"path\",\"line\",\"body\",\"rationale\"}} — comment on one line \
+           of the diff. `line` is the line *after* the change and the file has \
+           to appear in the diff. Prefer this over a thread comment when the \
+           point is about code: it survives where a chat message does not\n\
+         - POST /issues/{{number}}/edit \
+           {{\"title\",\"body\",\"rationale\"}} — rewrite an issue. The only \
+           call here that destroys rather than appends, so the server reads \
+           the current text first and stores it on the decision: the diff is \
+           recoverable, and the rationale is mandatory. Use it when an issue \
+           you filed rests on a theory that turned out wrong — a superseded \
+           theory left standing is inherited by whoever reads it next\n\
+         - GET /labels, POST /issues/{{number}}/labels \
+           {{\"labels\":[...],\"rationale\"}} — the repo's label vocabulary, \
+           and the complete set for one issue. Read the vocabulary before \
+           writing: inventing labels fragments every filter written later\n\
          - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
            and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
