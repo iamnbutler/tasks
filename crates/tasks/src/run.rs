@@ -713,13 +713,22 @@ async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
         count = leaked.len(),
         "concluded work still holds VMs — handing them back"
     );
+    // Bounded like every other teardown: this loop is sequential and sits on
+    // the dispatch loop's connect path, so one unanswered deallocate would
+    // stall *all* dispatch — and it runs precisely when the pool is already
+    // in trouble. A failure or an expiry is logged; the row is cleared either
+    // way, so the next sweep retries whatever did not land.
+    let handle = client.handle();
     for vm_id in leaked {
         let id = VmId::new(vm_id.clone());
-        if let Err(e) = client.deallocate(&id).await {
-            // Usually "unknown VM": vm-pool's own reaper got there first, or
-            // the pool restarted. Either way the slot is not ours to hold.
-            warn!(vm_id, error = %e, "could not deallocate a leaked VM");
-        }
+        crate::teardown::deallocate_bounded(
+            &handle,
+            store,
+            &id,
+            "leaked-VM sweep",
+            crate::teardown::DEALLOCATE_TIMEOUT,
+        )
+        .await;
         if let Err(e) = store.forget_vm(&vm_id).await {
             warn!(vm_id, error = %e, "could not clear a leaked VM's row");
         }

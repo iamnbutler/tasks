@@ -600,7 +600,7 @@ async fn reopen_task(
         ApiError::Unavailable("no GITHUB_TOKEN: the server cannot reopen issues".into())
     })?;
     let id = TaskId::from_raw(task_id);
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let decision = DecisionInput {
         actor,
         rationale: body.rationale,
@@ -679,7 +679,7 @@ async fn comment_on_work(
     if body.body.trim().is_empty() {
         return Err(ApiError::BadRequest("a comment must say something".into()));
     }
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let project = resolve_project(&store, body.project_id).await?;
     let decision = DecisionInput {
         actor,
@@ -755,7 +755,7 @@ async fn merge_pull_request(
             "unknown merge method: {method} (merge, squash, or rebase)"
         )));
     }
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     if actor == Actor::Orchestrator
         && body
             .rationale
@@ -832,7 +832,7 @@ async fn abandon_pull_request(
     let github = github.ok_or_else(|| {
         ApiError::Unavailable("no GITHUB_TOKEN: the server cannot close pull requests".into())
     })?;
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     if actor == Actor::Orchestrator
         && body
             .rationale
@@ -907,7 +907,7 @@ async fn create_review_comment(
     if body.body.trim().is_empty() {
         return Err(ApiError::BadRequest("a comment must say something".into()));
     }
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let project = resolve_project(&store, body.project_id).await?;
     let decision = DecisionInput {
         actor,
@@ -990,7 +990,7 @@ async fn edit_issue(
             "an edit must change the title, the body, or both".into(),
         ));
     }
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     if actor == Actor::Orchestrator
         && body
             .rationale
@@ -1078,7 +1078,7 @@ async fn set_issue_labels(
     let github = github.ok_or_else(|| {
         ApiError::Unavailable("no GITHUB_TOKEN: the server cannot set labels".into())
     })?;
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let project = resolve_project(&store, body.project_id).await?;
     let decision = DecisionInput {
         actor,
