@@ -1,0 +1,16 @@
+-- Reattachment covers scouts and builds, because they run inside VMs that
+-- outlive the server process. An orchestrator turn does not: it is a local
+-- child of `tasks serve`, and when the server dies the agent dies with it.
+--
+-- So the turn gets the honest alternative instead — shutdown waits it out
+-- rather than killing it, and a turn that really was interrupted (SIGKILL, a
+-- power cut, a drain the human abandoned) is reported at the next boot
+-- instead of vanishing. This marker is what makes that reportable: set when a
+-- turn starts, cleared when it ends, so a non-NULL value at startup means
+-- exactly one thing.
+--
+-- Nothing is retried off the back of it. The conversation already recovers by
+-- itself: an interrupted turn never advanced `answered_through`, so its input
+-- turns are still unanswered and the next tick answers them. The marker is
+-- for the human, who otherwise sees a silent gap in the feed.
+ALTER TABLE orchestrator ADD COLUMN turn_started_at TEXT;

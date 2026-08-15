@@ -25,8 +25,11 @@
 //! VM. That is exactly what `SCOUT_TIMEOUT_SECS` does when a scout hangs —
 //! a timeout is a dispatch failure like any other, not a mode concern.
 //!
-//! Crash consistency is the store's job, not memory's: startup calls
-//! [`reconcile_startup`] to clear work a dead process left mid-flight, and a
+//! Crash consistency is the store's job, not memory's. Startup first calls
+//! [`resume_in_flight`] — scouts and builds run inside VMs, and vm-pool is a
+//! separate daemon that keeps those VMs alive across a restart, so what a
+//! restart loses is the event stream and nothing else — and only then
+//! [`reconcile_startup`], which writes off whatever genuinely is gone. A
 //! task's failed dispatches are counted on its row, so restarts can't hand a
 //! task that can never be scouted three fresh attempts every time.
 //!
@@ -38,6 +41,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -57,7 +61,7 @@ use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
-use crate::store::{Store, StoreError};
+use crate::store::{ResumedWork, Store, StoreError};
 
 pub const DEFAULT_PORT: u16 = 4800;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
@@ -111,13 +115,23 @@ const DISPATCH_TICK: Duration = Duration::from_millis(500);
 /// How long to wait before retrying a vm-pool connection.
 const VM_POOL_RETRY: Duration = Duration::from_secs(10);
 
-/// How long in-flight scouts get to finish after ctrl_c before we walk away.
+/// How long in-flight scouts and builds get to finish after ctrl_c before we
+/// walk away.
+///
+/// Thirty seconds is right *because* of reattachment, not in spite of it:
+/// walking away from a scout now costs the wait until the successor attaches,
+/// not the run. A long drain would buy back something the successor already
+/// provides, and it would buy it at the price of a slow restart — which is
+/// the thing operators actually feel. Don't lengthen it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// `source` on the breadcrumbs the dispatcher writes to the event log.
 /// `pub(crate)` because [`crate::scout`] emits the timeout note under the same
 /// source — it has the vm id and the deadline that make the entry useful.
 pub(crate) const DISPATCHER: &str = "dispatcher";
+
+/// `source` on breadcrumbs about the orchestrator's own lifecycle.
+const ORCHESTRATOR: &str = "orchestrator";
 
 /// Consecutive failed dispatches after which a task is rejected outright.
 /// Matches the re-explore cap the plan puts on the server rather than the
@@ -505,22 +519,72 @@ async fn stop_signal() -> &'static str {
     }
 }
 
+/// Work this process is following that is not in either loop's own
+/// bookkeeping: runs picked back up by [`resume_in_flight`].
+///
+/// Resumed runs are invisible to the loops that would otherwise account for
+/// them — they live in their own spawned tasks, not in the dispatch loop's
+/// `JoinSet`. Without these counters a restart with two scouts still going
+/// would start two *more* and exhaust the pool, and the serial build lane
+/// would stop being serial.
+#[derive(Debug, Clone, Default)]
+pub struct InFlight {
+    scouts: Arc<AtomicUsize>,
+    builds: Arc<AtomicUsize>,
+}
+
+impl InFlight {
+    fn scouts(&self) -> usize {
+        self.scouts.load(Ordering::SeqCst)
+    }
+
+    fn builds(&self) -> usize {
+        self.builds.load(Ordering::SeqCst)
+    }
+}
+
+/// Increments a counter for as long as it lives. A guard rather than a pair of
+/// calls because the decrement must survive every exit path from the task that
+/// holds it, panics included — a counter that only leaks upwards silently
+/// throttles the pipeline to nothing.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn hold(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Run the server until ctrl_c.
 ///
-/// Startup begins with [`reconcile_startup`], so work abandoned by a previous
-/// process is cleaned up before either loop looks at the queue.
-///
-/// Shutdown is best-effort: ctrl_c stops the HTTP listener and signals both
-/// loops. The poll loop exits at once; the dispatch loop starts nothing new
-/// and waits out its in-flight scouts, up to [`SHUTDOWN_GRACE`]. Past that we
-/// stop waiting — the abandoned VMs are reaped by vm-pool's health loop, and
-/// their sessions stay `running` in the store until the next startup
-/// reconciles them.
+/// Startup is [`resume_in_flight`] then [`reconcile_startup`], in that order:
+/// pick up what is still alive, then write off only what is genuinely gone.
+/// Reversed, reconciliation would kill the runs reattachment exists to save.
 ///
 /// Two processes must never share a data dir, so the pidfile is checked
 /// *before* the store is opened: `Store::open` runs migrations, and a second
 /// process that refused a moment later would already have migrated the
 /// running server's database on its way in.
+///
+/// Shutdown is a hand-over rather than an outage. The HTTP listener is held
+/// through the whole drain — the API keeps answering while in-flight work
+/// finishes — and is released last, when this function returns. That is a real
+/// trade: a successor cannot bind the port until this process exits. It is the
+/// right one, because two processes both driving dispatch would be far worse
+/// than a wait.
+///
+/// The drain itself: the poll loop exits at once, scouts and builds get
+/// [`SHUTDOWN_GRACE`] (short, because a successor reattaches to whatever is
+/// abandoned), and the orchestrator's turn is waited out rather than killed —
+/// it is a local child, so nothing can pick it up. A second ctrl_c abandons
+/// the drain outright.
 pub async fn run(config: Config) -> Result<(), RunError> {
     if let Some(existing) = crate::pidfile::read_live(&config.data_dir) {
         return Err(RunError::AlreadyRunning {
@@ -530,13 +594,23 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     }
 
     let store = Arc::new(open_store(&config.data_dir).await?);
-    reconcile_startup(&store).await?;
+
+    // The port is taken here so a clash is a startup error, before any work is
+    // resumed — but the listener is not dropped until this function returns.
+    let listener = server::bind(config.port).await?;
+
+    let in_flight = InFlight::default();
+    let resumed = resume_in_flight(&store, &config, &in_flight).await;
+    reconcile_startup_except(&store, &resumed).await?;
+    report_interrupted_orchestrator_turn(&store).await;
+
     // After reconciliation: until that has run, this process is not yet the
     // owner of the work in the store.
     match crate::pidfile::write(&config.data_dir, config.port).await {
         Ok(file) => info!(pid = file.pid, port = file.port, exe = %file.exe.display(), "serving"),
         Err(err) => warn!(error = %err, "could not write pidfile"),
     }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let poll = tokio::spawn(poll_loop(
@@ -547,11 +621,13 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let dispatch = tokio::spawn(dispatch_loop(
         store.clone(),
         config.clone(),
+        in_flight.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
         store.clone(),
         config.clone(),
+        in_flight.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -588,14 +664,59 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // The API's own GitHub client: issue writes go through the server, so
     // without a token those routes answer 503 rather than falling back to an
     // agent's credential.
-    let served = server::serve_with_shutdown(
+    //
+    // The drain runs *inside* the shutdown future, which is what keeps the API
+    // answering (and the port held) until it is done.
+    let served = server::serve_on(
+        listener,
         store,
         Some(briefings),
         config.github_client().map(Arc::new),
-        config.port,
-        async {
+        async move {
+            // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`
+            // sends to swap a running server, and the default disposition
+            // kills the process outright — no drain, no pidfile cleanup, and
+            // nothing handed to the successor. The graceful swap only works
+            // because this waits on both.
             let signal = stop_signal().await;
-            info!(signal, "shutdown requested");
+            info!(
+                signal,
+                "shutdown requested; draining in-flight work (the API stays up)"
+            );
+            let _ = shutdown_tx.send(true);
+
+            let drain = async {
+                let _ = poll.await;
+                let _ = nudge.await;
+                let _ = obligations.await;
+                // Scouts and builds first, on a short leash: whatever we walk
+                // away from, the successor attaches to.
+                if tokio::time::timeout(SHUTDOWN_GRACE, async {
+                    let _ = dispatch.await;
+                    let _ = build.await;
+                })
+                .await
+                .is_err()
+                {
+                    warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "in-flight scouts/builds did not finish within the grace \
+                         period; leaving them to be reattached"
+                    );
+                }
+                // The orchestrator's turn is the one thing nothing can pick
+                // up — it is a local child, and killing it loses the turn
+                // outright. So it is waited out on its own budget rather than
+                // aborted at the grace period.
+                let _ = orchestrate.await;
+            };
+
+            tokio::select! {
+                _ = drain => info!("drain complete"),
+                _ = stop_signal() => {
+                    warn!("second interrupt; abandoning the drain");
+                }
+            }
         },
     )
     .await;
@@ -608,42 +729,236 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     crate::pidfile::remove_if_ours(&config.data_dir, std::process::id());
     served?;
 
-    let _ = shutdown_tx.send(true);
-    let _ = poll.await;
-    orchestrate.abort();
-    nudge.abort();
-    obligations.abort();
-    if tokio::time::timeout(SHUTDOWN_GRACE, async {
-        let _ = dispatch.await;
-        let _ = build.await;
-    })
-    .await
-    .is_err()
-    {
-        warn!(
-            grace_secs = SHUTDOWN_GRACE.as_secs(),
-            "in-flight work did not finish within the grace period; exiting anyway"
-        );
-    }
     Ok(())
 }
 
 /// Clean up work a previous process abandoned mid-flight.
 ///
-/// Must run before any loop starts: this process owns all dispatch, so every
-/// `running` session it finds at startup is by definition orphaned, and every
-/// `scouting` task is stranded behind one. See
-/// [`Store::reconcile_orphaned_work`] for what that means row by row.
+/// See [`Store::reconcile_orphaned_work`] for what that means row by row.
 pub async fn reconcile_startup(store: &Store) -> Result<(), StoreError> {
-    let report = store.reconcile_orphaned_work().await?;
+    reconcile_startup_except(store, &ResumedWork::default()).await
+}
+
+/// [`reconcile_startup`], minus the rows a reattach already owns.
+///
+/// Must run after [`resume_in_flight`] and before any loop starts. "Orphaned"
+/// is no longer the same thing as "`running` at startup": a session whose VM
+/// is still alive is running in the ordinary sense, and concluding it would
+/// destroy exactly the run reattachment exists to save. What is left after the
+/// resume — rows whose VM is gone, or that could not be picked up — is
+/// orphaned in the old sense, and is treated exactly as before.
+pub async fn reconcile_startup_except(
+    store: &Store,
+    resumed: &ResumedWork,
+) -> Result<(), StoreError> {
+    let report = store.reconcile_orphaned_work_except(resumed).await?;
     if !report.is_empty() {
         info!(
             sessions = report.sessions,
             tasks = report.tasks,
+            builds = report.builds,
             "reconciled work orphaned by a previous run"
         );
     }
     Ok(())
+}
+
+/// Say, once, that an orchestrator turn was cut off mid-flight.
+///
+/// Reattachment does not apply to it: the agent is a local child of `tasks
+/// serve`, and it died with its parent. Nothing is retried off the back of
+/// this — the conversation recovers by itself, because an interrupted turn
+/// never advanced `answered_through` and its input is therefore still
+/// unanswered. What was missing was any trace that it happened at all.
+async fn report_interrupted_orchestrator_turn(store: &Store) {
+    let started = match store.take_interrupted_orchestrator_turn().await {
+        Ok(Some(started)) => started,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, "could not check for an interrupted orchestrator turn");
+            return;
+        }
+    };
+    warn!(
+        turn_started_at = %started,
+        "an orchestrator turn was interrupted by the last shutdown"
+    );
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: ORCHESTRATOR.into(),
+            message: format!(
+                "an orchestrator turn that started at {started} was interrupted by a \
+                 restart; its input is still unanswered and the next tick will answer it"
+            ),
+        })
+        .await
+    {
+        warn!(error = %e, "could not record the interrupted orchestrator turn");
+    }
+}
+
+/// Pick up scouts and builds a previous process left in flight.
+///
+/// The server was never the thing doing the work: scouts and builds run under
+/// their own supervisors inside VMs, and vm-pool is a separate daemon that
+/// keeps those VMs alive across a restart. So the honest question at startup
+/// is not "what did I abandon" but "what is still running", and the answer is
+/// whatever `sessions`/`builds` still name a VM that vm-pool still has.
+///
+/// Everything here degrades to the old behaviour rather than to a failure: no
+/// resumable rows, an unreachable pool, a missing task or project, or no
+/// `GITHUB_TOKEN` for a build — each leaves the row untouched for
+/// [`reconcile_startup_except`], which writes it off exactly as before.
+///
+/// Returns what it took ownership of. Every returned row *will* be concluded
+/// by the reattach that owns it; that invariant is what makes it safe for
+/// reconciliation to skip them.
+///
+/// The spawned reattaches are deliberately not waited for at shutdown. They
+/// are charged against `in_flight` so the loops account for them, but if this
+/// process is asked to stop before they finish, walking away costs the same as
+/// walking away from a fresh dispatch — the next boot picks them up again, by
+/// the same route.
+pub async fn resume_in_flight(
+    store: &Arc<Store>,
+    config: &Config,
+    in_flight: &InFlight,
+) -> ResumedWork {
+    let sessions = match store.resumable_sessions().await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            warn!(error = %e, "could not look for resumable sessions");
+            Vec::new()
+        }
+    };
+    let builds = match store.resumable_builds().await {
+        Ok(builds) => builds,
+        Err(e) => {
+            warn!(error = %e, "could not look for resumable builds");
+            Vec::new()
+        }
+    };
+    if sessions.is_empty() && builds.is_empty() {
+        return ResumedWork::default();
+    }
+
+    let client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(
+                socket = %config.vm_pool_socket.display(),
+                error = %e,
+                sessions = sessions.len(),
+                builds = builds.len(),
+                "vm-pool unavailable at startup — in-flight work is written off instead"
+            );
+            return ResumedWork::default();
+        }
+    };
+    info!(
+        sessions = sessions.len(),
+        builds = builds.len(),
+        "work survived the restart; reattaching"
+    );
+
+    let mut resumed = ResumedWork::default();
+    for session in sessions {
+        let task = match store.get_task(&session.task_id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                warn!(session_id = %session.id, "session references a missing task");
+                continue;
+            }
+            Err(e) => {
+                warn!(session_id = %session.id, error = %e, "could not load a session's task");
+                continue;
+            }
+        };
+        let scout = Scout::new(store.clone(), client.handle(), scout_config(config));
+        resumed.sessions.insert(session.id.clone());
+        resumed.tasks.insert(task.id.clone());
+
+        let store = store.clone();
+        let counter = InFlightGuard::hold(&in_flight.scouts);
+        tokio::spawn(async move {
+            let _held = counter;
+            let task_id = task.id.clone();
+            let result = scout.reattach(session, task).await;
+            if let Err(e) = record_outcome(&store, &task_id, result).await {
+                warn!(task_id = %task_id, error = %e, "recording a resumed scout's outcome failed");
+            }
+        });
+    }
+
+    let github = config.github_client().map(Arc::new);
+    for build in builds {
+        let Some(github) = github.clone() else {
+            warn!(build_id = %build.id, "no GITHUB_TOKEN; a resumed build could not push or open a PR");
+            continue;
+        };
+        let project = match store.get_project(&build.project_id).await {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                warn!(build_id = %build.id, "build references a missing project");
+                continue;
+            }
+            Err(e) => {
+                warn!(build_id = %build.id, error = %e, "could not load a build's project");
+                continue;
+            }
+        };
+        let url = clone_url(config, &project);
+        let builder = Builder::new(
+            store.clone(),
+            client.handle(),
+            github,
+            builder_config(config),
+        );
+        resumed.builds.insert(build.id.clone());
+        for task_id in build_task_ids(store, &build.id).await {
+            resumed.tasks.insert(task_id);
+        }
+
+        let counter = InFlightGuard::hold(&in_flight.builds);
+        tokio::spawn(async move {
+            let _held = counter;
+            let build_id = build.id.clone();
+            match builder.reattach(build, &url).await {
+                Ok(done) => {
+                    info!(build_id = %done.id, pr = ?done.pr_number, "resumed build succeeded")
+                }
+                Err(e) => warn!(build_id = %build_id, error = %e, "resumed build did not land"),
+            }
+        });
+    }
+
+    // The connection outlives this function through the `ClientHandle`s the
+    // reattach tasks hold; dropping the owning `Client` only gives up its own
+    // event stream.
+    drop(client);
+    resumed
+}
+
+/// The tasks behind a build's batch, so reconciliation leaves them `building`
+/// while the build it belongs to is still being followed. Best-effort: a task
+/// that cannot be read is simply not protected, and is requeued as before.
+async fn build_task_ids(store: &Store, build_id: &crate::models::BuildId) -> Vec<TaskId> {
+    let spec_ids = match store.build_spec_ids(build_id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(%build_id, error = %e, "could not read a resumed build's specs");
+            return Vec::new();
+        }
+    };
+    let mut tasks = Vec::new();
+    for spec_id in spec_ids {
+        match store.get_spec(&spec_id).await {
+            Ok(Some(spec)) => tasks.push(spec.task_id),
+            Ok(None) => {}
+            Err(e) => warn!(%spec_id, error = %e, "could not read a resumed build's spec"),
+        }
+    }
+    tasks
 }
 
 // --- GitHub intake ---
@@ -821,12 +1136,42 @@ pub async fn poll_once(
 
 // --- scout dispatch ---
 
+/// How a Scout VM is booted, in one place: the dispatch loop and
+/// [`resume_in_flight`] must agree on it, and a resumed run's deadline is
+/// measured against the same budget.
+fn scout_config(config: &Config) -> ScoutConfig {
+    ScoutConfig {
+        image: config.scout_image.clone(),
+        vm_config: config.vm_config.clone(),
+        timeout: config.scout_timeout,
+    }
+}
+
+/// How a Builder VM is booted. See [`scout_config`].
+fn builder_config(config: &Config) -> BuilderConfig {
+    BuilderConfig {
+        image: config.builder_image.clone(),
+        vm_config: config.builder_vm_config.clone(),
+        timeout: config.builder_timeout,
+        scratch_root: config.data_dir.join("build-scratch"),
+    }
+}
+
 /// Keep up to `scout_max_concurrent` scouts running until `shutdown` flips.
 ///
 /// Owns the vm-pool connection: if the socket is missing or the connection
 /// drops, dispatch pauses and reconnects every [`VM_POOL_RETRY`] rather than
 /// taking the process down.
-pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watch::Receiver<bool>) {
+///
+/// `in_flight` carries scouts this loop did not start — runs
+/// [`resume_in_flight`] picked back up — which are otherwise invisible to its
+/// own accounting and would let a restart oversubscribe the pool.
+pub async fn dispatch_loop(
+    store: Arc<Store>,
+    config: Config,
+    in_flight: InFlight,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         if *shutdown.borrow() {
             return;
@@ -849,7 +1194,7 @@ pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watc
         info!(socket = %config.vm_pool_socket.display(), "connected to vm-pool");
         sweep_leaked_vms(&store, &mut client).await;
 
-        dispatch_connected(&store, &config, client, &mut shutdown).await;
+        dispatch_connected(&store, &config, &in_flight, client, &mut shutdown).await;
     }
 }
 
@@ -903,17 +1248,14 @@ async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
 async fn dispatch_connected(
     store: &Arc<Store>,
     config: &Config,
+    resumed: &InFlight,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let scout = Arc::new(Scout::new(
         store.clone(),
         client.handle(),
-        ScoutConfig {
-            image: config.scout_image.clone(),
-            vm_config: config.vm_config.clone(),
-            timeout: config.scout_timeout,
-        },
+        scout_config(config),
     ));
 
     let mut in_flight: JoinSet<(TaskId, Result<Spec, ScoutError>)> = JoinSet::new();
@@ -923,7 +1265,15 @@ async fn dispatch_connected(
 
     loop {
         if !draining
-            && let Err(e) = top_up(store, config, &scout, &mut in_flight, &mut in_flight_ids).await
+            && let Err(e) = top_up(
+                store,
+                config,
+                resumed,
+                &scout,
+                &mut in_flight,
+                &mut in_flight_ids,
+            )
+            .await
         {
             warn!(error = %e, "could not read the task queue; retrying next tick");
         }
@@ -960,6 +1310,7 @@ async fn dispatch_connected(
 async fn top_up(
     store: &Arc<Store>,
     config: &Config,
+    resumed: &InFlight,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
@@ -968,7 +1319,9 @@ async fn top_up(
         return Ok(());
     }
 
-    while in_flight.len() < config.scout_max_concurrent {
+    // Scouts this loop started plus scouts it inherited. Counting only its own
+    // would let a restart with two runs in flight start two more.
+    while in_flight.len() + resumed.scouts() < config.scout_max_concurrent {
         let Some((task, project)) = next_dispatchable(store, in_flight_ids).await? else {
             break;
         };
@@ -1057,6 +1410,24 @@ async fn record_outcome(
             })
             .await?;
         return Ok(ConnectionLost(true));
+    }
+
+    // A run that could not be picked up after a restart is the restart's
+    // fault, not the task's. Reconciliation never charged a strike for
+    // orphaning either, and charging one here would mean three restarts could
+    // reject a task nobody has anything against.
+    if let ScoutError::NotResumable(reason) = &error {
+        warn!(task_id = %task_id, reason, "a scout could not be resumed");
+        store
+            .append_event(EventPayload::Note {
+                source: DISPATCHER.into(),
+                message: format!(
+                    "the scout for {task_id} could not be resumed after a restart \
+                     ({reason}); the task is back in the queue and keeps its attempts"
+                ),
+            })
+            .await?;
+        return Ok(ConnectionLost(false));
     }
 
     // Read off the error variant alone, never off the notes table: a task can
@@ -1349,7 +1720,12 @@ pub async fn obligation_loop(
 /// runs normally. Mode gates the *start* of a run only — `Pause` never
 /// interrupts a running build, which has more at stake than a scout: a
 /// half-built branch has no home.
-pub async fn build_loop(store: Arc<Store>, config: Config, mut shutdown: watch::Receiver<bool>) {
+pub async fn build_loop(
+    store: Arc<Store>,
+    config: Config,
+    in_flight: InFlight,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let Some(github) = config.github_client() else {
         warn!("no GITHUB_TOKEN; builds disabled (a build must push and open a PR)");
         return;
@@ -1380,17 +1756,16 @@ pub async fn build_loop(store: Arc<Store>, config: Config, mut shutdown: watch::
             store.clone(),
             client.handle(),
             github.clone(),
-            BuilderConfig {
-                image: config.builder_image.clone(),
-                vm_config: config.builder_vm_config.clone(),
-                timeout: config.builder_timeout,
-                scratch_root: config.data_dir.join("build-scratch"),
-            },
+            builder_config(&config),
         );
 
         loop {
             match store.get_mode().await {
-                Ok(Mode::Play) => {
+                // A build this process inherited is `running` in the store, so
+                // `claim_next_queued_build` already refuses to start another.
+                // The counter says the same thing in the loop's own terms,
+                // where it can be read without a round trip.
+                Ok(Mode::Play) if in_flight.builds() == 0 => {
                     match store.claim_next_queued_build().await {
                         Ok(Some(build)) => {
                             let project = match store.get_project(&build.project_id).await {

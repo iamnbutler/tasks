@@ -26,7 +26,7 @@ use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::models::{
     GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
 };
-use tasks::run::{self, Config};
+use tasks::run::{self, Config, InFlight};
 use tasks::store::Store;
 
 mod common;
@@ -608,7 +608,12 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
     // Nothing is listening on this socket, and nothing ever will be.
     let config = test_config(&tmp.path().join("absent.sock"), tmp.path(), 1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(store.list_sessions().await.unwrap().is_empty());
@@ -774,7 +779,12 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
 
     let s = store.clone();
     wait_until(Duration::from_secs(60), || {
@@ -825,7 +835,12 @@ async fn pause_blocks_new_dispatches() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
 
     let s = store.clone();
     wait_until(Duration::from_secs(60), || {
@@ -895,7 +910,12 @@ async fn three_failed_dispatches_reject_the_task() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
 
     shutdown_tx.send(true).unwrap();
@@ -963,7 +983,12 @@ async fn a_restart_resumes_the_persisted_attempt_count() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
 
     shutdown_tx.send(true).unwrap();
@@ -1027,7 +1052,12 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
 
     let s = store.clone();
     wait_until(Duration::from_secs(60), || {
@@ -1070,7 +1100,12 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::dispatch_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
 
     // Three timeouts exhaust the attempt cap, exactly as three of anything else.
     wait_for_state(&store, &hung.id, TaskState::Rejected).await;

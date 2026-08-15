@@ -116,6 +116,13 @@ impl Orchestrator {
             .join("\n\n");
         info!(turns = pending.len(), "orchestrator tick");
 
+        // A turn is a local child process: a restart kills it, and unlike a
+        // scout or a build there is nothing left to reattach to. The marker
+        // makes that loss reportable at the next boot instead of silent. Set
+        // best-effort — failing to mark a turn must not stop it happening.
+        if let Err(e) = self.store.begin_orchestrator_turn().await {
+            warn!(error = %e, "could not mark the orchestrator turn as in flight");
+        }
         let (reply, session_id) = match self.run_agent(&prompt).await {
             Ok(turn) => {
                 info!(
@@ -134,6 +141,11 @@ impl Orchestrator {
                 (format!("(orchestrator error: {e})"), None)
             }
         };
+        // Cleared here, before the reply is persisted: a turn that produced an
+        // answer — even an error one — ran to its end and was not interrupted.
+        if let Err(e) = self.store.end_orchestrator_turn().await {
+            warn!(error = %e, "could not clear the orchestrator turn marker");
+        }
         let trimmed = reply.trim();
         let content = if trimmed.is_empty() {
             "(the orchestrator returned nothing)"

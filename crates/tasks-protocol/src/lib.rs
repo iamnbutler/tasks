@@ -306,6 +306,7 @@ mod tests {
             event: TaskEvent::Scout(ScoutEvent::Started {
                 branch: "scout/42-uuid".into(),
             }),
+            seq: 3,
         };
         let json = serde_json::to_string(&evt).unwrap();
         let back: ServiceEvent<TasksProtocol> = serde_json::from_str(&json).unwrap();

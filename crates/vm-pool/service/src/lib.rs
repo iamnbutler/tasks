@@ -159,14 +159,19 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
         let response_tx_for_events = response_tx.clone();
         tokio::spawn(async move {
             while let Ok(event) = event_rx.recv().await {
+                let seq = event.seq;
                 if let EventPayload::VmApp {
                     vm_id,
                     event: app_event,
                 } = event.payload
                 {
+                    // The same seq the event log assigned, so a client that
+                    // attached can tell which live events its replay already
+                    // covered.
                     let pushed = Response::push(ServiceEvent::VmApp {
                         vm_id,
                         event: app_event,
+                        seq,
                     });
                     if response_tx_for_events.send(pushed).await.is_err() {
                         break;
@@ -327,6 +332,40 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
             ServiceCommand::UnsubscribeLogs => {
                 info!("unsubscribe from logs");
                 ServiceEvent::LogsSubscribed { vm_id: None }
+            }
+
+            ServiceCommand::Attach {
+                vm_id,
+                since_seq,
+                limit,
+            } => {
+                // Presence BEFORE the replay, and the order is load-bearing.
+                // A VM that finishes between the two reads then reports
+                // `present: true` plus its terminal event, and the caller
+                // reads the outcome. Reversed, the same race reports a VM
+                // that is gone with a replay taken before it ended — work
+                // written off that had in fact concluded.
+                let present = self.pool.get(&vm_id).await.is_some();
+                let (events, dropped) = self
+                    .events
+                    .app_events_for_vm(&vm_id, since_seq, limit)
+                    .await;
+                info!(
+                    %vm_id,
+                    present,
+                    replayed = events.len(),
+                    dropped,
+                    "client attached to a VM"
+                );
+                ServiceEvent::VmAttached {
+                    vm_id,
+                    present,
+                    replay: events
+                        .into_iter()
+                        .map(|(seq, event)| vm_pool_protocol::ReplayedEvent { seq, event })
+                        .collect(),
+                    dropped,
+                }
             }
         }
     }
@@ -524,6 +563,117 @@ mod tests {
                 assert!(lines.is_empty());
             }
             other => panic!("expected LogTail, got {:?}", other),
+        }
+    }
+
+    /// Attach answers the two questions a reattaching client has: is the VM
+    /// still here, and what did I miss.
+    #[tokio::test]
+    async fn handle_attach_reports_presence_and_replays_events() {
+        use vm_pool_manager::EventPayload;
+        use vm_pool_protocol::{OutputStream, ShellEvent};
+
+        let svc = test_service().await;
+        let resp = svc
+            .handle_command(ServiceCommand::Allocate {
+                image: "agent:v1".into(),
+                config: VmConfig::default(),
+            })
+            .await;
+        let ServiceEvent::VmAllocated { vm_id, .. } = resp else {
+            panic!("expected VmAllocated, got {resp:?}");
+        };
+
+        for i in 0..3 {
+            svc.events
+                .append(EventPayload::VmApp {
+                    vm_id: vm_id.clone(),
+                    event: ShellEvent::Output {
+                        stream: OutputStream::Stdout,
+                        data: format!("line {i}"),
+                    },
+                })
+                .await;
+        }
+
+        let resp = svc
+            .handle_command(ServiceCommand::Attach {
+                vm_id: vm_id.clone(),
+                since_seq: 0,
+                limit: 2,
+            })
+            .await;
+        match resp {
+            ServiceEvent::VmAttached {
+                vm_id: id,
+                present,
+                replay,
+                dropped,
+            } => {
+                assert_eq!(id, vm_id);
+                assert!(present, "the pool still holds it");
+                assert_eq!(dropped, 1, "the limit cut the oldest");
+                assert_eq!(replay.len(), 2);
+                assert_eq!(
+                    replay[1].event,
+                    ShellEvent::Output {
+                        stream: OutputStream::Stdout,
+                        data: "line 2".into(),
+                    }
+                );
+                assert!(replay[0].seq < replay[1].seq);
+            }
+            other => panic!("expected VmAttached, got {other:?}"),
+        }
+
+        // Deallocated: gone from the pool, but the log still has the events —
+        // which is why `present: false` alone is not "lost".
+        svc.handle_command(ServiceCommand::Deallocate {
+            vm_id: vm_id.clone(),
+        })
+        .await;
+        let resp = svc
+            .handle_command(ServiceCommand::Attach {
+                vm_id: vm_id.clone(),
+                since_seq: 0,
+                limit: 100,
+            })
+            .await;
+        match resp {
+            ServiceEvent::VmAttached {
+                present, replay, ..
+            } => {
+                assert!(!present);
+                assert_eq!(replay.len(), 3, "the log outlives the VM");
+            }
+            other => panic!("expected VmAttached, got {other:?}"),
+        }
+    }
+
+    /// A VM nobody ever allocated: absent, with nothing to replay. Not an
+    /// error — the caller decides what that means for its own work.
+    #[tokio::test]
+    async fn handle_attach_to_an_unknown_vm_is_empty_not_an_error() {
+        let svc = test_service().await;
+        let resp = svc
+            .handle_command(ServiceCommand::Attach {
+                vm_id: VmId::new("vm-never-existed"),
+                since_seq: 0,
+                limit: 10,
+            })
+            .await;
+        match resp {
+            ServiceEvent::VmAttached {
+                present,
+                replay,
+                dropped,
+                ..
+            } => {
+                assert!(!present);
+                assert!(replay.is_empty());
+                assert_eq!(dropped, 0);
+            }
+            other => panic!("expected VmAttached, got {other:?}"),
         }
     }
 

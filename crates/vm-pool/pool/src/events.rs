@@ -221,6 +221,46 @@ impl<P: AppProtocol> EventLog<P> {
             .collect()
     }
 
+    /// Application events recorded for one VM, oldest first, together with
+    /// how many older ones `limit` cut off the front.
+    ///
+    /// This is the whole of what reattachment needs from the log, and it is a
+    /// *query* rather than new retention: the log was already append-only and
+    /// already keyed by VM. Nothing is buffered on the VM side, because there
+    /// is nothing to buffer against — a client going away is invisible from
+    /// inside the VM, so the supervisor has neither something to re-send nor
+    /// an ack to wait on. Giving it one would mean teaching vm-pool which
+    /// application events are terminal, which is exactly the app vocabulary
+    /// that must not enter this crate.
+    ///
+    /// The newest `limit` events are kept: a terminal event is by
+    /// construction the last one emitted, so a bounded window that keeps the
+    /// tail is the one that always contains it.
+    pub async fn app_events_for_vm(
+        &self,
+        vm_id: &VmId,
+        since: u64,
+        limit: usize,
+    ) -> (Vec<(u64, P::Event)>, u64) {
+        let events = self.events.read().await;
+        let matching: Vec<(u64, P::Event)> = events
+            .iter()
+            .filter(|e| e.seq >= since)
+            .filter_map(|e| match &e.payload {
+                EventPayload::VmApp { vm_id: id, event } if id == vm_id => {
+                    Some((e.seq, event.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let dropped = matching.len().saturating_sub(limit) as u64;
+        let kept = match matching.len().checked_sub(limit) {
+            Some(cut) if cut > 0 => matching[cut..].to_vec(),
+            _ => matching,
+        };
+        (kept, dropped)
+    }
+
     /// Tail the last N log lines for a VM.
     pub async fn tail_vm_logs(&self, vm_id: &VmId, n: usize) -> Vec<(LogStream, String, u64)> {
         let vm_logs = self.vm_logs.read().await;
@@ -451,6 +491,68 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.seq, 0);
         assert_eq!(event.vm_id, Some(vm_id));
+    }
+
+    /// The query reattachment is built on: one VM's application events, in
+    /// order, bounded to the newest `limit` — which is the window that always
+    /// contains the terminal event.
+    #[tokio::test]
+    async fn app_events_for_vm_keeps_the_newest_and_says_what_it_dropped() {
+        use vm_pool_protocol::{OutputStream, ShellEvent, ShellProtocol};
+
+        let log = EventLog::<ShellProtocol>::new();
+        let mine = VmId::new("vm-1");
+        let theirs = VmId::new("vm-2");
+
+        let output = |data: &str| ShellEvent::Output {
+            stream: OutputStream::Stdout,
+            data: data.into(),
+        };
+        for i in 0..5 {
+            log.append(EventPayload::VmApp {
+                vm_id: mine.clone(),
+                event: output(&format!("line {i}")),
+            })
+            .await;
+            // Another VM's traffic interleaved, plus a non-app event: neither
+            // may show up in the replay.
+            log.append(EventPayload::VmApp {
+                vm_id: theirs.clone(),
+                event: output("not mine"),
+            })
+            .await;
+            log.append(EventPayload::VmLifecycle {
+                vm_id: mine.clone(),
+                state: VmState::Ready,
+            })
+            .await;
+        }
+
+        let (all, dropped) = log.app_events_for_vm(&mine, 0, 100).await;
+        assert_eq!(dropped, 0);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].1, output("line 0"));
+        assert_eq!(all[4].1, output("line 4"));
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "seq ascending");
+
+        // Bounded: the tail survives, the head is counted.
+        let (tail, dropped) = log.app_events_for_vm(&mine, 0, 2).await;
+        assert_eq!(dropped, 3);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].1, output("line 3"));
+        assert_eq!(tail[1].1, output("line 4"));
+
+        // `since` skips what the caller already has.
+        let after = all[2].0;
+        let (rest, dropped) = log.app_events_for_vm(&mine, after + 1, 100).await;
+        assert_eq!(dropped, 0);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].1, output("line 3"));
+
+        // A VM with nothing recorded is empty rather than an error.
+        let (none, dropped) = log.app_events_for_vm(&VmId::new("vm-absent"), 0, 10).await;
+        assert!(none.is_empty());
+        assert_eq!(dropped, 0);
     }
 
     #[test]

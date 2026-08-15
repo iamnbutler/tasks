@@ -239,7 +239,7 @@ pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
     serve_with_shutdown(store, None, None, port, std::future::pending()).await
 }
 
-/// When this process started serving, stamped once by [`serve_with_shutdown`].
+/// When this process started serving, stamped once by [`serve_on`].
 ///
 /// A static rather than router state so [`router`] keeps its shape for the
 /// tests that build one directly: a router with no server around it still
@@ -251,8 +251,43 @@ pub fn serving_since() -> chrono::DateTime<Utc> {
     *SERVING_SINCE.get_or_init(Utc::now)
 }
 
-/// Serve the API on loopback at `port` until `shutdown` resolves, then stop
-/// accepting connections and let the in-flight ones drain.
+/// Take the API's port on loopback.
+///
+/// Split from [`serve_on`] so a caller can fail fast on a port clash — before
+/// it starts resuming work — while still holding the socket for as long as it
+/// likes afterwards. `tasks serve` uses that to keep answering through its
+/// whole shutdown drain, releasing the port last of all.
+pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    info!(addr = %listener.local_addr()?, "tasks api listening");
+    Ok(listener)
+}
+
+/// Serve the API on an already-bound listener until `shutdown` resolves, then
+/// stop accepting connections and let the in-flight ones drain.
+///
+/// The port is released when this returns — so anything a caller wants to
+/// finish while the API is still up belongs inside `shutdown`, not after this
+/// call.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    store: Arc<Store>,
+    briefings: Option<Arc<Briefings>>,
+    github: Option<Arc<GitHubClient>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    // Stamped here rather than in `serve_with_shutdown`, because `tasks serve`
+    // now binds and serves in two steps and never goes through that helper —
+    // stamping there would leave `/status` uptime dating from the first call
+    // instead of from the moment this process started serving.
+    serving_since();
+    axum::serve(listener, router_with_services(store, briefings, github))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+/// Bind and serve in one call. [`bind`] + [`serve_on`] for callers that do not
+/// need to do anything in between.
 pub async fn serve_with_shutdown(
     store: Arc<Store>,
     briefings: Option<Arc<Briefings>>,
@@ -260,14 +295,7 @@ pub async fn serve_with_shutdown(
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    // Stamped before the bind, so uptime measures serving and not the boot
-    // work that preceded it.
-    serving_since();
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    info!(addr = %listener.local_addr()?, "tasks api listening");
-    axum::serve(listener, router_with_services(store, briefings, github))
-        .with_graceful_shutdown(shutdown)
-        .await
+    serve_on(bind(port).await?, store, briefings, github, shutdown).await
 }
 
 // --- projects ---

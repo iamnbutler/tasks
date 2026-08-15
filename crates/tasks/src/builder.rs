@@ -12,6 +12,11 @@
 //!
 //! `dispatch` finalizes the build on every exit path; all the fallible work
 //! lives in `attempt`, so no `?` can leave a build `running`.
+//!
+//! Like a scout, a build is two halves — set the run up, then [`Builder::follow`]
+//! it — so [`Builder::reattach`] can re-enter the second half for a build a
+//! previous process started. A restart mid-build used to cost the whole
+//! implementation *and* leave the branch homeless.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,13 +27,14 @@ use chrono::Utc;
 use thiserror::Error;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
-use vm_pool_client::{ClientError, ClientHandle, EventStream};
-use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
+use vm_pool_client::{ClientError, ClientHandle};
+use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::github::{GhError, GitHubClient};
 use crate::models::{Build, Project, Spec, Task, TranscriptOwner, TranscriptStream};
 use crate::protocol::{BuildCommand, BuildEvent, TaskCommand, TaskEvent, TasksProtocol};
-use crate::store::{Store, StoreError};
+use crate::reattach::AppEvents;
+use crate::store::{SpecStrike, Store, StoreError};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
 #[derive(Debug, Error)]
@@ -41,6 +47,12 @@ pub enum BuilderError {
     GitHub(#[from] GhError),
     #[error("build failed: {0}")]
     BuildFailed(String),
+    /// The build could not be picked up after a restart: no VM recorded, the
+    /// pool no longer has it, and nothing terminal in the replay. The batch's
+    /// specs stay approved and the queue is left claimable, exactly as
+    /// reconciliation would have left them.
+    #[error("build could not be resumed: {0}")]
+    NotResumable(String),
     #[error("branch egress: {0}")]
     Egress(String),
     #[error("vm-pool event stream closed before completion")]
@@ -88,30 +100,59 @@ impl Builder {
     /// build row on every path and returns the finished build.
     pub async fn dispatch(&self, build: Build, clone_url: &str) -> Result<Build, BuilderError> {
         info!(build_id = %build.id, branch = %build.branch, "build dispatch starting");
-        match self.attempt(&build, clone_url).await {
+        self.conclude(&build, self.attempt(&build, clone_url).await)
+            .await
+    }
+
+    /// Pick up a build a previous process left running.
+    ///
+    /// **This always concludes `build`** — including when it cannot be
+    /// resumed. [`Store::reconcile_orphaned_work_except`] skips rows handed to
+    /// a reattach, and a `running` build nobody concludes wedges the serial
+    /// queue forever, which is strictly worse than an orphaned session.
+    pub async fn reattach(&self, build: Build, clone_url: &str) -> Result<Build, BuilderError> {
+        info!(build_id = %build.id, branch = %build.branch, "reattaching to a build");
+        self.conclude(&build, self.resume(&build, clone_url).await)
+            .await
+    }
+
+    /// Record the outcome. Failure is finalized here and nowhere else, so no
+    /// `?` inside `attempt`/`resume` can leave a build `running`.
+    async fn conclude(
+        &self,
+        build: &Build,
+        outcome: Result<Build, BuilderError>,
+    ) -> Result<Build, BuilderError> {
+        match outcome {
             Ok(done) => Ok(done),
             Err(e) => {
                 let reason = redact(&format!("{e}"));
                 warn!(build_id = %build.id, reason, "build failed");
-                self.store.finalize_build_failed(&build.id, &reason).await?;
+                // A build nobody could pick up after a restart says nothing
+                // about its specs, so it must not spend one of their attempts
+                // — three restarts would otherwise `blocked` a batch that has
+                // never actually failed to build.
+                let strike = match e {
+                    BuilderError::NotResumable(_) => SpecStrike::Waive,
+                    _ => SpecStrike::Charge,
+                };
+                self.store
+                    .finalize_build_failed_with(&build.id, &reason, strike)
+                    .await?;
                 Err(e)
             }
         }
     }
 
-    /// Everything that can fail. A `?` here lands in `dispatch`'s failure
-    /// finalization — nothing can leave the build `running`.
+    /// Everything that can fail on a fresh build. A `?` here lands in
+    /// [`Builder::conclude`]'s failure finalization.
     async fn attempt(&self, build: &Build, clone_url: &str) -> Result<Build, BuilderError> {
         let started = Instant::now();
         // Subscribe before allocating so no event for our VM can be missed.
         let mut events = self.client.subscribe_events();
 
         let batch = self.load_batch(build).await?;
-        let project = self
-            .store
-            .get_project(&build.project_id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("project {}", build.project_id)))?;
+        let project = self.project(build).await?;
         let prompt = render_prompt(&batch);
 
         let vm_id = self
@@ -127,8 +168,7 @@ impl Builder {
         );
         self.store.set_build_vm(&build.id, vm_id.as_str()).await?;
 
-        let send = self
-            .client
+        self.client
             .send_to_vm(
                 &vm_id,
                 TaskCommand::Build(BuildCommand::Start {
@@ -139,46 +179,97 @@ impl Builder {
                     prompt,
                 }),
             )
-            .await;
+            .await?;
 
-        // From here every path must deallocate, so the drain result is held
-        // rather than `?`'d.
+        let remaining = self.config.timeout.saturating_sub(started.elapsed());
+        let app = AppEvents::live(&mut events, vm_id.clone());
+        self.follow(build, clone_url, &batch, &project, &vm_id, app, remaining)
+            .await
+    }
+
+    /// Everything that can fail on a resumed build.
+    async fn resume(&self, build: &Build, clone_url: &str) -> Result<Build, BuilderError> {
+        let Some(vm_id) = build.vm_id.clone().map(VmId::new) else {
+            return Err(BuilderError::NotResumable("the build records no VM".into()));
+        };
+
+        let batch = self.load_batch(build).await?;
+        let project = self.project(build).await?;
+
+        let (mut events, resume) = crate::reattach::attach(&self.client, &vm_id)
+            .await
+            .map_err(|e| BuilderError::NotResumable(format!("attach failed: {e}")))?;
+
+        // Gone from the pool *and* silent is the only real orphan; a VM reaped
+        // after the build finished still has its Completed — bundle included —
+        // sitting in the replay, and that is a whole implementation.
+        if !resume.present && !resume.replay.iter().any(is_terminal) {
+            return Err(BuilderError::NotResumable(
+                "the VM is gone and its build never reported an outcome".into(),
+            ));
+        }
+
+        // Wall-clock from the original claim, floored so a replay already
+        // holding the outcome is never thrown away by a spent budget.
+        let elapsed = build
+            .started_at
+            .map(|t| (Utc::now() - t).to_std().unwrap_or_default())
+            .unwrap_or_default();
+        let remaining = self
+            .config
+            .timeout
+            .saturating_sub(elapsed)
+            .max(RESUME_MIN_BUDGET);
+
+        let app = AppEvents::resumed(&mut events, vm_id.clone(), resume);
+        self.follow(build, clone_url, &batch, &project, &vm_id, app, remaining)
+            .await
+    }
+
+    /// The second half of a build, shared by [`Builder::attempt`] and
+    /// [`Builder::resume`]: drain to a terminal event, deallocate, land the
+    /// branch, open the PR.
+    #[allow(clippy::too_many_arguments)]
+    async fn follow(
+        &self,
+        build: &Build,
+        clone_url: &str,
+        batch: &[(Spec, Task)],
+        project: &Project,
+        vm_id: &VmId,
+        mut events: AppEvents<'_>,
+        budget: Duration,
+    ) -> Result<Build, BuilderError> {
         let (mut sink, writer) =
             spawn_transcript_writer(self.store.clone(), TranscriptOwner::build(&build.id));
-        let result = match send {
-            Ok(()) => {
-                let remaining = self.config.timeout.saturating_sub(started.elapsed());
-                match tokio::time::timeout(
-                    remaining,
-                    self.drain_build_events(&mut events, &vm_id, &build.id, &mut sink),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_elapsed) => {
-                        // Said here rather than only in `dispatch`'s failure
-                        // warn, which runs *after* teardown: in the incident
-                        // that was 15:37 to 17:50 of silence between the
-                        // budget expiring and anyone being told.
-                        warn!(
-                            build_id = %build.id,
-                            secs = self.config.timeout.as_secs(),
-                            "build budget exhausted; tearing the VM down"
-                        );
-                        Err(BuilderError::Timeout {
-                            secs: self.config.timeout.as_secs(),
-                        })
-                    }
-                }
+        let result = match tokio::time::timeout(
+            budget,
+            self.drain_build_events(&mut events, &build.id, &mut sink),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // Said here rather than only in `dispatch`'s failure warn,
+                // which runs *after* teardown: in the incident that was 15:37
+                // to 17:50 of silence between the budget expiring and anyone
+                // being told.
+                warn!(
+                    build_id = %build.id,
+                    secs = self.config.timeout.as_secs(),
+                    "build budget exhausted; tearing the VM down"
+                );
+                Err(BuilderError::Timeout {
+                    secs: self.config.timeout.as_secs(),
+                })
             }
-            Err(e) => Err(e.into()),
         };
 
         // The agent phase ends here — before teardown, and long before the
         // push and the PR that `completed_at` waits for. Stamped on the
-        // send-error and timeout paths too, since those are exactly the
-        // durations someone will want to read afterwards. Best-effort: a store
-        // hiccup must not skip the deallocation below.
+        // timeout path too, since that is exactly the duration someone will
+        // want to read afterwards. Best-effort: a store hiccup must not skip
+        // the deallocation below.
         //
         // Above the flush deliberately: draining a queued transcript is our
         // bookkeeping, not the agent's work, and an 8 MiB tail would otherwise
@@ -204,7 +295,7 @@ impl Builder {
         crate::teardown::deallocate_bounded(
             &self.client,
             &self.store,
-            &vm_id,
+            vm_id,
             &format!("build {}", build.id),
             crate::teardown::DEALLOCATE_TIMEOUT,
         )
@@ -213,7 +304,7 @@ impl Builder {
 
         // Egress: unbundle, verify, push — then the PR.
         self.land_branch(build, clone_url, &outcome).await?;
-        let (title, body) = pr_text(&batch, &outcome);
+        let (title, body) = pr_text(batch, &outcome);
         let pr_number = self
             .github
             .create_pull_request(
@@ -239,6 +330,13 @@ impl Builder {
             .await?)
     }
 
+    async fn project(&self, build: &Build) -> Result<Project, BuilderError> {
+        self.store
+            .get_project(&build.project_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("project {}", build.project_id)).into())
+    }
+
     /// Load the batch's `(Spec, Task)` pairs in position order.
     async fn load_batch(&self, build: &Build) -> Result<Vec<(Spec, Task)>, BuilderError> {
         let mut batch = Vec::new();
@@ -261,23 +359,24 @@ impl Builder {
         Ok(batch)
     }
 
-    /// Consume this dispatch's event subscription until its VM reports a
-    /// terminal Completed/Failed, recording every line the agent emits into
-    /// `sink` on the way past.
+    /// Consume this run's events — the replay first if there is one, then
+    /// live — until its VM reports a terminal Completed/Failed, recording
+    /// every line the agent emits into `sink` on the way past.
+    ///
+    /// Nothing here is append-only, so a replayed event needs no special
+    /// handling: `base_sha` is an idempotent write and `Progress` is only
+    /// logged. The one event that matters is `Completed`, and the bounded
+    /// replay keeps the newest events precisely so it survives.
     async fn drain_build_events(
         &self,
-        events: &mut EventStream<TasksProtocol>,
-        target_vm: &VmId,
+        events: &mut AppEvents<'_>,
         build_id: &crate::models::BuildId,
         sink: &mut TranscriptSink,
     ) -> Result<BuildOutcome, BuilderError> {
         loop {
-            let event = events.recv().await.ok_or(BuilderError::StreamClosed)?;
+            let (_origin, event) = events.next().await.ok_or(BuilderError::StreamClosed)?;
             match event {
-                ServiceEvent::VmApp {
-                    vm_id,
-                    event: TaskEvent::Build(app),
-                } if &vm_id == target_vm => match app {
+                TaskEvent::Build(app) => match app {
                     BuildEvent::Started { base_sha } => {
                         self.store.set_build_base_sha(build_id, &base_sha).await?;
                     }
@@ -314,7 +413,8 @@ impl Builder {
                         return Err(BuilderError::BuildFailed(reason));
                     }
                 },
-                _other => {}
+                // A Scout VM's traffic on the same connection. Not ours.
+                TaskEvent::Scout(_) => {}
             }
         }
     }
@@ -402,6 +502,19 @@ impl Builder {
         info!(build_id = %build.id, branch = %build.branch, "branch pushed");
         Ok(())
     }
+}
+
+/// Least wall-clock budget a resumed build gets, however long the server was
+/// down. See `scout::RESUME_MIN_BUDGET` — same reasoning, and here the
+/// outcome in hand is a whole implementation plus its bundle.
+const RESUME_MIN_BUDGET: Duration = Duration::from_secs(30);
+
+/// Whether a build event ends the run.
+fn is_terminal(event: &TaskEvent) -> bool {
+    matches!(
+        event,
+        TaskEvent::Build(BuildEvent::Completed { .. } | BuildEvent::Failed { .. })
+    )
 }
 
 struct BuildOutcome {

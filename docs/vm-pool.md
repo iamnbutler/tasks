@@ -114,7 +114,16 @@ unique per connection:
 {"id": 6, "command": {"type": "status"}}
 {"id": 7, "command": {"type": "tail_logs", "vm_id": "vm-abc123", "lines": 100}}
 {"id": 8, "command": {"type": "subscribe_logs", "vm_id": "vm-abc123"}}
+{"id": 9, "command": {"type": "attach", "vm_id": "vm-abc123", "since_seq": 0, "limit": 256}}
 ```
+
+`attach` is how a client picks up a VM it was not following — after its own
+restart, say. The workload never stopped and the service never stopped logging
+it, so the reply carries whether the pool still holds the VM plus the
+application events recorded for it. `limit` is the caller's, and mandatory in
+spirit: the reply is one line on a line-oriented socket, and a long-running
+workload emits thousands of events. The newest are kept, because a terminal
+event is by construction the last one emitted.
 
 ### Responses and events (vm-pool → Tasks)
 
@@ -131,7 +140,11 @@ command's `id`:
 Asynchronously pushed events omit `id` entirely:
 
 ```json
-{"event": {"type": "vm_app", "vm_id": "vm-abc123", "event": {"type": "output", "stream": "stdout", "data": "..."}}}
+{"id": 9, "event": {"type": "vm_attached", "vm_id": "vm-abc123", "present": true, "replay": [{"seq": 12, "event": {"type": "command_completed", "exit_code": 0}}], "dropped": 0}}
+```
+
+```json
+{"event": {"type": "vm_app", "vm_id": "vm-abc123", "seq": 13, "event": {"type": "output", "stream": "stdout", "data": "..."}}}
 {"event": {"type": "vm_ready", "vm_id": "vm-abc123"}}
 {"event": {"type": "vm_stopped", "vm_id": "vm-abc123"}}
 {"event": {"type": "vm_crashed", "vm_id": "vm-abc123", "error": "..."}}
@@ -142,6 +155,16 @@ Clients route by `id`: `id` present ⇒ resolve that pending request; `id`
 absent ⇒ deliver to the event stream. This is what makes concurrent requests
 on a single connection safe — a VM event landing between a command and its
 response can never be mistaken for the response.
+
+`vm_app` carries the event log's `seq`, which is what lets a reattaching
+client splice a replay against live traffic: subscribe first, then attach,
+then discard live events at or below the replay's last `seq`. Subscribing
+second would open a window whose events neither source covers. The field is
+`#[serde(default)]`, so a peer that predates `attach` still decodes.
+
+`present: false` does not mean the work is lost: if the pool reaped the VM
+after the workload finished, its terminal event is still in `replay`. What
+counts as terminal is the application's business, not vm-pool's.
 
 ## Log Forwarding
 

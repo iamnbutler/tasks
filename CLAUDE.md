@@ -151,6 +151,22 @@ is a discovery record, not a lock: liveness is re-derived from the OS
 up by hand. This is not a service manager — no supervision, no
 restart-on-crash; point `launchd`/`systemd` at `tasks serve` if you want one.
 
+### Restarts and work in flight
+
+**A restart does not cost the work in flight.** Scouts and builds run under
+their own supervisors inside VMs that vm-pool (a separate daemon) keeps alive,
+so the only thing a restart loses is the event stream. Boot is `resume_in_flight`
+— attach to every still-`running` session/build that names a live VM
+(`ServiceCommand::Attach`, bounded replay, see `crates/tasks/src/reattach.rs`)
+— and only then `reconcile_startup`, which writes off what is genuinely gone.
+A reattach *always concludes its row*, including when it cannot resume;
+reconciliation skips rows it owns, so one that returned leaving a row `running`
+would strand it. The orchestrator's turn is a local child and cannot be
+reattached: shutdown waits it out instead, and an interrupted one is reported
+in the feed at the next boot. Shutdown holds the HTTP port through the whole
+drain (so a restart is a hand-over, not an outage) and releases it last, which
+means a successor waits for this process to exit before it can bind.
+
 ### Tests
 
 ```sh

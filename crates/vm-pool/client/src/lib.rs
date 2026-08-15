@@ -71,8 +71,8 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 use vm_pool_protocol::{
-    AppProtocol, LogLine, NullProtocol, Request, Response, ServiceCommand, ServiceEvent, VmConfig,
-    VmId,
+    AppProtocol, LogLine, NullProtocol, ReplayedEvent, Request, Response, ServiceCommand,
+    ServiceEvent, VmConfig, VmId,
 };
 
 /// How many pushed events a subscriber may fall behind before the oldest are
@@ -99,6 +99,33 @@ pub struct PoolStatus {
     pub total: usize,
     pub available: usize,
     pub allocated: usize,
+}
+
+/// What [`ClientHandle::attach`] found: whether the pool still holds the VM,
+/// and the application events it recorded while nobody was listening.
+///
+/// `present: false` does not mean the work is lost. If the pool reaped the VM
+/// after the workload finished, the terminal event is still in `replay` — it
+/// is only `!present` *and* nothing terminal in the replay that means the
+/// work is gone, and what counts as terminal is the application's business,
+/// not this crate's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment<P: AppProtocol = NullProtocol> {
+    /// Whether the pool still holds the VM.
+    pub present: bool,
+    /// Recorded application events, oldest first.
+    pub replay: Vec<ReplayedEvent<P>>,
+    /// How many older events the requested limit cut off the front of.
+    pub dropped: u64,
+}
+
+impl<P: AppProtocol> Attachment<P> {
+    /// The highest sequence number in the replay, if any. Live events at or
+    /// below it have already been delivered here, so a caller splicing the
+    /// two together skips them.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.replay.last().map(|e| e.seq)
+    }
 }
 
 /// Recover from a poisoned mutex: the guarded data is a plain map/option and
@@ -395,6 +422,44 @@ impl<P: AppProtocol> ClientHandle<P> {
             other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
     }
+
+    /// Pick up a VM this client was not following: ask whether the pool still
+    /// holds it and replay up to `limit` of its application events from
+    /// `since_seq` on.
+    ///
+    /// **Subscribe before calling this.** Events landing between the service
+    /// taking the replay snapshot and this client subscribing are otherwise
+    /// lost with no trace: [`ClientHandle::subscribe_events`] only delivers
+    /// what is pushed after it, and the replay only covers what was recorded
+    /// before it. Subscribing first makes the two overlap, and the overlap is
+    /// what [`Attachment::last_seq`] lets the caller discard.
+    pub async fn attach(
+        &self,
+        vm_id: &VmId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Attachment<P>, ClientError> {
+        let resp = self
+            .request(ServiceCommand::Attach {
+                vm_id: vm_id.clone(),
+                since_seq,
+                limit,
+            })
+            .await?;
+        match Self::check_error(resp)? {
+            ServiceEvent::VmAttached {
+                present,
+                replay,
+                dropped,
+                ..
+            } => Ok(Attachment {
+                present,
+                replay,
+                dropped,
+            }),
+            other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
+        }
+    }
 }
 
 /// Client for communicating with the vm-pool service.
@@ -546,6 +611,17 @@ impl<P: AppProtocol> Client<P> {
     /// Unsubscribe from log streaming.
     pub async fn unsubscribe_logs(&mut self) -> Result<(), ClientError> {
         self.handle.unsubscribe_logs().await
+    }
+
+    /// Pick up a VM this client was not following. See
+    /// [`ClientHandle::attach`] — including the ordering requirement.
+    pub async fn attach(
+        &mut self,
+        vm_id: &VmId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Attachment<P>, ClientError> {
+        self.handle.attach(vm_id, since_seq, limit).await
     }
 
     /// Receive the next asynchronously pushed event (VM application events).
@@ -802,7 +878,7 @@ mod tests {
             let mut seen: Vec<usize> = Vec::new();
             while let Some(event) = events.recv().await {
                 match event {
-                    ServiceEvent::VmApp { vm_id, event } => {
+                    ServiceEvent::VmApp { vm_id, event, .. } => {
                         assert_eq!(vm_id, VmId::new("vm-streaming"));
                         let ShellEvent::Output { data, .. } = event else {
                             panic!("unexpected app event: {event:?}");
@@ -958,6 +1034,60 @@ mod tests {
             ServiceEvent::VmApp { .. } => {}
             other => panic!("expected VmApp, got {other:?}"),
         }
+    }
+
+    /// A client that never saw a VM's events can still pick them up, and the
+    /// splice is exact: the replay carries seq numbers, and the live events
+    /// it already covered are identifiable rather than guessed at.
+    #[tokio::test]
+    async fn attach_replays_what_a_client_missed_and_marks_the_overlap() {
+        let (svc, socket_path, _dir) = start_service(3).await;
+        let vm_id = VmId::new("vm-was-running");
+
+        // Traffic while nobody is connected — the restart window.
+        for i in 0..3 {
+            push_app_event(&svc, &vm_id, format!("before {i}")).await;
+        }
+
+        let client = connect_client(&socket_path).await;
+        // Subscribe BEFORE attaching: anything landing between the snapshot
+        // and the subscription must be covered by one of the two.
+        let mut events = client.subscribe_events();
+        let attachment = client.handle().attach(&vm_id, 0, 100).await.unwrap();
+
+        assert!(!attachment.present, "no runtime, so no live VM entry");
+        assert_eq!(attachment.dropped, 0);
+        assert_eq!(attachment.replay.len(), 3);
+        let last_seq = attachment.last_seq().expect("replay is non-empty");
+        match &attachment.replay[0].event {
+            ShellEvent::Output { data, .. } => assert_eq!(data, "before 0"),
+            other => panic!("unexpected replayed event: {other:?}"),
+        }
+
+        // Live traffic from here on carries seq values past the watermark.
+        push_app_event(&svc, &vm_id, "after".into()).await;
+        loop {
+            match events.recv().await.expect("stream is open") {
+                ServiceEvent::VmApp { seq, event, .. } => {
+                    if seq <= last_seq {
+                        // Already in the replay; a real consumer drops these.
+                        continue;
+                    }
+                    match event {
+                        ShellEvent::Output { data, .. } => assert_eq!(data, "after"),
+                        other => panic!("unexpected event: {other:?}"),
+                    }
+                    assert!(seq > last_seq);
+                    break;
+                }
+                other => panic!("expected VmApp, got {other:?}"),
+            }
+        }
+
+        // A bounded replay keeps the newest and counts the rest.
+        let bounded = client.handle().attach(&vm_id, 0, 2).await.unwrap();
+        assert_eq!(bounded.dropped, 2);
+        assert_eq!(bounded.replay.len(), 2);
     }
 
     /// When the service goes away, in-flight and future requests fail with

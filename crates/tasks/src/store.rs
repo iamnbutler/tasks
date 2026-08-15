@@ -1,5 +1,6 @@
 //! SQLite-backed persistence.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,8 +20,7 @@ use crate::models::{
     OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, ScoutNotes,
     Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
     SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
-    TranscriptOwner,
-    TranscriptStream,
+    TranscriptOwner, TranscriptStream,
 };
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
 
@@ -136,6 +136,43 @@ impl ReconcileReport {
     /// Whether anything at all was reconciled — the only case worth logging.
     pub fn is_empty(&self) -> bool {
         self.sessions == 0 && self.tasks == 0 && self.builds == 0
+    }
+}
+
+/// Whether a failed build counts against its specs' build attempts.
+///
+/// The attempt cap exists to stop a spec that cannot be built from being
+/// retried forever. It is therefore only meaningful when the *build* was the
+/// thing that failed: charging a strike for a full pool, a dead socket, or a
+/// run this process could not pick up after a restart would blame the work for
+/// the infrastructure, and three of those would `blocked` a perfectly good
+/// spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecStrike {
+    /// The build itself failed; count it.
+    Charge,
+    /// The failure says nothing about the spec; leave the count alone.
+    Waive,
+}
+
+/// Rows a reattach has taken ownership of, and which
+/// [`Store::reconcile_orphaned_work_except`] must therefore leave alone.
+///
+/// Membership is a claim of responsibility, not a status: everything in here
+/// is still `running` in the database, and stays that way until the reattach
+/// concludes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumedWork {
+    pub sessions: HashSet<SessionId>,
+    pub builds: HashSet<BuildId>,
+    /// The tasks behind those sessions and builds — still `scouting` /
+    /// `building`, and not stranded, because someone is following them.
+    pub tasks: HashSet<TaskId>,
+}
+
+impl ResumedWork {
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty() && self.builds.is_empty()
     }
 }
 
@@ -1298,6 +1335,27 @@ impl Store {
     /// events are appended after it commits, exactly as the live failure path
     /// writes them.
     pub async fn reconcile_orphaned_work(&self) -> Result<ReconcileReport, StoreError> {
+        self.reconcile_orphaned_work_except(&ResumedWork::default())
+            .await
+    }
+
+    /// [`Store::reconcile_orphaned_work`], minus the rows a reattach has taken
+    /// ownership of.
+    ///
+    /// "Orphaned" stopped meaning "running at startup" the moment the server
+    /// could pick work back up: a session whose VM is still alive is running
+    /// in the ordinary sense, and writing it off would destroy exactly the run
+    /// reattachment exists to save. So the caller resumes first and passes
+    /// what it took here.
+    ///
+    /// This is safe only because a reattach *always concludes its row* — on
+    /// success, on failure, and on "not resumable". One that returned while
+    /// leaving its session `running` would strand it forever, since this sweep
+    /// runs once per boot and will not look at it again.
+    pub async fn reconcile_orphaned_work_except(
+        &self,
+        resumed: &ResumedWork,
+    ) -> Result<ReconcileReport, StoreError> {
         let now = Utc::now();
 
         let mut tx = self.pool.begin().await?;
@@ -1326,7 +1384,10 @@ impl Store {
                     status,
                 ))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(id, _, _)| !resumed.sessions.contains(id))
+            .collect::<Vec<_>>();
 
         let task_rows = sqlx::query("SELECT id FROM tasks WHERE state = ?")
             .bind(TaskState::Scouting.as_str())
@@ -1335,7 +1396,10 @@ impl Store {
         let orphaned_tasks = task_rows
             .into_iter()
             .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|id| !resumed.tasks.contains(id))
+            .collect::<Vec<_>>();
 
         // A `running` build belongs to a dead process; left alone it wedges
         // the serial build queue forever. `queued` builds are durable intent
@@ -1348,7 +1412,10 @@ impl Store {
         let orphaned_builds = build_rows
             .into_iter()
             .map(|row| Ok::<_, StoreError>(BuildId::from_raw(row.try_get::<String, _>("id")?)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|id| !resumed.builds.contains(id))
+            .collect::<Vec<_>>();
         let building_rows = sqlx::query("SELECT id FROM tasks WHERE state = ?")
             .bind(TaskState::Building.as_str())
             .fetch_all(&mut *tx)
@@ -1356,7 +1423,10 @@ impl Store {
         let orphaned_building = building_rows
             .into_iter()
             .map(|row| Ok::<_, StoreError>(TaskId::from_raw(row.try_get::<String, _>("id")?)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|id| !resumed.tasks.contains(id))
+            .collect::<Vec<_>>();
 
         // One statement per session rather than one bulk UPDATE, because the
         // status now depends on whether that session left anything behind.
@@ -1371,33 +1441,35 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        if !orphaned_tasks.is_empty() {
+        // Per row rather than one `WHERE state = ?` sweep, because a row a
+        // reattach owns is in exactly the same state as one nobody picked up.
+        // Only its id tells them apart.
+        for task_id in &orphaned_tasks {
             // Back to `Queued`, not `Backlog`: a crash doesn't un-pick work a
             // human put in the queue.
-            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE state = ?")
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
                 .bind(TaskState::Queued.as_str())
                 .bind(now.to_rfc3339())
-                .bind(TaskState::Scouting.as_str())
+                .bind(task_id.as_str())
                 .execute(&mut *tx)
                 .await?;
         }
-        if !orphaned_builds.is_empty() {
+        for build_id in &orphaned_builds {
             sqlx::query(
-                "UPDATE builds SET status = ?, completed_at = ?, exit_reason = ? \
-                 WHERE status = ?",
+                "UPDATE builds SET status = ?, completed_at = ?, exit_reason = ? WHERE id = ?",
             )
             .bind(BuildStatus::Failed.as_str())
             .bind(now.to_rfc3339())
             .bind(ORPHANED_EXIT_REASON)
-            .bind(BuildStatus::Running.as_str())
+            .bind(build_id.as_str())
             .execute(&mut *tx)
             .await?;
         }
-        if !orphaned_building.is_empty() {
-            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE state = ?")
+        for task_id in &orphaned_building {
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
                 .bind(TaskState::ReadyToBuild.as_str())
                 .bind(now.to_rfc3339())
-                .bind(TaskState::Building.as_str())
+                .bind(task_id.as_str())
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1485,6 +1557,43 @@ impl Store {
         }
 
         Ok(report)
+    }
+
+    /// Sessions a dead process left `running` while still naming a VM.
+    ///
+    /// The exact complement of [`Store::leaked_vm_ids`]: that asks which VMs
+    /// are held by work that has *concluded*, this asks which are held by work
+    /// that has not. A session this returns is a candidate for reattachment —
+    /// whether the VM is actually still there is vm-pool's answer to give, not
+    /// the store's.
+    ///
+    /// `vm_id IS NULL` is not a candidate: without a VM id there is nothing to
+    /// attach to, and the row is an ordinary orphan for reconciliation.
+    pub async fn resumable_sessions(&self) -> Result<Vec<Session>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
+             exit_reason, agent_usage FROM sessions \
+             WHERE status = ? AND vm_id IS NOT NULL ORDER BY started_at",
+        )
+        .bind(SessionStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(session_from_row).collect()
+    }
+
+    /// Builds a dead process left `running` while still naming a VM. See
+    /// [`Store::resumable_sessions`].
+    pub async fn resumable_builds(&self) -> Result<Vec<Build>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
+             pr_number, status, summary, files_touched, exit_reason, created_at, \
+             started_at, completed_at FROM builds \
+             WHERE status = ? AND vm_id IS NOT NULL ORDER BY created_at, rowid",
+        )
+        .bind(BuildStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(build_from_row).collect()
     }
 
     /// VMs the store still points at for work that has already concluded.
@@ -2226,6 +2335,18 @@ impl Store {
         id: &BuildId,
         reason: &str,
     ) -> Result<Build, StoreError> {
+        self.finalize_build_failed_with(id, reason, SpecStrike::Charge)
+            .await
+    }
+
+    /// [`Store::finalize_build_failed`], with the caller saying whether the
+    /// failure is the specs' to answer for.
+    pub async fn finalize_build_failed_with(
+        &self,
+        id: &BuildId,
+        reason: &str,
+        strike: SpecStrike,
+    ) -> Result<Build, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
 
@@ -2249,13 +2370,16 @@ impl Store {
         // full pool would `blocked` a perfectly good spec in under a minute,
         // and the one signal saying "this spec cannot be built" would then be
         // reporting something else entirely.
+        //
+        // A caller can waive the strike for the same reason — see
+        // [`SpecStrike`].
         let started = sqlx::query("SELECT vm_id FROM builds WHERE id = ?")
             .bind(id.as_str())
             .fetch_optional(&mut *tx)
             .await?
             .and_then(|row| row.try_get::<Option<String>, _>("vm_id").ok().flatten())
             .is_some();
-        if started {
+        if started && strike == SpecStrike::Charge {
             sqlx::query(
                 "UPDATE spec_queue SET build_attempts = build_attempts + 1 \
                  WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
@@ -2509,6 +2633,49 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.try_get("cc_session_id")?)
+    }
+
+    /// Mark an orchestrator turn as in flight.
+    ///
+    /// The orchestrator's agent is a local child process, so unlike a scout or
+    /// a build it cannot be picked up after a restart — it died with its
+    /// parent. This marker exists so that loss is at least *reportable*: a
+    /// non-NULL value at the next boot means a turn was cut off mid-flight.
+    pub async fn begin_orchestrator_turn(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET turn_started_at = ? WHERE id = 1")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear the in-flight marker. Called on every exit path from a turn,
+    /// including the one where the agent failed — a turn that ended with an
+    /// error still ended.
+    pub async fn end_orchestrator_turn(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET turn_started_at = NULL WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Read and clear the in-flight marker, returning when the interrupted
+    /// turn began (verbatim, as stored).
+    ///
+    /// Read *and clear*, in that order, because this is a one-shot report: the
+    /// same interruption must not be announced at every boot thereafter. The
+    /// timestamp is returned unparsed so that a value we cannot make sense of
+    /// is still reported rather than silently becoming "no interruption".
+    pub async fn take_interrupted_orchestrator_turn(&self) -> Result<Option<String>, StoreError> {
+        let started: Option<String> =
+            sqlx::query("SELECT turn_started_at FROM orchestrator WHERE id = 1")
+                .fetch_one(&self.pool)
+                .await?
+                .try_get("turn_started_at")?;
+        if started.is_some() {
+            self.end_orchestrator_turn().await?;
+        }
+        Ok(started)
     }
 
     /// The secret the orchestrator presents to be attributed as itself.
@@ -4632,6 +4799,165 @@ mod tests {
         assert!(report.is_empty());
         assert_eq!(report, ReconcileReport::default());
         assert_eq!(store.all_events().await.unwrap().len(), before);
+    }
+
+    /// A `running` row that still names a VM is a candidate for reattachment;
+    /// one that names none has nothing to attach to and is an ordinary orphan.
+    #[tokio::test]
+    async fn resumable_rows_are_running_ones_that_still_hold_a_vm() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+
+        let mut running = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: Some("vm-alive".into()),
+            branch: String::new(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&running).await.unwrap();
+
+        // No VM: nothing to attach to.
+        running.id = SessionId::new();
+        running.vm_id = None;
+        store.insert_session(&running).await.unwrap();
+        // Concluded, VM still recorded: that is a *leak*, not resumable work —
+        // it belongs to `leaked_vm_ids`, the exact complement of this query.
+        running.id = SessionId::new();
+        running.vm_id = Some("vm-leaked".into());
+        running.status = SessionStatus::ScoutFailed;
+        store.insert_session(&running).await.unwrap();
+
+        let resumable = store.resumable_sessions().await.unwrap();
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].vm_id.as_deref(), Some("vm-alive"));
+        assert_eq!(store.leaked_vm_ids().await.unwrap(), vec!["vm-leaked"]);
+    }
+
+    /// Rows a reattach owns are still `running`, and look exactly like the
+    /// ones nobody picked up. Only their ids tell them apart — so if the
+    /// exception is dropped, reattachment destroys the runs it exists to save.
+    #[tokio::test]
+    async fn reconciliation_leaves_resumed_rows_alone() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut ids = Vec::new();
+        for number in [1, 2] {
+            let task = task_with(&project.id, number, 0);
+            store.insert_task(&task).await.unwrap();
+            store
+                .update_task_state(&task.id, TaskState::Scouting)
+                .await
+                .unwrap();
+            let session = Session {
+                id: SessionId::new(),
+                task_id: task.id.clone(),
+                vm_id: Some(format!("vm-{number}")),
+                branch: String::new(),
+                status: SessionStatus::Running,
+                started_at: Utc::now(),
+                completed_at: None,
+                exit_reason: None,
+                usage: None,
+            };
+            store.insert_session(&session).await.unwrap();
+            ids.push((task, session));
+        }
+        let (resumed_task, resumed_session) = ids[0].clone();
+        let (orphan_task, orphan_session) = ids[1].clone();
+
+        let resumed = ResumedWork {
+            sessions: HashSet::from([resumed_session.id.clone()]),
+            tasks: HashSet::from([resumed_task.id.clone()]),
+            builds: HashSet::new(),
+        };
+        let report = store
+            .reconcile_orphaned_work_except(&resumed)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                sessions: 1,
+                tasks: 1,
+                builds: 0
+            },
+            "only the row nobody picked up"
+        );
+
+        let kept = store
+            .get_session(&resumed_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, SessionStatus::Running);
+        assert!(kept.completed_at.is_none());
+        assert_eq!(
+            store
+                .get_task(&resumed_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Scouting,
+            "the task behind a resumed session is not stranded, so not requeued"
+        );
+
+        let written_off = store
+            .get_session(&orphan_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written_off.status, SessionStatus::ScoutFailed);
+        assert_eq!(
+            store
+                .get_task(&orphan_task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+    }
+
+    /// The marker is a one-shot report: a boot that finds it says so once and
+    /// clears it, so the same interruption is not announced forever.
+    #[tokio::test]
+    async fn an_interrupted_orchestrator_turn_is_reported_exactly_once() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(
+            store.take_interrupted_orchestrator_turn().await.unwrap(),
+            None
+        );
+
+        store.begin_orchestrator_turn().await.unwrap();
+        // A turn that ended, however it ended, was not interrupted.
+        store.end_orchestrator_turn().await.unwrap();
+        assert_eq!(
+            store.take_interrupted_orchestrator_turn().await.unwrap(),
+            None
+        );
+
+        store.begin_orchestrator_turn().await.unwrap();
+        let interrupted = store.take_interrupted_orchestrator_turn().await.unwrap();
+        assert!(
+            interrupted.is_some(),
+            "a turn in flight at boot was cut off"
+        );
+        assert_eq!(
+            store.take_interrupted_orchestrator_turn().await.unwrap(),
+            None,
+            "reading it clears it"
+        );
     }
 
     #[tokio::test]

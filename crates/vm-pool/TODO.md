@@ -94,3 +94,6 @@ Metadata persistence is done. Actual save/restore needs Virtualization.framework
 - [ ] Per-connection log subscription filtering (currently broadcasts everything)
 - [ ] Event persistence to disk (currently in-memory only)
 - [ ] Event compaction / retention policy for long-running services
+- [ ] `EventLog.events` is an unbounded `Vec` and `attach` scans it linearly.
+      Fine at attach frequency (startup only), but the log's growth is the
+      real issue — see the retention item above.

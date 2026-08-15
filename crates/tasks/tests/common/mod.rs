@@ -216,6 +216,23 @@ pub fn echo_prompt_agent_path() -> PathBuf {
         .join("echo-prompt-agent.sh")
 }
 
+/// A stand-in scout agent that blocks until the test creates a gate file, so
+/// a run is provably still in flight when the test kills the server.
+pub fn gated_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gated-agent.sh")
+}
+
+/// [`gated_agent_path`] for builds.
+pub fn gated_builder_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gated-builder-agent.sh")
+}
+
 /// A stand-in agent that emits stream-json shaped output, paced so a test can
 /// attach to the live transcript tail mid-run.
 pub fn stream_json_agent_path() -> PathBuf {
