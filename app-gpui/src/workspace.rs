@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, list, px, Context, Div, Entity, Focusable, ListAlignment, ListState, MouseButton,
-    Window, WindowHandle,
+    actions, div, list, px, AnyElement, Context, Div, Entity, Focusable, ListAlignment, ListState,
+    MouseButton, Window, WindowHandle,
 };
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
-use gpuikit::theme::{ActiveTheme, Themeable};
+use gpuikit::theme::{ActiveTheme, Theme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
     BuildStatus, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
@@ -25,7 +25,8 @@ use tasks_client::api::models::{
 
 use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
 use crate::issue_composer::{self, IssueComposer};
-use crate::state::AppState;
+use crate::state::{AppState, OrchestratorTick};
+use crate::time;
 
 pub(crate) const FONT: &str = "Menlo";
 
@@ -85,6 +86,10 @@ pub struct Workspace {
     chat_list: ListState,
     /// Message count the list was last synced to.
     chat_len: usize,
+    /// Whether the list currently carries the in-flight tick's trailing item.
+    chat_tick: bool,
+    /// Tick revision that trailing item was last spliced at.
+    chat_tick_revision: u64,
 }
 
 impl Workspace {
@@ -92,8 +97,9 @@ impl Workspace {
         let app_state = cx.new(AppState::new);
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
 
-        // Live elapsed clocks (running scouts/builds) tick once a second —
-        // but only when something is actually running.
+        // Live elapsed clocks (running scouts/builds, and the orchestrator
+        // tick in flight) tick once a second — but only when something is
+        // actually running.
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| loop {
             executor.timer(Duration::from_secs(1)).await;
@@ -107,7 +113,8 @@ impl Workspace {
                         || state
                             .builds
                             .iter()
-                            .any(|build| build.status == BuildStatus::Running);
+                            .any(|build| build.status == BuildStatus::Running)
+                        || state.orchestrator_tick.is_some();
                     if live {
                         cx.notify();
                     }
@@ -172,6 +179,8 @@ impl Workspace {
             issue_window: None,
             chat_list: ListState::new(0, ListAlignment::Bottom, px(1024.)),
             chat_len: 0,
+            chat_tick: false,
+            chat_tick_revision: 0,
         }
     }
 
@@ -387,6 +396,12 @@ impl Workspace {
                 )
             })
             .count();
+        // A proactive tick is invisible from every section but Chat, so the
+        // Chat row wears the clock. Same slot the Queue count uses.
+        let tick_elapsed = state
+            .orchestrator_tick
+            .as_ref()
+            .map(|tick| time::elapsed(tick.started_at));
         let banner = if let Some(error) = &state.error {
             Some((error.clone(), true))
         } else if state.loaded && !state.connected {
@@ -410,8 +425,11 @@ impl Workspace {
             .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
                 Section::ALL.into_iter().enumerate().map(|(ix, section)| {
                     let selected = section == active;
-                    let badge = (section == Section::Queue && queued_work > 0)
-                        .then(|| queued_work.to_string());
+                    let badge = match section {
+                        Section::Queue if queued_work > 0 => Some(queued_work.to_string()),
+                        Section::Chat => tick_elapsed.clone(),
+                        _ => None,
+                    };
                     div()
                         .id(ix)
                         .flex()
@@ -485,6 +503,40 @@ impl Workspace {
             .child(inspector)
     }
 
+    /// The provisional bubble for the tick in flight: assistant styling, a
+    /// muted status line, then whatever text has arrived. The line leads with
+    /// an elapsed clock because a clock reads as working and a spinner reads
+    /// as hung — and because the clock is correct through extended thinking
+    /// and slow tool calls, when no text is arriving at all.
+    fn render_tick(tick: &OrchestratorTick, theme: &Theme) -> AnyElement {
+        let clock = time::elapsed(tick.started_at);
+        let status = match &tick.tool {
+            Some(label) => format!("{clock} · {label}"),
+            None => format!("{clock} · working…"),
+        };
+        div()
+            .w_full()
+            .px(px(12.))
+            .py(px(4.))
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .max_w(px(720.))
+                    .p(px(8.))
+                    .rounded(px(8.))
+                    .bg(theme.surface_secondary())
+                    .text_color(theme.fg())
+                    .text_sm()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_xs().text_color(theme.fg_muted()).child(status))
+                    .when(!tick.text.is_empty(), |el| el.child(tick.text.clone())),
+            )
+            .into_any_element()
+    }
+
     fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
@@ -497,7 +549,12 @@ impl Workspace {
             let theme = cx.theme().clone();
             let state = app_state.read(cx);
             let Some(message) = state.orchestrator_messages.get(ix) else {
-                return div().into_any_element();
+                // Past the durable messages: the one trailing item is the
+                // tick being written right now, if there is one.
+                return match &state.orchestrator_tick {
+                    Some(tick) => Self::render_tick(tick, &theme),
+                    None => div().into_any_element(),
+                };
             };
             let (role, content) = (message.role, message.content.clone());
 
@@ -537,7 +594,7 @@ impl Workspace {
             .flex_col()
             .size_full()
             .map(|el| {
-                if self.chat_len == 0 {
+                if self.chat_len == 0 && !self.chat_tick {
                     el.child(
                         div()
                             .flex_1()
@@ -654,17 +711,41 @@ impl Render for Workspace {
         let right_width = self.right_sidebar.width;
         self.right_sidebar.set_width(right_width, viewport_width);
 
-        // Sync the chat list's item count with the message log (append-only,
-        // so a shrink means the server was reset — start over).
-        let messages_len = self.app_state.read(cx).orchestrator_messages.len();
-        if messages_len != self.chat_len {
-            if messages_len < self.chat_len {
-                self.chat_list.reset(messages_len);
-            } else {
+        // Sync the chat list with the message log (append-only, so a shrink
+        // means the server was reset — start over) plus the one trailing item
+        // the in-flight tick rides on.
+        let (messages_len, tick_shown, tick_revision) = {
+            let state = self.app_state.read(cx);
+            (
+                state.orchestrator_messages.len(),
+                state.orchestrator_tick.is_some(),
+                state.tick_revision,
+            )
+        };
+        if messages_len < self.chat_len {
+            self.chat_list.reset(messages_len + usize::from(tick_shown));
+            self.chat_len = messages_len;
+            self.chat_tick = tick_shown;
+            self.chat_tick_revision = tick_revision;
+        } else {
+            if messages_len > self.chat_len {
+                // At `chat_len`, which is *above* the trailing item: turns
+                // that land mid-tick sit over the reply still being written.
                 self.chat_list
                     .splice(self.chat_len..self.chat_len, messages_len - self.chat_len);
+                self.chat_len = messages_len;
             }
-            self.chat_len = messages_len;
+            // `list` caches heights, not elements — the render closure runs
+            // every frame, so the clock updates on a bare notify, but a
+            // bubble whose *text* grew must be re-spliced to go back to
+            // Unmeasured or it lays out at a stale height.
+            if tick_shown != self.chat_tick || tick_revision != self.chat_tick_revision {
+                let end = self.chat_len + usize::from(self.chat_tick);
+                self.chat_list
+                    .splice(self.chat_len..end, usize::from(tick_shown));
+                self.chat_tick = tick_shown;
+                self.chat_tick_revision = tick_revision;
+            }
         }
 
         div()

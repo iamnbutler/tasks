@@ -7,14 +7,15 @@
 //! the channel into entity updates. Snapshot fetches and mutations run on
 //! gpui's background executor (loopback calls are sub-millisecond).
 
+use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::Context;
 use tasks_client::api::events::Event;
 use tasks_client::api::http::BriefingStatus;
 use tasks_client::api::models::{
-    Build, Mode, OrchestratorMessage, Project, Session, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId,
+    Build, ChatRole, Mode, OrchestratorFeedEvent, OrchestratorMessage, Project, Session, Spec,
+    SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -26,6 +27,42 @@ const ACTIVITY_LIMIT: i64 = 200;
 /// arrives incrementally, so the pane keeps growing with the conversation —
 /// this bounds the cold start, not the history.
 const CHAT_WINDOW: i64 = 200;
+
+/// The provisional view of the orchestrator tick in flight — what the live
+/// feed has shown so far, before the durable `orchestrator_messages` row that
+/// replaces it exists. Nothing here is persisted or authoritative; it is
+/// dropped whole the moment the real reply lands.
+pub struct OrchestratorTick {
+    /// When *this client* noticed the tick — a client that joins mid-tick
+    /// shows the age of what it has seen rather than inventing history it
+    /// missed.
+    pub started_at: DateTime<Utc>,
+    /// Assistant text accumulated from `Delta`, in generation order.
+    pub text: String,
+    /// The latest tool the agent invoked, if any.
+    pub tool: Option<String>,
+    /// Newest durable turn at the moment the view opened. An assistant turn
+    /// above this watermark is this tick's answer — anything at or below it
+    /// is history that was already there.
+    since_seq: i64,
+}
+
+impl OrchestratorTick {
+    fn new(since_seq: i64) -> Self {
+        Self {
+            started_at: Utc::now(),
+            text: String::new(),
+            tool: None,
+            since_seq,
+        }
+    }
+
+    /// Nothing has come through yet — the view is open on a wait, not on an
+    /// answer in progress.
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.tool.is_none()
+    }
+}
 
 pub struct AppState {
     client: Client,
@@ -40,6 +77,12 @@ pub struct AppState {
     pub activity: Vec<Event>,
     pub briefings: Vec<BriefingStatus>,
     pub orchestrator_messages: Vec<OrchestratorMessage>,
+    /// The tick in flight, if one is showing.
+    pub orchestrator_tick: Option<OrchestratorTick>,
+    /// Bumped on every change to [`Self::orchestrator_tick`]. The chat list
+    /// caches item *heights*, so a bubble growing a token at a time has to be
+    /// re-spliced to be re-measured — this is what the view compares against.
+    pub tick_revision: u64,
     pub mode: Option<Mode>,
 
     /// The event stream is up. `false` after a drop, until reconnect.
@@ -159,6 +202,42 @@ impl AppState {
         })
         .detach();
 
+        // The orchestrator's live feed, on its own thread and channel rather
+        // than merged into the event stream: the two have independent
+        // connection lifetimes, and one reconnecting must not disturb the
+        // other.
+        let (feed_tx, mut feed_rx) = mpsc::unbounded();
+        {
+            let client = client.clone();
+            std::thread::Builder::new()
+                .name("tasks-orchestrator-feed".into())
+                .spawn(move || {
+                    for item in client.stream_orchestrator() {
+                        if feed_tx.unbounded_send(item).is_err() {
+                            return; // app side gone
+                        }
+                    }
+                })
+                .expect("spawn orchestrator-feed thread");
+        }
+        cx.spawn(async move |this, cx| {
+            while let Some(item) = feed_rx.next().await {
+                let alive = this
+                    .update(cx, |state: &mut AppState, cx| state.on_feed_item(item, cx))
+                    .is_ok();
+                if !alive {
+                    return;
+                }
+            }
+            // The feed ended (a terminal error). Nothing more will arrive, so
+            // a view left open here would keep a clock running forever.
+            this.update(cx, |state: &mut AppState, cx| {
+                state.end_tick(cx);
+            })
+            .ok();
+        })
+        .detach();
+
         Self {
             client,
             projects: Vec::new(),
@@ -170,6 +249,8 @@ impl AppState {
             activity: Vec::new(),
             briefings: Vec::new(),
             orchestrator_messages: Vec::new(),
+            orchestrator_tick: None,
+            tick_revision: 0,
             mode: None,
             connected: false,
             loaded: false,
@@ -197,6 +278,104 @@ impl AppState {
         }
     }
 
+    /// One moment of the tick in flight. The feed is ephemeral and lossy by
+    /// design — nothing here is state, it is a view of a wait.
+    fn on_feed_item(
+        &mut self,
+        item: Result<OrchestratorFeedEvent, ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        match item {
+            Ok(OrchestratorFeedEvent::Started) => self.on_tick_started(cx),
+            // `get_or_insert_with`: an app that connected mid-tick never saw
+            // `Started`, and must still show what it can see.
+            Ok(OrchestratorFeedEvent::Delta { text }) => {
+                let since_seq = self.newest_turn();
+                let tick = self
+                    .orchestrator_tick
+                    .get_or_insert_with(|| OrchestratorTick::new(since_seq));
+                tick.text.push_str(&text);
+                self.tick_revision += 1;
+                cx.notify();
+            }
+            Ok(OrchestratorFeedEvent::Tool { label }) => {
+                let since_seq = self.newest_turn();
+                let tick = self
+                    .orchestrator_tick
+                    .get_or_insert_with(|| OrchestratorTick::new(since_seq));
+                // Per the feed's contract in docs/clients.md: text before a
+                // tool call is working narration, and the reply is the
+                // segment after the last one. Resetting here is what makes
+                // the bubble converge on the durable message that replaces
+                // it, instead of shrinking to it.
+                tick.text.clear();
+                tick.tool = Some(label);
+                self.tick_revision += 1;
+                cx.notify();
+            }
+            // The durable reply exists now — fetch it. The view is retired by
+            // that reply landing, not here: clearing on `Done` would leave a
+            // frame where the conversation looks unanswered, and it breaks
+            // whenever `Done` is lost.
+            Ok(OrchestratorFeedEvent::Done) => self.refresh(cx),
+            // Also the server-is-down arm: this fires once per reconnect
+            // delay for as long as the server is unreachable, so the refresh
+            // is guarded on there having been a live view to resync.
+            Err(_) => {
+                if self.end_tick(cx) {
+                    self.refresh(cx);
+                }
+            }
+        }
+    }
+
+    /// The server says a tick began.
+    fn on_tick_started(&mut self, cx: &mut Context<Self>) {
+        let since_seq = self.newest_turn();
+        match &self.orchestrator_tick {
+            // The view we opened at send time, still waiting: this is that
+            // tick starting. Keep `started_at` — the human's wait began when
+            // they hit send, not when the loop got round to them.
+            Some(tick) if tick.is_empty() => return,
+            // A view a previous tick left behind. A new tick is a new answer,
+            // so it starts over rather than appending to the old one.
+            _ => self.orchestrator_tick = Some(OrchestratorTick::new(since_seq)),
+        }
+        self.tick_revision += 1;
+        cx.notify();
+    }
+
+    /// Open the provisional view unless one is already showing, and report
+    /// whether it opened. A second message sent mid-tick must not reset the
+    /// clock — the running tick answers both turns.
+    fn begin_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.orchestrator_tick.is_some() {
+            return false;
+        }
+        let since_seq = self.newest_turn();
+        self.orchestrator_tick = Some(OrchestratorTick::new(since_seq));
+        self.tick_revision += 1;
+        cx.notify();
+        true
+    }
+
+    /// Drop the provisional view, reporting whether there was one.
+    fn end_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.orchestrator_tick.take().is_none() {
+            return false;
+        }
+        self.tick_revision += 1;
+        cx.notify();
+        true
+    }
+
+    fn newest_turn(&self) -> i64 {
+        self.orchestrator_messages
+            .last()
+            .map(|m| m.seq)
+            .unwrap_or(0)
+    }
+
     /// Full snapshot on the background executor, applied on completion.
     /// Coalesced: a refresh requested mid-flight runs once more at the end
     /// instead of stacking.
@@ -221,6 +400,9 @@ impl AppState {
     }
 
     fn apply(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        // The first snapshot is history, not news: it backfills old assistant
+        // turns, none of which answer a tick that is still running.
+        let was_loaded = self.loaded;
         macro_rules! merge {
             ($($field:ident),+) => {
                 $(if let Some(value) = snapshot.$field { self.$field = value; })+
@@ -235,6 +417,27 @@ impl AppState {
                 Some(newest) => self
                     .orchestrator_messages
                     .extend(messages.into_iter().filter(|m| m.seq > newest)),
+            }
+        }
+        // Retire the provisional view in the *same* frame that adds its
+        // replacement — no flicker, and no dependence on a `Done` that may
+        // never come.
+        let answered = match &self.orchestrator_tick {
+            Some(tick) if was_loaded => self
+                .orchestrator_messages
+                .iter()
+                .any(|m| m.seq > tick.since_seq && m.role == ChatRole::Assistant),
+            _ => false,
+        };
+        if answered {
+            self.orchestrator_tick = None;
+            self.tick_revision += 1;
+        } else if !was_loaded {
+            // Rebase the watermark past the backfill we just learned about,
+            // or every later refresh would read that history as the answer.
+            let newest = self.newest_turn();
+            if let Some(tick) = &mut self.orchestrator_tick {
+                tick.since_seq = tick.since_seq.max(newest);
             }
         }
         if let Some(mode) = snapshot.mode {
@@ -258,6 +461,18 @@ impl AppState {
         cx: &mut Context<Self>,
         op: impl FnOnce(&Client) -> Result<T, ClientError> + Send + 'static,
     ) {
+        self.run_rolling_back(cx, op, |_, _| {});
+    }
+
+    /// [`Self::run`], plus a `rollback` that undoes optimistic local state
+    /// when the mutation fails — a bubble opened at send time must not
+    /// outlive a POST the server never accepted.
+    fn run_rolling_back<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&Client) -> Result<T, ClientError> + Send + 'static,
+        rollback: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
         let client = self.client.clone();
         let work = cx.background_executor().spawn(async move { op(&client) });
         cx.spawn(async move |this, cx| {
@@ -265,6 +480,7 @@ impl AppState {
             this.update(cx, |state, cx| match result {
                 Ok(_) => state.refresh(cx),
                 Err(err) => {
+                    rollback(state, cx);
                     state.error = Some(err.to_string());
                     cx.notify();
                 }
@@ -303,8 +519,23 @@ impl AppState {
     }
 
     /// 202 from the server; the reply lands via `orchestrator_message` events.
+    ///
+    /// The provisional view opens here rather than waiting for the feed's
+    /// `Started`: the round trip to the tick loop is part of what the human
+    /// is waiting through, so it belongs on the clock.
     pub fn send_orchestrator_message(&mut self, content: String, cx: &mut Context<Self>) {
-        self.run(cx, move |client| client.send_orchestrator_message(content));
+        let opened = self.begin_tick(cx);
+        self.run_rolling_back(
+            cx,
+            move |client| client.send_orchestrator_message(content),
+            move |state, cx| {
+                // Only ours to close. A tick that was already showing is
+                // answering someone, and this failure isn't its business.
+                if opened {
+                    state.end_tick(cx);
+                }
+            },
+        );
     }
 
     // --- projections the sections read ---
