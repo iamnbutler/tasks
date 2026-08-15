@@ -1,6 +1,6 @@
 //! The Home section: the three LLM briefing slots plus what needs a human,
-//! reading-width capped. Plain text for now — markdown rendering is its own
-//! later slice.
+//! reading-width capped. Briefings render as markdown through the shared
+//! cache.
 
 use gpui::prelude::*;
 use gpui::{div, px, Context};
@@ -13,7 +13,18 @@ use crate::workspace::Workspace;
 impl Workspace {
     pub(crate) fn render_home(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let state = self.app_state.read(cx);
+        // Owned projections up front: briefing bodies feed the markdown
+        // cache, which needs `cx` mutably after the state borrow ends.
+        let (waiting, briefings, loaded) = {
+            let state = self.app_state.read(cx);
+            let waiting: Vec<_> = state
+                .tasks
+                .iter()
+                .filter(|task| task.state == TaskState::InReview)
+                .map(|task| (task.title.clone(), task.updated_at))
+                .collect();
+            (waiting, state.briefings.clone(), state.loaded)
+        };
 
         let mut column = div()
             .flex()
@@ -25,12 +36,6 @@ impl Workspace {
             .p(px(16.));
 
         // Needs you: specs awaiting a verdict.
-        let waiting: Vec<_> = state
-            .tasks
-            .iter()
-            .filter(|task| task.state == TaskState::InReview)
-            .map(|task| (task.title.clone(), task.updated_at))
-            .collect();
         if !waiting.is_empty() {
             let mut section = div().flex().flex_col().gap(px(4.)).child(
                 div()
@@ -79,7 +84,7 @@ impl Workspace {
         }
 
         // Briefing slots, in server display order.
-        for briefing in &state.briefings {
+        for briefing in &briefings {
             let label = crate::components::title_case(briefing.section.as_str()).to_uppercase();
             let provenance = match (&briefing.generated_at, briefing.regenerating) {
                 (Some(at), true) => format!("as of {} ago · refreshing…", time::relative(*at)),
@@ -106,12 +111,23 @@ impl Workspace {
                             ),
                     )
                     .when_some(briefing.content.clone(), |el, content| {
-                        el.child(div().text_sm().text_color(theme.fg()).child(content))
+                        // Briefings are agent-written markdown.
+                        let entity = self.markdown_cache().entity(
+                            format!("brief:{}", briefing.section.as_str()),
+                            &content,
+                            cx,
+                        );
+                        el.child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.fg())
+                                .child(crate::components::markdown_block(&entity, cx)),
+                        )
                     }),
             );
         }
 
-        if state.briefings.is_empty() && state.loaded {
+        if briefings.is_empty() && loaded {
             column = column.child(
                 div()
                     .text_sm()

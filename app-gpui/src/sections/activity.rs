@@ -6,10 +6,30 @@ use gpui::prelude::*;
 use gpui::{div, px, Context};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::events::EventPayload;
+use tasks_client::api::models::TaskId;
 
 use crate::components::title_case;
 use crate::time;
 use crate::workspace::Workspace;
+
+/// The task an event is about, when it names one — directly, or through the
+/// spec it concerns. Rows with a subject are click-to-inspect.
+fn subject_task(payload: &EventPayload, state: &crate::state::AppState) -> Option<TaskId> {
+    match payload {
+        EventPayload::TaskIngested { task_id, .. }
+        | EventPayload::TaskStateChanged { task_id, .. }
+        | EventPayload::TaskGhStateChanged { task_id, .. }
+        | EventPayload::SessionStarted { task_id, .. }
+        | EventPayload::SessionCompleted { task_id, .. }
+        | EventPayload::SpecCreated { task_id, .. } => Some(task_id.clone()),
+        EventPayload::SpecQueueStatusChanged { spec_id, .. } => state
+            .specs
+            .iter()
+            .find(|spec| &spec.id == spec_id)
+            .map(|spec| spec.task_id.clone()),
+        _ => None,
+    }
+}
 
 impl Workspace {
     pub(crate) fn render_activity(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -23,10 +43,11 @@ impl Workspace {
                 .unwrap_or_else(|| task_id.to_string())
         };
 
-        let rows: Vec<(i64, String, String)> = state
+        let rows: Vec<(i64, String, String, Option<TaskId>)> = state
             .activity
             .iter()
             .map(|event| {
+                let subject = subject_task(&event.payload, state);
                 let sentence = match &event.payload {
                     EventPayload::ProjectAdded { .. } => "Project added".to_string(),
                     EventPayload::TaskIngested { task_id, .. } => {
@@ -118,7 +139,12 @@ impl Workspace {
                     }
                     EventPayload::Note { source, message } => format!("[{source}] {message}"),
                 };
-                (event.seq, sentence, time::relative(event.timestamp))
+                (
+                    event.seq,
+                    sentence,
+                    time::relative(event.timestamp),
+                    subject,
+                )
             })
             .collect();
 
@@ -138,7 +164,7 @@ impl Workspace {
                         .child("Nothing has happened yet."),
                 )
             })
-            .children(rows.into_iter().map(|(seq, sentence, when)| {
+            .children(rows.into_iter().map(|(seq, sentence, when, subject)| {
                 div()
                     .id(seq as usize)
                     .flex()
@@ -148,6 +174,16 @@ impl Workspace {
                     .mx(px(6.))
                     .px(px(10.))
                     .py(px(4.))
+                    .rounded(px(5.))
+                    // Rows about a task open it in the inspector.
+                    .when_some(subject, |el, task_id| {
+                        let hover_bg = theme.surface_secondary();
+                        el.cursor_pointer()
+                            .hover(move |el| el.bg(hover_bg))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                this.select_task(task_id.clone(), cx);
+                            }))
+                    })
                     .child(
                         div()
                             .flex_1()

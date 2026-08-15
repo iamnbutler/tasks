@@ -13,7 +13,10 @@ use gpui::{
 };
 use gpuikit::input::bind_input_keys;
 
-use workspace::{NewIssue, ToggleLeftDock, ToggleRightDock, Workspace};
+use workspace::{
+    Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, NewIssue, ToggleLeftDock,
+    ToggleRightDock, Workspace,
+};
 
 /// The main window, so `Close Window` can't strand the app: clicking the Dock
 /// icon reopens it rather than stacking a second one.
@@ -42,6 +45,13 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleLeftDock, ws),
             KeyBinding::new("cmd-r", ToggleRightDock, ws),
             KeyBinding::new("cmd-n", NewIssue, ws),
+            KeyBinding::new("escape", Dismiss, ws),
+            // Section switching, in sidebar order.
+            KeyBinding::new("cmd-1", GoToHome, ws),
+            KeyBinding::new("cmd-2", GoToTasks, ws),
+            KeyBinding::new("cmd-3", GoToQueue, ws),
+            KeyBinding::new("cmd-4", GoToActivity, ws),
+            KeyBinding::new("cmd-5", GoToChat, ws),
         ]);
 
         // Bindings before the bar: gpui reads shortcuts out of the keymap
