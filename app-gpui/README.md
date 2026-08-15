@@ -26,12 +26,27 @@ components are built and how data moves):
   `workspace::ToggleLeftDock` (`cmd-b`), `workspace::ToggleRightDock`
   (`cmd-r`) — Zed's defaults. Title bar carries play/pause (mode gates
   *new* work only) and refresh.
-- **`menus.rs`** — the menu bar (App / File / Edit / Window) and its
-  actions. Handlers are global, not the workspace's, because Minimize /
-  Zoom / Close act on whichever window is focused; the Edit menu dispatches
-  gpuikit's own input actions so the items drive the same code path
-  `cmd-c` already drove. Bindings are registered before `set_menus` — gpui
-  reads shortcuts out of the keymap once, while building the bar.
+- **`menus.rs`** — the menu bar (App / File / Edit / View / Server /
+  Window) and its actions. Handlers are global, not the workspace's,
+  because Minimize / Zoom / Close act on whichever window is focused; the
+  Edit menu dispatches gpuikit's own input actions so the items drive the
+  same code path `cmd-c` already drove. Bindings are registered before
+  `set_menus` — gpui reads shortcuts out of the keymap once, while building
+  the bar. `menus()` is a pure function of `MenuState { serving, mode,
+  busy }`; `sync()` reinstalls the bar only when that state actually
+  changes, because `set_menus` leaks a boxed action per item on every
+  rebuild.
+- **`server.rs` / `server_window.rs`** — the Server menu: the one thing
+  the app cannot do over HTTP, because a server cannot gracefully swap
+  itself out through its own API. It shells out to the `tasks` binary
+  (`reload` / `stop`) and reads the exit code as a verdict (3 busy, 4 drain
+  timed out, 5 the swap did not land). A restart is minutes of staged work,
+  so it always opens the Server window, which streams the child's output
+  and shows `GET /status` + `GET /version` alongside it. A refusal grows
+  buttons — *Wait, then restart* / *Restart anyway* — because a GUI can ask
+  where the CLI could only refuse. Nothing in the menu takes a key
+  equivalent: a one-keystroke server restart is the foot-gun this is trying
+  not to build.
 - **`about.rs`** — a singleton About window showing the version and commit
   `build.rs` stamped from git. `0.1.0` with `commit unknown` means the
   binary was built without git in reach.
@@ -74,6 +89,15 @@ Connects to `http://127.0.0.1:$TASKS_SERVER_PORT` (default 4800 — the same
 variable the server reads). Without a server it shows the connecting state
 and retries every 3s. Builds without the Xcode Metal toolchain
 (gpui-platform's `runtime_shaders` feature compiles shaders at runtime).
+
+The Server menu needs to find two things a Dock-launched app cannot assume
+are on `PATH`:
+
+| var | | |
+| --- | --- | --- |
+| `TASKS_BIN` | — | the `tasks` binary to drive. Otherwise the `exe` the running server published in `<data dir>/tasks.pid`, otherwise `tasks` on the child's `PATH` (which is this process's, prefixed with `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin` — `tasks reload` starts with a `cargo build`, and launchd's `PATH` has no `cargo` on it) |
+| `TASKS_REPO` | — | passed as `--repo` to the ops that build. `reload` finds the workspace from its cwd, else from the `tasks` binary's ancestors; a bundled app's cwd is `/`, so an installed binary outside a checkout needs this |
+| `TASKS_DATA_DIR` | `~/.local/state/tasks-v2` | where the pidfile and `serve.log` live. Passed through to the child, so the app and the binary it drives always mean the same server |
 
 `make app` assembles a `Tasks.app` bundle by hand around the release binary
 (`Contents/MacOS/Tasks` plus `Info.plist.in` rendered by `sed`) and passes

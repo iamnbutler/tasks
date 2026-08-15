@@ -31,6 +31,8 @@ use crate::components::{
     markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::issue_composer::{self, IssueComposer};
+use crate::menus::{self, MenuState};
+use crate::server::ServerControl;
 use crate::state::AppState;
 use crate::time;
 
@@ -51,7 +53,10 @@ actions!(
         GoToTasks,
         GoToQueue,
         GoToActivity,
-        GoToChat
+        GoToChat,
+        SetModePlay,
+        SetModePause,
+        SetModeStop
     ]
 );
 
@@ -100,6 +105,10 @@ pub struct Workspace {
     /// Which sidebar is currently being drag-resized, if any.
     pub(crate) resizing: Option<SidebarSide>,
     pub(crate) app_state: Entity<AppState>,
+    /// The server *process*, as the Server menu acts on it. Observed for the
+    /// same reason `AppState` is: the menu's shape and the sidebar's banner
+    /// both depend on whether a `tasks` run is in flight.
+    pub(crate) server_control: Entity<ServerControl>,
     /// Task shown in the inspector (right sidebar).
     pub(crate) selected_task: Option<TaskId>,
     /// Chat composer.
@@ -130,7 +139,19 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_state = cx.new(AppState::new);
-        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+        let server_control = ServerControl::global(cx);
+        // The menu bar joins three facts from two entities, so both observers
+        // re-derive it. `sync` is a no-op unless something actually moved.
+        cx.observe(&app_state, |this: &mut Self, _, cx| {
+            this.sync_menus(cx);
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&server_control, |this: &mut Self, _, cx| {
+            this.sync_menus(cx);
+            cx.notify();
+        })
+        .detach();
 
         // Live elapsed clocks (running scouts/builds, and the orchestrator
         // tick in flight) tick once a second — but only when something is
@@ -153,7 +174,11 @@ impl Workspace {
                                 .builds
                                 .iter()
                                 .any(|build| build.status == BuildStatus::Running)
-                            || state.orchestrator_tick.is_some();
+                            || state.orchestrator_tick.is_some()
+                            // A restart is minutes of staged work with the
+                            // event stream down for most of it; its clock in
+                            // the banner is the only thing still moving.
+                            || this.server_control.read(cx).busy();
                         if live || ticks.is_multiple_of(30) {
                             cx.notify();
                         }
@@ -234,6 +259,7 @@ impl Workspace {
             right_sidebar: SidebarState::new(false).with_width(px(460.)),
             resizing: None,
             app_state,
+            server_control,
             selected_task: None,
             input,
             review_input,
@@ -269,6 +295,28 @@ impl Workspace {
     fn go_to_section(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
         cx.notify();
+    }
+
+    /// Set the pipeline mode — the title bar's play/pause buttons and the
+    /// Server menu's radio group, on one path.
+    pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, cx| state.set_mode(mode, cx));
+    }
+
+    /// Rebuild the menu bar from the three facts it depends on, which live in
+    /// two entities: `AppState` knows whether a server is answering and what
+    /// mode it is in, `ServerControl` knows whether a `tasks` run is in
+    /// flight. Called from observers on both; a no-op unless something moved.
+    fn sync_menus(&self, cx: &mut Context<Self>) {
+        let busy = self.server_control.read(cx).busy();
+        let state = self.app_state.read(cx);
+        let menu_state = MenuState {
+            serving: state.connected,
+            mode: state.mode,
+            busy,
+        };
+        menus::sync(cx, menu_state);
     }
 
     // --- selection (called from section rows) ---
@@ -423,8 +471,7 @@ impl Workspace {
                     .selected(mode == Some(Mode::Play))
                     .tooltip(tooltip("Play — work moves on its own"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.app_state
-                            .update(cx, |state, cx| state.set_mode(Mode::Play, cx));
+                        this.set_mode(Mode::Play, cx);
                     })),
             )
             .child_right(
@@ -432,8 +479,7 @@ impl Workspace {
                     .selected(mode == Some(Mode::Pause))
                     .tooltip(tooltip("Pause — no new work starts"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.app_state
-                            .update(cx, |state, cx| state.set_mode(Mode::Pause, cx));
+                        this.set_mode(Mode::Pause, cx);
                     })),
             )
             .child_right(
@@ -464,6 +510,18 @@ impl Workspace {
         );
         let active = self.section;
 
+        // Read before the app-state borrow: a run in flight outranks
+        // everything the server could tell us, because it is the reason the
+        // server stopped telling us anything.
+        let running_op = {
+            let control = self.server_control.read(cx);
+            control
+                .run
+                .as_ref()
+                .filter(|run| run.is_running())
+                .map(|run| (run.op, run.started_at))
+        };
+
         let state = self.app_state.read(cx);
         let queued_work = state
             .tasks
@@ -485,10 +543,21 @@ impl Workspace {
             .orchestrator_tick
             .as_ref()
             .map(|tick| time::elapsed(tick.started_at));
-        // The build warning outranks the error: when this app is older than
-        // the server supports, whatever failed underneath is the symptom and
-        // "your app is old" is the cause.
-        let banner = if let Some(warning) = &state.build_warning {
+        // A restart in flight outranks both, and is checked first rather than
+        // last: it takes the app's own event stream down, and reporting that
+        // drop as a transport error would be the app blaming the server for
+        // doing what it was asked. A stale build is usually *why* someone hit
+        // restart, so this has to sit above the build warning too.
+        //
+        // The build warning in turn outranks the error: when this app is
+        // older than the server supports, whatever failed underneath is the
+        // symptom and "your app is old" is the cause.
+        let banner = if let Some((op, started_at)) = running_op {
+            Some((
+                format!("{}… {}", op.label(), time::elapsed(started_at)),
+                false,
+            ))
+        } else if let Some(warning) = &state.build_warning {
             Some((warning.clone(), true))
         } else if let Some(error) = &state.error {
             Some((error.clone(), true))
@@ -1100,6 +1169,19 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &GoToChat, _window, cx| {
                 this.go_to_section(Section::Chat, cx);
+            }))
+            // Element-level, like the dock toggles: the pipeline is the
+            // workspace's business, so these grey out with no workspace
+            // focused rather than acting from the About or Server window.
+            // (The Server window has its own pipeline row for that case.)
+            .on_action(cx.listener(|this, _: &SetModePlay, _window, cx| {
+                this.set_mode(Mode::Play, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetModePause, _window, cx| {
+                this.set_mode(Mode::Pause, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetModeStop, _window, cx| {
+                this.set_mode(Mode::Stop, cx);
             }))
             // Drag-resize tracking: the handle only starts the drag; from
             // then on the pointer outruns it, so movement is tracked here at
