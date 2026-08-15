@@ -46,6 +46,17 @@ implementation.
   attention than just letting the thing act, and attention is the scarce
   resource here. The human is never gated — this governs autonomy, not the
   owner.
+- **The charter only binds what the server can attribute, so attribution must
+  work under the *tightest* agent permissions.** A write the server cannot
+  attribute is recorded as the human's — and the human is never gated, so a
+  broken credential does not fail closed, it *escalates*. The orchestrator's
+  token therefore reaches it as a server-written `curl -K` config file (0600,
+  under the data dir), which is a statically verifiable command under
+  `--allowedTools Bash(curl:*)`. Never move that credential into argv (`ps`),
+  the prompt (persisted), the environment (an agent under a static allowlist
+  cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
+  from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
+  a demotion to human.
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool

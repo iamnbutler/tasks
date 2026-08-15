@@ -1,0 +1,12 @@
+-- When the agent phase actually ended.
+--
+-- `completed_at` is stamped by the finalizers, which run after teardown and,
+-- on success, after the push and the PR too. So `completed_at - started_at`
+-- was never the interval the run budget bounds, and it disagreed with
+-- `exit_reason` by construction: build_5c65e18a hit its 3600s budget on
+-- schedule and then spent 84 minutes inside a `deallocate`, all of it charged
+-- to the agent.
+--
+-- Nullable: a build that never reached an agent has no phase to stamp, and
+-- every pre-existing row predates the field.
+ALTER TABLE builds ADD COLUMN agent_finished_at TEXT;

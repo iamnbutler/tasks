@@ -30,6 +30,28 @@ const MAX_BUILD_ATTEMPTS: i64 = 3;
 /// spending the context window on a wall of pipeline notices.
 const MAX_TURNS_PER_TICK: i64 = 50;
 
+/// The header an agent identifies its writes with: `orchestrator <token>`,
+/// where the token is the one this server minted at boot.
+///
+/// One statement of the name, shared by the writer (the curl config the
+/// orchestrator is handed) and the reader (the API). HTTP header lookup is
+/// case-insensitive, so the casing here is for humans.
+pub const ACTOR_HEADER: &str = "X-Tasks-Actor";
+
+/// What an [`ACTOR_HEADER`] value amounts to.
+///
+/// The third case is the point: attribution is what the charter gates, so a
+/// claim that does not verify must not quietly become the ungated human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorClaim {
+    /// No claim was made. The human proves nothing and is never gated.
+    Human,
+    /// A valid token: the orchestrator, and the charter applies.
+    Orchestrator,
+    /// A claim was made and it failed. Refuse it.
+    Unrecognized,
+}
+
 /// Conversation page size when a client does not ask for one.
 pub const MESSAGE_PAGE_DEFAULT: i64 = 200;
 /// Ceiling on a client-requested page. The conversation is kept forever; what
@@ -137,9 +159,12 @@ pub struct Store {
     transcript_tx: broadcast::Sender<TranscriptLine>,
     orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
     /// Secret the orchestrator presents to be attributed as itself. Minted
-    /// per boot and held only in memory: it is handed to the agent through
-    /// its environment (never argv, which is world-readable via `ps`, and
-    /// never the prompt, which is persisted).
+    /// per boot and held only in memory: it is handed to the agent through a
+    /// 0600 curl config file under the data dir (never argv, which is
+    /// world-readable via `ps`; never the prompt, which is persisted; never
+    /// the environment, which the agent cannot reference under a static
+    /// allowlist; and never the agent's workdir, which is a repo checkout it
+    /// commits from).
     ///
     /// Not authentication — the API is loopback and unauthenticated by
     /// design. It exists so the orchestrator cannot silently be mistaken for
@@ -1704,6 +1729,7 @@ impl Store {
             exit_reason: None,
             created_at: Utc::now(),
             started_at: None,
+            agent_finished_at: None,
             completed_at: None,
         };
         let branch = format!("build/{}", build.id);
@@ -1833,7 +1859,7 @@ impl Store {
         let row = sqlx::query(
             "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
              pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, completed_at FROM builds WHERE id = ?",
+             started_at, agent_finished_at, completed_at FROM builds WHERE id = ?",
         )
         .bind(id.as_str())
         .fetch_optional(&self.pool)
@@ -1846,7 +1872,8 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
              pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, completed_at FROM builds ORDER BY created_at DESC, rowid DESC",
+             started_at, agent_finished_at, completed_at \
+             FROM builds ORDER BY created_at DESC, rowid DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1868,6 +1895,28 @@ impl Store {
     pub async fn set_build_vm(&self, id: &BuildId, vm_id: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE builds SET vm_id = ? WHERE id = ?")
             .bind(vm_id)
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Stamp the end of the agent phase — the moment the drain concluded,
+    /// however it concluded.
+    ///
+    /// Separate from `completed_at`, which the finalizers write after teardown
+    /// and (on success) after the push and the PR. That interval is real work
+    /// and belongs on the clock somewhere, but it is not what the run budget
+    /// bounds, so charging it to the agent made a build that timed out on
+    /// schedule look like one that ran for hours. The finalizers must not
+    /// overwrite this.
+    pub async fn set_build_agent_finished(
+        &self,
+        id: &BuildId,
+        at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builds SET agent_finished_at = ? WHERE id = ?")
+            .bind(at.to_rfc3339())
             .bind(id.as_str())
             .execute(&self.pool)
             .await?;
@@ -2279,14 +2328,27 @@ impl Store {
         &self.actor_token
     }
 
-    /// Resolve an `X-Tasks-Actor` header value. The expected form is
-    /// `orchestrator <token>`; anything else — absent, malformed, wrong
-    /// token — is [`Actor::Human`], because the human is the caller who
-    /// never has to prove anything.
-    pub fn resolve_actor(&self, header: Option<&str>) -> Actor {
-        match header.and_then(|h| h.split_once(' ')) {
-            Some(("orchestrator", token)) if token == &*self.actor_token => Actor::Orchestrator,
-            _ => Actor::Human,
+    /// Resolve an [`ACTOR_HEADER`] value. The expected form is
+    /// `orchestrator <token>`.
+    ///
+    /// Three outcomes, not two. *Absent* (or empty) is the human, who proves
+    /// nothing because they are never gated. A *valid* token is the
+    /// orchestrator. Anything else is [`ActorClaim::Unrecognized`] — a claim
+    /// that failed — and the caller must refuse it rather than fall back to
+    /// the human, which would hand a broken credential more authority than it
+    /// asked for. Whitespace is trimmed, so a header whose token half is an
+    /// unexpanded shell variable cannot pass as a bare role.
+    pub fn resolve_actor(&self, header: Option<&str>) -> ActorClaim {
+        let Some(header) = header.map(str::trim).filter(|h| !h.is_empty()) else {
+            return ActorClaim::Human;
+        };
+        match header.split_once(' ') {
+            Some((role, token))
+                if role.trim() == "orchestrator" && token.trim() == &*self.actor_token =>
+            {
+                ActorClaim::Orchestrator
+            }
+            _ => ActorClaim::Unrecognized,
         }
     }
 
@@ -2734,20 +2796,34 @@ impl Store {
         Ok(())
     }
 
-    /// Record the context size reported by a finished turn. This is the gauge
-    /// a rotation threshold reads: an absolute measurement, not a running
-    /// total, so it stays honest across turns the server never drove (an
-    /// interactive checkout) and across an agent that isn't reporting usage
-    /// at all (the column simply stops advancing).
-    pub async fn record_orchestrator_context_tokens(
+    /// Record what a finished turn was holding and what it cost.
+    ///
+    /// `context_tokens` is the gauge a rotation threshold reads: an absolute
+    /// measurement (the prompt behind the turn's last main-chain model call),
+    /// not a running total, so it stays honest across turns the server never
+    /// drove — an interactive checkout. `tick_tokens` is the invocation's
+    /// aggregate spend and is a cost signal only.
+    ///
+    /// Each column is written with `COALESCE`, so a `None` stalls that gauge
+    /// rather than clearing it: an agent that isn't reporting usage at all (a
+    /// plain-text agent, a test stub) must not erase the last real reading.
+    pub async fn record_orchestrator_usage(
         &self,
         cc_session_id: &str,
-        tokens: i64,
+        context_tokens: Option<i64>,
+        tick_tokens: Option<i64>,
     ) -> Result<(), StoreError> {
+        if context_tokens.is_none() && tick_tokens.is_none() {
+            return Ok(());
+        }
         sqlx::query(
-            "UPDATE orchestrator_sessions SET last_context_tokens = ? WHERE cc_session_id = ?",
+            "UPDATE orchestrator_sessions \
+             SET last_context_tokens = COALESCE(?, last_context_tokens), \
+                 last_tick_tokens = COALESCE(?, last_tick_tokens) \
+             WHERE cc_session_id = ?",
         )
-        .bind(tokens)
+        .bind(context_tokens)
+        .bind(tick_tokens)
         .bind(cc_session_id)
         .execute(&self.pool)
         .await?;
@@ -2757,7 +2833,7 @@ impl Store {
     /// The session ledger, newest first.
     pub async fn orchestrator_sessions(&self) -> Result<Vec<OrchestratorSession>, StoreError> {
         let rows = sqlx::query(
-            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
+            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     last_tick_tokens, summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2780,7 +2856,7 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens,                     s.last_tick_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2792,6 +2868,7 @@ impl Store {
                 .as_deref()
                 .is_some_and(checkout_heartbeat_fresh),
             context_tokens: row.try_get("last_context_tokens")?,
+            tick_tokens: row.try_get("last_tick_tokens")?,
         })
     }
 
@@ -3068,6 +3145,7 @@ fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
         exit_reason: row.try_get("exit_reason")?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
         started_at: opt_ts("started_at")?,
+        agent_finished_at: opt_ts("agent_finished_at")?,
         completed_at: opt_ts("completed_at")?,
     })
 }
@@ -3294,6 +3372,7 @@ fn orchestrator_session_row(
             .transpose()?,
         end_reason,
         last_context_tokens: row.try_get("last_context_tokens")?,
+        last_tick_tokens: row.try_get("last_tick_tokens")?,
         summary: row.try_get("summary")?,
         summary_generated_at: summary_generated_at
             .as_deref()
@@ -4552,6 +4631,46 @@ mod tests {
         );
     }
 
+    /// A claim that does not verify is its own outcome. Reading any of these
+    /// as the human would hand a broken credential *more* authority than it
+    /// asked for, since the human is the one caller the charter never gates.
+    #[tokio::test]
+    async fn a_failed_actor_claim_is_not_the_human() {
+        let store = Store::open_in_memory().await.unwrap();
+        let token = store.actor_token().to_string();
+
+        // No claim at all: the human, who proves nothing.
+        assert_eq!(store.resolve_actor(None), ActorClaim::Human);
+        assert_eq!(store.resolve_actor(Some("")), ActorClaim::Human);
+        assert_eq!(store.resolve_actor(Some("   ")), ActorClaim::Human);
+
+        assert_eq!(
+            store.resolve_actor(Some(&format!("orchestrator {token}"))),
+            ActorClaim::Orchestrator
+        );
+
+        // A stale token from a previous boot.
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator 6f1c-not-this-boot")),
+            ActorClaim::Unrecognized
+        );
+        // `$TASKS_ACTOR_TOKEN` that expanded to nothing — the exact shape the
+        // old scheme produced when the variable was missing.
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator ")),
+            ActorClaim::Unrecognized
+        );
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator")),
+            ActorClaim::Unrecognized
+        );
+        // Right token, wrong role.
+        assert_eq!(
+            store.resolve_actor(Some(&format!("builder {token}"))),
+            ActorClaim::Unrecognized
+        );
+    }
+
     /// The ledger is the record of authority, so it must commit with the
     /// state it explains — and an autonomous verdict with no stated reason is
     /// refused outright, since the case for letting the orchestrator decide
@@ -5652,6 +5771,55 @@ mod tests {
         );
         let next = store.claim_next_queued_build().await.unwrap().unwrap();
         assert_eq!(next.status, BuildStatus::Running);
+    }
+
+    /// A build has two durations, and conflating them is what made an
+    /// on-schedule timeout read as an 84-minute run. The stamp belongs to the
+    /// agent phase and the finalizers must leave it alone.
+    #[tokio::test]
+    async fn the_agent_phase_ends_on_its_own_clock() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_task, spec) = approved_spec(&store, &project, 1).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.agent_finished_at, None, "no agent has finished yet");
+
+        let agent_finished = Utc::now();
+        store
+            .set_build_agent_finished(&build.id, agent_finished)
+            .await
+            .unwrap();
+        let failed = store
+            .finalize_build_failed(&build.id, "build timed out after 3600s")
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.agent_finished_at.map(|t| t.timestamp_millis()),
+            Some(agent_finished.timestamp_millis()),
+            "finalizing must not overwrite the agent's clock"
+        );
+        assert!(
+            failed.completed_at.unwrap() >= failed.agent_finished_at.unwrap(),
+            "teardown happens between the two"
+        );
+
+        // `build_from_row` reads by name, so a SELECT that forgot the column
+        // is a runtime error rather than a compile one — and the list path is
+        // the one integration tests don't exercise.
+        let listed = store.list_builds().await.unwrap();
+        assert_eq!(
+            listed[0].agent_finished_at.map(|t| t.timestamp_millis()),
+            Some(agent_finished.timestamp_millis())
+        );
     }
 
     #[tokio::test]

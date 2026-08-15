@@ -224,6 +224,13 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
         "files: {:?}",
         done.files_touched
     );
+    // Two clocks, in order: the agent phase ends when the drain does, and
+    // `completed_at` waits for teardown, the push, and the PR.
+    let agent_finished = done
+        .agent_finished_at
+        .expect("the agent phase was stamped when the drain ended");
+    assert!(done.started_at.unwrap() <= agent_finished);
+    assert!(agent_finished <= done.completed_at.unwrap());
 
     // The branch REALLY landed: the remote repo has it, at the reported tip.
     let branch_ref = format!("refs/heads/{}", done.branch);
@@ -299,6 +306,13 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
         "exit_reason: {:?}",
         after.exit_reason
     );
+    // The failure path is the one that hung for 84 minutes inside teardown,
+    // charging all of it to the agent. It gets its own clock too.
+    let agent_finished = after
+        .agent_finished_at
+        .expect("a failed drain still ends the agent phase");
+    assert!(after.started_at.unwrap() <= agent_finished);
+    assert!(agent_finished <= after.completed_at.unwrap());
     // Spec stays approved, task returns to ready_to_build — never further
     // back — and the queue is claimable again.
     assert_eq!(

@@ -55,6 +55,7 @@ fn orchestrator(store: Arc<Store>, stub: &Path, tmp: &Path) -> Orchestrator {
             timeout: Duration::from_secs(30),
             workdir: tmp.join("orch-workdir"),
             api_port: 4800,
+            curl_config: tmp.join("orchestrator-curl.conf"),
         },
     )
 }
@@ -382,19 +383,37 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
     );
 }
 
-/// The context gauge: an agent reporting stream-json usage advances it, and
-/// the reading is the whole input side — cached tokens included, since on a
-/// long resumed session the cache is nearly all of it.
+/// The two gauges, from one stream. Context size is the input side of the
+/// last *main-chain* assistant turn — cached tokens included, since on a long
+/// resumed session the cache is nearly all of it, and sub-agent turns
+/// excluded, since those hold a context of their own. What the whole
+/// invocation cost is the `result` aggregate, which is a much larger number
+/// and means something else entirely.
 #[tokio::test]
-async fn a_usage_reporting_agent_advances_the_context_gauge() {
+async fn usage_separates_context_size_from_what_the_tick_spent() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("stream.jsonl");
     tokio::fs::write(
         &fixture,
         concat!(
+            // An early main-chain turn, superseded by the later one.
+            r#"{"type":"assistant","message":{"content":[],"usage":"#,
+            r#"{"input_tokens":900,"cache_read_input_tokens":60000}}}"#,
+            "\n",
+            // A sub-agent turn with a huge context of its own: not ours.
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":"#,
+            r#"{"content":[],"usage":{"input_tokens":900000}}}"#,
+            "\n",
+            // The last main-chain turn — this is the reading that counts.
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":"#,
+            r#"{"content":[],"usage":{"input_tokens":1200,"#,
+            r#""cache_read_input_tokens":180000,"cache_creation_input_tokens":800,"#,
+            r#""output_tokens":450}}}"#,
+            "\n",
+            // And the invocation's aggregate bill.
             r#"{"type":"result","subtype":"success","result":"ok","usage":"#,
-            r#"{"input_tokens":1200,"cache_read_input_tokens":180000,"#,
-            r#""cache_creation_input_tokens":800,"output_tokens":450}}"#,
+            r#"{"input_tokens":2000,"cache_read_input_tokens":2700000,"#,
+            r#""output_tokens":9000}}"#,
             "\n",
         ),
     )
@@ -430,11 +449,147 @@ async fn a_usage_reporting_agent_advances_the_context_gauge() {
     assert_eq!(
         info.context_tokens,
         Some(182_000),
-        "input + cache_read + cache_creation, not input_tokens alone"
+        "the last main-chain assistant turn: input + cache_read + cache_creation, \
+         and never the 900k sub-agent turn"
+    );
+    assert_eq!(
+        info.tick_tokens,
+        Some(2_702_000),
+        "the result aggregate is what the tick spent, kept under its own name"
     );
     // The reply itself is attributed to the session that produced it.
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.last().unwrap().content, "ok");
+
+    // A second tick by an agent that reports no usage at all must not erase
+    // either reading — a stalled gauge is honest, a cleared one is a lie.
+    let args_log = tmp.path().join("args.log");
+    let plain = write_stub(tmp.path(), &args_log, false).await;
+    let orch = orchestrator(store.clone(), &plain, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "and now?")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    let info = store.orchestrator_session_info().await.unwrap();
+    assert_eq!(info.context_tokens, Some(182_000));
+    assert_eq!(info.tick_tokens, Some(2_702_000));
+}
+
+/// The regression test for #826, and deliberately end-to-end: a stub agent
+/// reads its instructions, pulls the `-K <path>` out of them, and makes a real
+/// `curl -K` write against a real bound server. A unit test cannot catch this
+/// class of bug — the old scheme (`-H "X-Tasks-Actor: orchestrator
+/// $TASKS_ACTOR_TOKEN"`) passed every unit test and still could not be run by
+/// an agent under `--allowedTools Bash(curl:*)`, because Claude Code will not
+/// statically verify a command containing a shell variable. The result was
+/// that the safest deployment was the one where nothing was attributable and
+/// the charter governed nothing.
+#[tokio::test]
+async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expansion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let spec = seed_pending_spec(&store).await;
+    store
+        .set_charter(
+            tasks::models::Capability::AutoReviewSpecs,
+            tasks::models::CharterLevel::Live,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let app = tasks::server::router(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // The credential lives under the data dir, not in the workdir: in
+    // production the workdir is a repo checkout the agent commits from.
+    let workdir = tmp.path().join("workdir");
+    let curl_config = tmp.path().join("state").join("orchestrator-curl.conf");
+
+    // The stub stands in for Claude Code: it reads the system prompt it was
+    // handed, finds the config path in it, and writes through the API with
+    // it. Note the `` ` `` in the character class — the prompt mentions the
+    // path once inside backticks and once bare.
+    let stub = tmp.path().join("curl-agent.sh");
+    tokio::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncat > /dev/null\n\
+             CONF=$(printf '%s\\n' \"$@\" | grep -o -- '-K [^ `]*orchestrator-curl.conf' \
+             | head -1 | cut -c4-)\n\
+             curl -sS -K \"$CONF\" -X POST \
+             http://127.0.0.1:{port}/spec-queue/{spec_id}/review \
+             -H 'Content-Type: application/json' \
+             -d '{{\"status\":\"approved\",\"rationale\":\"the spec holds up\"}}' \
+             > /dev/null\n\
+             echo approved\n",
+            spec_id = spec.id,
+        ),
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&stub).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&stub, p).await.unwrap();
+    }
+
+    let orch = Orchestrator::new(
+        store.clone(),
+        OrchestratorConfig {
+            command: stub.display().to_string(),
+            timeout: Duration::from_secs(30),
+            workdir: workdir.clone(),
+            api_port: port,
+            curl_config: curl_config.clone(),
+        },
+    );
+    store
+        .append_orchestrator_message(ChatRole::User, "review the spec")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    // The write landed, and it landed as the orchestrator's.
+    let decisions = store
+        .decisions(Some(("spec", spec.id.as_str())), 10)
+        .await
+        .unwrap();
+    assert_eq!(decisions.len(), 1, "the agent made exactly one write");
+    assert_eq!(
+        decisions[0].actor,
+        tasks::models::Actor::Orchestrator,
+        "an unattributed write would silently be the human's"
+    );
+    assert!(decisions[0].enforced);
+    assert_eq!(
+        decisions[0].rationale.as_deref(),
+        Some("the spec holds up"),
+        "attribution is what makes the rationale requirement reachable at all"
+    );
+
+    // And the credential itself: readable only by us, and nowhere near the
+    // checkout the agent commits from.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&curl_config)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert!(
+        !curl_config.starts_with(&workdir),
+        "a secret in the workdir is one `git add -A` from being published"
+    );
 }
 
 /// Attribution over the wire: a caller presenting the minted token is the
@@ -481,10 +636,20 @@ async fn the_actor_header_decides_who_a_write_belongs_to() {
         "an autonomous verdict needs a rationale"
     );
 
-    // A wrong token is simply the human, who owes no reason.
+    // A wrong token is refused, not quietly promoted to the human — who is
+    // never gated, and would therefore be *more* authority than was claimed.
     let resp = http
         .post(&review_url)
         .header("X-Tasks-Actor", "orchestrator not-the-token")
+        .json(&serde_json::json!({"status": "approved"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The human sends no header and owes no reason.
+    let resp = http
+        .post(&review_url)
         .json(&serde_json::json!({"status": "approved"}))
         .send()
         .await
