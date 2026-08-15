@@ -680,6 +680,22 @@ async fn an_approved_spec_stays_owed_until_a_build_carries_it() {
         owed(&store, ObligationKind::DispatchBuild).await,
         "a failed build leaves the work owed, not done"
     );
+
+    // And it says so. "No build is carrying it" reads as *never built* unless
+    // the history rides along, and re-running an hour-long build that already
+    // failed should cost a reader one sentence, not one attempt.
+    let summary = store
+        .open_obligations(chrono::Duration::zero())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|o| o.kind == ObligationKind::DispatchBuild)
+        .expect("the dispatch obligation")
+        .summary;
+    assert!(
+        summary.contains("1 earlier build(s) failed") && summary.contains("linker OOM"),
+        "the obligation must carry why the last attempt failed: {summary}"
+    );
 }
 
 /// With several specs unbuilt, the turn has to say that a Builder run takes a

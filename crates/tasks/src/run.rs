@@ -45,7 +45,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use vm_pool_client::{Client, ClientError};
-use vm_pool_protocol::VmConfig;
+use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::brief::Brief;
 use crate::briefing::{BriefingConfig, Briefings};
@@ -660,7 +660,7 @@ pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watc
         if *shutdown.borrow() {
             return;
         }
-        let client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
+        let mut client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
             Ok(client) => client,
             Err(e) => {
                 warn!(
@@ -676,8 +676,44 @@ pub async fn dispatch_loop(store: Arc<Store>, config: Config, mut shutdown: watc
             }
         };
         info!(socket = %config.vm_pool_socket.display(), "connected to vm-pool");
+        sweep_leaked_vms(&store, &mut client).await;
 
         dispatch_connected(&store, &config, client, &mut shutdown).await;
+    }
+}
+
+/// Hand back the VMs of work that already concluded.
+///
+/// Runs on every connect rather than once at startup, because the moment a
+/// leak becomes fixable is the moment there is a connection — and startup
+/// reconciliation happens before there is one. Cheap: the list is empty in the
+/// steady state, and each entry is one round-trip.
+///
+/// Best-effort by construction. A failure here must not stop dispatch, since
+/// the whole point is to get slots back so dispatch can proceed.
+async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
+    let leaked = match store.leaked_vm_ids().await {
+        Ok(leaked) if leaked.is_empty() => return,
+        Ok(leaked) => leaked,
+        Err(e) => {
+            warn!(error = %e, "could not look for leaked VMs");
+            return;
+        }
+    };
+    warn!(
+        count = leaked.len(),
+        "concluded work still holds VMs — handing them back"
+    );
+    for vm_id in leaked {
+        let id = VmId::new(vm_id.clone());
+        if let Err(e) = client.deallocate(&id).await {
+            // Usually "unknown VM": vm-pool's own reaper got there first, or
+            // the pool restarted. Either way the slot is not ours to hold.
+            warn!(vm_id, error = %e, "could not deallocate a leaked VM");
+        }
+        if let Err(e) = store.forget_vm(&vm_id).await {
+            warn!(vm_id, error = %e, "could not clear a leaked VM's row");
+        }
     }
 }
 
