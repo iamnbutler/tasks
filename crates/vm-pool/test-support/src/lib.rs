@@ -105,9 +105,69 @@ fn cargo_build(package: &str, bin: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("no {bin} executable in cargo build -p {package} output"))
 }
 
+/// Set on the re-exec'd child of
+/// `a_populated_bin_dir_never_shells_out_to_cargo`, to stop it recursing.
+#[cfg(test)]
+const NO_CARGO_CHILD: &str = "VM_POOL_TEST_NO_CARGO_CHILD";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of this crate, stated so it can fail.
+    ///
+    /// Every other test here checks that `lookup_in` *prefers* a prebuilt
+    /// binary. None of them can fail if resolution quietly builds anyway —
+    /// which is the regression that matters, because a `cargo build` takes
+    /// the build-directory lock and reinstates the stall this crate exists to
+    /// remove. So: point `$CARGO` at something that cannot exec, and assert
+    /// resolution still succeeds. Any reach-through to `cargo_build` dies
+    /// loudly instead of costing seconds nobody attributes.
+    ///
+    /// Re-execs this test binary rather than setting the variables in-process:
+    /// the environment is process-global, libtest runs tests on threads, and
+    /// `set_var` is `unsafe` in edition 2024 for exactly that reason.
+    ///
+    /// The parent resolves the binary the ordinary way first — which may build
+    /// once, memoized, as designed — so the test is meaningful under plain
+    /// `cargo test` as well as under `make test`, where the directory is
+    /// already exported.
+    #[test]
+    fn a_populated_bin_dir_never_shells_out_to_cargo() {
+        if std::env::var(NO_CARGO_CHILD).is_ok() {
+            // The child: `$CARGO` is poison and the bin dir is populated.
+            let path = supervisor_binary();
+            assert!(
+                path.is_file(),
+                "resolved {} which is not a file",
+                path.display()
+            );
+            return;
+        }
+
+        let binary = supervisor_binary();
+        let dir = binary.parent().expect("binary has a parent directory");
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_populated_bin_dir_never_shells_out_to_cargo",
+                "--nocapture",
+            ])
+            .env(NO_CARGO_CHILD, "1")
+            .env(BIN_DIR_ENV, dir)
+            .env("CARGO", "/nonexistent-cargo")
+            .output()
+            .expect("re-exec the test binary");
+
+        assert!(
+            output.status.success(),
+            "resolution shelled out to cargo despite a populated {BIN_DIR_ENV}\n\
+             stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     #[test]
     fn lookup_prefers_the_bin_name() {
