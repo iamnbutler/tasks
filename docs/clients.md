@@ -59,7 +59,12 @@ the server only.
   properly), and a `done`/`rejected` task whose issue is still *open* also
   shows — that's the "close the issue or re-queue?" decision surface.
   `GET /tasks?all=true` returns every row. Ordering is identical either way.
-- `GET /sessions` / `GET /sessions/{id}` — scout runs.
+- `GET /sessions` / `GET /sessions/{id}` — scout runs. `status` has a third
+  terminal value besides `scout_succeeded` / `scout_failed`:
+  **`scout_stopped_early`** — the run ended without a spec but left notes
+  behind (see *Scout notes* below). Treat it as neither success nor failure.
+- `GET /sessions/{id}/notes` — salvage from a run that stopped early;
+  **404 when there is none**, which is the ordinary case.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,
   `agent_exit_code`.
@@ -166,6 +171,33 @@ not the entity lists, and must hold the **whole** log:
 - **Nothing on the wire counts merged pull requests.** `pull_request_opened`
   fires at open; merged/closed state is GitHub's, queried at render time or
   not shown. Don't present opened PRs as shipped work.
+
+## Scout notes — salvage, never a spec
+
+A scout that dies before writing `SPEC.md` used to lose its whole run. It now
+keeps a `NOTES.md` as it works, the supervisor streams it back every 30s, and
+whatever arrived is persisted. A run that ends without a spec but with notes
+gets `status: "scout_stopped_early"`, and its notes are readable at
+`GET /sessions/{id}/notes`:
+
+```json
+{"session_id": "...", "task_id": "...", "reason": "scout timed out after 3600s",
+ "notes": "# Salvage from an interrupted scout run\n…", "files_touched": [],
+ "updated_at": "..."}
+```
+
+**These notes are not a spec and must never be rendered as one.** They are
+unverified exploration: no `Spec` row exists, no queue entry, no review path,
+and no verdict was ever passed on them. Their one consumer inside the system is
+the next attempt's prompt, where they are quoted as explicitly unverified
+leads. If you surface them in a UI, label them that way — the whole reason this
+is a separate table and a separate endpoint is that a half-explored spec
+sitting in a review queue *looks finished*, which is worse than the lost run it
+would replace. Promoting notes into a spec should stay a deliberate human act.
+
+The task returns to `queued` and the attempt still counts against the cap, so a
+scout that stops early at the same point every time is still retired after
+three tries.
 
 ## Transcripts
 
@@ -302,7 +334,9 @@ view).
   `rejected` with a dispatcher `note` explaining why; on server startup,
   orphaned `running` sessions become `scout_failed`
   (`exit_reason: "orphaned by server restart"`) and stuck `scouting` tasks
-  return to `queued` — clients just see the normal events.
+  return to `queued` — clients just see the normal events. Since #835 an
+  orphan that had checkpointed becomes `scout_stopped_early` instead, and its
+  notes survive the restart.
 - **Re-scout feedback loop** (next branch): `needs_revision` feedback will be
   fed into the next scout's prompt. No API change expected; the review call
   you make today is already the right hook.

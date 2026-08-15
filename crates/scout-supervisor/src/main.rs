@@ -10,13 +10,26 @@
 //!   4. Writes the prompt to `PROMPT.md` (reference copy) and pipes it to the
 //!      agent's stdin
 //!   5. Runs the configured agent command with cwd = workdir
-//!   6. Streams agent stdout/stderr as `ScoutEvent::Progress`
-//!   7. On exit: reads `SPEC.md` if present, emits `Completed`; else `Failed`.
+//!   6. Streams agent stdout/stderr as `ScoutEvent::Progress`, and `NOTES.md`
+//!      as `ScoutEvent::Checkpoint` every `SCOUT_CHECKPOINT_INTERVAL_SECS`
+//!   7. On exit: reads `SPEC.md` if present, emits `Completed`; else
+//!      `StoppedEarly` if anything was written down, else `Failed`.
 //!      A non-zero agent exit with a valid `SPEC.md` still completes — a spec
 //!      from a messy exit is still a spec.
 //!
+//! # Two files, two meanings
+//!
+//! `SPEC.md` means "I concluded". `NOTES.md` means "here is what I have so
+//! far". Keeping them separate is the whole design: reporting a partial spec
+//! as a spec would be worse than losing the run, because a half-explored spec
+//! entering the review queue looks finished. So notes stream out during the
+//! run and are reported as salvage, never as a deliverable.
+//!
 //! There is no in-band cancellation: the host cancels a scout by
 //! deallocating the VM, which tears down this process and everything under it.
+//! That is also why checkpoints are pushed as they change rather than
+//! collected at the end: at the deadline the VM is destroyed and nothing on
+//! its disk survives, so only what the host already received exists.
 //!
 //! The agent command is configured via the `SCOUT_AGENT_CMD` environment
 //! variable (tokens space-separated; no shell expansion). Default:
@@ -24,10 +37,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tasks_protocol::vm_memory::{AgentOutcome, sample_memory};
-use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
+use tasks_protocol::{
+    LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -234,8 +250,14 @@ async fn run_scout(
         return;
     }
 
-    // 4. Agent
-    let outcome = match run_agent(&workdir, prompt, tx.clone()).await {
+    // 4. Agent, watched for checkpoints while it runs.
+    let watcher = spawn_checkpoint_watcher(workdir.clone(), tx.clone());
+    let agent = run_agent(&workdir, prompt, tx.clone()).await;
+    // Stopped before the outcome is reported, so a checkpoint can never arrive
+    // after the terminal event that supersedes it.
+    watcher.abort();
+
+    let outcome = match agent {
         Ok(outcome) => outcome,
         Err(e) => {
             emit(
@@ -256,30 +278,51 @@ async fn run_scout(
     )
     .await;
 
-    // 5. Spec
-    let spec_path = workdir.join("SPEC.md");
-    let spec_markdown = match tokio::fs::read_to_string(&spec_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            // The most common cause of a missing spec is an agent that never
-            // got to write one — including one the OOM killer took out. Say so
-            // here: for a Scout this reason is the whole postmortem.
-            emit(
-                &tx,
-                ScoutEvent::Failed {
-                    reason: format!(
-                        "SPEC.md not found at {}: {e}{}",
-                        spec_path.display(),
-                        outcome.failure_context()
-                    ),
-                },
-            )
-            .await;
-            return;
-        }
+    // 5. Spec, or salvage, or nothing.
+    report_outcome(&workdir, &base_sha, &outcome, &tx).await;
+}
+
+/// Decide what the run produced and emit the one terminal event that says so.
+///
+/// Three outcomes, in descending order of value: a spec, salvage, nothing.
+/// The distinction between the last two is not cosmetic — a retry that cannot
+/// tell "we salvaged something" from "there was nothing" re-derives what it
+/// already had.
+async fn report_outcome(
+    workdir: &Path,
+    base_sha: &str,
+    outcome: &AgentOutcome,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) {
+    let spec_path = workdir.join(SPEC_FILE);
+    let spec = tokio::fs::read_to_string(&spec_path).await;
+    let notes = read_notes(workdir).await;
+
+    // Why the run is not being reported as a spec. `None` means it is.
+    let shortfall = match &spec {
+        Ok(content) => match spec_verdict(content, outcome.exit_code) {
+            SpecVerdict::Spec => None,
+            SpecVerdict::Unfinished { missing } => Some(format!(
+                "SPEC.md is not a spec yet — {} {} missing or still template{}",
+                missing.join(", "),
+                if missing.len() == 1 { "is" } else { "are" },
+                outcome.failure_context()
+            )),
+        },
+        // The most common cause of a missing spec is an agent that never got
+        // to write one — including one the OOM killer took out. Say so here:
+        // for a Scout this reason is the whole postmortem.
+        Err(e) => Some(format!(
+            "SPEC.md not found at {}: {e}{}",
+            spec_path.display(),
+            outcome.failure_context()
+        )),
     };
 
-    let files_touched = match git_diff_name_only(&workdir, &base_sha).await {
+    // Computed for every reported outcome, not just the successful one: a run
+    // that stopped early still touched files, and the next attempt is better
+    // off knowing which.
+    let files_touched = match git_diff_name_only(workdir, base_sha).await {
         Ok(files) => files,
         Err(e) => {
             warn!("could not compute files_touched: {e}");
@@ -287,14 +330,279 @@ async fn run_scout(
         }
     };
 
-    emit(
-        &tx,
-        ScoutEvent::Completed {
-            spec_markdown,
-            files_touched,
-        },
-    )
-    .await;
+    let Some(reason) = shortfall else {
+        emit(
+            tx,
+            ScoutEvent::Completed {
+                spec_markdown: spec.expect("a spec verdict implies a readable SPEC.md"),
+                files_touched,
+            },
+        )
+        .await;
+        return;
+    };
+
+    let unfinished_spec = spec.ok();
+    match render_salvage(notes.as_deref(), unfinished_spec.as_deref()) {
+        Some(notes_markdown) => {
+            info!(%reason, "run ended without a spec; salvaging what was written down");
+            emit(
+                tx,
+                ScoutEvent::StoppedEarly {
+                    reason,
+                    notes_markdown,
+                    files_touched,
+                },
+            )
+            .await;
+        }
+        None => {
+            emit(tx, ScoutEvent::Failed { reason }).await;
+        }
+    }
+}
+
+/// The file the agent concludes in. Reported as a spec, reviewed as one.
+const SPEC_FILE: &str = "SPEC.md";
+/// The file the agent thinks in. Streamed back as checkpoints, and reported
+/// as salvage when the run ends without a spec. Never a spec.
+const NOTES_FILE: &str = "NOTES.md";
+/// How often `NOTES.md` is polled when `SCOUT_CHECKPOINT_INTERVAL_SECS` is
+/// unset. Far finer than the failure it insures against (a whole scout run),
+/// and coarse enough that polling costs nothing.
+const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 30;
+
+fn checkpoint_interval() -> Duration {
+    let secs = std::env::var("SCOUT_CHECKPOINT_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Read `NOTES.md`, trimmed to the transport cap. `None` when it is absent,
+/// unreadable, or blank — an empty file is not exploration.
+async fn read_notes(workdir: &Path) -> Option<String> {
+    let content = tokio::fs::read_to_string(workdir.join(NOTES_FILE))
+        .await
+        .ok()?;
+    let content = trim_notes(content);
+    (!content.trim().is_empty()).then_some(content)
+}
+
+/// Poll `NOTES.md` and push a [`ScoutEvent::Checkpoint`] whenever it changes.
+///
+/// Polling rather than inotify: it adds no dependency to the agent image, and
+/// at 30s granularity the difference is invisible against the thing it
+/// insures against. Emitting only on change keeps an idle scout from
+/// reprinting a quarter-megabyte every interval.
+fn spawn_checkpoint_watcher(
+    workdir: PathBuf,
+    tx: mpsc::Sender<TaskVmEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let interval = checkpoint_interval();
+    tokio::spawn(async move {
+        let mut last: Option<String> = None;
+        loop {
+            // Sleep first: at t=0 the agent has not written anything yet.
+            tokio::time::sleep(interval).await;
+            let Some(notes) = read_notes(&workdir).await else {
+                continue;
+            };
+            if last.as_deref() == Some(notes.as_str()) {
+                continue;
+            }
+            debug!(bytes = notes.len(), "checkpointing NOTES.md");
+            emit(
+                &tx,
+                ScoutEvent::Checkpoint {
+                    notes_markdown: notes.clone(),
+                },
+            )
+            .await;
+            last = Some(notes);
+        }
+    })
+}
+
+/// Cut notes to [`MAX_NOTES_BYTES`] on a char boundary, keeping the head.
+/// Notes are written top-down, so a tail-first cut would hand the reader
+/// conclusions with nothing to attach them to.
+fn trim_notes(notes: String) -> String {
+    if notes.len() <= MAX_NOTES_BYTES {
+        return notes;
+    }
+    let mut cut = MAX_NOTES_BYTES;
+    while cut > 0 && !notes.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = notes.len() - cut;
+    let mut out = notes;
+    out.truncate(cut);
+    out.push_str(&format!(
+        "\n\n…[tasks: NOTES.md truncated, {dropped} bytes dropped]\n"
+    ));
+    out
+}
+
+/// Whether a `SPEC.md` on disk is a spec.
+#[derive(Debug, PartialEq, Eq)]
+enum SpecVerdict {
+    Spec,
+    /// Spec-shaped but not spec-substanced: the named sections are absent or
+    /// still carry the prompt's template text.
+    Unfinished {
+        missing: Vec<&'static str>,
+    },
+}
+
+/// Decide whether `SPEC.md` may be reported as a spec.
+///
+/// **A clean exit is taken at its word.** An agent that ran to completion and
+/// wrote a spec gets no structural audit at all, which is what keeps this
+/// change from touching the healthy path: losing a finished spec to a
+/// heading-wording quibble would be a worse trade than the trap it prevents.
+///
+/// Only a messy exit is read sceptically — and it is exactly the messy exit
+/// that used to complete a run with any `SPEC.md` at all, however partial.
+fn spec_verdict(spec: &str, exit_code: i32) -> SpecVerdict {
+    if exit_code == 0 {
+        return SpecVerdict::Spec;
+    }
+    let missing = missing_sections(spec);
+    if missing.is_empty() {
+        SpecVerdict::Spec
+    } else {
+        SpecVerdict::Unfinished { missing }
+    }
+}
+
+/// The template's sections, as (name reported back, keyword matched on).
+///
+/// Matched by keyword rather than exact heading so real specs — which rename
+/// freely — pass: `"blocker"` catches "Blockers and Dependencies", and
+/// `"pitfall"` catches "Pitfalls Discovered".
+const REQUIRED_SECTIONS: &[(&str, &str)] = &[
+    ("Summary", "summary"),
+    ("Implementation Approach", "implementation"),
+    ("Discovered Pitfalls", "pitfall"),
+    ("Blockers & Dependencies", "blocker"),
+    ("Complexity", "complexity"),
+    ("Notes", "notes"),
+];
+
+/// The prompt template's own placeholder lines. An agent that wrote the shape
+/// and then died leaves these behind; counting them as content is exactly how
+/// a skeleton would get through.
+const TEMPLATE_PLACEHOLDERS: &[&str] = &[
+    "one paragraph.",
+    "bullets: files changed and key design decisions.",
+    "edge cases, non-obvious dependencies.",
+    "other issues that block this.",
+    "simple | medium | complex",
+    "anything the builder should know.",
+];
+
+/// Template sections that are absent, empty, or still placeholder.
+fn missing_sections(spec: &str) -> Vec<&'static str> {
+    let sections = parse_sections(spec);
+    REQUIRED_SECTIONS
+        .iter()
+        .filter(|(_, keyword)| {
+            !sections
+                .iter()
+                .any(|(heading, filled)| *filled && heading.contains(keyword))
+        })
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Headings and whether each has real content under it.
+///
+/// Fenced blocks are skipped wholesale: the spec template is itself quoted
+/// inside a fence in the prompt, and a `# comment` in a shell snippet is not
+/// a heading.
+fn parse_sections(spec: &str) -> Vec<(String, bool)> {
+    let mut sections: Vec<(String, bool)> = Vec::new();
+    let mut fence: Option<String> = None;
+    for line in spec.lines() {
+        let trimmed = line.trim();
+        match &fence {
+            Some(open) => {
+                if trimmed.starts_with(open.as_str()) {
+                    fence = None;
+                }
+                continue;
+            }
+            None => {
+                if let Some(marker) = fence_marker(trimmed) {
+                    fence = Some(marker);
+                    continue;
+                }
+            }
+        }
+
+        if let Some(heading) = trimmed.strip_prefix('#') {
+            sections.push((heading.trim_start_matches('#').trim().to_lowercase(), false));
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_placeholder = TEMPLATE_PLACEHOLDERS.contains(&trimmed.to_lowercase().as_str());
+        if let Some((_, filled)) = sections.last_mut() {
+            *filled |= !is_placeholder;
+        }
+    }
+    sections
+}
+
+/// The fence a line opens, if it opens one.
+fn fence_marker(trimmed: &str) -> Option<String> {
+    for ch in ['`', '~'] {
+        let run = trimmed.chars().take_while(|c| *c == ch).count();
+        if run >= 3 {
+            return Some(std::iter::repeat_n(ch, run).collect());
+        }
+    }
+    None
+}
+
+/// Combine what the run left behind into one salvage document, under
+/// headings that say what each part is. `None` when there is nothing.
+///
+/// The unfinished spec is included but labelled: it is evidence of where the
+/// exploration got to, and calling it anything else is the confusion this
+/// whole design exists to prevent.
+fn render_salvage(notes: Option<&str>, unfinished_spec: Option<&str>) -> Option<String> {
+    let notes = notes.map(str::trim).filter(|n| !n.is_empty());
+    let spec = unfinished_spec.map(str::trim).filter(|s| !s.is_empty());
+    if notes.is_none() && spec.is_none() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "# Salvage from an interrupted scout run\n\n\
+         This run ended without concluding. Nothing below is a spec — it is \
+         unverified exploration, kept so the next attempt does not start from \
+         zero.\n",
+    );
+    if let Some(notes) = notes {
+        out.push_str("\n## NOTES.md (the agent's running notes)\n\n");
+        out.push_str(notes);
+        out.push('\n');
+    }
+    if let Some(spec) = spec {
+        out.push_str(
+            "\n## Unfinished SPEC.md\n\n\
+             The agent had started writing a spec but had not finished it. It \
+             was not reported as a spec and never entered the review queue.\n\n",
+        );
+        out.push_str(spec);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn make_workdir(task_id: &str) -> Result<PathBuf> {
@@ -380,7 +688,7 @@ async fn git_diff_name_only(workdir: &Path, base_sha: &str) -> Result<Vec<String
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
-        .filter(|l| *l != "PROMPT.md" && *l != "SPEC.md")
+        .filter(|l| *l != "PROMPT.md" && *l != SPEC_FILE && *l != NOTES_FILE)
         .map(|l| l.to_string())
         .collect())
 }
@@ -476,4 +784,179 @@ async fn run_agent(
         .await;
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The template as the prompt hands it out, filled in.
+    fn complete_spec() -> String {
+        "## Spec: A thing\n\n\
+         ### Summary\n\
+         It does the thing.\n\n\
+         ### Implementation Approach\n\
+         - Edited `src/lib.rs`\n\n\
+         ### Discovered Pitfalls\n\
+         - The clock is a lie\n\n\
+         ### Blockers & Dependencies\n\
+         None.\n\n\
+         ### Complexity\n\
+         Medium\n\n\
+         ### Notes\n\
+         Run the tests.\n"
+            .into()
+    }
+
+    /// The asymmetry that keeps this change off the healthy path: a clean
+    /// exit is a spec, whatever the file looks like.
+    #[test]
+    fn a_clean_exit_is_always_a_spec() {
+        assert_eq!(spec_verdict("## Spec: barely\n", 0), SpecVerdict::Spec);
+        assert_eq!(spec_verdict("", 0), SpecVerdict::Spec);
+        assert_eq!(spec_verdict(&complete_spec(), 0), SpecVerdict::Spec);
+    }
+
+    /// The existing `stub-agent.sh` fixture is the evidence the asymmetry was
+    /// needed: it writes a `### Files Touched` section the template does not
+    /// have and omits two it does. It exits 0, so it is never audited — but
+    /// audited, it would fail.
+    #[test]
+    fn the_stub_fixtures_shape_would_fail_the_audit_it_never_faces() {
+        let stub = "## Spec: Stub implementation\n\n\
+                    ### Summary\n\
+                    Stub agent ran.\n\n\
+                    ### Implementation Approach\n\
+                    - Added `src/stub.rs`\n\n\
+                    ### Discovered Pitfalls\n\
+                    - None\n\n\
+                    ### Complexity\n\
+                    Simple\n\n\
+                    ### Files Touched\n\
+                    - src/stub.rs\n";
+        assert_eq!(spec_verdict(stub, 0), SpecVerdict::Spec);
+        assert_eq!(
+            spec_verdict(stub, 1),
+            SpecVerdict::Unfinished {
+                missing: vec!["Blockers & Dependencies", "Notes"]
+            }
+        );
+    }
+
+    #[test]
+    fn a_messy_exit_with_a_complete_spec_is_still_a_spec() {
+        assert_eq!(spec_verdict(&complete_spec(), 1), SpecVerdict::Spec);
+        assert_eq!(spec_verdict(&complete_spec(), 137), SpecVerdict::Spec);
+    }
+
+    /// Headings are matched by keyword, so a scout that renames the sections
+    /// the way real specs do is not punished for it.
+    #[test]
+    fn headings_match_loosely() {
+        let renamed = complete_spec()
+            .replace(
+                "### Blockers & Dependencies",
+                "### Blockers and Dependencies",
+            )
+            .replace(
+                "### Discovered Pitfalls",
+                "## Pitfalls Discovered While Exploring",
+            )
+            .replace("### Notes", "### Notes for the Builder");
+        assert_eq!(spec_verdict(&renamed, 1), SpecVerdict::Spec);
+    }
+
+    /// An agent that wrote the shape and died leaves the template's own
+    /// prose behind. Treating that as content would let a skeleton through —
+    /// which is precisely the "checkpoint by writing a stub spec" failure
+    /// this design exists to make impossible.
+    #[test]
+    fn template_placeholders_do_not_count_as_content() {
+        let skeleton = "## Spec: <short title>\n\n\
+                        ### Summary\n\
+                        One paragraph.\n\n\
+                        ### Implementation Approach\n\
+                        Bullets: files changed and key design decisions.\n\n\
+                        ### Discovered Pitfalls\n\
+                        Edge cases, non-obvious dependencies.\n\n\
+                        ### Blockers & Dependencies\n\
+                        Other issues that block this.\n\n\
+                        ### Complexity\n\
+                        Simple | Medium | Complex\n\n\
+                        ### Notes\n\
+                        Anything the Builder should know.\n";
+        match spec_verdict(skeleton, 1) {
+            SpecVerdict::Unfinished { missing } => assert_eq!(missing.len(), 6),
+            other => panic!("a pure skeleton must not be a spec: {other:?}"),
+        }
+    }
+
+    /// A `#` inside a fenced block is a shell comment, not a heading — and
+    /// the spec template itself is routinely quoted inside a fence.
+    #[test]
+    fn fenced_blocks_are_not_read_for_headings() {
+        let with_fence = format!(
+            "## Spec: x\n\n\
+             ```sh\n\
+             # Summary\n\
+             echo done\n\
+             ```\n\n\
+             {}",
+            complete_spec()
+        );
+        assert_eq!(spec_verdict(&with_fence, 1), SpecVerdict::Spec);
+
+        // A fence whose headings are the *only* ones present proves the skip
+        // is real rather than incidental.
+        let only_fenced = "## Spec: x\n\n````markdown\n### Summary\nreal words\n\
+                           ### Implementation Approach\nreal\n### Discovered Pitfalls\nreal\n\
+                           ### Blockers & Dependencies\nreal\n### Complexity\nSimple\n\
+                           ### Notes\nreal\n````\n";
+        match spec_verdict(only_fenced, 1) {
+            SpecVerdict::Unfinished { missing } => assert_eq!(missing.len(), 6),
+            other => panic!("fenced headings must not count: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn salvage_labels_each_half_and_is_none_when_empty() {
+        assert!(render_salvage(None, None).is_none());
+        assert!(render_salvage(Some("   "), Some("\n")).is_none());
+
+        let both =
+            render_salvage(Some("# Notes\n\nfound the bug"), Some("## Spec: half\n")).unwrap();
+        assert!(both.contains("NOTES.md"));
+        assert!(both.contains("found the bug"));
+        assert!(both.contains("Unfinished SPEC.md"));
+        assert!(both.contains("## Spec: half"));
+        // The label is the point: salvage must never read as a conclusion.
+        assert!(both.contains("Nothing below is a spec"));
+
+        let notes_only = render_salvage(Some("just notes"), None).unwrap();
+        assert!(!notes_only.contains("Unfinished SPEC.md"));
+    }
+
+    #[test]
+    fn notes_are_trimmed_head_first_on_a_char_boundary() {
+        let short = "notes".to_string();
+        assert_eq!(trim_notes(short.clone()), short);
+
+        // Multi-byte chars straddling the cut must not panic or corrupt.
+        let long = format!("HEAD-MARKER{}", "é".repeat(MAX_NOTES_BYTES));
+        let out = trim_notes(long);
+        assert!(out.starts_with("HEAD-MARKER"), "the head is what survives");
+        assert!(out.contains("NOTES.md truncated"));
+        assert!(out.len() < MAX_NOTES_BYTES + 128);
+    }
+
+    #[test]
+    fn the_checkpoint_interval_falls_back_on_junk() {
+        // Reading process env, so this test stays single-threaded by keeping
+        // every assertion on the unset/default path plus pure parsing.
+        assert_eq!(
+            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
+            Duration::from_secs(30)
+        );
+        assert!(checkpoint_interval() >= Duration::from_secs(1));
+    }
 }

@@ -116,10 +116,14 @@ pub async fn write_supervisor_wrapper(
     workdir_root: &Path,
 ) -> PathBuf {
     let wrapper = dir.join("supervisor-wrapper.sh");
+    // The 1s checkpoint interval (30s in the image) lets a test watch NOTES.md
+    // reach the host without sleeping through a real interval. Harmless for
+    // the agents that never write notes: no file, no event.
     let script = format!(
         "#!/bin/sh\n\
          export SCOUT_AGENT_CMD={agent}\n\
          export SCOUT_WORKDIR_ROOT={root}\n\
+         export SCOUT_CHECKPOINT_INTERVAL_SECS=1\n\
          exec {bin}\n",
         agent = shell_escape(agent_cmd),
         root = shell_escape(&workdir_root.display().to_string()),
@@ -179,6 +183,28 @@ pub fn stub_agent_path() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("stub-agent.sh")
+}
+
+/// A stand-in agent that writes notes and half a SPEC.md, then exits non-zero
+/// — the shape of a scout that ran out of road (#835).
+pub fn interrupted_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scout-supervisor")
+        .join("tests")
+        .join("fixtures")
+        .join("stub-agent-interrupted.sh")
+}
+
+/// A stand-in agent that writes notes and then hangs until the deadline kills
+/// its VM — the case checkpoints are streamed for.
+pub fn notes_then_hangs_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scout-supervisor")
+        .join("tests")
+        .join("fixtures")
+        .join("stub-agent-notes-then-hangs.sh")
 }
 
 /// A stand-in agent that copies its whole stdin prompt into SPEC.md, so a test

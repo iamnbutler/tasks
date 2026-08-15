@@ -20,8 +20,8 @@ use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 
 use crate::events::EventPayload;
 use crate::models::{
-    Complexity, ReviewedSpec, Session, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
-    SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
+    Complexity, ReviewedSpec, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage, Spec,
+    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
 };
 use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
@@ -35,10 +35,18 @@ pub enum ScoutError {
     Client(#[from] ClientError),
     #[error("scout failed: {0}")]
     ScoutFailed(String),
+    /// The run ended without a spec but left notes behind. Still an error —
+    /// so [`crate::run::record_outcome`] ticks the attempt count and a scout
+    /// that dies at the same point every time cannot retry forever — but a
+    /// distinguishable one, because the salvage changes what the next attempt
+    /// is given.
+    #[error("scout stopped early: {0}")]
+    StoppedEarly(String),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
     /// Wall-clock deadline hit. The message lands verbatim in
-    /// `sessions.exit_reason`, so both integration tests match on `timed out`.
+    /// `sessions.exit_reason`, so the timeout integration tests match on
+    /// `timed out` — including the one where the run was salvaged.
     #[error("scout timed out after {secs}s")]
     Timeout { secs: u64 },
 }
@@ -127,7 +135,19 @@ impl Scout {
                 "re-scouting with the previous review"
             );
         }
-        let prompt = render_prompt(&task, prior.as_ref());
+        // Salvage from an interrupted attempt, if this task has any. Its only
+        // consumer is right here — quoted into the prompt as an unverified
+        // lead, never as a spec.
+        let salvage = self.store.salvage_for_task(&task.id).await?;
+        if let Some(notes) = &salvage {
+            info!(
+                task_id = %task.id,
+                from_session = %notes.session_id,
+                bytes = notes.notes.len(),
+                "carrying field notes from an interrupted attempt"
+            );
+        }
+        let prompt = render_prompt(&task, prior.as_ref(), salvage.as_ref());
 
         // Allocate
         let vm_id = self
@@ -187,13 +207,22 @@ impl Scout {
         // Drain events until terminal Completed / Failed, or until the budget
         // runs out. `saturating_sub` means an already-blown budget fires
         // immediately instead of wrapping.
+        // #849 gave the transcript writer an owner; #856 added the checkpoint
+        // writer beside it. Both survive: the sink is owner-addressed, and the
+        // notes it salvages are still keyed to this session and task.
         let (mut sink, writer) =
             spawn_transcript_writer(self.store.clone(), TranscriptOwner::session(&session_id));
-        let mut usage: Option<SessionUsage> = None;
+        let (mut checkpoints, checkpoint_writer) =
+            spawn_checkpoint_writer(self.store.clone(), session_id.clone(), task.id.clone());
+        // Everything the drain loop learns lives out here, not inside the
+        // future: `tokio::time::timeout` *drops* that future at the deadline,
+        // and the deadline is the case this whole feature exists for. State
+        // held inside it would be destroyed exactly when it is needed.
+        let mut state = DrainState::default();
         let remaining = self.config.timeout.saturating_sub(started.elapsed());
         let result = match tokio::time::timeout(
             remaining,
-            drain_scout_events(&mut events, &vm_id, &mut sink, &mut usage),
+            drain_scout_events(&mut events, &vm_id, &mut sink, &mut checkpoints, &mut state),
         )
         .await
         {
@@ -210,9 +239,24 @@ impl Scout {
         // whole transcript rather than a truncated one.
         crate::transcript::flush(sink, writer, session_id.as_str()).await;
 
+        // Joined here, before any finalize: a checkpoint still in the queue
+        // would land *after* the final salvage and overwrite it with an older,
+        // shorter version of the same notes.
+        if checkpoints.dropped > 0 {
+            warn!(
+                session_id = %session_id,
+                dropped = checkpoints.dropped,
+                "checkpoints dropped under queue pressure; the newest one still lands"
+            );
+        }
+        drop(checkpoints);
+        if let Err(e) = checkpoint_writer.await {
+            warn!(session_id = %session_id, error = %e, "checkpoint writer task failed");
+        }
+
         // Recorded on the failure path too: a scout that burned tokens and then
         // died is the case most worth costing.
-        if let Some(usage) = &usage
+        if let Some(usage) = &state.usage
             && let Err(e) = self.store.update_session_usage(&session_id, usage).await
         {
             warn!(session_id = %session_id, error = %e, "recording session usage failed");
@@ -233,12 +277,11 @@ impl Scout {
         )
         .await;
 
+        let branch = state.branch.clone().unwrap_or_default();
         match result {
-            Ok(DrainOutcome {
-                branch,
+            Ok(DrainOutcome::Concluded {
                 spec_markdown,
                 files_touched,
-                exit_code,
             }) => {
                 self.finalize_succeeded(
                     &session_id,
@@ -246,14 +289,55 @@ impl Scout {
                     branch,
                     spec_markdown,
                     files_touched,
-                    exit_code,
+                    state.exit_code,
                 )
                 .await
             }
+            // The supervisor said so itself: the run ended without concluding.
+            Ok(DrainOutcome::StoppedEarly {
+                reason,
+                notes_markdown,
+                files_touched,
+            }) => {
+                self.finalize_stopped_early(
+                    &session_id,
+                    &task,
+                    branch,
+                    &reason,
+                    notes_markdown,
+                    files_touched,
+                )
+                .await?;
+                Err(ScoutError::StoppedEarly(reason))
+            }
             Err(e) => {
                 let reason = format!("{e}");
-                self.finalize_failed(&session_id, &task, &vm_id, reason)
-                    .await?;
+                // The deadline and a dead stream never reach the supervisor's
+                // own reporting — the VM is destroyed where it stands. The
+                // last checkpoint is all there is, and it is worth the same
+                // as one the supervisor handed over deliberately.
+                //
+                // The error is returned unchanged either way. `Timeout` in
+                // particular keeps its shape: CLAUDE.md and the timeout
+                // integration tests pin `exit_reason` containing "timed out",
+                // and a salvaged timeout is still a timeout.
+                match state.checkpoint.take() {
+                    Some(notes) => {
+                        self.finalize_stopped_early(
+                            &session_id,
+                            &task,
+                            branch,
+                            &reason,
+                            notes,
+                            Vec::new(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        self.finalize_failed(&session_id, &task, &vm_id, reason)
+                            .await?
+                    }
+                }
                 Err(e)
             }
         }
@@ -363,6 +447,73 @@ impl Scout {
         Ok(spec)
     }
 
+    /// Everything the failure path does, plus the salvage — and nothing the
+    /// success path does.
+    ///
+    /// No [`Spec`] row, no queue entry, no state that any reviewer can reach:
+    /// the notes exist only for the next attempt's prompt. The task goes back
+    /// to `Queued` and the attempt still counts, exactly as for a failure,
+    /// because a scout that stops early at the same point every time must not
+    /// retry forever.
+    async fn finalize_stopped_early(
+        &self,
+        session_id: &SessionId,
+        task: &Task,
+        branch: String,
+        reason: &str,
+        notes: String,
+        files_touched: Vec<String>,
+    ) -> Result<(), ScoutError> {
+        let now = Utc::now();
+        if !branch.is_empty() {
+            self.store
+                .update_session_branch(session_id, &branch)
+                .await?;
+        }
+
+        // Notes before the status flip: a crash in between leaves a `running`
+        // session that has notes, which is exactly what the orphan sweep reads
+        // to mark it `scout_stopped_early` rather than `scout_failed`.
+        self.store
+            .upsert_scout_notes(&ScoutNotes {
+                session_id: session_id.clone(),
+                task_id: task.id.clone(),
+                reason: Some(reason.to_string()),
+                notes,
+                files_touched,
+                updated_at: now,
+            })
+            .await?;
+        self.store
+            .update_session_completion(
+                session_id,
+                SessionStatus::ScoutStoppedEarly,
+                now,
+                Some(reason.to_string()),
+            )
+            .await?;
+        self.store
+            .update_task_state(&task.id, TaskState::Queued)
+            .await?;
+
+        self.store
+            .append_event(EventPayload::SessionCompleted {
+                session_id: session_id.clone(),
+                task_id: task.id.clone(),
+                status: SessionStatus::ScoutStoppedEarly,
+            })
+            .await?;
+        self.store
+            .append_event(EventPayload::TaskStateChanged {
+                task_id: task.id.clone(),
+                from: TaskState::Scouting,
+                to: TaskState::Queued,
+            })
+            .await?;
+        warn!(task_id = %task.id, session_id = %session_id, reason, "scout stopped early; notes salvaged");
+        Ok(())
+    }
+
     async fn finalize_failed(
         &self,
         session_id: &SessionId,
@@ -405,11 +556,94 @@ impl Scout {
     }
 }
 
-struct DrainOutcome {
-    branch: String,
-    spec_markdown: String,
-    files_touched: Vec<String>,
+/// How a drained scout run ended, when it ended on its own terms.
+///
+/// Two outcomes rather than one plus an error, because "stopped early" is
+/// neither: it produced no spec, and it is not the same fact as a run that
+/// produced nothing at all.
+enum DrainOutcome {
+    /// The scout concluded. This is the only path to a [`Spec`].
+    Concluded {
+        spec_markdown: String,
+        files_touched: Vec<String>,
+    },
+    /// The run ended without a spec, but with something written down.
+    StoppedEarly {
+        reason: String,
+        notes_markdown: String,
+        files_touched: Vec<String>,
+    },
+}
+
+/// What the drain loop has learned, kept by the caller rather than the drain
+/// future so that dropping the future (which is how the deadline cancels)
+/// does not take it with it.
+#[derive(Default)]
+struct DrainState {
+    branch: Option<String>,
     exit_code: Option<i32>,
+    usage: Option<SessionUsage>,
+    /// The most recent checkpoint. On the timeout path this is the entire
+    /// salvage — the VM is destroyed, and the supervisor never gets to say
+    /// anything more.
+    checkpoint: Option<String>,
+}
+
+/// Depth of the checkpoint hand-off queue. Small on purpose: checkpoints
+/// arrive tens of seconds apart, each one supersedes the last, and the final
+/// salvage is written by `finalize_stopped_early` with an awaited call. A drop
+/// here costs resolution during a crash window, never the salvage itself.
+const CHECKPOINT_QUEUE_CAPACITY: usize = 4;
+
+/// Non-blocking handle for persisting checkpoints as they arrive.
+///
+/// `push` never awaits the store, for the same reason
+/// [`TranscriptSink::push`] doesn't: the drain loop is also what waits for the
+/// terminal event, and it reads a vm-pool broadcast that drops the oldest
+/// events for slow consumers. SQLite latency must not cost scout events.
+struct CheckpointSink {
+    tx: tokio::sync::mpsc::Sender<String>,
+    dropped: u64,
+}
+
+impl CheckpointSink {
+    fn push(&mut self, notes: String) {
+        if self.tx.try_send(notes).is_err() {
+            self.dropped += 1;
+        }
+    }
+}
+
+/// Spawn the task that persists checkpoints off the drain loop.
+///
+/// Persisted on arrival rather than at the end because the two deaths this
+/// insures against — a VM deallocated at the deadline and a server restart —
+/// never reach an end-of-run path. Notes held only in memory would die with
+/// the process, and two of #825's four failures were exactly that.
+fn spawn_checkpoint_writer(
+    store: Arc<Store>,
+    session_id: SessionId,
+    task_id: crate::models::TaskId,
+) -> (CheckpointSink, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(CHECKPOINT_QUEUE_CAPACITY);
+    let handle = tokio::spawn(async move {
+        while let Some(notes) = rx.recv().await {
+            let row = ScoutNotes {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                // No reason yet: a checkpoint is written before anyone knows
+                // how the run ends.
+                reason: None,
+                notes,
+                files_touched: Vec::new(),
+                updated_at: Utc::now(),
+            };
+            if let Err(e) = store.upsert_scout_notes(&row).await {
+                warn!(session_id = %session_id, error = %e, "persisting a scout checkpoint failed");
+            }
+        }
+    });
+    (CheckpointSink { tx, dropped: 0 }, handle)
 }
 
 /// Pull token usage out of the final stream-json `result` record.
@@ -445,10 +679,9 @@ async fn drain_scout_events(
     events: &mut EventStream<TasksProtocol>,
     target_vm: &VmId,
     sink: &mut TranscriptSink,
-    usage_out: &mut Option<SessionUsage>,
+    checkpoints: &mut CheckpointSink,
+    state: &mut DrainState,
 ) -> Result<DrainOutcome, ScoutError> {
-    let mut branch: Option<String> = None;
-    let mut exit_code: Option<i32> = None;
     loop {
         let event = events.recv().await.ok_or(ScoutError::StreamClosed)?;
 
@@ -458,7 +691,7 @@ async fn drain_scout_events(
                 event: TaskEvent::Scout(app),
             } if &vm_id == target_vm => match app {
                 ScoutEvent::Started { branch: b } => {
-                    branch = Some(b);
+                    state.branch = Some(b);
                 }
                 ScoutEvent::Progress { stream, line } => {
                     // The result record is the last thing the agent prints; it
@@ -467,22 +700,38 @@ async fn drain_scout_events(
                     if stream == LogStream::Stdout
                         && let Some(usage) = parse_usage(&line)
                     {
-                        *usage_out = Some(usage);
+                        state.usage = Some(usage);
                     }
                     sink.push(transcript_stream(stream), line);
                 }
+                // Kept twice over: persisted (so it survives this process
+                // dying) and held in `state` (so it survives this future being
+                // dropped at the deadline). Neither covers the other.
+                ScoutEvent::Checkpoint { notes_markdown } => {
+                    checkpoints.push(notes_markdown.clone());
+                    state.checkpoint = Some(notes_markdown);
+                }
                 ScoutEvent::ImplementationFinished { exit_code: c } => {
-                    exit_code = Some(c);
+                    state.exit_code = Some(c);
                 }
                 ScoutEvent::Completed {
                     spec_markdown,
                     files_touched,
                 } => {
-                    return Ok(DrainOutcome {
-                        branch: branch.unwrap_or_default(),
+                    return Ok(DrainOutcome::Concluded {
                         spec_markdown,
                         files_touched,
-                        exit_code,
+                    });
+                }
+                ScoutEvent::StoppedEarly {
+                    reason,
+                    notes_markdown,
+                    files_touched,
+                } => {
+                    return Ok(DrainOutcome::StoppedEarly {
+                        reason,
+                        notes_markdown,
+                        files_touched,
                     });
                 }
                 ScoutEvent::Failed { reason } => {
@@ -499,18 +748,33 @@ async fn drain_scout_events(
 /// Build the scout prompt, splicing in the previous attempt when the task has
 /// one. The section sits between the issue body and the instructions so the
 /// model reads issue → what went wrong last time → what to do.
-fn render_prompt(task: &Task, prior: Option<&ReviewedSpec>) -> String {
+fn render_prompt(
+    task: &Task,
+    prior: Option<&ReviewedSpec>,
+    salvage: Option<&ScoutNotes>,
+) -> String {
     let previous = prior.map(render_previous_attempt).unwrap_or_default();
+    let field_notes = salvage.map(render_field_notes).unwrap_or_default();
     format!(
         "You are a Scout in the Double Diamond architecture.\n\n\
          ## Issue: {title} (#{num})\n\n\
          {body}\n\n\
          {previous}\
+         {field_notes}\
          ## Your job\n\n\
          1. Implement a working solution in the cloned repo (cwd).\n\
-         2. Run the project's tests / lint / typecheck — get them green.\n\
-         3. Write `SPEC.md` in the repo root with the structure below.\n\
-         4. Do NOT create a PR or push anywhere.\n\n\
+         2. Keep `NOTES.md` in the repo root up to date as you go: findings, \
+         dead ends, where things live, anything you would hate to re-derive. \
+         It is read back every 30 seconds and is the only thing that survives \
+         if this run is cut short, so write it as you learn rather than at the \
+         end.\n\
+         3. Run the project's tests / lint / typecheck — get them green.\n\
+         4. Write `SPEC.md` in the repo root with the structure below, and \
+         only once you have actually concluded. **`SPEC.md` is not a \
+         checkpoint.** A half-written spec is worse than no spec, because it \
+         reaches a reviewer looking finished. If you want to record progress, \
+         that is what `NOTES.md` is for.\n\
+         5. Do NOT create a PR or push anywhere.\n\n\
          ## SPEC.md structure\n\n\
          ```\n\
          ## Spec: <short title>\n\n\
@@ -531,6 +795,62 @@ fn render_prompt(task: &Task, prior: Option<&ReviewedSpec>) -> String {
         num = task.gh_issue_number,
         body = task.body,
         previous = previous,
+        field_notes = field_notes,
+    )
+}
+
+/// Largest slice of salvaged notes a prompt will carry.
+///
+/// Much smaller than the transport's [`crate::protocol::MAX_NOTES_BYTES`], and
+/// the difference is the point: 256 KiB is fine on the wire and ruinous in a
+/// retry's context window. Trimmed head-first because notes are written
+/// top-down — a tail-first cut would hand the next scout conclusions with
+/// nothing to attach them to.
+const MAX_PROMPT_NOTES_BYTES: usize = 32 * 1024;
+
+/// Render the `## Field notes from an interrupted attempt` section.
+///
+/// Framed hard as unverified, because that is the whole distinction being
+/// preserved: these notes never passed a review, and a scout that treats them
+/// as conclusions inherits mistakes nobody checked.
+fn render_field_notes(salvage: &ScoutNotes) -> String {
+    let reason = salvage
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("the run was cut short before it could say why");
+    let notes = trim_prompt_notes(salvage.notes.trim());
+    let fence = fence_for(&notes);
+    format!(
+        "## Field notes from an interrupted attempt\n\n\
+         An earlier scout on this issue was interrupted before it reached a \
+         conclusion ({reason}). These are the notes it had written down at \
+         that point.\n\n\
+         **Nothing below has been verified.** It is not a spec, it was never \
+         reviewed, and it may be wrong or out of date. Treat it as leads worth \
+         checking first, not as findings you can rely on — confirm anything \
+         you intend to use against the code in front of you.\n\n\
+         {fence}markdown\n\
+         {notes}\n\
+         {fence}\n\n"
+    )
+}
+
+/// Cut salvaged notes to [`MAX_PROMPT_NOTES_BYTES`] on a char boundary,
+/// keeping the head and saying so.
+fn trim_prompt_notes(notes: &str) -> String {
+    if notes.len() <= MAX_PROMPT_NOTES_BYTES {
+        return notes.to_string();
+    }
+    let mut cut = MAX_PROMPT_NOTES_BYTES;
+    while cut > 0 && !notes.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = notes.len() - cut;
+    format!(
+        "{}\n\n…[tasks: field notes truncated here, {dropped} bytes dropped]",
+        &notes[..cut]
     )
 }
 
@@ -668,7 +988,7 @@ mod tests {
 
     #[test]
     fn a_fresh_prompt_has_no_previous_attempt_section() {
-        let prompt = render_prompt(&task_fixture(), None);
+        let prompt = render_prompt(&task_fixture(), None, None);
         assert!(!prompt.contains("Previous attempt"));
         // The body must still run straight into the instructions.
         assert!(prompt.contains("The issue body.\n\n## Your job"));
@@ -680,7 +1000,7 @@ mod tests {
             "## Spec: old\n\nSection 3 is thin.",
             Some("Flesh out section 3."),
         );
-        let prompt = render_prompt(&task_fixture(), Some(&prior));
+        let prompt = render_prompt(&task_fixture(), Some(&prior), None);
 
         let attempt = prompt.find("## Previous attempt").expect("section present");
         let verdict = prompt.find("needs_revision").expect("verdict present");
@@ -699,7 +1019,7 @@ mod tests {
     #[test]
     fn missing_or_blank_feedback_still_renders() {
         for empty in [None, Some(""), Some("   ")] {
-            let prompt = render_prompt(&task_fixture(), Some(&reviewed("spec body", empty)));
+            let prompt = render_prompt(&task_fixture(), Some(&reviewed("spec body", empty)), None);
             assert!(prompt.contains("## Previous attempt"));
             assert!(prompt.contains("no written feedback"));
         }
@@ -710,11 +1030,102 @@ mod tests {
         // A spec containing its own ```rust block would break out of a plain
         // ``` wrapper and merge its headings into the prompt's structure.
         let nested = "## Spec\n\n```rust\nfn x() {}\n```\n";
-        let prompt = render_prompt(&task_fixture(), Some(&reviewed(nested, Some("f"))));
+        let prompt = render_prompt(&task_fixture(), Some(&reviewed(nested, Some("f"))), None);
         assert!(prompt.contains("````markdown"));
         assert_eq!(fence_for("no fences"), "```");
         assert_eq!(fence_for("a ``` b"), "````");
         assert_eq!(fence_for("a ````` b"), "``````");
+    }
+
+    fn salvaged(notes: &str, reason: Option<&str>) -> ScoutNotes {
+        ScoutNotes {
+            session_id: SessionId::new(),
+            task_id: crate::models::TaskId::new(),
+            reason: reason.map(Into::into),
+            notes: notes.into(),
+            files_touched: vec![],
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The instruction that keeps "checkpoint early" from turning into "write
+    /// a skeleton spec early" — which would defeat the whole design, since a
+    /// skeleton spec is what reaches a reviewer looking finished.
+    #[test]
+    fn the_prompt_asks_for_notes_and_forbids_a_placeholder_spec() {
+        let prompt = render_prompt(&task_fixture(), None, None);
+        assert!(prompt.contains("Keep `NOTES.md`"));
+        assert!(prompt.contains("`SPEC.md` is not a checkpoint"));
+        assert!(prompt.contains("A half-written spec is worse than no spec"));
+        // No interrupted attempt, so no section quoting one.
+        assert!(!prompt.contains("Field notes"));
+    }
+
+    #[test]
+    fn salvage_reaches_the_next_prompt_marked_unverified() {
+        let notes = salvaged(
+            "# Notes\n\nThe parser lives in src/parse.rs.",
+            Some("scout timed out after 3600s"),
+        );
+        let prompt = render_prompt(&task_fixture(), None, Some(&notes));
+
+        let section = prompt
+            .find("## Field notes from an interrupted attempt")
+            .expect("section present");
+        let body = prompt.find("The parser lives in").expect("notes quoted");
+        let job = prompt.find("## Your job").expect("instructions present");
+        assert!(section < body && body < job, "issue → notes → instructions");
+
+        // The framing is the point: unverified leads, not findings.
+        assert!(prompt.contains("Nothing below has been verified."));
+        assert!(prompt.contains("It is not a spec"));
+        assert!(prompt.contains("scout timed out after 3600s"));
+
+        // A checkpoint salvaged mid-run has no reason yet; the section still
+        // renders rather than printing "None".
+        let no_reason = render_prompt(&task_fixture(), None, Some(&salvaged("x", None)));
+        assert!(no_reason.contains("cut short before it could say why"));
+        assert!(!no_reason.contains("None)"));
+    }
+
+    /// Notes containing their own fenced code must not break out of the
+    /// wrapper and merge into the prompt's structure — same trap as the
+    /// quoted prior spec.
+    #[test]
+    fn quoted_notes_survive_their_own_fences() {
+        let notes = salvaged("```rust\nfn x() {}\n```", None);
+        let prompt = render_prompt(&task_fixture(), None, Some(&notes));
+        assert!(prompt.contains("````markdown"));
+    }
+
+    /// The transport cap is 256 KiB; a prompt cap of the same size would
+    /// spend a retry's context window on the thing it was meant to help.
+    #[test]
+    fn prompt_notes_are_trimmed_head_first() {
+        let short = "still short";
+        assert_eq!(trim_prompt_notes(short), short);
+
+        let long = format!("HEAD{}TAIL", "é".repeat(MAX_PROMPT_NOTES_BYTES));
+        let out = trim_prompt_notes(&long);
+        assert!(out.starts_with("HEAD"), "the head is what survives");
+        assert!(!out.contains("TAIL"));
+        assert!(out.contains("field notes truncated"));
+        assert!(out.len() < MAX_PROMPT_NOTES_BYTES + 128);
+        const { assert!(MAX_PROMPT_NOTES_BYTES < crate::protocol::MAX_NOTES_BYTES) };
+    }
+
+    /// A re-scout can carry both: a reviewed spec *and* leads from a run that
+    /// never got as far as a verdict. History first, in that order.
+    #[test]
+    fn a_prompt_can_carry_both_a_review_and_field_notes() {
+        let prior = reviewed("## Spec: old", Some("Say more."));
+        let notes = salvaged("a later, interrupted look", None);
+        let prompt = render_prompt(&task_fixture(), Some(&prior), Some(&notes));
+
+        let previous = prompt.find("## Previous attempt").unwrap();
+        let field = prompt.find("## Field notes").unwrap();
+        let job = prompt.find("## Your job").unwrap();
+        assert!(previous < field && field < job);
     }
 
     #[test]

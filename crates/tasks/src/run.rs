@@ -1059,20 +1059,28 @@ async fn record_outcome(
         return Ok(ConnectionLost(true));
     }
 
+    // Read off the error variant alone, never off the notes table: a task can
+    // carry salvage from an *earlier* attempt, and the event log must not
+    // credit this run for it.
+    let outcome = match &error {
+        ScoutError::StoppedEarly(_) => "stopped early (notes salvaged)",
+        _ => "failed",
+    };
+
     let count = store.record_dispatch_failure(task_id).await?;
-    warn!(task_id = %task_id, attempt = count, error = %error, "scout dispatch failed");
+    warn!(task_id = %task_id, attempt = count, error = %error, "scout dispatch did not produce a spec");
     if count >= MAX_DISPATCH_ATTEMPTS {
         reject_exhausted(
             store,
             task_id,
-            format!("scout for {task_id} failed {count}x, rejecting the task: {error}"),
+            format!("scout for {task_id} {outcome} {count}x, rejecting the task: {error}"),
         )
         .await?;
     } else {
         store
             .append_event(EventPayload::Note {
                 source: DISPATCHER.into(),
-                message: format!("scout for {task_id} failed (attempt {count}): {error}"),
+                message: format!("scout for {task_id} {outcome} (attempt {count}): {error}"),
             })
             .await?;
     }

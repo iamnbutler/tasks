@@ -39,8 +39,8 @@ use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason, Decision,
     DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo,
-    Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
-    TaskId, TranscriptLine, TranscriptOwner,
+    Project, ProjectId, ScoutNotes, Session, SessionId, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -186,6 +186,7 @@ pub fn router_with_services(
         .route("/pull-requests/{number}/close", post(abandon_pull_request))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
+        .route("/sessions/{session_id}/notes", get(get_session_notes))
         .route("/sessions/{session_id}/transcript", get(list_transcript))
         .route(
             "/sessions/{session_id}/transcript/stream",
@@ -1278,6 +1279,27 @@ async fn get_session(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("session {id}")))
+}
+
+/// Salvage from a scout run that stopped early. 404 when there is none —
+/// which is the normal case, since most sessions either conclude or leave
+/// nothing behind.
+///
+/// Deliberately its own endpoint rather than a field on [`Session`]: notes run
+/// to a quarter-megabyte, and `GET /sessions` is refetched on every event.
+/// Just as deliberately not reachable from `/specs` or `/spec-queue` — these
+/// notes are unverified exploration and there is no shape in which they should
+/// reach a reviewer.
+async fn get_session_notes(
+    State(store): State<Arc<Store>>,
+    Path(session_id): Path<String>,
+) -> ApiResult<Json<ScoutNotes>> {
+    let id = SessionId::from_raw(session_id);
+    store
+        .get_scout_notes(&id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("notes for session {id}")))
 }
 
 // --- specs ---
@@ -2877,6 +2899,70 @@ mod tests {
         };
         store.insert_session(&session).await.unwrap();
         session.id
+    }
+
+    // --- scout notes (#835) ---
+
+    /// Salvage is reachable by session, and only by session: a 404 for a run
+    /// that left nothing, and no route from `/specs` or `/spec-queue`.
+    #[tokio::test]
+    async fn session_notes_are_served_alone_and_404_when_there_are_none() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let session_id = seed_session(&store).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let missing = http
+            .get(format!("{base}/sessions/{session_id}/notes"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+
+        let session = store.get_session(&session_id).await.unwrap().unwrap();
+        store
+            .upsert_scout_notes(&ScoutNotes {
+                session_id: session_id.clone(),
+                task_id: session.task_id.clone(),
+                reason: Some("scout timed out after 3600s".into()),
+                notes: "# Notes\n\nGot as far as the parser.".into(),
+                files_touched: vec!["src/parse.rs".into()],
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let notes: ScoutNotes = http
+            .get(format!("{base}/sessions/{session_id}/notes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(notes.session_id, session_id);
+        assert!(notes.notes.contains("Got as far as the parser."));
+        assert_eq!(notes.reason.as_deref(), Some("scout timed out after 3600s"));
+
+        // The invariant, from the API's side: salvage has no review path.
+        let specs: Vec<Spec> = http
+            .get(format!("{base}/specs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(specs.is_empty());
+        let queue: Vec<SpecQueueItem> = http
+            .get(format!("{base}/spec-queue"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(queue.is_empty());
     }
 
     #[tokio::test]

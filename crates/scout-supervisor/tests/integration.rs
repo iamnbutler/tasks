@@ -85,7 +85,11 @@ impl SupervisorProc {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .env("SCOUT_AGENT_CMD", agent_cmd)
-            .env("SCOUT_WORKDIR_ROOT", workdir_root);
+            .env("SCOUT_WORKDIR_ROOT", workdir_root)
+            // 1s instead of the 30s default so a test can watch NOTES.md
+            // change without sleeping through a real interval. Harmless for
+            // the tests whose agents never write notes: no file, no event.
+            .env("SCOUT_CHECKPOINT_INTERVAL_SECS", "1");
         let mut child = cmd.spawn().expect("spawn supervisor");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -376,6 +380,173 @@ async fn a_build_command_is_refused_not_acted_on() {
             payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
         } => assert!(reason.contains("scout"), "reason: {reason}"),
         other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// #835's actual failure shape: notes written, a SPEC.md started and never
+/// finished, non-zero exit.
+///
+/// Before this, that partial SPEC.md completed the run and went to review
+/// looking like a finished spec. Now it is salvage — reported, labelled, and
+/// unmistakably not a spec.
+#[tokio::test]
+async fn an_interrupted_run_is_salvaged_and_never_reported_as_a_spec() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("stub-agent-interrupted.sh");
+
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_835".into(),
+            repo_clone_url: repo_url,
+            base_branch: "main".into(),
+            prompt: "Explore it.".into(),
+        }),
+    })
+    .await;
+
+    let mut terminal = None;
+    while terminal.is_none() {
+        match sup.recv().await {
+            VmEvent::App {
+                payload:
+                    TaskEvent::Scout(
+                        evt @ (ScoutEvent::Completed { .. }
+                        | ScoutEvent::StoppedEarly { .. }
+                        | ScoutEvent::Failed { .. }),
+                    ),
+            } => terminal = Some(evt),
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    match terminal.unwrap() {
+        ScoutEvent::StoppedEarly {
+            reason,
+            notes_markdown,
+            files_touched,
+        } => {
+            // The reason names what the spec was still missing, so the next
+            // attempt (and any human reading the session) knows why.
+            assert!(
+                reason.contains("not a spec yet"),
+                "reason should say why: {reason}"
+            );
+            assert!(reason.contains("Complexity"), "reason: {reason}");
+            // Both halves travel, each under a heading that says what it is.
+            assert!(notes_markdown.contains("src/parse.rs"), "{notes_markdown}");
+            assert!(
+                notes_markdown.contains("Unfinished SPEC.md"),
+                "the partial spec should be carried, labelled: {notes_markdown}"
+            );
+            assert!(
+                notes_markdown.contains("Nothing below is a spec"),
+                "salvage must be labelled: {notes_markdown}"
+            );
+            assert!(files_touched.contains(&"src/half.rs".to_string()));
+            // NOTES.md is an artifact of the process, like SPEC.md — not a
+            // file the scout is reporting as touched work.
+            assert!(!files_touched.iter().any(|f| f == "NOTES.md"));
+            assert!(!files_touched.iter().any(|f| f == "SPEC.md"));
+        }
+        other => panic!("a half-written spec must not complete the run: {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// Checkpoints stream *during* the run, which is the only reason a scout whose
+/// VM is destroyed at the deadline leaves anything behind: at that moment
+/// there is no supervisor left to ask and nothing on the disk is recoverable.
+#[tokio::test]
+async fn notes_are_checkpointed_while_the_agent_is_still_running() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("stub-agent-notes-only.sh");
+
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_notes".into(),
+            repo_clone_url: repo_url,
+            base_branch: "main".into(),
+            prompt: "Take notes.".into(),
+        }),
+    })
+    .await;
+
+    let mut checkpoints: Vec<String> = Vec::new();
+    let mut saw_impl_finished = false;
+    let mut terminal = None;
+    while terminal.is_none() {
+        match sup.recv().await {
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::Checkpoint { notes_markdown }),
+            } => {
+                // Every checkpoint must arrive before the run ends — a
+                // checkpoint after the terminal event would overwrite it.
+                assert!(
+                    !saw_impl_finished,
+                    "checkpoint arrived after the agent exited"
+                );
+                checkpoints.push(notes_markdown);
+            }
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::ImplementationFinished { .. }),
+            } => saw_impl_finished = true,
+            VmEvent::App {
+                payload:
+                    TaskEvent::Scout(
+                        evt @ (ScoutEvent::Completed { .. }
+                        | ScoutEvent::StoppedEarly { .. }
+                        | ScoutEvent::Failed { .. }),
+                    ),
+            } => terminal = Some(evt),
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    assert!(
+        checkpoints.len() >= 2,
+        "expected to see the notes grow, got {} checkpoint(s): {checkpoints:?}",
+        checkpoints.len()
+    );
+    assert!(checkpoints[0].contains("First finding"));
+    let last = checkpoints.last().unwrap();
+    assert!(last.contains("Second finding"), "last checkpoint: {last}");
+    // Only changes are pushed: no two consecutive checkpoints are identical.
+    for pair in checkpoints.windows(2) {
+        assert_ne!(pair[0], pair[1], "an unchanged NOTES.md must not re-emit");
+    }
+
+    // Clean exit, no SPEC.md, notes on disk: salvage, not failure. "We
+    // salvaged something" and "there was nothing" are different facts.
+    match terminal.unwrap() {
+        ScoutEvent::StoppedEarly {
+            notes_markdown,
+            reason,
+            ..
+        } => {
+            assert!(reason.contains("SPEC.md"), "reason: {reason}");
+            assert!(notes_markdown.contains("Second finding"));
+            assert!(!notes_markdown.contains("Unfinished SPEC.md"));
+        }
+        other => panic!("expected StoppedEarly, got {other:?}"),
     }
 
     sup.send(VmCommand::Shutdown).await;

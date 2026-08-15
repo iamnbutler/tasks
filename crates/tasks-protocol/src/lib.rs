@@ -75,6 +75,14 @@ pub enum ScoutEvent {
     /// A stdout/stderr line from the agent process. Best-effort — may be
     /// dropped under load. Useful for breadcrumbs / live log tailing.
     Progress { stream: LogStream, line: String },
+    /// The agent's `NOTES.md` as of now — exploration so far, not a spec.
+    /// Non-terminal and pushed periodically while the agent works.
+    ///
+    /// Pushed rather than pulled because the host cancels a scout by
+    /// destroying its VM: at the deadline there is no supervisor left to ask,
+    /// and nothing on that disk is recoverable. Whatever the host already
+    /// holds is all it will ever have. Capped at [`MAX_NOTES_BYTES`].
+    Checkpoint { notes_markdown: String },
     /// Agent process finished. Implementation branch state at this point is
     /// whatever the agent produced.
     ImplementationFinished { exit_code: i32 },
@@ -83,10 +91,38 @@ pub enum ScoutEvent {
         spec_markdown: String,
         files_touched: Vec<String>,
     },
-    /// Terminal failure. `reason` is a short diagnostic; the supervisor has
-    /// already exited or is about to.
+    /// Terminal, and **never a spec**: the run ended without concluding, but
+    /// left something written down. `notes_markdown` is salvage — an
+    /// explicitly unverified lead for the next attempt, with no review path
+    /// and no queue entry. Anything that would treat this as a deliverable is
+    /// a bug; a half-explored spec that looks finished is worse than the lost
+    /// run this exists to prevent.
+    ///
+    /// `reason` says why the run ended (agent exit, an unfinished SPEC.md and
+    /// what it was missing). Capped at [`MAX_NOTES_BYTES`].
+    StoppedEarly {
+        reason: String,
+        notes_markdown: String,
+        files_touched: Vec<String>,
+    },
+    /// Terminal failure with *nothing to salvage*; `reason` is a short
+    /// diagnostic and the supervisor has already exited or is about to.
+    ///
+    /// Distinct from [`ScoutEvent::StoppedEarly`] on purpose: "we salvaged
+    /// something" and "there was nothing" are different facts, and a retry
+    /// that cannot tell them apart re-derives what it already had.
     Failed { reason: String },
 }
+
+/// Hard cap on the notes carried by [`ScoutEvent::Checkpoint`] and
+/// [`ScoutEvent::StoppedEarly`]. Past this the supervisor trims (notes are
+/// written top-down, so the head is the part worth keeping) rather than
+/// letting one runaway file dominate the JSON-lines transport.
+///
+/// This is a *transport* cap, not a prompt cap: 256 KiB is fine on the wire
+/// and ruinous in a retry's context window. The dispatcher trims much harder
+/// again on its way into a prompt.
+pub const MAX_NOTES_BYTES: usize = 256 * 1024;
 
 /// Commands the tasks server sends to a Builder VM.
 ///
@@ -223,6 +259,33 @@ mod tests {
         let json = serde_json::to_string(&evt).unwrap();
         let forged = json.replace("\"role\":\"scout\"", "\"role\":\"build\"");
         assert!(serde_json::from_str::<TaskEvent>(&forged).is_err());
+    }
+
+    /// A checkpoint and a stopped-early run are distinct wire kinds, and
+    /// neither one is `completed`. Nothing downstream should be able to reach
+    /// a spec by reading either.
+    #[test]
+    fn checkpoint_and_stopped_early_roundtrip_and_are_not_completions() {
+        let checkpoint = TaskEvent::Scout(ScoutEvent::Checkpoint {
+            notes_markdown: "# Notes\n\nHalf of an idea.".into(),
+        });
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        assert!(json.contains("\"kind\":\"checkpoint\""));
+        assert!(!json.contains("spec_markdown"));
+        assert_eq!(
+            serde_json::from_str::<TaskEvent>(&json).unwrap(),
+            checkpoint
+        );
+
+        let stopped = TaskEvent::Scout(ScoutEvent::StoppedEarly {
+            reason: "agent exited 1 with an unfinished SPEC.md".into(),
+            notes_markdown: "# Notes".into(),
+            files_touched: vec!["src/lib.rs".into()],
+        });
+        let json = serde_json::to_string(&stopped).unwrap();
+        assert!(json.contains("\"kind\":\"stopped_early\""));
+        assert!(!json.contains("spec_markdown"));
+        assert_eq!(serde_json::from_str::<TaskEvent>(&json).unwrap(), stopped);
     }
 
     #[test]

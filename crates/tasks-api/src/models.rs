@@ -287,6 +287,12 @@ impl TranscriptStream {
 pub enum SessionStatus {
     Running,
     ScoutSucceeded,
+    /// The run ended without a spec but left notes behind. A third terminal
+    /// outcome, neither success nor failure: there is no [`Spec`] row, no
+    /// queue entry and no review path — the salvage's only consumer is the
+    /// next attempt's prompt. See [`ScoutNotes`].
+    ScoutStoppedEarly,
+    /// The run ended with nothing to salvage.
     ScoutFailed,
     Cancelled,
 }
@@ -296,6 +302,7 @@ impl SessionStatus {
         match self {
             SessionStatus::Running => "running",
             SessionStatus::ScoutSucceeded => "scout_succeeded",
+            SessionStatus::ScoutStoppedEarly => "scout_stopped_early",
             SessionStatus::ScoutFailed => "scout_failed",
             SessionStatus::Cancelled => "cancelled",
         }
@@ -305,11 +312,32 @@ impl SessionStatus {
         match s {
             "running" => Some(SessionStatus::Running),
             "scout_succeeded" => Some(SessionStatus::ScoutSucceeded),
+            "scout_stopped_early" => Some(SessionStatus::ScoutStoppedEarly),
             "scout_failed" => Some(SessionStatus::ScoutFailed),
             "cancelled" => Some(SessionStatus::Cancelled),
             _ => None,
         }
     }
+}
+
+/// What a scout run had written down when it was interrupted — **never a
+/// spec**.
+///
+/// One row per session, superseded by each checkpoint. Deliberately not a
+/// column on `sessions` (a quarter-megabyte per interrupted run would ride
+/// every `GET /sessions`) and deliberately not a [`Spec`] (there must be no
+/// shape in which salvage reaches a reviewer). Its only consumer is the next
+/// attempt's prompt, where it is quoted as an explicitly unverified lead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScoutNotes {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    /// Why the run ended. `None` while the run is still going — a checkpoint
+    /// is written before anyone knows how it ends.
+    pub reason: Option<String>,
+    pub notes: String,
+    pub files_touched: Vec<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// The distilled artifact a Scout produces.
