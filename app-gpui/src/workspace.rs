@@ -8,6 +8,7 @@
 //! re-renders.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -27,6 +28,7 @@ use tasks_client::api::models::{
     BuildStatus, ChatRole, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
 };
 
+use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::components::{
     markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
 };
@@ -60,13 +62,29 @@ actions!(
     ]
 );
 
-/// Owned snapshot of the in-flight tick for one trailing-row render —
-/// extracted so no borrow of the app state is held while the markdown cache
-/// needs `cx`.
-struct OrchestratorTickView {
-    started_at: chrono::DateTime<chrono::Utc>,
-    text: String,
-    tool: Option<String>,
+/// One chat row, owned, projected out of the app state before the markdown
+/// cache needs `cx` mutably. `Empty` covers a row the state has moved past —
+/// a virtualized list can ask for one, and a blank row beats a panic inside
+/// a list item.
+enum ChatRowView {
+    Message {
+        seq: i64,
+        role: ChatRole,
+        created_at: chrono::DateTime<chrono::Utc>,
+        content: String,
+    },
+    /// A trail text segment. `live` marks the reply being written, as opposed
+    /// to narration a tool call has already closed off.
+    Text {
+        key: String,
+        text: String,
+        live: bool,
+    },
+    Tools {
+        id: ChatEntryId,
+        labels: Vec<String>,
+    },
+    Empty,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -125,12 +143,14 @@ pub struct Workspace {
     /// Scroll state for the chat list — tail-following, so the view opens
     /// at the newest message and stays pinned while new ones land.
     chat_list: ListState,
-    /// Message count the list was last synced to.
-    chat_len: usize,
-    /// Whether the list currently carries the in-flight tick's trailing item.
-    chat_tick: bool,
-    /// Tick revision the trailing item was last measured at.
+    /// The row keys the list is currently synced to — what the next frame's
+    /// keys are diffed against.
+    chat_keys: Vec<ChatRowKey>,
+    /// Tick revision the trailing row was last measured at.
     chat_tick_revision: u64,
+    /// Tool groups the human has opened. Ids are session-local and never
+    /// reused, so a stale one is inert.
+    expanded_tools: HashSet<ChatEntryId>,
     /// Parsed-markdown entities for every reading surface, so re-renders
     /// don't re-parse. `RefCell` because most render paths hold `&self`.
     markdown: RefCell<MarkdownCache>,
@@ -266,9 +286,9 @@ impl Workspace {
             issue_input,
             issue_window: None,
             chat_list,
-            chat_len: 0,
-            chat_tick: false,
+            chat_keys: Vec::new(),
             chat_tick_revision: 0,
+            expanded_tools: HashSet::new(),
             markdown: RefCell::new(MarkdownCache::new()),
         }
     }
@@ -659,89 +679,205 @@ impl Workspace {
             .child(inspector)
     }
 
-    /// The provisional view of the tick in flight, rendered as the list's
-    /// trailing item so tail-following pins to it: a muted status line, then
-    /// whatever markdown has arrived. The line leads with an elapsed clock
-    /// because a clock reads as working and a spinner reads as hung — and
-    /// because the clock is correct through extended thinking and slow tool
-    /// calls, when no text is arriving at all.
-    fn render_tick(&self, tick: OrchestratorTickView, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let clock = time::elapsed(tick.started_at);
-        let status = match &tick.tool {
-            Some(label) => format!("{clock} · {label}"),
-            None => format!("{clock} · working…"),
+    /// One chat row. Durable turns and the live tick's trail entries share
+    /// one flat list, so a turn that went text → tool → text reads down the
+    /// page in the order it happened instead of overwriting itself.
+    fn render_chat_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // Owned projection first — the markdown cache needs `cx` mutably
+        // after the state borrow ends.
+        let view = {
+            let state = self.app_state.read(cx);
+            match state.chat_row(ix) {
+                None => ChatRowView::Empty,
+                // `.get`, not indexing: a list can be asked for a row the
+                // state has moved past, and a blank row beats a panic inside
+                // a list item.
+                Some(row) => match (row.key, row.kind) {
+                    (_, ChatRowKind::Message(index)) => {
+                        match state.orchestrator_messages.get(index) {
+                            Some(message) => ChatRowView::Message {
+                                seq: message.seq,
+                                role: message.role,
+                                created_at: message.created_at,
+                                content: message.content.clone(),
+                            },
+                            None => ChatRowView::Empty,
+                        }
+                    }
+                    (key, ChatRowKind::Text(text)) => ChatRowView::Text {
+                        key: key.markdown_key(),
+                        text: text.to_string(),
+                        live: row.live_tail,
+                    },
+                    (ChatRowKey::Entry(id), ChatRowKind::Tools(labels)) => ChatRowView::Tools {
+                        id,
+                        labels: labels.to_vec(),
+                    },
+                    // Unreachable: only entries carry tool groups.
+                    (ChatRowKey::Message(_), ChatRowKind::Tools(_)) => ChatRowView::Empty,
+                },
+            }
         };
-        let body = (!tick.text.is_empty()).then(|| {
-            let entity = self
-                .markdown
-                .borrow_mut()
-                .entity("chat:live", &tick.text, cx);
+
+        match view {
+            ChatRowView::Empty => div().into_any_element(),
+            ChatRowView::Text { key, text, live } => self.render_trail_text(key, &text, live, cx),
+            ChatRowView::Tools { id, labels } => self.render_tool_group(id, labels, cx),
+            ChatRowView::Message {
+                seq,
+                role,
+                created_at,
+                content,
+            } => self.render_chat_message(seq, role, created_at, content, cx),
+        }
+    }
+
+    /// The chrome every trail row sits in: reading-width, tighter vertically
+    /// than a message so a text/tool/text sequence reads as one turn's work
+    /// rather than three messages.
+    fn trail_row(body: impl IntoElement) -> Div {
+        div().w_full().px(px(12.)).py(px(3.)).child(
+            div()
+                .max_w(CHAT_MAX_WIDTH)
+                .w_full()
+                .mx_auto()
+                .child(body.into_any_element()),
+        )
+    }
+
+    /// A text segment of the live trail. The tail is the reply being written,
+    /// so it reads at full contrast; anything a tool call has closed off is
+    /// working narration, and is muted.
+    ///
+    /// Partial markdown is safe here: gpuikit parses with `pulldown-cmark`,
+    /// which closes open constructs at end-of-input, so an unterminated fence
+    /// renders as the best reading of what has arrived.
+    fn render_trail_text(
+        &self,
+        key: String,
+        text: &str,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let entity = self.markdown.borrow_mut().entity(key, text, cx);
+        Self::trail_row(
             div()
                 .px(px(2.))
                 .text_sm()
-                .text_color(theme.fg())
-                .child(markdown_block(&entity, cx))
-        });
-        div()
-            .w_full()
-            .px(px(12.))
-            .py(px(6.))
-            .child(
-                div()
-                    .max_w(CHAT_MAX_WIDTH)
-                    .w_full()
-                    .mx_auto()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(div().text_xs().text_color(theme.fg_muted()).child(status))
-                    .children(body),
-            )
-            .into_any_element()
+                .text_color(if live { theme.fg() } else { theme.fg_muted() })
+                .child(markdown_block(&entity, cx)),
+        )
+        .into_any_element()
     }
 
-    /// One conversation row. User turns render as cards (their text is
-    /// verbatim, not markdown); assistant turns render as full-width
+    /// A run of consecutive tool calls, as one quiet expandable row: a dozen
+    /// curls are one step of the agent's work, not a dozen messages. A single
+    /// call has nothing to expand, so it just shows its label.
+    fn render_tool_group(
+        &self,
+        id: ChatEntryId,
+        labels: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let expanded = self.expanded_tools.contains(&id);
+        let single = labels.len() == 1;
+        let marker = if single {
+            "·"
+        } else if expanded {
+            "▾"
+        } else {
+            "▸"
+        };
+        let summary = match (single, expanded) {
+            (true, _) => labels[0].clone(),
+            (false, true) => format!("{} tool calls", labels.len()),
+            // Collapsed: the newest label, because that is the one still
+            // running or most recently done.
+            (false, false) => format!(
+                "{} tool calls · {}",
+                labels.len(),
+                labels.last().cloned().unwrap_or_default()
+            ),
+        };
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(6.))
+            .px(px(2.))
+            .text_xs()
+            .text_color(theme.fg_muted())
+            .child(div().flex_none().w(px(10.)).child(marker))
+            // The server already caps a label at 120 chars, but a narrow
+            // window is narrower than that.
+            .child(div().flex_1().overflow_hidden().truncate().child(summary));
+
+        let mut row = div().flex().flex_col().gap(px(2.)).child(
+            div()
+                // Keyed on the entry id, not the row index: rows shift when a
+                // trail's reply segment retires, and an element id that moves
+                // under the pointer drops the hover it was showing.
+                .id(("tool-group", id as usize))
+                .when(!single, |el| {
+                    el.cursor_pointer()
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.toggle_tool_group(id, cx);
+                        }))
+                })
+                .child(header),
+        );
+        if expanded && !single {
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .pl(px(18.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .children(
+                        labels
+                            .into_iter()
+                            .map(|label| div().w_full().overflow_hidden().truncate().child(label)),
+                    ),
+            );
+        }
+        Self::trail_row(row).into_any_element()
+    }
+
+    /// Open or close a tool group. The row changes height, so it is
+    /// re-measured — by key, since the index it sits at can move.
+    fn toggle_tool_group(&mut self, id: ChatEntryId, cx: &mut Context<Self>) {
+        if !self.expanded_tools.remove(&id) {
+            self.expanded_tools.insert(id);
+        }
+        if let Some(ix) = self
+            .chat_keys
+            .iter()
+            .position(|key| *key == ChatRowKey::Entry(id))
+        {
+            self.chat_list.remeasure_items(ix..ix + 1);
+        }
+        cx.notify();
+    }
+
+    /// One durable conversation turn. User turns render as cards (their text
+    /// is verbatim, not markdown); assistant turns render as full-width
     /// markdown on the pane background, Zed's agent-panel layout. Event and
     /// system rows are quiet one-liners. Every substantive row gets a
-    /// hover-revealed timestamp + copy affordance. Past the durable
-    /// messages, the one trailing item is the in-flight tick, if any.
-    fn render_chat_message(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// hover-revealed timestamp + copy affordance.
+    fn render_chat_message(
+        &self,
+        seq: i64,
+        role: ChatRole,
+        created_at: chrono::DateTime<chrono::Utc>,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        // Owned projection first — the markdown cache needs `cx` mutably
-        // after the state borrow ends.
-        let (message, tick) = {
-            let state = self.app_state.read(cx);
-            match state.orchestrator_messages.get(ix) {
-                Some(message) => (
-                    Some((
-                        message.seq,
-                        message.role,
-                        message.created_at,
-                        message.content.clone(),
-                    )),
-                    None,
-                ),
-                None => (
-                    None,
-                    state
-                        .orchestrator_tick
-                        .as_ref()
-                        .map(|tick| OrchestratorTickView {
-                            started_at: tick.started_at,
-                            text: tick.text.clone(),
-                            tool: tick.tool.clone(),
-                        }),
-                ),
-            }
-        };
-        let Some((seq, role, created_at, content)) = message else {
-            return match tick {
-                Some(tick) => self.render_tick(tick, cx),
-                None => div().into_any_element(),
-            };
-        };
 
         let body: gpui::AnyElement = match role {
             ChatRole::User => div()
@@ -819,7 +955,10 @@ impl Workspace {
                         .child(time::relative(created_at)),
                 )
                 .child(
-                    icon_button(("copy-msg", ix), Icons::copy())
+                    // Keyed on the seq, not the row index: rows shift when a
+                    // trail's reply segment retires, and an element id that
+                    // moves under the pointer drops the hover it was showing.
+                    icon_button(("copy-msg", seq as usize), Icons::copy())
                         .width(px(22.))
                         .height(px(20.))
                         .icon_size(px(12.))
@@ -847,30 +986,88 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Bring the virtualized list in line with the chat's row keys, once per
+    /// frame.
+    ///
+    /// A longest-common-prefix diff plus one `splice` covers every way the
+    /// rows can move: appending a turn, inserting one *above* an open trail,
+    /// the trail's reply segment retiring when the durable reply lands, and a
+    /// server whose seqs started over. Everything above the change point
+    /// keeps its measurements and the scroll position with them.
+    ///
+    /// When nothing structural moved but the tick did, the last row is
+    /// re-measured instead: `splice` would also re-measure, but it resets the
+    /// offset *within* the item, which makes streaming text stutter.
+    fn sync_chat_list(&mut self, cx: &mut Context<Self>) {
+        let (keys, tick_revision) = {
+            let state = self.app_state.read(cx);
+            (state.chat_row_keys(), state.tick_revision)
+        };
+
+        let prefix = self
+            .chat_keys
+            .iter()
+            .zip(keys.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if prefix < self.chat_keys.len() || prefix < keys.len() {
+            self.chat_list
+                .splice(prefix..self.chat_keys.len(), keys.len() - prefix);
+            // Evict the parses of rows that went away. Without this the
+            // shared cache grows by one orphaned entry per turn, forever.
+            let live: HashSet<ChatRowKey> = keys.iter().copied().collect();
+            let mut markdown = self.markdown.borrow_mut();
+            for key in &self.chat_keys {
+                if !live.contains(key) {
+                    markdown.remove(key.markdown_key());
+                }
+            }
+            self.chat_keys = keys;
+        } else if tick_revision != self.chat_tick_revision && !self.chat_keys.is_empty() {
+            let last = self.chat_keys.len() - 1;
+            self.chat_list.remeasure_items(last..last + 1);
+        }
+        self.chat_tick_revision = tick_revision;
+    }
+
     fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
         // Zed's agent-panel pattern: a virtualized `list` pinned to the
-        // conversation tail; item count is synced in `Render::render` via
-        // splice. Item rendering goes back through the workspace (via
-        // `processor`) for the markdown cache.
+        // conversation tail; rows are synced in `Render::render` by
+        // `sync_chat_list`. Item rendering goes back through the workspace
+        // (via `processor`) for the markdown cache.
         let messages = list(
             self.chat_list.clone(),
-            cx.processor(move |this, ix: usize, _window, cx| this.render_chat_message(ix, cx)),
+            cx.processor(move |this, ix: usize, _window, cx| this.render_chat_row(ix, cx)),
         );
 
-        // The orchestrator owes a reply whenever the newest turn is input
-        // (a user message or a pipeline event) — same definition the
-        // server's tick loop uses.
-        let awaiting_reply = self
-            .app_state
-            .read(cx)
-            .orchestrator_messages
-            .last()
-            .is_some_and(|message| message.role.is_input());
+        // The footer's status line. It leads with an elapsed clock because a
+        // clock reads as working and a spinner reads as hung — and because
+        // the clock is correct through extended thinking and slow tool calls,
+        // when no text is arriving at all. It lives here rather than in the
+        // list for two reasons: it must stay visible when the human has
+        // scrolled up, and a value that changes once a second has no business
+        // re-measuring a list item every second.
+        let status = {
+            let state = self.app_state.read(cx);
+            match &state.orchestrator_tick {
+                Some(tick) => Some(format!("{} · working…", time::elapsed(tick.started_at))),
+                // The orchestrator owes a reply whenever the newest turn is
+                // input (a user message or a pipeline event) — same
+                // definition the server's tick loop uses. This covers the
+                // gap the tick can't: input landed, no tick has announced
+                // itself yet.
+                None => state
+                    .orchestrator_messages
+                    .last()
+                    .is_some_and(|message| message.role.is_input())
+                    .then(|| "Thinking".to_string()),
+            }
+        };
 
         // The tail pin has released (user scrolled up) — offer the way back.
-        let show_jump_to_newest = self.chat_len > 0 && !self.chat_list.is_following_tail();
+        let show_jump_to_newest = !self.chat_keys.is_empty() && !self.chat_list.is_following_tail();
 
         let composer = self.render_chat_composer(cx);
 
@@ -879,7 +1076,7 @@ impl Workspace {
             .flex_col()
             .size_full()
             .map(|el| {
-                if self.chat_len == 0 && !self.chat_tick {
+                if self.chat_keys.is_empty() {
                     el.child(self.render_chat_empty_state(cx))
                 } else {
                     el.child(
@@ -908,10 +1105,10 @@ impl Workspace {
                     )
                 }
             })
-            // The in-flight tick renders as the list's trailing item; this
-            // fixed row covers only the gap it can't — input landed, tick
-            // not yet started (or a feed that streams nothing at all).
-            .when(awaiting_reply && !self.chat_tick, |el| {
+            // Fixed footer, above the composer and outside the scrolling
+            // list: the human who has scrolled up still needs to know
+            // whether the orchestrator is working.
+            .when_some(status, |el, status| {
                 el.child(
                     div().flex_none().w_full().px(px(12.)).pb(px(4.)).child(
                         div()
@@ -925,7 +1122,7 @@ impl Workspace {
                             .text_xs()
                             .text_color(theme.fg_muted())
                             .child(loading_indicator().ellipsis().xsmall())
-                            .child("Thinking"),
+                            .child(status),
                     ),
                 )
             })
@@ -1085,50 +1282,7 @@ impl Render for Workspace {
         let right_width = self.right_sidebar.width;
         self.right_sidebar.set_width(right_width, viewport_width);
 
-        // Sync the chat list with the message log (append-only, so a shrink
-        // means the server was reset — start over) plus the one trailing item
-        // the in-flight tick rides on.
-        let (messages_len, tick_shown, tick_revision) = {
-            let state = self.app_state.read(cx);
-            (
-                state.orchestrator_messages.len(),
-                state.orchestrator_tick.is_some(),
-                state.tick_revision,
-            )
-        };
-        if messages_len < self.chat_len {
-            self.chat_list.reset(messages_len + usize::from(tick_shown));
-            // Seqs started over — cached parses belong to the old world.
-            self.markdown.borrow_mut().clear();
-            self.chat_len = messages_len;
-            self.chat_tick = tick_shown;
-            self.chat_tick_revision = tick_revision;
-        } else {
-            if messages_len > self.chat_len {
-                // At `chat_len`, which is *above* the trailing item: turns
-                // that land mid-tick sit over the reply still being written.
-                self.chat_list
-                    .splice(self.chat_len..self.chat_len, messages_len - self.chat_len);
-                self.chat_len = messages_len;
-            }
-            if tick_shown != self.chat_tick {
-                // The trailing item appearing or retiring is structural.
-                let end = self.chat_len + usize::from(self.chat_tick);
-                self.chat_list
-                    .splice(self.chat_len..end, usize::from(tick_shown));
-                self.chat_tick = tick_shown;
-                self.chat_tick_revision = tick_revision;
-            } else if tick_shown && tick_revision != self.chat_tick_revision {
-                // Content growth is not: `remeasure_items` re-measures the
-                // one growing item while preserving the logical scroll top,
-                // which is what keeps the tail pin from stuttering as text
-                // streams in. (`splice` would also remeasure, but resets the
-                // offset within the item.)
-                self.chat_list
-                    .remeasure_items(self.chat_len..self.chat_len + 1);
-                self.chat_tick_revision = tick_revision;
-            }
-        }
+        self.sync_chat_list(cx);
 
         div()
             .key_context("Workspace")

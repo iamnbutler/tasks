@@ -20,6 +20,7 @@ use tasks_client::api::models::{
 use tasks_client::{Client, ClientError, EventStreamItem};
 
 use crate::about;
+use crate::chat_log::{ChatLog, ChatRow, ChatRowKey};
 
 /// Activity keeps the newest slice, refetched per event — the client never
 /// holds the whole log (the Swift app did, to reconstruct joins the API now
@@ -30,19 +31,15 @@ const ACTIVITY_LIMIT: i64 = 200;
 /// this bounds the cold start, not the history.
 const CHAT_WINDOW: i64 = 200;
 
-/// The provisional view of the orchestrator tick in flight — what the live
-/// feed has shown so far, before the durable `orchestrator_messages` row that
-/// replaces it exists. Nothing here is persisted or authoritative; it is
-/// dropped whole the moment the real reply lands.
+/// The orchestrator tick in flight. What the feed has *said* lives in
+/// [`AppState::chat`] as trail rows; this is only what the tick is, so the
+/// chat can keep those rows after it ends. Nothing here is persisted or
+/// authoritative.
 pub struct OrchestratorTick {
     /// When *this client* noticed the tick — a client that joins mid-tick
     /// shows the age of what it has seen rather than inventing history it
     /// missed.
     pub started_at: DateTime<Utc>,
-    /// Assistant text accumulated from `Delta`, in generation order.
-    pub text: String,
-    /// The latest tool the agent invoked, if any.
-    pub tool: Option<String>,
     /// Newest durable turn at the moment the view opened. An assistant turn
     /// above this watermark is this tick's answer — anything at or below it
     /// is history that was already there.
@@ -53,16 +50,8 @@ impl OrchestratorTick {
     fn new(since_seq: i64) -> Self {
         Self {
             started_at: Utc::now(),
-            text: String::new(),
-            tool: None,
             since_seq,
         }
-    }
-
-    /// Nothing has come through yet — the view is open on a wait, not on an
-    /// answer in progress.
-    fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.tool.is_none()
     }
 }
 
@@ -81,9 +70,23 @@ pub struct AppState {
     pub orchestrator_messages: Vec<OrchestratorMessage>,
     /// The tick in flight, if one is showing.
     pub orchestrator_tick: Option<OrchestratorTick>,
-    /// Bumped on every change to [`Self::orchestrator_tick`]. The chat list
-    /// caches item *heights*, so a bubble growing a token at a time has to be
-    /// re-spliced to be re-measured — this is what the view compares against.
+    /// The chat pane's rows: durable turns and live-trail entries in arrival
+    /// order. Private — the view reads it through [`Self::chat_row_keys`] and
+    /// [`Self::chat_row`], and deliberately gets no length accessor, because
+    /// it must count the rows its list is *synced to*, not a number this has
+    /// already moved past.
+    chat: ChatLog,
+    /// Assistant replies the client owes to ticks it has already sealed.
+    ///
+    /// The server appends a reply before it publishes `Done`, and therefore
+    /// before it can publish the next tick's `Started` — but this client
+    /// learns of the reply through an asynchronous refresh, so `Started` can
+    /// overtake it. Without this counter, tick A's late reply retires tick B:
+    /// B's clock resets and its first narration is orphaned.
+    owed_replies: usize,
+    /// Bumped on every change to the tick in flight or its trail. The chat
+    /// list caches item *heights*, so a row growing a token at a time has to
+    /// be re-measured — this is what the view compares against.
     pub tick_revision: u64,
     pub mode: Option<Mode>,
 
@@ -261,6 +264,8 @@ impl AppState {
             briefings: Vec::new(),
             orchestrator_messages: Vec::new(),
             orchestrator_tick: None,
+            chat: ChatLog::new(),
+            owed_replies: 0,
             tick_revision: 0,
             mode: None,
             connected: false,
@@ -294,8 +299,10 @@ impl AppState {
         }
     }
 
-    /// One moment of the tick in flight. The feed is ephemeral and lossy by
-    /// design — nothing here is state, it is a view of a wait.
+    /// One moment of the tick in flight, appended to the chat's live trail.
+    /// The feed is ephemeral and lossy by design, so what lands here is
+    /// session-local scrollback and never persisted: a restart or a reconnect
+    /// collapses the conversation back to the durable messages.
     fn on_feed_item(
         &mut self,
         item: Result<OrchestratorFeedEvent, ClientError>,
@@ -303,29 +310,19 @@ impl AppState {
     ) {
         match item {
             Ok(OrchestratorFeedEvent::Started) => self.on_tick_started(cx),
-            // `get_or_insert_with`: an app that connected mid-tick never saw
-            // `Started`, and must still show what it can see.
+            // `open_tick`: an app that connected mid-tick never saw
+            // `Started`, and must still show what it can see. Neither arm
+            // clears the other — text and tool calls stack in arrival order,
+            // which is the whole point of the trail.
             Ok(OrchestratorFeedEvent::Delta { text }) => {
-                let since_seq = self.newest_turn();
-                let tick = self
-                    .orchestrator_tick
-                    .get_or_insert_with(|| OrchestratorTick::new(since_seq));
-                tick.text.push_str(&text);
+                self.open_tick();
+                self.chat.push_delta(&text);
                 self.tick_revision += 1;
                 cx.notify();
             }
             Ok(OrchestratorFeedEvent::Tool { label }) => {
-                let since_seq = self.newest_turn();
-                let tick = self
-                    .orchestrator_tick
-                    .get_or_insert_with(|| OrchestratorTick::new(since_seq));
-                // Per the feed's contract in docs/clients.md: text before a
-                // tool call is working narration, and the reply is the
-                // segment after the last one. Resetting here is what makes
-                // the bubble converge on the durable message that replaces
-                // it, instead of shrinking to it.
-                tick.text.clear();
-                tick.tool = Some(label);
+                self.open_tick();
+                self.chat.push_tool(label);
                 self.tick_revision += 1;
                 cx.notify();
             }
@@ -347,42 +344,106 @@ impl AppState {
 
     /// The server says a tick began.
     fn on_tick_started(&mut self, cx: &mut Context<Self>) {
-        let since_seq = self.newest_turn();
-        match &self.orchestrator_tick {
-            // The view we opened at send time, still waiting: this is that
-            // tick starting. Keep `started_at` — the human's wait began when
-            // they hit send, not when the loop got round to them.
-            Some(tick) if tick.is_empty() => return,
-            // A view a previous tick left behind. A new tick is a new answer,
-            // so it starts over rather than appending to the old one.
-            _ => self.orchestrator_tick = Some(OrchestratorTick::new(since_seq)),
+        if self.orchestrator_tick.is_some() {
+            if self.chat.live_is_empty() {
+                // The tick we opened at send time, still waiting: this is
+                // that tick starting. Keep `started_at` — the human's wait
+                // began when they hit send, not when the loop got round to
+                // them.
+                return;
+            }
+            // A tick that has already said something, and whose reply this
+            // client hasn't fetched yet. Seal its trail (the rows stay on
+            // screen) and record that a reply is still owed to it, so the
+            // one in flight doesn't get retired by an answer that isn't its.
+            self.retire_tick();
+            self.owed_replies += 1;
         }
+        self.open_tick();
         self.tick_revision += 1;
         cx.notify();
     }
 
-    /// Open the provisional view unless one is already showing, and report
-    /// whether it opened. A second message sent mid-tick must not reset the
-    /// clock — the running tick answers both turns.
+    /// Open a tick and its trail unless one is already open. Does not notify:
+    /// every caller bumps the revision and notifies for itself.
+    fn open_tick(&mut self) {
+        if self.orchestrator_tick.is_some() {
+            return;
+        }
+        let since_seq = self.newest_turn();
+        self.orchestrator_tick = Some(OrchestratorTick::new(since_seq));
+        self.chat.begin_live();
+    }
+
+    /// Open the tick view unless one is already showing, and report whether
+    /// it opened. A second message sent mid-tick must not reset the clock —
+    /// the running tick answers both turns.
     fn begin_tick(&mut self, cx: &mut Context<Self>) -> bool {
         if self.orchestrator_tick.is_some() {
             return false;
         }
-        let since_seq = self.newest_turn();
-        self.orchestrator_tick = Some(OrchestratorTick::new(since_seq));
+        self.open_tick();
         self.tick_revision += 1;
         cx.notify();
         true
     }
 
-    /// Drop the provisional view, reporting whether there was one.
-    fn end_tick(&mut self, cx: &mut Context<Self>) -> bool {
+    /// End the tick, sealing its trail so the rows stay on screen, and report
+    /// whether there was one. No `cx`, so it can run inside a refresh that
+    /// notifies once at the end.
+    fn retire_tick(&mut self) -> bool {
         if self.orchestrator_tick.take().is_none() {
             return false;
         }
+        self.chat.conclude_live();
         self.tick_revision += 1;
+        true
+    }
+
+    /// [`Self::retire_tick`] for callers outside a refresh — the feed dying
+    /// or the app giving up on it. Owed replies go with it: the feed is what
+    /// was tracking them, and a debt nothing will pay down would keep the
+    /// next tick from ever being retired by its own answer.
+    fn end_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        self.owed_replies = 0;
+        if !self.retire_tick() {
+            return false;
+        }
         cx.notify();
         true
+    }
+
+    // --- the chat pane's row model ---
+
+    /// Every chat row's key, in order — what the view diffs its list against.
+    pub fn chat_row_keys(&self) -> Vec<ChatRowKey> {
+        self.chat.keys()
+    }
+
+    /// The chat row at `ix`, or `None` past the end.
+    pub fn chat_row(&self, ix: usize) -> Option<ChatRow<'_>> {
+        self.chat.row(ix)
+    }
+
+    /// An assistant turn above the open tick's watermark just arrived. It
+    /// either pays down a reply owed to a tick already sealed by `Started` —
+    /// in which case the watermark advances past it and the tick in flight
+    /// keeps running — or it is this tick's own answer, which retires it.
+    fn settle_reply(&mut self, seq: i64) {
+        let Some(tick) = &self.orchestrator_tick else {
+            return;
+        };
+        if seq <= tick.since_seq {
+            return;
+        }
+        if self.owed_replies > 0 {
+            self.owed_replies -= 1;
+            if let Some(tick) = &mut self.orchestrator_tick {
+                tick.since_seq = seq;
+            }
+        } else {
+            self.retire_tick();
+        }
     }
 
     fn newest_turn(&self) -> i64 {
@@ -447,17 +508,30 @@ impl AppState {
         merge!(projects, tasks, sessions, specs, spec_queue, builds, activity, briefings);
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
+        // The opening window is the same code path — an empty list has no
+        // newest seq, so `i64::MIN` lets everything through.
+        //
+        // One turn at a time, and answered-checked *before* the push: the
+        // trail has to be sealed above the reply it produced, not below it.
+        // Per-message also keeps the opening backfill landing above a trail
+        // that a `Delta` already opened, with no special case.
         if let Some(messages) = snapshot.orchestrator_messages {
-            match self.orchestrator_messages.last().map(|m| m.seq) {
-                None => self.orchestrator_messages = messages,
-                Some(newest) => self
-                    .orchestrator_messages
-                    .extend(messages.into_iter().filter(|m| m.seq > newest)),
+            let newest = self
+                .orchestrator_messages
+                .last()
+                .map_or(i64::MIN, |m| m.seq);
+            for message in messages.into_iter().filter(|m| m.seq > newest) {
+                if was_loaded && message.role == ChatRole::Assistant {
+                    self.settle_reply(message.seq);
+                }
+                let index = self.orchestrator_messages.len();
+                self.chat.push_message(index, message.seq);
+                self.orchestrator_messages.push(message);
             }
         }
-        // Retire the provisional view in the *same* frame that adds its
-        // replacement — no flicker, and no dependence on a `Done` that may
-        // never come.
+        // Backstop for the per-message pass above: a reply this client never
+        // saw arrive (it was already in the list) still retires the view, so
+        // no `Done` is depended on and no clock runs forever.
         let answered = match &self.orchestrator_tick {
             Some(tick) if was_loaded => self
                 .orchestrator_messages
@@ -466,15 +540,17 @@ impl AppState {
             _ => false,
         };
         if answered {
-            self.orchestrator_tick = None;
-            self.tick_revision += 1;
+            self.retire_tick();
         } else if !was_loaded {
             // Rebase the watermark past the backfill we just learned about,
             // or every later refresh would read that history as the answer.
+            // The re-anchoring subsumes any obligation carried in from before
+            // the first snapshot, so those are cleared with it.
             let newest = self.newest_turn();
             if let Some(tick) = &mut self.orchestrator_tick {
                 tick.since_seq = tick.since_seq.max(newest);
             }
+            self.owed_replies = 0;
         }
         if let Some(mode) = snapshot.mode {
             self.mode = Some(mode);

@@ -161,11 +161,22 @@ the server only.
   `Bash: curl …`), `{"kind":"done"}` (the durable reply is now fetchable).
   **Ephemeral**: no backfill, a (re)connect only sees what happens next, and
   a lagged subscriber misses deltas — never the reply, which always lands in
-  `/orchestrator/messages`. Suggested rendering: accumulate deltas into a
-  growing bubble, reset the accumulator on each `tool` frame (pre-tool text
-  is working narration; the segment after the last tool call is the reply),
-  show the latest tool label as status, and swap in the persisted message
-  when it arrives. Skip unknown `kind`s.
+  `/orchestrator/messages`. Skip unknown `kind`s.
+  Two renderings are legitimate, and they share one rule: **the segment after
+  the last `tool` frame is the reply**, so drop it when the durable message
+  lands rather than printing the answer twice. *Minimal rendering* — one
+  growing bubble; reset the accumulator on each `tool` frame (pre-tool text
+  is working narration), show the latest tool label as status, swap in the
+  persisted message when it arrives. *Stacked rendering* — keep a flat row
+  list in which durable turns and the tick's text segments and tool groups
+  interleave in arrival order, coalescing consecutive `tool` frames into one
+  expandable group, so a turn that went text → tool → text reads down the
+  page instead of overwriting itself. A turn that arrives mid-tick belongs
+  *above* the open trail. Concluded trails are **session-local scrollback**:
+  keep them for the life of the client process, but let a restart or
+  reconnect collapse the conversation back to the durable
+  `/orchestrator/messages` — persisting a feed the server documents as
+  ephemeral would be the wrong side of that contract.
   Drive the "is it working" indicator off the tick's **lifecycle** — an
   elapsed clock from `started` (or from your own send) until the reply lands
   — not off text arriving: extended thinking and slow tool calls are long
