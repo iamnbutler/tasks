@@ -193,8 +193,39 @@ deliberately keeps the period short rather than waiting the leak out, which
 would cost seconds and hide a real leak. Tuning lives in
 `.config/nextest.toml`.
 
-Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`). Config via
-env / `.env`:
+Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`).
+
+**Config is read from `.env`, not just from the environment**
+(`crates/tasks/src/env_file.rs`). Three files are tried, in this order, and
+the first to define a variable wins — with the real environment outranking all
+of them, so `GITHUB_TOKEN=… tasks serve` still overrides:
+
+1. `<data dir>/.env` — launcher-independent, and the only one an installed
+   binary outside a checkout can have
+2. the nearest `.env` at or above the **cwd** — a developer's `make serve`
+3. the nearest `.env` at or above the **executable** — the same repo file,
+   found when the cwd is `/` because launchd started the app
+
+The third one is not redundant. Configuration used to come from the process
+environment alone, which meant it only ever applied to a server started from a
+shell that had exported it: restarting from the app's Server menu — whose
+ancestor is launchd — silently reverted `GITHUB_TOKEN`, `ORCHESTRATOR_CMD` and
+`ORCHESTRATOR_WORKDIR` to their defaults, and the server came up healthy and
+wrong. Loading happens once in `main`, before subcommand dispatch (so `serve`,
+`reload` and `status` cannot disagree about `TASKS_DATA_DIR`) and before the
+tokio runtime exists (`set_var` is unsafe once threads are running). It is
+never done inside `Config::from_env` — tests build configs, and a suite that
+read the developer's untracked `.env` would be the worse bug.
+
+The matching rule for the orchestrator: **anything the system prompt claims
+about the environment is generated from it**, alongside the charter-generated
+authority section. `workdir_is_checkout` and `github_configured` decide whether
+the prompt offers a checkout it may edit and whether it warns that GitHub
+writes will fail. A hardcoded "your working directory is the project checkout"
+is what sent a curl-only agent reaching for `python3` and `Write`.
+
+| var | default | |
+| --- | --- | --- |
 
 | var | default | |
 | --- | --- | --- |
