@@ -464,12 +464,13 @@ fn parse_env<T: std::str::FromStr>(
     }
 }
 
+/// `$TASKS_DATA_DIR`, else `$HOME/.local/state/tasks-v2`.
+///
+/// The rule itself lives in [`tasks_api::paths`] — clients resolve the same
+/// dir to find the pidfile, and two answers to "which server?" would be one
+/// too many. All this adds is the server's own way of saying "no `$HOME`".
 pub fn data_dir() -> Result<PathBuf, ConfigError> {
-    if let Some(dir) = env_string("TASKS_DATA_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME").ok_or(ConfigError::NoHome)?;
-    Ok(PathBuf::from(home).join(".local/state/tasks-v2"))
+    tasks_api::paths::data_dir().ok_or(ConfigError::NoHome)
 }
 
 /// Open (creating as needed) the store under `data_dir`.

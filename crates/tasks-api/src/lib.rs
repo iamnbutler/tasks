@@ -11,7 +11,13 @@
 //! lenient fallback. Version skew between a dev client and a dev server is
 //! a build error here, on purpose.
 
+//! One module here is not a wire type: `paths` is the filesystem record a
+//! server publishes about itself (`<data dir>/tasks.pid`). It lives here for
+//! the same reason the rest does — the server writes it and more than one
+//! client reads it, so there is one definition rather than a copy per client.
+
 pub mod events;
 pub mod http;
 pub mod models;
+pub mod paths;
 pub mod version;

@@ -3,6 +3,8 @@ mod components;
 mod issue_composer;
 mod menus;
 mod sections;
+mod server;
+mod server_window;
 mod state;
 mod time;
 mod workspace;
@@ -54,10 +56,20 @@ fn main() {
             KeyBinding::new("cmd-5", GoToChat, ws),
         ]);
 
+        // The Server menu's model is a global the menu's handlers and the
+        // workspace both reach, so it exists before either.
+        server::init(cx);
+
         // Bindings before the bar: gpui reads shortcuts out of the keymap
         // while building the menu, once.
+        //
+        // The bar starts from the default state — nothing serving, no mode —
+        // and the workspace's first `sync_menus` corrects it. A loopback
+        // connect is sub-millisecond, so that is one frame in practice, but
+        // it does mean the item reads "Start Server" for that frame even
+        // with a server up.
         menus::init(cx);
-        menus::set(cx);
+        menus::set(cx, menus::MenuState::default());
 
         open_workspace(cx);
     });
