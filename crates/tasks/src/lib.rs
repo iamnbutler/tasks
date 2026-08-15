@@ -9,6 +9,9 @@ pub mod briefing;
 pub mod builder;
 pub mod env_file;
 pub mod github;
+/// The migration set plus the naming rule that keeps parallel branches from
+/// colliding on it — private, like `teardown`: the store is the only caller.
+mod migrations;
 pub mod orchestrator;
 pub mod pidfile;
 pub mod reattach;
