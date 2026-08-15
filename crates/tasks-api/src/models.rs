@@ -592,10 +592,19 @@ pub struct OrchestratorSessionInfo {
     /// A human holds an interactive checkout (fresh heartbeat); headless
     /// ticks are suspended while true.
     pub checked_out: bool,
-    /// Size of the current session's context as of its last turn, in tokens.
-    /// `None` before the session has taken a turn, or when the agent isn't
-    /// emitting stream-json usage (plain-text agents, test stubs).
+    /// How much context the session is holding as of its last turn, in
+    /// tokens: the input side (fresh + cached) of the prompt behind its last
+    /// main-chain model call. An absolute reading — this is the number to
+    /// compare against a context window. `None` before the session has taken
+    /// a turn, or when the agent isn't emitting stream-json usage
+    /// (plain-text agents, test stubs).
     pub context_tokens: Option<i64>,
+    /// What the last tick *spent*, in tokens: the invocation's aggregate over
+    /// every internal turn, each of which re-read the cached prefix. This is
+    /// a bill, and it routinely exceeds the context window several times
+    /// over — never compare it against one, and never render it as "context
+    /// used".
+    pub tick_tokens: Option<i64>,
 }
 
 /// Something the pipeline is owed, computed from its state.
@@ -1034,9 +1043,18 @@ pub struct OrchestratorSession {
     /// `None` for the live session.
     pub ended_at: Option<DateTime<Utc>>,
     pub end_reason: Option<SessionEndReason>,
-    /// Context size at this session's last turn — the reading a rotation
-    /// threshold is compared against.
+    /// Context this session was holding at its last turn: the input side of
+    /// the prompt behind that turn's last main-chain model call. The reading
+    /// a rotation threshold is compared against. `None` for sessions whose
+    /// turns all predate the measurement — the column that used to hold this
+    /// name held tick spend, and those values live on in `last_tick_tokens`
+    /// rather than being reinterpreted here.
     pub last_context_tokens: Option<i64>,
+    /// What this session's last tick spent: the invocation's aggregate across
+    /// its internal turns. A cost signal — useful for a budget or an
+    /// "expensive tick" alert, and never to be compared against a context
+    /// window or used for a compaction decision.
+    pub last_tick_tokens: Option<i64>,
     /// The continuation note this session was seeded into its successor
     /// with. Unwritten until owned rotation lands.
     pub summary: Option<String>,

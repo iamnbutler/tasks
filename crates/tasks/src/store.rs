@@ -2734,20 +2734,34 @@ impl Store {
         Ok(())
     }
 
-    /// Record the context size reported by a finished turn. This is the gauge
-    /// a rotation threshold reads: an absolute measurement, not a running
-    /// total, so it stays honest across turns the server never drove (an
-    /// interactive checkout) and across an agent that isn't reporting usage
-    /// at all (the column simply stops advancing).
-    pub async fn record_orchestrator_context_tokens(
+    /// Record what a finished turn was holding and what it cost.
+    ///
+    /// `context_tokens` is the gauge a rotation threshold reads: an absolute
+    /// measurement (the prompt behind the turn's last main-chain model call),
+    /// not a running total, so it stays honest across turns the server never
+    /// drove — an interactive checkout. `tick_tokens` is the invocation's
+    /// aggregate spend and is a cost signal only.
+    ///
+    /// Each column is written with `COALESCE`, so a `None` stalls that gauge
+    /// rather than clearing it: an agent that isn't reporting usage at all (a
+    /// plain-text agent, a test stub) must not erase the last real reading.
+    pub async fn record_orchestrator_usage(
         &self,
         cc_session_id: &str,
-        tokens: i64,
+        context_tokens: Option<i64>,
+        tick_tokens: Option<i64>,
     ) -> Result<(), StoreError> {
+        if context_tokens.is_none() && tick_tokens.is_none() {
+            return Ok(());
+        }
         sqlx::query(
-            "UPDATE orchestrator_sessions SET last_context_tokens = ? WHERE cc_session_id = ?",
+            "UPDATE orchestrator_sessions \
+             SET last_context_tokens = COALESCE(?, last_context_tokens), \
+                 last_tick_tokens = COALESCE(?, last_tick_tokens) \
+             WHERE cc_session_id = ?",
         )
-        .bind(tokens)
+        .bind(context_tokens)
+        .bind(tick_tokens)
         .bind(cc_session_id)
         .execute(&self.pool)
         .await?;
@@ -2757,7 +2771,7 @@ impl Store {
     /// The session ledger, newest first.
     pub async fn orchestrator_sessions(&self) -> Result<Vec<OrchestratorSession>, StoreError> {
         let rows = sqlx::query(
-            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
+            "SELECT cc_session_id, started_at, ended_at, end_reason, last_context_tokens,                     last_tick_tokens, summary, summary_generated_at              FROM orchestrator_sessions ORDER BY started_at DESC, rowid DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2780,7 +2794,7 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens,                     s.last_tick_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -2792,6 +2806,7 @@ impl Store {
                 .as_deref()
                 .is_some_and(checkout_heartbeat_fresh),
             context_tokens: row.try_get("last_context_tokens")?,
+            tick_tokens: row.try_get("last_tick_tokens")?,
         })
     }
 
@@ -3294,6 +3309,7 @@ fn orchestrator_session_row(
             .transpose()?,
         end_reason,
         last_context_tokens: row.try_get("last_context_tokens")?,
+        last_tick_tokens: row.try_get("last_tick_tokens")?,
         summary: row.try_get("summary")?,
         summary_generated_at: summary_generated_at
             .as_deref()

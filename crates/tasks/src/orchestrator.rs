@@ -104,7 +104,8 @@ impl Orchestrator {
             Ok(turn) => {
                 info!(
                     session = %turn.session_id,
-                    context_tokens = ?turn.context_tokens,
+                    context_tokens = ?turn.usage.context_tokens,
+                    tick_tokens = ?turn.usage.tick_tokens,
                     "orchestrator turn complete"
                 );
                 (turn.text, Some(turn.session_id))
@@ -163,15 +164,17 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok((text, context_tokens)) => {
-                    if let Some(tokens) = context_tokens {
-                        self.store
-                            .record_orchestrator_context_tokens(&session, tokens)
-                            .await?;
-                    }
+                Ok((text, usage)) => {
+                    self.store
+                        .record_orchestrator_usage(
+                            &session,
+                            usage.context_tokens,
+                            usage.tick_tokens,
+                        )
+                        .await?;
                     Ok(Turn {
                         text,
-                        context_tokens,
+                        usage,
                         session_id: session,
                     })
                 }
@@ -201,7 +204,7 @@ impl Orchestrator {
         replacing: Option<&str>,
     ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
-        let (text, context_tokens) = self
+        let (text, usage) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
@@ -214,14 +217,12 @@ impl Orchestrator {
                 replacing.map(|_| SessionEndReason::ResumeFailed),
             )
             .await?;
-        if let Some(tokens) = context_tokens {
-            self.store
-                .record_orchestrator_context_tokens(&session, tokens)
-                .await?;
-        }
+        self.store
+            .record_orchestrator_usage(&session, usage.context_tokens, usage.tick_tokens)
+            .await?;
         Ok(Turn {
             text,
-            context_tokens,
+            usage,
             session_id: session,
         })
     }
@@ -235,7 +236,7 @@ impl Orchestrator {
         &self,
         extra_args: &[&str],
         prompt: &str,
-    ) -> Result<(String, Option<i64>), OrchestratorError> {
+    ) -> Result<(String, TurnUsage), OrchestratorError> {
         let mut parts = self.config.command.split_whitespace();
         let prog = parts.next().unwrap_or("claude").to_string();
         let base_args: Vec<String> = parts.map(str::to_string).collect();
@@ -286,21 +287,29 @@ impl Orchestrator {
             let mut lines = BufReader::new(stdout).lines();
             let mut raw = String::new();
             let mut result_text: Option<String> = None;
-            let mut context_tokens: Option<i64> = None;
+            let mut usage = TurnUsage::default();
             while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
                 match parse_stream_line(&line) {
                     StreamLine::Delta(text) => self
                         .store
                         .publish_orchestrator_feed(OrchestratorFeedEvent::Delta { text }),
-                    StreamLine::Tools(labels) => {
-                        for label in labels {
+                    StreamLine::Assistant {
+                        tools,
+                        context_tokens,
+                    } => {
+                        for label in tools {
                             self.store
                                 .publish_orchestrator_feed(OrchestratorFeedEvent::Tool { label });
                         }
+                        // Last main-chain reading wins: the final assistant
+                        // turn is the context the next tick resumes from.
+                        if context_tokens.is_some() {
+                            usage.context_tokens = context_tokens;
+                        }
                     }
-                    StreamLine::Result { text, tokens } => {
+                    StreamLine::Result { text, tick_tokens } => {
                         result_text = Some(text);
-                        context_tokens = tokens;
+                        usage.tick_tokens = tick_tokens;
                     }
                     StreamLine::Other => {}
                     StreamLine::NotStreamJson => {
@@ -310,14 +319,13 @@ impl Orchestrator {
                 }
             }
             let status = child.wait().await.map_err(OrchestratorError::Spawn)?;
-            Ok::<_, OrchestratorError>((status, result_text, raw, context_tokens))
+            Ok::<_, OrchestratorError>((status, result_text, raw, usage))
         };
 
         let secs = self.config.timeout.as_secs();
-        let (status, result_text, raw, context_tokens) =
-            tokio::time::timeout(self.config.timeout, read)
-                .await
-                .map_err(|_| OrchestratorError::Timeout { secs })??;
+        let (status, result_text, raw, usage) = tokio::time::timeout(self.config.timeout, read)
+            .await
+            .map_err(|_| OrchestratorError::Timeout { secs })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -326,30 +334,54 @@ impl Orchestrator {
                 stderr: stderr.chars().take(2000).collect(),
             });
         }
-        Ok((result_text.unwrap_or(raw), context_tokens))
+        Ok((result_text.unwrap_or(raw), usage))
     }
 }
 
 /// One completed agent turn.
 struct Turn {
     text: String,
-    /// Absolute context size reported by the agent, when it reports one.
-    context_tokens: Option<i64>,
+    /// What the turn held and what it cost.
+    usage: TurnUsage,
     /// The Claude Code session this turn ran in, stamped onto the durable
     /// reply so a verdict can be traced back to the memory regime that
     /// produced it.
     session_id: String,
 }
 
+/// The two token readings a turn produces. They share arithmetic and mean
+/// entirely different things, which is exactly why they are separate fields:
+/// deduplicating them back into one number is the bug this split fixed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TurnUsage {
+    /// How much context the session is *holding*: the input side of the last
+    /// main-chain assistant record's `usage`, i.e. the prompt behind a single
+    /// model call. An absolute reading, and the one a rotation threshold
+    /// compares against. `None` when the agent reports no usage at all
+    /// (plain-text agents, test stubs).
+    context_tokens: Option<i64>,
+    /// What this tick *spent*: the `result` record's aggregate over every
+    /// internal turn of the invocation, each of which re-reads the cached
+    /// prefix. A cost signal — never a context size.
+    tick_tokens: Option<i64>,
+}
+
 /// What one line of agent stdout means for the live feed.
 enum StreamLine {
     /// Assistant text as it's generated (`--include-partial-messages`).
     Delta(String),
-    /// Tool invocations from a completed assistant turn.
-    Tools(Vec<String>),
-    /// The final `result` record: the reply text, and the context size that
-    /// produced it when the agent reports usage.
-    Result { text: String, tokens: Option<i64> },
+    /// A completed assistant turn: its tool invocations (for the feed) and,
+    /// for main-chain turns only, the context that produced it.
+    Assistant {
+        tools: Vec<String>,
+        context_tokens: Option<i64>,
+    },
+    /// The final `result` record: the reply text, and what the whole
+    /// invocation cost when the agent reports usage.
+    Result {
+        text: String,
+        tick_tokens: Option<i64>,
+    },
     /// A stream-json record with nothing for us (init, thinking, tool results).
     Other,
     /// Not stream-json at all — a plain-text agent's output.
@@ -366,7 +398,7 @@ fn parse_stream_line(line: &str) -> StreamLine {
             None => StreamLine::Other,
         },
         Some("assistant") => {
-            let labels: Vec<String> = v
+            let tools: Vec<String> = v
                 .pointer("/message/content")
                 .and_then(|c| c.as_array())
                 .map(|items| {
@@ -377,16 +409,23 @@ fn parse_stream_line(line: &str) -> StreamLine {
                         .collect()
                 })
                 .unwrap_or_default();
-            if labels.is_empty() {
-                StreamLine::Other
-            } else {
-                StreamLine::Tools(labels)
+            // A sub-agent turn (`Task`) is a conversation of its own with a
+            // context of its own; reading it as the session's would make the
+            // gauge jump for reasons unrelated to this session's memory. Its
+            // tool labels are still worth showing in the feed — only the
+            // gauge filters.
+            let sidechain = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+            StreamLine::Assistant {
+                tools,
+                context_tokens: (!sidechain)
+                    .then(|| input_side_tokens(v.pointer("/message/usage")))
+                    .flatten(),
             }
         }
         Some("result") => match v.get("result").and_then(|r| r.as_str()) {
             Some(text) => StreamLine::Result {
                 text: text.to_string(),
-                tokens: context_tokens(v.get("usage")),
+                tick_tokens: input_side_tokens(v.get("usage")),
             },
             None => StreamLine::Other,
         },
@@ -396,15 +435,18 @@ fn parse_stream_line(line: &str) -> StreamLine {
     }
 }
 
-/// Context size from a stream-json `usage` object: every input-side token the
-/// model had to read this turn, cached or not.
+/// Every input-side token in a stream-json `usage` object, cached or not.
 ///
-/// The sum is what matters. `input_tokens` alone under-reports by whatever
-/// the cache served — which, on a long-lived resumed session, is nearly all
-/// of it. And because this is an absolute measurement rather than a running
-/// total, it stays honest across turns the server never drove (an interactive
-/// checkout) without any reconciliation.
-fn context_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
+/// The sum is what matters: `input_tokens` alone under-reports by whatever the
+/// cache served, which on a long-lived resumed session is nearly all of it.
+///
+/// What this sum *means* is decided entirely by whose `usage` it is, and the
+/// two callers are not measuring the same thing. On an `assistant` record it
+/// is the prompt behind one model call — a context size. On the `result`
+/// record it is an aggregate over every internal turn of the invocation, each
+/// re-reading the cached prefix — a bill. Shared arithmetic, opposite
+/// meanings; do not fold the call sites back together.
+fn input_side_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
     let usage = usage?;
     let field = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
     let total = field("input_tokens")
@@ -1040,6 +1082,87 @@ mod tests {
         // And it must no longer send the agent to re-derive the present from
         // the whole event log, which is what the brief exists to replace.
         assert!(!p.contains("since=1"));
+    }
+
+    /// The two readings are taken off different records and mean different
+    /// things; this pins which is which, because the arithmetic is shared and
+    /// nothing else would catch them being swapped back.
+    #[test]
+    fn usage_is_read_per_record_and_sidechains_do_not_count() {
+        let assistant = |line: &str| match parse_stream_line(line) {
+            StreamLine::Assistant { context_tokens, .. } => context_tokens,
+            other => panic!(
+                "expected an assistant record, got {}",
+                match other {
+                    StreamLine::Delta(_) => "delta",
+                    StreamLine::Result { .. } => "result",
+                    StreamLine::Other => "other",
+                    StreamLine::NotStreamJson => "not stream-json",
+                    StreamLine::Assistant { .. } => unreachable!(),
+                }
+            ),
+        };
+
+        // Context: the input side of THIS record's usage, cache included.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","message":{"content":[],"usage":
+                   {"input_tokens":1200,"cache_read_input_tokens":180000,
+                    "cache_creation_input_tokens":800,"output_tokens":450}}}"#
+            ),
+            Some(182_000)
+        );
+        // A sub-agent turn has its own conversation and its own context.
+        // Reading it would report a number unrelated to this session.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[],
+                   "usage":{"input_tokens":900000}}}"#
+            ),
+            None
+        );
+        // An explicit null parent is main-chain, not a sidechain.
+        assert_eq!(
+            assistant(
+                r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[],
+                   "usage":{"input_tokens":5}}}"#
+            ),
+            Some(5)
+        );
+        // No usage at all: no reading. Not zero — zero would stall or clear a
+        // gauge that has a perfectly good previous value.
+        assert_eq!(
+            assistant(r#"{"type":"assistant","message":{"content":[]}}"#),
+            None
+        );
+
+        // Tool labels reach the feed from a sidechain turn all the same.
+        match parse_stream_line(
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":
+               [{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],
+               "usage":{"input_tokens":900000}}}"#,
+        ) {
+            StreamLine::Assistant {
+                tools,
+                context_tokens,
+            } => {
+                assert_eq!(tools, vec!["Bash: ls".to_string()]);
+                assert_eq!(context_tokens, None, "only the gauge filters");
+            }
+            _ => panic!("expected an assistant record"),
+        }
+
+        // And the `result` record is the tick's bill, not a context size.
+        match parse_stream_line(
+            r#"{"type":"result","subtype":"success","result":"ok","usage":
+               {"input_tokens":2000,"cache_read_input_tokens":2700000}}"#,
+        ) {
+            StreamLine::Result { text, tick_tokens } => {
+                assert_eq!(text, "ok");
+                assert_eq!(tick_tokens, Some(2_702_000));
+            }
+            _ => panic!("expected a result record"),
+        }
     }
 
     /// The authority section is generated, so an empty charter must read as

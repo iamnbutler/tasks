@@ -266,13 +266,20 @@ actually designed. 6-7 are where it earns trust.
 Make the resource the product runs on measurable, and its loss audible.
 
 Parse `usage` in `parse_stream_line` — every field is currently discarded
-(`orchestrator.rs:265-300`), though `input_tokens + cache_read_input_tokens`
-off the `result` record is an absolute reading of context size and therefore
-self-corrects even across turns the server never drove. Add
-`orchestrator_sessions` (`cc_session_id` PK, `started_at`, `ended_at`,
-`end_reason`, `last_context_tokens`, `summary`), stamp `cc_session_id` onto
-message rows, and make the `run_fresh` fallback emit an event plus a visible
-seam in the chat.
+(`orchestrator.rs:265-300`). **Correction (#827): the `result` record's usage
+is not a context size.** It aggregates across every internal turn of one
+`claude --print` invocation, each of which re-reads the cached prefix, so it
+measures what the tick *spent* — 2.7M on a live server, against a far smaller
+window. The absolute reading is the same arithmetic (`input_tokens +
+cache_read_input_tokens + cache_creation_input_tokens`) taken off the **last
+main-chain `assistant` record**, which is the prompt behind a single model
+call and self-corrects even across turns the server never drove. Both are
+kept, under names that say which is which: `last_context_tokens` (the gauge)
+and `last_tick_tokens` (the bill). Add `orchestrator_sessions`
+(`cc_session_id` PK, `started_at`, `ended_at`, `end_reason`,
+`last_context_tokens`, `last_tick_tokens`, `summary`), stamp `cc_session_id`
+onto message rows, and make the `run_fresh` fallback emit an event plus a
+visible seam in the chat.
 
 *Today:* `--resume` fails at 3pm, the chat continues seamlessly, and the thing
 writing it has forgotten the morning. You find out when it re-litigates
@@ -515,7 +522,9 @@ actually flows.
 
 ### 7. Owned rotation
 
-The server watches the gauge from item 1; past a threshold (env var beside
+The server watches the gauge from item 1 — `last_context_tokens`, and only
+that one; `last_tick_tokens` is spend and would fire the threshold on an
+expensive tick in an empty session. Past a threshold (env var beside
 `ORCHESTRATOR_TIMEOUT_SECS`) it runs a one-shot summarize agent over the
 durable transcript — the same shape as briefings — stores the summary in
 `orchestrator_sessions`, starts a fresh `--session-id` seeded with it, and

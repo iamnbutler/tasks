@@ -382,19 +382,37 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
     );
 }
 
-/// The context gauge: an agent reporting stream-json usage advances it, and
-/// the reading is the whole input side — cached tokens included, since on a
-/// long resumed session the cache is nearly all of it.
+/// The two gauges, from one stream. Context size is the input side of the
+/// last *main-chain* assistant turn — cached tokens included, since on a long
+/// resumed session the cache is nearly all of it, and sub-agent turns
+/// excluded, since those hold a context of their own. What the whole
+/// invocation cost is the `result` aggregate, which is a much larger number
+/// and means something else entirely.
 #[tokio::test]
-async fn a_usage_reporting_agent_advances_the_context_gauge() {
+async fn usage_separates_context_size_from_what_the_tick_spent() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("stream.jsonl");
     tokio::fs::write(
         &fixture,
         concat!(
+            // An early main-chain turn, superseded by the later one.
+            r#"{"type":"assistant","message":{"content":[],"usage":"#,
+            r#"{"input_tokens":900,"cache_read_input_tokens":60000}}}"#,
+            "\n",
+            // A sub-agent turn with a huge context of its own: not ours.
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":"#,
+            r#"{"content":[],"usage":{"input_tokens":900000}}}"#,
+            "\n",
+            // The last main-chain turn — this is the reading that counts.
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":"#,
+            r#"{"content":[],"usage":{"input_tokens":1200,"#,
+            r#""cache_read_input_tokens":180000,"cache_creation_input_tokens":800,"#,
+            r#""output_tokens":450}}}"#,
+            "\n",
+            // And the invocation's aggregate bill.
             r#"{"type":"result","subtype":"success","result":"ok","usage":"#,
-            r#"{"input_tokens":1200,"cache_read_input_tokens":180000,"#,
-            r#""cache_creation_input_tokens":800,"output_tokens":450}}"#,
+            r#"{"input_tokens":2000,"cache_read_input_tokens":2700000,"#,
+            r#""output_tokens":9000}}"#,
             "\n",
         ),
     )
@@ -430,11 +448,32 @@ async fn a_usage_reporting_agent_advances_the_context_gauge() {
     assert_eq!(
         info.context_tokens,
         Some(182_000),
-        "input + cache_read + cache_creation, not input_tokens alone"
+        "the last main-chain assistant turn: input + cache_read + cache_creation, \
+         and never the 900k sub-agent turn"
+    );
+    assert_eq!(
+        info.tick_tokens,
+        Some(2_702_000),
+        "the result aggregate is what the tick spent, kept under its own name"
     );
     // The reply itself is attributed to the session that produced it.
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.last().unwrap().content, "ok");
+
+    // A second tick by an agent that reports no usage at all must not erase
+    // either reading — a stalled gauge is honest, a cleared one is a lie.
+    let args_log = tmp.path().join("args.log");
+    let plain = write_stub(tmp.path(), &args_log, false).await;
+    let orch = orchestrator(store.clone(), &plain, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "and now?")
+        .await
+        .unwrap();
+    assert!(orch.tick().await.unwrap());
+
+    let info = store.orchestrator_session_info().await.unwrap();
+    assert_eq!(info.context_tokens, Some(182_000));
+    assert_eq!(info.tick_tokens, Some(2_702_000));
 }
 
 /// Attribution over the wire: a caller presenting the minted token is the
