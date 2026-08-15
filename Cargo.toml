@@ -18,6 +18,7 @@ members = [
     "crates/vm-pool/protocol",
     "crates/vm-pool/service",
     "crates/vm-pool/supervisor",
+    "crates/vm-pool/test-support",
 ]
 
 [workspace.package]
@@ -65,6 +66,9 @@ vm-pool-protocol = { path = "crates/vm-pool/protocol", version = "0.1.0-alpha.1"
 vm-pool-client = { path = "crates/vm-pool/client", version = "0.1.0-alpha.1" }
 vm-pool-service = { path = "crates/vm-pool/service", version = "0.1.0-alpha.1" }
 vm-pool-manager = { path = "crates/vm-pool/pool", version = "0.1.0-alpha.1" }
+# Dev-dependency only, and path-only on purpose: `cargo package` strips it
+# from the published manifest, so it cannot affect publishability.
+vm-pool-test-support = { path = "crates/vm-pool/test-support" }
 
 # tasks internal
 # build-dependency only: one implementation of the version stamp, so the

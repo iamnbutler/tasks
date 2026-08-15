@@ -10,31 +10,7 @@ use vm_pool_manager::{
     EventLog, EventPayload, ImageRef, Pool, PoolConfig, SupervisorRuntime, VmState,
 };
 use vm_pool_protocol::{Priority, ShellCommand, ShellEvent, ShellProtocol, VmConfig};
-
-/// Build the supervisor and return its path.
-async fn build_supervisor() -> PathBuf {
-    let output = tokio::process::Command::new("cargo")
-        .args(["build", "-p", "vm-pool-supervisor", "--message-format=json"])
-        .output()
-        .await
-        .unwrap();
-    assert!(output.status.success(), "supervisor build failed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find_map(|msg| {
-            if msg.get("reason")?.as_str()? == "compiler-artifact"
-                && msg.get("target")?.get("name")?.as_str()? == "supervisor"
-            {
-                Some(PathBuf::from(msg.get("executable")?.as_str()?))
-            } else {
-                None
-            }
-        })
-        .expect("could not find supervisor binary path")
-}
+use vm_pool_test_support::supervisor_binary;
 
 fn make_pool(
     binary: &PathBuf,
@@ -62,7 +38,7 @@ fn config_with_priority(priority: Priority) -> VmConfig {
 /// Test: Allocate a real VM, execute a command, verify output in the event log.
 #[tokio::test]
 async fn allocate_execute_and_verify_events() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_binary();
     let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 
@@ -146,7 +122,7 @@ async fn allocate_execute_and_verify_events() {
 /// Test: Fill the pool, then evict a low-priority VM for a high-priority one.
 #[tokio::test]
 async fn priority_eviction() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_binary();
     let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 2, events.clone());
 
@@ -224,7 +200,7 @@ async fn priority_eviction() {
 /// Test: Cannot evict when all VMs have equal or higher priority.
 #[tokio::test]
 async fn no_eviction_when_all_same_priority() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_binary();
     let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 1, events);
 
@@ -252,7 +228,7 @@ async fn no_eviction_when_all_same_priority() {
 /// verify all events in correct order.
 #[tokio::test]
 async fn full_lifecycle_with_multiple_commands() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_binary();
     let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 
@@ -342,7 +318,7 @@ async fn full_lifecycle_with_multiple_commands() {
 /// Test: Multiple VMs running concurrently, each executing commands.
 #[tokio::test]
 async fn concurrent_vms() {
-    let binary = build_supervisor().await;
+    let binary = supervisor_binary();
     let events = EventLog::<ShellProtocol>::new();
     let pool = make_pool(&binary, 3, events.clone());
 

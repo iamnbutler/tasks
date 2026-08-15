@@ -10,6 +10,8 @@ A standalone service that manages a pool of isolated Linux VMs for running workl
   - `pool/` — VM allocation, limits, health monitoring; includes transport, events, images, snapshot modules
   - `service/` — Main binary + library, Unix socket API with configurable ServiceConfig
   - `client/` — High-level async client for communicating with the service
+  - `test-support/` — Test-only helpers (locating the binaries tests exec);
+    dev-dependency only, never depended on by shipping code
 - `images/` — Dockerfiles for each image type
   - `base/` — Ubuntu + common tooling
   - `agent/` — Base + Claude Code + dev tools
@@ -40,6 +42,39 @@ cargo build                          # build all crates
 cargo build -p vm-pool-supervisor   # build supervisor only
 cargo test --workspace               # run all tests
 ```
+
+## Testing
+
+No mocks — the pool tests spawn a real supervisor process. That binary lives
+in a sibling package, so `CARGO_BIN_EXE_*` is not available to the tests that
+need it, and the obvious fallback (`cargo build` inline) takes cargo's
+build-directory lock: every such call is a place the suite can stall behind
+rust-analyzer, an editor save hook, or a build in another terminal.
+
+So tests never shell out to `cargo build` themselves. They call
+`vm_pool_test_support::supervisor_binary()`, which:
+
+1. uses `$VM_POOL_TEST_BIN_DIR/<bin>` (then `/<package>`) when that exists,
+2. otherwise builds — once per test process, memoized, using `$CARGO` so a
+   non-default toolchain stays consistent with the outer `cargo test`.
+
+Prebuild the directory and export the variable:
+
+```sh
+cargo build -p vm-pool-supervisor
+VM_POOL_TEST_BIN_DIR=$PWD/target/debug cargo test --workspace
+```
+
+The tasks workspace's `make test` does exactly this. The variable is
+vm-pool-local by design: vm-pool is vendored infrastructure and must stay
+independently testable and publishable, so it does not read the host
+project's equivalent (`TASKS_TEST_BIN_DIR`). A bare `cargo test` with nothing
+exported still works — it just builds once.
+
+Note the package/binary names differ: package `vm-pool-supervisor` declares
+`[[bin]] name = "supervisor"`, so the file cargo writes is `supervisor`. The
+helper checks the bin name first and the package name second, so pointing the
+variable straight at `target/debug` works with no copying.
 
 ## Key Decisions
 

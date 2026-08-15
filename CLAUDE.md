@@ -99,7 +99,10 @@ implementation.
   the test's own package use `env!("CARGO_BIN_EXE_<name>")`; for one from
   another package use `common::workspace_bin(name)` in `crates/tasks/tests`,
   which reads `TASKS_TEST_BIN_DIR` (exported by `make test`) and only builds
-  as a memoized fallback.
+  as a memoized fallback. vm-pool has its own copy of this —
+  `vm_pool_test_support::supervisor_binary()`, reading `VM_POOL_TEST_BIN_DIR`
+  — deliberately, so vendored infrastructure stays independently testable;
+  don't merge the two.
 - Errors: `thiserror` enums per module. Logging: `tracing`.
 - Rust edition 2024, `cargo fmt` + `cargo clippy --workspace --all-targets`
   clean before committing.
