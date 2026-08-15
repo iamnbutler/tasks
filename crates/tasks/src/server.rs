@@ -30,7 +30,7 @@ use tasks_api::http::{
     AbandonPullRequest, BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest,
     CommentRequest, CreateProject, EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest,
     ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, SendMessage, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
+    ReviewRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
@@ -220,6 +220,7 @@ pub fn router_with_services(
             "/orchestrator/session/release",
             post(release_orchestrator_session),
         )
+        .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
         .route("/briefings", get(list_briefings))
@@ -237,6 +238,18 @@ pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
     serve_with_shutdown(store, None, None, port, std::future::pending()).await
 }
 
+/// When this process started serving, stamped once by [`serve_with_shutdown`].
+///
+/// A static rather than router state so [`router`] keeps its shape for the
+/// tests that build one directly: a router with no server around it still
+/// answers `/status`, dating itself from the first call.
+static SERVING_SINCE: std::sync::OnceLock<chrono::DateTime<Utc>> = std::sync::OnceLock::new();
+
+/// When this process began serving (first call wins).
+pub fn serving_since() -> chrono::DateTime<Utc> {
+    *SERVING_SINCE.get_or_init(Utc::now)
+}
+
 /// Serve the API on loopback at `port` until `shutdown` resolves, then stop
 /// accepting connections and let the in-flight ones drain.
 pub async fn serve_with_shutdown(
@@ -246,6 +259,9 @@ pub async fn serve_with_shutdown(
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    // Stamped before the bind, so uptime measures serving and not the boot
+    // work that preceded it.
+    serving_since();
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     info!(addr = %listener.local_addr()?, "tasks api listening");
     axum::serve(listener, router_with_services(store, briefings, github))
@@ -1664,6 +1680,20 @@ async fn stream_orchestrator(
 
 // --- mode ---
 
+/// `GET /status` — who is serving, since when, what this boot migrated, and
+/// what is in flight. See [`ServerStatus`]: a 200 here is the claim that
+/// *this* pid opened the database and finished its migrations, which is what
+/// makes it a usable liveness probe for `tasks reload`.
+async fn get_status(State(store): State<Arc<Store>>) -> ApiResult<Json<ServerStatus>> {
+    Ok(Json(ServerStatus {
+        pid: std::process::id(),
+        started_at: serving_since(),
+        migrations_applied: store.migrations_applied().to_vec(),
+        mode: store.get_mode().await?,
+        in_flight: store.in_flight().await?,
+    }))
+}
+
 async fn get_mode(State(store): State<Arc<Store>>) -> ApiResult<Json<ModeResponse>> {
     Ok(Json(ModeResponse {
         mode: store.get_mode().await?,
@@ -2472,6 +2502,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// `/status` answers both halves of "is it up?" in one call: the process
+    /// facts only this pid can supply, and the store facts a supervisor needs
+    /// before it signals anything.
+    #[tokio::test]
+    async fn status_answers_process_and_store_facts_together() {
+        let (store, project) = store_with_project().await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let body: Value = http
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["pid"], std::process::id());
+        assert_eq!(body["mode"], "pause");
+        assert!(body["started_at"].is_string());
+        // An in-memory store is a first boot, so it migrated everything.
+        assert!(!body["migrations_applied"].as_array().unwrap().is_empty());
+        assert_eq!(body["in_flight"]["scouts"].as_array().unwrap().len(), 0);
+        assert!(body["in_flight"]["orchestrator"].is_null());
+
+        // A running scout shows up with the task behind it.
+        let task = insert_task(&store, &project, 1, 0).await;
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: Some("vm-1".into()),
+            branch: "scout/1".into(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+
+        let body: Value = http
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let scouts = body["in_flight"]["scouts"].as_array().unwrap();
+        assert_eq!(scouts.len(), 1);
+        assert_eq!(scouts[0]["id"], session.id.to_string());
+        assert!(scouts[0]["since"].is_string());
+
+        // And the typed shape the client and the supervisor decode.
+        let typed: ServerStatus = http
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(typed.pid, std::process::id());
+        assert!(typed.in_flight.is_destructible());
     }
 
     #[tokio::test]

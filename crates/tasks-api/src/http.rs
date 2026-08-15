@@ -241,6 +241,91 @@ pub struct ModeResponse {
     pub mode: Mode,
 }
 
+/// Response of `GET /status` — the liveness answer, from the process that
+/// owns the database.
+///
+/// Half of this is knowable only from the running process (its pid, when
+/// *this* boot started, which migrations *this* boot applied) and half only
+/// from the store (mode, work in flight). It is one route because a
+/// supervisor needs both in one answer: a 200 here is the claim "this binary
+/// opened the database, ran its migrations, and is serving".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    /// The serving process. A supervisor verifies *this*, not "something
+    /// answered the port" — a stale listener satisfies the latter.
+    pub pid: u32,
+    /// When this boot began serving.
+    pub started_at: DateTime<Utc>,
+    /// Migrations this boot actually applied — empty when the schema was
+    /// already current. Not "migrations this binary ships with": the
+    /// operator's question is whether the schema moved under them.
+    pub migrations_applied: Vec<AppliedMigration>,
+    pub mode: Mode,
+    pub in_flight: InFlight,
+}
+
+/// One migration a boot applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedMigration {
+    pub version: i64,
+    /// As sqlx records it, which is the filename with underscores turned into
+    /// spaces (`manual rank`). Render via [`AppliedMigration::file_stem`].
+    pub description: String,
+}
+
+impl AppliedMigration {
+    /// `0002_manual_rank` — the migration's filename stem, so a report is
+    /// greppable against `crates/tasks/migrations/`.
+    pub fn file_stem(&self) -> String {
+        format!("{:04}_{}", self.version, self.description.replace(' ', "_"))
+    }
+}
+
+/// Work a restart would interrupt, as `GET /status` reports it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct InFlight {
+    /// `running` scout sessions.
+    pub scouts: Vec<InFlightItem>,
+    /// `running` builds. Queued ones are deliberately absent: durable intent
+    /// survives a restart, and counting it would make a healthy backlog read
+    /// as a permanent reason never to restart.
+    pub builds: Vec<InFlightItem>,
+    /// An orchestrator turn the pipeline owes, if any. Reported, never a
+    /// reason to wait — see [`InFlight::is_destructible`].
+    pub orchestrator: Option<InFlightItem>,
+}
+
+impl InFlight {
+    /// Work a restart would destroy: a scout or a build in a VM that nobody
+    /// resumes. This is the drain condition.
+    ///
+    /// An owed orchestrator turn is not here on purpose. The obligation and
+    /// nudge loops keep producing input, so waiting for the conversation to
+    /// settle can wait forever; and the answered watermark only advances with
+    /// the reply, so a restart mid-turn costs one agent turn and the next boot
+    /// takes it again.
+    pub fn is_destructible(&self) -> bool {
+        !self.scouts.is_empty() || !self.builds.is_empty()
+    }
+
+    /// Nothing at all in flight, owed turns included.
+    pub fn is_empty(&self) -> bool {
+        !self.is_destructible() && self.orchestrator.is_none()
+    }
+}
+
+/// One piece of in-flight work: what it is, and how long it has been at it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightItem {
+    /// Session id, build id, or the seq of the oldest unanswered turn.
+    pub id: String,
+    /// What it is working on — the task behind a scout, the branch of a build.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// When it started, so a report can age it.
+    pub since: DateTime<Utc>,
+}
+
 /// One Home briefing slot as `GET /briefings` serves it. All three sections
 /// are always present; a never-generated one has no content and reads as
 /// stale.

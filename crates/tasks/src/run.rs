@@ -133,6 +133,13 @@ pub enum RunError {
     Config(#[from] ConfigError),
     #[error("http server: {0}")]
     Io(#[from] std::io::Error),
+    /// Another server already owns this data dir. Named separately because
+    /// the fix is a specific command, not a diagnosis.
+    #[error(
+        "a tasks server is already running (pid {pid}, port {port}); \
+         use `tasks reload` to swap it, or `tasks stop` to shut it down"
+    )]
+    AlreadyRunning { pid: u32, port: u16 },
 }
 
 #[derive(Debug, Error)]
@@ -362,11 +369,50 @@ pub fn data_dir() -> Result<PathBuf, ConfigError> {
 }
 
 /// Open (creating as needed) the store under `data_dir`.
+///
+/// Logs which migrations this open applied, so the answer exists in
+/// `serve.log` even when nobody ran `tasks reload` to watch the swap.
 pub async fn open_store(data_dir: &Path) -> Result<Store, RunError> {
     tokio::fs::create_dir_all(data_dir).await?;
     let db_path = data_dir.join("tasks.db");
     info!(db = %db_path.display(), "opening store");
-    Ok(Store::open(&db_path).await?)
+    let store = Store::open(&db_path).await?;
+    match store.migrations_applied() {
+        [] => info!("schema already current"),
+        applied => info!(
+            count = applied.len(),
+            migrations = %applied
+                .iter()
+                .map(|m| m.file_stem())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "applied migrations"
+        ),
+    }
+    Ok(store)
+}
+
+/// Resolve on ctrl-c or SIGTERM, whichever comes first, and say which.
+///
+/// SIGTERM is the standard restart signal, and `serve` used to have no
+/// handler for it: the default disposition kills the process outright, so a
+/// plain `kill` meant no graceful drain, no pidfile cleanup, and every
+/// in-flight scout lost. A graceful swap is only possible because this exists.
+async fn stop_signal() -> &'static str {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(err) => {
+            // Registering the handler failed — degrade to ctrl-c rather than
+            // refusing to serve.
+            warn!(error = %err, "could not install SIGTERM handler");
+            let _ = tokio::signal::ctrl_c().await;
+            return "ctrl-c";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl-c",
+        _ = term.recv() => "SIGTERM",
+    }
 }
 
 /// Run the server until ctrl_c.
@@ -380,9 +426,27 @@ pub async fn open_store(data_dir: &Path) -> Result<Store, RunError> {
 /// stop waiting — the abandoned VMs are reaped by vm-pool's health loop, and
 /// their sessions stay `running` in the store until the next startup
 /// reconciles them.
+///
+/// Two processes must never share a data dir, so the pidfile is checked
+/// *before* the store is opened: `Store::open` runs migrations, and a second
+/// process that refused a moment later would already have migrated the
+/// running server's database on its way in.
 pub async fn run(config: Config) -> Result<(), RunError> {
+    if let Some(existing) = crate::pidfile::read_live(&config.data_dir) {
+        return Err(RunError::AlreadyRunning {
+            pid: existing.pid,
+            port: existing.port,
+        });
+    }
+
     let store = Arc::new(open_store(&config.data_dir).await?);
     reconcile_startup(&store).await?;
+    // After reconciliation: until that has run, this process is not yet the
+    // owner of the work in the store.
+    match crate::pidfile::write(&config.data_dir, config.port).await {
+        Ok(file) => info!(pid = file.pid, port = file.port, exe = %file.exe.display(), "serving"),
+        Err(err) => warn!(error = %err, "could not write pidfile"),
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let poll = tokio::spawn(poll_loop(
@@ -434,17 +498,25 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // The API's own GitHub client: issue writes go through the server, so
     // without a token those routes answer 503 rather than falling back to an
     // agent's credential.
-    server::serve_with_shutdown(
+    let served = server::serve_with_shutdown(
         store,
         Some(briefings),
         config.github_client().map(Arc::new),
         config.port,
         async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutdown requested");
+            let signal = stop_signal().await;
+            info!(signal, "shutdown requested");
         },
     )
-    .await?;
+    .await;
+
+    // The listener is down, so this process is no longer serving — say so
+    // before waiting out in-flight work, so a `tasks reload` blocked on "is
+    // it gone yet?" learns the moment it is true rather than 30s later. Also
+    // on the error path: a bind that failed (a port already taken) must not
+    // leave a record claiming this pid is serving.
+    crate::pidfile::remove_if_ours(&config.data_dir, std::process::id());
+    served?;
 
     let _ = shutdown_tx.send(true);
     let _ = poll.await;
