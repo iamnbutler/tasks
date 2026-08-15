@@ -789,16 +789,24 @@ impl Capability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CharterLevel {
-    /// Refused at the endpoint. The default, and where everything starts.
+    /// Refused at the endpoint. The zero value, so an unreadable or absent
+    /// charter fails closed — but not where anything starts: the seed is
+    /// `Live` across the board.
     #[default]
     Off,
-    /// The call is accepted, the decision is recorded, and nothing happens.
+    /// The call is accepted, the decision is recorded with `enforced = 0`, and
+    /// nothing happens.
     ///
     /// Narrated, not silent: the orchestrator explains its reasoning in the
     /// conversation as it always does, and the ledger keeps the verdict it
-    /// would have rendered. After a week the question "did shadow agree with
-    /// me?" is a query, which is what makes flipping a capability an evidence
-    /// decision rather than a nerve one.
+    /// would have rendered.
+    ///
+    /// Not a probation period on the way to `Live`, which is what it was
+    /// originally for and what it is bad at — the capability does the entire
+    /// job and then hands the answer back to be re-entered by hand, spending
+    /// the human attention the system exists to save. Reach for it to demote
+    /// a capability that has already misbehaved and whose reasoning you want
+    /// to keep watching.
     Shadow,
     /// Applied.
     Live,

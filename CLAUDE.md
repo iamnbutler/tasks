@@ -33,15 +33,18 @@ implementation.
   `off` | `shadow` | `live`, human-writable only. The system prompt's
   authority section is *generated* from those rows every turn and the server
   enforces the same rows on the endpoints — one statement of authority, and
-  not one a long conversation can talk itself out of. `shadow` is a server
-  behaviour, not an instruction: the call is accepted, the decision is
-  recorded with `enforced = 0`, and nothing is applied. No capability ships
-  with a rate limit — the point of the system is that work moves without being
-  asked. Ships as
-  `queue_tasks`/`dispatch_builds`/`capture_work` live (the first two already
-  worked; the third replaces an ungoverned `gh` write) and
-  `auto_review_specs`/`retire_work` shadow. The human is never gated — this
-  governs autonomy, not the owner.
+  not one a long conversation can talk itself out of. **All five ship `live`
+  and uncapped** — the charter is a kill switch, not a promotion ladder, and
+  the point of the system is that work moves without being asked. What makes
+  that safe is the `decisions` ledger under every write: audit and recourse
+  after the fact, never pre-approval. `shadow` (server behaviour, not an
+  instruction: the call is accepted, the decision is recorded with
+  `enforced = 0`, nothing is applied) exists only for **demotion** — a
+  capability caught misbehaving, whose reasoning is still worth reading. It is
+  never a probation period on the way to `live`; that costs the human more
+  attention than just letting the thing act, and attention is the scarce
+  resource here. The human is never gated — this governs autonomy, not the
+  owner.
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool

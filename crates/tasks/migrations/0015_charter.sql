@@ -22,7 +22,7 @@
 --   * `queue_tasks` and `dispatch_builds` are `live` because they already
 --     worked. The charter exists to govern new autonomy, not to quietly
 --     remove function that was there yesterday.
---   * `capture_work` is `live`, which is *stricter* than the
+--   * `capture_work` is `live` with a cap, which is *stricter* than the
 --     status quo rather than looser: the orchestrator can already file issues
 --     with its own `gh` credential, entirely outside this system, which is
 --     the side channel that produced the `Closes #N` incident. Routing it
@@ -42,21 +42,18 @@
 CREATE TABLE orchestrator_charter (
     capability TEXT PRIMARY KEY,       -- capture_work | retire_work | queue_tasks | dispatch_builds | auto_review_specs
     level      TEXT NOT NULL,          -- off | shadow | live
-    -- JSON. Today: {"daily_limit": N}, unset by default. An optional manual
-    -- brake for a capability seen misbehaving -- not part of the design's
-    -- philosophy, and deliberately not a default. Runaway protection already
-    -- lives in the pipeline's shape: builds are serial, scouts are bounded by
-    -- SCOUT_MAX_CONCURRENT, and a failing batch is retired by the attempt cap.
+    -- JSON. Today: {"daily_limit": N} -- a mechanical floor, not a judgment.
+    -- Policy contributes caps and budgets; it never contributes verdicts.
     params     TEXT,
     updated_at TEXT NOT NULL
 );
 
 INSERT INTO orchestrator_charter (capability, level, params, updated_at) VALUES
-    ('capture_work',      'live',   NULL, '1970-01-01T00:00:00Z'),
-    ('queue_tasks',       'live',   NULL, '1970-01-01T00:00:00Z'),
-    ('dispatch_builds',   'live',   NULL, '1970-01-01T00:00:00Z'),
-    ('auto_review_specs', 'shadow', NULL, '1970-01-01T00:00:00Z'),
-    ('retire_work',       'shadow', NULL, '1970-01-01T00:00:00Z');
+    ('capture_work',      'live',   '{"daily_limit": 5}',  '1970-01-01T00:00:00Z'),
+    ('queue_tasks',       'live',   '{"daily_limit": 10}', '1970-01-01T00:00:00Z'),
+    ('dispatch_builds',   'live',   NULL,                  '1970-01-01T00:00:00Z'),
+    ('auto_review_specs', 'shadow', NULL,                  '1970-01-01T00:00:00Z'),
+    ('retire_work',       'shadow', NULL,                  '1970-01-01T00:00:00Z');
 
 -- Whether this decision was actually applied. A shadow decision is a real
 -- entry in the ledger -- it is the record of what the orchestrator judged --

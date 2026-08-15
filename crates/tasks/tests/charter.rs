@@ -159,13 +159,15 @@ async fn a_fresh_install_ships_the_intended_posture() {
         charter.iter().all(|e| e.daily_limit.is_none()),
         "no capability should ship with a rate limit"
     );
-    // The verdict stays the human's while the ledger fills with the ones it
-    // would have rendered.
-    assert_eq!(
-        level(Capability::AutoReviewSpecs).level,
-        CharterLevel::Shadow
+    // Nothing ships shadowed either. A shadowed capability does the whole job
+    // and then hands the result back as prose to be re-entered by hand, which
+    // spends more of the human's attention than acting would — and attention,
+    // not tokens or nerve, is the scarce thing. What makes `live` safe is the
+    // decisions ledger behind it: audit and recourse, not pre-approval.
+    assert!(
+        charter.iter().all(|e| e.level == CharterLevel::Live),
+        "the charter is a kill switch, not a promotion ladder: {charter:?}"
     );
-    assert_eq!(level(Capability::RetireWork).level, CharterLevel::Shadow);
 }
 
 /// Off means refused at the endpoint — not discouraged in a prompt the agent
@@ -317,6 +319,9 @@ async fn a_daily_budget_bounds_live_actions_only() {
 #[tokio::test]
 async fn the_orchestrator_cannot_set_its_own_charter() {
     let h = harness().await;
+    // Demoted first, so the attempt below is a self-promotion — the direction
+    // that actually matters. Seeded `live` would make a "live" write a no-op.
+    h.set(Capability::RetireWork, CharterLevel::Off, None).await;
 
     let resp = h
         .as_orchestrator(h.http.post(format!("{}/charter/retire_work", h.base)))
@@ -332,7 +337,7 @@ async fn the_orchestrator_cannot_set_its_own_charter() {
             .await
             .unwrap()
             .level,
-        CharterLevel::Shadow
+        CharterLevel::Off
     );
 
     // The human sets it, and it takes effect immediately.

@@ -1,0 +1,36 @@
+-- The charter is a kill switch, not a promotion ladder.
+--
+-- `0015` shipped `auto_review_specs` and `retire_work` in `shadow`, and daily
+-- caps on `capture_work` and `queue_tasks`. Both were struck within a day, for
+-- the same reason, and `0015`'s prose arguing for them should be read as the
+-- record of a wrong turn rather than as current design.
+--
+-- The caps were never asked for. Token spend is not a constraint in this
+-- system, and a per-day cap on `capture_work` is incoherent besides, since a
+-- human pressing cmd-N files through the orchestrator and would have spent the
+-- orchestrator's allowance. `params` survives as an optional manual brake on a
+-- capability seen misbehaving; it is not a default and not part of the safety
+-- story. Runaway protection is structural: backlog never dispatches, scouts
+-- are bounded by SCOUT_MAX_CONCURRENT, builds are serial.
+--
+-- Shadow's failure is more interesting, because it looked prudent. A shadowed
+-- capability does the entire job -- reads the spec, verifies the claim, forms
+-- the verdict -- and then hands the answer back as prose for the human to read
+-- and re-enter by hand. It spends the one resource this system exists to
+-- conserve, the human's attention, to buy evidence about whether the agent can
+-- be trusted to spend less of it. And the evidence is worse than the real
+-- thing: a verdict that costs nothing to be wrong about is not the same
+-- verdict as one that ships. `auto_review_specs: shadow` ran for one real day
+-- and produced exactly that -- a correct, well-argued review that then had to
+-- be performed again by hand.
+--
+-- What makes `live` safe is not a preceding trial period. It is the ledger
+-- underneath: every write lands in `decisions` with its rationale and its
+-- actor, so a bad call is visible, attributable, and reversible after the
+-- fact. Audit and recourse, not pre-approval.
+--
+-- `shadow` stays in the enum, aimed downward. A capability caught making bad
+-- calls can be dropped to it -- keeping its reasoning in the ledger while it
+-- stops acting -- or to `off` outright. That is a response to evidence, which
+-- is the direction evidence actually flows.
+UPDATE orchestrator_charter SET level = 'live', params = NULL;

@@ -341,8 +341,9 @@ body from `Implements #N` to `Closes #N` and presented it as a bug fix; that
 wording is deliberate (`builder.rs:459`, `neutralize_closing_keywords` at
 `:489`) and exists so agents cannot write GitHub-owned state. Until case law
 exists, a restarted session will make that same "fix" with the same
-confidence — tolerable only because capabilities start in shadow with a human
-reading the narration.
+confidence. With everything `live`, nothing catches that in advance — the
+ledger catches it afterwards, which is the trade this design takes everywhere
+and the reason item 4 is the one that matters most.
 
 Sketch for when it lands: append-only `orchestrator_notes` (kind `correction`
 | `instruction`, content, source decision, `created_at`, `retired_at` —
@@ -433,39 +434,50 @@ away from trusting the prompt:
   forever would be nagging about work it cannot finish. What remains is the
   human's turn.
 
-Spend budgets are per-capability daily caps counted from the ledger, and they
-count *enforced* rows only — a shadow decision changed nothing in the world, so
-charging it against the budget would starve the evaluation of the thing being
-evaluated.
+Decision rows count *enforced* ones only where any count is taken — a shadow
+decision changed nothing in the world, so reading the two as the same thing
+would make an evaluation look like a history.
 
-**Shipped defaults** (decided 2026-08-14, revising "everything starts off").
-Starting everything at `off` turned out to be the wrong safe: the orchestrator
-can already queue, dispatch, and — when told to — review, so an all-off charter
-would have *removed* function rather than governed it, which is the opposite of
-the direction this design is meant to go. What ships instead:
+**Shipped defaults** (decided 2026-08-14, then twice revised — the sketch above
+survives only as the record of a wrong turn).
 
-| Capability | Level | Why |
-| --- | --- | --- |
-| `queue_tasks` | live, 10/day | Already worked; the cap is the new part |
-| `dispatch_builds` | live | Already worked; specs are human-approved |
-| `capture_work` | live, 5/day | *Stricter* than the status quo — the alternative is an ungoverned `gh issue create` |
-| `auto_review_specs` | shadow | Today's only guard is prompt text; `live` would grant more than existed |
-| `retire_work` | shadow | Genuinely new, and the judgment with no cheap evidence standard |
+The first draft started everything at `off`. Wrong safe: the orchestrator could
+already queue, dispatch, and — when told to — review, so an all-off charter
+would have *removed* function rather than governed it. The second draft fixed
+that but kept `auto_review_specs` and `retire_work` in `shadow`, plus invented
+daily caps. Both were struck the same day, for the same reason.
 
-The one real regression is that "approve spec X" relayed through the
-conversation now answers `shadowed: true` instead of applying — the server
-cannot distinguish a relayed instruction from an autonomous verdict, and
-inventing a flag that says "the human told me to" would hand the charter's
-keys to the thing it governs. The human clicks instead, and the shadow row
-starts the calibration record that decides when `auto_review_specs` flips.
+**What ships: all five `live`, none capped.** The charter is a kill switch, not
+a promotion ladder.
 
-**Flip order.** `capture_work` first — it is additive, trivially reversible,
-addresses information loss happening right now, and generates calibration data
-in a domain where being wrong costs one closeable issue. Then `retire_work`
-(non-GitHub retirement before closure), then `dispatch_builds`, then
-`queue_tasks`, then `auto_review_specs` last. Note `dispatch_builds=live,
-auto_review_specs=shadow` is a coherent state a single play/pause switch
-cannot express — and plausibly the one to want first.
+Shadow's problem is not that it is too cautious. It is that it is the most
+expensive possible setting for the resource that is actually scarce here.
+`auto_review_specs: shadow` spent one real day in production and the shape was
+immediate: the orchestrator read the spec, verified the central claim against
+the source, wrote a correct and well-argued verdict — and then handed it back
+as prose for the human to read and re-enter by hand. Tokens were never the
+constraint; attention was. Shadow spends attention to buy evidence about
+whether the agent can be trusted to spend less of it. And the evidence it buys
+is inferior to the real thing, because a verdict that costs nothing to be wrong
+about is not the same verdict as one that ships.
+
+What makes `live` safe is not a preceding trial. It is the ledger underneath:
+every write lands in `decisions` with its rationale and its actor, so a bad call
+is visible, attributable, and reversible after the fact. Audit and recourse, not
+pre-approval — the same posture as play mode, applied to the charter itself.
+
+That also disposes of the regression the previous draft accepted: "approve spec
+X" relayed through the conversation applies again, because `auto_review_specs`
+is live. The server still cannot distinguish a relayed instruction from an
+autonomous verdict, and the fix is still not a "the human told me to" flag —
+that would hand the charter's keys to the thing it governs. The fix is that the
+capability is granted, so the distinction stops mattering.
+
+`shadow` stays in the enum, aimed at the case it is genuinely shaped for:
+**demotion**. A capability seen making bad calls can be dropped to shadow —
+keeping its reasoning in the ledger while it stops acting — or to `off`
+outright. That is a response to evidence, which is the direction the evidence
+actually flows.
 
 ### 7. Owned rotation
 
@@ -521,8 +533,9 @@ configuration allows.
    handoff notes are a good product moment and a new surface to build.
 3. **Where does the retirement judgment escalate?** "No longer relevant" is
    the one custodial call with no cheap evidence standard.
-4. **Does shadow mode narrate every capability, or only the ones under
-   evaluation?** Narrating all of them is honest and expensive.
+4. **What does a demotion look like from the human's side?** Now that `shadow`
+   is only reached downward, something has to make dropping a misbehaving
+   capability a one-gesture move — there is no charter UI at all today.
 5. **What is the compaction threshold relative to the model's context?**
    `ORCHESTRATOR_CMD` is configurable, so a hardcoded 200k is wrong in both
    directions.
