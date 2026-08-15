@@ -160,6 +160,17 @@ impl<'a> Brief<'a> {
             .iter()
             .filter(|b| matches!(b.status, BuildStatus::Queued | BuildStatus::Running))
             .collect();
+        // A spec stays `approved` for the whole build that carries it —
+        // `create_build` deliberately leaves the queue status alone so a failed
+        // build can return its specs for another attempt. So "approved" does
+        // not mean "unbuilt", and the waiting count has to subtract what the
+        // lines above just named, or the same specs appear on both. `queued`
+        // counts as carried alongside `running` because builds are serial: a
+        // dispatched batch sitting behind the running one has already been
+        // asked for. Same rule as `Store::obligations` and the guard in
+        // `Store::create_build`; the set is built from the same iteration that
+        // prints the lines so the two cannot disagree.
+        let mut carried: HashSet<&SpecId> = HashSet::new();
         for build in in_flight {
             lines.push(format!(
                 "build {} is {} on branch {} ({})",
@@ -168,16 +179,22 @@ impl<'a> Brief<'a> {
                 build.branch,
                 self.describe_specs(build_key(build), world),
             ));
+            if let Some(ids) = world.build_specs.get(build_key(build)) {
+                carried.extend(ids);
+            }
         }
 
         let approved = world
             .queue
             .iter()
-            .filter(|(_, status)| **status == SpecQueueStatus::Approved)
+            .filter(|(spec_id, status)| {
+                **status == SpecQueueStatus::Approved && !carried.contains(spec_id)
+            })
             .count();
         if approved > 0 {
             lines.push(format!(
-                "{approved} approved spec(s) are waiting to be batched into a Builder run"
+                "{approved} approved spec(s) are in no build yet, waiting to be batched \
+                 into a Builder run"
             ));
         }
         Ok(lines)
