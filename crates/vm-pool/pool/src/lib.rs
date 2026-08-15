@@ -672,6 +672,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use vm_pool_protocol::{ShellCommand, ShellEvent, ShellProtocol};
+    use vm_pool_test_support::supervisor_binary;
 
     fn test_pool(max_vms: usize) -> Arc<Pool<NoRuntime, ShellProtocol>> {
         let events = EventLog::<ShellProtocol>::new();
@@ -683,31 +684,6 @@ mod tests {
             },
             events,
         )
-    }
-
-    /// Build the supervisor and return its path.
-    async fn build_supervisor() -> std::path::PathBuf {
-        let output = tokio::process::Command::new("cargo")
-            .args(["build", "-p", "vm-pool-supervisor", "--message-format=json"])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success(), "supervisor build failed");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find_map(|msg| {
-                if msg.get("reason")?.as_str()? == "compiler-artifact"
-                    && msg.get("target")?.get("name")?.as_str()? == "supervisor"
-                {
-                    Some(std::path::PathBuf::from(msg.get("executable")?.as_str()?))
-                } else {
-                    None
-                }
-            })
-            .expect("could not find supervisor binary path")
     }
 
     #[tokio::test]
@@ -866,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_runtime_allocate_and_send() {
-        let binary = build_supervisor().await;
+        let binary = supervisor_binary();
         let events = EventLog::<ShellProtocol>::new();
         let runtime = SupervisorRuntime::new(&binary);
         let pool: Arc<Pool<SupervisorRuntime, ShellProtocol>> = Pool::with_runtime(
@@ -902,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_runtime_events_forwarded_to_log() {
-        let binary = build_supervisor().await;
+        let binary = supervisor_binary();
         let events = EventLog::<ShellProtocol>::new();
         let pool: Arc<Pool<SupervisorRuntime, ShellProtocol>> = Pool::with_runtime(
             PoolConfig {
