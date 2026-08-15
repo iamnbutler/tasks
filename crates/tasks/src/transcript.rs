@@ -64,7 +64,13 @@ impl TranscriptSink {
         if self.capped {
             return;
         }
-        let line = truncate_line(line);
+        // Scrub *before* truncating (#840). `Store::append_transcript_lines`
+        // is the guarantee; this call closes the one edge it cannot see — a
+        // 32 KiB cut landing inside `x-access-token:<token>@` strands a token
+        // prefix with no `@` behind it, which nothing downstream can still
+        // recognise as a credential. Moved here with the sink when #825 lifted
+        // it out of `scout.rs`; it covers build transcripts for free.
+        let line = truncate_line(crate::redact::redact_owned(line));
         if self.bytes + line.len() > MAX_TRANSCRIPT_BYTES_PER_RUN {
             self.capped = true;
             // Best-effort: if even this doesn't fit the queue, the log still
