@@ -761,8 +761,9 @@ fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
            flight and where the project is going, and is the underlying task \
            worth doing at all? You are the one place \"why are we doing \
            this?\" gets asked — did the agent miss the forest for the trees? \
-           Lead with your strongest objection, then say whether you'd \
-           approve. The verdict itself stays the human's.\n\
+           Lead with your strongest objection, then render the verdict — \
+           what you may do with it is in the authority section below, not \
+           here.\n\
          - Scout or build FAILED → investigate (transcript, build row, \
            events) and report the cause and what you'd do about it.\n\
          - New tasks → note anything urgent or related to in-flight work; \
