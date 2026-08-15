@@ -19,8 +19,8 @@ use tasks_protocol::TasksProtocol;
 
 mod common;
 use common::{
-    make_fixture_repo, spawn_vm_pool, stream_json_agent_path, workspace_bin,
-    write_supervisor_wrapper,
+    FIXTURE_TOKEN, credential_echo_agent_path, make_fixture_repo, spawn_vm_pool,
+    stream_json_agent_path, workspace_bin, write_supervisor_wrapper,
 };
 
 async fn insert_project_and_task(store: &Store) -> (Project, Task) {
@@ -220,5 +220,124 @@ async fn the_transcript_is_complete_before_the_session_completes() {
     assert!(
         lines.iter().any(|l| l.line.contains(r#""type":"result""#)),
         "the final result line was not persisted before completion"
+    );
+}
+
+/// #840: an agent that echoes the credentialed clone URL its VM was handed
+/// must not leave the token anywhere durable — not in the table, not in the
+/// API's answer, not in the SQLite files on disk.
+#[tokio::test]
+async fn a_credential_echoed_by_the_agent_never_reaches_the_transcript() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        credential_echo_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 2).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let db_path = tmp.path().join("tasks.db");
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store).await;
+
+    let app = tasks::server::router(store.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+        },
+    );
+    let spec = scout
+        .dispatch(
+            task.clone(),
+            &ScoutTarget {
+                repo_clone_url: repo_url,
+                base_branch: "main".into(),
+            },
+        )
+        .await
+        .expect("dispatch");
+
+    let lines = store
+        .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
+        .await
+        .unwrap();
+    let joined = lines
+        .iter()
+        .map(|l| l.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The negative assertion is only meaningful if the lines were recorded at
+    // all — pin the scrubbed form first.
+    assert!(
+        joined.contains("https://***@github.com/o/r.git"),
+        "the credentialed URL was not recorded in any form:\n{joined}"
+    );
+    assert!(
+        !joined.contains(FIXTURE_TOKEN),
+        "the token survived into the transcript:\n{joined}"
+    );
+    // All three routes in: plain stdout, a stream-json record, and stderr.
+    assert!(joined.contains("origin"), "the stdout line is missing");
+    assert!(
+        joined.contains(r#""type":"assistant""#),
+        "the stream-json record is missing"
+    );
+    assert!(
+        joined.contains("fatal: could not read from"),
+        "the stderr line is missing"
+    );
+
+    let body = reqwest::get(format!(
+        "{base}/sessions/{}/transcript?limit=2000",
+        spec.session_id
+    ))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        body.contains("https://***@github.com/o/r.git"),
+        "the API returned no transcript to check:\n{body}"
+    );
+    assert!(
+        !body.contains(FIXTURE_TOKEN),
+        "the token survived into the API response"
+    );
+
+    // At rest. A just-committed line usually lives in the WAL rather than the
+    // main file, so "not in tasks.db" alone is nearly vacuous — read both, and
+    // require the scrubbed form to be somewhere in them.
+    let mut on_disk = Vec::new();
+    for suffix in ["", "-wal"] {
+        let path = db_path.with_file_name(format!("tasks.db{suffix}"));
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            on_disk.extend_from_slice(&bytes);
+        }
+    }
+    let on_disk = String::from_utf8_lossy(&on_disk);
+    assert!(
+        on_disk.contains("https://***@github.com/o/r.git"),
+        "neither tasks.db nor tasks.db-wal holds the transcript — nothing was checked"
+    );
+    assert!(
+        !on_disk.contains(FIXTURE_TOKEN),
+        "the token is on disk in tasks.db / tasks.db-wal"
     );
 }

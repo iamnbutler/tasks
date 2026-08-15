@@ -303,6 +303,17 @@ nullable and so is `usage` itself — a renamed upstream key costs a null, not a
 failed scout. Builds have no equivalent column: a build's token cost is visible
 inside its transcript, not on the build row.
 
+**Credentials are scrubbed before a line is stored.** The server hands VMs a
+`https://x-access-token:<token>@github.com/…` clone URL, and git echoes its
+remote back — in `git remote -v`, in most of its errors — so agent output can
+carry a live token. Every transcript line is rewritten on write, for both
+owners: the userinfo of a `scheme://` URL's authority becomes `***`, giving
+`https://***@github.com/o/r.git`. Only that userinfo is touched — an `@` later
+in a path (`/a/path@with-at`) and an uncredentialed URL are left exactly as the
+agent wrote them. Render lines verbatim as usual; a `***@` you didn't expect in
+an old transcript is the one-time sweep that scrubbed rows written before this
+landed, not something the agent printed.
+
 Two caps bound each run server-side: 32 KiB per line (over-long lines are cut
 and marked with a `[tasks: truncated ` prefix) and 8 MiB per run, after which
 one notice is written and recording stops — the agent itself is unaffected.

@@ -64,7 +64,15 @@ impl TranscriptSink {
         if self.capped {
             return;
         }
-        let line = truncate_line(line);
+        // Scrub *before* truncating, and here rather than per-caller: since
+        // #825 this sink is the one write path for both owners, so a single
+        // call covers scout sessions and builds at once — which is exactly
+        // what #825 said the fix for #759 had to do.
+        //
+        // Before, not after, because a 32 KiB cut landing inside
+        // `x-access-token:<token>@` strands a token prefix with no `@` behind
+        // it, which no later pass can recognise as a credential.
+        let line = truncate_line(crate::redact::redact_owned(line));
         if self.bytes + line.len() > MAX_TRANSCRIPT_BYTES_PER_RUN {
             self.capped = true;
             // Best-effort: if even this doesn't fit the queue, the log still

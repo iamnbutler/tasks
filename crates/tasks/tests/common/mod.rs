@@ -233,6 +233,19 @@ pub fn gated_builder_agent_path() -> PathBuf {
         .join("gated-builder-agent.sh")
 }
 
+/// A stand-in agent that echoes a credentialed clone URL on stdout, inside a
+/// stream-json record, and on stderr — the leak #840 closed.
+pub fn credential_echo_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("credential-echo-agent.sh")
+}
+
+/// The fixture token [`credential_echo_agent_path`] prints. Not a secret; the
+/// point is that it must not survive anywhere durable.
+pub const FIXTURE_TOKEN: &str = "ghp_fixtureTOKEN0123456789abcdefghij";
+
 /// A stand-in agent that emits stream-json shaped output, paced so a test can
 /// attach to the live transcript tail mid-run.
 pub fn stream_json_agent_path() -> PathBuf {

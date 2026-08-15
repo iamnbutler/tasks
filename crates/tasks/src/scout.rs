@@ -665,6 +665,10 @@ impl Scout {
         vm_id: Option<&VmId>,
         reason: String,
     ) -> Result<(), ScoutError> {
+        // Failure reasons quote git, and git quotes the credentialed clone URL
+        // back at us. One call here covers all three destinations below:
+        // `sessions.exit_reason`, the event log, and the log line.
+        let reason = crate::redact::redact_owned(reason);
         let now = Utc::now();
         self.store
             .update_session_completion(
