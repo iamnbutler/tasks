@@ -693,6 +693,28 @@ pub enum DecisionAction {
     CaptureWork,
     /// An issue was closed: finished, or judged no longer worth doing.
     RetireWork,
+    /// A closed issue was reopened — the recourse for a retirement that was
+    /// wrong, and the reason `retire_work` can be trusted with `live`.
+    ReopenWork,
+    /// Something was said on an issue or a pull request. The lightest write
+    /// here: recorded because a comment is still the system speaking in
+    /// public under the owner's name.
+    CommentOnWork,
+    /// A pull request was merged. The only action whose recourse is a revert
+    /// rather than an edit.
+    MergeBuild,
+    /// A pull request was closed unmerged — the branch is not going to land.
+    AbandonBuild,
+    /// A comment pinned to a line of a pull request's diff. Separate from
+    /// `CommentOnWork` because it points at code rather than at the thread,
+    /// and because it can be wrong about a line that no longer exists.
+    ReviewComment,
+    /// An issue's body was rewritten. The only action here that destroys
+    /// rather than appends, which is why its ledger row carries the previous
+    /// text: the thing worth auditing is the diff, not the event.
+    EditIssue,
+    /// An issue's labels were replaced.
+    LabelIssue,
 }
 
 impl DecisionAction {
@@ -705,6 +727,13 @@ impl DecisionAction {
             DecisionAction::QueueTask => "queue_task",
             DecisionAction::CaptureWork => "capture_work",
             DecisionAction::RetireWork => "retire_work",
+            DecisionAction::ReopenWork => "reopen_work",
+            DecisionAction::CommentOnWork => "comment_on_work",
+            DecisionAction::MergeBuild => "merge_build",
+            DecisionAction::AbandonBuild => "abandon_build",
+            DecisionAction::ReviewComment => "review_comment",
+            DecisionAction::EditIssue => "edit_issue",
+            DecisionAction::LabelIssue => "label_issue",
         }
     }
 
@@ -717,6 +746,13 @@ impl DecisionAction {
             "queue_task" => Some(DecisionAction::QueueTask),
             "capture_work" => Some(DecisionAction::CaptureWork),
             "retire_work" => Some(DecisionAction::RetireWork),
+            "reopen_work" => Some(DecisionAction::ReopenWork),
+            "comment_on_work" => Some(DecisionAction::CommentOnWork),
+            "merge_build" => Some(DecisionAction::MergeBuild),
+            "abandon_build" => Some(DecisionAction::AbandonBuild),
+            "review_comment" => Some(DecisionAction::ReviewComment),
+            "edit_issue" => Some(DecisionAction::EditIssue),
+            "label_issue" => Some(DecisionAction::LabelIssue),
             _ => None,
         }
     }
@@ -744,17 +780,29 @@ pub enum Capability {
     DispatchBuilds,
     /// Render a review verdict on a spec.
     AutoReviewSpecs,
+    /// Say something on an issue or a pull request.
+    CommentOnWork,
+    /// Decide a Builder PR's fate: merge it, or close it unmerged.
+    /// `dispatch_builds` starts the run; this one finishes it.
+    LandBuilds,
+    /// Revise work already filed: rewrite an issue's body, change its labels.
+    /// Separate from `CaptureWork` because it rewrites rather than appends —
+    /// a bad capture leaves a bad issue, a bad edit destroys a good one.
+    CurateWork,
 }
 
 impl Capability {
     /// Every capability, in the order the charter is meant to be flipped:
     /// additive and trivially reversible first, irreversible-ish last.
-    pub const ALL: [Capability; 5] = [
+    pub const ALL: [Capability; 8] = [
         Capability::CaptureWork,
+        Capability::CommentOnWork,
         Capability::RetireWork,
         Capability::QueueTasks,
         Capability::DispatchBuilds,
         Capability::AutoReviewSpecs,
+        Capability::LandBuilds,
+        Capability::CurateWork,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -764,6 +812,9 @@ impl Capability {
             Capability::QueueTasks => "queue_tasks",
             Capability::DispatchBuilds => "dispatch_builds",
             Capability::AutoReviewSpecs => "auto_review_specs",
+            Capability::CommentOnWork => "comment_on_work",
+            Capability::LandBuilds => "land_builds",
+            Capability::CurateWork => "curate_work",
         }
     }
 
@@ -774,6 +825,9 @@ impl Capability {
             "queue_tasks" => Some(Capability::QueueTasks),
             "dispatch_builds" => Some(Capability::DispatchBuilds),
             "auto_review_specs" => Some(Capability::AutoReviewSpecs),
+            "comment_on_work" => Some(Capability::CommentOnWork),
+            "land_builds" => Some(Capability::LandBuilds),
+            "curate_work" => Some(Capability::CurateWork),
             _ => None,
         }
     }
@@ -786,6 +840,9 @@ impl Capability {
             Capability::QueueTasks => "move tasks from the backlog into the queue",
             Capability::DispatchBuilds => "batch approved specs into Builder runs",
             Capability::AutoReviewSpecs => "render review verdicts on specs",
+            Capability::CommentOnWork => "comment on issues and pull requests",
+            Capability::LandBuilds => "merge a Builder's pull request, or close it unmerged",
+            Capability::CurateWork => "revise an issue you filed: its body, its labels",
         }
     }
 }

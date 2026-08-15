@@ -28,12 +28,13 @@ implementation.
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
   and builds are serial.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
-  prompt.** Five independently switchable capabilities (`capture_work`,
-  `retire_work`, `queue_tasks`, `dispatch_builds`, `auto_review_specs`), each
+  prompt.** Eight independently switchable capabilities (`capture_work`,
+  `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,
+  `dispatch_builds`, `auto_review_specs`, `land_builds`), each
   `off` | `shadow` | `live`, human-writable only. The system prompt's
   authority section is *generated* from those rows every turn and the server
   enforces the same rows on the endpoints — one statement of authority, and
-  not one a long conversation can talk itself out of. **All five ship `live`
+  not one a long conversation can talk itself out of. **All eight ship `live`
   and uncapped** — the charter is a kill switch, not a promotion ladder, and
   the point of the system is that work moves without being asked. What makes
   that safe is the `decisions` ledger under every write: audit and recourse

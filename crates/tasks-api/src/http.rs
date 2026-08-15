@@ -86,6 +86,82 @@ pub struct CloseTaskRequest {
     pub evidence: Option<serde_json::Value>,
 }
 
+/// Body of `POST /tasks/{task_id}/reopen` — undo a retirement.
+///
+/// The recourse half of [`CloseTaskRequest`]. A capability that can close work
+/// and cannot reopen it makes every mistaken close permanent for whoever finds
+/// it next, which is a strange shape for a system whose whole safety argument
+/// is "audit and recourse, not pre-approval".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReopenTaskRequest {
+    /// What changed. Reopening contradicts an earlier recorded decision, so
+    /// the ledger should say why the earlier one no longer holds.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /issues/{number}/comments` — say something on an issue or a
+/// pull request.
+///
+/// One route for both because GitHub's comment endpoint makes no distinction:
+/// a PR *is* an issue as far as `/issues/{n}/comments` is concerned, and they
+/// share one number space. Splitting it into two routes here would invent a
+/// difference the API does not have.
+///
+/// This exists because a verdict with nowhere to go is a verdict that comes
+/// back as prose for a human to re-read and re-type. That is the same waste
+/// shadow mode produced, arriving by a different road.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommentRequest {
+    /// Which repository. Optional when exactly one project is configured.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// The comment, as markdown.
+    pub body: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /pull-requests/{number}/merge`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MergePullRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// `merge`, `squash`, or `rebase`. Defaults to `squash`, which is what
+    /// every Builder PR in this repo has been merged with.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The commit subject. Defaults to GitHub's own, which is the PR title.
+    #[serde(default)]
+    pub commit_title: Option<String>,
+    /// Why this is safe to land. Required of the orchestrator: merging is the
+    /// one write here whose recourse is a revert rather than an edit, so the
+    /// ledger row has to be worth reading on its own.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// What was checked — CI conclusion, the review, the diff. Free-form JSON.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /pull-requests/{number}/close` — close a PR without merging.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbandonPullRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// Why this branch is not going to land. Required of the orchestrator —
+    /// abandoning a Builder run discards work that cost a VM hour, and the
+    /// only thing that makes that reviewable is the stated reason.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// Body of `POST /queue/reorder`: the complete queue order, front to back.
 /// Tasks not listed are left unranked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,4 +261,79 @@ pub struct BriefingStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Body of `POST /pull-requests/{number}/review-comments` — a comment pinned
+/// to one line of the diff.
+///
+/// The head SHA is deliberately not a field. GitHub anchors a review comment
+/// to a commit, and a SHA that arrived through a prompt is precisely the kind
+/// of GitHub-owned fact this system refuses to carry: the server reads the
+/// current head at comment time instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewCommentRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// Repo-relative path, as it appears in the diff.
+    pub path: String,
+    /// Line number in the file *after* the change. The file has to actually
+    /// appear in the diff — GitHub refuses otherwise, which is correct: a
+    /// review comment on an unchanged line is one nobody sees.
+    pub line: u64,
+    pub body: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /issues/{number}/edit` — rewrite an issue's title or body.
+///
+/// The only write in the API that destroys rather than appends, which is why
+/// the server reads the current text first and stores it on the decision. An
+/// issue built on a theory that later collapses is worse than no issue: the
+/// next reader inherits the superseded reasoning as though it still held. But
+/// "the orchestrator edited #835" is not an auditable record — the diff is —
+/// so the ledger keeps the old text whether anyone asked for it or not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EditIssueRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// Omit to leave unchanged.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Omit to leave unchanged. Replaces the body entirely.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// What changed and why the earlier text no longer holds. Required of the
+    /// orchestrator — an edit with no reason is indistinguishable from a
+    /// mistake once the old text is only in the ledger.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /issues/{number}/labels` — replace an issue's labels.
+///
+/// The complete set, not an addition, so removing a label is expressible.
+/// Read the vocabulary from `GET /labels` first: labelling from a guessed
+/// vocabulary is how a repo ends up with `bug` and `bugs`, and every filter
+/// written afterwards is quietly wrong.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetLabelsRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// One entry of `GET /labels`: the repository's label vocabulary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelInfo {
+    pub name: String,
+    pub description: String,
 }
