@@ -288,10 +288,23 @@ pub async fn write_builder_supervisor_wrapper(
 /// A stand-in builder agent that commits work, forgets one file, and writes
 /// SUMMARY.md — lives in the builder-supervisor crate's fixtures.
 pub fn stub_builder_agent_path() -> PathBuf {
+    builder_agent_fixture("stub-builder-agent.sh")
+}
+
+/// A stand-in builder agent that talks on both pipes, commits nothing and
+/// exits non-zero: the silent-failure shape from #825.
+pub fn silent_builder_agent_path() -> PathBuf {
+    builder_agent_fixture("silent-builder-agent.sh")
+}
+
+/// `BUILDER_AGENT_CMD` is split on whitespace with no shell, so these have to
+/// be real executables (mode 755) at paths without spaces — not inlined
+/// snippets.
+fn builder_agent_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("builder-supervisor")
         .join("tests")
         .join("fixtures")
-        .join("stub-builder-agent.sh")
+        .join(name)
 }

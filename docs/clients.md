@@ -157,23 +157,34 @@ not the entity lists, and must hold the **whole** log:
   fires at open; merged/closed state is GitHub's, queried at render time or
   not shown. Don't present opened PRs as shipped work.
 
-## Session transcripts
+## Transcripts
 
 Agent output is a **separate channel from the event log**, on purpose (see
-*Event volume* below). Two endpoints, both scoped to one session:
+*Event volume* below). Two owners — a scout session and a build — on one
+contract, four endpoints:
 
 - `GET /sessions/{id}/transcript?since=<seq>&limit=` — catch-up read. Returns
-  `[{session_id, seq, timestamp, stream, line}]`, oldest first. `stream` is
+  `[{owner, seq, timestamp, stream, line}]`, oldest first. `stream` is
   `stdout` \| `stderr`. `since` is **inclusive**, matching `/events?since=` — a
   tailing client passes `last_seq + 1`. `limit` defaults to 500, capped at 2000.
 - `GET /sessions/{id}/transcript/stream` — SSE tail. Replays from `since` (all
   of it, paging internally — no `limit`, so the stream can't silently skip a
   span) and then streams live lines, with the same 15s keepalive as
   `/events/stream`.
+- `GET /builds/{id}/transcript?since=<seq>&limit=` and
+  `GET /builds/{id}/transcript/stream` — the builder agent's output, same
+  contract, same caps, same marker. When a build failed, this is the first
+  thing to read: the build row says it failed, the transcript says why.
 
-`seq` is dense per session and assigned server-side at persist time. An empty
-transcript means *nothing was recorded* — sessions predating transcript capture
-have none — so render it as "no transcript", never as a failure.
+`owner` is internally tagged and names the route to fetch more from:
+`{"kind":"session","session_id":"sess_…"}` or
+`{"kind":"build","build_id":"build_…"}`.
+
+`seq` is dense **per owner** and assigned server-side at persist time, so keep
+cursors per owner, never per task — a build's first line is seq 1 no matter
+what its specs' scout sessions recorded. An empty transcript means *nothing was
+recorded* — runs predating transcript capture have none — so render it as "no
+transcript", never as a failure.
 
 Lines are the agent's stream-json output: one JSON object per line (assistant
 messages, thinking, tool calls with their inputs, tool results, and a final
@@ -182,17 +193,23 @@ parse Claude Code's schema — it's forwarded verbatim, and a transcript can
 contain any file the agent read, so it carries the same trust boundary as the
 rest of this API: local SQLite, loopback only, no auth.
 
+A few lines are the server's own, not the agent's, and they are plain text
+rather than JSON: the truncation and drop notices below, and
+`[tasks] builder agent exited with code N` — the builder agent's exit status,
+written into the same ordered stream as the output that explains it.
+
 `Session` also carries `usage` (`{input_tokens, output_tokens,
 cache_read_input_tokens, cache_creation_input_tokens, total_cost_usd,
 duration_ms, num_turns}`), parsed from that final record. Every field is
 nullable and so is `usage` itself — a renamed upstream key costs a null, not a
-failed scout.
+failed scout. Builds have no equivalent column: a build's token cost is visible
+inside its transcript, not on the build row.
 
-Two caps bound a session server-side: 32 KiB per line (over-long lines are cut
-and marked) and 8 MiB per session, after which one notice is written and
-recording stops — the scout itself is unaffected. Lines lost to queue pressure
-are announced inline as `[tasks] N transcript line(s) dropped here` rather than
-left as an invisible gap.
+Two caps bound each run server-side: 32 KiB per line (over-long lines are cut
+and marked with a `[tasks: truncated ` prefix) and 8 MiB per run, after which
+one notice is written and recording stops — the agent itself is unaffected.
+Lines lost to queue pressure are announced inline as `[tasks] N transcript
+line(s) dropped here` rather than left as an invisible gap.
 
 ## Event volume
 
