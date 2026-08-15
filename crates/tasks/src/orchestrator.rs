@@ -102,6 +102,12 @@ impl Orchestrator {
         if pending.is_empty() {
             return Ok(false);
         }
+        // Before any of the slow work (charter read, prompt build, agent
+        // spawn): the whole point is to cover the silence in front of the
+        // first token. A no-op tick publishes nothing — a client must never
+        // be told a tick began when none did.
+        self.store
+            .publish_orchestrator_feed(OrchestratorFeedEvent::Started);
         let answered_through = pending.last().map(|m| m.seq).unwrap_or(0);
         let prompt = pending
             .iter()
