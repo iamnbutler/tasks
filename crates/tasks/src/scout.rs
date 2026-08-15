@@ -133,7 +133,16 @@ impl Scout {
             .client
             .allocate(&self.config.image, self.config.vm_config.clone())
             .await?;
-        info!(%vm_id, task_id = %task.id, "allocated scout VM");
+        // The VM's shape is logged with the allocation so a failure that only
+        // makes sense in terms of memory (an OOM-killed linker) can be
+        // correlated with what this VM actually had.
+        info!(
+            %vm_id,
+            task_id = %task.id,
+            cpus = ?self.config.vm_config.cpus,
+            memory_mb = ?self.config.vm_config.memory_mb,
+            "allocated scout VM"
+        );
 
         // Persist initial session (branch filled in once Scout emits Started).
         let session_row = Session {

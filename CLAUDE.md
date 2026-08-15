@@ -137,6 +137,9 @@ env / `.env`:
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
 | `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
+| `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
+| `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
+| `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |

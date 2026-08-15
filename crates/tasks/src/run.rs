@@ -178,8 +178,13 @@ pub struct Config {
     /// Branch scouts base their throwaway branch on (`SCOUT_BASE_BRANCH`).
     /// Future: per-project config.
     pub scout_base_branch: String,
-    /// VM shape requested from vm-pool for each scout.
+    /// VM shape requested from vm-pool for each scout (`SCOUT_VM_*`).
     pub vm_config: VmConfig,
+    /// VM shape requested from vm-pool for each build (`BUILDER_VM_*`).
+    /// Deliberately larger than a scout's: builds are serial, so a Builder's
+    /// memory is not multiplied by anything, and a Builder killed halfway
+    /// costs a whole implementation rather than one exploration.
+    pub builder_vm_config: VmConfig,
     /// vm-pool image builds run in (`BUILDER_IMAGE`).
     pub builder_image: String,
     /// Wall-clock budget for one build (`BUILDER_TIMEOUT_SECS`).
@@ -205,6 +210,9 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
+        // Resolved once and shared by both roles: the apiKeyHelper path shells
+        // out to a script, and it should not run twice per startup.
+        let credentials = agent_credentials_env();
         Ok(Self {
             data_dir: data_dir()?,
             port: parse_env("TASKS_SERVER_PORT", "a port number", DEFAULT_PORT)?,
@@ -234,12 +242,8 @@ impl Config {
             clone_url_base: env_string("GITHUB_CLONE_URL_BASE")
                 .unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into()),
             scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
-            vm_config: VmConfig {
-                cpus: Some(parse_env("SCOUT_VM_CPUS", "a positive integer", 4)?),
-                memory_mb: Some(parse_env("SCOUT_VM_MEMORY_MB", "a size in MB", 4096)?),
-                env: scout_vm_env(),
-                ..VmConfig::default()
-            },
+            vm_config: agent_vm_config(SCOUT_VM, &credentials)?,
+            builder_vm_config: agent_vm_config(BUILDER_VM, &credentials)?,
             builder_image: env_string("BUILDER_IMAGE")
                 .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.into()),
             builder_timeout: Duration::from_secs(parse_env(
@@ -296,12 +300,98 @@ fn env_string(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|s| !s.is_empty())
 }
 
-/// Credentials for the agent inside Scout VMs, resolved host-side once at
-/// startup: `ANTHROPIC_API_KEY` from the environment, else the output of the
-/// host's Claude Code `apiKeyHelper` script (`~/.claude/anthropic_key.sh`)
-/// when one exists. Injected per-VM via `VmConfig.env`, never baked into
-/// images. Empty means scouts will fail agent auth — warned at startup.
-fn scout_vm_env() -> Vec<(String, String)> {
+/// The env vars and defaults that shape one role's VM. A role is a set of
+/// knobs, not a set of behaviours: Scout and Builder differ only in the
+/// numbers, so they share [`agent_vm_config`] and the derivation below.
+struct VmRole {
+    cpus_var: &'static str,
+    memory_var: &'static str,
+    /// Overrides the derived `CARGO_BUILD_JOBS` outright, for a host that
+    /// knows better than the formula.
+    jobs_var: &'static str,
+    default_cpus: u32,
+    default_memory_mb: u32,
+}
+
+/// Scouts run `SCOUT_MAX_CONCURRENT` at a time, so their memory is the number
+/// that gets multiplied on a small host. 6 GB derives 2 build jobs.
+const SCOUT_VM: VmRole = VmRole {
+    cpus_var: "SCOUT_VM_CPUS",
+    memory_var: "SCOUT_VM_MEMORY_MB",
+    jobs_var: "SCOUT_BUILD_JOBS",
+    default_cpus: 4,
+    default_memory_mb: 6144,
+};
+
+/// Builds are serial: exactly one of these exists at a time, and losing one
+/// costs a whole implementation. 8 GB derives 3 build jobs.
+const BUILDER_VM: VmRole = VmRole {
+    cpus_var: "BUILDER_VM_CPUS",
+    memory_var: "BUILDER_VM_MEMORY_MB",
+    jobs_var: "BUILDER_BUILD_JOBS",
+    default_cpus: 4,
+    default_memory_mb: 8192,
+};
+
+/// Memory set aside for everything that is not a cargo job: the agent process
+/// itself, the supervisor, git, and the page cache a build churns through.
+const AGENT_RESERVE_MEMORY_MB: u32 = 2048;
+/// Memory to budget per concurrent cargo job. Linking this workspace's test
+/// binaries is the peak, and it is what the OOM reports were about.
+const BUILD_JOB_MEMORY_MB: u32 = 2048;
+
+/// How many concurrent cargo jobs a VM of this shape can afford.
+///
+/// Cargo defaults `-j` to the CPU count and knows nothing about the memory
+/// limit, which is the whole bug: 4 CPUs against 4 GB runs four concurrent
+/// links of this workspace and the kernel kills one. Deriving the job count
+/// from memory instead — and injecting it per-VM as `CARGO_BUILD_JOBS` —
+/// states the rule once for every role rather than once per image.
+///
+/// Both constants are worth revisiting as the workspace grows; they are
+/// calibrated so the shape that was failing (4 CPU / 4 GB) derives the single
+/// job the field reports say completes.
+fn build_jobs(cpus: u32, memory_mb: u32) -> u32 {
+    let for_jobs = memory_mb.saturating_sub(AGENT_RESERVE_MEMORY_MB);
+    (for_jobs / BUILD_JOB_MEMORY_MB).clamp(1, cpus.max(1))
+}
+
+/// Build one role's VM shape: cpus, memory, and the environment its agent
+/// runs with (credentials plus the derived `CARGO_BUILD_JOBS`).
+///
+/// The images pin `CARGO_BUILD_JOBS=1` as a floor for hand-started
+/// containers; this env entry overrides it, so the server's arithmetic always
+/// wins for a VM the server allocated.
+fn agent_vm_config(
+    role: VmRole,
+    credentials: &[(String, String)],
+) -> Result<VmConfig, ConfigError> {
+    let cpus: u32 = parse_env(role.cpus_var, "a positive integer", role.default_cpus)?.max(1);
+    let memory_mb: u32 = parse_env(role.memory_var, "a size in MB", role.default_memory_mb)?;
+    let jobs: u32 = parse_env(
+        role.jobs_var,
+        "a positive integer",
+        build_jobs(cpus, memory_mb),
+    )?
+    .max(1);
+
+    let mut env = credentials.to_vec();
+    env.push(("CARGO_BUILD_JOBS".into(), jobs.to_string()));
+    Ok(VmConfig {
+        cpus: Some(cpus),
+        memory_mb: Some(memory_mb),
+        env,
+        ..VmConfig::default()
+    })
+}
+
+/// Credentials for the agent inside a Scout or Builder VM, resolved host-side
+/// once at startup: `ANTHROPIC_API_KEY` from the environment, else the output
+/// of the host's Claude Code `apiKeyHelper` script
+/// (`~/.claude/anthropic_key.sh`) when one exists. Injected per-VM via
+/// `VmConfig.env`, never baked into images. Empty means agents will fail auth
+/// — warned at startup.
+fn agent_credentials_env() -> Vec<(String, String)> {
     if let Some(key) = env_string("ANTHROPIC_API_KEY") {
         return vec![("ANTHROPIC_API_KEY".into(), key)];
     }
@@ -313,7 +403,7 @@ fn scout_vm_env() -> Vec<(String, String)> {
             Ok(out) if out.status.success() => {
                 let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !key.is_empty() {
-                    tracing::info!("scout credentials: host apiKeyHelper");
+                    tracing::info!("agent credentials: host apiKeyHelper");
                     return vec![("ANTHROPIC_API_KEY".into(), key)];
                 }
             }
@@ -325,7 +415,7 @@ fn scout_vm_env() -> Vec<(String, String)> {
             }
         }
     }
-    tracing::warn!("no scout credentials found — scouts will fail agent auth");
+    tracing::warn!("no agent credentials found — scouts and builds will fail agent auth");
     Vec::new()
 }
 
@@ -1193,7 +1283,7 @@ pub async fn build_loop(store: Arc<Store>, config: Config, mut shutdown: watch::
             github.clone(),
             BuilderConfig {
                 image: config.builder_image.clone(),
-                vm_config: config.vm_config.clone(),
+                vm_config: config.builder_vm_config.clone(),
                 timeout: config.builder_timeout,
                 scratch_root: config.data_dir.join("build-scratch"),
             },
@@ -1302,6 +1392,7 @@ mod tests {
             clone_url_base: DEFAULT_CLONE_URL_BASE.into(),
             scout_base_branch: "main".into(),
             vm_config: VmConfig::default(),
+            builder_vm_config: VmConfig::default(),
             builder_image: DEFAULT_BUILDER_IMAGE.into(),
             builder_timeout: Duration::from_secs(DEFAULT_BUILDER_TIMEOUT_SECS),
             github_rest_api_url: None,
@@ -1321,6 +1412,25 @@ mod tests {
             repo_name: "tasks".into(),
             added_at: Utc::now(),
         }
+    }
+
+    /// The shape that was OOM-killing builds: cargo would have taken its
+    /// default of 4 concurrent jobs against 4 GB and lost a linker to the
+    /// kernel. One job is what the field reports say completes.
+    #[test]
+    fn four_cpus_and_four_gb_derive_a_single_build_job() {
+        assert_eq!(build_jobs(4, 4096), 1);
+    }
+
+    #[test]
+    fn build_jobs_scale_with_memory_and_stop_at_the_cpu_count() {
+        assert_eq!(build_jobs(4, 6144), 2, "the scout default");
+        assert_eq!(build_jobs(4, 8192), 3, "the builder default");
+        // Memory to spare, but there is no point running more jobs than CPUs.
+        assert_eq!(build_jobs(4, 65536), 4);
+        // vm-pool's own default shape, and anything smaller, still builds.
+        assert_eq!(build_jobs(2, 2048), 1);
+        assert_eq!(build_jobs(1, 65536), 1);
     }
 
     #[test]
