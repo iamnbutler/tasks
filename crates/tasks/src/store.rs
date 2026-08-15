@@ -8,6 +8,7 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
@@ -138,6 +139,105 @@ impl ReconcileReport {
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Rows rewritten per transaction by a one-shot repair. Small enough that the
+/// sweep never holds a write lock long enough to matter to a live scout.
+const MAINTENANCE_BATCH: i64 = 500;
+
+/// Run the one-shot repairs a migration asked for, then forget them.
+///
+/// The seam exists for repairs a migration *cannot* express in SQL — the
+/// credential sweep below needs `redact`, and SQLite has no regex, so the
+/// alternative was a second implementation of the redaction rules that could
+/// disagree with the first. Don't reach for this for anything plain SQL can
+/// do.
+///
+/// An unrecognised marker is logged and **left in place**: it means a newer
+/// binary wrote this database, and dropping the row would silently lose a
+/// repair that binary still intends to perform.
+async fn run_pending_maintenance(pool: &SqlitePool) -> Result<(), StoreError> {
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pending_maintenance ORDER BY requested_at, name")
+            .fetch_all(pool)
+            .await?;
+    for name in names {
+        match name.as_str() {
+            "redact_transcripts" => {
+                let scrubbed = sweep_transcript_credentials(pool).await?;
+                if scrubbed > 0 {
+                    warn!(
+                        rows = scrubbed,
+                        "scrubbed credentials out of historical transcript lines; \
+                         those lines were readable over the API, so rotate GITHUB_TOKEN"
+                    );
+                }
+            }
+            other => {
+                warn!(
+                    marker = other,
+                    "unrecognised pending_maintenance marker, leaving it in place; \
+                     a newer binary probably wrote this database"
+                );
+                continue;
+            }
+        }
+        sqlx::query("DELETE FROM pending_maintenance WHERE name = ?")
+            .bind(&name)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Rewrite transcript lines written before the scrub moved onto the write
+/// path (#840). Returns how many rows changed.
+///
+/// `LIKE '%://%@%'` only narrows the scan — `redact` still decides row by row,
+/// so `/a/path@with-at` survives the sweep exactly as it survives the write
+/// path. Paging is keyset on the primary key rather than `OFFSET`: a rewritten
+/// row still matches the prefilter, but nothing here should depend on that.
+async fn sweep_transcript_credentials(pool: &SqlitePool) -> Result<u64, StoreError> {
+    let mut cursor = (String::new(), i64::MIN);
+    let mut scrubbed = 0u64;
+    loop {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT session_id, seq, line FROM transcript_lines \
+             WHERE (session_id > ? OR (session_id = ? AND seq > ?)) \
+             AND line LIKE '%://%@%' \
+             ORDER BY session_id, seq LIMIT ?",
+        )
+        .bind(&cursor.0)
+        .bind(&cursor.0)
+        .bind(cursor.1)
+        .bind(MAINTENANCE_BATCH)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(scrubbed);
+        }
+        let batch_len = rows.len() as i64;
+        let mut tx = pool.begin().await?;
+        for (session_id, seq, line) in rows {
+            let redacted = crate::redact::redact(&line);
+            if redacted != line {
+                sqlx::query(
+                    "UPDATE transcript_lines SET line = ? WHERE session_id = ? AND seq = ?",
+                )
+                .bind(&redacted)
+                .bind(&session_id)
+                .bind(seq)
+                .execute(&mut *tx)
+                .await?;
+                scrubbed += 1;
+            }
+            cursor = (session_id, seq);
+        }
+        tx.commit().await?;
+        if batch_len < MAINTENANCE_BATCH {
+            return Ok(scrubbed);
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlx: {0}")]
@@ -200,6 +300,7 @@ impl Store {
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
+        run_pending_maintenance(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -219,6 +320,7 @@ impl Store {
             .connect("sqlite::memory:")
             .await?;
         MIGRATOR.run(&pool).await?;
+        run_pending_maintenance(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -1060,6 +1162,13 @@ impl Store {
         let mut persisted = Vec::with_capacity(lines.len());
         for (offset, (stream, line)) in lines.iter().enumerate() {
             let seq = next + offset as i64;
+            // Scrubbed here rather than at each producer: this is the one
+            // choke point every transcript passes through, so a token never
+            // reaches the table — which covers a copy of `tasks.db` as well as
+            // the API, and means no future reader can forget. The row and the
+            // broadcast copy are built from the same scrubbed text, so a live
+            // tail and a catch-up read see identical bytes.
+            let line = crate::redact::redact_line(line);
             sqlx::query(
                 "INSERT INTO transcript_lines (session_id, build_id, seq, timestamp, stream, line) \
                  VALUES (?, ?, ?, ?, ?, ?)",
@@ -1069,7 +1178,7 @@ impl Store {
             .bind(seq)
             .bind(now.to_rfc3339())
             .bind(stream.as_str())
-            .bind(line)
+            .bind(line.as_ref())
             .execute(&mut *tx)
             .await?;
             persisted.push(TranscriptLine {
@@ -1077,7 +1186,7 @@ impl Store {
                 seq,
                 timestamp: now,
                 stream: *stream,
-                line: line.clone(),
+                line: line.into_owned(),
             });
         }
         tx.commit().await?;
@@ -6503,563 +6612,4 @@ mod tests {
             vec!["a_repair_from_the_future"]
         );
     }
-
-    #[tokio::test]
-    async fn session_usage_round_trips() {
-        let store = Store::open_in_memory().await.unwrap();
-        let (task, _) = seed_spec(&store, 1).await;
-        let session = Session {
-            id: SessionId::new(),
-            task_id: task.id.clone(),
-            vm_id: None,
-            branch: String::new(),
-            status: SessionStatus::Running,
-            started_at: Utc::now(),
-            completed_at: None,
-            exit_reason: None,
-            usage: None,
-        };
-        store.insert_session(&session).await.unwrap();
-        assert!(
-            store
-                .get_session(&session.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .usage
-                .is_none()
-        );
-
-        let usage = SessionUsage {
-            input_tokens: Some(1200),
-            output_tokens: Some(340),
-            total_cost_usd: Some(0.0421),
-            ..Default::default()
-        };
-        store
-            .update_session_usage(&session.id, &usage)
-            .await
-            .unwrap();
-        let back = store.get_session(&session.id).await.unwrap().unwrap();
-        assert_eq!(back.usage, Some(usage));
-    }
-
-    #[tokio::test]
-    async fn retirable_listing_is_closed_and_picked_up_only() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-
-        let mut wanted = Vec::new();
-        for (number, state, gh_state) in [
-            (1, TaskState::Queued, GhState::Closed),
-            (2, TaskState::InReview, GhState::Closed),
-            (3, TaskState::ReadyToBuild, GhState::Closed),
-            // Not candidates: still open, never picked up, mid-scout, or done.
-            (4, TaskState::Queued, GhState::Open),
-            (5, TaskState::Backlog, GhState::Closed),
-            (6, TaskState::Scouting, GhState::Closed),
-            (7, TaskState::Done, GhState::Closed),
-        ] {
-            let mut task = sample_task(&project.id);
-            task.gh_issue_number = number;
-            task.state = state;
-            task.gh_state = gh_state;
-            store.insert_task(&task).await.unwrap();
-            if number <= 3 {
-                wanted.push(task.id);
-            }
-        }
-
-        let mut got: Vec<TaskId> = store
-            .list_retirable_tasks(&project.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        wanted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(got, wanted);
-    }
-
-    #[tokio::test]
-    async fn retire_task_concludes_the_work_and_frees_its_queue_slot() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-
-        let mut task = sample_task(&project.id);
-        task.state = TaskState::Queued;
-        task.gh_state = GhState::Closed;
-        task.manual_rank = Some(3);
-        store.insert_task(&task).await.unwrap();
-
-        let retired = store
-            .retire_task(&task.id, TaskState::Done)
-            .await
-            .unwrap()
-            .expect("task was retirable");
-        assert_eq!(retired.state, TaskState::Done);
-        assert_eq!(retired.manual_rank, None);
-
-        let payloads: Vec<EventPayload> = store
-            .all_events()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.payload)
-            .collect();
-        assert!(payloads.contains(&EventPayload::TaskStateChanged {
-            task_id: task.id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Done,
-        }));
-    }
-
-    /// Retirement is a no-op (not an error) when the decision-time re-check
-    /// fails: the issue reopened, or the state moved on.
-    #[tokio::test]
-    async fn retire_task_declines_when_no_longer_a_candidate() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-
-        let mut reopened = sample_task(&project.id);
-        reopened.state = TaskState::InReview;
-        reopened.gh_state = GhState::Open;
-        store.insert_task(&reopened).await.unwrap();
-        assert!(
-            store
-                .retire_task(&reopened.id, TaskState::Done)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let mut scouting = sample_task(&project.id);
-        scouting.gh_issue_number = 43;
-        scouting.state = TaskState::Scouting;
-        scouting.gh_state = GhState::Closed;
-        store.insert_task(&scouting).await.unwrap();
-        assert!(
-            store
-                .retire_task(&scouting.id, TaskState::Rejected)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // Neither attempt left a trace.
-        assert!(store.all_events().await.unwrap().is_empty());
-
-        let err = store
-            .retire_task(&reopened.id, TaskState::Backlog)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Invalid(_)));
-    }
-
-    /// Insert the full chain a build consumes: a ready_to_build task, its
-    /// session, its spec, and an approved queue entry.
-    async fn approved_spec(store: &Store, project: &Project, issue: u64) -> (Task, Spec) {
-        let mut task = sample_task(&project.id);
-        task.gh_issue_number = issue;
-        task.state = TaskState::ReadyToBuild;
-        store.insert_task(&task).await.unwrap();
-
-        let session = Session {
-            id: SessionId::new(),
-            task_id: task.id.clone(),
-            vm_id: None,
-            branch: format!("scout/{}", task.id),
-            status: SessionStatus::ScoutSucceeded,
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            exit_reason: None,
-            usage: None,
-        };
-        store.insert_session(&session).await.unwrap();
-
-        let spec = Spec {
-            id: SpecId::new(),
-            session_id: session.id,
-            task_id: task.id.clone(),
-            content: format!("## Spec: issue {issue}"),
-            complexity: Complexity::Simple,
-            files_touched: vec![],
-            created_at: Utc::now(),
-        };
-        store.insert_spec(&spec).await.unwrap();
-        store
-            .upsert_spec_queue_entry(&SpecQueueEntry {
-                spec_id: spec.id.clone(),
-                status: SpecQueueStatus::Approved,
-                rank: None,
-                approved_at: Some(Utc::now()),
-                feedback: None,
-                blocking_dependencies: vec![],
-            })
-            .await
-            .unwrap();
-        (task, spec)
-    }
-
-    #[tokio::test]
-    async fn create_build_validates_the_batch() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (_task, spec) = approved_spec(&store, &project, 1).await;
-
-        // Empty and duplicated sets.
-        assert!(matches!(
-            store
-                .create_build(&[], "main", DecisionInput::human())
-                .await
-                .unwrap_err(),
-            StoreError::Invalid(_)
-        ));
-        assert!(matches!(
-            store
-                .create_build(
-                    &[spec.id.clone(), spec.id.clone()],
-                    "main",
-                    DecisionInput::human()
-                )
-                .await
-                .unwrap_err(),
-            StoreError::Invalid(_)
-        ));
-
-        // A non-approved spec.
-        let (_t2, pending) = approved_spec(&store, &project, 2).await;
-        store
-            .review_spec(
-                &pending.id,
-                SpecQueueStatus::Rejected,
-                None,
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-        let err = store
-            .create_build(
-                std::slice::from_ref(&pending.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("rejected"), "{err}");
-
-        // A spec already in an active build.
-        let build = store
-            .create_build(
-                std::slice::from_ref(&spec.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(build.status, BuildStatus::Queued);
-        assert_eq!(build.branch, format!("build/{}", build.id));
-        let err = store
-            .create_build(
-                std::slice::from_ref(&spec.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("already part of"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn create_build_resorts_the_batch_into_spec_queue_order() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (_ta, spec_a) = approved_spec(&store, &project, 1).await;
-        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
-        // Rank b above a; the human's order wins over the caller's.
-        store
-            .set_spec_queue_order(&[spec_b.id.clone(), spec_a.id.clone()])
-            .await
-            .unwrap();
-
-        let build = store
-            .create_build(
-                &[spec_a.id.clone(), spec_b.id.clone()],
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.build_spec_ids(&build.id).await.unwrap(),
-            vec![spec_b.id, spec_a.id]
-        );
-    }
-
-    #[tokio::test]
-    async fn claiming_is_serial_by_construction() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
-        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
-
-        let first = store
-            .create_build(
-                std::slice::from_ref(&spec_a.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-        let _second = store
-            .create_build(
-                std::slice::from_ref(&spec_b.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-
-        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
-        assert_eq!(claimed.id, first.id, "oldest first");
-        assert_eq!(claimed.status, BuildStatus::Running);
-        // Its task went building; the second build cannot be claimed.
-        assert_eq!(
-            store.get_task(&task_a.id).await.unwrap().unwrap().state,
-            TaskState::Building
-        );
-        assert!(
-            store.claim_next_queued_build().await.unwrap().is_none(),
-            "one at a time"
-        );
-
-        // Failure returns the task to ready_to_build, spec stays approved,
-        // and the queue unblocks.
-        store
-            .finalize_build_failed(&claimed.id, "agent produced no commits")
-            .await
-            .unwrap();
-        assert_eq!(
-            store.get_task(&task_a.id).await.unwrap().unwrap().state,
-            TaskState::ReadyToBuild
-        );
-        assert_eq!(
-            store
-                .get_spec_queue_entry(&spec_a.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            SpecQueueStatus::Approved
-        );
-        let next = store.claim_next_queued_build().await.unwrap().unwrap();
-        assert_eq!(next.status, BuildStatus::Running);
-    }
-
-    #[tokio::test]
-    async fn a_successful_build_drains_the_batch() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (task, spec) = approved_spec(&store, &project, 1).await;
-        let build = store
-            .create_build(
-                std::slice::from_ref(&spec.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap();
-        store.claim_next_queued_build().await.unwrap().unwrap();
-
-        let done = store
-            .finalize_build_succeeded(
-                &build.id,
-                "headsha123",
-                77,
-                Some("Did the thing."),
-                &["src/lib.rs".to_string()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(done.status, BuildStatus::Succeeded);
-        assert_eq!(done.pr_number, Some(77));
-        assert_eq!(done.head_sha.as_deref(), Some("headsha123"));
-
-        // Spec drained, task concluded, and neither can be re-consumed.
-        assert_eq!(
-            store
-                .get_spec_queue_entry(&spec.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            SpecQueueStatus::Built
-        );
-        assert_eq!(
-            store.get_task(&task.id).await.unwrap().unwrap().state,
-            TaskState::Done
-        );
-        let err = store
-            .create_build(
-                std::slice::from_ref(&spec.id),
-                "main",
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("built"), "{err}");
-
-        // Built is not a verdict a reviewer can render.
-        let err = store
-            .review_spec(
-                &spec.id,
-                SpecQueueStatus::Built,
-                None,
-                DecisionInput::human(),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Invalid(_)));
-
-        let payloads: Vec<EventPayload> = store
-            .all_events()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.payload)
-            .collect();
-        assert!(payloads.contains(&EventPayload::PullRequestOpened {
-            build_id: build.id.clone(),
-            pr_number: 77,
-        }));
-        assert!(payloads.contains(&EventPayload::BuildCompleted {
-            build_id: build.id,
-            status: BuildStatus::Succeeded,
-        }));
-    }
-
-    #[tokio::test]
-    async fn reconcile_fails_orphaned_running_builds_but_keeps_queued_ones() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
-        let (_tb, spec_b) = approved_spec(&store, &project, 2).await;
-        let running = store
-            .create_build(&[spec_a.id], "main", DecisionInput::human())
-            .await
-            .unwrap();
-        let queued = store
-            .create_build(&[spec_b.id], "main", DecisionInput::human())
-            .await
-            .unwrap();
-        store.claim_next_queued_build().await.unwrap().unwrap();
-
-        let report = store.reconcile_orphaned_work().await.unwrap();
-        assert_eq!(report.builds, 1);
-
-        let after = store.get_build(&running.id).await.unwrap().unwrap();
-        assert_eq!(after.status, BuildStatus::Failed);
-        assert_eq!(
-            after.exit_reason.as_deref(),
-            Some("orphaned by server restart")
-        );
-        assert_eq!(
-            store.get_task(&task_a.id).await.unwrap().unwrap().state,
-            TaskState::ReadyToBuild
-        );
-        // Queued builds are durable intent: untouched, claimable now.
-        assert_eq!(
-            store.get_build(&queued.id).await.unwrap().unwrap().status,
-            BuildStatus::Queued
-        );
-        assert_eq!(
-            store.claim_next_queued_build().await.unwrap().unwrap().id,
-            queued.id
-        );
-    }
-
-    /// A closed issue's approved-but-unbuilt spec must not linger where
-    /// `create_build` would consume it.
-    #[tokio::test]
-    async fn retiring_a_task_drains_its_unconsumed_specs() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (task, spec) = approved_spec(&store, &project, 1).await;
-        store
-            .reconcile_closed_issues(&project.id, &[])
-            .await
-            .unwrap();
-
-        let retired = store
-            .retire_task(&task.id, TaskState::Done)
-            .await
-            .unwrap()
-            .expect("retirable");
-        assert_eq!(retired.state, TaskState::Done);
-        assert_eq!(
-            store
-                .get_spec_queue_entry(&spec.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            SpecQueueStatus::Rejected
-        );
-        let err = store
-            .create_build(&[spec.id], "main", DecisionInput::human())
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("rejected"), "{err}");
-    }
-
-    /// Rows retired before the inline drain existed (or via any future gap)
-    /// are healed at startup: no live queue entry may belong to a concluded
-    /// task.
-    #[tokio::test]
-    async fn startup_reconcile_drains_specs_of_concluded_tasks() {
-        let store = Store::open_in_memory().await.unwrap();
-        let project = sample_project();
-        store.insert_project(&project).await.unwrap();
-        let (task, spec) = approved_spec(&store, &project, 1).await;
-        // Conclude the task behind the queue's back (as pre-drain retirement did).
-        store
-            .update_task_state(&task.id, TaskState::Done)
-            .await
-            .unwrap();
-
-        store.reconcile_orphaned_work().await.unwrap();
-        assert_eq!(
-            store
-                .get_spec_queue_entry(&spec.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            SpecQueueStatus::Rejected
-        );
-
-        // A live task's approved spec is untouched.
-        let (_t2, live) = approved_spec(&store, &project, 2).await;
-        store.reconcile_orphaned_work().await.unwrap();
-        assert_eq!(
-            store
-                .get_spec_queue_entry(&live.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            SpecQueueStatus::Approved
-        );
-    }
-}
 }

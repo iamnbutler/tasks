@@ -274,7 +274,7 @@ async fn a_credential_echoed_by_the_agent_never_reaches_the_transcript() {
         .expect("dispatch");
 
     let lines = store
-        .transcript_since(&spec.session_id, 0, 1000)
+        .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
         .await
         .unwrap();
     let joined = lines
