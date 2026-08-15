@@ -23,7 +23,7 @@ use tasks_api::events::Event;
 use tasks_api::http::{
     BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
     ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
-    SetCharter, SetMode,
+    ServerStatus, SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -371,6 +371,16 @@ impl Client {
                 evidence: None,
             },
         )
+    }
+
+    // --- status ---
+
+    /// Who is serving, since when, what that boot migrated, and what is in
+    /// flight. A successful call is the claim that *this* pid opened the
+    /// database and finished its migrations — which is why it doubles as the
+    /// liveness probe for a swap.
+    pub fn status(&self) -> Result<ServerStatus> {
+        self.get_json("/status", &[])
     }
 
     // --- mode ---

@@ -20,6 +20,7 @@ use crate::models::{
     SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
     SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
 };
+use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
 
 /// Builder runs a batch of specs may cost before the batch is retired.
 /// Mirrors `MAX_DISPATCH_ATTEMPTS` for scouts, one diamond along.
@@ -137,6 +138,51 @@ impl ReconcileReport {
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Run the migrations and report which ones *this* run applied.
+///
+/// The diff is taken around [`MIGRATOR::run`] rather than read off the
+/// migrator's own list because "what ships in this binary" and "what this boot
+/// changed" are different questions, and only the second tells an operator the
+/// schema moved under them. A missing `_sqlx_migrations` table reads as an
+/// empty before-set, so a first boot honestly reports applying everything.
+async fn migrate_reporting(pool: &SqlitePool) -> Result<Vec<AppliedMigration>, StoreError> {
+    let before: std::collections::HashSet<i64> = applied_versions(pool).await?;
+    MIGRATOR.run(pool).await?;
+    let rows = sqlx::query("SELECT version, description FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(AppliedMigration {
+                version: row.try_get("version")?,
+                description: row.try_get("description")?,
+            })
+        })
+        .filter(|m: &Result<AppliedMigration, StoreError>| {
+            m.as_ref()
+                .map(|m| !before.contains(&m.version))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// Migration versions already recorded, or none at all if the bookkeeping
+/// table does not exist yet (a fresh database).
+async fn applied_versions(pool: &SqlitePool) -> Result<std::collections::HashSet<i64>, StoreError> {
+    let rows = match sqlx::query("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        // Anything that isn't "no such table" is a real problem, but the
+        // migrator is about to run and will surface it far more precisely.
+        Err(_) => return Ok(std::collections::HashSet::new()),
+    };
+    rows.into_iter()
+        .map(|row| Ok(row.try_get::<i64, _>("version")?))
+        .collect()
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlx: {0}")]
@@ -171,6 +217,9 @@ pub struct Store {
     /// the human, which matters because the self-nudge filter trusts the
     /// actor field.
     actor_token: std::sync::Arc<str>,
+    /// Migrations *this* open applied, in version order. Empty when the
+    /// schema was already current. See [`migrate_reporting`].
+    migrations_applied: Vec<AppliedMigration>,
 }
 
 impl Store {
@@ -198,7 +247,7 @@ impl Store {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        MIGRATOR.run(&pool).await?;
+        let migrations_applied = migrate_reporting(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -208,6 +257,7 @@ impl Store {
             transcript_tx,
             orchestrator_feed_tx,
             actor_token: Uuid::new_v4().to_string().into(),
+            migrations_applied,
         })
     }
 
@@ -217,7 +267,7 @@ impl Store {
             .max_connections(1) // shared in-memory DB — one connection
             .connect("sqlite::memory:")
             .await?;
-        MIGRATOR.run(&pool).await?;
+        let migrations_applied = migrate_reporting(&pool).await?;
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (transcript_tx, _) = broadcast::channel(TRANSCRIPT_BROADCAST_CAPACITY);
         let (orchestrator_feed_tx, _) = broadcast::channel(ORCHESTRATOR_FEED_CAPACITY);
@@ -227,7 +277,15 @@ impl Store {
             transcript_tx,
             orchestrator_feed_tx,
             actor_token: Uuid::new_v4().to_string().into(),
+            migrations_applied,
         })
+    }
+
+    /// Migrations this open applied, in version order. Empty when the schema
+    /// was already current — which is the answer an operator swapping
+    /// binaries actually wants ("did the schema move under me?").
+    pub fn migrations_applied(&self) -> &[AppliedMigration] {
+        &self.migrations_applied
     }
 
     // --- projects ---
@@ -2895,6 +2953,74 @@ impl Store {
     /// Whether a human currently has the orchestrator session checked out.
     pub async fn orchestrator_checked_out(&self) -> Result<bool, StoreError> {
         Ok(self.orchestrator_session_info().await?.checked_out)
+    }
+
+    // --- in-flight work ---
+
+    /// What this server currently has in the air: `running` scout sessions,
+    /// `running` builds, and whether the orchestrator owes a turn.
+    ///
+    /// Queued builds are deliberately not here — see [`InFlight::builds`] —
+    /// and neither is anything else durable. The question this answers is
+    /// "what would a restart destroy?", so only work living in a process or a
+    /// VM counts.
+    pub async fn in_flight(&self) -> Result<InFlight, StoreError> {
+        let session_rows = sqlx::query(
+            "SELECT id, task_id, started_at FROM sessions WHERE status = ? ORDER BY started_at",
+        )
+        .bind(SessionStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        let scouts = session_rows
+            .into_iter()
+            .map(|row| {
+                Ok(InFlightItem {
+                    id: row.try_get::<String, _>("id")?,
+                    detail: Some(format!("task {}", row.try_get::<String, _>("task_id")?)),
+                    since: parse_ts(&row.try_get::<String, _>("started_at")?, "started_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+
+        // A build that has not been picked up yet has no `started_at`; it
+        // cannot be `running` either, but COALESCE keeps the read total
+        // rather than trusting two columns to agree.
+        let build_rows = sqlx::query(
+            "SELECT id, branch, COALESCE(started_at, created_at) AS since FROM builds \
+             WHERE status = ? ORDER BY since",
+        )
+        .bind(BuildStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        let builds = build_rows
+            .into_iter()
+            .map(|row| {
+                Ok(InFlightItem {
+                    id: row.try_get::<String, _>("id")?,
+                    detail: Some(row.try_get::<String, _>("branch")?),
+                    since: parse_ts(&row.try_get::<String, _>("since")?, "since")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+
+        // The oldest turn above the answered watermark: one entry, aged from
+        // when the pipeline first owed a reply.
+        let orchestrator = self
+            .unanswered_orchestrator_messages()
+            .await?
+            .into_iter()
+            .min_by_key(|m| m.seq)
+            .map(|m| InFlightItem {
+                id: m.seq.to_string(),
+                detail: Some(format!("{} turn unanswered", m.role.as_str())),
+                since: m.created_at,
+            });
+
+        Ok(InFlight {
+            scouts,
+            builds,
+            orchestrator,
+        })
     }
 
     // --- mode ---
@@ -6018,6 +6144,127 @@ mod tests {
                 .unwrap()
                 .status,
             SpecQueueStatus::Approved
+        );
+    }
+
+    // --- in-flight work / migration reporting ---
+
+    /// The drain condition: a running scout and a running build count, and
+    /// each carries the age a report needs.
+    #[tokio::test]
+    async fn in_flight_reports_running_scouts_and_builds() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        assert!(store.in_flight().await.unwrap().is_empty());
+
+        let task = task_with(&project.id, 1, 0);
+        store.insert_task(&task).await.unwrap();
+        let started = Utc::now() - chrono::Duration::minutes(12);
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: Some("vm-1".into()),
+            branch: "scout/1".into(),
+            status: SessionStatus::Running,
+            started_at: started,
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+        };
+        store.insert_session(&session).await.unwrap();
+
+        let (_t, spec) = approved_spec(&store, &project, 2).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        // Queued is durable intent, not work a restart would destroy.
+        let queued_only = store.in_flight().await.unwrap();
+        assert!(queued_only.builds.is_empty(), "{queued_only:?}");
+        assert!(queued_only.is_destructible(), "the scout still counts");
+
+        store.claim_next_queued_build().await.unwrap();
+        let in_flight = store.in_flight().await.unwrap();
+        assert_eq!(in_flight.scouts.len(), 1);
+        assert_eq!(in_flight.scouts[0].id, session.id.to_string());
+        assert!(
+            in_flight.scouts[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains(task.id.as_str())
+        );
+        assert_eq!(
+            in_flight.scouts[0].since.timestamp(),
+            started.timestamp(),
+            "the report ages work from when it started"
+        );
+        assert_eq!(in_flight.builds.len(), 1);
+        assert_eq!(in_flight.builds[0].id, build.id.to_string());
+        assert!(in_flight.is_destructible());
+
+        // A finished session drops out.
+        store
+            .update_session_completion(&session.id, SessionStatus::ScoutSucceeded, Utc::now(), None)
+            .await
+            .unwrap();
+        assert!(store.in_flight().await.unwrap().scouts.is_empty());
+    }
+
+    /// An owed orchestrator turn is reported but is never a reason to wait —
+    /// the obligation and nudge loops keep producing input, so a drain that
+    /// waited on the conversation would wait forever.
+    #[tokio::test]
+    async fn an_owed_orchestrator_turn_is_reported_but_not_destructible() {
+        let store = Store::open_in_memory().await.unwrap();
+        let message = store
+            .append_orchestrator_message(ChatRole::User, "do the thing")
+            .await
+            .unwrap();
+
+        let in_flight = store.in_flight().await.unwrap();
+        let owed = in_flight.orchestrator.as_ref().expect("an owed turn");
+        assert_eq!(owed.id, message.seq.to_string());
+        assert!(!in_flight.is_destructible());
+        assert!(!in_flight.is_empty());
+
+        store
+            .append_orchestrator_reply("done", message.seq, None)
+            .await
+            .unwrap();
+        assert!(store.in_flight().await.unwrap().is_empty());
+    }
+
+    /// "What this boot changed" is not "what this binary ships": a fresh
+    /// database reports applying everything, and reopening it reports nothing.
+    #[tokio::test]
+    async fn migrations_applied_is_this_boots_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+
+        let first = Store::open(&path).await.unwrap();
+        let applied = first.migrations_applied().to_vec();
+        assert_eq!(
+            applied.len(),
+            MIGRATOR.iter().count(),
+            "a first boot applies every migration"
+        );
+        // Greppable against crates/tasks/migrations/, underscores and all.
+        assert_eq!(applied[1].file_stem(), "0002_manual_rank");
+        drop(first);
+
+        let second = Store::open(&path).await.unwrap();
+        assert!(
+            second.migrations_applied().is_empty(),
+            "an already-current schema moved nothing: {:?}",
+            second.migrations_applied()
         );
     }
 }
