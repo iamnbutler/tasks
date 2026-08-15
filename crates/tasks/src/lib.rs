@@ -9,6 +9,8 @@ pub mod briefing;
 pub mod builder;
 pub mod github;
 pub mod orchestrator;
+pub mod pidfile;
+pub mod reload;
 pub mod run;
 pub mod scout;
 pub mod server;
