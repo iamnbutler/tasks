@@ -327,6 +327,40 @@ This is the concrete meaning of "don't get blocked, keep working", and it
 removes the scariest property of autonomy: that a crash at the wrong moment
 drops work silently rather than delaying it.
 
+**The set has to cover the whole pipeline, not just its stalls.** As first
+built there were two kinds — `review_spec` and `unblock_spec` — and the gap
+between them was the entire reason play mode looked idle after item 6 shipped.
+`dispatch_builds` was `live`, so the orchestrator had the authority to batch
+approved specs into a Builder run, and *nothing ever asked it to*. Its own
+verdicts are filtered out of nudges (correctly — being told what you just did
+invites second-guessing it), so approving a spec produced silence, and the
+approved spec sat there. Permission with no trigger is not autonomy; it just
+looks like an orchestrator waiting to be told.
+
+So `dispatch_build` is a third kind: **an approved spec that no `queued` or
+`running` build is carrying.** Queued counts as carried, because builds are
+serial and the queue is where a dispatched batch legitimately waits. A build
+that fails returns its specs to `approved` and re-raises the obligation on
+purpose; the attempt cap is what ends that loop, by moving the spec to
+`blocked` and thus to `unblock_spec`.
+
+The general rule this makes explicit: **every state the pipeline can rest in
+either is terminal or has an obligation that names who owes what.** A state
+that is neither is a place work goes to be forgotten, and the fact that a
+capability exists to move it along is no help if nothing says so.
+
+Two supporting pieces, both about the difference between having permission and
+using it well:
+
+- The turn tells the orchestrator to **batch** when several specs are unbuilt.
+  A Builder run takes a *list* — one branch, one PR — and the obvious reading
+  of N obligations is N dispatches, which would scatter related work across N
+  PRs. The brief beneath each one already says which specs touch the same
+  files, so the judgment is supported where it is asked for.
+- The prompt tells it to dispatch **in the same turn it approves**, treating
+  the obligation as the safety net rather than the path. Waiting out the grace
+  period is a dropped ball being caught, not the system working.
+
 ### 4. Case law + crystallization — DEFERRED
 
 **Not built in this pass** (decided 2026-08-14). What makes a correction a

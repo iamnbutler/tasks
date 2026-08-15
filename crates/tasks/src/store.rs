@@ -2265,6 +2265,49 @@ impl Store {
             });
         }
 
+        // An approved spec that no build is carrying. Approval is not
+        // delivery: nothing in the pipeline dispatches on its own, so without
+        // this the `dispatch_builds` capability is permission with nothing to
+        // prompt it and approved work waits for a human to notice.
+        //
+        // `queued` counts as carried, not just `running` — builds are serial,
+        // so the queue is where a dispatched batch legitimately waits, and
+        // re-raising here would ask for the same build twice. A build that
+        // *fails* returns its specs to `approved`, which raises this again on
+        // purpose; the attempt cap is what ends that loop, by moving the spec
+        // to `blocked` and the obligation below.
+        let rows = sqlx::query(
+            "SELECT q.spec_id, q.approved_at, t.gh_issue_number, t.title \
+             FROM spec_queue q \
+             JOIN specs s ON s.id = q.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE q.status = ? AND q.approved_at IS NOT NULL AND q.approved_at <= ? \
+               AND NOT EXISTS (SELECT 1 FROM build_specs bs \
+                               JOIN builds b ON b.id = bs.build_id \
+                               WHERE bs.spec_id = q.spec_id AND b.status IN (?, ?)) \
+             ORDER BY q.approved_at",
+        )
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(&cutoff)
+        .bind(BuildStatus::Queued.as_str())
+        .bind(BuildStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("approved_at")?, "approved_at")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::DispatchBuild,
+                subject_id: row.try_get("spec_id")?,
+                summary: format!(
+                    "#{} \"{}\" was approved {} and no build is carrying it",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                    since.format("%Y-%m-%d %H:%M UTC"),
+                ),
+                since,
+            });
+        }
+
         // A batch that ran out of build attempts. Stopped work stays visible
         // until someone decides about it, rather than parking silently.
         let rows = sqlx::query(
@@ -4312,7 +4355,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(store.open_obligations(none).await.unwrap().is_empty());
+        // The review is discharged; what the approval creates in its place is
+        // the dispatch obligation, covered by its own test.
+        let open = store.open_obligations(none).await.unwrap();
+        assert_eq!(
+            open.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![ObligationKind::DispatchBuild]
+        );
     }
 
     /// Work that stopped must stay visible rather than parking silently —

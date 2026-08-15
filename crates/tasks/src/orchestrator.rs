@@ -603,18 +603,43 @@ pub async fn format_obligations(
         .iter()
         .map(|o| format!("- {}", o.summary))
         .collect();
-    let header = format!(
+    let mut header = format!(
         "[pipeline] Standing obligations — not notifications. These are \
          derived from pipeline state and will keep appearing until they are \
          resolved, so act on them rather than acknowledging them:\n{}",
         lines.join("\n")
     );
 
+    // Batching is the whole reason a Builder run takes a list. Left to one
+    // dispatch per obligation the orchestrator would open N PRs over N
+    // branches for work that belongs together — so say it here, where the
+    // specs are in front of it, rather than hoping the standing prompt is
+    // still weighted after a long session.
+    let to_dispatch = obligations
+        .iter()
+        .filter(|o| o.kind == ObligationKind::DispatchBuild)
+        .count();
+    if to_dispatch > 1 {
+        header.push_str(&format!(
+            "\n\n{to_dispatch} approved specs are unbuilt. Specs from the same \
+             project can go in one `POST /builds` — one branch, one PR — and \
+             the facts below say which of them touch the same files. Batch \
+             where that is sensible instead of dispatching one at a time; \
+             split where the work is unrelated."
+        ));
+    }
+
     let mut sections = Vec::new();
     for obligation in obligations {
         let spec_id = crate::models::SpecId::from_raw(&obligation.subject_id);
         let facts = match obligation.kind {
-            ObligationKind::ReviewSpec => spec_facts(brief, &spec_id).await,
+            // Dispatch wants the same facts as review: overlap with in-flight
+            // work, migration-number clashes, files two specs both touch.
+            // Those decide whether this batches with the next one or has to
+            // wait, which is the judgment being asked for.
+            ObligationKind::ReviewSpec | ObligationKind::DispatchBuild => {
+                spec_facts(brief, &spec_id).await
+            }
             ObligationKind::UnblockSpec => match brief.for_blocked_spec(&spec_id).await {
                 Ok(facts) => facts,
                 Err(e) => vec![brief_unavailable(&e)],
@@ -764,6 +789,13 @@ fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
            Lead with your strongest objection, then render the verdict — \
            what you may do with it is in the authority section below, not \
            here.\n\
+         - You approved a spec → carry it through in the same turn. Approval \
+           is not delivery: nothing dispatches on its own, and your own \
+           verdicts do not come back to you as news. Either queue the build \
+           now (POST /builds) or say what it is waiting for. A `dispatch_build` \
+           obligation will eventually chase an approved spec nobody built, but \
+           that is the safety net catching a dropped ball, not the normal \
+           path.\n\
          - Scout or build FAILED → investigate (transcript, build row, \
            events) and report the cause and what you'd do about it.\n\
          - New tasks → note anything urgent or related to in-flight work; \
