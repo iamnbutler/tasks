@@ -24,8 +24,17 @@ components are built and how data moves):
   per-sidebar open/width, selection, resize-drag tracking), observes
   `AppState`, and registers action handlers. Actions:
   `workspace::ToggleLeftDock` (`cmd-b`), `workspace::ToggleRightDock`
-  (`cmd-r`, `cmd-alt-b`) — Zed's defaults. Title bar carries play/pause
-  (mode gates *new* work only) and refresh.
+  (`cmd-r`) — Zed's defaults. Title bar carries play/pause (mode gates
+  *new* work only) and refresh.
+- **`menus.rs`** — the menu bar (App / File / Edit / Window) and its
+  actions. Handlers are global, not the workspace's, because Minimize /
+  Zoom / Close act on whichever window is focused; the Edit menu dispatches
+  gpuikit's own input actions so the items drive the same code path
+  `cmd-c` already drove. Bindings are registered before `set_menus` — gpui
+  reads shortcuts out of the keymap once, while building the bar.
+- **`about.rs`** — a singleton About window showing the version and commit
+  `build.rs` stamped from git. `0.1.0` with `commit unknown` means the
+  binary was built without git in reach.
 - **`sections/`** — one file per sidebar section (`impl Workspace` blocks):
   Tasks (Linear-style rows → inspector), Queue (attention-ordered groups:
   Needs you / Running / Building / Up next / Ready to build, with live
@@ -54,10 +63,20 @@ SVG assets are served by `Application::with_assets(gpuikit::assets())`.
 ## Running
 
 ```sh
-cargo run
+cargo run          # from this directory
+make app           # from the repo root: install ~/Applications/Tasks.app
+make run           # …and (re)launch it
+cargo test         # from this directory — app-gpui is not a workspace member,
+                   # so `cargo test --workspace` at the root skips it
 ```
 
 Connects to `http://127.0.0.1:$TASKS_SERVER_PORT` (default 4800 — the same
 variable the server reads). Without a server it shows the connecting state
 and retries every 3s. Builds without the Xcode Metal toolchain
 (gpui-platform's `runtime_shaders` feature compiles shaders at runtime).
+
+`make app` assembles a `Tasks.app` bundle by hand around the release binary
+(`Contents/MacOS/Tasks` plus `Info.plist.in` rendered by `sed`) and passes
+`TASKS_GPUI_VERSION` / `TASKS_GPUI_COMMIT` explicitly, so an installed build
+is stamped exactly. A bare `cargo run` lets `build.rs` probe git itself,
+which can lag the `-dirty` suffix by a build.
