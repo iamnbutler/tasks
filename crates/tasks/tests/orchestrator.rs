@@ -8,8 +8,9 @@ use std::time::Duration;
 use chrono::Utc;
 use tasks::events::EventPayload;
 use tasks::models::{
-    ChatRole, Complexity, GhState, Project, ProjectId, Session, SessionEndReason, SessionId,
-    SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    ChatRole, Complexity, GhState, ObligationKind, Project, ProjectId, Session, SessionEndReason,
+    SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId,
+    TaskState,
 };
 use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
 use tasks::run::orchestrator_nudge_loop;
@@ -598,7 +599,8 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
         .count();
     assert_eq!(event_turns, 1, "one mention, not one per tick");
 
-    // A verdict is what ends it.
+    // A verdict is what ends it — and hands off to the next one, because an
+    // approved spec nobody is building is also work the pipeline is owed.
     store
         .review_spec(
             &spec.id,
@@ -608,16 +610,103 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
         )
         .await
         .unwrap();
-    assert!(
-        store
-            .open_obligations(chrono::Duration::zero())
-            .await
-            .unwrap()
-            .is_empty()
+    let open = store
+        .open_obligations(chrono::Duration::zero())
+        .await
+        .unwrap();
+    assert_eq!(
+        open.iter().map(|o| o.kind).collect::<Vec<_>>(),
+        vec![ObligationKind::DispatchBuild],
+        "review discharged, dispatch owed: {open:?}"
     );
 
     let _ = shutdown_tx.send(true);
     let _ = loop_handle.await;
+}
+
+/// Approval is not delivery. Nothing in the pipeline dispatches on its own, so
+/// an approved spec with no build behind it is owed work — and the obligation
+/// has to survive the build *failing*, which is the case a one-shot
+/// notification would drop on the floor.
+#[tokio::test]
+async fn an_approved_spec_stays_owed_until_a_build_carries_it() {
+    let store = Store::open_in_memory().await.unwrap();
+    let spec = seed_pending_spec(&store).await;
+    async fn owed(store: &Store, kind: ObligationKind) -> bool {
+        store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .iter()
+            .any(|o| o.kind == kind)
+    }
+
+    // Pending review owes a verdict and nothing else.
+    assert!(owed(&store, ObligationKind::ReviewSpec).await);
+    assert!(!owed(&store, ObligationKind::DispatchBuild).await);
+
+    store
+        .review_spec(
+            &spec.id,
+            SpecQueueStatus::Approved,
+            None,
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    assert!(owed(&store, ObligationKind::DispatchBuild).await);
+    assert!(!owed(&store, ObligationKind::ReviewSpec).await);
+
+    // A queued build discharges it — builds are serial, so waiting in the
+    // queue is being carried, and re-raising here would ask for the same
+    // build twice.
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    assert!(!owed(&store, ObligationKind::DispatchBuild).await);
+
+    // A failure returns the spec to `approved`, and the obligation with it:
+    // the spec is still good, and nothing else will pick it up.
+    store
+        .finalize_build_failed(&build.id, "linker OOM")
+        .await
+        .unwrap();
+    assert!(
+        owed(&store, ObligationKind::DispatchBuild).await,
+        "a failed build leaves the work owed, not done"
+    );
+}
+
+/// With several specs unbuilt, the turn has to say that a Builder run takes a
+/// *list* — otherwise the obvious reading is one dispatch per obligation, and
+/// work that belongs on one branch gets N branches and N PRs.
+#[tokio::test]
+async fn several_unbuilt_specs_ask_to_be_batched() {
+    let store = Store::open_in_memory().await.unwrap();
+    let brief = tasks::brief::Brief::new(&store, None, "main");
+    let obligation = |n: u64| tasks::models::Obligation {
+        kind: ObligationKind::DispatchBuild,
+        subject_id: format!("spec_{n}"),
+        summary: format!("#{n} \"a task\" was approved and no build is carrying it"),
+        since: Utc::now(),
+    };
+
+    let one = tasks::orchestrator::format_obligations(&store, &brief, &[obligation(1)]).await;
+    assert!(
+        !one.contains("one `POST /builds`"),
+        "no batching advice for a single spec: {one}"
+    );
+
+    let many =
+        tasks::orchestrator::format_obligations(&store, &brief, &[obligation(1), obligation(2)])
+            .await;
+    assert!(many.contains("2 approved specs are unbuilt"), "{many}");
+    assert!(many.contains("one `POST /builds`"), "{many}");
 }
 
 /// A spec sitting in `pending_review`, with the task and session behind it.

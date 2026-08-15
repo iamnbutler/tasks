@@ -621,6 +621,10 @@ pub struct Obligation {
 pub enum ObligationKind {
     /// A spec is waiting for a verdict and no decision has been recorded.
     ReviewSpec,
+    /// A spec is approved and no build is carrying it. Approval is not
+    /// delivery: without this, `dispatch_builds` is permission with nothing to
+    /// prompt it, and approved work sits still until a human notices.
+    DispatchBuild,
     /// A batch burned through its build attempts and stopped. Nothing will
     /// pick it up again until someone decides what to do.
     UnblockSpec,
@@ -630,6 +634,7 @@ impl ObligationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ObligationKind::ReviewSpec => "review_spec",
+            ObligationKind::DispatchBuild => "dispatch_build",
             ObligationKind::UnblockSpec => "unblock_spec",
         }
     }
