@@ -40,7 +40,7 @@ use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason, Decision,
     DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo,
     Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
-    TaskId, TranscriptLine,
+    TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -201,6 +201,11 @@ pub fn router_with_services(
         .route("/charter", get(get_charter))
         .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
+        .route("/builds/{build_id}/transcript", get(list_build_transcript))
+        .route(
+            "/builds/{build_id}/transcript/stream",
+            get(stream_build_transcript),
+        )
         .route(
             "/orchestrator/messages",
             get(list_orchestrator_messages).post(send_orchestrator_message),
@@ -1689,8 +1694,8 @@ struct TranscriptQuery {
     limit: Option<i64>,
 }
 
-/// Catch-up read of a session's agent output. `since` is **inclusive**, to
-/// match `/events?since=` — a tailing client passes `last_seq + 1`. An empty
+/// Catch-up read of a scout session's agent output. `since` is **inclusive**,
+/// to match `/events?since=` — a tailing client passes `last_seq + 1`. An empty
 /// array means "nothing recorded", not an error: sessions that predate
 /// transcript capture have none.
 async fn list_transcript(
@@ -1698,10 +1703,66 @@ async fn list_transcript(
     Path(session_id): Path<String>,
     Query(query): Query<TranscriptQuery>,
 ) -> ApiResult<Json<Vec<TranscriptLine>>> {
-    let session_id = SessionId::from_raw(session_id);
+    let owner = session_owner(&store, session_id).await?;
+    list_owner_transcript(&store, &owner, query).await
+}
+
+/// The same read for a build. Builds get transcripts on identical terms —
+/// same caps, same truncation marker, same inclusive `since` — because a
+/// build that ran its whole budget and committed nothing is precisely the
+/// thing nobody could diagnose before.
+async fn list_build_transcript(
+    State(store): State<Arc<Store>>,
+    Path(build_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<Vec<TranscriptLine>>> {
+    let owner = build_owner(&store, build_id).await?;
+    list_owner_transcript(&store, &owner, query).await
+}
+
+/// SSE tail of a session's transcript: replay from `since`, then live lines.
+async fn stream_transcript(
+    State(store): State<Arc<Store>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>> {
+    let owner = session_owner(&store, session_id).await?;
+    stream_owner_transcript(&store, owner, query).await
+}
+
+/// SSE tail of a build's transcript, on the same contract.
+async fn stream_build_transcript(
+    State(store): State<Arc<Store>>,
+    Path(build_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>> {
+    let owner = build_owner(&store, build_id).await?;
+    stream_owner_transcript(&store, owner, query).await
+}
+
+/// Resolve a path id to a transcript owner, 404ing on an unknown row — the
+/// only difference between the two pairs of handlers above.
+async fn session_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {
+    let session_id = SessionId::from_raw(raw);
     if store.get_session(&session_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("session {session_id}")));
     }
+    Ok(TranscriptOwner::Session { session_id })
+}
+
+async fn build_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {
+    let build_id = BuildId::from_raw(raw);
+    if store.get_build(&build_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("build {build_id}")));
+    }
+    Ok(TranscriptOwner::Build { build_id })
+}
+
+async fn list_owner_transcript(
+    store: &Store,
+    owner: &TranscriptOwner,
+    query: TranscriptQuery,
+) -> ApiResult<Json<Vec<TranscriptLine>>> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_TRANSCRIPT_LIMIT)
@@ -1710,28 +1771,27 @@ async fn list_transcript(
         return Err(ApiError::BadRequest("limit must be positive".into()));
     }
     let lines = store
-        .transcript_since(&session_id, query.since.unwrap_or(0), limit)
+        .transcript_since(owner, query.since.unwrap_or(0), limit)
         .await?;
     Ok(Json(lines))
 }
 
-/// SSE tail of a session's transcript: replay from `since`, then live lines.
+/// Replay from `since`, then live lines.
 ///
 /// The replay pages until it catches up and deliberately takes no `limit`. The
 /// obvious alternative — one limit-sized page, then attach the tail — hands the
 /// client a stream that jumps silently from the end of the page to the newest
 /// line, and a stream is exactly the shape in which that hole goes unnoticed.
-/// The per-session byte cap is what keeps reading it all affordable.
-async fn stream_transcript(
-    State(store): State<Arc<Store>>,
-    Path(session_id): Path<String>,
-    Query(query): Query<TranscriptQuery>,
-) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
-    let session_id = SessionId::from_raw(session_id);
-    if store.get_session(&session_id).await?.is_none() {
-        return Err(ApiError::NotFound(format!("session {session_id}")));
-    }
-
+/// The per-run byte cap is what keeps reading it all affordable.
+///
+/// `use<>` on the return type is load-bearing: under Rust 2024 capture rules
+/// the returned `impl Stream` would otherwise capture the `&Store` borrow, and
+/// the handlers above wouldn't compile.
+async fn stream_owner_transcript(
+    store: &Store,
+    owner: TranscriptOwner,
+    query: TranscriptQuery,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>> {
     // Subscribe *before* reading history, so a line appended between the two
     // steps arrives on the live channel instead of falling down the gap.
     let live = store.subscribe_transcript();
@@ -1740,7 +1800,7 @@ async fn stream_transcript(
     let mut next = query.since.unwrap_or(0);
     loop {
         let page = store
-            .transcript_since(&session_id, next, MAX_TRANSCRIPT_LIMIT)
+            .transcript_since(&owner, next, MAX_TRANSCRIPT_LIMIT)
             .await?;
         let Some(last) = page.last() else { break };
         next = last.seq + 1;
@@ -1751,7 +1811,6 @@ async fn stream_transcript(
         }
     }
 
-    let session_filter = session_id.clone();
     let tail = BroadcastStream::new(live).filter_map(move |result| {
         let line = match result {
             Ok(line) => line,
@@ -1760,8 +1819,11 @@ async fn stream_transcript(
                 return None;
             }
         };
-        // Drop other sessions, and anything the backfill already delivered.
-        if line.session_id != session_filter || line.seq < next {
+        // Drop other runs, and anything the backfill already delivered. The
+        // whole owner is compared, not just its id: seq restarts per owner,
+        // so an id match alone would let a build's line into a session's tail
+        // if the two ever shared a raw id.
+        if line.owner != owner || line.seq < next {
             return None;
         }
         to_sse(&line)
@@ -2729,7 +2791,7 @@ mod tests {
             .map(|i| (crate::models::TranscriptStream::Stdout, format!("line {i}")))
             .collect();
         store
-            .append_transcript_lines(&session_id, &batch)
+            .append_transcript_lines(&TranscriptOwner::session(&session_id), &batch)
             .await
             .unwrap();
 
@@ -2793,6 +2855,70 @@ mod tests {
         assert!(lines.is_empty());
     }
 
+    /// Builds read on the same contract as sessions, through their own route,
+    /// and a line says which owner it belongs to (#825).
+    #[tokio::test]
+    async fn a_build_transcript_reads_on_the_same_contract_as_a_session() {
+        let (store, project) = store_with_project().await;
+        let (_task, spec) = insert_spec(&store, &project, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let owner = TranscriptOwner::build(&build.id);
+        let batch: Vec<_> = (1..=3)
+            .map(|i| (crate::models::TranscriptStream::Stdout, format!("line {i}")))
+            .collect();
+        store.append_transcript_lines(&owner, &batch).await.unwrap();
+
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let all: Vec<TranscriptLine> = http
+            .get(format!("{base}/builds/{}/transcript", build.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|l| l.owner == owner));
+        assert_eq!(all[0].seq, 1, "a build's transcript starts at seq 1");
+
+        // `since` is inclusive here too.
+        let tail: Vec<TranscriptLine> = http
+            .get(format!("{base}/builds/{}/transcript?since=3", build.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(tail.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![3]);
+
+        // And the owner is a resource, not a free-form id.
+        let missing = http
+            .get(format!("{base}/builds/build_nope/transcript"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+    }
+
     /// The regression guard for the SSE replay: one limit-sized page followed
     /// by the live tail would silently skip everything in between. The count is
     /// an exact multiple of the page size, which is the boundary where a naive
@@ -2807,7 +2933,7 @@ mod tests {
             .map(|i| (crate::models::TranscriptStream::Stdout, format!("line {i}")))
             .collect();
         store
-            .append_transcript_lines(&session_id, &batch)
+            .append_transcript_lines(&TranscriptOwner::session(&session_id), &batch)
             .await
             .unwrap();
 
@@ -2848,7 +2974,7 @@ mod tests {
         let session_id = seed_session(&store).await;
         store
             .append_transcript_lines(
-                &session_id,
+                &TranscriptOwner::session(&session_id),
                 &[(crate::models::TranscriptStream::Stdout, "historic".into())],
             )
             .await
@@ -2863,7 +2989,7 @@ mod tests {
 
         store
             .append_transcript_lines(
-                &session_id,
+                &TranscriptOwner::session(&session_id),
                 &[(crate::models::TranscriptStream::Stderr, "live".into())],
             )
             .await

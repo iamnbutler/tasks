@@ -18,7 +18,8 @@ use crate::models::{
     GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
     OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, Session,
     SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry,
-    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptStream,
+    SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptOwner,
+    TranscriptStream,
 };
 
 /// Builder runs a batch of specs may cost before the batch is retired.
@@ -1021,27 +1022,38 @@ impl Store {
 
     // --- transcripts ---
 
-    /// Append agent output lines for a session, assigning dense `seq` values
-    /// from `MAX(seq)+1`. One transaction for the batch; subscribers are
-    /// notified only after it commits, so a live tail can never announce a line
-    /// a catch-up read would fail to return.
+    /// Append agent output lines for one run — a scout session or a build —
+    /// assigning dense `seq` values from `MAX(seq)+1` **for that owner**. One
+    /// transaction for the batch; subscribers are notified only after it
+    /// commits, so a live tail can never announce a line a catch-up read would
+    /// fail to return.
+    ///
+    /// The insert binds both owner columns (one of them `None`), so only the
+    /// two SELECTs have to branch — and they branch by picking a whole literal
+    /// statement, never by interpolating a column name into SQL.
     ///
     /// Returns the persisted lines with their seq values filled in.
     pub async fn append_transcript_lines(
         &self,
-        session_id: &SessionId,
+        owner: &TranscriptOwner,
         lines: &[(TranscriptStream, String)],
     ) -> Result<Vec<TranscriptLine>, StoreError> {
         if lines.is_empty() {
             return Ok(Vec::new());
         }
+        let (session_id, build_id) = owner_columns(owner);
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
 
-        let next: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE session_id = ?",
-        )
-        .bind(session_id.as_str())
+        let next: i64 = sqlx::query_scalar(match owner {
+            TranscriptOwner::Session { .. } => {
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE session_id = ?"
+            }
+            TranscriptOwner::Build { .. } => {
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE build_id = ?"
+            }
+        })
+        .bind(owner.id().to_string())
         .fetch_one(&mut *tx)
         .await?;
 
@@ -1049,10 +1061,11 @@ impl Store {
         for (offset, (stream, line)) in lines.iter().enumerate() {
             let seq = next + offset as i64;
             sqlx::query(
-                "INSERT INTO transcript_lines (session_id, seq, timestamp, stream, line) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO transcript_lines (session_id, build_id, seq, timestamp, stream, line) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
-            .bind(session_id.as_str())
+            .bind(session_id.clone())
+            .bind(build_id.clone())
             .bind(seq)
             .bind(now.to_rfc3339())
             .bind(stream.as_str())
@@ -1060,7 +1073,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
             persisted.push(TranscriptLine {
-                session_id: session_id.clone(),
+                owner: owner.clone(),
                 seq,
                 timestamp: now,
                 stream: *stream,
@@ -1075,20 +1088,26 @@ impl Store {
         Ok(persisted)
     }
 
-    /// Transcript lines for a session with `seq >= since`, oldest first.
+    /// Transcript lines for one owner with `seq >= since`, oldest first.
     /// `since` is inclusive, matching `/events?since=`; a tailing client passes
     /// `last_seq + 1`.
     pub async fn transcript_since(
         &self,
-        session_id: &SessionId,
+        owner: &TranscriptOwner,
         since: i64,
         limit: i64,
     ) -> Result<Vec<TranscriptLine>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT session_id, seq, timestamp, stream, line FROM transcript_lines \
-             WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?",
-        )
-        .bind(session_id.as_str())
+        let rows = sqlx::query(match owner {
+            TranscriptOwner::Session { .. } => {
+                "SELECT session_id, build_id, seq, timestamp, stream, line FROM transcript_lines \
+                 WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?"
+            }
+            TranscriptOwner::Build { .. } => {
+                "SELECT session_id, build_id, seq, timestamp, stream, line FROM transcript_lines \
+                 WHERE build_id = ? AND seq >= ? ORDER BY seq LIMIT ?"
+            }
+        })
+        .bind(owner.id().to_string())
         .bind(since)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -1096,9 +1115,10 @@ impl Store {
         rows.into_iter().map(transcript_line_from_row).collect()
     }
 
-    /// Live transcript lines for *every* session; subscribers filter by id.
-    /// One channel rather than per-session ones because `SCOUT_MAX_CONCURRENT`
-    /// is small and per-session channel lifetimes aren't worth managing.
+    /// Live transcript lines for *every* run; subscribers filter by owner.
+    /// One channel rather than per-owner ones because `SCOUT_MAX_CONCURRENT`
+    /// is small, builds are serial, and per-owner channel lifetimes aren't
+    /// worth managing.
     pub fn subscribe_transcript(&self) -> broadcast::Receiver<TranscriptLine> {
         self.transcript_tx.subscribe()
     }
@@ -3103,10 +3123,36 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Session, StoreError>
     })
 }
 
+/// The two owner columns for a binding, exactly one of them `Some`.
+fn owner_columns(owner: &TranscriptOwner) -> (Option<String>, Option<String>) {
+    match owner {
+        TranscriptOwner::Session { session_id } => (Some(session_id.to_string()), None),
+        TranscriptOwner::Build { build_id } => (None, Some(build_id.to_string())),
+    }
+}
+
 fn transcript_line_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TranscriptLine, StoreError> {
     let stream_raw: String = row.try_get("stream")?;
+    // The arc is a CHECK constraint, so neither/both is a corrupt row rather
+    // than a case with a sensible default. Say so instead of guessing.
+    let owner = match (
+        row.try_get::<Option<String>, _>("session_id")?,
+        row.try_get::<Option<String>, _>("build_id")?,
+    ) {
+        (Some(session_id), None) => TranscriptOwner::Session {
+            session_id: SessionId::from_raw(session_id),
+        },
+        (None, Some(build_id)) => TranscriptOwner::Build {
+            build_id: BuildId::from_raw(build_id),
+        },
+        _ => {
+            return Err(StoreError::Invalid(
+                "transcript line owns neither or both of session_id / build_id".into(),
+            ));
+        }
+    };
     Ok(TranscriptLine {
-        session_id: SessionId::from_raw(row.try_get::<String, _>("session_id")?),
+        owner,
         seq: row.try_get("seq")?,
         timestamp: parse_ts(&row.try_get::<String, _>("timestamp")?, "timestamp")?,
         stream: TranscriptStream::from_str(&stream_raw).ok_or(StoreError::BadEnum {
@@ -5348,7 +5394,7 @@ mod tests {
 
         let first = store
             .append_transcript_lines(
-                &session.id,
+                &TranscriptOwner::session(&session.id),
                 &[
                     (TranscriptStream::Stdout, "one".into()),
                     (TranscriptStream::Stderr, "two".into()),
@@ -5360,20 +5406,32 @@ mod tests {
 
         // A second batch continues the sequence rather than restarting it.
         let second = store
-            .append_transcript_lines(&session.id, &[(TranscriptStream::Stdout, "three".into())])
+            .append_transcript_lines(
+                &TranscriptOwner::session(&session.id),
+                &[(TranscriptStream::Stdout, "three".into())],
+            )
             .await
             .unwrap();
         assert_eq!(second[0].seq, 3);
 
-        let all = store.transcript_since(&session.id, 0, 100).await.unwrap();
+        let all = store
+            .transcript_since(&TranscriptOwner::session(&session.id), 0, 100)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[1].stream, TranscriptStream::Stderr);
 
         // `since` is inclusive, matching /events?since=.
-        let tail = store.transcript_since(&session.id, 2, 100).await.unwrap();
+        let tail = store
+            .transcript_since(&TranscriptOwner::session(&session.id), 2, 100)
+            .await
+            .unwrap();
         assert_eq!(tail.iter().map(|l| l.seq).collect::<Vec<_>>(), vec![2, 3]);
 
-        let capped = store.transcript_since(&session.id, 0, 2).await.unwrap();
+        let capped = store
+            .transcript_since(&TranscriptOwner::session(&session.id), 0, 2)
+            .await
+            .unwrap();
         assert_eq!(capped.len(), 2);
     }
 
@@ -5396,7 +5454,10 @@ mod tests {
 
         let mut rx = store.subscribe_transcript();
         store
-            .append_transcript_lines(&session.id, &[(TranscriptStream::Stdout, "hello".into())])
+            .append_transcript_lines(
+                &TranscriptOwner::session(&session.id),
+                &[(TranscriptStream::Stdout, "hello".into())],
+            )
             .await
             .unwrap();
 
@@ -5406,12 +5467,265 @@ mod tests {
         // Anything announced on the channel must already be readable.
         assert_eq!(
             store
-                .transcript_since(&session.id, line.seq, 10)
+                .transcript_since(&TranscriptOwner::session(&session.id), line.seq, 10)
                 .await
                 .unwrap()[0]
                 .line,
             "hello"
         );
+    }
+
+    // --- build transcripts (#825) ---
+
+    /// A build only accepts approved specs, so every build-transcript test
+    /// has to walk the spec through review first.
+    async fn approve(store: &Store, spec: &Spec) {
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `seq` is per owner, not global: a build's first line is seq 1 even
+    /// though its spec's scout session already recorded lines. That is the
+    /// whole reason clients must keep cursors per owner.
+    #[tokio::test]
+    async fn transcript_seqs_run_per_owner_and_never_cross() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        let session_owner = TranscriptOwner::session(&spec.session_id);
+        approve(&store, &spec).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let build_owner = TranscriptOwner::build(&build.id);
+
+        store
+            .append_transcript_lines(
+                &session_owner,
+                &[
+                    (TranscriptStream::Stdout, "scout one".into()),
+                    (TranscriptStream::Stdout, "scout two".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let build_lines = store
+            .append_transcript_lines(
+                &build_owner,
+                &[(TranscriptStream::Stderr, "build one".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(build_lines[0].seq, 1, "the build starts its own sequence");
+        assert_eq!(build_lines[0].owner, build_owner);
+
+        // Neither read sees the other's lines.
+        let scout = store
+            .transcript_since(&session_owner, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            scout.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
+            vec!["scout one", "scout two"]
+        );
+        let built = store.transcript_since(&build_owner, 0, 100).await.unwrap();
+        assert_eq!(
+            built.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
+            vec!["build one"]
+        );
+        assert!(built.iter().all(|l| l.owner == build_owner));
+
+        // And the sequences continue independently.
+        let more = store
+            .append_transcript_lines(&session_owner, &[(TranscriptStream::Stdout, "3".into())])
+            .await
+            .unwrap();
+        assert_eq!(more[0].seq, 3);
+    }
+
+    /// The arc is enforced in SQL, and each side keeps 0004's cascade: a
+    /// deleted owner takes its transcript with it, which is what makes
+    /// transcript lifetime free.
+    #[tokio::test]
+    async fn the_owner_arc_is_exclusive_and_each_side_cascades() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        approve(&store, &spec).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        // Neither side set, and both sides set, are both refused.
+        for (session_id, build_id) in [
+            (None, None),
+            (
+                Some(spec.session_id.to_string()),
+                Some(build.id.to_string()),
+            ),
+        ] {
+            let err = sqlx::query(
+                "INSERT INTO transcript_lines (session_id, build_id, seq, timestamp, stream, line) \
+                 VALUES (?, ?, 1, '2026-01-01T00:00:00Z', 'stdout', 'x')",
+            )
+            .bind(session_id)
+            .bind(build_id)
+            .execute(&store.pool)
+            .await
+            .expect_err("the CHECK must refuse a line that is not owned by exactly one row");
+            assert!(
+                format!("{err}").to_lowercase().contains("check"),
+                "expected a CHECK violation, got {err}"
+            );
+        }
+
+        store
+            .append_transcript_lines(
+                &TranscriptOwner::build(&build.id),
+                &[(TranscriptStream::Stdout, "doomed".into())],
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM builds WHERE id = ?")
+            .bind(build.id.as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .transcript_since(&TranscriptOwner::build(&build.id), 0, 100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "deleting the build must cascade to its transcript"
+        );
+    }
+
+    /// Existing session transcripts survive the rebuild in 0020 with their
+    /// seqs intact — the migration copies rows, and a dropped or renumbered
+    /// one would silently break every `?since=` cursor a client holds.
+    ///
+    /// Reaches for `Migrator::DEFAULT` + assigning `migrations` because sqlx
+    /// 0.8 has no `run_to`: it is the only way to apply a prefix of the set.
+    /// Those fields are `pub` but documented semver-exempt, so a sqlx bump
+    /// could break this test — which is cheaper than not testing the rebuild.
+    #[tokio::test]
+    async fn the_rebuild_carries_existing_session_transcripts_across() {
+        use sqlx::migrate::Migrator;
+
+        let all: Vec<_> = MIGRATOR.migrations.iter().cloned().collect();
+        let split = all
+            .iter()
+            .position(|m| m.version == 20)
+            .expect("0020_build_transcripts is in the migration set");
+        let mut prefix = Migrator::DEFAULT;
+        prefix.migrations = all[..split].to_vec().into();
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("old.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        prefix.run(&pool).await.unwrap();
+
+        // A session transcript written against the *old* schema.
+        let project = sample_project();
+        let task = task_with(&project.id, 1, 0);
+        let session_id = SessionId::new();
+        sqlx::query("INSERT INTO projects (id, repo_owner, repo_name, added_at) VALUES (?,?,?,?)")
+            .bind(project.id.as_str())
+            .bind(&project.repo_owner)
+            .bind(&project.repo_name)
+            .bind(project.added_at.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks (id, project_id, gh_issue_number, title, body, labels, gh_state, \
+             state, priority, ingested_at, updated_at) \
+             VALUES (?,?,?,?,?,'[]','open','backlog',0,?,?)",
+        )
+        .bind(task.id.as_str())
+        .bind(project.id.as_str())
+        .bind(1i64)
+        .bind(&task.title)
+        .bind(&task.body)
+        .bind(task.ingested_at.to_rfc3339())
+        .bind(task.updated_at.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, task_id, branch, status, started_at) \
+             VALUES (?,?,'scout/1','running',?)",
+        )
+        .bind(session_id.as_str())
+        .bind(task.id.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        for seq in 1..=3i64 {
+            sqlx::query(
+                "INSERT INTO transcript_lines (session_id, seq, timestamp, stream, line) \
+                 VALUES (?,?,?,'stdout',?)",
+            )
+            .bind(session_id.as_str())
+            .bind(seq)
+            .bind(Utc::now().to_rfc3339())
+            .bind(format!("old line {seq}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        // Now migrate for real, through the same path the server uses.
+        let store = Store::open(dir.path().join("old.db")).await.unwrap();
+        let lines = store
+            .transcript_since(&TranscriptOwner::session(&session_id), 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l.seq, l.line.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "old line 1"), (2, "old line 2"), (3, "old line 3")],
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.owner == TranscriptOwner::session(&session_id)),
+            "migrated rows must come across session-owned"
+        );
+
+        // And the rebuilt table still takes new lines on the same sequence.
+        let next = store
+            .append_transcript_lines(
+                &TranscriptOwner::session(&session_id),
+                &[(TranscriptStream::Stdout, "new line".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(next[0].seq, 4);
     }
 
     #[tokio::test]
