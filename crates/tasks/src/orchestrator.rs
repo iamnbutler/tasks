@@ -26,7 +26,7 @@
 //! agent talks to GitHub it authenticates as itself (gh's keychain auth),
 //! not with the server's credential.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ use crate::models::{
     Actor, BuildStatus, CharterEntry, CharterLevel, Obligation, ObligationKind,
     OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{ACTOR_HEADER, Store, StoreError};
 
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
@@ -50,6 +50,11 @@ pub enum OrchestratorError {
     Store(#[from] StoreError),
     #[error("spawn agent: {0}")]
     Spawn(std::io::Error),
+    #[error("writing the actor credential to {path}: {source}")]
+    ActorConfig {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("agent exited with {status}: {stderr}")]
     AgentFailed {
         status: std::process::ExitStatus,
@@ -71,6 +76,11 @@ pub struct OrchestratorConfig {
     pub workdir: PathBuf,
     /// Port the tasks API listens on; spliced into the system prompt.
     pub api_port: u16,
+    /// Where the agent's curl config — its actor credential — is written
+    /// before every turn. Under the data dir, never the workdir: in
+    /// production the workdir is a repo checkout the agent commits from, and
+    /// a secret there is one `git add -A` from being published.
+    pub curl_config: PathBuf,
 }
 
 pub struct Orchestrator {
@@ -154,7 +164,7 @@ impl Orchestrator {
         // through the prompt. A human flipping a capability takes effect on
         // the next turn, without restarting anything.
         let charter = self.store.charter().await?;
-        let system = system_prompt(self.config.api_port, &charter);
+        let system = system_prompt(self.config.api_port, &charter, &self.config.curl_config);
         match self.store.orchestrator_cc_session().await? {
             None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
@@ -245,6 +255,17 @@ impl Orchestrator {
             .await
             .map_err(OrchestratorError::Spawn)?;
 
+        // Rewritten before every spawn: the token is minted per boot, so a
+        // stale file is useless. An agent that cannot identify itself must
+        // not run at all — an unattributed write is recorded as the human's,
+        // which is the charter going silently unenforced.
+        write_curl_config(&self.config.curl_config, self.store.actor_token())
+            .await
+            .map_err(|source| OrchestratorError::ActorConfig {
+                path: self.config.curl_config.display().to_string(),
+                source,
+            })?;
+
         let mut cmd = tokio::process::Command::new(&prog);
         cmd.args(&base_args)
             .args(extra_args)
@@ -252,11 +273,11 @@ impl Orchestrator {
             // The server's token stays the server's. When the agent talks to
             // GitHub it authenticates as itself (gh keychain auth).
             .env_remove("GITHUB_TOKEN")
-            // How the agent proves its writes are its own. Passed through the
-            // environment rather than argv (world-readable via `ps`) or the
-            // prompt (persisted), and referenced by name in the standing
-            // instructions so the value itself never lands in the transcript.
-            .env("TASKS_ACTOR_TOKEN", self.store.actor_token())
+            // The credential is a file now (`curl -K`), and this is not just
+            // "stop setting it": the server's own environment could carry a
+            // `TASKS_ACTOR_TOKEN`, and inheriting one would revive the shell
+            // expansion that a static allowlist cannot run.
+            .env_remove("TASKS_ACTOR_TOKEN")
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
             .kill_on_drop(true)
@@ -453,6 +474,54 @@ fn input_side_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
         + field("cache_read_input_tokens")
         + field("cache_creation_input_tokens");
     (total > 0).then_some(total)
+}
+
+/// The curl config the agent presents as its identity: a comment header and
+/// exactly one option.
+///
+/// One option, deliberately. `-K` is not scoped to a host — everything in the
+/// file applies to whatever URL that invocation names — so anything else in
+/// here would be sent wherever the agent points curl. A unit test pins the
+/// count.
+fn curl_config_contents(token: &str) -> String {
+    format!(
+        "# Written by the tasks server before each orchestrator turn.\n\
+         # It is the orchestrator's actor credential: writes carrying this\n\
+         # header are attributed to it and gated by the charter.\n\
+         # `-K` applies this to whatever URL curl is given, so this file\n\
+         # holds the header and nothing else.\n\
+         header = \"{ACTOR_HEADER}: orchestrator {token}\"\n"
+    )
+}
+
+/// Write the curl config at `path`, atomically and 0600.
+///
+/// Written to a sibling temp file opened `create_new` *with* the mode (never
+/// chmod-after: the window would be short, but the file is a credential) and
+/// then renamed, so a turn can never read a half-written config. A leftover
+/// temp file from a crashed write is removed first — `open` will not lower an
+/// existing file's mode.
+async fn write_curl_config(path: &Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("tmp");
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .await?;
+    file.write_all(curl_config_contents(token).as_bytes())
+        .await?;
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await
 }
 
 /// One-line human label for a tool call, e.g. `Bash: curl -s .../tasks`.
@@ -796,8 +865,9 @@ fn authority_section(charter: &[CharterEntry]) -> String {
 /// The orchestrator's standing instructions. Appended (not replacing) so
 /// Claude Code's own tool discipline stays intact, and passed on every turn
 /// (resume included) so edits here reach a long-lived session.
-fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
+fn system_prompt(port: u16, charter: &[CharterEntry], curl_config: &Path) -> String {
     let authority = authority_section(charter);
+    let curl_config = curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
@@ -864,14 +934,25 @@ fn system_prompt(port: u16, charter: &[CharterEntry]) -> String {
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
          state and the activity log honest.\n\n\
-         Identify yourself on every write: pass \
-         `-H \"X-Tasks-Actor: orchestrator $TASKS_ACTOR_TOKEN\"` (the token is \
-         in your environment — never print it). Writes carrying it are \
-         recorded as yours, which is what keeps you from being notified about \
-         your own actions, and what makes the decisions ledger worth reading. \
-         Every write you make that way must also carry a `rationale` — the \
-         server rejects one without it, because a decision nobody can review \
-         afterwards is not one you were trusted to make.\n\n\
+         Identify yourself on every write: pass `-K {curl_config}` to curl. \
+         That file is a curl config the server rewrites for you before every \
+         turn; it holds one line, the header that says this write is yours. \
+         Do not read it, print it, copy it, or pass it to anything else, and \
+         never use it against any host other than http://127.0.0.1:{port} — \
+         `-K` applies its header to whatever URL you name. Writes carrying it \
+         are recorded as yours, which is what keeps you from being notified \
+         about your own actions, and what makes the decisions ledger worth \
+         reading. If you cannot make an identified write — the file is \
+         missing, curl is denied — say so and stop; do not fall back to an \
+         unidentified one, which is recorded as the human's and escapes \
+         everything that governs you. Every write you make must also carry a \
+         `rationale` — the server rejects one without it, because a decision \
+         nobody can review afterwards is not one you were trusted to make. \
+         For example:\n\
+         curl -sS -K {curl_config} -X POST \
+         http://127.0.0.1:{port}/spec-queue/spec_abc/review \
+         -H 'Content-Type: application/json' \
+         -d '{{\"status\":\"approved\",\"rationale\":\"why\"}}'\n\n\
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
@@ -1060,9 +1141,13 @@ mod tests {
         }));
     }
 
+    fn prompt(port: u16, charter: &[CharterEntry]) -> String {
+        system_prompt(port, charter, Path::new("/data/orchestrator-curl.conf"))
+    }
+
     #[test]
     fn the_system_prompt_carries_the_port_and_the_guardrails() {
-        let p = system_prompt(4800, &[]);
+        let p = prompt(4800, &[]);
         assert!(p.contains("http://127.0.0.1:4800"));
         assert!(p.contains("[pipeline]"));
         assert!(p.contains("proactive"));
@@ -1180,11 +1265,11 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let empty = system_prompt(4800, &[]);
+        let empty = prompt(4800, &[]);
         assert!(empty.contains("Act on your own: nothing yet"), "{empty}");
         assert!(!empty.contains("Decide but do not act"), "{empty}");
 
-        let p = system_prompt(
+        let p = prompt(
             4800,
             &[
                 entry(Capability::CaptureWork, CharterLevel::Live, Some(5)),
@@ -1203,5 +1288,74 @@ mod tests {
         // every denial would grow with the enum for no benefit.
         assert!(!p.contains("close issues that are done"), "{p}");
         assert!(p.contains("anything not listed here is the human's"), "{p}");
+    }
+
+    /// The credential the agent can actually present. The old scheme asked it
+    /// to interpolate `$TASKS_ACTOR_TOKEN` into a `-H` argument, which Claude
+    /// Code refuses to run under a static `Bash(curl:*)` allowlist — so the
+    /// safest deployment was the one where nothing could be attributed and
+    /// the charter was inert.
+    #[test]
+    fn the_prompt_asks_for_the_config_file_and_never_a_shell_variable() {
+        let p = prompt(4800, &[]);
+        assert!(p.contains("-K /data/orchestrator-curl.conf"), "{p}");
+        assert!(
+            !p.contains("TASKS_ACTOR_TOKEN") && !p.contains('$'),
+            "a command with a variable in it is not statically verifiable: {p}"
+        );
+        // The two things `-K` makes possible to get wrong: pointing it at
+        // another host, and giving up on attribution instead of stopping.
+        assert!(
+            p.contains("never use it against any host other than"),
+            "{p}"
+        );
+        assert!(p.contains("recorded as the human's"), "{p}");
+    }
+
+    #[test]
+    fn the_curl_config_holds_the_header_and_nothing_else() {
+        let rendered = curl_config_contents("tok-123");
+        let options: Vec<&str> = rendered
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            options,
+            vec![r#"header = "X-Tasks-Actor: orchestrator tok-123""#],
+            "-K is not scoped to a host, so anything else here would be sent \
+             wherever curl is pointed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_credential_is_written_0600_in_place_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("orchestrator-curl.conf");
+
+        write_curl_config(&path, "first").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file is a credential");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("first"));
+
+        // Rewritten every turn: replacing must work even though `create_new`
+        // is what gives the temp file its mode.
+        write_curl_config(&path, "second").await.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("second") && !contents.contains("first"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the temp file is renamed, not left behind"
+        );
+
+        // And a leftover temp file from a crashed write does not wedge it.
+        std::fs::write(path.with_extension("tmp"), "junk").unwrap();
+        write_curl_config(&path, "third").await.unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
     }
 }

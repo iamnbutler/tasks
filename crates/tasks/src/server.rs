@@ -42,7 +42,9 @@ use crate::models::{
     Project, ProjectId, Session, SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
     TaskId, TranscriptLine,
 };
-use crate::store::{MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError};
+use crate::store::{
+    ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
+};
 
 /// How many events `/events` returns when the caller doesn't ask for a count.
 const DEFAULT_EVENT_LIMIT: i64 = 100;
@@ -351,7 +353,7 @@ async fn queue_under_charter(
     id: &TaskId,
     front: bool,
 ) -> ApiResult<Response> {
-    let actor = actor_of(store, headers);
+    let actor = actor_of(store, headers)?;
     let authority = authorize(
         store,
         actor,
@@ -422,7 +424,7 @@ async fn capture_issue(
     if body.title.trim().is_empty() {
         return Err(ApiError::BadRequest("title must be non-empty".into()));
     }
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     // Provenance is what makes a captured issue auditable from GitHub alone,
     // so an autonomous capture without it is refused rather than filed
     // anonymously.
@@ -520,7 +522,7 @@ async fn close_task(
     let reason = CloseReason::from_str(&body.reason)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown reason: {}", body.reason)))?;
     let id = TaskId::from_raw(task_id);
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     if authorize(
         &store,
         actor,
@@ -1279,13 +1281,25 @@ async fn list_spec_queue(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<
     Ok(Json(store.list_spec_queue().await?))
 }
 
-/// Header the orchestrator identifies itself with: `orchestrator <token>`,
-/// where the token was minted for it at boot and handed over in its
-/// environment. Everything else is the human.
-const ACTOR_HEADER: &str = "x-tasks-actor";
-
-fn actor_of(store: &Store, headers: &axum::http::HeaderMap) -> Actor {
-    store.resolve_actor(headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()))
+/// Who a write belongs to: the [`ACTOR_HEADER`] claim, or the human when no
+/// claim is made.
+///
+/// A claim that is *present but does not verify* is a 403, not the human.
+/// Since the human is never gated, demoting a failed claim would hand the
+/// caller more authority than it asked for — the charter would go silently
+/// unenforced, the ledger would misattribute the write, and the echo filter
+/// would nudge the orchestrator about its own action. Failing closed costs a
+/// turn; failing open costs all of that.
+fn actor_of(store: &Store, headers: &axum::http::HeaderMap) -> ApiResult<Actor> {
+    match store.resolve_actor(headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok())) {
+        ActorClaim::Human => Ok(Actor::Human),
+        ActorClaim::Orchestrator => Ok(Actor::Orchestrator),
+        ActorClaim::Unrecognized => Err(ApiError::Forbidden(format!(
+            "{ACTOR_HEADER} did not verify — expected `orchestrator <token>` with the \
+             token this server minted at boot. A failed claim is refused rather than \
+             read as the human; send no header at all to write as the human."
+        ))),
+    }
 }
 
 // --- the charter: what the orchestrator may do ---
@@ -1356,7 +1370,7 @@ async fn set_charter(
     headers: axum::http::HeaderMap,
     Json(body): Json<SetCharter>,
 ) -> ApiResult<Json<CharterEntry>> {
-    if actor_of(&store, &headers) != Actor::Human {
+    if actor_of(&store, &headers)? != Actor::Human {
         return Err(ApiError::Forbidden(
             "the charter is the human's to set".into(),
         ));
@@ -1415,7 +1429,7 @@ async fn review_spec(
     let status = SpecQueueStatus::from_str(&body.status)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown status: {}", body.status)))?;
     let id = SpecId::from_raw(spec_id);
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let decision = DecisionInput {
         actor,
         rationale: body.rationale,
@@ -1471,7 +1485,7 @@ async fn request_build(
     Json(body): Json<BuildRequest>,
 ) -> ApiResult<Response> {
     let base_branch = body.base_branch.as_deref().unwrap_or("main");
-    let actor = actor_of(&store, &headers);
+    let actor = actor_of(&store, &headers)?;
     let decision = DecisionInput {
         actor,
         rationale: body.rationale,

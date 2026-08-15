@@ -30,6 +30,28 @@ const MAX_BUILD_ATTEMPTS: i64 = 3;
 /// spending the context window on a wall of pipeline notices.
 const MAX_TURNS_PER_TICK: i64 = 50;
 
+/// The header an agent identifies its writes with: `orchestrator <token>`,
+/// where the token is the one this server minted at boot.
+///
+/// One statement of the name, shared by the writer (the curl config the
+/// orchestrator is handed) and the reader (the API). HTTP header lookup is
+/// case-insensitive, so the casing here is for humans.
+pub const ACTOR_HEADER: &str = "X-Tasks-Actor";
+
+/// What an [`ACTOR_HEADER`] value amounts to.
+///
+/// The third case is the point: attribution is what the charter gates, so a
+/// claim that does not verify must not quietly become the ungated human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorClaim {
+    /// No claim was made. The human proves nothing and is never gated.
+    Human,
+    /// A valid token: the orchestrator, and the charter applies.
+    Orchestrator,
+    /// A claim was made and it failed. Refuse it.
+    Unrecognized,
+}
+
 /// Conversation page size when a client does not ask for one.
 pub const MESSAGE_PAGE_DEFAULT: i64 = 200;
 /// Ceiling on a client-requested page. The conversation is kept forever; what
@@ -137,9 +159,12 @@ pub struct Store {
     transcript_tx: broadcast::Sender<TranscriptLine>,
     orchestrator_feed_tx: broadcast::Sender<OrchestratorFeedEvent>,
     /// Secret the orchestrator presents to be attributed as itself. Minted
-    /// per boot and held only in memory: it is handed to the agent through
-    /// its environment (never argv, which is world-readable via `ps`, and
-    /// never the prompt, which is persisted).
+    /// per boot and held only in memory: it is handed to the agent through a
+    /// 0600 curl config file under the data dir (never argv, which is
+    /// world-readable via `ps`; never the prompt, which is persisted; never
+    /// the environment, which the agent cannot reference under a static
+    /// allowlist; and never the agent's workdir, which is a repo checkout it
+    /// commits from).
     ///
     /// Not authentication — the API is loopback and unauthenticated by
     /// design. It exists so the orchestrator cannot silently be mistaken for
@@ -2279,14 +2304,27 @@ impl Store {
         &self.actor_token
     }
 
-    /// Resolve an `X-Tasks-Actor` header value. The expected form is
-    /// `orchestrator <token>`; anything else — absent, malformed, wrong
-    /// token — is [`Actor::Human`], because the human is the caller who
-    /// never has to prove anything.
-    pub fn resolve_actor(&self, header: Option<&str>) -> Actor {
-        match header.and_then(|h| h.split_once(' ')) {
-            Some(("orchestrator", token)) if token == &*self.actor_token => Actor::Orchestrator,
-            _ => Actor::Human,
+    /// Resolve an [`ACTOR_HEADER`] value. The expected form is
+    /// `orchestrator <token>`.
+    ///
+    /// Three outcomes, not two. *Absent* (or empty) is the human, who proves
+    /// nothing because they are never gated. A *valid* token is the
+    /// orchestrator. Anything else is [`ActorClaim::Unrecognized`] — a claim
+    /// that failed — and the caller must refuse it rather than fall back to
+    /// the human, which would hand a broken credential more authority than it
+    /// asked for. Whitespace is trimmed, so a header whose token half is an
+    /// unexpanded shell variable cannot pass as a bare role.
+    pub fn resolve_actor(&self, header: Option<&str>) -> ActorClaim {
+        let Some(header) = header.map(str::trim).filter(|h| !h.is_empty()) else {
+            return ActorClaim::Human;
+        };
+        match header.split_once(' ') {
+            Some((role, token))
+                if role.trim() == "orchestrator" && token.trim() == &*self.actor_token =>
+            {
+                ActorClaim::Orchestrator
+            }
+            _ => ActorClaim::Unrecognized,
         }
     }
 
@@ -4565,6 +4603,46 @@ mod tests {
             entry.status,
             SpecQueueStatus::Approved,
             "the pool was full; the work was not wrong"
+        );
+    }
+
+    /// A claim that does not verify is its own outcome. Reading any of these
+    /// as the human would hand a broken credential *more* authority than it
+    /// asked for, since the human is the one caller the charter never gates.
+    #[tokio::test]
+    async fn a_failed_actor_claim_is_not_the_human() {
+        let store = Store::open_in_memory().await.unwrap();
+        let token = store.actor_token().to_string();
+
+        // No claim at all: the human, who proves nothing.
+        assert_eq!(store.resolve_actor(None), ActorClaim::Human);
+        assert_eq!(store.resolve_actor(Some("")), ActorClaim::Human);
+        assert_eq!(store.resolve_actor(Some("   ")), ActorClaim::Human);
+
+        assert_eq!(
+            store.resolve_actor(Some(&format!("orchestrator {token}"))),
+            ActorClaim::Orchestrator
+        );
+
+        // A stale token from a previous boot.
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator 6f1c-not-this-boot")),
+            ActorClaim::Unrecognized
+        );
+        // `$TASKS_ACTOR_TOKEN` that expanded to nothing — the exact shape the
+        // old scheme produced when the variable was missing.
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator ")),
+            ActorClaim::Unrecognized
+        );
+        assert_eq!(
+            store.resolve_actor(Some("orchestrator")),
+            ActorClaim::Unrecognized
+        );
+        // Right token, wrong role.
+        assert_eq!(
+            store.resolve_actor(Some(&format!("builder {token}"))),
+            ActorClaim::Unrecognized
         );
     }
 

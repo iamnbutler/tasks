@@ -279,6 +279,15 @@ impl Config {
             .unwrap_or_else(|| self.data_dir.join("orchestrator"))
     }
 
+    /// Where the orchestrator's actor credential is written.
+    ///
+    /// Under the data dir, never [`Config::agent_workdir`]: in production
+    /// that is the repo checkout the agent commits from, so a secret there is
+    /// one `git add -A` from being published.
+    fn orchestrator_curl_config(&self) -> PathBuf {
+        self.data_dir.join("orchestrator-curl.conf")
+    }
+
     fn github_client(&self) -> Option<GitHubClient> {
         let token = self.github_token.as_ref()?;
         let client = match &self.github_api_url {
@@ -973,6 +982,7 @@ pub async fn orchestrator_loop(
             timeout: config.orchestrator_timeout,
             workdir,
             api_port: config.port,
+            curl_config: config.orchestrator_curl_config(),
         },
     );
     loop {
