@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
+use tasks_protocol::vm_memory::{AgentOutcome, sample_memory};
 use tasks_protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -234,8 +235,8 @@ async fn run_scout(
     }
 
     // 4. Agent
-    let exit_code = match run_agent(&workdir, prompt, tx.clone()).await {
-        Ok(code) => code,
+    let outcome = match run_agent(&workdir, prompt, tx.clone()).await {
+        Ok(outcome) => outcome,
         Err(e) => {
             emit(
                 &tx,
@@ -247,17 +248,30 @@ async fn run_scout(
             return;
         }
     };
-    emit(&tx, ScoutEvent::ImplementationFinished { exit_code }).await;
+    emit(
+        &tx,
+        ScoutEvent::ImplementationFinished {
+            exit_code: outcome.exit_code,
+        },
+    )
+    .await;
 
     // 5. Spec
     let spec_path = workdir.join("SPEC.md");
     let spec_markdown = match tokio::fs::read_to_string(&spec_path).await {
         Ok(s) => s,
         Err(e) => {
+            // The most common cause of a missing spec is an agent that never
+            // got to write one — including one the OOM killer took out. Say so
+            // here: for a Scout this reason is the whole postmortem.
             emit(
                 &tx,
                 ScoutEvent::Failed {
-                    reason: format!("SPEC.md not found at {}: {e}", spec_path.display()),
+                    reason: format!(
+                        "SPEC.md not found at {}: {e}{}",
+                        spec_path.display(),
+                        outcome.failure_context()
+                    ),
                 },
             )
             .await;
@@ -371,13 +385,24 @@ async fn git_diff_name_only(workdir: &Path, base_sha: &str) -> Result<Vec<String
         .collect())
 }
 
-async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) -> Result<i32> {
+/// Run the agent, streaming its output, and report how it ended.
+///
+/// The run is bracketed by cgroup memory samples: an OOM kill inside this VM
+/// is otherwise invisible, because the kernel usually kills a compiler or
+/// linker job the agent merely sees as a failed command. See
+/// [`tasks_protocol::vm_memory`].
+async fn run_agent(
+    workdir: &Path,
+    prompt: &str,
+    tx: mpsc::Sender<TaskVmEvent>,
+) -> Result<AgentOutcome> {
     let cmd_str = std::env::var("SCOUT_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
     let mut parts = cmd_str.split_whitespace();
     let prog = parts.next().context("SCOUT_AGENT_CMD is empty")?;
     let args: Vec<&str> = parts.collect();
     info!(?prog, ?args, workdir = %workdir.display(), "running agent");
 
+    let before = sample_memory();
     let mut child = Command::new(prog)
         .args(&args)
         .current_dir(workdir)
@@ -416,7 +441,7 @@ async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) 
             .await;
         }
     });
-    let tx_err = tx;
+    let tx_err = tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut r = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = r.next_line().await {
@@ -434,5 +459,21 @@ async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) 
     let status = child.wait().await.context("wait for agent")?;
     let _ = stdout_task.await;
     let _ = stderr_task.await;
-    Ok(status.code().unwrap_or(-1))
+
+    let outcome = AgentOutcome::new(status, before, sample_memory());
+    // Emitted on every run, not just failures: a scout that exits 0 having
+    // achieved nothing looks identical to one that did nothing, unless the
+    // kill count is on the record either way.
+    if let Some(summary) = outcome.memory_summary() {
+        info!(%summary, "VM memory");
+        emit(
+            &tx,
+            ScoutEvent::Progress {
+                stream: LogStream::Stderr,
+                line: format!("scout-supervisor: VM memory: {summary}"),
+            },
+        )
+        .await;
+    }
+    Ok(outcome)
 }

@@ -61,11 +61,15 @@ async fn make_fixture_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-fn fixture_stub_agent() -> PathBuf {
+fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("stub-agent.sh")
+        .join(name)
+}
+
+fn fixture_stub_agent() -> PathBuf {
+    fixture("stub-agent.sh")
 }
 
 struct SupervisorProc {
@@ -257,6 +261,58 @@ async fn start_scout_fails_if_agent_missing_spec() {
         ),
         _ => unreachable!(),
     }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// An agent the kernel kills — the OOM shape. The exit code must be
+/// `128 + 9`, not the `-1` a signal death used to flatten into, and the
+/// failure reason must name the signal: for a Scout, that reason is the whole
+/// postmortem.
+#[tokio::test]
+async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("oom-killed-agent.sh");
+
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_oom".into(),
+            repo_clone_url: repo_url,
+            base_branch: "main".into(),
+            prompt: "n/a".into(),
+        }),
+    })
+    .await;
+
+    let mut exit_code = None;
+    let mut failure = None;
+    while failure.is_none() {
+        match sup.recv().await {
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::ImplementationFinished { exit_code: code }),
+            } => exit_code = Some(code),
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
+            } => failure = Some(reason),
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    assert_eq!(exit_code, Some(137), "SIGKILL should surface as 128 + 9");
+    let reason = failure.unwrap();
+    assert!(
+        reason.contains("killed by signal 9 (SIGKILL)"),
+        "reason did not name the signal: {reason}"
+    );
+    assert!(reason.contains("SPEC.md"), "reason: {reason}");
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;

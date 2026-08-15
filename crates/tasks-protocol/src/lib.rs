@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use vm_pool_protocol::AppProtocol;
 
+pub mod vm_memory;
+
 /// The application protocol tasks uses with vm-pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TasksProtocol;

@@ -57,11 +57,15 @@ async fn make_fixture_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-fn fixture_agent() -> PathBuf {
+fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("stub-builder-agent.sh")
+        .join(name)
+}
+
+fn fixture_agent() -> PathBuf {
+    fixture("stub-builder-agent.sh")
 }
 
 struct SupervisorProc {
@@ -230,6 +234,49 @@ async fn an_empty_branch_is_a_failure() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// The OOM shape: the agent is killed by a signal, commits nothing, and until
+/// #825 lands the failure reason is the only place a build's postmortem can
+/// live. So the reason must name the signal, and the exit code must be
+/// `128 + 9` rather than the `-1` every other odd failure used to share.
+#[tokio::test]
+async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let agent = fixture("oom-killed-agent.sh");
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url)).await;
+
+    let mut exit_code = None;
+    let reason = loop {
+        match sup.recv().await {
+            VmEvent::App {
+                payload: TaskEvent::Build(BuildEvent::ImplementationFinished { exit_code: code }),
+            } => exit_code = Some(code),
+            VmEvent::App {
+                payload: TaskEvent::Build(BuildEvent::Failed { reason }),
+            } => break reason,
+            VmEvent::App {
+                payload: TaskEvent::Build(_),
+            } => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+
+    assert_eq!(exit_code, Some(137), "SIGKILL should surface as 128 + 9");
+    assert!(reason.contains("no commits"), "reason: {reason}");
+    assert!(
+        reason.contains("killed by signal 9 (SIGKILL)"),
+        "reason did not name the signal: {reason}"
+    );
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;
