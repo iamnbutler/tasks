@@ -21,7 +21,7 @@ use vm_pool_protocol::{ServiceEvent, VmConfig, VmId};
 use crate::events::EventPayload;
 use crate::models::{
     Complexity, ReviewedSpec, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage, Spec,
-    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner, TranscriptStream,
+    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
 };
 use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::store::{Store, StoreError};
