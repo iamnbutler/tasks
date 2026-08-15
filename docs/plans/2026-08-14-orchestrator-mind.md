@@ -72,6 +72,15 @@ work that is done or no longer relevant. This is the "person in charge when
 the human isn't" role, and it is distinct from reviewing specs and
 dispatching builds.
 
+**Token spend is not a design constraint.** This tool is for someone with
+effectively unlimited spend; the scarce resource is the human's attention, not
+tokens. So no capability ships rate-limited, throughput beats frugality when
+they conflict, and "this might cost a lot" is never on its own a reason to add
+a gate. Where a cap exists it is a brake on a *misbehaving* capability, not a
+budget. Designs that trade latency or autonomy for cost are the wrong shape
+here, and reading a constraint as being about money when it was about control
+is the specific error this section exists to prevent.
+
 **Guardrails default off.** Cooling-off `0`, generous caps, escalation async
 rather than blocking. They are tuning knobs, not gates. The human gate that
 matters is merging to `main`, and the Change Queue from #744 was never built
@@ -82,7 +91,7 @@ stated explicitly because the day it lands the risk calculus changes.
 diff — is not machine-computable, and a tier gate teaches the agent that
 lower claims succeed. The server computes *facts* (staleness, overlap,
 collision); the orchestrator makes judgments. Policy contributes mechanical
-floors only: attempt caps, spend budgets, rate limits.
+floors only: attempt caps, and the pipeline's own serialization.
 
 ## What today's shape costs
 
@@ -148,7 +157,7 @@ that matters, and it is worth noticing that the two custodial capabilities are
 | --- | --- | --- | --- |
 | `capture_work` | file a new issue | trivial (close it) | dedup against open issues + recent captures |
 | `retire_work` | close / deem irrelevant | trivial (reopen) | merged PR or named commit, queried live |
-| `queue_tasks` | move backlog → queued | trivial (dequeue) | spend budget; bulk intake never auto-dispatches |
+| `queue_tasks` | move backlog → queued | trivial (dequeue) | bulk intake never auto-dispatches |
 | `dispatch_builds` | approved specs → Builder run | one wasted Builder run | attempt cap; specs already human-approved |
 | `auto_review_specs` | render the verdict | one wasted Builder run + a closeable PR | staleness, overlap, verification quality |
 
@@ -206,19 +215,29 @@ work, queue it, scout it, review the spec, and dispatch the build. This is the
 first point at which the system generates its own work, and it deserves to be
 named as such.
 
-The governor is a **spend budget** on the charter (scout-runs/day,
-issues/day), not a human gate. Note that queue depth was never where spend
-happens — dispatch is, and dispatch is already bounded by
-`SCOUT_MAX_CONCURRENT`, so an 11,000-issue repo drains two at a time: a
-bleed, not a spike. The budget protects against a runaway orchestrator and an
-overenthusiastic human equally, which is what "safe by construction rather
-than by trust" means here.
+**There is no governor, and this section originally invented one** (corrected
+2026-08-14). It read the manual-queue rule as a *cost* guard and proposed
+per-day spend budgets to replace it. That was a misreading: the concern was
+never billing, it was that adding a repo with 11,000 issues must not turn into
+11,000 Scout runs and 11,000 PRs nobody chose — bulk intake becoming bulk
+*work*.
 
-CLAUDE.md's manual-queue rule should be reworded accordingly. Its intent was
-a cost guard — adding a repo with 11,000 issues must not bill 11,000 scout
-runs — not a human-judgment gate. The invariant to preserve is *bulk intake
-never auto-dispatches*; deliberate per-task queueing by an accountable actor
-is fine.
+That invariant is already upheld by the pipeline's shape, which is a much
+better place for it than a number someone picked. Backlog never dispatches.
+`SCOUT_MAX_CONCURRENT` bounds exploration. **Builds are serial** — `build_loop`
+awaits each run inline — so the 11,000-PR outcome is structurally impossible
+rather than rate-limited. And a batch that keeps failing is retired by the
+attempt cap instead of retrying forever.
+
+So no capability ships with a rate limit. Per-day caps remain settable as a
+manual brake for a capability caught misbehaving, but they are not a default
+and not part of the safety story: the point of the system is that work moves
+without being asked, and a cap that fires is a capability that should have been
+turned down instead.
+
+CLAUDE.md's manual-queue rule is reworded accordingly — the invariant to
+preserve is *bulk intake never becomes bulk work*; deliberate per-task queueing
+by an accountable actor is fine.
 
 ### The GitHub write path
 
@@ -381,7 +400,7 @@ the feature actively worse than foraging.
 ### 6. Charter + shadow capabilities
 
 `orchestrator_charter`: one row per capability with level `off` | `shadow` |
-`live` plus params (spend budget, caps, cooling-off). Human-writable only. The
+`live`, plus optional params. Human-writable only. The
 prompt's authority section is **generated** from it, so there is exactly one
 statement of what the orchestrator may do — otherwise hand-written prose
 saying "reviews are the human's" (`orchestrator.rs:504`) contradicts a charter

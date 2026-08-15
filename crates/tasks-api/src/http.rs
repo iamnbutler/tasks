@@ -34,9 +34,8 @@ pub struct ShadowAck {
 pub struct SetCharter {
     /// `off`, `shadow`, or `live`.
     pub level: String,
-    /// Actions per day, or `null` for uncapped. A mechanical floor against a
-    /// runaway loop; it is not a judgment about whether any one action is a
-    /// good idea.
+    /// Optional manual brake: actions per day. `null` (the default) is
+    /// uncapped, which is what every capability ships as.
     #[serde(default)]
     pub daily_limit: Option<i64>,
 }

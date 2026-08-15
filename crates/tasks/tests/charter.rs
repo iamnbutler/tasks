@@ -150,9 +150,15 @@ async fn a_fresh_install_ships_the_intended_posture() {
     assert_eq!(level(Capability::QueueTasks).level, CharterLevel::Live);
     assert_eq!(level(Capability::DispatchBuilds).level, CharterLevel::Live);
     // Stricter than the status quo, not looser: the alternative is an
-    // ungoverned `gh issue create` with no ledger row and no cap.
+    // ungoverned `gh issue create` with no ledger row at all.
     assert_eq!(level(Capability::CaptureWork).level, CharterLevel::Live);
-    assert_eq!(level(Capability::CaptureWork).daily_limit, Some(5));
+    // Nothing ships rate-limited. Token spend is not a constraint here, and a
+    // per-day cap on a *human*-initiated action (cmd-N files through the
+    // orchestrator) is incoherent besides.
+    assert!(
+        charter.iter().all(|e| e.daily_limit.is_none()),
+        "no capability should ship with a rate limit"
+    );
     // The verdict stays the human's while the ledger fills with the ones it
     // would have rendered.
     assert_eq!(

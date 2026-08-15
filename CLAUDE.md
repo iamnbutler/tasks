@@ -19,11 +19,14 @@ implementation.
   write it. Ingested issues land in `backlog` and are never dispatched — only
   explicitly queued tasks (`POST /tasks/{id}/queue` or `/scout`) reach a
   Scout, and picked-up work stays picked up (failures and `needs_revision`
-  return to `queued`, not `backlog`). The invariant is a *cost guard*: adding
-  a repo with 11,000 issues must not bill 11,000 Scout runs. It is not a
-  human-judgment gate, so deliberate per-task queueing by an accountable actor
-  is fine — the orchestrator may do it when `queue_tasks` is live in the
-  charter, bounded by that capability's daily budget.
+  return to `queued`, not `backlog`). The invariant is that **bulk intake must
+  not become bulk work**: adding a repo with 11,000 issues must not turn into
+  11,000 Scout runs and 11,000 PRs nobody chose. It is not a human-judgment
+  gate on any individual task, so deliberate per-task queueing by an
+  accountable actor is fine — the orchestrator may do it when `queue_tasks` is
+  live in the charter. The invariant is upheld by the pipeline's shape, not by
+  rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
+  and builds are serial.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
   prompt.** Five independently switchable capabilities (`capture_work`,
   `retire_work`, `queue_tasks`, `dispatch_builds`, `auto_review_specs`), each
@@ -32,7 +35,9 @@ implementation.
   enforces the same rows on the endpoints — one statement of authority, and
   not one a long conversation can talk itself out of. `shadow` is a server
   behaviour, not an instruction: the call is accepted, the decision is
-  recorded with `enforced = 0`, and nothing is applied. Ships as
+  recorded with `enforced = 0`, and nothing is applied. No capability ships
+  with a rate limit — the point of the system is that work moves without being
+  asked. Ships as
   `queue_tasks`/`dispatch_builds`/`capture_work` live (the first two already
   worked; the third replaces an ungoverned `gh` write) and
   `auto_review_specs`/`retire_work` shadow. The human is never gated — this

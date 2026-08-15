@@ -828,10 +828,15 @@ impl CharterLevel {
 pub struct CharterEntry {
     pub capability: Capability,
     pub level: CharterLevel,
-    /// Actions of this kind the orchestrator may take per day. `None` is
-    /// uncapped — fine for reversible capabilities, and the reason this is a
-    /// cap rather than a gate: it protects against a runaway loop, not
-    /// against a bad judgment.
+    /// Optional manual brake: actions of this kind per day. `None` — the
+    /// default for every capability — is uncapped.
+    ///
+    /// Deliberately not part of the design's safety story. Runaway protection
+    /// lives in the pipeline's shape (builds are serial, scouts are bounded by
+    /// `SCOUT_MAX_CONCURRENT`, a failing batch is retired by the attempt cap),
+    /// and the point of this system is that work moves without being asked.
+    /// This exists for the narrow case of a capability caught misbehaving,
+    /// where the alternative is turning it off entirely.
     pub daily_limit: Option<i64>,
     pub updated_at: DateTime<Utc>,
 }
