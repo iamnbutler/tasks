@@ -94,8 +94,9 @@ the server only.
   the next tick. Wrap interactive use: checkout + renew loop, run `claude
   --resume`, release on exit.
 - `GET /orchestrator/stream` — SSE live view of the in-flight tick, one JSON
-  frame per `data:` line: `{"kind":"delta","text"}` (assistant text in
-  generation order), `{"kind":"tool","label"}` (a tool call, e.g.
+  frame per `data:` line: `{"kind":"started"}` (a tick began — published
+  before the agent is even spawned), `{"kind":"delta","text"}` (assistant
+  text in generation order), `{"kind":"tool","label"}` (a tool call, e.g.
   `Bash: curl …`), `{"kind":"done"}` (the durable reply is now fetchable).
   **Ephemeral**: no backfill, a (re)connect only sees what happens next, and
   a lagged subscriber misses deltas — never the reply, which always lands in
@@ -104,6 +105,15 @@ the server only.
   is working narration; the segment after the last tool call is the reply),
   show the latest tool label as status, and swap in the persisted message
   when it arrives. Skip unknown `kind`s.
+  Drive the "is it working" indicator off the tick's **lifecycle** — an
+  elapsed clock from `started` (or from your own send) until the reply lands
+  — not off text arriving: extended thinking and slow tool calls are long
+  silences, and an operator who overrides `ORCHESTRATOR_CMD` without
+  `--output-format stream-json --verbose --include-partial-messages` gets
+  `started`/`done` and nothing in between. Retire the provisional view when
+  the durable reply arrives rather than on `done`: `done` can be dropped
+  (lagged subscriber, dropped connection, a server that died mid-tick), and
+  a view retired only by `done` leaves a clock running forever when it is.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
   `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.

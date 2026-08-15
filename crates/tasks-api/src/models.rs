@@ -1115,6 +1115,12 @@ pub struct OrchestratorSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OrchestratorFeedEvent {
+    /// A tick began. Published before the agent is spawned, so a client can
+    /// show that work is under way during the long silence before the first
+    /// token — and so a *proactive* tick (one no client asked for) is visible
+    /// at all. Payload-free on purpose: a client times the wait it actually
+    /// witnessed rather than inventing history it missed.
+    Started,
     /// A chunk of assistant text, in generation order.
     Delta { text: String },
     /// The agent invoked a tool (e.g. a curl against this API).
