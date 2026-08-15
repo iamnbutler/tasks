@@ -6,7 +6,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, size, App, Bounds, Context, Global, TitlebarOptions, Window, WindowBounds,
+    div, px, size, App, Bounds, Context, Global, TitlebarOptions, Window, WindowBounds,
     WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
@@ -39,10 +39,12 @@ pub fn open(cx: &mut App) {
     }
 
     let options = WindowOptions {
+        // A standard title bar, unlike the workspace's: this window draws no
+        // chrome of its own, so let AppKit draw the title and close button.
         titlebar: Some(TitlebarOptions {
             title: Some("About Tasks".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(8.), px(8.))),
+            appears_transparent: false,
+            traffic_light_position: None,
         }),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
