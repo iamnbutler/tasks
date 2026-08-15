@@ -250,3 +250,60 @@ fn orchestrator_message_send_and_list() {
     let empty = server.client.send_orchestrator_message("   ").unwrap_err();
     assert!(matches!(empty, ClientError::Api { status: 400, .. }));
 }
+
+/// The live feed end to end — the exact path the GUI subscribes on. The feed
+/// is ephemeral: no `Connected` item, no backfill, so there is no observable
+/// moment the subscription goes live. A publisher thread therefore repeats the
+/// whole tick until the reader catches a complete round.
+#[test]
+fn orchestrator_feed_delivers_a_tick_in_order() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tasks_api::models::OrchestratorFeedEvent as Feed;
+
+    let server = spawn_server();
+    let stop = Arc::new(AtomicBool::new(false));
+    let publisher = {
+        let store = server.store.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                store.publish_orchestrator_feed(Feed::Started);
+                store.publish_orchestrator_feed(Feed::Delta {
+                    text: "check".into(),
+                });
+                store.publish_orchestrator_feed(Feed::Tool {
+                    label: "Bash: curl -s /tasks".into(),
+                });
+                store.publish_orchestrator_feed(Feed::Done);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+
+    let mut feed = server.client.stream_orchestrator();
+    // Join mid-round if we have to: a round starts at the first `Started`.
+    let mut round = Vec::new();
+    while round.len() < 4 {
+        let event = feed.next().expect("feed never ends here").unwrap();
+        if round.is_empty() && event != Feed::Started {
+            continue;
+        }
+        round.push(event);
+    }
+    stop.store(true, Ordering::Relaxed);
+    publisher.join().unwrap();
+
+    assert_eq!(
+        round,
+        vec![
+            Feed::Started,
+            Feed::Delta {
+                text: "check".into()
+            },
+            Feed::Tool {
+                label: "Bash: curl -s /tasks".into()
+            },
+            Feed::Done,
+        ]
+    );
+}
