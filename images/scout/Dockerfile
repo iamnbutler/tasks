@@ -10,12 +10,30 @@ USER root
 COPY scout-supervisor /usr/local/bin/scout-supervisor
 RUN chmod +x /usr/local/bin/scout-supervisor
 
+# cargo-nextest, from the official prebuilt tarball. Without it `make test`
+# hard-fails with an install hint and pushes the agent onto bare
+# `cargo test --workspace` — the exact command whose parallel links OOM.
+RUN arch="$(uname -m)" && \
+    case "$arch" in \
+      aarch64|arm64) url=https://get.nextest.dev/latest/linux-arm ;; \
+      x86_64) url=https://get.nextest.dev/latest/linux ;; \
+      *) echo "no nextest build for $arch" >&2; exit 1 ;; \
+    esac && \
+    curl -LsSf "$url" | tar zxf - -C /usr/local/bin
+
 USER agent
 WORKDIR /home/agent
 
 # The base image installs Rust for root only; scouts build as `agent`.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
+
+# The floor for a container someone starts by hand — including one booted at
+# vm-pool's 2 GB default. The server derives a real job count from the memory
+# it gives each VM and injects it as `-e CARGO_BUILD_JOBS`, overriding this;
+# what this line guarantees is that nothing ever links at cargo's own default
+# of one job per CPU, which is how a 4 CPU / 4 GB VM got its linker OOM-killed.
+ENV CARGO_BUILD_JOBS=1
 
 # Headless agent invocation. The prompt arrives on stdin; SPEC.md is the
 # artifact. Credentials (ANTHROPIC_API_KEY) are injected per-VM, never baked

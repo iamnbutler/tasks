@@ -119,7 +119,13 @@ impl Builder {
             .client
             .allocate(&self.config.image, self.config.vm_config.clone())
             .await?;
-        info!(%vm_id, build_id = %build.id, "allocated builder VM");
+        info!(
+            %vm_id,
+            build_id = %build.id,
+            cpus = ?self.config.vm_config.cpus,
+            memory_mb = ?self.config.vm_config.memory_mb,
+            "allocated builder VM"
+        );
         self.store.set_build_vm(&build.id, vm_id.as_str()).await?;
 
         let send = self

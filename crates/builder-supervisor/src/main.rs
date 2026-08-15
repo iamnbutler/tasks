@@ -33,6 +33,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use tasks_protocol::vm_memory::{AgentOutcome, sample_memory};
 use tasks_protocol::{
     BuildCommand, BuildEvent, LogStream, MAX_BUNDLE_BASE64_BYTES, TaskCommand, TaskEvent,
     TasksProtocol,
@@ -223,11 +224,17 @@ async fn run_build(
         fail!("prompt write: {e}");
     }
 
-    let exit_code = match run_agent(&workdir, prompt, tx.clone()).await {
-        Ok(code) => code,
+    let outcome = match run_agent(&workdir, prompt, tx.clone()).await {
+        Ok(outcome) => outcome,
         Err(e) => fail!("agent: {e}"),
     };
-    emit(&tx, BuildEvent::ImplementationFinished { exit_code }).await;
+    emit(
+        &tx,
+        BuildEvent::ImplementationFinished {
+            exit_code: outcome.exit_code,
+        },
+    )
+    .await;
 
     // SUMMARY.md is read before the artifact cleanup removes it. Optional:
     // missing prose does not fail a build — the code is the deliverable.
@@ -264,7 +271,13 @@ async fn run_build(
         Err(e) => fail!("rev-parse head: {e}"),
     };
     if head_sha == base_sha {
-        fail!("agent produced no commits (head == base)");
+        // A build with no transcript (#825) has only this string to explain
+        // itself, so an OOM kill or a signal death is named here rather than
+        // left for someone to infer from a budget that vanished.
+        fail!(
+            "agent produced no commits (head == base){}",
+            outcome.failure_context()
+        );
     }
 
     let files_touched = match git_stdout(
@@ -370,13 +383,22 @@ async fn git_stdout(workdir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) -> Result<i32> {
+/// Run the agent, streaming its output, and report how it ended — including
+/// whether anything in this VM was OOM-killed while it ran. See
+/// [`tasks_protocol::vm_memory`] for why the exit code alone cannot answer
+/// that.
+async fn run_agent(
+    workdir: &Path,
+    prompt: &str,
+    tx: mpsc::Sender<TaskVmEvent>,
+) -> Result<AgentOutcome> {
     let cmd_str = std::env::var("BUILDER_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
     let mut parts = cmd_str.split_whitespace();
     let prog = parts.next().context("BUILDER_AGENT_CMD is empty")?;
     let args: Vec<&str> = parts.collect();
     info!(?prog, ?args, workdir = %workdir.display(), "running agent");
 
+    let before = sample_memory();
     let mut child = Command::new(prog)
         .args(&args)
         .current_dir(workdir)
@@ -412,7 +434,7 @@ async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) 
             .await;
         }
     });
-    let tx_err = tx;
+    let tx_err = tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut r = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = r.next_line().await {
@@ -430,5 +452,20 @@ async fn run_agent(workdir: &Path, prompt: &str, tx: mpsc::Sender<TaskVmEvent>) 
     let status = child.wait().await.context("wait for agent")?;
     let _ = stdout_task.await;
     let _ = stderr_task.await;
-    Ok(status.code().unwrap_or(-1))
+
+    let outcome = AgentOutcome::new(status, before, sample_memory());
+    // Every run, not just the failing ones — an agent that exits 0 after the
+    // OOM killer ate its build is the case this is here to catch.
+    if let Some(summary) = outcome.memory_summary() {
+        info!(%summary, "VM memory");
+        emit(
+            &tx,
+            BuildEvent::Progress {
+                stream: LogStream::Stderr,
+                line: format!("builder-supervisor: VM memory: {summary}"),
+            },
+        )
+        .await;
+    }
+    Ok(outcome)
 }
