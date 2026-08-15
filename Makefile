@@ -70,20 +70,26 @@ check-nextest:
 		echo "missing cargo-nextest: cargo install cargo-nextest --locked"; \
 		echo "(or run 'make test-cargo' to use plain cargo test)"; exit 1; }
 
-# Prebuild the binaries the tasks suite execs, so TASKS_TEST_BIN_DIR is
-# populated before the first test process starts.
+# Prebuild the binaries the suites exec, so TASKS_TEST_BIN_DIR and
+# VM_POOL_TEST_BIN_DIR are populated before the first test process starts.
+# vm-pool has its own variable on purpose: it is vendored infrastructure and
+# nothing from the surrounding tasks workspace may leak into it.
 test-bins:
-	cargo build -p scout-supervisor -p builder-supervisor
+	cargo build -p scout-supervisor -p builder-supervisor -p vm-pool-supervisor
+
+# Both variables name the same directory today; they are separate names, not
+# one shared name, so vm-pool keeps working when it is extracted.
+TEST_BIN_ENV := TASKS_TEST_BIN_DIR=$(TEST_BIN_DIR) VM_POOL_TEST_BIN_DIR=$(TEST_BIN_DIR)
 
 test: check-nextest test-bins
-	TASKS_TEST_BIN_DIR=$(TEST_BIN_DIR) cargo nextest run --workspace
+	$(TEST_BIN_ENV) cargo nextest run --workspace
 	cargo test --doc --workspace
 
 test-ci: check-nextest test-bins
-	TASKS_TEST_BIN_DIR=$(TEST_BIN_DIR) cargo nextest run --workspace --profile ci
+	$(TEST_BIN_ENV) cargo nextest run --workspace --profile ci
 	cargo test --doc --workspace
 
-# The no-prerequisites path. Deliberately does not export TASKS_TEST_BIN_DIR,
+# The no-prerequisites path. Deliberately exports neither bin-dir variable,
 # so the build-on-demand fallback stays exercised.
 test-cargo:
 	cargo test --workspace

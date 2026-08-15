@@ -149,35 +149,11 @@ pub fn find_supervisor_binary() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use vm_pool_protocol::{OutputStream, ShellCommand, ShellEvent, ShellProtocol};
-
-    /// Build the supervisor and return its path.
-    async fn build_supervisor() -> std::path::PathBuf {
-        let output = tokio::process::Command::new("cargo")
-            .args(["build", "-p", "vm-pool-supervisor", "--message-format=json"])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success(), "supervisor build failed");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find_map(|msg| {
-                if msg.get("reason")?.as_str()? == "compiler-artifact"
-                    && msg.get("target")?.get("name")?.as_str()? == "supervisor"
-                {
-                    Some(std::path::PathBuf::from(msg.get("executable")?.as_str()?))
-                } else {
-                    None
-                }
-            })
-            .expect("could not find supervisor binary path in cargo output")
-    }
+    use vm_pool_test_support::supervisor_binary;
 
     #[tokio::test]
     async fn supervisor_ping_pong() {
-        let binary = build_supervisor().await;
+        let binary = supervisor_binary();
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
             .await
             .unwrap();
@@ -196,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_execute_with_output() {
-        let binary = build_supervisor().await;
+        let binary = supervisor_binary();
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
             .await
             .unwrap();
@@ -237,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_execute_nonzero_exit() {
-        let binary = build_supervisor().await;
+        let binary = supervisor_binary();
         let mut transport = VmTransport::<ShellProtocol>::spawn(binary.to_str().unwrap(), &[])
             .await
             .unwrap();
