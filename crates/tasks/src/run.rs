@@ -582,9 +582,10 @@ impl Drop for InFlightGuard {
 ///
 /// The drain itself: the poll loop exits at once, scouts and builds get
 /// [`SHUTDOWN_GRACE`] (short, because a successor reattaches to whatever is
-/// abandoned), and the orchestrator's turn is waited out rather than killed —
-/// it is a local child, so nothing can pick it up. A second ctrl_c abandons
-/// the drain outright.
+/// abandoned), and the orchestrator's turn gets the same grace — it is a local
+/// child so nothing can pick it up, but an unbounded wait only means `reload`
+/// SIGKILLs us at its own deadline instead. An abandoned turn is reported at
+/// the next boot. A second ctrl_c abandons the drain outright.
 pub async fn run(config: Config) -> Result<(), RunError> {
     if let Some(existing) = crate::pidfile::read_live(&config.data_dir) {
         return Err(RunError::AlreadyRunning {
@@ -704,11 +705,35 @@ pub async fn run(config: Config) -> Result<(), RunError> {
                          period; leaving them to be reattached"
                     );
                 }
-                // The orchestrator's turn is the one thing nothing can pick
-                // up — it is a local child, and killing it loses the turn
-                // outright. So it is waited out on its own budget rather than
-                // aborted at the grace period.
-                let _ = orchestrate.await;
+                // The orchestrator's turn is the one thing nothing can pick up
+                // — it is a local child, so losing it costs the turn outright.
+                // Worth waiting for, but on the same short leash as everything
+                // else, for two reasons.
+                //
+                // `reload` SIGKILLs a server that has not exited within its own
+                // `STOP_GRACE` (75s), and `is_destructible()` deliberately does
+                // not count an orchestrator turn — so an unbounded wait here is
+                // not "the turn finishes", it is "the swap kills us anyway,
+                // 45 seconds later, skipping the pidfile cleanup and the rest
+                // of this drain". A turn's own budget is `ORCHESTRATOR_TIMEOUT_
+                // SECS` (600 by default), twenty times the grace a scout gets
+                // for work that costs an hour.
+                //
+                // Abandoning it is already handled honestly: the turn marker
+                // survives in the store and `report_interrupted_orchestrator_
+                // turn` says so at the next boot. The answered watermark only
+                // advances with the reply, so the next tick retakes it.
+                if tokio::time::timeout(SHUTDOWN_GRACE, orchestrate)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "orchestrator turn did not finish within the grace \
+                         period; abandoning it — the next boot reports it and \
+                         the next tick retakes it"
+                    );
+                }
             };
 
             tokio::select! {
