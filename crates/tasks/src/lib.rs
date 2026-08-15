@@ -11,6 +11,7 @@ pub mod github;
 pub mod orchestrator;
 pub mod pidfile;
 pub mod reattach;
+pub mod redact;
 pub mod reload;
 pub mod run;
 pub mod scout;
