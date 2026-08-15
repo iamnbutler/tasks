@@ -27,7 +27,12 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
-        check-nextest test-bins test test-ci test-cargo app run
+        check-nextest test-bins test test-ci test-cargo app run \
+        server serve restart status stop
+
+# Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
+RELOAD ?=
+TASKS_BIN := $(CARGO_TARGET_DIR)/debug/tasks
 
 # Version identity stamped into the app (shown in About Tasks): version is
 # 0.1.<commit count>, build is the short SHA, "-dirty" when uncommitted
@@ -57,6 +62,33 @@ app:
 run: app
 	@pkill -x Tasks 2>/dev/null || true
 	open ~/Applications/Tasks.app
+
+# The server's own build/run loop, the same shape as `make run` for the app:
+# these swap a running server rather than refusing. Every target builds first,
+# then signals — a failed build must never cost you the server you have. The
+# freshly built binary is the one that does the swapping (`--no-build`), so
+# make owns the build and `tasks reload` owns the handover.
+#
+#   make serve                    build, take over, log to this terminal
+#   make restart                  build, take over, background it
+#   make restart RELOAD=--when-idle   ... but wait out in-flight scouts first
+server:
+	cargo build -p tasks
+
+serve: server
+	$(TASKS_BIN) reload --no-build --foreground $(RELOAD)
+
+restart: server
+	$(TASKS_BIN) reload --no-build $(RELOAD)
+
+# `tasks status` exits 1 when nothing is serving, which is the right contract
+# for a script and pure noise here ("make: *** Error 1" on a correct answer).
+# Scripts should call the binary, not make.
+status: server
+	@$(TASKS_BIN) status || true
+
+stop: server
+	@$(TASKS_BIN) stop
 
 # Tests. Binaries are built once, here, and the suite only execs them —
 # nothing shells out to `cargo build` mid-test (that used to block on the

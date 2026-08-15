@@ -110,7 +110,10 @@ implementation.
 ## Running
 
 ```sh
-cargo run -p tasks -- serve            # poller + scout dispatcher + HTTP API
+make serve                             # build, take over, log to this terminal
+make restart                           # build, take over, background it
+make restart RELOAD=--when-idle        # ...but wait out in-flight scouts first
+make status / make stop
 cargo run -p tasks -- add-project owner/repo
 make test                              # see Tests below
 ```
@@ -121,6 +124,27 @@ scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates
 Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
 polling, an unreachable vm-pool disables dispatch and reconnects periodically,
 and the API stays up either way.
+
+### Upgrading a running server
+
+`tasks reload` (alias `restart`, `crates/tasks/src/reload.rs`) is the upgrade
+loop the make targets drive: **build, report, gate, drain, swap, verify**, in
+that order. A failed build costs nothing because nothing has been signalled
+yet; "did it come up?" and "did the schema move?" are answered by `GET /status`
+on the *new* pid rather than assumed. It refuses by default when a scout or a
+build is in flight (`--when-idle` waits for a drain point and pauses dispatch
+for the wait, `--force` swaps anyway); an owed orchestrator turn is reported
+but never blocks, since the obligation loop keeps producing input and the
+answered watermark means a restart mid-turn only costs one turn. Exit codes: 3
+busy, 4 drain timed out, 5 the swap did not land.
+
+Nothing in `reload` opens the store — `Store::open` runs migrations, so a
+supervisor that opened the database would apply the new schema before the new
+binary booted, masking the failure it exists to catch. `<data dir>/tasks.pid`
+is a discovery record, not a lock: liveness is re-derived from the OS
+(`ps`, where a `Z` state is dead), so a killed server leaves nothing to clean
+up by hand. This is not a service manager — no supervision, no
+restart-on-crash; point `launchd`/`systemd` at `tasks serve` if you want one.
 
 ### Tests
 
