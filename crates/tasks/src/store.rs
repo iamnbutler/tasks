@@ -1274,6 +1274,55 @@ impl Store {
         Ok(report)
     }
 
+    /// VMs the store still points at for work that has already concluded.
+    ///
+    /// A VM is deallocated by the same code path that allocated it, so a
+    /// process that dies mid-scout or mid-build never deallocates at all:
+    /// [`Store::reconcile_orphaned_work`] fails the row, and the container
+    /// keeps running. vm-pool's reaper is the only backstop and it waits
+    /// `vm_timeout` — 7200s by default, long enough for a few restarts to
+    /// pin every slot in the pool. That is not hypothetical: six leaked VMs
+    /// against `max_vms = 6` turned every dispatch into `pool exhausted`,
+    /// and the failures then read as the *work* failing rather than the
+    /// infrastructure being full.
+    ///
+    /// Terminal is the honest predicate rather than "orphaned by this
+    /// restart": a deallocate that failed in-process (which only warns) leaks
+    /// exactly the same way, and this catches those too.
+    pub async fn leaked_vm_ids(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT vm_id FROM builds WHERE vm_id IS NOT NULL AND status NOT IN (?, ?) \
+             UNION \
+             SELECT vm_id FROM sessions WHERE vm_id IS NOT NULL AND status != ?",
+        )
+        .bind(BuildStatus::Queued.as_str())
+        .bind(BuildStatus::Running.as_str())
+        .bind(SessionStatus::Running.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("vm_id").map_err(StoreError::from))
+            .collect()
+    }
+
+    /// Drop the store's claim that some concluded work holds this VM.
+    ///
+    /// Called after a sweep deallocates, and after one *fails* too: the claim
+    /// is already known to be stale, and a pointer we retry on every reconnect
+    /// forever is its own slow leak. vm-pool's timeout remains the backstop
+    /// for the case where the deallocate genuinely did not land.
+    pub async fn forget_vm(&self, vm_id: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE builds SET vm_id = NULL WHERE vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE sessions SET vm_id = NULL WHERE vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // --- specs ---
 
     pub async fn insert_spec(&self, spec: &Spec) -> Result<(), StoreError> {
@@ -1955,12 +2004,29 @@ impl Store {
         // ones that have run out. Without this the batch stays `approved`
         // forever, which is harmless while a human decides what to rebuild
         // and a runaway loop the moment anything dispatches automatically.
-        sqlx::query(
-            "UPDATE spec_queue SET build_attempts = build_attempts + 1              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
-        )
-        .bind(id.as_str())
-        .execute(&mut *tx)
-        .await?;
+        //
+        // Unless the build never started. `vm_id` is set immediately after a
+        // successful allocate, so its absence means we never got a VM — the
+        // pool was full, or the socket was gone. Charging that to the spec
+        // blames the work for the infrastructure: three dispatches into a
+        // full pool would `blocked` a perfectly good spec in under a minute,
+        // and the one signal saying "this spec cannot be built" would then be
+        // reporting something else entirely.
+        let started = sqlx::query("SELECT vm_id FROM builds WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .and_then(|row| row.try_get::<Option<String>, _>("vm_id").ok().flatten())
+            .is_some();
+        if started {
+            sqlx::query(
+                "UPDATE spec_queue SET build_attempts = build_attempts + 1 \
+                 WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
+            )
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
         let exhausted = sqlx::query(
             "SELECT spec_id FROM spec_queue              WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)                AND status = ? AND build_attempts >= ?",
         )
@@ -2274,10 +2340,28 @@ impl Store {
         // so the queue is where a dispatched batch legitimately waits, and
         // re-raising here would ask for the same build twice. A build that
         // *fails* returns its specs to `approved`, which raises this again on
-        // purpose; the attempt cap is what ends that loop, by moving the spec
+        // purpose; `build_attempts` is what ends that loop, by moving the spec
         // to `blocked` and the obligation below.
+        //
+        // Which is why the failure history rides along. Two things would
+        // otherwise mislead whoever acts on this. The obvious one: "no build
+        // is carrying it" reads as *never built* when it can equally mean
+        // *built twice, failed twice*, and re-dispatching a spec that burned
+        // an hour on each of two attempts should be a decision, not a reflex.
+        // The subtler one: a build orphaned by a server restart is failed but
+        // deliberately not charged an attempt — the operator restarted, the
+        // spec did nothing wrong — so the strike count and the failure count
+        // legitimately disagree, and a reader who knows only one of them will
+        // draw the wrong conclusion from it.
         let rows = sqlx::query(
-            "SELECT q.spec_id, q.approved_at, t.gh_issue_number, t.title \
+            "SELECT q.spec_id, q.approved_at, q.build_attempts, t.gh_issue_number, t.title, \
+                    (SELECT COUNT(*) FROM build_specs bs \
+                     JOIN builds b ON b.id = bs.build_id \
+                     WHERE bs.spec_id = q.spec_id AND b.status = ?) AS failed_builds, \
+                    (SELECT b.exit_reason FROM build_specs bs \
+                     JOIN builds b ON b.id = bs.build_id \
+                     WHERE bs.spec_id = q.spec_id AND b.status = ? \
+                     ORDER BY b.completed_at DESC LIMIT 1) AS last_failure \
              FROM spec_queue q \
              JOIN specs s ON s.id = q.spec_id \
              JOIN tasks t ON t.id = s.task_id \
@@ -2287,6 +2371,8 @@ impl Store {
                                WHERE bs.spec_id = q.spec_id AND b.status IN (?, ?)) \
              ORDER BY q.approved_at",
         )
+        .bind(BuildStatus::Failed.as_str())
+        .bind(BuildStatus::Failed.as_str())
         .bind(SpecQueueStatus::Approved.as_str())
         .bind(&cutoff)
         .bind(BuildStatus::Queued.as_str())
@@ -2295,15 +2381,27 @@ impl Store {
         .await?;
         for row in rows {
             let since = parse_ts(&row.try_get::<String, _>("approved_at")?, "approved_at")?;
+            let mut summary = format!(
+                "#{} \"{}\" was approved {} and no build is carrying it",
+                row.try_get::<i64, _>("gh_issue_number")?,
+                row.try_get::<String, _>("title")?,
+                since.format("%Y-%m-%d %H:%M UTC"),
+            );
+            let failed: i64 = row.try_get("failed_builds")?;
+            if failed > 0 {
+                let attempts: i64 = row.try_get("build_attempts")?;
+                summary.push_str(&format!(
+                    " — but {failed} earlier build(s) failed, most recently: {}. \
+                     {attempts} of {MAX_BUILD_ATTEMPTS} attempts are charged against it. \
+                     Read why it failed before asking for the same work again",
+                    row.try_get::<Option<String>, _>("last_failure")?
+                        .unwrap_or_else(|| "no reason recorded".into()),
+                ));
+            }
             obligations.push(Obligation {
                 kind: ObligationKind::DispatchBuild,
                 subject_id: row.try_get("spec_id")?,
-                summary: format!(
-                    "#{} \"{}\" was approved {} and no build is carrying it",
-                    row.try_get::<i64, _>("gh_issue_number")?,
-                    row.try_get::<String, _>("title")?,
-                    since.format("%Y-%m-%d %H:%M UTC"),
-                ),
+                summary,
                 since,
             });
         }
@@ -4389,6 +4487,7 @@ mod tests {
                 .await
                 .unwrap();
             store.claim_next_queued_build().await.unwrap();
+            store.set_build_vm(&build.id, "vm-test").await.unwrap();
             store
                 .finalize_build_failed(&build.id, "boom")
                 .await
@@ -4405,6 +4504,51 @@ mod tests {
             open[0].summary.contains("blocked"),
             "says what is wrong: {}",
             open[0].summary
+        );
+    }
+
+    /// A dispatch that never gets a VM is the pool's failure, not the spec's.
+    /// Charging it would let a full pool `blocked` three good specs a minute,
+    /// and the one signal meaning "this cannot be built" would then be
+    /// reporting a capacity problem instead.
+    #[tokio::test]
+    async fn a_build_that_never_started_costs_the_spec_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..MAX_BUILD_ATTEMPTS + 1 {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            // No `set_build_vm`: allocate failed, so nothing ever ran.
+            store
+                .finalize_build_failed(&build.id, "pool exhausted: 0 available, 1 requested")
+                .await
+                .unwrap();
+        }
+
+        // One more failure than the cap, and still eligible: none of them was
+        // an attempt, because none of them ever ran.
+        let entry = store.get_spec_queue_entry(&spec.id).await.unwrap().unwrap();
+        assert_eq!(
+            entry.status,
+            SpecQueueStatus::Approved,
+            "the pool was full; the work was not wrong"
         );
     }
 
@@ -4535,6 +4679,9 @@ mod tests {
                 .await
                 .unwrap();
             store.claim_next_queued_build().await.unwrap();
+            // A VM was allocated, so this is the build failing on its merits
+            // — the case that spends an attempt. See `finalize_build_failed`.
+            store.set_build_vm(&build.id, "vm-test").await.unwrap();
             store
                 .finalize_build_failed(&build.id, "builder exited 1")
                 .await
