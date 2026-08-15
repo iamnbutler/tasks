@@ -1585,9 +1585,14 @@ impl Store {
     /// [`Store::resumable_sessions`].
     pub async fn resumable_builds(&self) -> Result<Vec<Build>, StoreError> {
         let rows = sqlx::query(
+            // `agent_finished_at` included like every other build SELECT:
+            // `build_from_row` reads it, so omitting it makes this query fail
+            // at runtime with ColumnNotFound — and the failure is swallowed
+            // into "no resumable builds", which looks exactly like a restart
+            // with nothing in flight.
             "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
              pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, completed_at FROM builds \
+             started_at, agent_finished_at, completed_at FROM builds \
              WHERE status = ? AND vm_id IS NOT NULL ORDER BY created_at, rowid",
         )
         .bind(BuildStatus::Running.as_str())
