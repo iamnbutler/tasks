@@ -23,7 +23,9 @@ use gpui::{actions, App, KeyBinding, Menu, MenuItem, OsAction, Window};
 use gpuikit::input::bindings;
 
 use crate::about;
-use crate::workspace::{ToggleLeftDock, ToggleRightDock};
+use crate::workspace::{
+    GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, ToggleLeftDock, ToggleRightDock,
+};
 
 actions!(
     tasks,
@@ -106,6 +108,16 @@ fn menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::os_action("Select All", bindings::SelectAll, OsAction::SelectAll),
         ]),
+        // Section navigation. The key equivalents (⌘1–⌘5) come from the
+        // workspace bindings in `main`, which run before `set` — the same
+        // ordering constraint as everything else in this bar.
+        Menu::new("View").items([
+            MenuItem::action("Home", GoToHome),
+            MenuItem::action("Tasks", GoToTasks),
+            MenuItem::action("Queue", GoToQueue),
+            MenuItem::action("Activity", GoToActivity),
+            MenuItem::action("Chat", GoToChat),
+        ]),
         // The name is load-bearing: gpui special-cases the literal string
         // "Window" and hands that menu to AppKit as the windows menu, which is
         // what makes the list of open windows append itself. Renaming it
@@ -149,9 +161,24 @@ mod tests {
     }
 
     #[test]
-    fn bar_has_the_four_menus_in_order() {
+    fn bar_has_the_five_menus_in_order() {
         let names: Vec<_> = menus().iter().map(|menu| menu.name.to_string()).collect();
-        assert_eq!(names, ["Tasks", "File", "Edit", "Window"]);
+        assert_eq!(names, ["Tasks", "File", "Edit", "View", "Window"]);
+    }
+
+    #[test]
+    fn view_menu_covers_every_section_in_sidebar_order() {
+        let actions: Vec<_> = items("View").into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            actions,
+            [
+                "workspace::GoToHome",
+                "workspace::GoToTasks",
+                "workspace::GoToQueue",
+                "workspace::GoToActivity",
+                "workspace::GoToChat",
+            ]
+        );
     }
 
     #[test]

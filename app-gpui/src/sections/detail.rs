@@ -347,7 +347,12 @@ impl Workspace {
             );
         }
 
-        if let Some((_, complexity, content)) = task.pending_spec {
+        // Specs and issue bodies are markdown at the source (agent output,
+        // GitHub issues) — render them as such, through the shared cache.
+        if let Some((spec_id, complexity, content)) = task.pending_spec {
+            let entity = self
+                .markdown_cache()
+                .entity(format!("spec:{spec_id}"), &content, cx);
             pane = pane
                 .child(
                     div()
@@ -360,16 +365,19 @@ impl Workspace {
                         .p(px(8.))
                         .rounded(px(6.))
                         .bg(theme.bg())
-                        .text_xs()
+                        .text_sm()
                         .text_color(theme.fg())
-                        .child(content),
+                        .child(crate::components::markdown_block(&entity, cx)),
                 );
         } else if !task.body.is_empty() {
+            let entity = self
+                .markdown_cache()
+                .entity(format!("task:{}", task.id), &task.body, cx);
             pane = pane.child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.fg_muted())
-                    .child(task.body.clone()),
+                    .child(crate::components::markdown_block(&entity, cx)),
             );
         }
 

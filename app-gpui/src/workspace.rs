@@ -7,29 +7,53 @@
 //! state. Server state lives in [`AppState`]; the workspace observes it and
 //! re-renders.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, list, px, Context, Div, Entity, Focusable, ListAlignment, ListState, MouseButton,
-    Window, WindowHandle,
+    actions, div, list, px, ClipboardItem, Context, Div, Entity, Focusable, FollowMode,
+    ListAlignment, ListState, MouseButton, Window, WindowHandle,
 };
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
+use gpuikit::elements::kbd::kbd;
+use gpuikit::elements::loading_indicator::loading_indicator;
+use gpuikit::elements::tooltip::tooltip;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
-    BuildStatus, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
+    BuildStatus, ChatRole, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
 };
 
-use crate::components::{sidebar, title_bar, SidebarSide, SidebarState};
+use crate::components::{
+    markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
+};
 use crate::issue_composer::{self, IssueComposer};
 use crate::state::AppState;
+use crate::time;
 
 pub(crate) const FONT: &str = "Menlo";
 
-actions!(workspace, [ToggleLeftDock, ToggleRightDock, NewIssue]);
+/// Reading-width cap for conversation content — long markdown replies
+/// wrap at a comfortable measure instead of spanning a wide window.
+const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
+
+actions!(
+    workspace,
+    [
+        ToggleLeftDock,
+        ToggleRightDock,
+        NewIssue,
+        Dismiss,
+        GoToHome,
+        GoToTasks,
+        GoToQueue,
+        GoToActivity,
+        GoToChat
+    ]
+);
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Section {
@@ -80,11 +104,14 @@ pub struct Workspace {
     /// The cmd-n "new issue" window, if it has been opened. May be stale
     /// (window closed) — probed with `update` before re-fronting.
     issue_window: Option<WindowHandle<IssueComposer>>,
-    /// Scroll state for the chat list — bottom-aligned, so the view opens
-    /// at the newest message and follows new ones.
+    /// Scroll state for the chat list — tail-following, so the view opens
+    /// at the newest message and stays pinned while new ones land.
     chat_list: ListState,
     /// Message count the list was last synced to.
     chat_len: usize,
+    /// Parsed-markdown entities for every reading surface, so re-renders
+    /// don't re-parse. `RefCell` because most render paths hold `&self`.
+    markdown: RefCell<MarkdownCache>,
 }
 
 impl Workspace {
@@ -93,28 +120,34 @@ impl Workspace {
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
 
         // Live elapsed clocks (running scouts/builds) tick once a second —
-        // but only when something is actually running.
+        // but only when something is actually running. Either way the view
+        // re-renders every 30s so relative timestamps ("5m") don't go stale
+        // in a quiet window.
         let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| loop {
-            executor.timer(Duration::from_secs(1)).await;
-            let alive = this
-                .update(cx, |this: &mut Workspace, cx| {
-                    let state = this.app_state.read(cx);
-                    let live = state
-                        .sessions
-                        .iter()
-                        .any(|session| session.status == SessionStatus::Running)
-                        || state
-                            .builds
+        cx.spawn(async move |this, cx| {
+            let mut ticks: u64 = 0;
+            loop {
+                executor.timer(Duration::from_secs(1)).await;
+                ticks += 1;
+                let alive = this
+                    .update(cx, |this: &mut Workspace, cx| {
+                        let state = this.app_state.read(cx);
+                        let live = state
+                            .sessions
                             .iter()
-                            .any(|build| build.status == BuildStatus::Running);
-                    if live {
-                        cx.notify();
-                    }
-                })
-                .is_ok();
-            if !alive {
-                return;
+                            .any(|session| session.status == SessionStatus::Running)
+                            || state
+                                .builds
+                                .iter()
+                                .any(|build| build.status == BuildStatus::Running);
+                        if live || ticks % 30 == 0 {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    return;
+                }
             }
         })
         .detach();
@@ -157,6 +190,28 @@ impl Workspace {
         });
         window.focus(&input.focus_handle(cx), cx);
 
+        // Follow the conversation tail: top-aligned with `FollowMode::Tail`
+        // (not `ListAlignment::Bottom` — a short conversation should read
+        // from the top). The pin releases when the user scrolls up and
+        // re-engages within a pixel of the bottom. Overdraw is generous so
+        // items near the viewport stay measured and the scroll doesn't pop.
+        let chat_list = ListState::new(0, ListAlignment::Top, px(2048.));
+        chat_list.set_follow_mode(FollowMode::Tail);
+        {
+            // Re-render so the jump-to-newest button tracks the pin state.
+            // Deferred: the handler can run while the list's internals are
+            // borrowed, so nothing here may touch the list synchronously.
+            let workspace = cx.entity().downgrade();
+            chat_list.set_scroll_handler(move |_event, _window, cx| {
+                let workspace = workspace.clone();
+                cx.defer(move |cx| {
+                    if let Some(workspace) = workspace.upgrade() {
+                        workspace.update(cx, |_, cx| cx.notify());
+                    }
+                });
+            });
+        }
+
         Self {
             section: Section::Home,
             left_sidebar: SidebarState::new(true),
@@ -170,9 +225,16 @@ impl Workspace {
             review_input,
             issue_input,
             issue_window: None,
-            chat_list: ListState::new(0, ListAlignment::Bottom, px(1024.)),
+            chat_list,
             chat_len: 0,
+            markdown: RefCell::new(MarkdownCache::new()),
         }
+    }
+
+    /// The shared parsed-markdown cache, borrowed mutably for the duration
+    /// of one `entity` call. Render paths hold `&self`, hence the `RefCell`.
+    pub(crate) fn markdown_cache(&self) -> std::cell::RefMut<'_, MarkdownCache> {
+        self.markdown.borrow_mut()
     }
 
     fn sidebar_mut(&mut self, side: SidebarSide) -> &mut SidebarState {
@@ -185,6 +247,11 @@ impl Workspace {
     fn toggle_sidebar(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
         let state = self.sidebar_mut(side);
         state.open = !state.open;
+        cx.notify();
+    }
+
+    fn go_to_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
         cx.notify();
     }
 
@@ -207,6 +274,10 @@ impl Workspace {
         self.app_state
             .update(cx, |state, cx| state.send_orchestrator_message(message, cx));
         self.section = Section::Chat;
+        // Sending re-engages the tail pin even if the user had scrolled up —
+        // their own message (and the reply behind it) lands at the bottom.
+        self.chat_list.scroll_to_end();
+        self.chat_list.set_follow_mode(FollowMode::Tail);
         cx.notify();
     }
 
@@ -219,6 +290,8 @@ impl Workspace {
         self.input.update(cx, |input, cx| input.set_content("", cx));
         self.app_state
             .update(cx, |state, cx| state.send_orchestrator_message(content, cx));
+        self.chat_list.scroll_to_end();
+        self.chat_list.set_follow_mode(FollowMode::Tail);
     }
 
     /// Submit the review draft as a question about the selected task's
@@ -316,22 +389,23 @@ impl Workspace {
             .child_left(
                 Self::title_bar_button("toggle-left-sidebar", Icons::panel_left())
                     .selected(self.left_sidebar.open)
+                    .tooltip(tooltip("Toggle sidebar (⌘B)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleLeftDock), cx);
                     }),
             )
             .child_left(
-                Self::title_bar_button("open-chat", Icons::chat_bubble()).on_click(cx.listener(
-                    |this, _event, _window, cx| {
-                        this.section = Section::Chat;
-                        cx.notify();
-                    },
-                )),
+                Self::title_bar_button("open-chat", Icons::chat_bubble())
+                    .tooltip(tooltip("Open chat (⌘5)"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.go_to_section(Section::Chat, cx);
+                    })),
             )
             .child_center(div().child("tasks"))
             .child_right(
                 Self::title_bar_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
+                    .tooltip(tooltip("Play — work moves on its own"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.app_state
                             .update(cx, |state, cx| state.set_mode(Mode::Play, cx));
@@ -340,21 +414,23 @@ impl Workspace {
             .child_right(
                 Self::title_bar_button("mode-pause", Icons::pause())
                     .selected(mode == Some(Mode::Pause))
+                    .tooltip(tooltip("Pause — no new work starts"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.app_state
                             .update(cx, |state, cx| state.set_mode(Mode::Pause, cx));
                     })),
             )
             .child_right(
-                Self::title_bar_button("refresh", Icons::reload()).on_click(cx.listener(
-                    |this, _event, _window, cx| {
+                Self::title_bar_button("refresh", Icons::reload())
+                    .tooltip(tooltip("Refresh"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
                         this.app_state.update(cx, |state, cx| state.refresh(cx));
-                    },
-                )),
+                    })),
             )
             .child_right(
                 Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
                     .selected(self.right_sidebar.open)
+                    .tooltip(tooltip("Toggle inspector (⌘R)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleRightDock), cx);
                     }),
@@ -425,8 +501,7 @@ impl Workspace {
                         .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
                         .when(selected, |el| el.bg(selected_bg))
                         .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.section = section;
-                            cx.notify();
+                            this.go_to_section(section, cx);
                         }))
                         .child(
                             div()
@@ -485,52 +560,149 @@ impl Workspace {
             .child(inspector)
     }
 
+    /// One conversation row. User turns render as cards (their text is
+    /// verbatim, not markdown); assistant turns render as full-width
+    /// markdown on the pane background, Zed's agent-panel layout. Event and
+    /// system rows are quiet one-liners. Every substantive row gets a
+    /// hover-revealed timestamp + copy affordance.
+    fn render_chat_message(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Some(message) = self.app_state.read(cx).orchestrator_messages.get(ix) else {
+            return div().into_any_element();
+        };
+        let (seq, role, created_at) = (message.seq, message.role, message.created_at);
+        let content = message.content.clone();
+
+        let body: gpui::AnyElement = match role {
+            ChatRole::User => div()
+                .p(px(10.))
+                .rounded(px(8.))
+                .bg(theme.surface_secondary())
+                .border_1()
+                .border_color(theme.border_subtle())
+                .text_sm()
+                .text_color(theme.fg())
+                .child(content.clone())
+                .into_any_element(),
+            ChatRole::Assistant => {
+                let entity = self
+                    .markdown
+                    .borrow_mut()
+                    .entity(format!("chat:{seq}"), &content, cx);
+                div()
+                    .px(px(2.))
+                    .text_sm()
+                    .text_color(theme.fg())
+                    .child(markdown_block(&entity, cx))
+                    .into_any_element()
+            }
+            ChatRole::Event => div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(6.))
+                .px(px(2.))
+                .text_xs()
+                .text_color(theme.fg_muted())
+                .child(div().flex_none().child("●").opacity(0.5))
+                .child(div().flex_1().child(content.clone()))
+                .into_any_element(),
+            // A session seam. The conversation reads as continuous here but
+            // the orchestrator's memory does not, so it renders as a divider
+            // rather than sitting in the flow of turns.
+            ChatRole::System => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .text_xs()
+                .text_color(theme.fg_muted())
+                .child(div().flex_1().h(px(1.)).bg(theme.border_subtle()))
+                .child(div().flex_none().child(content.clone()))
+                .child(div().flex_1().h(px(1.)).bg(theme.border_subtle()))
+                .into_any_element(),
+        };
+
+        // Timestamp + copy, floated over the row's top-right corner on
+        // hover only — out of flow, so revealing them can't shift layout.
+        let affordances = matches!(role, ChatRole::User | ChatRole::Assistant).then(|| {
+            div()
+                .absolute()
+                .top(px(-6.))
+                .right(px(4.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .px(px(6.))
+                .py(px(2.))
+                .rounded(px(5.))
+                .bg(theme.surface())
+                .border_1()
+                .border_color(theme.border_subtle())
+                .opacity(0.)
+                .group_hover("chat-msg", |el| el.opacity(1.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(time::relative(created_at)),
+                )
+                .child(
+                    icon_button(("copy-msg", ix), Icons::copy())
+                        .width(px(22.))
+                        .height(px(20.))
+                        .icon_size(px(12.))
+                        .tooltip(tooltip("Copy message"))
+                        .on_click(move |_event, _window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                        }),
+                )
+        });
+
+        div()
+            .w_full()
+            .px(px(12.))
+            .py(px(6.))
+            .child(
+                div()
+                    .max_w(CHAT_MAX_WIDTH)
+                    .w_full()
+                    .mx_auto()
+                    .relative()
+                    .group("chat-msg")
+                    .child(body)
+                    .children(affordances),
+            )
+            .into_any_element()
+    }
+
     fn render_chat(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
-        // Zed's agent-panel pattern: a bottom-aligned `list` starts at the
-        // newest message and stays pinned there as new ones land; item
-        // count is synced in `Render::render` via splice.
-        let app_state = self.app_state.clone();
-        let messages = list(self.chat_list.clone(), move |ix, _window, cx| {
-            use tasks_client::api::models::ChatRole;
-            let theme = cx.theme().clone();
-            let state = app_state.read(cx);
-            let Some(message) = state.orchestrator_messages.get(ix) else {
-                return div().into_any_element();
-            };
-            let (role, content) = (message.role, message.content.clone());
+        // Zed's agent-panel pattern: a virtualized `list` pinned to the
+        // conversation tail; item count is synced in `Render::render` via
+        // splice. Item rendering goes back through the workspace (via
+        // `processor`) for the markdown cache.
+        let messages = list(
+            self.chat_list.clone(),
+            cx.processor(move |this, ix: usize, _window, cx| this.render_chat_message(ix, cx)),
+        );
 
-            let bubble = div()
-                .max_w(px(720.))
-                .p(px(8.))
-                .rounded(px(8.))
-                .text_sm()
-                .child(content);
-            div()
-                .w_full()
-                .px(px(12.))
-                .py(px(4.))
-                .flex()
-                .flex_row()
-                .map(|el| match role {
-                    ChatRole::User => el
-                        .justify_end()
-                        .child(bubble.bg(theme.accent_bg()).text_color(theme.fg())),
-                    ChatRole::Assistant => {
-                        el.child(bubble.bg(theme.surface_secondary()).text_color(theme.fg()))
-                    }
-                    ChatRole::Event => el.child(bubble.text_color(theme.fg_muted()).text_xs()),
-                    // A session seam. The conversation reads as continuous
-                    // here but the orchestrator's memory does not, so it is
-                    // centered like a divider rather than sitting in the
-                    // flow of turns.
-                    ChatRole::System => el
-                        .justify_center()
-                        .child(bubble.text_color(theme.fg_muted()).text_xs()),
-                })
-                .into_any_element()
-        });
+        // The orchestrator owes a reply whenever the newest turn is input
+        // (a user message or a pipeline event) — same definition the
+        // server's tick loop uses.
+        let awaiting_reply = self
+            .app_state
+            .read(cx)
+            .orchestrator_messages
+            .last()
+            .is_some_and(|message| message.role.is_input());
+
+        // The tail pin has released (user scrolled up) — offer the way back.
+        let show_jump_to_newest = self.chat_len > 0 && !self.chat_list.is_following_tail();
+
+        let composer = self.render_chat_composer(cx);
 
         div()
             .flex()
@@ -538,57 +710,143 @@ impl Workspace {
             .size_full()
             .map(|el| {
                 if self.chat_len == 0 {
+                    el.child(self.render_chat_empty_state(cx))
+                } else {
                     el.child(
                         div()
+                            .relative()
                             .flex_1()
-                            .p(px(16.))
-                            .text_sm()
-                            .text_color(theme.fg_muted())
-                            .child("Talk to the orchestrator — the conversation lands here."),
+                            .min_h(px(0.))
+                            .w_full()
+                            .child(messages.size_full().py(px(8.)))
+                            .when(show_jump_to_newest, |el| {
+                                el.child(
+                                    div().absolute().bottom(px(10.)).right(px(16.)).child(
+                                        icon_button("jump-to-newest", Icons::pin_bottom())
+                                            .width(px(28.))
+                                            .height(px(28.))
+                                            .icon_size(px(14.))
+                                            .tooltip(tooltip("Jump to newest"))
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.chat_list.scroll_to_end();
+                                                this.chat_list.set_follow_mode(FollowMode::Tail);
+                                                cx.notify();
+                                            })),
+                                    ),
+                                )
+                            }),
                     )
-                } else {
-                    el.child(messages.flex_1().min_h(px(0.)).w_full().py(px(8.)))
                 }
             })
+            .when(awaiting_reply, |el| {
+                el.child(
+                    div().flex_none().w_full().px(px(12.)).pb(px(4.)).child(
+                        div()
+                            .max_w(CHAT_MAX_WIDTH)
+                            .w_full()
+                            .mx_auto()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child(loading_indicator().ellipsis().xsmall())
+                            .child("Thinking"),
+                    ),
+                )
+            })
+            .child(composer)
+    }
+
+    /// The chat composer: grows with its draft (three lines minimum, ten
+    /// maximum), sends on ⌘↩, and gates the send button on content the way
+    /// the review form does.
+    fn render_chat_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let draft = self.input.read(cx).content();
+        let has_text = !draft.trim().is_empty();
+        let lines = draft.lines().count().clamp(3, 10);
+        let composer_height = px(22. * lines as f32 + 20.);
+
+        div()
+            .flex_none()
+            .p(px(8.))
+            .border_t_1()
+            .border_color(theme.border_subtle())
+            .flex()
+            .flex_row()
+            .items_end()
+            .gap(px(8.))
+            .text_sm()
+            .child(
+                // The multiline input fills its parent, so the parent
+                // must own a height — unsized, it collapses to zero.
+                div()
+                    .flex_1()
+                    .h(composer_height)
+                    .child(text_area(&self.input, cx).size_full()),
+            )
             .child(
                 div()
+                    .id("chat-send")
                     .flex_none()
-                    .p(px(8.))
-                    .border_t_1()
-                    .border_color(theme.border_subtle())
                     .flex()
                     .flex_row()
-                    .items_end()
-                    .gap(px(8.))
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme.border_secondary())
+                    .text_xs()
+                    .map(|el| {
+                        if has_text {
+                            el.cursor_pointer()
+                                .text_color(theme.fg())
+                                .hover({
+                                    let hover_bg = theme.surface_secondary();
+                                    move |el| el.bg(hover_bg)
+                                })
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.send_chat(cx);
+                                }))
+                        } else {
+                            el.text_color(theme.fg_muted()).opacity(0.5)
+                        }
+                    })
+                    .child("Send")
+                    .child(kbd("⌘↩")),
+            )
+    }
+
+    /// What an empty conversation says about itself.
+    fn render_chat_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .p(px(16.))
+            .child(
+                div()
                     .text_sm()
+                    .text_color(theme.fg())
+                    .child("Talk to the orchestrator"),
+            )
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_center()
+                    .text_xs()
+                    .text_color(theme.fg_muted())
                     .child(
-                        // The multiline input fills its parent, so the parent
-                        // must own a height — unsized, it collapses to zero.
-                        div()
-                            .flex_1()
-                            .h(px(64.))
-                            .child(text_area(&self.input, cx).size_full()),
-                    )
-                    .child(
-                        div()
-                            .id("chat-send")
-                            .flex_none()
-                            .px(px(10.))
-                            .py(px(4.))
-                            .rounded(px(5.))
-                            .border_1()
-                            .border_color(theme.border_secondary())
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(theme.fg())
-                            .hover({
-                                let hover_bg = theme.surface_secondary();
-                                move |el| el.bg(hover_bg)
-                            })
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.send_chat(cx);
-                            }))
-                            .child("Send"),
+                        "It can queue and prioritize work, answer questions about \
+                         tasks and specs, and file issues. Press ⌘↩ to send.",
                     ),
             )
     }
@@ -660,6 +918,8 @@ impl Render for Workspace {
         if messages_len != self.chat_len {
             if messages_len < self.chat_len {
                 self.chat_list.reset(messages_len);
+                // Seqs started over — cached parses belong to the old world.
+                self.markdown.borrow_mut().clear();
             } else {
                 self.chat_list
                     .splice(self.chat_len..self.chat_len, messages_len - self.chat_len);
@@ -683,6 +943,29 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &NewIssue, _window, cx| {
                 this.open_issue_window(cx);
+            }))
+            // Layered dismissal: escape in a focused input blurs it (the
+            // input's own binding); the next escape lands here and puts the
+            // inspector away.
+            .on_action(cx.listener(|this, _: &Dismiss, _window, cx| {
+                if this.selected_task.is_some() || this.right_sidebar.open {
+                    this.clear_selection(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GoToHome, _window, cx| {
+                this.go_to_section(Section::Home, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToTasks, _window, cx| {
+                this.go_to_section(Section::Tasks, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToQueue, _window, cx| {
+                this.go_to_section(Section::Queue, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToActivity, _window, cx| {
+                this.go_to_section(Section::Activity, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToChat, _window, cx| {
+                this.go_to_section(Section::Chat, cx);
             }))
             // Drag-resize tracking: the handle only starts the drag; from
             // then on the pointer outruns it, so movement is tracked here at
