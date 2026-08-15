@@ -10,12 +10,27 @@ USER root
 COPY builder-supervisor /usr/local/bin/builder-supervisor
 RUN chmod +x /usr/local/bin/builder-supervisor
 
+# cargo-nextest from the official prebuilt tarball — see
+# images/scout/Dockerfile for why an agent that cannot run `make test` is a
+# memory problem.
+RUN arch="$(uname -m)" && \
+    case "$arch" in \
+      aarch64|arm64) url=https://get.nextest.dev/latest/linux-arm ;; \
+      x86_64) url=https://get.nextest.dev/latest/linux ;; \
+      *) echo "no nextest build for $arch" >&2; exit 1 ;; \
+    esac && \
+    curl -LsSf "$url" | tar zxf - -C /usr/local/bin
+
 USER agent
 WORKDIR /home/agent
 
 # The base image installs Rust for root only; builders build as `agent`.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
+
+# Floor for a hand-started container; the server's per-VM `-e CARGO_BUILD_JOBS`
+# (derived from the VM's memory) overrides it. See images/scout/Dockerfile.
+ENV CARGO_BUILD_JOBS=1
 
 # Headless agent invocation — same shape as the scout image; see
 # images/scout/Dockerfile for why --verbose is mandatory with stream-json.
