@@ -112,6 +112,21 @@ implementation.
   `vm_pool_test_support::supervisor_binary()`, reading `VM_POOL_TEST_BIN_DIR`
   — deliberately, so vendored infrastructure stays independently testable;
   don't merge the two.
+- **A new migration is named for a UTC instant, never for the next free
+  number.** `make migration NAME=build_transcripts` writes
+  `crates/tasks/migrations/20260815030411_build_transcripts.sql`
+  (`YYYYMMDDHHMMSS`, UTC, **digits only**) — don't hand-roll one by copying
+  the file next to it and adding one to the number. That number is read off a
+  tree that cannot see its sibling branches, so two of them pick `0024`, and
+  the collision exists only after the merge, where it surfaces as a boot
+  failure in a process that has already taken the port. Three facts make the
+  switch additive: 0001–0023 keep their versions and checksums (sqlx records
+  both, so an applied migration can never be renamed), a 14-digit stamp sorts
+  after any four-digit sequence number, and sqlx parses the text before the
+  first `_` as an `i64` — so `20260815T030411_…` is a hard compile error, and
+  a name it cannot split at all is silently skipped and simply never runs.
+  `crates/tasks/src/migrations.rs` owns `MIGRATOR`, documents the rule, and
+  holds the guard tests that make a violation red in your branch.
 - Errors: `thiserror` enums per module. Logging: `tracing`.
 - Rust edition 2024, `cargo fmt` + `cargo clippy --workspace --all-targets`
   clean before committing.
@@ -124,6 +139,7 @@ make restart                           # build, take over, background it
 make restart RELOAD=--when-idle        # ...but wait out in-flight scouts first
 make status / make stop
 cargo run -p tasks -- add-project owner/repo
+make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make test                              # see Tests below
 ```
 

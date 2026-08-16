@@ -276,6 +276,11 @@ pub struct AppliedMigration {
 impl AppliedMigration {
     /// `0002_manual_rank` — the migration's filename stem, so a report is
     /// greppable against `crates/tasks/migrations/`.
+    ///
+    /// The `{:04}` is for the legacy sequence, whose filenames are zero-padded
+    /// and would not be greppable without it. New migrations are named for a
+    /// UTC instant (`20260815030411_build_transcripts`), where padding to four
+    /// digits is a no-op — so one format string spans both eras.
     pub fn file_stem(&self) -> String {
         format!("{:04}_{}", self.version, self.description.replace(' ', "_"))
     }
@@ -421,4 +426,27 @@ pub struct SetLabelsRequest {
 pub struct LabelInfo {
     pub name: String,
     pub description: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppliedMigration;
+
+    fn applied(version: i64, description: &str) -> AppliedMigration {
+        AppliedMigration {
+            version,
+            description: description.to_string(),
+        }
+    }
+
+    /// Both eras of migration name reconstruct: the zero-padded legacy
+    /// sequence needs the `{:04}`, and a 14-digit UTC stamp is unharmed by it.
+    #[test]
+    fn a_file_stem_is_greppable_in_both_naming_eras() {
+        assert_eq!(applied(2, "manual rank").file_stem(), "0002_manual_rank");
+        assert_eq!(
+            applied(20260815030411, "build transcripts").file_stem(),
+            "20260815030411_build_transcripts"
+        );
+    }
 }

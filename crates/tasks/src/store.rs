@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
+use crate::migrations::MIGRATOR;
 use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
     CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
@@ -176,8 +177,6 @@ impl ResumedWork {
         self.sessions.is_empty() && self.builds.is_empty()
     }
 }
-
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Run the migrations and report which ones *this* run applied.
 ///

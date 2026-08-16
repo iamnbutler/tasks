@@ -28,7 +28,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
         check-nextest test-bins test test-ci test-cargo app run \
-        server serve restart status stop
+        server serve restart status stop migration
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
 RELOAD ?=
@@ -89,6 +89,29 @@ status: server
 
 stop: server
 	@$(TASKS_BIN) stop
+
+# A new migration, named for this UTC instant:
+#
+#   make migration NAME=build_transcripts
+#   -> crates/tasks/migrations/20260815030411_build_transcripts.sql
+#
+# Never hand-roll one by copying the file next to it and adding a number: the
+# "next free number" is read off a tree that cannot see its sibling branches,
+# so two of them pick the same one and the collision surfaces after the merge,
+# at boot. The rule and the tests that enforce it are in
+# crates/tasks/src/migrations.rs; digits only, because sqlx parses the part
+# before the first `_` as an i64.
+#
+# NAME becomes sqlx's description, and is what the guard test reconstructs the
+# filename from, so it is checked here rather than left to fail later.
+migration:
+	@[ -n "$(NAME)" ] || { echo "usage: make migration NAME=lower_snake_case"; exit 1; }
+	@echo "$(NAME)" | grep -Eq '^[a-z][a-z0-9]*(_[a-z0-9]+)*$$' || { \
+		echo "NAME must be lower_snake_case: $(NAME)"; exit 1; }
+	@file="crates/tasks/migrations/$$(date -u +%Y%m%d%H%M%S)_$(NAME).sql"; \
+	if [ -e "$$file" ]; then echo "already exists: $$file"; exit 1; fi; \
+	echo "-- $(NAME)" > "$$file"; \
+	echo "$$file"
 
 # Tests. Binaries are built once, here, and the suite only execs them —
 # nothing shells out to `cargo build` mid-test (that used to block on the
