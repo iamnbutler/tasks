@@ -16,6 +16,18 @@ pub struct CreateProject {
     pub repo_name: String,
 }
 
+/// Body of `POST /projects/{project_id}/status` — how much of the pipeline
+/// runs for one repo.
+///
+/// A string rather than the enum, like [`SetCharter`]: an unknown word comes
+/// back as a 400 naming the three legal ones instead of serde's "unknown
+/// variant `pasued`, expected one of …".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetProjectStatus {
+    /// `active`, `paused`, or `archived`.
+    pub status: String,
+}
+
 /// The answer to a write the charter shadowed: the decision was recorded and
 /// nothing happened. Deliberately not the normal success body — a shadow run
 /// whose responses look like real ones is an evaluation that lies.

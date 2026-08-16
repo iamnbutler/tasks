@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::models::{
     Actor, Build, Capability, CharterLevel, Complexity, DecisionAction, DecisionInput, GhState,
-    Project, ProjectId, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
-    SpecQueueStatus, Task, TaskId, TaskState,
+    Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId,
+    SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::run::poll_once;
 use tasks::store::Store;
@@ -174,6 +174,7 @@ async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec,
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
 

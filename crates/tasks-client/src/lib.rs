@@ -26,12 +26,12 @@ use tasks_api::http::{
     BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
     CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
     ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, ServerStatus,
-    SetCharter, SetMode,
+    SetCharter, SetMode, SetProjectStatus,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ScoutNotes, Session, SessionId, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ScoutNotes, Session, SessionId,
+    Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use tasks_api::version::VersionInfo;
 use thiserror::Error;
@@ -240,6 +240,23 @@ impl Client {
             &CreateProject {
                 repo_owner: repo_owner.into(),
                 repo_name: repo_name.into(),
+            },
+        )
+    }
+
+    /// How much of the pipeline runs for one repo — the per-repo counterpart
+    /// to [`Client::set_mode`], and the only removal there is (archive, never
+    /// delete). Gates *new* work only: a scout or build already in flight for
+    /// this project runs to its own conclusion. Human-only at the server.
+    pub fn set_project_status(
+        &self,
+        project_id: &ProjectId,
+        status: ProjectStatus,
+    ) -> Result<Project> {
+        self.post_json(
+            &format!("/projects/{project_id}/status"),
+            &SetProjectStatus {
+                status: status.as_str().to_string(),
             },
         )
     }

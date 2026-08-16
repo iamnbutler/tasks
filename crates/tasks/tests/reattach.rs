@@ -27,9 +27,9 @@ use tokio::process::Command;
 
 use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::models::{
-    Build, BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, Session, SessionId,
-    SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
-    TranscriptOwner,
+    Build, BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, ProjectStatus,
+    Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptOwner,
 };
 use tasks::run::{self, Config, InFlight};
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
@@ -84,6 +84,7 @@ async fn insert_project(store: &Store) -> Project {
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
     project

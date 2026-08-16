@@ -115,6 +115,43 @@ implementation.
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
   and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
   rather than beside it: it is per-task, human-only, and one call is one build.
+- **Mode is global; what is per-repo is the subtraction. And there is no
+  project delete.** `projects.status` ∈ `active` | `paused` | `archived` gates
+  the three places that select work — scout dispatch, the build claim, and the
+  *upsert* half of the poll — and nothing else. It is not a second `/mode`:
+  mode gates a dispatcher whose real constraints are server-wide (one
+  `SCOUT_MAX_CONCURRENT`, one strictly serial build lane, one vm-pool), so a
+  per-repo `play` could not run while another repo's build held the lane, and
+  the setting would promise what the architecture cannot deliver
+  (`store::tests::one_repos_running_build_holds_the_lane_against_every_other_repo`
+  pins that in code). One ordered column rather than two booleans, because
+  archived already implies not dispatching. Three consequences are load-bearing.
+  Archiving must **not** stop the resolution half of the poll: closure is only
+  ever learned from *absence in the open set*, so a repo that stopped being
+  fetched would leave every task it already has at `gh_state = open` forever
+  and strand an `awaiting_merge` batch with nothing to make it loud — one
+  fetch per archived project per poll is the right price. The build's check
+  lives **inside** `claim_next_queued_build`'s transaction, because
+  claim-then-release would flip a build `queued → running → queued` every tick
+  and drag its batch's tasks to `building` each time; and it is a `WHERE`
+  rather than a test on the head of the queue, so a paused repo is walked past
+  rather than stopped at (`next_dispatchable` `continue`s for the same reason).
+  **Removal is archive, never delete**: `decisions` is append-only and keyed to
+  a project's tasks, and `tasks.project_id` is `ON DELETE CASCADE`, so deleting
+  a project takes the audit trail the whole charter rests on with it — there is
+  no delete endpoint and there should not be one. `resolve_project` stops
+  counting archived projects (or archiving one repo breaks `POST /issues` for
+  the one that is left), while naming one explicitly still resolves it, because
+  commenting on its open PR and closing its issue are exactly the work
+  archiving does not abandon. `POST /projects` and
+  `POST /projects/{id}/status` are **human-only and not charter-gated**, on the
+  `build-now` precedent: they decide what the pipeline is pointed at rather
+  than doing a unit of work inside it. Finally, `UNIQUE(repo_owner, repo_name)`
+  is case-*sensitive*, so both add paths (the handler and `tasks add-project`)
+  check `find_project_by_repo` case-insensitively first — not a unique index,
+  because a `CREATE UNIQUE INDEX` migration can *fail* on a database that
+  already holds the duplicate, and a failed migration is a boot failure in a
+  process that has already taken the port.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
   prompt.** Nine independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,

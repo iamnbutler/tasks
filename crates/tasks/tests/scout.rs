@@ -17,8 +17,8 @@ use chrono::Utc;
 use vm_pool_protocol::VmConfig;
 
 use tasks::models::{
-    DecisionInput, GhState, Project, ProjectId, SessionStatus, SpecQueueStatus, Task, TaskId,
-    TaskState,
+    DecisionInput, GhState, Project, ProjectId, ProjectStatus, SessionStatus, SpecQueueStatus,
+    Task, TaskId, TaskState,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
 use tasks::store::Store;
@@ -36,6 +36,7 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
 

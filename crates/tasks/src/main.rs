@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use tasks::events::EventPayload;
-use tasks::models::{Project, ProjectId};
+use tasks::models::{Project, ProjectId, ProjectStatus};
 use tasks::reload::{self, ReloadOptions, StopOptions};
 use tasks::run::{self, Config};
 use tasks::store::Store;
@@ -291,11 +291,28 @@ async fn add_project(args: &[String]) -> Result<()> {
         .with_context(|| format!("expected owner/repo, got {spec}"))?;
 
     let store = open_store().await?;
+    // Case-insensitively, and here as well as in the handler: this path writes
+    // straight to the store, so it would otherwise be the hole in the check.
+    // `Owner/Repo` beside `owner/repo` is two projects for one repo, which
+    // costs `resolve_project` its answer and doubles every poll.
+    if let Some(existing) = store
+        .find_project_by_repo(owner, name)
+        .await
+        .with_context(|| format!("looking up {spec}"))?
+    {
+        bail!(
+            "{} is already tracked as {} ({})",
+            existing.slug(),
+            existing.id,
+            existing.status
+        );
+    }
     let project = Project {
         id: ProjectId::new(),
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store
         .insert_project(&project)
