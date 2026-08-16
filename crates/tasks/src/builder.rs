@@ -699,7 +699,7 @@ mod tests {
         (
             Spec {
                 id: SpecId::new(),
-                session_id: SessionId::new(),
+                session_id: Some(SessionId::new()),
                 task_id: task_id.clone(),
                 content: content.into(),
                 complexity: Complexity::Simple,

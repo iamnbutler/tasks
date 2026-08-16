@@ -283,7 +283,8 @@ async fn a_restart_reattaches_to_a_scout_instead_of_orphaning_it() {
     let specs = store.list_specs().await.unwrap();
     assert_eq!(specs.len(), 1);
     assert_eq!(
-        specs[0].session_id, session_id,
+        specs[0].session_id.as_ref(),
+        Some(&session_id),
         "the same run, not a new one"
     );
     assert!(specs[0].content.contains("Gated implementation"));
@@ -910,7 +911,7 @@ async fn seed_approved(store: &Store, project: &Project) -> (Task, Spec) {
 
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task.id.clone(),
         content: "## Spec: wants building\n\nAdd a function.".into(),
         complexity: Complexity::Simple,

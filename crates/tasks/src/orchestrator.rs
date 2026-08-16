@@ -602,10 +602,17 @@ fn tool_label(item: &serde_json::Value) -> String {
 pub fn nudge_worthy(payload: &EventPayload) -> bool {
     match payload {
         EventPayload::TaskIngested { .. }
-        | EventPayload::SpecCreated { .. }
         | EventPayload::BuildCompleted { .. }
         | EventPayload::PullRequestOpened { .. }
         | EventPayload::ModeChanged { .. } => true,
+        // A spec landing is the turn it gets reviewed on — which is only true
+        // of a spec a Scout wrote. A human-authored one (#869) arrives already
+        // approved and already inside a build, so summoning a reviewer to it
+        // asks for a verdict that has nowhere to go: `auto_review_specs` is
+        // live, and a `needs_revision` on it would send a *building* task back
+        // to `queued`. The human's decision still reaches the conversation, as
+        // the approval below.
+        EventPayload::SpecCreated { session_id, .. } => session_id.is_some(),
         // Success is conveyed by the SpecCreated that accompanies it. A run
         // that stopped early has no SpecCreated to convey anything, and is
         // exactly the kind of half-finished state worth flagging.
@@ -1128,6 +1135,12 @@ fn system_prompt(
            or say \"opened\", not \"shipped\"\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
+         Not yours: POST /tasks/{{id}}/build-now — the human's shortcut past \
+         the Scout for a task whose issue body already is the spec. It \
+         authors a spec, approves it and dispatches a build in one act, with \
+         no second opinion anywhere in the loop, and no charter capability \
+         covers that; it answers you 403. When you think a task needs no \
+         scouting, say so and let the human make the call.\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → done (rejected = terminal). Issue closure on GitHub \
@@ -1159,7 +1172,16 @@ mod tests {
         assert!(nudge_worthy(&EventPayload::SpecCreated {
             spec_id: spec(),
             task_id: task(),
-            session_id: sess(),
+            session_id: Some(sess()),
+        }));
+        // …but not a spec the human wrote by hand (#869): it is already
+        // approved and already in a build, so "spec landed for review" would
+        // ask for a verdict on work that is past the point of taking one. The
+        // approval right below is how that reaches the conversation instead.
+        assert!(!nudge_worthy(&EventPayload::SpecCreated {
+            spec_id: spec(),
+            task_id: task(),
+            session_id: None,
         }));
         assert!(nudge_worthy(&EventPayload::SessionCompleted {
             session_id: sess(),

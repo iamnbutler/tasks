@@ -213,6 +213,38 @@ pub struct BuildRequest {
     pub evidence: Option<serde_json::Value>,
 }
 
+/// Body of `POST /tasks/{task_id}/build-now` — skip scouting for a task whose
+/// issue body already is the specification.
+///
+/// Every field is optional, because the common case is "the issue says it
+/// all": an empty body writes the issue body as the spec, approves it, and
+/// queues a Builder run over it. Human-only — the server refuses the
+/// orchestrator outright, since authoring and approving one's own spec with no
+/// second opinion anywhere in the loop is a different kind of autonomy from
+/// anything in the charter today.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BuildNowRequest {
+    /// The spec, if the issue body is not it. **Replaces** the body rather
+    /// than extending it — the Builder prompt is spec content alone, so a
+    /// supplied `content` is the whole of what the Builder will read.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// `simple` \| `medium` \| `complex`. Defaults to `simple`: a task worth
+    /// skipping the Scout for is one nobody needed to explore.
+    #[serde(default)]
+    pub complexity: Option<String>,
+    /// Branch the build is cut from and PR'd against. Defaults to `main`.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Why this needed no spec. Not required — only the orchestrator owes
+    /// explanations, and the orchestrator cannot call this at all — but it is
+    /// the one thing that makes an unreviewed build reviewable afterwards.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// A build with its batch, in position order — the shape of
 /// `GET /builds/{id}` and the `POST /builds` acknowledgement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

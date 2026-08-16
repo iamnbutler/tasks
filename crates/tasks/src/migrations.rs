@@ -235,6 +235,150 @@ mod tests {
         );
     }
 
+    /// The version that made `specs.session_id` nullable (#869), and the one
+    /// the test below stops short of so it can seed the old schema.
+    const HUMAN_AUTHORED_SPECS: i64 = 20260816021713;
+
+    /// The claim that migration rests on, against real SQLite with foreign
+    /// keys enforced: `specs` can be dropped and re-created under its own name
+    /// while `spec_queue` and `build_specs` still reference it, and the rows in
+    /// those children come back untouched.
+    ///
+    /// This was the thing expected to blow up. `ALTER TABLE specs_new RENAME
+    /// TO specs` runs while two tables hold foreign keys pointing at a table
+    /// that does not exist at that instant — which is not a schema parse error
+    /// and needs no `PRAGMA legacy_alter_table`. The rest of the migration is
+    /// the workaround for the part that *is* real: `DROP TABLE specs` with
+    /// foreign keys on runs an implicit delete, which would cascade the review
+    /// queue away and trip `build_specs`, and `PRAGMA foreign_keys` is a silent
+    /// no-op inside the transaction sqlx wraps each migration in.
+    #[tokio::test]
+    async fn making_session_id_nullable_keeps_the_children_of_specs() {
+        use sqlx::Row;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        for entry in std::fs::read_dir(migrations_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version: i64 = match name.split('_').next().and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            if version < HUMAN_AUTHORED_SPECS {
+                std::fs::copy(entry.path(), earlier.join(&name)).unwrap();
+            }
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("swap.db"))
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fk, 1, "the swap is only interesting with FKs enforced");
+
+        Migrator::new(earlier.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        // The full chain the swap has to carry across: a project, a task, a
+        // session, a spec, its queue entry, and a build holding that spec.
+        for statement in [
+            "INSERT INTO projects (id, repo_owner, repo_name, added_at) \
+             VALUES ('proj', 'o', 'r', '2026-08-16T00:00:00Z')",
+            "INSERT INTO tasks (id, project_id, gh_issue_number, title, body, labels, \
+             gh_state, state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at) \
+             VALUES ('task', 'proj', 1, 't', 'b', '[]', 'open', 'ready_to_build', 0, NULL, 0, \
+             '2026-08-16T00:00:00Z', '2026-08-16T00:00:00Z')",
+            "INSERT INTO sessions (id, task_id, vm_id, branch, status, started_at) \
+             VALUES ('sess', 'task', NULL, 'scout/1', 'scout_succeeded', '2026-08-16T00:00:00Z')",
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, files_touched, \
+             created_at) VALUES ('spec', 'sess', 'task', '## Spec', 'simple', '[\"a.rs\"]', \
+             '2026-08-16T00:00:00Z')",
+            "INSERT INTO spec_queue (spec_id, status, rank, approved_at, feedback, \
+             blocking_dependencies) VALUES ('spec', 'approved', 3, '2026-08-16T00:00:00Z', \
+             'ship it', '[]')",
+            "INSERT INTO builds (id, project_id, branch, base_branch, status, created_at) \
+             VALUES ('build', 'proj', 'build/1', 'main', 'succeeded', '2026-08-16T00:00:00Z')",
+            "INSERT INTO build_specs (build_id, spec_id, position) VALUES ('build', 'spec', 1)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        MIGRATOR.run(&pool).await.expect("the swap applies");
+
+        // The column moved…
+        sqlx::query(
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, files_touched, \
+             created_at) VALUES ('hand', NULL, 'task', '## Spec', 'simple', '[]', \
+             '2026-08-16T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("session_id is nullable now");
+
+        // …and the scouted spec came across whole.
+        let row = sqlx::query("SELECT session_id, files_touched FROM specs WHERE id = 'spec'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.try_get::<String, _>("session_id").unwrap(), "sess");
+        assert_eq!(
+            row.try_get::<String, _>("files_touched").unwrap(),
+            "[\"a.rs\"]"
+        );
+
+        // The children are the point: an unguarded DROP would have cascaded
+        // this queue entry away and failed on the build_specs row.
+        let entry =
+            sqlx::query("SELECT status, rank, feedback FROM spec_queue WHERE spec_id = 'spec'")
+                .fetch_one(&pool)
+                .await
+                .expect("the queue entry survived");
+        assert_eq!(entry.try_get::<String, _>("status").unwrap(), "approved");
+        assert_eq!(entry.try_get::<i64, _>("rank").unwrap(), 3);
+        assert_eq!(entry.try_get::<String, _>("feedback").unwrap(), "ship it");
+        let position: i64 = sqlx::query_scalar(
+            "SELECT position FROM build_specs WHERE build_id = 'build' AND spec_id = 'spec'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the build still holds its spec");
+        assert_eq!(position, 1);
+
+        // The index dropped with the old table is back, so the per-task
+        // lookup every read does is not a scan.
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'specs'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            indexes.iter().any(|name| name == "specs_task_idx"),
+            "specs_task_idx was dropped with the table and not recreated: {indexes:?}"
+        );
+
+        // And the foreign keys still resolve, now that `specs` exists again.
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(violations.is_empty(), "the swap left dangling references");
+    }
+
     /// The boundary itself, without a filesystem: what counts as a version.
     #[test]
     fn allowed_versions_are_the_frozen_sequence_and_real_instants() {

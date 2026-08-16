@@ -27,20 +27,21 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    AbandonPullRequest, BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest,
-    CommentRequest, CreateProject, EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest,
-    ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
+    AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CaptureIssue,
+    CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse, LabelInfo,
+    MergePullRequest, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
+    ReviewCommentRequest, ReviewRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest,
+    SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
 use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
-    Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason, Decision,
-    DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo,
-    Project, ProjectId, ScoutNotes, Session, SessionId, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
+    Complexity, Decision, DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage,
+    OrchestratorSessionInfo, Project, ProjectId, ScoutNotes, Session, SessionId, Spec, SpecId,
+    SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -174,6 +175,7 @@ pub fn router_with_services(
         .route("/tasks/{task_id}/queue", post(queue_task))
         .route("/tasks/{task_id}/dequeue", post(dequeue_task))
         .route("/tasks/{task_id}/scout", post(scout_task_now))
+        .route("/tasks/{task_id}/build-now", post(build_task_now))
         .route("/tasks/{task_id}/close", post(close_task))
         .route("/tasks/{task_id}/reopen", post(reopen_task))
         .route("/issues", post(capture_issue))
@@ -1617,6 +1619,86 @@ async fn request_build(
     Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })).into_response())
 }
 
+/// `POST /tasks/{task_id}/build-now` — skip the Scout for a task whose issue
+/// body already is the specification (#869).
+///
+/// One call, because from the human's side it is one decision: write the spec,
+/// approve it, queue the build. 202 with the same [`BuildDetail`] as
+/// `POST /builds`, and for the same reason — builds are serial, so this queues
+/// one rather than starting it.
+///
+/// **Human-only, and not charter-gated.** The orchestrator is refused outright
+/// rather than checked against `dispatch_builds`: authoring a spec, approving
+/// it, and dispatching a build off it with no second opinion anywhere in the
+/// loop is a materially different autonomy from batching specs a reviewer
+/// already ruled on. If it is ever granted it wants its own named capability,
+/// which is a decision for a human and an issue, not for this handler.
+///
+/// The two store calls are deliberately not merged into one transaction. If
+/// `create_build` fails the spec is still approved and the task sits in
+/// `ready_to_build`, recoverable with a plain `POST /builds` — a better place
+/// to land than silently discarding what the human wrote.
+async fn build_task_now(
+    State(store): State<Arc<Store>>,
+    Path(task_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<BuildNowRequest>>,
+) -> ApiResult<Response> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let actor = actor_of(&store, &headers)?;
+    if actor != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "build-now is the human's alone: it writes a spec, approves it, and dispatches \
+             a build in one act, with no second opinion anywhere in the loop. No charter \
+             capability covers that. Propose it to the human, or send the task to a Scout \
+             with POST /tasks/{id}/scout and review the spec it writes."
+                .into(),
+        ));
+    }
+
+    let id = TaskId::from_raw(task_id);
+    let task = store
+        .get_task(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("task {id}")))?;
+
+    let complexity = match body.complexity.as_deref() {
+        // A task worth skipping the Scout for is one nobody needed to explore.
+        None => Complexity::Simple,
+        Some(raw) => Complexity::from_str(raw)
+            .ok_or_else(|| ApiError::BadRequest(format!("unknown complexity: {raw}")))?,
+    };
+    // A supplied `content` *replaces* the issue body rather than extending it:
+    // the Builder prompt is spec content alone, so whatever lands here is the
+    // whole of what the Builder reads.
+    let content = body.content.unwrap_or_else(|| task.body.clone());
+    if content.trim().is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "issue #{} has an empty body and no content was supplied — there would be \
+             nothing for the Builder to implement",
+            task.gh_issue_number
+        )));
+    }
+
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let spec = store
+        .author_spec(&id, &content, complexity, decision.clone())
+        .await?;
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            body.base_branch.as_deref().unwrap_or("main"),
+            decision,
+        )
+        .await?;
+    let spec_ids = store.build_spec_ids(&build.id).await?;
+    Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })).into_response())
+}
+
 async fn list_builds(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Build>>> {
     Ok(Json(store.list_builds().await?))
 }
@@ -2085,7 +2167,7 @@ mod tests {
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session.id.clone(),
+            session_id: Some(session.id.clone()),
             task_id: task.id.clone(),
             content: "## Spec".into(),
             complexity: Complexity::Simple,
@@ -2532,6 +2614,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    // --- build now (#869) ---
+
+    /// The whole path in one call: the issue body becomes the spec, the spec
+    /// is approved, and a build is queued over it.
+    ///
+    /// `ready_to_build` rather than `building` is the expected end state
+    /// because no build loop runs in this test — `create_build` never touches
+    /// the task, and `claim_next_queued_build` is what moves it on.
+    #[tokio::test]
+    async fn build_now_writes_the_issue_body_as_an_approved_spec_and_queues_a_build() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 7, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .json(&json!({"rationale": "the issue body is the whole spec"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let detail: BuildDetail = resp.json().await.unwrap();
+        assert_eq!(detail.spec_ids.len(), 1);
+        assert_eq!(detail.build.status, crate::models::BuildStatus::Queued);
+
+        let spec = store
+            .get_spec(&detail.spec_ids[0])
+            .await
+            .unwrap()
+            .expect("the spec was written");
+        assert_eq!(spec.content, task.body, "the issue body is the spec");
+        assert_eq!(spec.session_id, None, "no Scout ran — that is the tell");
+        assert_eq!(spec.complexity, Complexity::Simple);
+        assert!(
+            spec.files_touched.is_empty(),
+            "nobody explored this, so nothing is known to be touched"
+        );
+
+        let entry = store.get_spec_queue_entry(&spec.id).await.unwrap().unwrap();
+        assert_eq!(entry.status, SpecQueueStatus::Approved);
+        assert!(entry.approved_at.is_some());
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild
+        );
+
+        // One ledger row, and it says `author_spec` rather than `approve`:
+        // there was no second opinion to record.
+        let decisions = store
+            .decisions(Some(("spec", spec.id.as_str())), 10)
+            .await
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].action, DecisionAction::AuthorSpec);
+        assert_eq!(decisions[0].actor, Actor::Human);
+        assert_eq!(
+            decisions[0].rationale.as_deref(),
+            Some("the issue body is the whole spec")
+        );
+    }
+
+    /// `content` replaces the issue body rather than extending it — the
+    /// Builder prompt is spec content alone, so whatever lands here is all it
+    /// reads.
+    #[tokio::test]
+    async fn build_now_content_replaces_the_issue_body() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 8, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .json(&json!({"content": "## Spec\nRename the flag.", "complexity": "medium"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let detail: BuildDetail = resp.json().await.unwrap();
+
+        let spec = store.get_spec(&detail.spec_ids[0]).await.unwrap().unwrap();
+        assert_eq!(spec.content, "## Spec\nRename the flag.");
+        assert!(
+            !spec.content.contains(&task.body),
+            "a supplied content replaces the body, it does not append to it"
+        );
+        assert_eq!(spec.complexity, Complexity::Medium);
+    }
+
+    /// Human-only, and *not* charter-gated: every capability that could
+    /// plausibly cover this is `live`, and it is still a 403. Authoring a
+    /// spec, approving it and dispatching a build off it with no second
+    /// opinion anywhere in the loop is a different autonomy from batching
+    /// specs someone already ruled on.
+    #[tokio::test]
+    async fn build_now_refuses_the_orchestrator_however_wide_its_charter() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 9, 0).await;
+        for capability in [
+            Capability::DispatchBuilds,
+            Capability::AutoReviewSpecs,
+            Capability::QueueTasks,
+        ] {
+            store
+                .set_charter(capability, CharterLevel::Live, None)
+                .await
+                .unwrap();
+        }
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .header(
+                ACTOR_HEADER,
+                format!("orchestrator {}", store.actor_token()),
+            )
+            .json(&json!({"rationale": "trivial"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body: Value = resp.json().await.unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("/scout"),
+            "the refusal should point at the path that is open to it: {error}"
+        );
+
+        // Refused before anything is written — not even a shadow decision,
+        // because this is not a capability that has a shadow.
+        assert!(store.list_specs().await.unwrap().is_empty());
+        assert!(store.list_builds().await.unwrap().is_empty());
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Backlog
+        );
+    }
+
+    /// Past `queued` a Scout has run or is running, and there is a real spec
+    /// (or one on the way) to review. Writing a second one by hand there would
+    /// silently supersede it.
+    #[tokio::test]
+    async fn build_now_refuses_a_task_the_scout_already_has() {
+        let (store, project) = store_with_project().await;
+        let (task, _) = insert_spec(&store, &project, 10).await;
+        store
+            .update_task_state(&task.id, TaskState::InReview)
+            .await
+            .unwrap();
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(
+            store.list_specs().await.unwrap().len(),
+            1,
+            "the scout's spec is the only one"
+        );
+        assert!(store.list_builds().await.unwrap().is_empty());
+    }
+
+    /// An empty issue body and no `content` leaves nothing for the Builder to
+    /// implement, and a build over an empty spec is a VM hour spent on
+    /// nothing.
+    #[tokio::test]
+    async fn build_now_refuses_when_there_is_nothing_to_build_from() {
+        let (store, project) = store_with_project().await;
+        let now = Utc::now();
+        let task = Task {
+            id: TaskId::new(),
+            project_id: project.id.clone(),
+            gh_issue_number: 11,
+            title: "a title and nothing else".into(),
+            body: "   ".into(),
+            labels: vec![],
+            gh_state: GhState::Open,
+            state: TaskState::Backlog,
+            priority: 0,
+            manual_rank: None,
+            dispatch_attempts: 0,
+            ingested_at: now,
+            updated_at: now,
+        };
+        store.insert_task(&task).await.unwrap();
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        // Sent with no body at all — the documented common case, and what a
+        // bare `curl -X POST` produces. A 415 here would mean the handler was
+        // never reached; the error naming the issue is what says it was.
+        let resp = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("#11"));
+        assert!(store.list_specs().await.unwrap().is_empty());
     }
 
     #[tokio::test]

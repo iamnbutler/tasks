@@ -23,9 +23,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
-    ErrorResponse, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest,
-    SendMessage, ServerStatus, SetCharter, SetMode,
+    BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CaptureIssue, CloseTaskRequest,
+    CreateProject, ErrorResponse, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
+    ReviewRequest, SendMessage, ServerStatus, SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -458,6 +458,32 @@ impl Client {
                 base_branch,
                 rationale: None,
                 evidence: None,
+            },
+        )
+    }
+
+    /// "Build now": write the spec by hand, approve it, and queue the Builder
+    /// run — one call, because from the human's side it is one decision.
+    ///
+    /// For a task whose issue body already *is* the specification. The spec is
+    /// always that body: `content` is an API-level override this client does
+    /// not offer, because if the body is not the spec the honest answers are to
+    /// scout the task or edit the issue, not to type a description only Tasks
+    /// can see.
+    ///
+    /// `rationale` is what makes an unreviewed build reviewable afterwards —
+    /// nothing else in this path carries a second opinion. The server does not
+    /// demand it (only the orchestrator is ever gated on one, and the
+    /// orchestrator is refused this endpoint outright), so callers that mean it
+    /// to be mandatory enforce that themselves.
+    ///
+    /// 202, like [`Self::request_build`]: queued, not started.
+    pub fn build_task_now(&self, id: &TaskId, rationale: Option<String>) -> Result<BuildDetail> {
+        self.post_json(
+            &format!("/tasks/{id}/build-now"),
+            &BuildNowRequest {
+                rationale,
+                ..Default::default()
             },
         )
     }

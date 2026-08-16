@@ -116,7 +116,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
 
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task.id.clone(),
         content: format!("## Spec: {title}\n\nAdd a function for issue {issue}."),
         complexity: Complexity::Simple,
@@ -442,7 +442,11 @@ async fn a_silent_build_failure_leaves_a_readable_transcript() {
     // and a build's lines belong to the build.
     assert!(
         h.store
-            .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
+            .transcript_since(
+                &TranscriptOwner::session(spec.session_id.as_ref().unwrap()),
+                0,
+                1000
+            )
             .await
             .unwrap()
             .is_empty(),
