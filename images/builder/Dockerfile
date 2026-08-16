@@ -10,16 +10,21 @@ USER root
 COPY builder-supervisor /usr/local/bin/builder-supervisor
 RUN chmod +x /usr/local/bin/builder-supervisor
 
-# cargo-nextest from the official prebuilt tarball — see
-# images/scout/Dockerfile for why an agent that cannot run `make test` is a
-# memory problem.
+# cargo-nextest, pinned — see images/scout/Dockerfile for why an agent that
+# cannot run `make test` is a memory problem, and for why this no longer goes
+# through `get.nextest.dev`.
+ARG NEXTEST_VERSION=0.9.143
 RUN arch="$(uname -m)" && \
     case "$arch" in \
-      aarch64|arm64) url=https://get.nextest.dev/latest/linux-arm ;; \
-      x86_64) url=https://get.nextest.dev/latest/linux ;; \
+      aarch64|arm64) target=aarch64-unknown-linux-gnu ;; \
+      x86_64) target=x86_64-unknown-linux-gnu ;; \
       *) echo "no nextest build for $arch" >&2; exit 1 ;; \
     esac && \
-    curl -LsSf "$url" | tar zxf - -C /usr/local/bin
+    curl -LsSf -o /tmp/nextest.tar.gz \
+      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${target}.tar.gz" && \
+    tar zxf /tmp/nextest.tar.gz -C /usr/local/bin && \
+    rm /tmp/nextest.tar.gz && \
+    test -x /usr/local/bin/cargo-nextest
 
 # app-gpui's build dependencies — see images/scout/Dockerfile for what each
 # package is for and what the layer costs. A Builder needs them more than a
