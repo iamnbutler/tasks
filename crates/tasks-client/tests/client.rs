@@ -10,8 +10,8 @@ use tasks::server::router;
 use tasks::store::Store;
 use tasks_api::events::EventPayload;
 use tasks_api::models::{
-    GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
-    TranscriptOwner, TranscriptStream,
+    CloseReason, GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId,
+    TaskState, TranscriptOwner, TranscriptStream,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -124,6 +124,67 @@ fn queue_flow_round_trips_typed_states() {
     let back = server.client.dequeue_task(&task.id).unwrap();
     assert_eq!(back.state, TaskState::Backlog);
     assert_eq!(back.manual_rank, None);
+}
+
+/// Retiring work and taking that back are the same power, so the client has
+/// to offer both — a close with no undo makes every mistaken close permanent
+/// for whoever finds it next.
+///
+/// This server has no GitHub token, so both calls come back 503 with the
+/// server's own explanation. That is the assertion worth making here: it says
+/// the method reached its route (a wrong path or verb would be a 404/405) and
+/// that a missing token is reported rather than swallowed.
+#[test]
+fn closing_and_reopening_both_reach_their_routes() {
+    let server = spawn_server();
+    let project = server.client.create_project("iamnbutler", "tasks").unwrap();
+    let task = server.seed_task(&project, 11);
+
+    let err = server
+        .client
+        .close_task(&task.id, CloseReason::NotPlanned, None)
+        .unwrap_err();
+    match err {
+        ClientError::Api { status, message } => {
+            assert_eq!(status, 503);
+            assert!(message.contains("close issues"), "message: {message}");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+
+    let err = server.client.reopen_task(&task.id, None).unwrap_err();
+    match err {
+        ClientError::Api { status, message } => {
+            assert_eq!(status, 503);
+            assert!(message.contains("reopen issues"), "message: {message}");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+/// The human owes no explanation — only the orchestrator does, and it does not
+/// speak through this client. Both custodial writes therefore send a body with
+/// a null rationale, and the server takes it.
+#[test]
+fn a_human_close_carries_no_rationale() {
+    let server = spawn_server();
+    let project = server.client.create_project("iamnbutler", "tasks").unwrap();
+    let task = server.seed_task(&project, 12);
+
+    // A 400 here would mean the server had started demanding a rationale of
+    // everyone, which is the premise the row menu's one-click verbs rest on.
+    for err in [
+        server
+            .client
+            .close_task(&task.id, CloseReason::Completed, None)
+            .unwrap_err(),
+        server.client.reopen_task(&task.id, None).unwrap_err(),
+    ] {
+        match err {
+            ClientError::Api { status, .. } => assert_eq!(status, 503),
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
 }
 
 #[test]

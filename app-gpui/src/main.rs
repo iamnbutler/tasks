@@ -3,6 +3,7 @@ mod chat_log;
 mod components;
 mod issue_composer;
 mod menus;
+mod row_menu;
 mod sections;
 mod server;
 mod server_window;

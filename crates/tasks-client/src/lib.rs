@@ -24,8 +24,8 @@ use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
     BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
-    ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
-    ServerStatus, SetCharter, SetMode,
+    ErrorResponse, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest,
+    SendMessage, ServerStatus, SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -285,6 +285,23 @@ impl Client {
             &format!("/tasks/{id}/close"),
             &CloseTaskRequest {
                 reason: reason.as_str().to_string(),
+                rationale,
+                evidence: None,
+            },
+        )
+    }
+
+    /// Reopen the GitHub issue behind a retired task — the recourse half of
+    /// [`Client::close_task`], and 202 for the same reason: open-or-closed is
+    /// GitHub's fact, and the poller reads it back on its next pass.
+    ///
+    /// Which is why a caller should not gate this on the task's *local*
+    /// `gh_state`: it lags a close by up to a poll interval, and that is
+    /// exactly the window in which someone wants the undo.
+    pub fn reopen_task(&self, id: &TaskId, rationale: Option<String>) -> Result<()> {
+        self.post_json_accepted(
+            &format!("/tasks/{id}/reopen"),
+            &ReopenTaskRequest {
                 rationale,
                 evidence: None,
             },

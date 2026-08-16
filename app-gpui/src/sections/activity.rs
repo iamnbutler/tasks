@@ -3,7 +3,8 @@
 //! purpose, so a new event kind is a compile error here, not a mystery row.
 
 use gpui::prelude::*;
-use gpui::{div, px, Context};
+use gpui::{div, px, Context, SharedString};
+use gpuikit::elements::context_menu::context_menu;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::events::EventPayload;
 use tasks_client::api::models::TaskId;
@@ -165,7 +166,7 @@ impl Workspace {
                 )
             })
             .children(rows.into_iter().map(|(seq, sentence, when, subject)| {
-                div()
+                let row = div()
                     .id(seq as usize)
                     .flex()
                     .flex_row()
@@ -176,7 +177,7 @@ impl Workspace {
                     .py(px(4.))
                     .rounded(px(5.))
                     // Rows about a task open it in the inspector.
-                    .when_some(subject, |el, task_id| {
+                    .when_some(subject.clone(), |el, task_id| {
                         let hover_bg = theme.surface_secondary();
                         el.cursor_pointer()
                             .hover(move |el| el.bg(hover_bg))
@@ -198,7 +199,21 @@ impl Workspace {
                             .text_xs()
                             .text_color(theme.fg_muted())
                             .child(when),
-                    )
+                    );
+
+                // A row that names a task *is* a task row, addressed by what
+                // happened rather than by what it is — so it gets the same
+                // menu. Rows that name none (a mode change, a briefing) get
+                // no menu rather than an empty one. Keyed by event seq: one
+                // task can be the subject of many rows.
+                match subject {
+                    Some(task_id) => {
+                        context_menu(SharedString::from(format!("row-menu-activity-{seq}")), row)
+                            .menu(Workspace::row_menu(task_id, cx))
+                            .into_any_element()
+                    }
+                    None => row.into_any_element(),
+                }
             }))
     }
 }
