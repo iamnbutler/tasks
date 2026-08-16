@@ -21,11 +21,40 @@ RUN arch="$(uname -m)" && \
     esac && \
     curl -LsSf "$url" | tar zxf - -C /usr/local/bin
 
+# app-gpui's build dependencies. Without them `cd app-gpui && cargo test`
+# fails in a build script — `yeslogic-fontconfig-sys` probes pkg-config for
+# fontconfig, and linking the test binary additionally wants xcb and
+# xkbcommon(-x11). The Makefile's `app-check` / `app-test` can work around
+# their absence (RUST_FONTCONFIG_DLOPEN plus empty stub .so's) but the plain
+# command an agent reaches for first cannot, and the workaround's RUSTFLAGS
+# rebuild the whole gpui tree over a hand-run `cargo test`.
+#
+# The trade: ~23 MB installed (27 new packages, 7 upgrades on arm64 — pkgconf,
+# freetype, png, zlib, expat, x11proto, xcb-xkb, xkb-data among them) and
+# ~20s of image build, in an image that already carries Rust, Node, Bun, gh
+# and Claude Code. Cheap against a crate whose every change so far merged
+# uncompiled.
+#
+# apt-get update is required, not decorative: the base image deletes
+# /var/lib/apt/lists.
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libfontconfig-dev \
+    libxkbcommon-dev \
+    libxkbcommon-x11-dev \
+    libxcb1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 USER agent
 WORKDIR /home/agent
 
 # The base image installs Rust for root only; scouts build as `agent`.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+#
+# `--profile minimal` leaves out rustfmt and clippy, and `cargo fmt` +
+# `cargo clippy --workspace --all-targets` are what this repo requires clean
+# before committing — without the components they fail with "not installed
+# for the toolchain", in the one place that cannot install them mid-run.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
 # The floor for a container someone starts by hand — including one booted at

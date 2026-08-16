@@ -21,11 +21,25 @@ RUN arch="$(uname -m)" && \
     esac && \
     curl -LsSf "$url" | tar zxf - -C /usr/local/bin
 
+# app-gpui's build dependencies — see images/scout/Dockerfile for what each
+# package is for and what the layer costs. A Builder needs them more than a
+# Scout does: it is the one that has to leave an app-gpui spec implemented and
+# tested, not merely explored.
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libfontconfig-dev \
+    libxkbcommon-dev \
+    libxkbcommon-x11-dev \
+    libxcb1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 USER agent
 WORKDIR /home/agent
 
 # The base image installs Rust for root only; builders build as `agent`.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+# `-c rustfmt -c clippy` because `--profile minimal` ships neither, and both
+# are required clean before committing — see images/scout/Dockerfile.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy
 ENV PATH="/home/agent/.cargo/bin:${PATH}"
 
 # Floor for a hand-started container; the server's per-VM `-e CARGO_BUILD_JOBS`
