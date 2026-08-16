@@ -10,8 +10,8 @@ use vm_pool_client::Client;
 use vm_pool_protocol::VmConfig;
 
 use tasks::models::{
-    GhState, Project, ProjectId, SessionStatus, Task, TaskId, TaskState, TranscriptOwner,
-    TranscriptStream,
+    GhState, Project, ProjectId, ProjectStatus, SessionStatus, Task, TaskId, TaskState,
+    TranscriptOwner, TranscriptStream,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
 use tasks::store::Store;
@@ -29,6 +29,7 @@ async fn insert_project_and_task(store: &Store) -> (Project, Task) {
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
     let now = Utc::now();

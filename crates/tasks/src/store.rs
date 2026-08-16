@@ -19,10 +19,10 @@ use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
     CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
     GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, RunKind,
-    ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
-    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
-    TranscriptOwner, TranscriptStream,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ReviewedSpec,
+    RunKind, ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec,
+    SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    TranscriptLine, TranscriptOwner, TranscriptStream,
 };
 use crate::protocol::FailureClass;
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
@@ -505,34 +505,91 @@ impl Store {
 
     pub async fn insert_project(&self, project: &Project) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO projects (id, repo_owner, repo_name, added_at) \
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO projects (id, repo_owner, repo_name, added_at, status) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(project.id.as_str())
         .bind(&project.repo_owner)
         .bind(&project.repo_name)
         .bind(project.added_at.to_rfc3339())
+        .bind(project.status.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     pub async fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError> {
-        let row =
-            sqlx::query("SELECT id, repo_owner, repo_name, added_at FROM projects WHERE id = ?")
-                .bind(id.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query(
+            "SELECT id, repo_owner, repo_name, added_at, status FROM projects WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(project_from_row).transpose()
+    }
+
+    /// The project tracking `owner/repo`, matched **case-insensitively**.
+    ///
+    /// `UNIQUE(repo_owner, repo_name)` is case-sensitive, so `Owner/Repo`
+    /// beside `owner/repo` is two projects for one repository — which is worse
+    /// than a duplicate row: `resolve_project` stops being able to answer "the
+    /// only one there is", the poller ingests every issue twice, and every list
+    /// shows the repo twice. Both add paths (the handler and `tasks
+    /// add-project`) ask this first. Not a `CREATE UNIQUE INDEX` migration,
+    /// because one can *fail* on a database that already holds the duplicate,
+    /// and a failed migration is a boot failure in a process that has already
+    /// taken the port.
+    pub async fn find_project_by_repo(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Result<Option<Project>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, repo_owner, repo_name, added_at, status FROM projects \
+             WHERE repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE",
+        )
+        .bind(owner)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(project_from_row).transpose()
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, repo_owner, repo_name, added_at FROM projects ORDER BY added_at",
+            "SELECT id, repo_owner, repo_name, added_at, status FROM projects ORDER BY added_at",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(project_from_row).collect()
+    }
+
+    /// Set how much of the pipeline runs for one repo. Returns the project as
+    /// it now reads, or `NotFound`.
+    ///
+    /// Gates **new** work only, like the mode: a scout or a build already in
+    /// flight for this project runs to its own conclusion.
+    pub async fn set_project_status(
+        &self,
+        id: &ProjectId,
+        status: ProjectStatus,
+    ) -> Result<Project, StoreError> {
+        let result = sqlx::query("UPDATE projects SET status = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(id.as_str())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("project {id}")));
+        }
+        self.append_event(EventPayload::ProjectStatusChanged {
+            project_id: id.clone(),
+            status,
+        })
+        .await?;
+        self.get_project(id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("project {id}")))
     }
 
     // --- tasks ---
@@ -2540,6 +2597,15 @@ impl Store {
     /// The specs' tasks move `ready_to_build → building` (tasks that left
     /// `ready_to_build` some other way — e.g. retired because their issue
     /// closed — are left alone). Emits `BuildStarted` plus the task events.
+    ///
+    /// A build whose project is not `active` is not a candidate, and the
+    /// filter lives **inside the claim** rather than beside it. Claiming and
+    /// then releasing would flip the build `queued → running → queued` on
+    /// every tick of the build loop, and each claim drags its batch's tasks to
+    /// `building` — a paused repo would look like it was building forever.
+    /// Being a `WHERE` clause rather than a check on the head of the queue is
+    /// also what keeps a paused repo from starving the ones behind it: the
+    /// ordering simply skips past it.
     pub async fn claim_next_queued_build(&self) -> Result<Option<Build>, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
@@ -2553,9 +2619,13 @@ impl Store {
         }
 
         let Some(row) = sqlx::query(
-            "SELECT id FROM builds WHERE status = ? ORDER BY created_at, rowid LIMIT 1",
+            "SELECT b.id FROM builds b \
+             JOIN projects p ON p.id = b.project_id \
+             WHERE b.status = ? AND p.status = ? \
+             ORDER BY b.created_at, b.rowid LIMIT 1",
         )
         .bind(BuildStatus::Queued.as_str())
+        .bind(ProjectStatus::Active.as_str())
         .fetch_optional(&mut *tx)
         .await?
         else {
@@ -4326,11 +4396,16 @@ impl Store {
 // --- row mappers ---
 
 fn project_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Project, StoreError> {
+    let status_raw: String = row.try_get("status")?;
     Ok(Project {
         id: ProjectId::from_raw(row.try_get::<String, _>("id")?),
         repo_owner: row.try_get("repo_owner")?,
         repo_name: row.try_get("repo_name")?,
         added_at: parse_ts(&row.try_get::<String, _>("added_at")?, "added_at")?,
+        status: ProjectStatus::from_str(&status_raw).ok_or(StoreError::BadEnum {
+            column: "status",
+            value: status_raw.clone(),
+        })?,
     })
 }
 
@@ -4742,6 +4817,7 @@ mod tests {
             repo_owner: "iamnbutler".into(),
             repo_name: "tasks".into(),
             added_at: Utc::now(),
+            status: ProjectStatus::Active,
         }
     }
 
@@ -5210,6 +5286,7 @@ mod tests {
             repo_owner: "iamnbutler".into(),
             repo_name: "other".into(),
             added_at: Utc::now(),
+            status: ProjectStatus::Active,
         };
         store.insert_project(&project).await.unwrap();
         project
@@ -8157,6 +8234,164 @@ mod tests {
         );
         let next = store.claim_next_queued_build().await.unwrap().unwrap();
         assert_eq!(next.status, BuildStatus::Running);
+    }
+
+    // --- per-repo status (#903) ---
+
+    /// The argument for keeping **mode** global, in code.
+    ///
+    /// A per-repo `play` would promise what the architecture cannot deliver:
+    /// there is one strictly serial build lane for the whole server, so a
+    /// running build in one repo blocks every other repo regardless of what
+    /// their own switch says. What is honestly per-repo is the *subtraction*.
+    #[tokio::test]
+    async fn one_repos_running_build_holds_the_lane_against_every_other_repo() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let other = second_project(&store).await;
+        let (_ta, spec_a) = approved_spec(&store, &project, 1).await;
+        let (_tb, spec_b) = approved_spec(&store, &other, 2).await;
+
+        let first = store
+            .create_build(
+                std::slice::from_ref(&spec_a.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store
+            .create_build(
+                std::slice::from_ref(&spec_b.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+        assert!(
+            store.claim_next_queued_build().await.unwrap().is_none(),
+            "a different repo, and still the one lane — this is why mode stays \
+             global and only the subtraction is per-repo"
+        );
+    }
+
+    /// The check lives *inside* the claim. Claim-then-release would flip the
+    /// build `queued → running → queued` on every tick of the build loop, and
+    /// each claim drags its batch's tasks to `building` — a paused repo would
+    /// look like it was building forever.
+    #[tokio::test]
+    async fn a_paused_repos_build_is_never_claimed_and_never_touched() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .set_project_status(&project.id, ProjectStatus::Paused)
+            .await
+            .unwrap();
+        assert!(store.claim_next_queued_build().await.unwrap().is_none());
+        assert_eq!(
+            store.get_build(&build.id).await.unwrap().unwrap().status,
+            BuildStatus::Queued,
+            "still queued: durable intent, not a run that keeps restarting"
+        );
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild,
+            "and its task was never dragged to building"
+        );
+
+        // Un-pausing needs no other act: the build is exactly where it was.
+        store
+            .set_project_status(&project.id, ProjectStatus::Active)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.id, build.id);
+    }
+
+    /// A paused repo at the head of the queue must not starve the ones behind
+    /// it — that is the whole difference between pausing one repo and pausing
+    /// the server.
+    #[tokio::test]
+    async fn a_paused_repo_at_the_head_does_not_starve_the_queue() {
+        let store = Store::open_in_memory().await.unwrap();
+        let paused = sample_project();
+        store.insert_project(&paused).await.unwrap();
+        let live = second_project(&store).await;
+        let (_tp, spec_p) = approved_spec(&store, &paused, 1).await;
+        let (_tl, spec_l) = approved_spec(&store, &live, 2).await;
+
+        // The paused repo's build is created first, so it is the head.
+        store
+            .create_build(
+                std::slice::from_ref(&spec_p.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let behind = store
+            .create_build(
+                std::slice::from_ref(&spec_l.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_project_status(&paused.id, ProjectStatus::Paused)
+            .await
+            .unwrap();
+
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.id, behind.id, "skipped past, not stopped at");
+    }
+
+    /// `Owner/Repo` and `owner/repo` are one repository, and
+    /// `UNIQUE(repo_owner, repo_name)` cannot see that.
+    #[tokio::test]
+    async fn find_project_by_repo_ignores_case() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let found = store
+            .find_project_by_repo("IAMNBUTLER", "Tasks")
+            .await
+            .unwrap()
+            .expect("one repo, whatever the case");
+        assert_eq!(found.id, project.id);
+        assert!(
+            store
+                .find_project_by_repo("iamnbutler", "other")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_the_status_of_a_missing_project_is_not_found() {
+        let store = Store::open_in_memory().await.unwrap();
+        let err = store
+            .set_project_status(&ProjectId::new(), ProjectStatus::Paused)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err}");
     }
 
     // --- hand-written specs (#869) ---

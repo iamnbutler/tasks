@@ -15,8 +15,8 @@ use tasks_client::api::events::Event;
 use tasks_client::api::http::{BriefingStatus, RejectedBundle};
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, Project, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
-    TaskId, TaskState,
+    OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -809,6 +809,32 @@ impl AppState {
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.set_mode(mode));
+    }
+
+    /// Start tracking a repository. Nothing is dispatched by it: ingested
+    /// issues land in `backlog`, and backlog never dispatches.
+    ///
+    /// The response is deliberately not folded in — like every other mutation
+    /// here, the refresh that follows is what applies the change. Which is why
+    /// the Add Repo window parks its "select this one" intent on the *slug*
+    /// rather than an id: at the moment the window closes there is no id yet.
+    pub fn create_project(&mut self, owner: String, name: String, cx: &mut Context<Self>) {
+        self.run(cx, move |client| client.create_project(owner, name));
+    }
+
+    /// How much of the pipeline runs for one repo — the per-repo counterpart
+    /// to [`Self::set_mode`], and the only removal there is.
+    ///
+    /// Gates *new* work only: a scout or a build already in flight for this
+    /// project runs to its own conclusion, exactly as a mode change never
+    /// interrupts one.
+    pub fn set_project_status(
+        &mut self,
+        id: ProjectId,
+        status: ProjectStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.run(cx, move |client| client.set_project_status(&id, status));
     }
 
     pub fn review_spec(

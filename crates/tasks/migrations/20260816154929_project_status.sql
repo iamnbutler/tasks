@@ -1,0 +1,19 @@
+-- Per-repo status: how much of the pipeline runs for one project (#903).
+--
+-- The counterpart to the global mode, and deliberately not a second copy of
+-- it: mode gates a dispatcher whose real constraints are server-wide (one
+-- SCOUT_MAX_CONCURRENT, one strictly serial build lane, one vm-pool), so a
+-- per-repo `play` could not run while another repo's build held the lane. What
+-- is honestly per-repo is the subtraction — a project the dispatcher skips,
+-- and one the poller stops ingesting from.
+--
+-- One ordered column rather than two booleans: `paused` and `archived` are not
+-- orthogonal (archived already implies not dispatching), so a pair of flags
+-- would have a meaningless fourth state.
+--
+-- Additive, with a default that backfills every existing project to exactly
+-- what it was. Archiving is also the *only* removal there is: `decisions` is
+-- append-only and keyed to a project's tasks, and `tasks.project_id` is
+-- ON DELETE CASCADE, so deleting a project would take the audit trail the
+-- whole charter rests on with it.
+ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active';

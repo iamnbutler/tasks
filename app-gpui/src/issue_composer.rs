@@ -3,8 +3,15 @@
 //! A small separate OS window (Zed's new-window flow: `cx.open_window` off a
 //! spawn, root view built in the window's context), not an in-window overlay.
 //! One field, no chrome of its own beyond the system title bar. Cmd-enter
-//! hands the draft to the orchestrator — which owns picking the repo, titling
-//! the issue, and folding in its ambient context — and closes the window.
+//! hands the draft to the orchestrator — which owns titling the issue and
+//! folding in its ambient context — and closes the window.
+//!
+//! **The repo is the window's to decide, not the orchestrator's.** The server
+//! already refuses to guess between several projects, so this stops asking an
+//! agent to: the footer names the target, the send is dead while several repos
+//! are in view and none is selected, and the message carries the `project_id`
+//! verbatim so the agent copies a value rather than re-deriving one. See
+//! [`crate::projects::issue_target`].
 //!
 //! The draft `InputState` is owned by the workspace, so escape or closing
 //! the window keeps the text; the next cmd-n picks it back up.
@@ -18,6 +25,7 @@ use gpuikit::elements::input::text_area;
 use gpuikit::input::{InputState, InputStateEvent};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
+use crate::projects::{self, IssueTarget};
 use crate::state::AppState;
 use crate::workspace::Workspace;
 
@@ -74,17 +82,37 @@ impl IssueComposer {
         }
     }
 
+    /// Where this window would file, read out of the workspace's repo filter.
+    ///
+    /// Falls back to the app state directly if the workspace is gone, which is
+    /// the same fallback `submit` uses to send.
+    fn target(&self, cx: &App) -> IssueTarget {
+        let filter = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project_filter.clone())
+            .unwrap_or_default();
+        projects::issue_target(&self.app_state.read(cx).projects, &filter)
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.input.read(cx).content().trim().to_string();
         if draft.is_empty() {
             return;
         }
+        // The refusal the server would make, made before the message is sent
+        // rather than after: an ambiguous target reaching the orchestrator is
+        // exactly the guess this window exists to stop asking for.
+        let IssueTarget::Repo { id, slug } = self.target(cx) else {
+            return;
+        };
         self.input.update(cx, |input, cx| input.set_content("", cx));
         let message = format!(
-            "Create a new GitHub issue from the draft below. Pick the right \
-             repository, write a clear, specific title, and expand the body with \
-             any relevant context you have (related tasks, recent activity, code \
-             areas). File it and reply with the issue number and link.\n\n\
+            "Create a new GitHub issue from the draft below, in {slug}. Pass \
+             \"project_id\": \"{id}\" to POST /issues — that is the repository \
+             chosen in the app, not one to re-derive. Write a clear, specific \
+             title, and expand the body with any relevant context you have \
+             (related tasks, recent activity, code areas). File it and reply \
+             with the issue number and link.\n\n\
              Draft:\n{draft}"
         );
         // Route through the workspace so the main window jumps to Chat —
@@ -106,6 +134,8 @@ impl IssueComposer {
 impl Render for IssueComposer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let target = self.target(cx);
+        let can_file = target.can_file();
         div()
             .key_context("IssueComposer")
             .flex()
@@ -133,9 +163,18 @@ impl Render for IssueComposer {
                     .py(px(8.))
                     .border_t_1()
                     .border_color(theme.border_subtle())
+                    .gap(px(8.))
                     .text_xs()
                     .text_color(theme.fg_muted())
-                    .child("The orchestrator picks the repo and files it")
+                    // Which repo, in words. The one thing this window used to
+                    // leave to an agent.
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .truncate()
+                            .child(target.sentence()),
+                    )
                     .child(
                         div()
                             .id("file-issue")
@@ -145,15 +184,16 @@ impl Render for IssueComposer {
                             .rounded(px(5.))
                             .border_1()
                             .border_color(theme.border_secondary())
-                            .cursor_pointer()
-                            .text_color(theme.fg())
-                            .hover({
+                            .when(can_file, |el| {
                                 let hover_bg = theme.surface_secondary();
-                                move |el| el.bg(hover_bg)
+                                el.cursor_pointer()
+                                    .text_color(theme.fg())
+                                    .hover(move |el| el.bg(hover_bg))
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.submit(window, cx);
+                                    }))
                             })
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.submit(window, cx);
-                            }))
+                            .when(!can_file, |el| el.text_color(theme.fg_muted()).opacity(0.5))
                             .child("File issue ⌘↩"),
                     ),
             )

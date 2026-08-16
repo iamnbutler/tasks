@@ -57,6 +57,72 @@ id_newtype!(SessionId, "sess");
 id_newtype!(SpecId, "spec");
 id_newtype!(BuildId, "build");
 
+/// How much of the pipeline still runs for one repo — the honest per-repo
+/// counterpart to the global [`Mode`].
+///
+/// One ordered column rather than a pair of booleans: `paused` and `archived`
+/// are not orthogonal (archived already implies not dispatching), so two flags
+/// would have a meaningless fourth state and un-archiving would have to
+/// remember which switch it was allowed to touch. The order is how much of the
+/// pipeline survives:
+///
+/// | | issues ingested | scouts / builds dispatched |
+/// | --- | --- | --- |
+/// | `active` | yes | yes |
+/// | `paused` | yes | no |
+/// | `archived` | no | no |
+///
+/// Like [`Mode`], it gates **new** work only: nothing here interrupts a scout
+/// or a build already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    #[default]
+    Active,
+    Paused,
+    Archived,
+}
+
+impl ProjectStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProjectStatus::Active => "active",
+            ProjectStatus::Paused => "paused",
+            ProjectStatus::Archived => "archived",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(ProjectStatus::Active),
+            "paused" => Some(ProjectStatus::Paused),
+            "archived" => Some(ProjectStatus::Archived),
+            _ => None,
+        }
+    }
+
+    /// Whether the dispatcher may start new scouts and builds for this repo.
+    pub fn dispatches(&self) -> bool {
+        matches!(self, ProjectStatus::Active)
+    }
+
+    /// Whether the poller may ingest this repo's issues as new tasks.
+    ///
+    /// Only the *upsert* half of a poll asks this. Closure is learned from
+    /// absence in the open set, so an archived project keeps being fetched —
+    /// otherwise every task it already has would sit at `gh_state = open`
+    /// forever, and a Builder PR it already opened would never be resolved.
+    pub fn ingests(&self) -> bool {
+        !matches!(self, ProjectStatus::Archived)
+    }
+}
+
+impl fmt::Display for ProjectStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A repo being tracked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -64,6 +130,18 @@ pub struct Project {
     pub repo_owner: String,
     pub repo_name: String,
     pub added_at: DateTime<Utc>,
+    /// `#[serde(default)]` so a client built from this repo can read a server
+    /// that predates the column: absent reads as `active`, which is what every
+    /// project was before there was a switch.
+    #[serde(default)]
+    pub status: ProjectStatus,
+}
+
+impl Project {
+    /// `owner/repo`, the way a human names it.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.repo_owner, self.repo_name)
+    }
 }
 
 /// A unit of work, sourced from a GitHub issue.

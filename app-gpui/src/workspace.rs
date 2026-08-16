@@ -14,20 +14,22 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     actions, div, list, px, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, MouseButton, Window, WindowHandle,
+    FollowMode, ListAlignment, ListState, MouseButton, SharedString, Stateful, WeakEntity, Window,
+    WindowHandle,
 };
 use gpuikit::elements::context_menu::{menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::elements::kbd::kbd;
 use gpuikit::elements::loading_indicator::loading_indicator;
+use gpuikit::elements::popover::{popover, PopoverState};
 use gpuikit::elements::tooltip::tooltip;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
-    BuildStatus, ChatRole, CloseReason, Mode, SessionStatus, SpecId, SpecQueueStatus, TaskId,
-    TaskState,
+    BuildStatus, ChatRole, CloseReason, Mode, ProjectId, ProjectStatus, SessionStatus, SpecId,
+    SpecQueueStatus, TaskId, TaskState,
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
@@ -40,6 +42,8 @@ use crate::menus::{self, MenuState};
 use crate::palette::{
     GoToAnything, PaletteKind, PaletteState, SelectNextRow, SelectPrevRow, ShowCommandPalette,
 };
+use crate::projects::{self, ProjectFilter};
+use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
 use crate::state::{is_picked_up, AppState};
@@ -57,6 +61,7 @@ actions!(
         ToggleLeftDock,
         ToggleRightDock,
         NewIssue,
+        AddRepo,
         Dismiss,
         GoToHome,
         GoToTasks,
@@ -291,6 +296,30 @@ pub struct Workspace {
     /// one field for both palettes: they never show together, and the query
     /// is cleared on each open anyway.
     pub(crate) palette_input: Entity<InputState>,
+    /// Which repo this window is looking at. A view filter over the one working
+    /// set, per-window and resetting on relaunch, exactly like [`Self::show_done`]
+    /// — see [`crate::projects`] for why it is not a query parameter.
+    pub(crate) project_filter: ProjectFilter,
+    /// The title bar's repo switcher.
+    ///
+    /// A popover rather than gpuikit's `context_menu` (right-click only) and
+    /// rather than a menu-bar menu: `set_menus` leaks a boxed action per item
+    /// on every rebuild, and the item list here *is* the project list, so a bar
+    /// that rebuilt on every add or archive would leak per repo per change.
+    project_switcher: Entity<PopoverState>,
+    /// `owner/repo` draft for the Add Repo window. Owned here, like the issue
+    /// draft, so a dismissed one survives to the next open.
+    pub(crate) repo_input: Entity<InputState>,
+    /// The Add Repo window, if it has been opened. May be stale.
+    repo_window: Option<WindowHandle<RepoComposer>>,
+    /// A repo just added, by slug, waiting for a snapshot that holds it.
+    ///
+    /// By slug and not by id, because the client applies snapshots rather than
+    /// responses: at the moment the Add Repo window closes there is no id yet.
+    /// Cleared when it resolves, and by any other selection — an intent that
+    /// outlived the human changing their mind would yank the window somewhere
+    /// they did not ask to go.
+    pending_repo_selection: Option<String>,
 }
 
 impl Workspace {
@@ -396,6 +425,34 @@ impl Workspace {
             state.set_placeholder("Describe the issue…", cx);
             state
         });
+        // One line, so cmd-enter and plain enter can mean the same thing —
+        // there is no newline to protect.
+        let repo_input = cx.new(|cx| {
+            let mut state = InputState::new_singleline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("owner/repo", cx);
+            state
+        });
+
+        // The switcher's rows *are* the project list, so both callbacks read
+        // the workspace back out of a weak handle rather than closing over a
+        // snapshot that would be stale by the first archive.
+        let project_switcher = {
+            let trigger = cx.entity().downgrade();
+            let content = cx.entity().downgrade();
+            cx.new(|_cx| {
+                PopoverState::new(
+                    popover("project-switcher")
+                        .trigger(move |window, cx| {
+                            Self::render_switcher_trigger(&trigger, window, cx)
+                        })
+                        .content(move |window, cx| {
+                            Self::render_switcher_content(&content, window, cx)
+                        }),
+                )
+            })
+        };
+        cx.observe(&project_switcher, |_, _, cx| cx.notify())
+            .detach();
 
         // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
         // escape is gpuikit's own blur, and the blur is how the palette learns
@@ -484,6 +541,11 @@ impl Workspace {
             row_menu_open: false,
             palette: None,
             palette_input,
+            project_filter: ProjectFilter::All,
+            project_switcher,
+            repo_input,
+            repo_window: None,
+            pending_repo_selection: None,
         }
     }
 
@@ -963,6 +1025,119 @@ impl Workspace {
         .detach();
     }
 
+    /// Cmd-shift-n: open the Add Repo window, or re-front it. One drafting
+    /// surface, like [`Self::open_issue_window`].
+    fn open_repo_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.repo_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let app_state = self.app_state.clone();
+        let input = self.repo_input.clone();
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |this, cx| {
+            let handle = cx
+                .update(|cx| {
+                    let options = repo_composer::window_options(cx);
+                    cx.open_window(options, |window, cx| {
+                        cx.new(|cx| RepoComposer::new(app_state, input, workspace, window, cx))
+                    })
+                })
+                .ok();
+            if let Some(handle) = handle {
+                this.update(cx, |this: &mut Workspace, _| {
+                    this.repo_window = Some(handle)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Track a repository, and select it once a snapshot holds it.
+    ///
+    /// The intent is parked on the slug rather than an id because this client
+    /// applies snapshots, never responses — there is no id to select by until
+    /// the refresh that follows the POST lands.
+    pub(crate) fn add_repo(
+        &mut self,
+        owner: String,
+        name: String,
+        slug: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_repo_selection = Some(slug);
+        self.app_state
+            .update(cx, |state, cx| state.create_project(owner, name, cx));
+        cx.notify();
+    }
+
+    /// Point the window at one repo, or at all of them.
+    ///
+    /// Clears an inspector selection belonging to a *different* repo: leaving
+    /// it would sit the right sidebar open on a task the window is no longer
+    /// showing.
+    pub(crate) fn select_project(
+        &mut self,
+        filter: ProjectFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_filter = filter;
+        self.pending_repo_selection = None;
+        let stale = {
+            let state = self.app_state.read(cx);
+            self.selected_task
+                .as_ref()
+                .and_then(|id| state.task(id))
+                .is_some_and(|task| !self.project_filter.admits(&task.project_id))
+        };
+        if stale {
+            self.clear_selection(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Pause, archive or reactivate a repo.
+    ///
+    /// The selection is deliberately left alone, including when the repo being
+    /// archived is the one on screen: you archive a repo while looking at it,
+    /// and jumping to All repos in the same click hides the thing you were
+    /// about to check.
+    fn set_project_status(&mut self, id: ProjectId, status: ProjectStatus, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, cx| state.set_project_status(id, status, cx));
+    }
+
+    fn close_switcher(&mut self, cx: &mut Context<Self>) {
+        self.project_switcher.update(cx, |popover, cx| {
+            popover.close(cx);
+        });
+    }
+
+    /// Adopt a just-added repo once a snapshot names it. Called from the
+    /// render pass, which is the first place that can know the id exists.
+    fn settle_pending_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slug) = self.pending_repo_selection.clone() else {
+            return;
+        };
+        let id = self
+            .app_state
+            .read(cx)
+            .projects
+            .iter()
+            .find(|project| project.slug().eq_ignore_ascii_case(&slug))
+            .map(|project| project.id.clone());
+        if let Some(id) = id {
+            self.pending_repo_selection = None;
+            self.select_project(ProjectFilter::One(id), window, cx);
+        }
+    }
+
     // Chrome
 
     /// A title-bar icon button at the design spec's metrics: 14px icon with
@@ -977,21 +1152,212 @@ impl Workspace {
             .icon_size(px(14.))
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // The repo the working set belongs to. A label, not a button: the
-        // server offers no way to switch projects yet, and a control that
-        // looks live and isn't is worse than a word. Nothing renders before
-        // the first snapshot — a placeholder would be a claim about a repo
-        // we have not read.
-        let (mode, project) = {
-            let state = self.app_state.read(cx);
-            let project = state
-                .projects
-                .first()
-                .map(|project| format!("{}/{}", project.repo_owner, project.repo_name));
-            (state.mode, project)
+    /// The switcher's trigger: what the window is looking at, and a chevron
+    /// saying it can be changed.
+    ///
+    /// Nothing renders before the first snapshot — a placeholder would be a
+    /// claim about a repo we have not read — and with one repo configured it
+    /// is that repo's slug, so a single-repo window reads exactly as it did
+    /// before there was a switcher.
+    fn render_switcher_trigger(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let label = workspace
+            .read_with(cx, |this, cx| {
+                let state = this.app_state.read(cx);
+                projects::switcher_label(&state.projects, &this.project_filter)
+            })
+            .ok()
+            .flatten();
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .pl(px(6.))
+            .pr(px(4.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .text_sm()
+            .text_color(theme.fg_muted())
+            .when(label.is_some(), |el| {
+                let hover_bg = theme.surface_secondary();
+                el.hover(move |el| el.bg(hover_bg))
+            })
+            .children(label.clone())
+            .when(label.is_some(), |el| {
+                el.child(
+                    Icons::chevron_down()
+                        .size(px(10.))
+                        .text_color(theme.fg_muted()),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The switcher's rows: All repos, then every project in
+    /// [`projects::switcher_order`], then Add Repo.
+    fn render_switcher_content(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Ok((rows, filter, several)) = workspace.read_with(cx, |this, cx| {
+            let state = this.app_state.read(cx);
+            let rows: Vec<_> = projects::switcher_order(&state.projects)
+                .into_iter()
+                .map(|project| {
+                    (
+                        project.id.clone(),
+                        project.slug(),
+                        projects::status_note(project.status),
+                        projects::status_actions(project.status),
+                    )
+                })
+                .collect();
+            let several = state.projects.len() > 1;
+            (rows, this.project_filter.clone(), several)
+        }) else {
+            return div().into_any_element();
         };
-        let text_muted = cx.theme().fg_muted();
+
+        let row_style = |el: Stateful<Div>, selected: bool| {
+            let hover_bg = theme.surface_secondary();
+            el.flex()
+                .flex_col()
+                .gap(px(1.))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.surface_tertiary()))
+                .hover(move |el| el.bg(hover_bg))
+        };
+
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .min_w(px(240.))
+            .text_sm()
+            .text_color(theme.fg());
+
+        // Only offered when there is something to be "all" of. With one repo
+        // configured the window is already showing all of it.
+        if several {
+            let selected = filter.selected().is_none();
+            list = list.child(
+                row_style(div().id("switcher-all"), selected)
+                    .on_click({
+                        let workspace = workspace.clone();
+                        move |_event, window, cx| {
+                            workspace
+                                .update(cx, |this, cx| {
+                                    this.select_project(ProjectFilter::All, window, cx);
+                                    this.close_switcher(cx);
+                                })
+                                .ok();
+                        }
+                    })
+                    .child("All repos"),
+            );
+        }
+
+        for (id, slug, note, actions) in rows {
+            let selected = filter.selected() == Some(&id);
+            let mut row = row_style(
+                div().id(SharedString::from(format!("switcher-{id}"))),
+                selected,
+            )
+            .on_click({
+                let workspace = workspace.clone();
+                let id = id.clone();
+                move |_event, window, cx| {
+                    workspace
+                        .update(cx, |this, cx| {
+                            this.select_project(ProjectFilter::One(id.clone()), window, cx);
+                            this.close_switcher(cx);
+                        })
+                        .ok();
+                }
+            })
+            .child(div().truncate().child(slug));
+            // Only a repo that is subtracting something carries a note; the
+            // ordinary case earns no badge.
+            if let Some(note) = note {
+                row = row.child(div().text_xs().text_color(theme.fg_muted()).child(note));
+            }
+            // The status verbs sit under the repo they act on rather than in a
+            // submenu: there are at most two, and a repo's pipeline stopping is
+            // not a thing to bury.
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .pt(px(2.))
+                    .text_xs()
+                    .children(actions.into_iter().map(|action| {
+                        let workspace = workspace.clone();
+                        let id = id.clone();
+                        div()
+                            .id(SharedString::from(format!(
+                                "switcher-{id}-{}",
+                                action.status.as_str()
+                            )))
+                            .text_color(theme.fg_muted())
+                            .cursor_pointer()
+                            .tooltip(tooltip(action.note))
+                            .hover({
+                                let fg = theme.fg();
+                                move |el| el.text_color(fg)
+                            })
+                            .on_click(move |_event, _window, cx| {
+                                workspace
+                                    .update(cx, |this, cx| {
+                                        this.set_project_status(id.clone(), action.status, cx);
+                                        this.close_switcher(cx);
+                                    })
+                                    .ok();
+                            })
+                            .child(action.label)
+                    })),
+            );
+            list = list.child(row);
+        }
+
+        list.child(
+            div()
+                .mt(px(2.))
+                .pt(px(4.))
+                .border_t_1()
+                .border_color(theme.border_subtle())
+                .child(
+                    row_style(div().id("switcher-add-repo"), false)
+                        .on_click({
+                            let workspace = workspace.clone();
+                            move |_event, _window, cx| {
+                                workspace
+                                    .update(cx, |this, cx| {
+                                        this.close_switcher(cx);
+                                        this.open_repo_window(cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .child("Add repo…"),
+                ),
+        )
+        .into_any_element()
+    }
+
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.app_state.read(cx).mode;
 
         title_bar()
             .child_left(
@@ -1002,13 +1368,9 @@ impl Workspace {
                         window.dispatch_action(Box::new(ToggleLeftDock), cx);
                     }),
             )
-            .child_left(
-                div()
-                    .pl(px(6.))
-                    .text_sm()
-                    .text_color(text_muted)
-                    .children(project),
-            )
+            // The repo the working set belongs to, and the control that
+            // changes it.
+            .child_left(self.project_switcher.clone())
             // The section you are looking at, named once. The sidebar's rows
             // are icons and `render_center` draws no header, so this is the
             // only place the word appears.
@@ -1811,6 +2173,9 @@ impl Render for Workspace {
 
         self.sync_chat_list(cx);
         self.sync_palette(cx);
+        // The first frame that can know a just-added repo's id: this client
+        // applies snapshots, not responses.
+        self.settle_pending_repo(window, cx);
 
         div()
             // A name rather than an index, per #861: this sits at the root of
@@ -1846,6 +2211,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &NewIssue, _window, cx| {
                 this.open_issue_window(cx);
+            }))
+            .on_action(cx.listener(|this, _: &AddRepo, _window, cx| {
+                this.open_repo_window(cx);
             }))
             // Layered dismissal: escape in a focused input blurs it (the
             // input's own binding); the next escape lands here and puts the

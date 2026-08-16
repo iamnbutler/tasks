@@ -12,8 +12,8 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use tasks::models::{
     Actor, Capability, CharterEntry, CharterLevel, Complexity, GhState, Project, ProjectId,
-    Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId,
-    TaskState,
+    ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::store::Store;
 
@@ -47,6 +47,7 @@ async fn harness() -> Harness {
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
 

@@ -26,9 +26,9 @@ use tokio::process::Command;
 use tasks::builder::{Builder, BuilderConfig};
 use tasks::github::GitHubClient;
 use tasks::models::{
-    BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, Session, SessionId,
-    SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
-    TranscriptOwner, TranscriptStream,
+    BuildStatus, Complexity, DecisionInput, GhState, Project, ProjectId, ProjectStatus, Session,
+    SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId,
+    TaskState, TranscriptOwner, TranscriptStream,
 };
 use tasks::store::Store;
 use tasks_protocol::TasksProtocol;
@@ -178,6 +178,7 @@ async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> H
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
 
