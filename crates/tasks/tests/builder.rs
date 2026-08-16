@@ -37,8 +37,8 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    make_fixture_repo, silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path,
-    workspace_bin, write_builder_supervisor_wrapper,
+    history_rewriting_builder_agent_path, make_fixture_repo, silent_builder_agent_path,
+    spawn_vm_pool, stub_builder_agent_path, workspace_bin, write_builder_supervisor_wrapper,
 };
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -144,6 +144,9 @@ struct Harness {
     project: Project,
     repo_url: String,
     repo: std::path::PathBuf,
+    /// Where per-build scratch repos live — and, under `rejected/`, the
+    /// bundles egress could not push.
+    scratch_root: std::path::PathBuf,
     seen_prs: Arc<Mutex<Vec<Value>>>,
     _tmp: tempfile::TempDir,
 }
@@ -174,6 +177,7 @@ async fn harness(agent_cmd: &str) -> Harness {
             .with_rest_base_url(rest_url),
     );
 
+    let scratch_root = tmp.path().join("scratch");
     let builder = Builder::new(
         store.clone(),
         client.handle(),
@@ -182,7 +186,7 @@ async fn harness(agent_cmd: &str) -> Harness {
             image: "builder:test".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(60),
-            scratch_root: tmp.path().join("scratch"),
+            scratch_root: scratch_root.clone(),
         },
     );
 
@@ -192,6 +196,7 @@ async fn harness(agent_cmd: &str) -> Harness {
         project,
         repo_url,
         repo,
+        scratch_root,
         seen_prs,
         _tmp: tmp,
     }
@@ -453,5 +458,183 @@ async fn a_silent_build_failure_leaves_a_readable_transcript() {
             .unwrap()
             .is_empty(),
         "build output was written onto the scout session"
+    );
+}
+
+/// #891 end to end: an agent that tidies its history from a detached HEAD.
+///
+/// From the detach onwards `refs/heads/<branch>` stops tracking the work, so
+/// the supervisor reported one commit and bundled another and the server threw
+/// a finished implementation away. What has to hold now is the whole chain: the
+/// branch really reaches the remote, at the recorded head, carrying the
+/// rewritten history — and the tip the reconciliation decided against rides the
+/// bundle without ever being pushed.
+#[tokio::test]
+async fn a_history_rewriting_build_lands_its_branch() {
+    let h = harness(history_rewriting_builder_agent_path().to_str().unwrap()).await;
+    let (task, spec) = seed_approved(&h.store, &h.project, 891, "Tidy the series").await;
+
+    let build = h
+        .store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+
+    let done = h.builder.dispatch(claimed, &h.repo_url).await.unwrap();
+    assert_eq!(done.status, BuildStatus::Succeeded);
+    let head_sha = done.head_sha.clone().expect("head sha recorded");
+
+    // The branch landed in the remote at the recorded head, carrying the
+    // rewritten history rather than the ref the agent left behind.
+    let branch_ref = format!("refs/heads/{}", done.branch);
+    assert_eq!(
+        run_git(&h.repo, &["rev-parse", &branch_ref]).await,
+        head_sha
+    );
+    let listing = run_git(&h.repo, &["ls-tree", "-r", "--name-only", &head_sha]).await;
+    for file in ["src/one.rs", "src/two.rs", "src/three.rs"] {
+        assert!(listing.contains(file), "{file} missing:\n{listing}");
+    }
+    assert!(!listing.contains("PROMPT.md") && !listing.contains("SUMMARY.md"));
+
+    // The abandoned tip is insurance inside the bundle, never a ref anyone
+    // publishes: the server pushes one refspec, by name.
+    assert!(
+        run_git(&h.repo, &["for-each-ref", "refs/abandoned/"])
+            .await
+            .is_empty(),
+        "refs/abandoned/ reached the remote"
+    );
+
+    // And a reviewer reads what happened in the transcript rather than
+    // re-deriving it from SHAs in an error string.
+    let lines = h
+        .store
+        .transcript_since(&TranscriptOwner::build(&done.id), 0, 1000)
+        .await
+        .unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.line.contains("reconciling the build branch")),
+        "the reconciliation is not in the transcript: {lines:?}"
+    );
+
+    assert_eq!(
+        h.store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::AwaitingMerge
+    );
+    assert_eq!(h.seen_prs.lock().unwrap().len(), 1);
+    assert_eq!(
+        h.store.get_build(&build.id).await.unwrap().unwrap().status,
+        BuildStatus::Succeeded
+    );
+}
+
+/// The VM is deallocated before egress runs, so a bundle the server refuses to
+/// push is the only copy of the implementation there is. The assertion is not
+/// the error text but the recovery: the preserved bundle reconstructs the
+/// branch in a fresh repo.
+///
+/// The remote is pre-loaded with the build's branch on other history, which
+/// makes the push a plain non-fast-forward rejection — no mocks, and the
+/// failure lands exactly where a real one does.
+#[tokio::test]
+async fn a_rejected_egress_keeps_the_builds_commits() {
+    let h = harness(stub_builder_agent_path().to_str().unwrap()).await;
+    let (task, spec) = seed_approved(&h.store, &h.project, 7, "First thing").await;
+
+    let build = h
+        .store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+
+    // Somebody else's commit, sitting on the branch name this build will push.
+    run_git(&h.repo, &["checkout", "-q", "-b", &build.branch]).await;
+    tokio::fs::write(h.repo.join("unrelated.txt"), "someone else was here\n")
+        .await
+        .unwrap();
+    run_git(&h.repo, &["add", "-A"]).await;
+    run_git(&h.repo, &["commit", "-q", "-m", "Unrelated work"]).await;
+    run_git(&h.repo, &["checkout", "-q", "main"]).await;
+
+    let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+    let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+    let reason = format!("{err}");
+    assert!(reason.starts_with("branch egress: "), "{reason}");
+    assert!(
+        !reason.contains("branch egress: branch egress:"),
+        "the prefix was wrapped twice: {reason}"
+    );
+    assert!(reason.contains("recover them with git fetch"), "{reason}");
+    assert!(h.seen_prs.lock().unwrap().is_empty(), "no PR for a failure");
+
+    // The per-build scratch repo is swept; the bundle beside it is not.
+    let bundle = h
+        .scratch_root
+        .join("rejected")
+        .join(format!("{}.bundle", build.id));
+    assert!(
+        bundle.exists(),
+        "no preserved bundle at {}",
+        bundle.display()
+    );
+    assert!(
+        reason.contains(&bundle.display().to_string()),
+        "the reason does not name the bundle: {reason}"
+    );
+    assert!(
+        !h.scratch_root
+            .join(format!("scratch-{}", build.id))
+            .exists(),
+        "the scratch repo outlived the build"
+    );
+
+    // The recovery, run: fetch the preserved bundle into a fresh repo and the
+    // implementation is all there.
+    let tmp = tempfile::tempdir().unwrap();
+    let recovered = tmp.path().join("recovered.git");
+    tokio::fs::create_dir_all(&recovered).await.unwrap();
+    run_git(&recovered, &["init", "--bare"]).await;
+    run_git(&recovered, &["fetch", &h.repo_url, "main:refs/heads/main"]).await;
+    run_git(
+        &recovered,
+        &[
+            "fetch",
+            bundle.to_str().unwrap(),
+            &format!("{b}:{b}", b = build.branch),
+        ],
+    )
+    .await;
+    let listing = run_git(&recovered, &["ls-tree", "-r", "--name-only", &build.branch]).await;
+    assert!(listing.contains("src/built.rs"), "{listing}");
+    assert!(listing.contains("src/forgotten.rs"), "{listing}");
+
+    // And the build is charged for the failure like any other, without
+    // wedging the queue.
+    let after = h.store.get_build(&build.id).await.unwrap().unwrap();
+    assert_eq!(after.status, BuildStatus::Failed);
+    assert!(
+        after
+            .exit_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("recover them with git fetch"),
+        "exit_reason: {:?}",
+        after.exit_reason
+    );
+    assert_eq!(
+        h.store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::ReadyToBuild
     );
 }

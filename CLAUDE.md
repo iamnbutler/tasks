@@ -145,6 +145,29 @@ implementation.
   judged. `dispatch_attempts` is still charged for one — see #845 for the
   remaining piece, which must key off a classification field on the event, not
   a string match on the reason text.
+- **A build is whichever tip the reconciliation chooses, and the head is read
+  out of the bundle — in that order.** `git rev-parse HEAD` and
+  `refs/heads/<branch>` are the same commit only while HEAD stays symbolically
+  attached to the host-chosen branch; a rebase, a `git checkout <sha>` or a
+  branch of the agent's own detaches it, and the branch ref silently stops
+  tracking the work. That is #891, where a finished build was discarded for
+  `bundle tip … does not match the reported head …`. Both halves of the fix are
+  load-bearing: `reconcile_checkout` decides which tip the build *is* (by
+  ancestry, with a rebase guard ahead of it, since git parks HEAD on a partial
+  replay while the branch still holds the complete history), and `package_bundle`
+  then reads `head_sha` back out of the bundle, so there is **one** value where
+  there were two that had to agree. Reading from the bundle alone makes the
+  error disappear while shipping a stale tip; reconciling alone leaves the
+  two-values problem. And the reconciliation runs **before the sweep**, because
+  the sweep lands on whatever HEAD is: on a stranded checkout, sweep-first
+  manufactures a divergence no ancestry rule can undo, and the PR ships the
+  sweep with none of the implementation. Whatever the decision chooses against
+  rides the bundle as `refs/abandoned/<branch>` and is never pushed, so no arm
+  of it can lose a commit. The server's tip check stays, and now measures
+  transport integrity rather than racing the VM — and it no longer costs the
+  build, because the VM is deallocated before egress runs, so a rejected bundle
+  is written to `<scratch_root>/rejected/` (deliberately never swept) with the
+  `git fetch` that recovers it named in the failure reason.
 - **A cancel interrupts the dispatcher's drain; it never just removes the VM.**
   `POST /sessions/{id}/cancel` and `POST /builds/{id}/cancel` write a durable
   `cancellations` row, and `crate::cancel::bounded` — the `tokio::select!` the

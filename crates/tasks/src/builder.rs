@@ -469,7 +469,24 @@ impl Builder {
     /// where that commit stays reachable even if the base branch has moved
     /// on. Fetching it shallowly would reintroduce the shallow-repo problem
     /// one layer down.
+    /// Every `Egress` failure routes through [`Builder::preserve_bundle`]: the
+    /// VM was deallocated before this ran, so the bundle in `outcome` is the
+    /// only copy of the implementation left anywhere.
     async fn land_branch(
+        &self,
+        build: &Build,
+        clone_url: &str,
+        outcome: &BuildOutcome,
+    ) -> Result<(), BuilderError> {
+        match self.land_and_sweep(build, clone_url, outcome).await {
+            // The variant is unwrapped and re-wrapped, so the reason reads
+            // `branch egress: …` once rather than twice.
+            Err(BuilderError::Egress(why)) => Err(self.preserve_bundle(build, outcome, &why).await),
+            other => other,
+        }
+    }
+
+    async fn land_and_sweep(
         &self,
         build: &Build,
         clone_url: &str,
@@ -488,6 +505,55 @@ impl Builder {
             warn!(scratch = %scratch.display(), error = %e, "could not remove scratch repo");
         }
         result
+    }
+
+    /// Write a rejected bundle down, and name the command that recovers it.
+    ///
+    /// [`Builder::follow`] tears the VM down *before* egress runs — deliberately,
+    /// since holding a VM across a push and a PR is a worse trade — so an
+    /// egress failure used to destroy the whole implementation with nothing
+    /// left to recover it from. Best-effort: a failure to preserve is appended
+    /// to the reason rather than replacing it, because the original failure is
+    /// still the thing that went wrong.
+    async fn preserve_bundle(
+        &self,
+        build: &Build,
+        outcome: &BuildOutcome,
+        why: &str,
+    ) -> BuilderError {
+        let dir = self.config.scratch_root.join(REJECTED_BUNDLE_DIR);
+        let path = dir.join(format!("{}.bundle", build.id));
+
+        let saved = async {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&outcome.bundle_base64)
+                .map_err(|e| format!("bundle base64: {e}"))?;
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("rejected bundle dir: {e}"))?;
+            tokio::fs::write(&path, bytes)
+                .await
+                .map_err(|e| format!("rejected bundle write: {e}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+
+        BuilderError::Egress(match saved {
+            Ok(()) => {
+                warn!(
+                    build_id = %build.id,
+                    bundle = %path.display(),
+                    "egress failed; the build's commits were preserved"
+                );
+                format!(
+                    "{why}; the build's commits were kept at {bundle} — recover them with \
+                     git fetch {bundle} '{branch}:{branch}'",
+                    bundle = path.display(),
+                    branch = build.branch,
+                )
+            }
+            Err(e) => format!("{why}; the build's commits could not be preserved either: {e}"),
+        })
     }
 
     async fn land_in(
@@ -526,7 +592,11 @@ impl Builder {
         .await?;
 
         // Verify the tip before pushing: a truncated or wrong bundle must not
-        // be pushed as if it were the build.
+        // be pushed as if it were the build. Since #891 the VM reads
+        // `head_sha` back out of the bundle it packaged rather than observing
+        // it a second time in the worktree, so this no longer races the VM —
+        // it compares the bundle as sent with the bundle as received, which is
+        // transport integrity and nothing else.
         let tip = git_stdout(scratch, &["rev-parse", &branch_ref]).await?;
         if tip != outcome.head_sha {
             return Err(BuilderError::Egress(format!(
@@ -544,6 +614,13 @@ impl Builder {
         Ok(())
     }
 }
+
+/// Where a bundle that could not be pushed is written, under
+/// [`BuilderConfig::scratch_root`] and deliberately **outside** the per-build
+/// scratch repo — that repo is still removed after every build, this is not.
+/// Its contents are whole implementations, so removing one is a human's call,
+/// which also makes it unbounded by design.
+const REJECTED_BUNDLE_DIR: &str = "rejected";
 
 /// Least wall-clock budget a resumed build gets, however long the server was
 /// down. See `scout::RESUME_MIN_BUDGET` — same reasoning, and here the
