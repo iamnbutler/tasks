@@ -114,6 +114,17 @@ impl Workspace {
                         format!("Build requested over {} spec(s)", spec_ids.len())
                     }
                     EventPayload::BuildStarted { .. } => "Build started".to_string(),
+                    // The request, not the outcome — the run's own completion
+                    // row says how it ended. Naming the actor is the point:
+                    // this is the one line that distinguishes a run somebody
+                    // stopped from one that died.
+                    EventPayload::RunCancelRequested {
+                        run_kind, actor, ..
+                    } => format!(
+                        "Cancel requested for a {} ({})",
+                        run_kind.noun(),
+                        actor.as_str()
+                    ),
                     EventPayload::BuildCompleted { status, .. } => {
                         format!("Build {}", status.as_str())
                     }

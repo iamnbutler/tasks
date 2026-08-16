@@ -96,8 +96,9 @@ No auth, loopback only — don't build a login flow.
 | Un-pick a task | `POST /tasks/{task_id}/dequeue` | `queued` → `backlog`, rank cleared. 400 once work has started (past `queued`). |
 | Scout now | `POST /tasks/{task_id}/scout` | Queue the task (from `backlog` or `queued`) at the **front**, shifting everything else down. The dispatch loop picks it up on its next tick; the concurrency cap still applies — it jumps the queue, it doesn't bypass it. |
 | Build now | `POST /tasks/{task_id}/build-now` `{"content"?,"complexity"?,"base_branch"?,"rationale"?}` | Skip the Scout for a task whose issue body already *is* the spec. Writes the spec by hand, approves it, and queues a Builder run over it in one call; **202** with the same `{..., spec_ids}` shape as `POST /builds`. Legal only from `backlog` or `queued` — the states where no Scout has run and none is running (`backlog` → `ready_to_build` is a new edge). Every field is optional: the spec defaults to the issue body, complexity to `simple`. A supplied `content` **replaces** the body rather than extending it. 400 if that leaves nothing to build from. **Human-only**: any other actor is a 403, because this authors, approves and dispatches with no second opinion anywhere in the loop — no charter capability covers that. |
+| Cancel a run | `POST /sessions/{session_id}/cancel` \| `POST /builds/{build_id}/cancel` `{"rationale"?}` | Stop a scout or a build that is already in flight. 404 for a run that does not exist, 409 for one that has already concluded. The run ends as **`cancelled`** — never `failed` — with the actor and rationale in `exit_reason`, and the work comes back: a scout's task to **`backlog`** (not `queued`, or the dispatch loop would start a replacement within the tick) and a build's specs to `approved` with no attempt charged. The ack is `{run_kind, run_id, concluded, status, decision_seq, note}`; **`concluded: false` is not a failure** — the request is recorded and the dispatcher following the run concludes it, so watch for `session_completed` / `build_completed` rather than retrying. A queued build is cancelled outright (nothing is following it). Cancelling a run that finishes in the same breath leaves the run's real outcome standing and says so. |
 | Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected`. `approved` → task `ready_to_build`; `needs_revision` → task returns to `queued` for a re-scout (feedback reaches the next scout's prompt); `rejected` → dead end. |
-| Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running). The mode is **not** remembered across restarts: every boot starts in the server's configured `TASKS_DEFAULT_MODE` (default `pause`), and only `tasks reload` carries the old mode to its replacement. So a client that survives a server restart must re-read `/mode` (or `/status`) rather than trusting its last snapshot — reconnecting to the event stream and resnapshotting, which a restart forces anyway, already does this. |
+| Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running — cancelling one is `POST /sessions/{id}/cancel`, above). The mode is **not** remembered across restarts: every boot starts in the server's configured `TASKS_DEFAULT_MODE` (default `pause`), and only `tasks reload` carries the old mode to its replacement. So a client that survives a server restart must re-read `/mode` (or `/status`) rather than trusting its last snapshot — reconnecting to the event stream and resnapshotting, which a restart forces anyway, already does this. |
 
 Everything else is read-only. There is deliberately no
 `POST /tasks` (tasks come from GitHub issue intake), no task-edit endpoint,
@@ -123,10 +124,14 @@ the server only.
   *open* also shows, that's the "close the issue or re-queue?" decision
   surface. `GET /tasks?all=true` returns every row. Ordering is identical
   either way.
-- `GET /sessions` / `GET /sessions/{id}` — scout runs. `status` has a third
-  terminal value besides `scout_succeeded` / `scout_failed`:
+- `GET /sessions` / `GET /sessions/{id}` — scout runs. `status` has two more
+  terminal values besides `scout_succeeded` / `scout_failed`:
   **`scout_stopped_early`** — the run ended without a spec but left notes
-  behind (see *Scout notes* below). Treat it as neither success nor failure.
+  behind (see *Scout notes* below); treat it as neither success nor failure —
+  and **`cancelled`**, which somebody asked for. A cancelled run's
+  `exit_reason` reads `cancelled by <actor>: <rationale>`, which is the only
+  thing distinguishing it from a crash; it keeps whatever notes it had
+  checkpointed, and it costs the task no dispatch attempt.
 - `GET /sessions/{id}/notes` — salvage from a run that stopped early;
   **404 when there is none**, which is the ordinary case.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
@@ -203,6 +208,9 @@ the server only.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
   `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
+  `status` ∈ `queued` \| `running` \| `succeeded` \| `failed` \| **`cancelled`**
+  — the last of those is somebody stopping the run, not the build failing, and
+  its batch's specs stay `approved` with no attempt charged.
   A build has **two durations**, and they are not interchangeable:
   `agent_finished_at - started_at` is the agent phase — what the run budget
   bounds, and what to render as "took" — while `completed_at` also includes
@@ -421,6 +429,10 @@ dropped out of the repository's open set; refetch the task or the list),
 `spec_queue_status_changed`, `queue_reordered`, `spec_queue_reordered`,
 `build_requested` (`build_id`, `spec_ids`), `build_started`,
 `build_completed` (`build_id`, `status` — refetch the build for detail),
+`run_cancel_requested` (`run_kind` ∈ `session` \| `build`, `run_id`, `actor`,
+`decision_seq` — somebody asked for a run to stop; the *request*, not the
+outcome, which arrives as that run's ordinary completion event with a
+`cancelled` status),
 `pull_request_opened` (`build_id`, `pr_number`),
 `orchestrator_message` (`seq`, `role` — refetch `/orchestrator/messages`),
 `mode_changed` (a `POST /mode` only — a boot's mode is set before the listener

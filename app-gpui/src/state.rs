@@ -14,8 +14,8 @@ use gpui::Context;
 use tasks_client::api::events::Event;
 use tasks_client::api::http::BriefingStatus;
 use tasks_client::api::models::{
-    Build, ChatRole, CloseReason, Mode, OrchestratorFeedEvent, OrchestratorMessage, Project,
-    Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    Build, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent, OrchestratorMessage,
+    Project, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -727,6 +727,38 @@ impl AppState {
         self.run(cx, move |client| {
             client.build_task_now(&id, Some(rationale))
         });
+    }
+
+    /// Stop whatever this task currently has in flight.
+    ///
+    /// Which run that is needs no guessing: a scout is the task's own
+    /// `running` session, and a build is *the* running build, because builds
+    /// are serial and there is at most one. A task can be in only one of those
+    /// states, so the two are checked in pipeline order rather than merged.
+    ///
+    /// No rationale, on the same principle as [`Self::close_task`]: this
+    /// client speaks for the human, who owes none, and the server records the
+    /// stop as theirs. The run concludes as `cancelled`, its task returns to
+    /// the backlog (a scout) or to `ready_to_build` (a build), and nothing is
+    /// applied locally — the refresh reads the new state back.
+    pub fn cancel_run(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        if let Some(session) = self.running_session(&id) {
+            let session_id = session.id.clone();
+            self.run(cx, move |client| {
+                client.cancel_session(&session_id, None)
+            });
+            return;
+        }
+        if let Some(build) = self
+            .builds
+            .iter()
+            .find(|build| build.status == BuildStatus::Running)
+        {
+            let build_id = build.id.clone();
+            self.run(cx, move |client| client.cancel_build(&build_id, None));
+            return;
+        }
+        self.report("nothing is running for that task", cx);
     }
 
     /// Put a message in the sidebar banner without a server round trip — how

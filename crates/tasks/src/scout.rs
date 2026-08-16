@@ -23,14 +23,16 @@ use tracing::{info, warn};
 use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
+use crate::cancel::Bounded;
 use crate::events::EventPayload;
 use crate::models::{
-    Complexity, ReviewedSpec, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage, Spec,
-    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner, TranscriptStream,
+    Complexity, ReviewedSpec, RunKind, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage,
+    Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
+    TranscriptStream,
 };
 use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::reattach::{AppEvents, Origin};
-use crate::store::{Store, StoreError};
+use crate::store::{CancelRequest, Store, StoreError};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
 #[derive(Debug, Error)]
@@ -56,6 +58,12 @@ pub enum ScoutError {
     /// is given.
     #[error("scout stopped early: {0}")]
     StoppedEarly(String),
+    /// Somebody stopped the run on purpose. Carries the whole request, because
+    /// what makes a cancel legible afterwards is the actor and the rationale —
+    /// [`crate::run::record_outcome`] therefore charges no dispatch attempt,
+    /// and [`Scout::finalize_cancelled`] writes them into `exit_reason`.
+    #[error("scout cancelled by {}", .0.actor.as_str())]
+    Cancelled(CancelRequest),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
     /// Wall-clock deadline hit. The message lands verbatim in
@@ -355,7 +363,14 @@ impl Scout {
                     .into(),
             );
         }
-        let result = match tokio::time::timeout(
+        // A cancel travels the same way the deadline does — see
+        // `crate::cancel`: the drain is parked on a stream that a destroyed VM
+        // would simply leave silent, so the interrupt has to reach *here*, and
+        // teardown then goes down the path the deadline already uses.
+        let result = match crate::cancel::bounded(
+            &self.store,
+            RunKind::Session,
+            session_id.as_str(),
             budget,
             drain_scout_events(
                 &self.store,
@@ -368,8 +383,18 @@ impl Scout {
         )
         .await
         {
-            Ok(result) => result,
-            Err(_elapsed) => {
+            Bounded::Completed(result) => result,
+            Bounded::Cancelled(request) => {
+                warn!(
+                    session_id = %session_id,
+                    task_id = %task.id,
+                    %vm_id,
+                    actor = request.actor.as_str(),
+                    "scout cancelled; tearing the VM down"
+                );
+                Err(ScoutError::Cancelled(request))
+            }
+            Bounded::TimedOut => {
                 let secs = self.config.timeout.as_secs();
                 self.note_timeout(task, vm_id, secs).await;
                 Err(ScoutError::Timeout { secs })
@@ -451,6 +476,20 @@ impl Scout {
                 )
                 .await?;
                 Err(ScoutError::StoppedEarly(reason))
+            }
+            // A deliberate stop, and therefore neither a failure nor a run
+            // that ended on its own terms: its own terminal path, so nothing
+            // downstream has to infer intent from an error string.
+            Err(ScoutError::Cancelled(request)) => {
+                self.finalize_cancelled(
+                    session_id,
+                    task,
+                    branch,
+                    &request,
+                    state.checkpoint.take(),
+                )
+                .await?;
+                Err(ScoutError::Cancelled(request))
             }
             Err(e) => {
                 let reason = format!("{e}");
@@ -653,6 +692,85 @@ impl Scout {
             })
             .await?;
         warn!(task_id = %task.id, session_id = %session_id, reason, "scout stopped early; notes salvaged");
+        Ok(())
+    }
+
+    /// A run somebody stopped: the third terminal path, and the only one whose
+    /// reason names a person.
+    ///
+    /// Three things make it different from a failure, and each is deliberate:
+    ///
+    /// - **The status is `cancelled`, not `scout_stopped_early`.** That status
+    ///   means the run ended on its own terms and charges the task an attempt,
+    ///   and neither is true here.
+    /// - **The salvage is kept.** The checkpoint writer has already persisted
+    ///   whatever the scout had written down; the cancel only stamps its own
+    ///   rationale onto the notes' `reason`, so the next attempt reads both
+    ///   the leads and why the last look was called off.
+    /// - **The task goes back to `backlog`, not `queued`.** Every other
+    ///   non-success path returns it to `queued` on the principle that
+    ///   picked-up work stays picked up. A cancel is the one case where that is
+    ///   wrong: the dispatch loop would start a fresh scout for it inside half
+    ///   a second, which is a restart nobody asked for. Re-queueing is one call
+    ///   by the person who stopped it — see [`Store::return_task_to_backlog`].
+    async fn finalize_cancelled(
+        &self,
+        session_id: &SessionId,
+        task: &Task,
+        branch: String,
+        request: &CancelRequest,
+        checkpoint: Option<String>,
+    ) -> Result<(), ScoutError> {
+        let now = Utc::now();
+        let reason = request.exit_reason();
+        if !branch.is_empty() {
+            self.store
+                .update_session_branch(session_id, &branch)
+                .await?;
+        }
+
+        // Two shapes of the same salvage. A checkpoint still in hand is written
+        // whole (it may be newer than the persisted row); otherwise the reason
+        // is stamped onto whatever the checkpoint writer already landed, which
+        // is a no-op when there is nothing to stamp.
+        match checkpoint {
+            Some(notes) => {
+                self.store
+                    .upsert_scout_notes(&ScoutNotes {
+                        session_id: session_id.clone(),
+                        task_id: task.id.clone(),
+                        reason: Some(reason.clone()),
+                        notes,
+                        files_touched: Vec::new(),
+                        updated_at: now,
+                    })
+                    .await?
+            }
+            None => {
+                self.store
+                    .stamp_scout_notes_reason(session_id, &reason)
+                    .await?
+            }
+        }
+
+        self.store
+            .update_session_completion(
+                session_id,
+                SessionStatus::Cancelled,
+                now,
+                Some(reason.clone()),
+            )
+            .await?;
+        // Emits its own TaskStateChanged, whatever state the task was in.
+        self.store.return_task_to_backlog(&task.id).await?;
+        self.store
+            .append_event(EventPayload::SessionCompleted {
+                session_id: session_id.clone(),
+                task_id: task.id.clone(),
+                status: SessionStatus::Cancelled,
+            })
+            .await?;
+        warn!(task_id = %task.id, session_id = %session_id, reason, "scout cancelled");
         Ok(())
     }
 
