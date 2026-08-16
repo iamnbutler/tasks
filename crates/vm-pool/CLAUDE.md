@@ -89,6 +89,21 @@ variable straight at `target/debug` works with no copying.
 - Image format: OCI (built with `container build`)
 - Snapshots: Virtualization.framework save/restore APIs
 - Type safety: VmId newtype, strongly-typed protocol enums
+- Protocol versioning: `PROTOCOL_VERSION` in `protocol/`, reported by the
+  service on `ServiceEvent::PoolStatus` and read back by
+  `PoolStatus::speaks(v)`. The service outlives its clients — it is a daemon
+  that a client upgrade does not restart — so a new client routinely talks to
+  an old one. An added *field* survives that with `#[serde(default)]`; an added
+  *command* does not, because an old peer rejects the line at decode time. The
+  version rides `status` rather than a new `hello` for exactly that reason: a
+  handshake command would be rejected by the very peers it exists to identify,
+  whereas `status` has been in the protocol since its first revision and an
+  absent field reads as `PRE_VERSIONING` — an answer, not a missing value. Each
+  addition gets its own gate constant (`ATTACH_PROTOCOL_VERSION`) so callers
+  ask for the capability they need rather than for a bare number; `const _: ()
+  = assert!(…)` beside them makes a gate above what the build speaks a compile
+  error. Policy about what to *do* with a "no" belongs to the caller — the
+  application, never this tree.
 - Testing: TDD with unit tests + integration tests (supervisor spawn)
 
 ## Development Phases

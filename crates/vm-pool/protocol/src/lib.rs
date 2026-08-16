@@ -10,6 +10,49 @@ use std::fmt::Debug;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// What this build speaks, reported on [`ServiceEvent::PoolStatus`].
+///
+/// | revision | added |
+/// | --- | --- |
+/// | 0 ([`PRE_VERSIONING`]) | everything through `unsubscribe_logs` |
+/// | 1 | [`ServiceCommand::Attach`], [`ServiceEvent::VmAttached`], `seq` on [`ServiceEvent::VmApp`], and this field |
+///
+/// vm-pool is a long-lived daemon upgraded separately from its clients, so a
+/// new client routinely talks to a service running an older binary. Serde
+/// rescues an added *field* — an absent one decodes as its default. It cannot
+/// rescue an added *command*: an old service rejects the whole line at decode
+/// time (`unknown variant attach`), and the client sees that as an ordinary
+/// service error, indistinguishable from the command failing on its merits.
+/// So a caller that needs a command introduced after some revision has to ask
+/// first, and this is what it asks about.
+///
+/// # Adding to the protocol
+///
+/// Bump `PROTOCOL_VERSION`, and give the addition its own
+/// `<THING>_PROTOCOL_VERSION` constant beside [`ATTACH_PROTOCOL_VERSION`], so
+/// callers gate on the capability they actually need rather than on a bare
+/// number they have to keep in their heads.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// What a service that predates version reporting says *by omitting the
+/// field*.
+///
+/// It is an answer, not a missing value: such a peer speaks everything through
+/// `unsubscribe_logs` and nothing after it.
+pub const PRE_VERSIONING: u32 = 0;
+
+/// The revision that introduced [`ServiceCommand::Attach`].
+///
+/// Gate on this — not on [`PROTOCOL_VERSION`] — when all you need is to
+/// reattach; see [`ServiceEvent::PoolStatus`].
+pub const ATTACH_PROTOCOL_VERSION: u32 = 1;
+
+// A gate above what this build speaks is a permanent, silent "unsupported"
+// against every peer including itself. Catch it at compile time — a `#[test]`
+// would trip clippy's `assertions_on_constants` and is the weaker guarantee.
+const _: () = assert!(PROTOCOL_VERSION >= ATTACH_PROTOCOL_VERSION);
+const _: () = assert!(ATTACH_PROTOCOL_VERSION > PRE_VERSIONING);
+
 /// Strongly-typed VM identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -286,10 +329,21 @@ pub enum ServiceEvent<P: AppProtocol = NullProtocol> {
     /// VM crashed or was killed.
     VmCrashed { vm_id: VmId, error: String },
     /// Pool status response.
+    ///
+    /// `protocol_version` is what the *service* speaks — see
+    /// [`PROTOCOL_VERSION`]. It rides `status` because `status` has been in the
+    /// protocol since its first revision, so a peer of any age answers it; a
+    /// dedicated handshake command would be rejected at decode time by exactly
+    /// the peers it exists to identify. `#[serde(default)]` makes an absent
+    /// field decode as [`PRE_VERSIONING`], which is the correct reading of
+    /// silence rather than a missing value — the same technique as `seq` on
+    /// [`ServiceEvent::VmApp`].
     PoolStatus {
         total: usize,
         available: usize,
         allocated: usize,
+        #[serde(default)]
+        protocol_version: u32,
     },
     /// Log line from a VM (streamed).
     VmLog {
@@ -605,10 +659,31 @@ mod tests {
             total: 6,
             available: 4,
             allocated: 2,
+            protocol_version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"protocol_version\":1"), "got: {json}");
         let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    /// The load-bearing compatibility case: a service that predates version
+    /// reporting sends `pool_status` without the field, and that silence has
+    /// to read as an answer — [`PRE_VERSIONING`] — rather than as a decode
+    /// failure. Everything the gate does rests on getting an answer here.
+    #[test]
+    fn service_event_pool_status_decodes_without_a_version() {
+        let json = r#"{"type":"pool_status","total":6,"available":4,"allocated":2}"#;
+        let parsed: ServiceEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            ServiceEvent::PoolStatus {
+                total: 6,
+                available: 4,
+                allocated: 2,
+                protocol_version: PRE_VERSIONING,
+            }
+        );
     }
 
     #[test]
@@ -785,6 +860,7 @@ mod tests {
                 total: 3,
                 available: 2,
                 allocated: 1,
+                protocol_version: PROTOCOL_VERSION,
             },
         );
         assert!(!resp.is_push());

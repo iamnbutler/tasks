@@ -32,10 +32,28 @@
 //! treat [`Origin::Replayed`] as "state I need, output I already have" — see
 //! `scout::follow`, which rebuilds its in-memory state from the replay but
 //! writes one marker line instead of re-persisting the transcript tail.
+//!
+//! # Whether the peer can be attached to at all
+//!
+//! vm-pool is a separate daemon with its own lifetime, so a freshly built
+//! server routinely talks to a service running an older binary — one that
+//! predates [`ServiceCommand::Attach`](vm_pool_protocol::ServiceCommand) and
+//! rejects the line at decode time. That rejection is a fact about the
+//! *deployment*, not about the run: the scout or build on the other side is
+//! alive and would have been recoverable by a newer daemon. Treating it as a
+//! failure of the run is the worst available answer, because the run is then
+//! killed by the very code path that exists to save it.
+//!
+//! So it is asked once per boot, about the service, by [`attach_support`] —
+//! before any row is claimed. Too old, unanswerable, and unreachable all land
+//! in the same place: claim nothing, and let `reconcile_startup` write the
+//! rows off exactly as a server without reattachment did.
+
+use std::fmt;
 
 use tracing::info;
 use vm_pool_client::{ClientError, ClientHandle, EventStream};
-use vm_pool_protocol::{ServiceEvent, VmId};
+use vm_pool_protocol::{ATTACH_PROTOCOL_VERSION, ServiceEvent, VmId};
 
 use crate::protocol::{TaskEvent, TasksProtocol};
 
@@ -51,6 +69,64 @@ use crate::protocol::{TaskEvent, TasksProtocol};
 /// which is why the branch it carries is persisted the moment it arrives
 /// rather than at finalize.
 pub const REPLAY_LIMIT: usize = 256;
+
+/// Whether the vm-pool on the other end of this connection understands
+/// [`attach`] at all.
+///
+/// The two "no" variants are kept apart for the log line, not for the
+/// decision — [`is_supported`](Self::is_supported) is false for both, and a
+/// pool that will not say what it speaks is not one to send an unrecognised
+/// command to.
+#[derive(Debug)]
+pub enum AttachSupport {
+    /// The service speaks this revision, which is new enough.
+    Yes(u32),
+    /// The service speaks this revision, which predates `attach`.
+    TooOld(u32),
+    /// The service would not say. `status` is the oldest command there is, so
+    /// if that does not come back, nothing better will.
+    Unknown(ClientError),
+}
+
+impl AttachSupport {
+    /// Whether in-flight work may be claimed and reattached to.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Yes(_))
+    }
+}
+
+impl fmt::Display for AttachSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Yes(version) => write!(f, "vm-pool speaks protocol v{version}"),
+            Self::TooOld(version) => write!(
+                f,
+                "vm-pool speaks protocol v{version}, and attach needs \
+                 v{ATTACH_PROTOCOL_VERSION} — restart vm-pool"
+            ),
+            Self::Unknown(e) => write!(
+                f,
+                "vm-pool would not report its protocol version ({e}) — restart vm-pool"
+            ),
+        }
+    }
+}
+
+/// Ask the service, once, whether it understands [`attach`].
+///
+/// One `status` round trip. `status` is used rather than a dedicated handshake
+/// precisely because it has been in the protocol since its first revision: a
+/// new command would be rejected by exactly the peers this needs an answer
+/// from. See [`vm_pool_protocol::PROTOCOL_VERSION`].
+pub async fn attach_support(client: &ClientHandle<TasksProtocol>) -> AttachSupport {
+    match client.status().await {
+        Ok(status) if status.speaks(ATTACH_PROTOCOL_VERSION) => {
+            AttachSupport::Yes(status.protocol_version)
+        }
+        Ok(status) => AttachSupport::TooOld(status.protocol_version),
+        Err(e) => AttachSupport::Unknown(e),
+    }
+}
 
 /// What a reattachment recovered: whether vm-pool still holds the VM, the
 /// events recorded while nobody was reading, and how many older ones the

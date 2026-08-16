@@ -99,6 +99,34 @@ pub struct PoolStatus {
     pub total: usize,
     pub available: usize,
     pub allocated: usize,
+    /// The protocol revision the *service* speaks — see
+    /// [`vm_pool_protocol::PROTOCOL_VERSION`]. A service that predates version
+    /// reporting omits the field and is read as
+    /// [`PRE_VERSIONING`](vm_pool_protocol::PRE_VERSIONING).
+    pub protocol_version: u32,
+}
+
+impl PoolStatus {
+    /// Whether the service speaks at least this protocol revision.
+    ///
+    /// Gate on the constant for the command you need, not on a bare number:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), vm_pool_client::ClientError> {
+    /// use vm_pool_client::Client;
+    /// use vm_pool_protocol::{ATTACH_PROTOCOL_VERSION, NullProtocol};
+    ///
+    /// let client: Client<NullProtocol> = Client::connect("/tmp/vm-pool.sock").await?;
+    /// if client.handle().status().await?.speaks(ATTACH_PROTOCOL_VERSION) {
+    ///     // `attach` will be understood; without this it is rejected at
+    ///     // decode time and arrives as an ordinary `ClientError::Service`.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn speaks(&self, version: u32) -> bool {
+        self.protocol_version >= version
+    }
 }
 
 /// What [`ClientHandle::attach`] found: whether the pool still holds the VM,
@@ -306,10 +334,12 @@ impl<P: AppProtocol> ClientHandle<P> {
                 total,
                 available,
                 allocated,
+                protocol_version,
             } => Ok(PoolStatus {
                 total,
                 available,
                 allocated,
+                protocol_version,
             }),
             other => Err(ClientError::UnexpectedResponse(format!("{other:?}"))),
         }
@@ -433,6 +463,15 @@ impl<P: AppProtocol> ClientHandle<P> {
     /// what is pushed after it, and the replay only covers what was recorded
     /// before it. Subscribing first makes the two overlap, and the overlap is
     /// what [`Attachment::last_seq`] lets the caller discard.
+    ///
+    /// **Ask [`status`](Self::status) first and gate on
+    /// `speaks(`[`ATTACH_PROTOCOL_VERSION`](vm_pool_protocol::ATTACH_PROTOCOL_VERSION)`)**
+    /// if a rejection would be expensive. vm-pool is upgraded separately from
+    /// its clients, and a service that predates this command rejects the line
+    /// at decode time — which arrives here as [`ClientError::Service`],
+    /// indistinguishable (without matching serde's message text, which is not
+    /// stable) from a genuine failure to attach to a VM that does exist. Only
+    /// the caller knows which of those two it can afford to be wrong about.
     pub async fn attach(
         &self,
         vm_id: &VmId,
@@ -718,6 +757,62 @@ mod tests {
         assert_eq!(status.total, 3);
         assert_eq!(status.available, 3);
         assert_eq!(status.allocated, 0);
+    }
+
+    /// A current service says so, and `speaks` agrees.
+    #[tokio::test]
+    async fn client_status_reports_the_protocol_version() {
+        let (mut client, _svc, _dir) = test_client().await;
+
+        let status = client.status().await.unwrap();
+        assert_eq!(
+            status.protocol_version,
+            vm_pool_protocol::PROTOCOL_VERSION,
+            "the service reports what it speaks"
+        );
+        assert!(status.speaks(vm_pool_protocol::ATTACH_PROTOCOL_VERSION));
+        assert!(status.speaks(vm_pool_protocol::PRE_VERSIONING));
+        assert!(!status.speaks(vm_pool_protocol::PROTOCOL_VERSION + 1));
+    }
+
+    /// The case the gate exists for, against the only honest peer left: raw
+    /// bytes in the shape a service that predates version reporting emitted.
+    /// That binary is not in this tree any more, so its wire form is the test.
+    #[tokio::test]
+    async fn a_pre_versioning_service_reports_pre_versioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("old.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        // An old service: it answers `status` in the old shape, with no
+        // `protocol_version` field at all.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                let id: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                let reply = format!(
+                    r#"{{"id":{},"event":{{"type":"pool_status","total":3,"available":3,"allocated":0}}}}"#,
+                    id["id"]
+                );
+                writer.write_all(reply.as_bytes()).await.unwrap();
+                writer.write_all(b"\n").await.unwrap();
+                writer.flush().await.unwrap();
+                line.clear();
+            }
+        });
+
+        let mut client = Client::<ShellProtocol>::connect(&socket_path)
+            .await
+            .unwrap();
+        let status = client.status().await.unwrap();
+        assert_eq!(status.protocol_version, vm_pool_protocol::PRE_VERSIONING);
+        assert!(
+            !status.speaks(vm_pool_protocol::ATTACH_PROTOCOL_VERSION),
+            "silence about the version is an answer: no attach"
+        );
     }
 
     #[tokio::test]

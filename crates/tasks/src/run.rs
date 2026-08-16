@@ -59,6 +59,7 @@ use crate::github::{GitHubClient, IntakeFilter};
 use crate::models::{ChatRole, GhState, Mode, Project, Spec, Task, TaskId, TaskState};
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
+use crate::reattach;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
 use crate::store::{ResumedWork, Store, StoreError};
@@ -832,9 +833,10 @@ async fn report_interrupted_orchestrator_turn(store: &Store) {
 /// whatever `sessions`/`builds` still name a VM that vm-pool still has.
 ///
 /// Everything here degrades to the old behaviour rather than to a failure: no
-/// resumable rows, an unreachable pool, a missing task or project, or no
-/// `GITHUB_TOKEN` for a build — each leaves the row untouched for
-/// [`reconcile_startup_except`], which writes it off exactly as before.
+/// resumable rows, an unreachable pool, *a pool too old to understand
+/// `attach`*, a missing task or project, or no `GITHUB_TOKEN` for a build —
+/// each leaves the row untouched for [`reconcile_startup_except`], which
+/// writes it off exactly as before.
 ///
 /// Returns what it took ownership of. Every returned row *will* be concluded
 /// by the reattach that owns it; that invariant is what makes it safe for
@@ -881,6 +883,26 @@ pub async fn resume_in_flight(
             return ResumedWork::default();
         }
     };
+
+    // Before anything is claimed. `ResumedWork` membership is a promise that
+    // the reattach owning the row will conclude it, and a reattach against a
+    // pool that cannot decode `attach` concludes it by *failing the run* —
+    // work that was alive and recoverable, destroyed by the code path that
+    // exists to save it. Asked here, the same skew costs only what a server
+    // without reattachment always cost.
+    let support = reattach::attach_support(&client.handle()).await;
+    if !support.is_supported() {
+        warn!(
+            socket = %config.vm_pool_socket.display(),
+            sessions = sessions.len(),
+            builds = builds.len(),
+            reason = %support,
+            "vm-pool cannot be attached to — in-flight work is written off instead. \
+             Restart vm-pool, then the server"
+        );
+        return ResumedWork::default();
+    }
+
     info!(
         sessions = sessions.len(),
         builds = builds.len(),
@@ -1218,9 +1240,31 @@ pub async fn dispatch_loop(
             }
         };
         info!(socket = %config.vm_pool_socket.display(), "connected to vm-pool");
+        report_attach_support(&client).await;
         sweep_leaked_vms(&store, &mut client).await;
 
         dispatch_connected(&store, &config, &in_flight, client, &mut shutdown).await;
+    }
+}
+
+/// Say, on every connect, whether this vm-pool could be reattached to.
+///
+/// Deliberately not a gate. Dispatch needs nothing newer than the original
+/// command set, and an old daemon runs scouts and builds perfectly well; the
+/// only thing it cannot do is hand work back after a restart. That bill
+/// arrives at the *next* restart, by which point the work it costs is already
+/// in flight — so connect time is the last moment an operator can act on it,
+/// which is the whole reason to say it out loud here.
+async fn report_attach_support(client: &Client<TasksProtocol>) {
+    let support = reattach::attach_support(&client.handle()).await;
+    if support.is_supported() {
+        info!(%support, "vm-pool can hand work back across a restart");
+    } else {
+        warn!(
+            %support,
+            "vm-pool cannot hand work back across a restart — a restart from here \
+             will write off whatever is in flight"
+        );
     }
 }
 
