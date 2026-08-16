@@ -395,8 +395,7 @@ impl Workspace {
     }
 
     fn toggle_sidebar(&mut self, side: SidebarSide, cx: &mut Context<Self>) {
-        let state = self.sidebar_mut(side);
-        state.open = !state.open;
+        self.sidebar_mut(side).toggle();
         cx.notify();
     }
 
@@ -453,7 +452,9 @@ impl Workspace {
                 .update(cx, |input, cx| input.set_content("", cx));
         }
         self.selected_task = Some(id);
-        self.right_sidebar.open = true;
+        // `reveal`, not `force_open`: a row click is the content asking to be
+        // seen, and it must not undo a dismissal the user made deliberately.
+        self.right_sidebar.reveal();
         cx.notify();
     }
 
@@ -722,7 +723,11 @@ impl Workspace {
     /// a modal that would cover the thing being judged.
     fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
         self.select_task(id, cx);
-        self.right_sidebar.open = true;
+        // The one selection path that overrides a dismissal, and it has to run
+        // *after* `select_task`, whose `reveal` may have been a no-op: the
+        // composer being focused below means a hidden panel would eat
+        // keystrokes with nothing on screen to explain where they went.
+        self.right_sidebar.force_open();
         window.focus(&self.review_input.focus_handle(cx), cx);
         cx.notify();
     }
@@ -766,7 +771,9 @@ impl Workspace {
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_task = None;
-        self.right_sidebar.open = false;
+        // `hide`, not `toggle`: escape and the inspector's ✕ mean "clear this",
+        // never "and don't come back". The next row click opens it again.
+        self.right_sidebar.hide();
         cx.notify();
     }
 
@@ -839,7 +846,7 @@ impl Workspace {
         title_bar()
             .child_left(
                 Self::title_bar_button("toggle-left-sidebar", Icons::panel_left())
-                    .selected(self.left_sidebar.open)
+                    .selected(self.left_sidebar.is_open())
                     .tooltip(tooltip("Toggle sidebar (⌘B)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleLeftDock), cx);
@@ -881,7 +888,7 @@ impl Workspace {
             )
             .child_right(
                 Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
-                    .selected(self.right_sidebar.open)
+                    .selected(self.right_sidebar.is_open())
                     .tooltip(tooltip("Toggle inspector (⌘R)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleRightDock), cx);
@@ -1688,7 +1695,7 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                if this.selected_task.is_some() || this.right_sidebar.open {
+                if this.selected_task.is_some() || this.right_sidebar.is_open() {
                     this.clear_selection(cx);
                 }
             }))
@@ -1776,11 +1783,11 @@ impl Render for Workspace {
                     .flex_row()
                     .flex_grow(1.)
                     .overflow_hidden()
-                    .when(self.left_sidebar.open, |el| {
+                    .when(self.left_sidebar.is_open(), |el| {
                         el.child(self.render_left_sidebar(cx))
                     })
                     .child(self.render_center(cx))
-                    .when(self.right_sidebar.open, |el| {
+                    .when(self.right_sidebar.is_open(), |el| {
                         el.child(self.render_right_sidebar(cx))
                     }),
             )
