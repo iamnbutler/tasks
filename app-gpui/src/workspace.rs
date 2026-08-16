@@ -1081,7 +1081,12 @@ impl Workspace {
     /// Clears an inspector selection belonging to a *different* repo: leaving
     /// it would sit the right sidebar open on a task the window is no longer
     /// showing.
-    pub(crate) fn select_project(&mut self, filter: ProjectFilter, cx: &mut Context<Self>) {
+    pub(crate) fn select_project(
+        &mut self,
+        filter: ProjectFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.project_filter = filter;
         self.pending_repo_selection = None;
         let stale = {
@@ -1092,7 +1097,7 @@ impl Workspace {
                 .is_some_and(|task| !self.project_filter.admits(&task.project_id))
         };
         if stale {
-            self.clear_selection(cx);
+            self.clear_selection(window, cx);
         }
         cx.notify();
     }
@@ -1116,7 +1121,7 @@ impl Workspace {
 
     /// Adopt a just-added repo once a snapshot names it. Called from the
     /// render pass, which is the first place that can know the id exists.
-    fn settle_pending_repo(&mut self, cx: &mut Context<Self>) {
+    fn settle_pending_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(slug) = self.pending_repo_selection.clone() else {
             return;
         };
@@ -1129,7 +1134,7 @@ impl Workspace {
             .map(|project| project.id.clone());
         if let Some(id) = id {
             self.pending_repo_selection = None;
-            self.select_project(ProjectFilter::One(id), cx);
+            self.select_project(ProjectFilter::One(id), window, cx);
         }
     }
 
@@ -1250,10 +1255,10 @@ impl Workspace {
                 row_style(div().id("switcher-all"), selected)
                     .on_click({
                         let workspace = workspace.clone();
-                        move |_event, _window, cx| {
+                        move |_event, window, cx| {
                             workspace
                                 .update(cx, |this, cx| {
-                                    this.select_project(ProjectFilter::All, cx);
+                                    this.select_project(ProjectFilter::All, window, cx);
                                     this.close_switcher(cx);
                                 })
                                 .ok();
@@ -1272,10 +1277,10 @@ impl Workspace {
             .on_click({
                 let workspace = workspace.clone();
                 let id = id.clone();
-                move |_event, _window, cx| {
+                move |_event, window, cx| {
                     workspace
                         .update(cx, |this, cx| {
-                            this.select_project(ProjectFilter::One(id.clone()), cx);
+                            this.select_project(ProjectFilter::One(id.clone()), window, cx);
                             this.close_switcher(cx);
                         })
                         .ok();
@@ -2170,7 +2175,7 @@ impl Render for Workspace {
         self.sync_palette(cx);
         // The first frame that can know a just-added repo's id: this client
         // applies snapshots, not responses.
-        self.settle_pending_repo(cx);
+        self.settle_pending_repo(window, cx);
 
         div()
             // A name rather than an index, per #861: this sits at the root of
