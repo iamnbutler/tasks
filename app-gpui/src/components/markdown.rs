@@ -11,7 +11,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use gpui::{App, AppContext, Entity, FontWeight, SharedString};
+use gpui::prelude::*;
+use gpui::{div, App, Entity, FontWeight, SharedString};
 use gpuikit::markdown::{Markdown, MarkdownElement, MarkdownStyle, TextStyle};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
@@ -63,8 +64,22 @@ impl MarkdownCache {
 }
 
 /// A markdown element styled for this app's reading surfaces.
-pub fn markdown_block(entity: &Entity<Markdown>, cx: &App) -> MarkdownElement {
-    MarkdownElement::new(entity.clone()).style(style(cx))
+///
+/// The wrapper `div` exists for its id, not its box: gpuikit mints text-run
+/// ids (`md-run-1`, `md-run-2`, …) from a counter it restarts on every
+/// render, so two documents on one screen emit the same ids and collide in
+/// whatever gpui keys off the id path — which is how three briefings on Home
+/// tripped the a11y tree's uniqueness assert (#861). Giving each document a
+/// distinct id ancestor makes the app immune regardless of what upstream does
+/// with that counter next. Keyed on `entity_id()` because [`MarkdownCache`]
+/// already hands out one stable entity per key, so the id is unique per
+/// document *and* stable across frames — which is what gpui wants in order to
+/// treat a node as the same node frame to frame.
+pub fn markdown_block(entity: &Entity<Markdown>, cx: &App) -> impl IntoElement {
+    div()
+        .id(("markdown", entity.entity_id()))
+        .w_full()
+        .child(MarkdownElement::new(entity.clone()).style(style(cx)))
 }
 
 fn style(cx: &App) -> MarkdownStyle {
