@@ -93,8 +93,12 @@ above the cwd, then the nearest above this binary; the real environment wins):
 /// It runs for every subcommand, not just `serve`: `reload` and `status`
 /// resolve `TASKS_DATA_DIR` too, and a `.env` that moved the data dir for one
 /// and not the others would mean two answers to "which server?".
+///
+/// `TASKS_ENV_FILES=off` skips it — and an unreadable value there stops the
+/// process before anything is configured, rather than being ignored back into
+/// the behaviour it was turning off.
 fn main() -> Result<()> {
-    let env_sources = tasks::env_file::load();
+    let env_sources = tasks::env_file::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))

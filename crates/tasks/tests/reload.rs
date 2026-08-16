@@ -9,12 +9,34 @@
 //! blocked inside `reload`), so "has it exited" and "has it been reaped"
 //! differ, and the reap races with tokio's SIGCHLD handling.
 //!
-//! Two environment variables are scrubbed from every child. `TASKS_DEFAULT_MODE`
-//! decides what a boot comes up in, and an ambient one would silently decide
-//! the result of every test here. `ORCHESTRATOR_CMD` is pointed at a stub: the
-//! default is `claude`, so on any machine that has it installed the mode flips
-//! below started a live agent turn that the shutdown then waited out — which
-//! is minutes of wall clock spent on nothing, in a suite about restarts.
+//! Three environment settings are forced on every child, and each closes a
+//! route by which ambient configuration decides a result here.
+//! `TASKS_DEFAULT_MODE` decides what a boot comes up in. `ORCHESTRATOR_CMD` is
+//! pointed at a stub: the default is `claude`, so on any machine that has it
+//! installed the mode flips below started a live agent turn that the shutdown
+//! then waited out — minutes of wall clock spent on nothing, in a suite about
+//! restarts. And `TASKS_ENV_FILES=off`, because `env_remove` is the *opposite*
+//! of a scrub: these children are real `tasks` processes, `main` runs
+//! `env_file::load()`, and the real environment is the only thing a `.env`
+//! entry loses to — so removing a variable is exactly what lets this
+//! checkout's (gitignored, so per-machine) `.env` decide it.
+//!
+//! # The budget
+//!
+//! nextest kills a test at 60s (`.config/nextest.toml`: `slow-timeout` 5s ×
+//! `terminate-after` 12), and a killed test prints none of its own assertions
+//! — it surfaces as an opaque `TIMEOUT`. So [`DRAIN_TIMEOUT`] sits well under
+//! that: at 60 it sat *exactly* on the threshold, and a drain that genuinely
+//! timed out could never say so.
+//!
+//! One thing can blow the budget while every assertion here is correct, and it
+//! is the first thing to check if this suite ever times out again: `reload`'s
+//! own `STOP_GRACE` is **75s**, permanently larger than the whole harness
+//! budget. A server that misses its graceful shutdown path is SIGKILLed at 75s,
+//! which this suite can only ever observe as a harness timeout with no output.
+//! That is what #883 was — a background loop that never saw the shutdown flag,
+//! awaited unbounded by a drain that named nothing. The server now bounds and
+//! names those loops (`run::drain_background`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,6 +54,11 @@ use tokio::process::Command;
 fn tasks_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tasks"))
 }
+
+/// `--drain-timeout` for the tests that wait one out. Comfortably under
+/// nextest's 60s kill, so a drain that really does time out can print its own
+/// failure instead of dying as a `TIMEOUT` with no output. See the module docs.
+const DRAIN_TIMEOUT: &str = "20";
 
 /// A data dir that takes its server down with it, however the test ended.
 /// The servers `reload` starts are in their own process group and are nobody's
@@ -96,6 +123,9 @@ fn serve_command(data_dir: &Path, port: u16) -> Command {
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
         .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
+        // Without this the `env_remove` below hands the decision to whichever
+        // `.env` this checkout happens to have. See the module docs.
+        .env(tasks::env_file::DISABLE_VAR, "off")
         .env_remove("GITHUB_TOKEN")
         .env_remove("TASKS_DEFAULT_MODE")
         .stdin(Stdio::null())
@@ -155,6 +185,9 @@ async fn cli(data_dir: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// The same, with an explicit `TASKS_DEFAULT_MODE` — which the server `reload`
 /// spawns inherits, exactly as it would from an operator's shell or a `.env`.
+///
+/// The successor `reload` spawns inherits this environment wholesale, so the
+/// `.env` switch set here covers it too.
 async fn cli_with(
     data_dir: &Path,
     args: &[&str],
@@ -165,6 +198,7 @@ async fn cli_with(
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
         .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
+        .env(tasks::env_file::DISABLE_VAR, "off")
         .env_remove("GITHUB_TOKEN")
         .stdin(Stdio::null());
     match default_mode {
@@ -242,6 +276,53 @@ async fn wait_until_gone(pid: u32) {
 }
 
 // --- tests ---
+
+/// The hole this suite's header used to claim was closed: `env_remove` does not
+/// scrub a variable, it *promotes the `.env` that defines it*. These children
+/// are real `tasks` processes and `main` runs `env_file::load()`, so a
+/// maintainer with `TASKS_DEFAULT_MODE=play` in a (gitignored) `.env` failed
+/// this file on their machine and nowhere else.
+///
+/// Both halves are load-bearing. The control proves the file really can decide
+/// the boot mode; without it the second assertion passes whether or not the
+/// switch does anything at all.
+#[tokio::test]
+async fn a_dot_env_decides_the_boot_mode_unless_the_switch_is_off() {
+    let dir = DataDir::new();
+    // `<data dir>/.env` is the first place `env_file` looks, and the one this
+    // test can control — the other two are the cwd's and the executable's
+    // checkout.
+    std::fs::write(dir.path().join(".env"), "TASKS_DEFAULT_MODE=play\n").unwrap();
+
+    // Control: with the switch removed, `serve_command`'s `env_remove` of
+    // TASKS_DEFAULT_MODE is exactly what lets the file decide.
+    let port = free_port().await;
+    let mut cmd = serve_command(dir.path(), port);
+    cmd.env_remove(tasks::env_file::DISABLE_VAR);
+    let mut child = cmd.spawn().unwrap();
+    let status = wait_serving(port).await;
+    assert_eq!(
+        status.mode,
+        Mode::Play,
+        "the .env really can decide the boot mode — without this the assertion \
+         below is vacuous"
+    );
+    cli(dir.path(), &["stop"]).await;
+    wait_until_gone(status.pid).await;
+    let _ = child.start_kill();
+
+    // And with the settings this suite uses, the same file decides nothing.
+    let port = free_port().await;
+    let (mut child, status) = start_server(dir.path(), port).await;
+    assert_eq!(
+        status.mode,
+        Mode::Pause,
+        "TASKS_ENV_FILES=off must skip the file the control just proved wins"
+    );
+    cli(dir.path(), &["stop"]).await;
+    wait_until_gone(status.pid).await;
+    let _ = child.start_kill();
+}
 
 /// The happy path: one command, and a different process is serving the same
 /// port from the same data dir — with the schema question answered by the new
@@ -327,7 +408,7 @@ async fn when_idle_waits_for_the_drain_and_restores_the_mode() {
                 "--no-build",
                 "--when-idle",
                 "--drain-timeout",
-                "60",
+                DRAIN_TIMEOUT,
             ],
         )
         .await
@@ -643,7 +724,11 @@ async fn stop_when_idle_waits_for_the_drain_and_leaves_dispatch_paused() {
 
     let data_dir = dir.path().to_path_buf();
     let stop = tokio::spawn(async move {
-        cli(&data_dir, &["stop", "--when-idle", "--drain-timeout", "60"]).await
+        cli(
+            &data_dir,
+            &["stop", "--when-idle", "--drain-timeout", DRAIN_TIMEOUT],
+        )
+        .await
     });
 
     // It pauses before it waits — without which the wait never terminates.
