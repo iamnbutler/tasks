@@ -50,6 +50,10 @@ pub enum RowAction {
     Queue,
     Dequeue,
     ScoutNow,
+    /// Stop the scout or build this row currently has in flight. Destructive:
+    /// the VM and everything on its disk go away, and only what the run had
+    /// already checkpointed survives.
+    CancelRun,
     ApproveSpec,
     /// Reveals and focuses the inspector's review composer. The one item that
     /// needs text, and the only one that opens anything — hence the ellipsis.
@@ -140,6 +144,17 @@ pub fn entries(context: RowContext) -> Vec<RowEntry> {
             scout_refusal(context),
             false,
             Some(menus::rendered_keystroke(menus::SCOUT_KEYSTROKE)),
+        ),
+        // Beside the verbs that start work, because it is the answer to having
+        // started it. Destructive and unbound to a key for the same reason the
+        // closing verbs are: a mis-keyed cancel throws away a VM hour.
+        item(
+            RowAction::CancelRun,
+            "row-cancel",
+            "Cancel Run",
+            cancel_refusal(context),
+            true,
+            None,
         ),
         RowEntry::Separator,
         // The spec, and what a verdict on it leads to.
@@ -272,6 +287,23 @@ fn scout_refusal(context: RowContext) -> Option<&'static str> {
         TaskState::InReview => Some("its spec is in review"),
         TaskState::ReadyToBuild => Some("its spec is approved"),
         TaskState::Building => Some("a build is running"),
+        TaskState::Done => Some("this task is done"),
+        TaskState::Rejected => Some("this task was rejected"),
+    }
+}
+
+/// Cancelling needs something to cancel: a scout or a build actually in
+/// flight, which from a task row is exactly `Scouting` and `Building`.
+///
+/// A queued build is *not* offered here even though the server accepts one:
+/// its task still reads `ready_to_build`, so the row cannot tell it from a
+/// task with nothing dispatched, and a verb that sometimes stops a build and
+/// sometimes says "nothing is running" is worse than one that says so plainly.
+fn cancel_refusal(context: RowContext) -> Option<&'static str> {
+    match context.task_state {
+        TaskState::Scouting | TaskState::Building => None,
+        TaskState::Backlog | TaskState::Queued => Some("nothing has started yet"),
+        TaskState::InReview | TaskState::ReadyToBuild => Some("nothing is running"),
         TaskState::Done => Some("this task is done"),
         TaskState::Rejected => Some("this task was rejected"),
     }
@@ -412,7 +444,7 @@ mod tests {
             .into_iter()
             .map(|item| item.action)
             .collect();
-        assert_eq!(reference.len(), 12);
+        assert_eq!(reference.len(), 13);
 
         for context in every_context() {
             let actions: Vec<RowAction> =
@@ -584,6 +616,60 @@ mod tests {
         assert!(!enabled(no_project).contains(&RowAction::CopyUrl));
         // The number lives on the task itself, so it is always copyable.
         assert!(enabled(no_project).contains(&RowAction::CopyNumber));
+    }
+
+    /// Cancelling is offered exactly where something is in flight — the two
+    /// states a run can be interrupted from — and says why everywhere else.
+    #[test]
+    fn cancelling_needs_a_run_in_flight() {
+        for state in [TaskState::Scouting, TaskState::Building] {
+            assert!(
+                enabled(context(state)).contains(&RowAction::CancelRun),
+                "{state:?}"
+            );
+        }
+        for state in [
+            TaskState::Backlog,
+            TaskState::Queued,
+            TaskState::InReview,
+            TaskState::ReadyToBuild,
+            TaskState::Done,
+            TaskState::Rejected,
+        ] {
+            assert!(
+                !enabled(context(state)).contains(&RowAction::CancelRun),
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            item(context(TaskState::Scouting), RowAction::CancelRun)
+                .unwrap()
+                .menu_label(),
+            "Cancel Run"
+        );
+        assert_eq!(
+            refusal(context(TaskState::Queued), RowAction::CancelRun),
+            Some("nothing has started yet")
+        );
+    }
+
+    /// The verbs that throw work away are rendered as such. Cancel joins the
+    /// closing pair: it destroys a VM and everything on its disk.
+    #[test]
+    fn the_destructive_verbs_are_marked_destructive() {
+        let destructive: Vec<RowAction> = items(context(TaskState::Scouting))
+            .into_iter()
+            .filter(|item| item.destructive)
+            .map(|item| item.action)
+            .collect();
+        assert_eq!(
+            destructive,
+            [
+                RowAction::CancelRun,
+                RowAction::CloseCompleted,
+                RowAction::CloseNotPlanned
+            ]
+        );
     }
 
     /// Copying is never a write, so it is never greyed by pipeline state.

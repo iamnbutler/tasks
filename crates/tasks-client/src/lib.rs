@@ -23,9 +23,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CaptureIssue, CloseTaskRequest,
-    CreateProject, ErrorResponse, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
-    ReviewRequest, SendMessage, ServerStatus, SetCharter, SetMode,
+    BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
+    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, ReopenTaskRequest,
+    ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, ServerStatus, SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -390,6 +390,47 @@ impl Client {
         self.get_json(
             &format!("/builds/{id}/transcript"),
             &transcript_query(since, limit),
+        )
+    }
+
+    // --- stopping work in flight ---
+
+    /// Stop a running scout.
+    ///
+    /// The run concludes as `cancelled` — never `failed` — and the task goes
+    /// back to the **backlog** rather than the queue, so the dispatch loop does
+    /// not immediately start a replacement. Re-queueing is
+    /// [`Client::queue_task`], by the person who stopped it.
+    ///
+    /// `rationale` is what makes the stop legible afterwards: it lands in the
+    /// session's `exit_reason`, which is otherwise indistinguishable from a
+    /// crash. The server only *requires* one of the orchestrator, so a caller
+    /// that means it to be mandatory enforces that itself.
+    ///
+    /// [`CancelAck::concluded`] is `false` when the run had not stopped yet by
+    /// the time the server answered — recorded, not failed. Watch for the
+    /// run's completion event.
+    pub fn cancel_session(&self, id: &SessionId, rationale: Option<String>) -> Result<CancelAck> {
+        self.post_json(
+            &format!("/sessions/{id}/cancel"),
+            &CancelRunRequest {
+                rationale,
+                evidence: None,
+            },
+        )
+    }
+
+    /// [`Client::cancel_session`] for a build, queued or running. Its specs go
+    /// back to `approved` and their tasks to `ready_to_build`, with no build
+    /// attempt charged — a cancelled build says nothing about whether the work
+    /// can be built.
+    pub fn cancel_build(&self, id: &BuildId, rationale: Option<String>) -> Result<CancelAck> {
+        self.post_json(
+            &format!("/builds/{id}/cancel"),
+            &CancelRunRequest {
+                rationale,
+                evidence: None,
+            },
         )
     }
 

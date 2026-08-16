@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{
     Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode, ProjectId,
-    SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId, TaskState,
+    RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
+    TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -124,6 +125,24 @@ pub enum EventPayload {
         build_id: BuildId,
         status: BuildStatus,
     },
+    /// Somebody asked for a run that is already in flight to stop.
+    ///
+    /// The announcement, not the outcome: the dispatcher following the run is
+    /// what actually interrupts it, and it concludes the row with the ordinary
+    /// [`Self::SessionCompleted`] / [`Self::BuildCompleted`] carrying a
+    /// `cancelled` status. A cancel that arrives after the run finished on its
+    /// own leaves this event and nothing else, which is honest.
+    ///
+    /// **The fields cannot be called `kind` or `id`.** This enum is
+    /// `#[serde(tag = "kind")]`, so a field by that name is a compile error,
+    /// and `run_id` is named to match rather than to differ for its own sake.
+    RunCancelRequested {
+        run_kind: RunKind,
+        run_id: String,
+        actor: Actor,
+        #[serde(default)]
+        decision_seq: Option<i64>,
+    },
     /// The server pushed the branch and opened the pull request. `pr_number`
     /// is an identifier: the PR's state is GitHub's, queried, never stored.
     PullRequestOpened {
@@ -189,6 +208,7 @@ impl EventPayload {
             EventPayload::BuildRequested { .. } => "build_requested",
             EventPayload::BuildStarted { .. } => "build_started",
             EventPayload::BuildCompleted { .. } => "build_completed",
+            EventPayload::RunCancelRequested { .. } => "run_cancel_requested",
             EventPayload::PullRequestOpened { .. } => "pull_request_opened",
             EventPayload::OrchestratorMessage { .. } => "orchestrator_message",
             EventPayload::OrchestratorSessionStarted { .. } => "orchestrator_session_started",
@@ -204,8 +224,8 @@ mod tests {
     use super::*;
     use crate::models::{
         Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode,
-        ProjectId, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
-        TaskState,
+        ProjectId, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus,
+        TaskId, TaskState,
     };
 
     fn task() -> TaskId {
@@ -281,6 +301,12 @@ mod tests {
             EventPayload::BuildCompleted {
                 build_id: BuildId::from_raw("build_1"),
                 status: BuildStatus::Succeeded,
+            },
+            EventPayload::RunCancelRequested {
+                run_kind: RunKind::Session,
+                run_id: "sess_1".into(),
+                actor: Actor::Human,
+                decision_seq: Some(4),
             },
             EventPayload::PullRequestOpened {
                 build_id: BuildId::from_raw("build_1"),
@@ -372,6 +398,26 @@ mod tests {
         assert_eq!(wire["spec_ids"], serde_json::json!(["spec_a", "spec_b"]));
     }
 
+    /// The tag collision that makes this variant's field names non-negotiable:
+    /// `kind` is serde's discriminant for the whole enum, so a payload field
+    /// called `kind` does not compile — and one called `id` would read as the
+    /// event's own id rather than the run's.
+    #[test]
+    fn a_cancel_request_names_the_run_without_shadowing_the_tag() {
+        let wire = serde_json::to_value(EventPayload::RunCancelRequested {
+            run_kind: RunKind::Build,
+            run_id: "build_1".into(),
+            actor: Actor::Orchestrator,
+            decision_seq: Some(9),
+        })
+        .unwrap();
+        assert_eq!(wire["kind"], "run_cancel_requested");
+        assert_eq!(wire["run_kind"], "build");
+        assert_eq!(wire["run_id"], "build_1");
+        assert_eq!(wire["actor"], "orchestrator");
+        assert!(wire.get("id").is_none());
+    }
+
     /// Every kind string, for the vocabulary test.
     const KINDS: &[&str] = &[
         "project_added",
@@ -387,6 +433,7 @@ mod tests {
         "build_requested",
         "build_started",
         "build_completed",
+        "run_cancel_requested",
         "pull_request_opened",
         "orchestrator_message",
         "mode_changed",

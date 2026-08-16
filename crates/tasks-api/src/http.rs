@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BriefingSection, Build, Mode, ProjectId, SpecId, TaskId};
+use crate::models::{BriefingSection, Build, Mode, ProjectId, RunKind, SpecId, TaskId};
 
 /// Body of `POST /projects`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +243,44 @@ pub struct BuildNowRequest {
     pub rationale: Option<String>,
     #[serde(default)]
     pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /sessions/{id}/cancel` and `POST /builds/{id}/cancel` — stop
+/// work that is already in flight.
+///
+/// Both routes take the same body because a cancel says the same thing about
+/// either: who asked, and why. Everything else the server already knows from
+/// the row.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CancelRunRequest {
+    /// Why this run should not finish. Required of the orchestrator, and the
+    /// text that lands in the run's `exit_reason` — which is what lets a
+    /// reader tell a deliberate stop from a crash long afterwards.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// The answer to a cancel: what was asked, and whether it has landed yet.
+///
+/// `concluded` is the load-bearing field. A cancel is a request the dispatcher
+/// following the run has to notice, so the server polls briefly and then
+/// answers honestly rather than claiming success it has not observed. `false`
+/// is not a failure — it means "asked, not yet concluded", and the run's
+/// terminal event is still coming.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAck {
+    pub run_kind: RunKind,
+    pub run_id: String,
+    /// Whether the run had reached a terminal state by the time this answered.
+    pub concluded: bool,
+    /// The run's status as of this answer — terminal when `concluded`.
+    pub status: String,
+    /// The ledger row holding the decision to stop it.
+    pub decision_seq: i64,
+    /// What happened, in words, for whoever (or whatever) is reading.
+    pub note: String,
 }
 
 /// A build with its batch, in position order — the shape of

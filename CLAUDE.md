@@ -49,13 +49,17 @@ implementation.
   and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
   rather than beside it: it is per-task, human-only, and one call is one build.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
-  prompt.** Eight independently switchable capabilities (`capture_work`,
+  prompt.** Nine independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,
-  `dispatch_builds`, `auto_review_specs`, `land_builds`), each
+  `dispatch_builds`, `cancel_runs`, `auto_review_specs`, `land_builds`), each
   `off` | `shadow` | `live`, human-writable only. The system prompt's
   authority section is *generated* from those rows every turn and the server
   enforces the same rows on the endpoints — one statement of authority, and
-  not one a long conversation can talk itself out of. **All eight ship `live`
+  not one a long conversation can talk itself out of. Adding a capability is
+  two edits, not one: the enum variant alone grants nothing, because
+  `Store::charter_entry` reads a missing row as `off` — the migration's
+  `INSERT` is what makes it real, and without it the refusal looks like a bug
+  in `authorize`. **All nine ship `live`
   and uncapped** — the charter is a kill switch, not a promotion ladder, and
   the point of the system is that work moves without being asked. What makes
   that safe is the `decisions` ledger under every write: audit and recourse
@@ -107,6 +111,29 @@ implementation.
   judged. `dispatch_attempts` is still charged for one — see #845 for the
   remaining piece, which must key off a classification field on the event, not
   a string match on the reason text.
+- **A cancel interrupts the dispatcher's drain; it never just removes the VM.**
+  `POST /sessions/{id}/cancel` and `POST /builds/{id}/cancel` write a durable
+  `cancellations` row, and `crate::cancel::bounded` — the `tokio::select!` the
+  wall-clock deadline already used, with a third arm — is what wakes the drain,
+  which then tears the VM down through the path it always used. Killing the
+  container by hand (or calling `deallocate` and nothing else) is precisely the
+  bug (#876): the drain is parked on a vm-pool stream that will never produce
+  another event, so the row stays `running`, the serial build lane stays
+  occupied, and nothing tells the operator the cancel took. The request is a
+  store row rather than a channel because the process taking the request need
+  not be the one following the run — a run picked back up by
+  `resume_in_flight` was never subscribed to anything. A cancelled run is
+  `cancelled`, never `failed`: `exit_reason` names the actor and the rationale
+  (the only thing that later tells a deliberate stop from a crash), no dispatch
+  attempt or build strike is charged, and the work returns — a build's specs to
+  `approved`, and a scout's task to **`backlog`**, the one exception to
+  "picked-up work stays picked up", because leaving it `queued` has the
+  dispatch loop start a replacement scout within the tick. A cancelled scout
+  keeps its salvage, with the cancel's rationale stamped onto the notes'
+  `reason`. The `biased` ordering in `bounded` is load-bearing: an outcome
+  already in hand is never discarded for a cancel that arrived in the same
+  poll, so cancelling a run that finishes in the same breath is honest rather
+  than destructive.
 
 ## Project structure
 

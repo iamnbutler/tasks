@@ -226,6 +226,16 @@ pub fn gated_agent_path() -> PathBuf {
         .join("gated-agent.sh")
 }
 
+/// [`gated_agent_path`], plus a checkpoint: it writes `NOTES.md` before it
+/// blocks, so a test can assert on salvage from a run that provably never
+/// concluded.
+pub fn gated_notes_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("gated-notes-agent.sh")
+}
+
 /// [`gated_agent_path`] for builds.
 pub fn gated_builder_agent_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

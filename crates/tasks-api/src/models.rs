@@ -294,6 +294,10 @@ pub enum SessionStatus {
     ScoutStoppedEarly,
     /// The run ended with nothing to salvage.
     ScoutFailed,
+    /// Stopped on purpose, by an accountable actor, while it was still
+    /// running. Never a verdict on the work: `exit_reason` names who asked and
+    /// why, the attempt count is untouched, and whatever the run had
+    /// checkpointed is kept — see [`ScoutNotes`].
     Cancelled,
 }
 
@@ -535,6 +539,11 @@ pub enum BuildStatus {
     Succeeded,
     /// Any failure — agent, egress, push, or PR. `exit_reason` says which.
     Failed,
+    /// Stopped on purpose while it was queued or running. Deliberately not a
+    /// `Failed`: the batch's specs go back to `approved` without a strike, and
+    /// a reader of the row can tell "somebody stopped this" from "this could
+    /// not be built" — which is the whole point of the distinction.
+    Cancelled,
 }
 
 impl BuildStatus {
@@ -544,6 +553,7 @@ impl BuildStatus {
             BuildStatus::Running => "running",
             BuildStatus::Succeeded => "succeeded",
             BuildStatus::Failed => "failed",
+            BuildStatus::Cancelled => "cancelled",
         }
     }
 
@@ -553,8 +563,63 @@ impl BuildStatus {
             "running" => Some(BuildStatus::Running),
             "succeeded" => Some(BuildStatus::Succeeded),
             "failed" => Some(BuildStatus::Failed),
+            "cancelled" => Some(BuildStatus::Cancelled),
             _ => None,
         }
+    }
+
+    /// Whether the build has reached a state nothing will move it out of.
+    /// The predicate `POST /builds/{id}/cancel` refuses on.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            BuildStatus::Succeeded | BuildStatus::Failed | BuildStatus::Cancelled
+        )
+    }
+}
+
+/// Which kind of run something is about — a Scout session or a Builder run.
+///
+/// The discriminant that lets one `cancellations` table and one cancel path
+/// serve both dispatchers. Deliberately not folded into [`TranscriptOwner`]:
+/// that one carries the id and exists to address a transcript, this one is the
+/// bare kind and travels beside an id that is already in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunKind {
+    Session,
+    Build,
+}
+
+impl RunKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunKind::Session => "session",
+            RunKind::Build => "build",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "session" => Some(RunKind::Session),
+            "build" => Some(RunKind::Build),
+            _ => None,
+        }
+    }
+
+    /// What a run of this kind is called in prose — for an `exit_reason` or a
+    /// banner, where "session" is jargon and "scout" is the thing.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            RunKind::Session => "scout",
+            RunKind::Build => "build",
+        }
+    }
+}
+
+impl fmt::Display for RunKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -817,6 +882,14 @@ pub enum DecisionAction {
     EditIssue,
     /// An issue's labels were replaced.
     LabelIssue,
+    /// A scout or a build that was already in flight was stopped.
+    ///
+    /// Its own action rather than a flavour of `RequestBuild`, because the two
+    /// answer different questions: one says work was started, this one says
+    /// somebody decided it should not finish. The rationale on this row is the
+    /// only thing that distinguishes a deliberate stop from a crash when the
+    /// run is read back later.
+    CancelRun,
 }
 
 impl DecisionAction {
@@ -837,6 +910,7 @@ impl DecisionAction {
             DecisionAction::ReviewComment => "review_comment",
             DecisionAction::EditIssue => "edit_issue",
             DecisionAction::LabelIssue => "label_issue",
+            DecisionAction::CancelRun => "cancel_run",
         }
     }
 
@@ -857,6 +931,7 @@ impl DecisionAction {
             "review_comment" => Some(DecisionAction::ReviewComment),
             "edit_issue" => Some(DecisionAction::EditIssue),
             "label_issue" => Some(DecisionAction::LabelIssue),
+            "cancel_run" => Some(DecisionAction::CancelRun),
             _ => None,
         }
     }
@@ -893,17 +968,25 @@ pub enum Capability {
     /// Separate from `CaptureWork` because it rewrites rather than appends —
     /// a bad capture leaves a bad issue, a bad edit destroys a good one.
     CurateWork,
+    /// Stop a scout or a build that is already running.
+    ///
+    /// Not folded into `dispatch_builds`: starting work and stopping it have
+    /// unrelated failure modes — one spends a VM hour, the other throws one
+    /// away — and a human who wants one without the other has to be able to
+    /// say so.
+    CancelRuns,
 }
 
 impl Capability {
     /// Every capability, in the order the charter is meant to be flipped:
     /// additive and trivially reversible first, irreversible-ish last.
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 9] = [
         Capability::CaptureWork,
         Capability::CommentOnWork,
         Capability::RetireWork,
         Capability::QueueTasks,
         Capability::DispatchBuilds,
+        Capability::CancelRuns,
         Capability::AutoReviewSpecs,
         Capability::LandBuilds,
         Capability::CurateWork,
@@ -919,6 +1002,7 @@ impl Capability {
             Capability::CommentOnWork => "comment_on_work",
             Capability::LandBuilds => "land_builds",
             Capability::CurateWork => "curate_work",
+            Capability::CancelRuns => "cancel_runs",
         }
     }
 
@@ -932,6 +1016,7 @@ impl Capability {
             "comment_on_work" => Some(Capability::CommentOnWork),
             "land_builds" => Some(Capability::LandBuilds),
             "curate_work" => Some(Capability::CurateWork),
+            "cancel_runs" => Some(Capability::CancelRuns),
             _ => None,
         }
     }
@@ -947,6 +1032,7 @@ impl Capability {
             Capability::CommentOnWork => "comment on issues and pull requests",
             Capability::LandBuilds => "merge a Builder's pull request, or close it unmerged",
             Capability::CurateWork => "revise an issue you filed: its body, its labels",
+            Capability::CancelRuns => "stop a scout or a build that is already running",
         }
     }
 }

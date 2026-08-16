@@ -19,8 +19,8 @@ use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
     CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
     GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, ScoutNotes,
-    Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ReviewedSpec, RunKind,
+    ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
     SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
     TranscriptOwner, TranscriptStream,
 };
@@ -155,6 +155,43 @@ pub enum SpecStrike {
     Charge,
     /// The failure says nothing about the spec; leave the count alone.
     Waive,
+}
+
+/// A standing request that a run in flight be stopped.
+///
+/// Durable rather than a channel, because the process that takes the request is
+/// not necessarily the one following the run — see the `cancellations`
+/// migration. Read by [`crate::cancel::bounded`], which is what actually
+/// interrupts the drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRequest {
+    pub kind: RunKind,
+    pub id: String,
+    pub actor: Actor,
+    pub rationale: Option<String>,
+    pub decision_seq: Option<i64>,
+    pub requested_at: DateTime<Utc>,
+}
+
+impl CancelRequest {
+    /// The one string that lets someone reading a concluded row afterwards tell
+    /// a cancel from a crash: who stopped it, and what they said.
+    ///
+    /// Written verbatim into `sessions.exit_reason` / `builds.exit_reason`,
+    /// which is why it leads with the word "cancelled" — the reason column is
+    /// often the only thing a report shows.
+    pub fn exit_reason(&self) -> String {
+        let who = self.actor.as_str();
+        match self
+            .rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            Some(why) => format!("cancelled by {who}: {why}"),
+            None => format!("cancelled by {who}"),
+        }
+    }
 }
 
 /// Rows a reattach has taken ownership of, and which
@@ -651,6 +688,49 @@ impl Store {
         self.get_task(id)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("task {id}")))
+    }
+
+    /// Put a task back in the backlog from wherever it is, clearing its rank,
+    /// and say where it came from.
+    ///
+    /// The one path out of the queue that is not [`Store::dequeue_task`], and
+    /// deliberately not gated on a state: it exists for a cancelled scout,
+    /// whose task is `Scouting` at the time. Every *other* non-success path
+    /// returns a task to `Queued` — "picked-up work stays picked up" — and a
+    /// cancel is the one case where that is wrong, because the dispatch loop
+    /// would start a fresh scout for it inside half a second, which is a
+    /// restart nobody asked for. Re-queueing is one call by the person who
+    /// stopped it.
+    ///
+    /// Emits the transition itself; returns the state the task was in, or
+    /// `None` if it was already in the backlog and nothing moved.
+    pub async fn return_task_to_backlog(
+        &self,
+        id: &TaskId,
+    ) -> Result<Option<TaskState>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let task = self
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        if task.state == TaskState::Backlog {
+            return Ok(None);
+        }
+        sqlx::query("UPDATE tasks SET state = ?, manual_rank = NULL, updated_at = ? WHERE id = ?")
+            .bind(TaskState::Backlog.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::TaskStateChanged {
+            task_id: id.clone(),
+            from: task.state,
+            to: TaskState::Backlog,
+        })
+        .await?;
+        Ok(Some(task.state))
     }
 
     /// "Scout now": queue the task (from `Backlog` or already `Queued`) at the
@@ -1218,6 +1298,62 @@ impl Store {
         Ok(())
     }
 
+    // --- cancellations ---
+
+    /// Record that a run should stop, and return the request that is on record
+    /// afterwards.
+    ///
+    /// `INSERT OR IGNORE` then read back, which makes two things true at once:
+    /// a double-click is idempotent, and the request that wins is the *first*
+    /// one — so the actor and rationale that reach the run's `exit_reason` are
+    /// the ones that actually stopped it.
+    pub async fn request_cancel(
+        &self,
+        kind: RunKind,
+        id: &str,
+        actor: Actor,
+        rationale: Option<&str>,
+        decision_seq: Option<i64>,
+    ) -> Result<CancelRequest, StoreError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO cancellations \
+             (kind, id, actor, rationale, decision_seq, requested_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(kind.as_str())
+        .bind(id)
+        .bind(actor.as_str())
+        .bind(rationale)
+        .bind(decision_seq)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        self.pending_cancel(kind, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("cancellation for {kind} {id}")))
+    }
+
+    /// The standing cancel request for a run, if anyone has made one.
+    ///
+    /// Cheap on purpose: [`crate::cancel::bounded`] polls this on a slow timer
+    /// underneath the event broadcast, because a broadcast cannot cover a
+    /// lagged subscriber or a request made while nothing was watching.
+    pub async fn pending_cancel(
+        &self,
+        kind: RunKind,
+        id: &str,
+    ) -> Result<Option<CancelRequest>, StoreError> {
+        let row = sqlx::query(
+            "SELECT kind, id, actor, rationale, decision_seq, requested_at \
+             FROM cancellations WHERE kind = ? AND id = ?",
+        )
+        .bind(kind.as_str())
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(cancel_request_from_row).transpose()
+    }
+
     // --- transcripts ---
 
     /// Append agent output lines for one run — a scout session or a build —
@@ -1375,12 +1511,38 @@ impl Store {
         row.map(scout_notes_from_row).transpose()
     }
 
+    /// Stamp a reason onto a session's salvaged notes, leaving the notes
+    /// themselves alone.
+    ///
+    /// The checkpoint writer persists notes with no reason — a checkpoint is
+    /// written before anyone knows how the run ends — so a cancel that arrives
+    /// afterwards needs a way to say why the last look was called off without
+    /// inventing a newer version of the notes. A session with no notes row is
+    /// the ordinary case and not an error.
+    pub async fn stamp_scout_notes_reason(
+        &self,
+        session_id: &SessionId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE scout_notes SET reason = ? WHERE session_id = ?")
+            .bind(reason)
+            .bind(session_id.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The salvage worth carrying into this task's next scout, if any.
     ///
-    /// The newest notes belonging to a session that *stopped early* — not
-    /// "the latest session's notes". An interrupted run followed by one that
-    /// died on a clone error still has exploration worth carrying, and the
-    /// clone failure has nothing to say about it.
+    /// The newest notes belonging to a session that *stopped early* or was
+    /// *cancelled* — not "the latest session's notes". An interrupted run
+    /// followed by one that died on a clone error still has exploration worth
+    /// carrying, and the clone failure has nothing to say about it.
+    ///
+    /// A cancelled run counts for the same reason a stopped-early one does:
+    /// the checkpoint writer already persisted what it had, and the next
+    /// attempt should read both the leads and (through `reason`) why the last
+    /// look was called off.
     ///
     /// Suppressed once a scout has concluded since: a spec supersedes the
     /// notes that led to it, and re-quoting stale leads at a scout that
@@ -1392,11 +1554,12 @@ impl Store {
         let row = sqlx::query(
             "SELECT n.session_id, n.task_id, n.reason, n.notes, n.files_touched, n.updated_at \
              FROM scout_notes n JOIN sessions s ON s.id = n.session_id \
-             WHERE n.task_id = ? AND s.status = ? \
+             WHERE n.task_id = ? AND s.status IN (?, ?) \
              ORDER BY n.updated_at DESC, n.rowid DESC LIMIT 1",
         )
         .bind(task_id.as_str())
         .bind(SessionStatus::ScoutStoppedEarly.as_str())
+        .bind(SessionStatus::Cancelled.as_str())
         .fetch_optional(&self.pool)
         .await?;
         let Some(notes) = row.map(scout_notes_from_row).transpose()? else {
@@ -2590,11 +2753,79 @@ impl Store {
         reason: &str,
         strike: SpecStrike,
     ) -> Result<Build, StoreError> {
+        self.finalize_build_unsuccessfully(id, BuildStatus::Failed, reason, strike)
+            .await
+    }
+
+    /// Terminal cancel: somebody stopped a build that was already running.
+    ///
+    /// The failure path's body with two things changed, and only two: the
+    /// status, and the strike. The specs stay `approved` and their tasks
+    /// return to `ready_to_build` exactly as a failure leaves them — a
+    /// cancelled build says nothing about whether the work can be built, which
+    /// is also why it never spends one of the batch's attempts.
+    pub async fn finalize_build_cancelled(
+        &self,
+        id: &BuildId,
+        reason: &str,
+    ) -> Result<Build, StoreError> {
+        self.finalize_build_unsuccessfully(id, BuildStatus::Cancelled, reason, SpecStrike::Waive)
+            .await
+    }
+
+    /// Stop a build that has not been claimed yet.
+    ///
+    /// A `queued` build has no dispatcher parked on it, so nothing would ever
+    /// read the cancel request — the API applies it directly. Conditional on
+    /// the status inside one statement, because the serial build loop may claim
+    /// it in the same instant, and a lost race here must leave the *running*
+    /// build's own cancel path to conclude the row rather than concluding it
+    /// twice.
+    ///
+    /// Returns whether this call is what cancelled it. The batch is untouched:
+    /// a queued build never moved its specs or its tasks anywhere.
+    pub async fn cancel_queued_build(
+        &self,
+        id: &BuildId,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE builds SET status = ?, exit_reason = ?, completed_at = ? \
+             WHERE id = ? AND status = ?",
+        )
+        .bind(BuildStatus::Cancelled.as_str())
+        .bind(reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.as_str())
+        .bind(BuildStatus::Queued.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        self.append_event(EventPayload::BuildCompleted {
+            build_id: id.clone(),
+            status: BuildStatus::Cancelled,
+        })
+        .await?;
+        Ok(true)
+    }
+
+    /// The shared body behind [`Store::finalize_build_failed_with`] and
+    /// [`Store::finalize_build_cancelled`]: conclude the row, settle the
+    /// batch, put the tasks back.
+    async fn finalize_build_unsuccessfully(
+        &self,
+        id: &BuildId,
+        status: BuildStatus,
+        reason: &str,
+        strike: SpecStrike,
+    ) -> Result<Build, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("UPDATE builds SET status = ?, exit_reason = ?, completed_at = ? WHERE id = ?")
-            .bind(BuildStatus::Failed.as_str())
+            .bind(status.as_str())
             .bind(reason)
             .bind(now.to_rfc3339())
             .bind(id.as_str())
@@ -2696,7 +2927,7 @@ impl Store {
         }
         self.append_event(EventPayload::BuildCompleted {
             build_id: id.clone(),
-            status: BuildStatus::Failed,
+            status,
         })
         .await?;
 
@@ -3818,6 +4049,25 @@ fn scout_notes_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ScoutNotes, Stor
         notes: row.try_get("notes")?,
         files_touched: serde_json::from_str(&files_raw)?,
         updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
+    })
+}
+
+fn cancel_request_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CancelRequest, StoreError> {
+    let kind_raw: String = row.try_get("kind")?;
+    let actor_raw: String = row.try_get("actor")?;
+    Ok(CancelRequest {
+        kind: RunKind::from_str(&kind_raw).ok_or(StoreError::BadEnum {
+            column: "kind",
+            value: kind_raw,
+        })?,
+        id: row.try_get("id")?,
+        actor: Actor::from_str(&actor_raw).ok_or(StoreError::BadEnum {
+            column: "actor",
+            value: actor_raw,
+        })?,
+        rationale: row.try_get("rationale")?,
+        decision_seq: row.try_get("decision_seq")?,
+        requested_at: parse_ts(&row.try_get::<String, _>("requested_at")?, "requested_at")?,
     })
 }
 
