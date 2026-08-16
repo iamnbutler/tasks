@@ -538,14 +538,14 @@ async fn a_history_rewriting_build_lands_its_branch() {
 
 /// The VM is deallocated before egress runs, so a bundle the server refuses to
 /// push is the only copy of the implementation there is. The assertion is not
-/// the error text but the recovery: the preserved bundle reconstructs the
-/// branch in a fresh repo.
+/// the error text but the recovery: **the command the server printed is run**,
+/// against a fresh clone, and the implementation comes back.
 ///
 /// The remote is pre-loaded with the build's branch on other history, which
 /// makes the push a plain non-fast-forward rejection — no mocks, and the
 /// failure lands exactly where a real one does.
 #[tokio::test]
-async fn a_rejected_egress_keeps_the_builds_commits() {
+async fn a_rejected_egress_preserves_the_commits_and_the_command_recovers_them() {
     let h = harness(stub_builder_agent_path().to_str().unwrap()).await;
     let (task, spec) = seed_approved(&h.store, &h.project, 7, "First thing").await;
 
@@ -600,22 +600,49 @@ async fn a_rejected_egress_keeps_the_builds_commits() {
         "the scratch repo outlived the build"
     );
 
-    // The recovery, run: fetch the preserved bundle into a fresh repo and the
-    // implementation is all there.
+    // Announced, so the file is in front of somebody without anyone going
+    // looking: this is the one moment at which the server knows an
+    // implementation now exists in exactly one place.
+    let preserved = h
+        .store
+        .events_since(0, 500)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.payload {
+            tasks::events::EventPayload::BundlePreserved { build_id, bytes } => {
+                Some((build_id, bytes))
+            }
+            _ => None,
+        })
+        .expect("the preservation was announced");
+    assert_eq!(preserved.0, build.id);
+    assert_eq!(
+        preserved.1,
+        tokio::fs::metadata(&bundle).await.unwrap().len(),
+        "the announced size is the file's"
+    );
+
+    // The recovery, run — and run as *printed*: the failure reason is parsed
+    // for the command rather than the command being rebuilt here, because a
+    // command that only works when the test reconstructs it is not a recovery.
     let tmp = tempfile::tempdir().unwrap();
     let recovered = tmp.path().join("recovered.git");
     tokio::fs::create_dir_all(&recovered).await.unwrap();
     run_git(&recovered, &["init", "--bare"]).await;
     run_git(&recovered, &["fetch", &h.repo_url, "main:refs/heads/main"]).await;
-    run_git(
-        &recovered,
-        &[
-            "fetch",
-            bundle.to_str().unwrap(),
-            &format!("{b}:{b}", b = build.branch),
-        ],
-    )
-    .await;
+    let printed = reason
+        .split_once("recover them with ")
+        .expect("the reason names the recovery")
+        .1;
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(printed)
+        .current_dir(&recovered)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "the printed recovery failed: {printed}");
     let listing = run_git(&recovered, &["ls-tree", "-r", "--name-only", &build.branch]).await;
     assert!(listing.contains("src/built.rs"), "{listing}");
     assert!(listing.contains("src/forgotten.rs"), "{listing}");

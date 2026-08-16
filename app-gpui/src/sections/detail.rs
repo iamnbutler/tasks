@@ -4,14 +4,26 @@
 //! server's own error message in the banner.
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, ClickEvent, Context, Hsla};
+use gpui::{div, px, AnyElement, ClickEvent, ClipboardItem, Context, Hsla};
 use gpuikit::elements::input::text_area;
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::models::{Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState};
+use tasks_client::api::http::RejectedBundle;
+use tasks_client::api::models::{
+    BuildId, Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState,
+};
 
-use crate::components::{status_badge, task_state_color, title_case};
+use crate::components::{byte_size, status_badge, task_state_color, title_case};
 use crate::time;
 use crate::workspace::Workspace;
+
+/// Amber: this is not an error and not a success. The build failed, but the
+/// work survived — the block exists to be noticed, not to alarm.
+const BUNDLE_ACCENT: Hsla = Hsla {
+    h: 35. / 360.,
+    s: 0.80,
+    l: 0.55,
+    a: 1.,
+};
 
 /// Owned projection of the selected task — extracted up front so no borrow
 /// of the app state entity is held while listeners are created.
@@ -35,6 +47,11 @@ struct TaskView {
     /// actions key off — approving something already approved is not an
     /// action, it is a second click that means nothing.
     pending_spec: Option<SpecId>,
+    /// An implementation of this task whose branch could not be pushed, and
+    /// which therefore exists only as a file on the server host. Cloned rather
+    /// than borrowed for the same reason as everything else here: no borrow of
+    /// the state entity may be held while listeners are built.
+    bundle: Option<RejectedBundle>,
 }
 
 /// The spec as the inspector renders it.
@@ -81,6 +98,7 @@ impl Workspace {
                             human_authored: spec.session_id.is_none(),
                         }),
                         pending_spec: pending.map(|spec| spec.id.clone()),
+                        bundle: state.bundle_for_task(&task.id).cloned(),
                     }
                 })
         };
@@ -170,6 +188,13 @@ impl Workspace {
                     .text_color(theme.fg_muted())
                     .child(task.labels.join(", ")),
             );
+        }
+
+        // Above the actions, deliberately: every button below is about what to
+        // do *next* with this task, and all of them are the wrong move while
+        // a finished implementation of it is sitting unrecovered on a disk.
+        if let Some(bundle) = task.bundle.clone() {
+            pane = pane.child(self.render_bundle(bundle, cx));
         }
 
         // Actions by state; the server enforces legality.
@@ -400,23 +425,18 @@ impl Workspace {
                             .text_sm()
                             .child(text_area(&self.build_input, cx).size_full()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(self.form_button(
-                                "build-now",
-                                "Build Now",
-                                gpui::hsla(200. / 360., 0.70, 0.58, 1.),
-                                has_text,
-                                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.build_selected_task_now(cx);
-                                }),
-                                cx,
-                            )),
-                    ),
+                    .child(div().flex().flex_row().items_center().gap(px(6.)).child(
+                        self.form_button(
+                            "build-now",
+                            "Build Now",
+                            gpui::hsla(200. / 360., 0.70, 0.58, 1.),
+                            has_text,
+                            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.build_selected_task_now(cx);
+                            }),
+                            cx,
+                        ),
+                    )),
             );
         }
 
@@ -467,6 +487,134 @@ impl Workspace {
         }
 
         pane.into_any_element()
+    }
+
+    /// The "recovered implementation" block: a build finished this task and
+    /// its branch could not be pushed, so its commits are a file on the server
+    /// host and nowhere else.
+    ///
+    /// **Recovery does not happen in this app, and the block does not pretend
+    /// otherwise.** The file is on the server's disk and the `git fetch` runs
+    /// in whatever checkout the human works in, so the command is shown in
+    /// full and copyable rather than hidden behind a Recover button that would
+    /// have to lie about where it ran. `base_sha` is stated beside it because
+    /// the bundle is thin: it carries the build's commits and not the commit
+    /// they grew from, so the fetch only reconstructs the branch in a
+    /// repository that already has that base.
+    ///
+    /// Delete arms on the first click and fires on the second. There is no
+    /// undo and no second copy — [`Workspace::bundle_delete_armed`].
+    fn render_bundle(&self, bundle: RejectedBundle, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let armed = self.bundle_delete_armed.as_ref() == Some(&bundle.build_id);
+        let build_id: BuildId = bundle.build_id.clone();
+
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(BUNDLE_ACCENT.opacity(0.5))
+            .bg(BUNDLE_ACCENT.opacity(0.08))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(BUNDLE_ACCENT)
+                    .child("RECOVERED IMPLEMENTATION — this build's branch never landed"),
+            )
+            .child(div().text_xs().text_color(theme.fg_muted()).child(format!(
+                "{} · {} old · branch {}",
+                byte_size(bundle.bytes),
+                time::relative(bundle.created_at),
+                bundle.branch,
+            )));
+
+        if let Some(reason) = bundle.exit_reason.clone() {
+            block = block.child(div().text_xs().text_color(theme.fg()).child(reason));
+        }
+
+        block = block
+            .child(div().text_xs().text_color(theme.fg_muted()).child(
+                match bundle.base_sha.clone() {
+                    // The bundle's prerequisite, said rather than implied:
+                    // the fetch fails in a repository that does not have
+                    // this commit, and that is not obvious from the error.
+                    Some(base) => format!("Run in a checkout that has {base}:"),
+                    None => "Run in a checkout that has this build's base commit:".to_string(),
+                },
+            ))
+            .child(
+                div()
+                    .p(px(6.))
+                    .rounded(px(5.))
+                    .bg(theme.bg())
+                    .text_xs()
+                    .text_color(theme.fg())
+                    .child(bundle.recovery_command.clone()),
+            );
+
+        let delete_label = if armed {
+            "Really delete — this is the only copy"
+        } else {
+            "Delete"
+        };
+        block
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(self.action_button(
+                        "copy-recovery-command",
+                        "Copy Command",
+                        None,
+                        {
+                            let command = bundle.recovery_command.clone();
+                            move |_: &ClickEvent, _window, cx: &mut gpui::App| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))
+                            }
+                        },
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("delete-bundle")
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.border_secondary())
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(if armed {
+                                gpui::hsla(0., 0.75, 0.55, 1.)
+                            } else {
+                                theme.fg_muted()
+                            })
+                            .hover({
+                                let hover_bg = theme.surface_secondary();
+                                move |el| el.bg(hover_bg)
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                if this.bundle_delete_armed.as_ref() == Some(&build_id) {
+                                    this.bundle_delete_armed = None;
+                                    let id = build_id.clone();
+                                    this.app_state
+                                        .update(cx, |state, cx| state.delete_bundle(id, cx));
+                                } else {
+                                    this.bundle_delete_armed = Some(build_id.clone());
+                                }
+                                cx.notify();
+                            }))
+                            .child(delete_label),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The trimmed review draft, clearing the composer — `None` if empty.

@@ -1,11 +1,13 @@
 //! Reusable UI components for the Tasks app.
 
+mod byte_size;
 mod markdown;
 mod sidebar;
 mod sortable;
 mod status_badge;
 mod titlebar;
 
+pub use byte_size::byte_size;
 pub use markdown::{markdown_block, MarkdownCache};
 pub use sidebar::{sidebar, SidebarSide, SidebarState};
 pub use sortable::{move_to, sortable};

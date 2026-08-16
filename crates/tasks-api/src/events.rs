@@ -143,6 +143,22 @@ pub enum EventPayload {
         #[serde(default)]
         decision_seq: Option<i64>,
     },
+    /// Egress failed and the build's commits were written down instead. The
+    /// VM is deallocated before egress runs, so at this moment the file named
+    /// by `GET /builds/{build_id}/bundle` is the only copy of that
+    /// implementation anywhere.
+    BundlePreserved {
+        build_id: BuildId,
+        bytes: u64,
+    },
+    /// A preserved bundle was deleted. `superseded` is the whole difference
+    /// that matters: `true` is the retention policy reclaiming work that has
+    /// since shipped, `false` is somebody throwing an implementation away.
+    BundleRemoved {
+        build_id: BuildId,
+        superseded: bool,
+        actor: Actor,
+    },
     /// The server pushed the branch and opened the pull request. `pr_number`
     /// is an identifier: the PR's state is GitHub's, queried, never stored.
     PullRequestOpened {
@@ -209,6 +225,8 @@ impl EventPayload {
             EventPayload::BuildStarted { .. } => "build_started",
             EventPayload::BuildCompleted { .. } => "build_completed",
             EventPayload::RunCancelRequested { .. } => "run_cancel_requested",
+            EventPayload::BundlePreserved { .. } => "bundle_preserved",
+            EventPayload::BundleRemoved { .. } => "bundle_removed",
             EventPayload::PullRequestOpened { .. } => "pull_request_opened",
             EventPayload::OrchestratorMessage { .. } => "orchestrator_message",
             EventPayload::OrchestratorSessionStarted { .. } => "orchestrator_session_started",
@@ -308,6 +326,15 @@ mod tests {
                 actor: Actor::Human,
                 decision_seq: Some(4),
             },
+            EventPayload::BundlePreserved {
+                build_id: BuildId::from_raw("build_1"),
+                bytes: 4096,
+            },
+            EventPayload::BundleRemoved {
+                build_id: BuildId::from_raw("build_1"),
+                superseded: true,
+                actor: Actor::Human,
+            },
             EventPayload::PullRequestOpened {
                 build_id: BuildId::from_raw("build_1"),
                 pr_number: 7,
@@ -398,6 +425,29 @@ mod tests {
         assert_eq!(wire["spec_ids"], serde_json::json!(["spec_a", "spec_b"]));
     }
 
+    /// A reclaim and a human throwing work away are the same *kind* of event,
+    /// and are told apart by `superseded` alone. Pinned because the two read
+    /// very differently to whoever is scrolling the feed: one is bookkeeping,
+    /// the other destroyed the only copy of an implementation.
+    #[test]
+    fn a_bundle_removal_says_whether_the_work_had_shipped() {
+        let reclaimed = serde_json::to_value(EventPayload::BundleRemoved {
+            build_id: BuildId::from_raw("build_1"),
+            superseded: true,
+            actor: Actor::Human,
+        })
+        .unwrap();
+        let discarded = serde_json::to_value(EventPayload::BundleRemoved {
+            build_id: BuildId::from_raw("build_1"),
+            superseded: false,
+            actor: Actor::Human,
+        })
+        .unwrap();
+        assert_eq!(reclaimed["kind"], discarded["kind"]);
+        assert_eq!(reclaimed["superseded"], serde_json::json!(true));
+        assert_eq!(discarded["superseded"], serde_json::json!(false));
+    }
+
     /// The tag collision that makes this variant's field names non-negotiable:
     /// `kind` is serde's discriminant for the whole enum, so a payload field
     /// called `kind` does not compile — and one called `id` would read as the
@@ -434,6 +484,8 @@ mod tests {
         "build_started",
         "build_completed",
         "run_cancel_requested",
+        "bundle_preserved",
+        "bundle_removed",
         "pull_request_opened",
         "orchestrator_message",
         "mode_changed",

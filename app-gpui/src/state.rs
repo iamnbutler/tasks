@@ -12,10 +12,11 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::Context;
 use tasks_client::api::events::Event;
-use tasks_client::api::http::BriefingStatus;
+use tasks_client::api::http::{BriefingStatus, RejectedBundle};
 use tasks_client::api::models::{
-    Build, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent, OrchestratorMessage,
-    Project, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
+    OrchestratorMessage, Project, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
+    TaskId, TaskState,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -64,6 +65,18 @@ pub struct AppState {
     pub specs: Vec<Spec>,
     pub spec_queue: Vec<SpecQueueItem>,
     pub builds: Vec<Build>,
+    /// Implementations whose branch could not be pushed, newest first. Read
+    /// like every other list — a full snapshot per event — because there is
+    /// no table behind it either: the server derives it from the directory,
+    /// so a bundle a human deleted on the server host disappears here on the
+    /// next refresh rather than lingering as a row.
+    ///
+    /// Empty on a server too old to serve `/bundles`, or one without the
+    /// service: [`Snapshot::fetch`] deliberately does not banner that, because
+    /// an app that cannot show preserved work should not imply there is none —
+    /// it simply shows nothing, and the server logs and the failure reason on
+    /// the build still say where the file is.
+    pub bundles: Vec<RejectedBundle>,
     /// Newest [`ACTIVITY_LIMIT`] events, newest first.
     pub activity: Vec<Event>,
     pub briefings: Vec<BriefingStatus>,
@@ -124,6 +137,7 @@ struct Snapshot {
     specs: Option<Vec<Spec>>,
     spec_queue: Option<Vec<SpecQueueItem>>,
     builds: Option<Vec<Build>>,
+    bundles: Option<Vec<RejectedBundle>>,
     activity: Option<Vec<Event>>,
     briefings: Option<Vec<BriefingStatus>>,
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
@@ -160,6 +174,11 @@ impl Snapshot {
         take(&mut snapshot.specs, &mut error, client.specs());
         take(&mut snapshot.spec_queue, &mut error, client.spec_queue());
         take(&mut snapshot.builds, &mut error, client.builds());
+        // Not through `take`: a server without the bundle service answers 503,
+        // and that is a configuration this app has nothing to say about. It
+        // must not raise the banner every refresh forever — the ordinary
+        // reading of a red banner is "something broke just now".
+        snapshot.bundles = client.bundles().ok();
         take(
             &mut snapshot.activity,
             &mut error,
@@ -265,6 +284,7 @@ impl AppState {
             specs: Vec::new(),
             spec_queue: Vec::new(),
             builds: Vec::new(),
+            bundles: Vec::new(),
             activity: Vec::new(),
             briefings: Vec::new(),
             orchestrator_messages: Vec::new(),
@@ -511,7 +531,7 @@ impl AppState {
                 $(if let Some(value) = snapshot.$field { self.$field = value; })+
             };
         }
-        merge!(projects, tasks, sessions, specs, spec_queue, builds, activity, briefings);
+        merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity, briefings);
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
         // The opening window is the same code path — an empty list has no
@@ -729,6 +749,26 @@ impl AppState {
         });
     }
 
+    /// Throw a preserved implementation away.
+    ///
+    /// Optimistic, which is unusual here and deliberate: the block disappears
+    /// on the click rather than a refresh later, because a Delete that leaves
+    /// its subject on screen reads as not having worked and invites a second
+    /// click at something the server may already have removed. The rollback
+    /// puts it back if the server refuses — a 404 for a bundle the retention
+    /// policy reclaimed in the same breath, most likely, which is the one case
+    /// where the local removal was right anyway and the refresh agrees.
+    pub fn delete_bundle(&mut self, id: BuildId, cx: &mut Context<Self>) {
+        let rollback = self.bundles.clone();
+        self.bundles.retain(|bundle| bundle.build_id != id);
+        cx.notify();
+        self.run_rolling_back(
+            cx,
+            move |client| client.delete_build_bundle(&id),
+            move |state, _cx| state.bundles = rollback,
+        );
+    }
+
     /// Stop whatever this task currently has in flight.
     ///
     /// Which run that is needs no guessing: a scout is the task's own
@@ -744,9 +784,7 @@ impl AppState {
     pub fn cancel_run(&mut self, id: TaskId, cx: &mut Context<Self>) {
         if let Some(session) = self.running_session(&id) {
             let session_id = session.id.clone();
-            self.run(cx, move |client| {
-                client.cancel_session(&session_id, None)
-            });
+            self.run(cx, move |client| client.cancel_session(&session_id, None));
             return;
         }
         if let Some(build) = self
@@ -807,6 +845,16 @@ impl AppState {
 
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
         self.tasks.iter().find(|task| &task.id == id)
+    }
+
+    /// The preserved implementation covering a task, if there is one.
+    ///
+    /// Keyed to the *task* rather than to a build, because a build that never
+    /// landed a branch has no PR and appears nowhere in this app — there is no
+    /// build row to hang it off. Newest first from the server, so the first
+    /// match is the newest attempt, which is the one worth recovering.
+    pub fn bundle_for_task(&self, id: &TaskId) -> Option<&RejectedBundle> {
+        bundle_covering(&self.bundles, id)
     }
 
     /// The project a task belongs to — for the GitHub link.
@@ -903,6 +951,17 @@ fn ranked_first<T, I: PartialEq>(items: &mut [T], order: &[I], id: impl Fn(&T) -
     );
 }
 
+/// The newest preserved implementation covering a task, if any.
+///
+/// A free function so it is testable without a `Context`; the list arrives
+/// newest first from the server, so "the newest attempt" is just the first
+/// match. A task can be covered by more than one bundle — two builds over the
+/// same spec can both have failed egress — and the older one is not hidden,
+/// only shown second to whoever goes looking through `GET /bundles`.
+fn bundle_covering<'a>(bundles: &'a [RejectedBundle], id: &TaskId) -> Option<&'a RejectedBundle> {
+    bundles.iter().find(|bundle| bundle.task_ids.contains(id))
+}
+
 /// What a queue reorder left unranked, if anything: a task that is picked up
 /// but came back with no `manual_rank` was not in the order that was posted,
 /// so it lost its place.
@@ -987,6 +1046,57 @@ mod tests {
             },
             task_id: TaskId::from_raw(format!("task-{number}")),
         }
+    }
+
+    fn bundle(build: &str, tasks: &[&str]) -> RejectedBundle {
+        RejectedBundle {
+            build_id: tasks_client::api::models::BuildId::from_raw(build),
+            path: format!("/var/tasks/build-scratch/rejected/{build}.bundle"),
+            bytes: 4096,
+            created_at: Utc.timestamp_opt(0, 0).unwrap(),
+            branch: format!("build/{build}"),
+            base_sha: Some("b45e5ba".into()),
+            head_sha: Some("deadbeef".into()),
+            exit_reason: Some("branch egress: push refused".into()),
+            task_ids: tasks.iter().map(|id| TaskId::from_raw(*id)).collect(),
+            recovery_command: "git fetch /var/tasks/x.bundle 'b:b'".into(),
+            superseded: false,
+        }
+    }
+
+    /// A bundle is one file over a whole batch, so it covers every task in
+    /// that batch — the inspector for any of them has to find it.
+    #[test]
+    fn a_bundle_covers_every_task_in_its_batch() {
+        let bundles = vec![bundle("build-1", &["task-7", "task-9"])];
+        for id in ["task-7", "task-9"] {
+            assert_eq!(
+                bundle_covering(&bundles, &TaskId::from_raw(id)).map(|b| b.build_id.to_string()),
+                Some("build-1".to_string()),
+                "{id}"
+            );
+        }
+        assert!(bundle_covering(&bundles, &TaskId::from_raw("task-11")).is_none());
+    }
+
+    /// The server answers newest first, so the first match is the newest
+    /// attempt — which is the one worth recovering when a task has been built
+    /// and failed egress twice.
+    #[test]
+    fn the_newest_attempt_is_the_one_shown() {
+        let bundles = vec![
+            bundle("build-new", &["task-7"]),
+            bundle("build-old", &["task-7"]),
+        ];
+        assert_eq!(
+            bundle_covering(&bundles, &TaskId::from_raw("task-7")).map(|b| b.build_id.to_string()),
+            Some("build-new".to_string())
+        );
+    }
+
+    #[test]
+    fn nothing_preserved_covers_nothing() {
+        assert!(bundle_covering(&[], &TaskId::from_raw("task-7")).is_none());
     }
 
     fn numbers(tasks: &[Task]) -> Vec<u64> {

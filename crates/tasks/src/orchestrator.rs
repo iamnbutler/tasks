@@ -1256,6 +1256,14 @@ fn system_prompt(
          - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
            and which turn of this conversation explains it\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
+         - GET /bundles, GET /builds/{{id}}/bundle — implementations whose \
+           branch could not be pushed. The VM is gone before egress runs, so \
+           each of these is the ONLY copy of a finished implementation, \
+           sitting as a file on this host. Empty list is the normal answer; a \
+           503 means this server cannot say, which is not the same as none. \
+           When one exists, it usually outranks whatever else you were going \
+           to report: name the tasks it covers, the failure reason, and the \
+           recovery_command verbatim so a human can run it\n\
          - GET /events?since=N — the activity log, newest last. Reach for it \
            when you need history the brief does not cover, and page a bounded \
            window: it is a log, not a state snapshot, and re-deriving the \
@@ -1274,6 +1282,12 @@ fn system_prompt(
          no second opinion anywhere in the loop, and no charter capability \
          covers that; it answers you 403. When you think a task needs no \
          scouting, say so and let the human make the call.\n\n\
+         Also not yours: DELETE /builds/{{id}}/bundle — deleting the only \
+         copy of an implementation. There is no undo, and the retention \
+         policy already reclaims every bundle whose whole batch was rebuilt \
+         and shipped, so what is left is by construction work nobody \
+         reproduced; it answers you 403 too. Say which one you think is \
+         redundant and why.\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → awaiting_merge → done (rejected = terminal). Issue \

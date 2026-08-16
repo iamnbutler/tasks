@@ -63,6 +63,7 @@ use vm_pool_protocol::{VmConfig, VmId};
 use crate::brief::Brief;
 use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
+use crate::bundles::RejectedBundles;
 use crate::events::EventPayload;
 use crate::github::{GitHubClient, IntakeFilter, PrState};
 use crate::models::{
@@ -798,8 +799,13 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let served = server::serve_on(
         listener,
         store,
-        Some(briefings),
-        config.github_client().map(Arc::new),
+        server::Services {
+            briefings: Some(briefings),
+            github: config.github_client().map(Arc::new),
+            bundles: Some(Arc::new(RejectedBundles::under(
+                builder_config(&config).scratch_root,
+            ))),
+        },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`
             // sends to swap a running server, and the default disposition
@@ -1201,6 +1207,8 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
         None => info!("intake accepts every open issue (TASKS_INTAKE_LABEL unset)"),
     }
 
+    let bundles = RejectedBundles::under(builder_config(&config).scratch_root);
+
     loop {
         match store.get_mode().await {
             Ok(Mode::Stop) => {}
@@ -1210,6 +1218,11 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
                     Ok(n) => info!(ingested = n, "poll ingested new tasks"),
                     Err(e) => warn!(error = %e, "poll failed"),
                 }
+                // Immediately after the poll, deliberately: `poll_once` is
+                // where superseding evidence arrives. `done` is written by the
+                // closure-derived retirement inside it, and `done` is half the
+                // retention predicate.
+                reclaim_bundles(&store, &bundles).await;
             }
             Err(e) => warn!(error = %e, "could not read mode; skipping poll"),
         }
@@ -1323,6 +1336,76 @@ pub async fn poll_once(
         watch_merges(store, github, &project, trunk).await?;
     }
     Ok(ingested)
+}
+
+/// Retention for preserved bundles: delete only what has demonstrably been
+/// **reproduced and shipped**.
+///
+/// Never by age and never by disk usage. A bundle holds the only copy of a
+/// finished implementation — the VM was deallocated before egress ran — so the
+/// only safe reason to delete one is that the same work now exists somewhere
+/// it cannot be lost from. [`Store::build_superseded`] is that predicate:
+/// every spec in the batch carried by a *later* build that succeeded, and
+/// every task in it `done`, which in this system means the issue is closed
+/// upstream. An old bundle for work nobody ever rebuilt is kept forever, and
+/// that is the intended behaviour rather than a leak — see
+/// [`ObligationKind::LandBatch`][crate::store::ObligationKind] for the other
+/// half of not losing work quietly.
+///
+/// A deletion that fails is logged and left for the next pass; a bundle whose
+/// build row is gone is left alone, since nothing can show it was reproduced.
+///
+/// Rides [`poll_loop`], so it is gated on a GitHub token. That is correct
+/// rather than a limitation: a tokenless server never retires anything, so
+/// nothing can ever become superseded.
+pub async fn reclaim_bundles(store: &Store, bundles: &RejectedBundles) {
+    let files = match bundles.list().await {
+        Ok(files) => files,
+        Err(e) => {
+            warn!(dir = %bundles.dir().display(), error = %e, "could not list preserved bundles");
+            return;
+        }
+    };
+    for file in files {
+        match store.build_superseded(&file.build_id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(build_id = %file.build_id, error = %e, "could not judge a preserved bundle");
+                continue;
+            }
+        }
+        match bundles.remove(&file.build_id).await {
+            Ok(true) => {
+                info!(
+                    build_id = %file.build_id,
+                    bytes = file.bytes,
+                    "reclaimed a preserved bundle: every spec in its batch was rebuilt \
+                     and shipped"
+                );
+                if let Err(e) = store
+                    .append_event(EventPayload::BundleRemoved {
+                        build_id: file.build_id.clone(),
+                        superseded: true,
+                        // The server acting on a fact it observed — the work
+                        // shipped — and not a judgment anybody made. Never
+                        // `Human`: a misattributed write escalates here,
+                        // because the human is the one nothing gates.
+                        actor: Actor::System,
+                    })
+                    .await
+                {
+                    warn!(build_id = %file.build_id, error = %e, "could not record a reclaim");
+                }
+            }
+            // Somebody deleted it between the listing and here. Nothing to say.
+            Ok(false) => {}
+            Err(e) => {
+                warn!(build_id = %file.build_id, error = %e, "could not reclaim a bundle; \
+                      leaving it for the next pass");
+            }
+        }
+    }
 }
 
 /// Closure-derived retirement: issue closure IS the "done" signal for picked-up

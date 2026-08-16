@@ -24,8 +24,9 @@ use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
     BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
-    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, ReopenTaskRequest,
-    ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, ServerStatus, SetCharter, SetMode,
+    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
+    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, ServerStatus,
+    SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -186,6 +187,15 @@ impl Client {
             .call()
             .map_err(map_ureq)?
             .into_json()?)
+    }
+
+    /// A delete whose only answer is 204 — no body to decode.
+    fn delete(&self, path: &str) -> Result<()> {
+        self.calls
+            .delete(&self.url(path))
+            .call()
+            .map_err(map_ureq)?;
+        Ok(())
     }
 
     // --- version ---
@@ -501,6 +511,40 @@ impl Client {
                 evidence: None,
             },
         )
+    }
+
+    // --- preserved bundles ---
+
+    /// Every implementation whose branch could not be pushed, newest first.
+    ///
+    /// An empty list means the server looked and found nothing. A server with
+    /// no bundle directory configured answers 503 instead — deliberately not
+    /// an empty list, since "nothing was preserved" is the one wrong thing to
+    /// say about work that exists in exactly one place.
+    pub fn bundles(&self) -> Result<Vec<RejectedBundle>> {
+        self.get_json("/bundles", &[])
+    }
+
+    /// One build's preserved bundle. `None` rather than an error for the 404,
+    /// like [`Self::session_notes`]: every build that landed its branch has
+    /// none, which is the overwhelming majority.
+    pub fn build_bundle(&self, id: &BuildId) -> Result<Option<RejectedBundle>> {
+        match self.get_json::<RejectedBundle>(&format!("/builds/{id}/bundle"), &[]) {
+            Ok(bundle) => Ok(Some(bundle)),
+            Err(ClientError::Api { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Throw a preserved implementation away. There is no undo, and the
+    /// retention policy already reclaims anything that has been rebuilt and
+    /// shipped — so what this deletes is, by construction, the only copy of
+    /// something nobody reproduced.
+    ///
+    /// Human-only at the server. A 404 means it was already gone (a second
+    /// click, or a reclaim that got there first).
+    pub fn delete_build_bundle(&self, id: &BuildId) -> Result<()> {
+        self.delete(&format!("/builds/{id}/bundle"))
     }
 
     /// "Build now": write the spec by hand, approve it, and queue the Builder
