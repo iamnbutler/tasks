@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gpui = { package = "gpui-unofficial", version = "1.14.2" }
+# Exact, not caret: gpuikit asks for ^1.14.2, so `=1.14.2` unifies with it,
+# and a future gpuikit needing 1.15 becomes a loud resolution error here
+# instead of a silent bump under an app that pins nothing else.
+gpui = { package = "gpui-unofficial", version = "=1.14.2" }
 # runtime_shaders: compile Metal shaders at runtime so builds don't need the
 # Xcode Metal toolchain.
-gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "1.14.2", features = ["font-kit", "runtime_shaders"] }
-# Pinned to the inline-links/inline-code/soft-break markdown fixes
-# (iamnbutler/gpuikit#122); move back to a crates.io version once that
-# merges and releases.
-gpuikit = { git = "https://github.com/iamnbutler/gpuikit", rev = "1d9aaf3dbd7fdf04886963efe9dfb847d1682afe" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.14.2", features = ["font-kit", "runtime_shaders"] }
+gpuikit = "0.7"
 smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.
