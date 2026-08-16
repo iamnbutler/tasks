@@ -744,9 +744,7 @@ impl AppState {
     pub fn cancel_run(&mut self, id: TaskId, cx: &mut Context<Self>) {
         if let Some(session) = self.running_session(&id) {
             let session_id = session.id.clone();
-            self.run(cx, move |client| {
-                client.cancel_session(&session_id, None)
-            });
+            self.run(cx, move |client| client.cancel_session(&session_id, None));
             return;
         }
         if let Some(build) = self

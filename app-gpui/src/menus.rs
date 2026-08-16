@@ -1,10 +1,17 @@
 //! The application menu bar.
 //!
+//! The bar is *derived*, not written: [`menus`] is a fold over
+//! [`crate::commands::COMMANDS`], one menu per [`Slot`], with only the Edit
+//! menu spliced in by hand — its items dispatch gpuikit's own input actions
+//! through `MenuItem::os_action`, which are not this app's actions and are
+//! never bound here. Which verbs exist, what they are called, what they are
+//! bound to and when they grey out all live in that one table.
+//!
 //! Two entry points, and the order between them is load-bearing: [`init`]
-//! registers the handlers *and the key bindings*, then [`set`] installs the
-//! bar. gpui reads shortcuts out of the keymap while building the menu, once —
-//! an action bound after `set_menus` shows no key equivalent and nothing warns
-//! you about it.
+//! registers the handlers, `commands::bind_keys` installs the bindings, then
+//! [`set`] installs the bar. gpui reads shortcuts out of the keymap while
+//! building the menu, once — an action bound after `set_menus` shows no key
+//! equivalent and nothing warns you about it.
 //!
 //! Handlers are global (`App::on_action`) rather than hung off the workspace
 //! root. Minimize/Zoom/Close act on whichever window is focused — including
@@ -29,18 +36,14 @@
 //! are rare, so the total is bounded.
 
 use gpui::Global;
-use gpui::{actions, App, KeyBinding, Menu, MenuItem, OsAction, Window};
+use gpui::{actions, App, Menu, MenuItem, OsAction, Window};
 use gpuikit::input::bindings;
 use tasks_client::api::models::Mode;
 
 use crate::about;
+use crate::commands::{self, Facts, Slot};
 use crate::server::{self, Op};
 use crate::server_window;
-use crate::workspace::{
-    ApproveSelectedSpec, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, QueueSelectedTask,
-    ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock, ToggleRightDock,
-    ToggleShowDone,
-};
 
 actions!(
     tasks,
@@ -132,10 +135,15 @@ struct InstalledMenus(MenuState);
 
 impl Global for InstalledMenus {}
 
-/// Register the menu bar's action handlers and key bindings.
+/// Register the menu bar's *global* action handlers.
 ///
-/// Must run before [`set`], and after `bind_input_keys` and the dock
-/// bindings — that ordering is the whole constraint in `main`.
+/// The key bindings are not here any more — `commands::bind_keys` installs
+/// every one of them from the registry, and it must run before [`set`] for the
+/// reason the module docs give. What is left here is the half of the handlers
+/// that is global on purpose: Minimize/Zoom/Close act on whichever window is
+/// focused (including the About window, which has no workspace behind it), and
+/// Hide/Quit are not a window's business at all. The workspace's own handlers
+/// stay on the workspace root, so they grey out with nothing focused.
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &About, cx| about::open(cx));
     cx.on_action(|_: &Hide, cx| cx.hide());
@@ -175,38 +183,6 @@ pub fn init(cx: &mut App) {
             server::open_path(&dir);
         }
     });
-
-    // The App and Window menus' shortcuts. The Edit menu's belong to
-    // gpuikit's input bindings, which `bind_input_keys` already installed,
-    // and the dock toggles' are bound in `main` next to their context.
-    //
-    // Nothing in the Server menu is bound, deliberately: a one-keystroke
-    // server restart is the foot-gun this menu is trying not to build.
-    // Whoever adds one later must add it *here*, before `set` — gpui reads
-    // shortcuts out of the keymap once, while building the bar, and a binding
-    // installed afterwards shows no key equivalent with nothing to warn you.
-    cx.bind_keys([
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("cmd-alt-h", HideOthers, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-    ]);
-
-    // The Task menu's three verbs, in the workspace's context: they act on
-    // the selected row, so they should grey out with no workspace focused —
-    // and they must be bound *here*, before `set`, for the same reason as
-    // everything else in this bar.
-    //
-    // Only these three, and only the safe ones. Closing an issue is one
-    // click in the row menu and no keystroke anywhere: it is the one verb
-    // here that changes something outside this machine.
-    let ws = Some("Workspace");
-    cx.bind_keys([
-        KeyBinding::new(QUEUE_KEYSTROKE, QueueSelectedTask, ws),
-        KeyBinding::new(SCOUT_KEYSTROKE, ScoutSelectedTask, ws),
-        KeyBinding::new(APPROVE_KEYSTROKE, ApproveSelectedSpec, ws),
-    ]);
 }
 
 /// Install the menu bar. Call after [`init`].
@@ -227,125 +203,56 @@ pub fn sync(cx: &mut App, state: MenuState) {
 
 /// The bar itself, as data — kept separate from [`set`] so the structure is
 /// testable without standing up a gpui `App`.
+///
+/// Every menu but Edit is a fold over the registry. `Selection::Unknown` is
+/// what the bar passes: it cannot grey per selection, because `set_menus`
+/// leaks a boxed action per item on every rebuild (see the module docs) and
+/// the selection moves on every arrow key. A verb that cannot run therefore
+/// says so in the sidebar banner when it is *chosen* — a keystroke that
+/// quietly does nothing reads as a bug, the reason reads as an answer.
 fn menus(state: MenuState) -> Vec<Menu> {
+    let facts = Facts::for_menu_bar(state);
+    let menu = |slot: Slot| Menu::new(slot.menu_name()).items(commands::menu_items(slot, facts));
     vec![
-        Menu::new("Tasks").items([
-            MenuItem::action("About Tasks", About),
-            MenuItem::separator(),
-            MenuItem::action("Hide Tasks", Hide),
-            MenuItem::action("Hide Others", HideOthers),
-            MenuItem::action("Show All", ShowAll),
-            MenuItem::separator(),
-            MenuItem::action("Quit Tasks", Quit),
-        ]),
-        Menu::new("File").items([
-            // `New Issue` goes here when the window that creates one lands —
-            // one `MenuItem::action` line plus its `cmd-n` binding in `init`.
-            MenuItem::action("Close Window", CloseWindow),
-        ]),
-        // These dispatch gpuikit's *own* input actions rather than new ones,
-        // so the items drive exactly the code path `cmd-c` already drove and
-        // every present and future `InputState` is covered without opting in.
-        // `os_action` maps them to the AppKit selectors, which keeps the key
-        // equivalents working inside system panels. Undo/Redo are the
-        // exception gpui documents: with no `NSTextView` behind them `undo:`
-        // and `redo:` are permanently disabled, so gpui routes those two back
-        // through its own dispatch and they behave like plain actions.
-        Menu::new("Edit").items([
-            MenuItem::os_action("Undo", bindings::Undo, OsAction::Undo),
-            MenuItem::os_action("Redo", bindings::Redo, OsAction::Redo),
-            MenuItem::separator(),
-            MenuItem::os_action("Cut", bindings::Cut, OsAction::Cut),
-            MenuItem::os_action("Copy", bindings::Copy, OsAction::Copy),
-            MenuItem::os_action("Paste", bindings::Paste, OsAction::Paste),
-            MenuItem::separator(),
-            MenuItem::os_action("Select All", bindings::SelectAll, OsAction::SelectAll),
-        ]),
-        // Section navigation. The key equivalents (⌘1–⌘5) come from the
-        // workspace bindings in `main`, which run before `set` — the same
-        // ordering constraint as everything else in this bar.
-        Menu::new("View").items([
-            MenuItem::action("Home", GoToHome),
-            MenuItem::action("Tasks", GoToTasks),
-            MenuItem::action("Queue", GoToQueue),
-            MenuItem::action("Activity", GoToActivity),
-            MenuItem::action("Chat", GoToChat),
-            MenuItem::separator(),
-            // Below the separator because it filters a section rather than
-            // going to one. Its `shift-cmd-d` is bound in `main`, with the
-            // section shortcuts and before `set` — same constraint.
-            MenuItem::action("Show Done Tasks", ToggleShowDone).checked(state.show_done),
-        ]),
-        // The selected row's safe verbs, so the three that are worth a
-        // keystroke have somewhere to announce themselves. The rest of the
-        // row's verbs live in its context menu, which can grey per row;
-        // these cannot.
-        //
-        // Nothing here greys with the selection, deliberately: `set_menus`
-        // leaks a boxed action per item on every rebuild (see the module
-        // docs) and the selection changes on every arrow key, so rebuilding
-        // the bar per selection is not an option. A verb that cannot run
-        // says so in the sidebar banner when it is asked to — a keystroke
-        // that quietly does nothing reads as a bug, the reason reads as an
-        // answer.
-        Menu::new("Task").items([
-            MenuItem::action("Add to Queue", QueueSelectedTask),
-            MenuItem::action("Scout Now", ScoutSelectedTask),
-            MenuItem::action("Approve Spec", ApproveSelectedSpec),
-        ]),
+        menu(Slot::App),
+        menu(Slot::File),
+        edit_menu(),
+        menu(Slot::View),
+        menu(Slot::Task),
         // The one menu that acts on the server *process* rather than over
         // HTTP, because a server cannot gracefully swap itself out through
         // its own API.
-        //
-        // Status comes first so you can see what you are about to interrupt.
-        // The pipeline group is last-but-one and prefixed, because it governs
-        // dispatch rather than the process — same menu, different subject,
-        // and the prefix is what keeps "Stop Server" and "Pipeline: Stop"
-        // from reading as two spellings of one thing.
-        Menu::new("Server").items([
-            MenuItem::action("Server Status…", ShowServerStatus),
-            MenuItem::separator(),
-            // `tasks reload` with no live pid already *is* a start, so this
-            // is one item that renames itself rather than two that run the
-            // same command.
-            match state.serving {
-                true => MenuItem::action("Restart Server…", RestartServer),
-                false => MenuItem::action("Start Server", RestartServer),
-            }
-            .disabled(state.busy),
-            // `--when-idle` and `stop` both need something to be running:
-            // with nothing up, the first has nothing to wait for and the
-            // second nothing to stop.
-            MenuItem::action("Restart When Idle…", RestartServerWhenIdle)
-                .disabled(state.busy || !state.serving),
-            // "Stop Server…" earned its ellipsis: with work in flight it now
-            // asks in the Server window rather than ending the process under
-            // it. "Stop When Idle…" sits beside it exactly as the restart pair
-            // does, and greys out on the same two facts.
-            MenuItem::action("Stop Server…", StopServer).disabled(state.busy || !state.serving),
-            MenuItem::action("Stop When Idle…", StopServerWhenIdle)
-                .disabled(state.busy || !state.serving),
-            MenuItem::separator(),
-            MenuItem::action("Pipeline: Play", SetModePlay).checked(state.mode == Some(Mode::Play)),
-            MenuItem::action("Pipeline: Pause", SetModePause)
-                .checked(state.mode == Some(Mode::Pause)),
-            MenuItem::action("Pipeline: Stop", SetModeStop).checked(state.mode == Some(Mode::Stop)),
-            MenuItem::separator(),
-            MenuItem::action("Reveal serve.log", RevealServeLog),
-            MenuItem::action("Open Data Directory", OpenDataDirectory),
-        ]),
+        menu(Slot::Server),
         // The name is load-bearing: gpui special-cases the literal string
         // "Window" and hands that menu to AppKit as the windows menu, which is
         // what makes the list of open windows append itself. Renaming it
-        // silently loses that.
-        Menu::new("Window").items([
-            MenuItem::action("Minimize", Minimize),
-            MenuItem::action("Zoom", Zoom),
-            MenuItem::separator(),
-            MenuItem::action("Toggle Left Dock", ToggleLeftDock),
-            MenuItem::action("Toggle Right Dock", ToggleRightDock),
-        ]),
+        // silently loses that — which is why `Slot::Window::menu_name` is not
+        // free to change either.
+        menu(Slot::Window),
     ]
+}
+
+/// The one menu the registry does not generate.
+///
+/// These dispatch gpuikit's *own* input actions rather than new ones, so the
+/// items drive exactly the code path `cmd-c` already drove and every present
+/// and future `InputState` is covered without opting in. `os_action` maps them
+/// to the AppKit selectors, which keeps the key equivalents working inside
+/// system panels. Undo/Redo are the exception gpui documents: with no
+/// `NSTextView` behind them `undo:` and `redo:` are permanently disabled, so
+/// gpui routes those two back through its own dispatch and they behave like
+/// plain actions.
+fn edit_menu() -> Menu {
+    Menu::new("Edit").items([
+        MenuItem::os_action("Undo", bindings::Undo, OsAction::Undo),
+        MenuItem::os_action("Redo", bindings::Redo, OsAction::Redo),
+        MenuItem::separator(),
+        MenuItem::os_action("Cut", bindings::Cut, OsAction::Cut),
+        MenuItem::os_action("Copy", bindings::Copy, OsAction::Copy),
+        MenuItem::os_action("Paste", bindings::Paste, OsAction::Paste),
+        MenuItem::separator(),
+        MenuItem::os_action("Select All", bindings::SelectAll, OsAction::SelectAll),
+    ])
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
@@ -607,6 +514,9 @@ mod tests {
         }
     }
 
+    /// The sections in sidebar order, then the two palettes — because a
+    /// surface reachable only by knowing its keystroke is one most people
+    /// never find — then the archive filter.
     #[test]
     fn view_menu_covers_every_section_in_sidebar_order() {
         let actions: Vec<_> = items("View").into_iter().map(|(_, a)| a).collect();
@@ -618,6 +528,8 @@ mod tests {
                 "workspace::GoToQueue",
                 "workspace::GoToActivity",
                 "workspace::GoToChat",
+                "palette::GoToAnything",
+                "palette::ShowCommandPalette",
                 "workspace::ToggleShowDone",
             ]
         );
@@ -687,9 +599,46 @@ mod tests {
         );
     }
 
+    /// New Issue joined this menu when the window that creates one landed —
+    /// the comment that used to sit here said it should.
     #[test]
     fn file_menu_only_offers_what_exists() {
         let actions: Vec<_> = items("File").into_iter().map(|(_, a)| a).collect();
-        assert_eq!(actions, ["tasks::CloseWindow"]);
+        assert_eq!(actions, ["workspace::NewIssue", "tasks::CloseWindow"]);
+    }
+
+    /// The bar is a fold over the registry, so nothing in the registry can be
+    /// invisible in the bar and nothing in the bar can be absent from the
+    /// registry. This is the check that a command added to the table cannot
+    /// quietly fail to appear — the failure mode the old hand-written lists
+    /// had in both directions.
+    #[test]
+    fn every_registry_command_with_a_slot_reaches_the_bar() {
+        let in_bar: Vec<&'static str> = menus(MenuState::default())
+            .iter()
+            // Edit is spliced in by hand and dispatches gpuikit's actions.
+            .filter(|menu| menu.name != "Edit")
+            .flat_map(|menu| menu.items.iter())
+            .filter_map(|item| match item {
+                MenuItem::Action { action, .. } => Some(action.name()),
+                _ => None,
+            })
+            .collect();
+
+        let expected: Vec<&'static str> = commands::COMMANDS
+            .iter()
+            .filter(|command| command.menu.is_some())
+            .map(|command| (command.action)().name())
+            .collect();
+        assert_eq!(in_bar, expected);
+
+        // …and every one of them still says something.
+        for menu in menus(MenuState::default()) {
+            for item in &menu.items {
+                if let MenuItem::Action { name, .. } = item {
+                    assert!(!name.is_empty(), "{} has a nameless item", menu.name);
+                }
+            }
+        }
     }
 }

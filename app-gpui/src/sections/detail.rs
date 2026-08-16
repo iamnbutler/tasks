@@ -400,23 +400,18 @@ impl Workspace {
                             .text_sm()
                             .child(text_area(&self.build_input, cx).size_full()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(self.form_button(
-                                "build-now",
-                                "Build Now",
-                                gpui::hsla(200. / 360., 0.70, 0.58, 1.),
-                                has_text,
-                                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.build_selected_task_now(cx);
-                                }),
-                                cx,
-                            )),
-                    ),
+                    .child(div().flex().flex_row().items_center().gap(px(6.)).child(
+                        self.form_button(
+                            "build-now",
+                            "Build Now",
+                            gpui::hsla(200. / 360., 0.70, 0.58, 1.),
+                            has_text,
+                            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.build_selected_task_now(cx);
+                            }),
+                            cx,
+                        ),
+                    )),
             );
         }
 
