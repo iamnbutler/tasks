@@ -128,7 +128,11 @@ implementation.
 - `crates/vm-pool/` — vendored VM infrastructure (protocol, pool, service,
   client, supervisor). Has its own CLAUDE.md and TODO.md; conventions there
   apply within it (notably: no mocks, real processes in tests)
-- `images/` — container image definitions (base, agent, automation)
+- `images/` — container image definitions. `base`, `agent` and `automation`
+  are vm-pool's own (it stays independently publishable); `scout` and
+  `builder` are Tasks'. A tool a Tasks crate needs goes in the latter two,
+  duplicated, rather than once in `agent` — app vocabulary does not enter
+  vm-pool's images any more than it enters its code
 - `docs/plans/` — implementation plans; `docs/vm-pool.md` — vm-pool spec
 - `spec` for the platform: issue #744 + docs/plans/2026-08-09-v2-resume.md
 
@@ -264,21 +268,37 @@ would cost seconds and hide a real leak. Tuning lives in
 `.config/nextest.toml`.
 
 **`app-gpui` is not a workspace member, so none of the above touches it — and
-it *can* be checked from a Linux agent VM**, which was long assumed otherwise:
+it *can* be compiled and tested from a Linux agent VM**, which was long
+assumed otherwise:
 
 ```sh
 make app-check   # cargo check --all-targets, ~1 minute cold
 make app-test    # the app's own unit tests
+cd app-gpui && cargo test   # the same thing, when the deps below are present
 ```
 
-Neither needs a display, X11 dev packages or a Mac. `RUST_FONTCONFIG_DLOPEN=1`
-makes `yeslogic-fontconfig-sys` skip the `pkg_config` probe that is the only
-thing blocking the check, and linking the *test* binary is satisfied by three
-empty stub `.so`s (`-lxcb`, `-lxkbcommon`, `-lxkbcommon-x11`) that `app-stubs`
+Neither needs a display or a Mac. The build wants five packages —
+`pkg-config libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev
+libxcb1-dev` — which `images/{scout,builder}/Dockerfile` install, so in a VM
+off a current image all three commands above are plain cargo. Where they are
+absent the make targets fall back to what they always did:
+`RUST_FONTCONFIG_DLOPEN=1` makes `yeslogic-fontconfig-sys` skip its
+`pkg_config` probe, and linking the *test* binary is satisfied by three empty
+stub `.so`s (`-lxcb`, `-lxkbcommon`, `-lxkbcommon-x11`) that `app-stubs`
 generates — the tests are pure functions over view state and never enter the
-platform layer. What this cannot tell you is whether a pixel landed correctly;
-that still needs `make app` on a Mac. But "the GUI can't be compiled here" was
-costing every app-gpui change its feedback loop, and it was not true.
+platform layer. The Makefile picks between the two with one `pkg-config
+--exists`, because the fallback must not stay the default once the packages
+exist: `-L` beats the system paths, so the empty stubs would shadow the real
+libraries, and `RUSTFLAGS` is part of cargo's fingerprint, so a stubbed
+`make app-test` and a hand-run `cargo test` would each rebuild the whole gpui
+tree over the other.
+
+The boundary is compile and test, yes; **run, no**. A green `make app-test`
+says the code compiles and its logic holds, not that a pixel landed anywhere —
+the title bar next to the traffic lights, icon-only rows at 240px and whether
+a menu item is actually greyed are still `make app` on a Mac. But "the GUI
+can't be compiled here" was costing every app-gpui change its feedback loop,
+and it was not true.
 
 Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`).
 

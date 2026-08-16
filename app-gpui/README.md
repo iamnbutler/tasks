@@ -168,6 +168,14 @@ cargo test         # from this directory — app-gpui is not a workspace member,
                    # so `cargo test --workspace` at the root skips it
 ```
 
+On Linux the build needs five packages — `pkg-config libfontconfig-dev
+libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev` — which the Scout and
+Builder images install, so a bare `cargo test` works in an agent VM off a
+current image. Without them, `make app-check` / `make app-test` from the repo
+root still compile and test the crate (they set `RUST_FONTCONFIG_DLOPEN=1` and
+link against empty stub `.so`s); the Makefile picks whichever path applies.
+Neither needs a display. Running the app is still macOS only.
+
 Connects to `http://127.0.0.1:$TASKS_SERVER_PORT` (default 4800 — the same
 variable the server reads). Without a server it shows the connecting state
 and retries every 3s. Builds without the Xcode Metal toolchain

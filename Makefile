@@ -64,28 +64,53 @@ run: app
 	@pkill -x Tasks 2>/dev/null || true
 	open ~/Applications/Tasks.app
 
-# Typecheck and test the GUI on a machine with no display, no X11 dev
-# packages and no Mac — which is every agent VM, and used to mean every
-# app-gpui change was written without a compile, let alone a test.
+# Typecheck and test the GUI on a machine with no display and no Mac — which
+# is every agent VM, and used to mean every app-gpui change was written
+# without a compile, let alone a test.
 #
-# Two obstacles, both worked around here rather than by installing anything:
+# With app-gpui's build dependencies installed (`pkg-config libfontconfig-dev
+# libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev`, which the scout and
+# builder images now carry) these are plain cargo commands, and so is a
+# hand-run `cd app-gpui && cargo test`. Without them, two obstacles:
 #
 #   * `yeslogic-fontconfig-sys`'s build.rs calls `pkg_config::find_library`
-#     and fails without it — but the same build.rs skips pkg-config entirely
-#     when RUST_FONTCONFIG_DLOPEN is set, which is all `app-check` needs.
+#     and fails — but the same build.rs skips pkg-config entirely when
+#     RUST_FONTCONFIG_DLOPEN is set, which is all `app-check` needs.
 #   * linking the *test* binary additionally wants -lxcb and -lxkbcommon(-x11).
 #     Nothing in these tests calls them: they are pure functions over view
 #     state and never enter the platform layer. Empty stub .so's satisfy the
 #     linker, and a test that did reach the platform would fail loudly rather
 #     than quietly pass.
 #
+# The workaround has to stay — the image change is inert until someone runs
+# `make images`, so every VM alive before that still needs it — but it must
+# not stay unconditional. `-L $(APP_STUB_DIR)` is searched before the system
+# paths, so the empty stubs shadow the real libraries wherever both exist, and
+# RUSTFLAGS is part of cargo's fingerprint, so a stubbed `make app-test` and a
+# hand-run `cargo test` each rebuild the whole gpui tree over the other.
+#
+# pkg-config is itself one of the five packages, so its absence is the same
+# answer as a missing header, and macOS (where none of this is needed and
+# `cd app-gpui && cargo test` is the shorter path) reaches the plain branch
+# via Homebrew's pkg-config or the fallback, both of which work.
+#
 # The app itself still comes from `make app` on a Mac; this proves the code
-# compiles and its logic holds, not that a pixel landed anywhere. On macOS the
-# stubs are unnecessary (and `cd app-gpui && cargo test` is the shorter path).
+# compiles and its logic holds, not that a pixel landed anywhere.
 APP_STUB_DIR := $(abspath $(CARGO_TARGET_DIR)/app-link-stubs)
+APP_DEPS_INSTALLED := $(shell pkg-config --exists fontconfig xkbcommon xkbcommon-x11 xcb 2>/dev/null && echo yes)
+
+ifeq ($(APP_DEPS_INSTALLED),yes)
+APP_CHECK_ENV :=
+APP_TEST_ENV :=
+APP_TEST_PREREQS :=
+else
+APP_CHECK_ENV := RUST_FONTCONFIG_DLOPEN=1
+APP_TEST_ENV := RUST_FONTCONFIG_DLOPEN=1 RUSTFLAGS="-L $(APP_STUB_DIR)"
+APP_TEST_PREREQS := app-stubs
+endif
 
 app-check:
-	cd app-gpui && RUST_FONTCONFIG_DLOPEN=1 cargo check --all-targets
+	cd app-gpui && $(APP_CHECK_ENV) cargo check --all-targets
 
 app-stubs:
 	@mkdir -p $(APP_STUB_DIR)
@@ -94,8 +119,8 @@ app-stubs:
 		cc -shared -fPIC -o $(APP_STUB_DIR)/lib$$lib.so $(APP_STUB_DIR)/stub.c || exit 1; \
 	done
 
-app-test: app-stubs
-	cd app-gpui && RUST_FONTCONFIG_DLOPEN=1 RUSTFLAGS="-L $(APP_STUB_DIR)" cargo test
+app-test: $(APP_TEST_PREREQS)
+	cd app-gpui && $(APP_TEST_ENV) cargo test
 
 # The server's own build/run loop, the same shape as `make run` for the app:
 # these swap a running server rather than refusing. Every target builds first,
