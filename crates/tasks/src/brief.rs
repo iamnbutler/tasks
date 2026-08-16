@@ -61,9 +61,10 @@ const MAX_NAMED_FILES: usize = 4;
 /// How many past decisions on the same task to recall.
 const MAX_PRIOR_DECISIONS: usize = 3;
 
-/// A succeeded build stops being context this long after it finished. Its PR
-/// may well still be open, but at some point "related work exists" is history
-/// rather than a live consideration.
+/// A build stops being context this long after it finished — the outer bound
+/// on what a brief will even consider, not the test for whether a build is
+/// still live. That test is [`is_unresolved`], which reads the batch's own
+/// state; this only keeps the window a brief loads bounded.
 const BUILD_RECENCY_DAYS: i64 = 14;
 
 /// Digits needed before a filename counts as sequence-numbered. Three is
@@ -513,7 +514,8 @@ impl<'a> Brief<'a> {
             .collect();
 
         // Only builds that are still context: in flight, or finished recently
-        // enough that their PR is plausibly still open.
+        // enough to be worth a second look. Which of *those* still claims
+        // anything is `is_unresolved`'s question, asked per fact.
         let cutoff = chrono::Utc::now() - chrono::Duration::days(BUILD_RECENCY_DAYS);
         let builds: Vec<Build> = self
             .store
@@ -592,9 +594,9 @@ impl<'a> Brief<'a> {
         // Nothing to ask about is not the same as not asking: stay silent when
         // this spec opens no PR question and proposes no numbered file, so the
         // "we skipped it" note keeps meaning something when it does appear.
-        let overlapping_pr = world.builds.iter().any(|b| {
-            b.pr_number.is_some() && !shared_files(&spec.files_touched, &b.files_touched).is_empty()
-        });
+        let overlapping_pr = unresolved_builds(spec, world)
+            .iter()
+            .any(|(build, _)| build.pr_number.is_some());
         if !overlapping_pr && sequence_candidates(&spec.files_touched).is_empty() {
             return Vec::new();
         }
@@ -635,14 +637,15 @@ impl<'a> Brief<'a> {
         let owner = &project.repo_owner;
         let name = &project.repo_name;
 
-        // PR state for every overlapping build that opened one.
-        for build in world.builds.iter() {
+        // PR state for every *unresolved* overlapping build that opened one.
+        // The filter is what keeps this inside the budget: one request per PR,
+        // serially, over every build of the last fortnight was tens of requests
+        // and reliably blew [`GITHUB_BUDGET`] — so the brief lost its whole
+        // GitHub half exactly when it had the most overlap to explain.
+        for (build, _) in unresolved_builds(spec, world) {
             let Some(number) = build.pr_number else {
                 continue;
             };
-            if shared_files(&spec.files_touched, &build.files_touched).is_empty() {
-                continue;
-            }
             match github.pull_request_state(owner, name, number).await {
                 Ok(state) => lines.push(format!("PR #{number} is {}", state.label())),
                 Err(e) => {
@@ -852,29 +855,112 @@ fn spec_overlap(spec: &Spec, world: &World) -> Vec<String> {
     lines
 }
 
-/// Files this spec claims that a build is already carrying or has shipped.
-/// PR liveness is a GitHub fact and is added separately.
+/// Files this spec claims that a build is *still* claiming. Which PRs are
+/// actually open is answered separately, and from GitHub.
+///
+/// Settled builds are counted, not listed. See [`unresolved_builds`] for why
+/// listing them was the bug: a repo that ships thirty PRs a fortnight produced
+/// thirty lines of history above the one live conflict, and the count carries
+/// the only thing they were jointly worth — that these files move often.
 fn build_overlap(spec: &Spec, world: &World) -> Vec<String> {
-    let mut lines = Vec::new();
-    for build in &world.builds {
-        let shared = shared_files(&spec.files_touched, &build.files_touched);
-        if shared.is_empty() {
-            continue;
-        }
-        let where_ = match (build.status, build.pr_number) {
-            (BuildStatus::Queued | BuildStatus::Running, _) => {
-                format!("build {} ({})", build.id, build.status.as_str())
-            }
-            (_, Some(number)) => format!("PR #{number} (build {})", build.id),
-            (status, None) => format!("build {} ({})", build.id, status.as_str()),
-        };
+    let mut lines: Vec<String> = unresolved_builds(spec, world)
+        .into_iter()
+        .map(|(build, shared)| {
+            let where_ = match (build.status, build.pr_number) {
+                (BuildStatus::Queued | BuildStatus::Running, _) => {
+                    format!("build {} ({})", build.id, build.status.as_str())
+                }
+                (_, Some(number)) => format!("PR #{number} (build {})", build.id),
+                (status, None) => format!("build {} ({})", build.id, status.as_str()),
+            };
+            format!(
+                "shares {} with {where_}: {}",
+                plural_files(shared.len()),
+                name_some(&shared),
+            )
+        })
+        .collect();
+
+    let settled = settled_overlap_count(spec, world);
+    if settled > 0 {
         lines.push(format!(
-            "shares {} with {where_}: {}",
-            plural_files(shared.len()),
-            name_some(&shared),
+            "{settled} settled build(s) of the last {BUILD_RECENCY_DAYS} days also touched \
+             these files — merged or abandoned, so this is the trunk the spec was written \
+             against rather than a competing claim on it, and they are not listed"
         ));
     }
     lines
+}
+
+/// Builds whose claim on this spec's files is still live, with the paths they
+/// share. One definition, because the overlap lines, the settled count and the
+/// PR-state lookups must not disagree about which builds those are.
+///
+/// A build in flight is obviously live. A finished one is live only while its
+/// pull request is unresolved — and *that is a Tasks-owned fact*, so it is read
+/// here rather than asked of GitHub: [`Store::finalize_build_succeeded`] parks
+/// the batch in `awaiting_merge`, and [`crate::run::watch_merges`] is the only
+/// thing that moves it out, to `done` once the commit reaches the trunk or back
+/// to `ready_to_build` when the PR closed unmerged. So a task still sitting in
+/// `awaiting_merge` *is* "nobody has resolved this PR yet", with nothing
+/// GitHub-owned persisted to say it.
+///
+/// Everything else is history, and history was drowning the signal. The 14-day
+/// window was standing in for "its PR is plausibly still open", which is a fine
+/// proxy in a repo that ships weekly and a useless one here.
+///
+/// A failed build never opened a PR and its specs went back to `approved`, so
+/// it claims nothing; what actually went wrong is [`Brief::for_blocked_spec`]'s
+/// job, and reporting it as overlap would only compete with that.
+fn unresolved_builds<'w>(spec: &Spec, world: &'w World) -> Vec<(&'w Build, Vec<String>)> {
+    world
+        .builds
+        .iter()
+        .filter(|build| is_unresolved(build, world))
+        .filter_map(|build| {
+            let shared = shared_files(&spec.files_touched, &build.files_touched);
+            (!shared.is_empty()).then_some((build, shared))
+        })
+        .collect()
+}
+
+/// How many builds overlap that [`unresolved_builds`] deliberately dropped.
+fn settled_overlap_count(spec: &Spec, world: &World) -> usize {
+    world
+        .builds
+        .iter()
+        .filter(|build| !is_unresolved(build, world))
+        .filter(|build| !shared_files(&spec.files_touched, &build.files_touched).is_empty())
+        .count()
+}
+
+/// Whether this build's work is still an open claim — see [`unresolved_builds`].
+///
+/// Matched exhaustively on purpose: a new [`BuildStatus`] is a new answer to
+/// "does this still claim its files", and a wildcard would quietly pick one.
+fn is_unresolved(build: &Build, world: &World) -> bool {
+    match build.status {
+        BuildStatus::Queued | BuildStatus::Running => true,
+        // Neither reached a pull request, and both hand the specs back
+        // `approved` — a failed build for another attempt, a cancelled one
+        // because somebody stopped it. Nothing is holding the files.
+        BuildStatus::Failed | BuildStatus::Cancelled => false,
+        BuildStatus::Succeeded => {
+            let states: Vec<TaskState> = world
+                .build_specs
+                .get(build_key(build))
+                .into_iter()
+                .flatten()
+                .filter_map(|spec_id| world.specs.iter().find(|s| &s.id == spec_id))
+                .filter_map(|spec| world.tasks.get(&spec.task_id))
+                .map(|task| task.state)
+                .collect();
+            // Nothing left to read a verdict off: a PR nobody can account for
+            // is reported, not assumed settled. Dropping it silently is the
+            // failure this whole file is written against.
+            states.is_empty() || states.contains(&TaskState::AwaitingMerge)
+        }
+    }
 }
 
 /// Two live specs reaching for the same sequence number. The base-branch half

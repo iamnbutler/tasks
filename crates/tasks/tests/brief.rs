@@ -328,6 +328,94 @@ async fn the_skipped_github_note_appears_only_when_github_had_something_to_say()
     assert!(numbered_text.contains("no token"), "{numbered_text}");
 }
 
+/// Overlap with a build is only worth a line while that build is still
+/// claiming the files. A merged batch is the trunk the spec was written on, and
+/// listing every one of them buried the single live conflict under a fortnight
+/// of shipped history — thirty-odd lines, in the repo this was found in.
+#[tokio::test]
+async fn only_builds_that_still_claim_their_files_are_listed() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+
+    // Shipped: PR merged, issue closed upstream, task retired.
+    let shipped = approved_spec(&store, &project, 861, &["src/store.rs"]).await;
+    let shipped_build = store
+        .create_build(
+            std::slice::from_ref(&shipped.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+    store
+        .finalize_build_succeeded(
+            &shipped_build.id,
+            "sha1",
+            862,
+            None,
+            &["src/store.rs".into()],
+        )
+        .await
+        .unwrap();
+    // Retirement is closure-derived, so the issue has to close first — #863 is
+    // still open and stays out of the closed set.
+    store
+        .reconcile_closed_issues(&project.id, &[863])
+        .await
+        .unwrap();
+    store
+        .retire_task(&shipped.task_id, TaskState::Done)
+        .await
+        .unwrap()
+        .expect("a merged batch's task retires to done");
+
+    // Live: PR open, batch still parked in `awaiting_merge`.
+    let parked = approved_spec(&store, &project, 863, &["src/store.rs"]).await;
+    let parked_build = store
+        .create_build(
+            std::slice::from_ref(&parked.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+    store
+        .finalize_build_succeeded(
+            &parked_build.id,
+            "sha2",
+            864,
+            None,
+            &["src/store.rs".into()],
+        )
+        .await
+        .unwrap();
+
+    let subject = seed_spec(
+        &store,
+        &project,
+        865,
+        &["src/store.rs"],
+        SpecQueueStatus::PendingReview,
+    )
+    .await;
+    let text = joined(&brief_lines(&store, &subject.id).await);
+
+    assert!(text.contains("#864"), "the unresolved PR is named: {text}");
+    assert!(
+        !text.contains("#862"),
+        "the shipped build must not read as a competing claim: {text}"
+    );
+    // Dropped, not disappeared: a brief never shrinks in silence.
+    assert!(text.contains("1 settled build(s)"), "{text}");
+    assert_eq!(
+        text.matches("shares").count(),
+        1,
+        "exactly one live overlap: {text}"
+    );
+}
+
 /// A blocked spec's obligation says work stopped; the brief has to say what
 /// actually failed, or the decision it asks for is a guess.
 #[tokio::test]
