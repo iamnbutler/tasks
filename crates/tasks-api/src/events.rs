@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{
     Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode, ProjectId,
-    RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
-    TaskState,
+    ProjectStatus, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus,
+    TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -29,6 +29,15 @@ pub struct Event {
 pub enum EventPayload {
     ProjectAdded {
         project_id: ProjectId,
+    },
+    /// A repo was paused, archived, or made active again.
+    ///
+    /// The status is *in* the payload, against the identifier-only rule above,
+    /// because it is one word and a client that had to refetch `/projects` to
+    /// learn which way the switch moved could not narrate the event at all.
+    ProjectStatusChanged {
+        project_id: ProjectId,
+        status: ProjectStatus,
     },
     TaskIngested {
         task_id: TaskId,
@@ -210,6 +219,7 @@ impl EventPayload {
     pub fn kind(&self) -> &'static str {
         match self {
             EventPayload::ProjectAdded { .. } => "project_added",
+            EventPayload::ProjectStatusChanged { .. } => "project_status_changed",
             EventPayload::TaskIngested { .. } => "task_ingested",
             EventPayload::TaskStateChanged { .. } => "task_state_changed",
             EventPayload::TaskGhStateChanged { .. } => "task_gh_state_changed",
@@ -242,8 +252,8 @@ mod tests {
     use super::*;
     use crate::models::{
         Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode,
-        ProjectId, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus,
-        TaskId, TaskState,
+        ProjectId, ProjectStatus, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId,
+        SpecQueueStatus, TaskId, TaskState,
     };
 
     fn task() -> TaskId {
@@ -257,6 +267,10 @@ mod tests {
         let samples = vec![
             EventPayload::ProjectAdded {
                 project_id: ProjectId::from_raw("proj_1"),
+            },
+            EventPayload::ProjectStatusChanged {
+                project_id: ProjectId::from_raw("proj_1"),
+                status: ProjectStatus::Paused,
             },
             EventPayload::TaskIngested {
                 task_id: task(),

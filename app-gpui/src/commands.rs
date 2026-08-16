@@ -49,9 +49,9 @@ use crate::menus::{
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
 use crate::workspace::{
-    ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, NewIssue,
-    QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock,
-    ToggleRightDock, ToggleShowDone,
+    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks,
+    NewIssue, QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop,
+    ToggleLeftDock, ToggleRightDock, ToggleShowDone,
 };
 
 /// The keymap context the workspace root sets on itself. A binding in this
@@ -293,6 +293,13 @@ pub const COMMANDS: &[Command] = &[
     // once the window that creates one lands. It has landed.
     Command::new("new-issue", "New Issue…", || Box::new(NewIssue))
         .key("cmd-n")
+        .on_workspace()
+        .menu(Slot::File),
+    // The other way to the Add Repo window, for the same reason the palettes
+    // are in the bar: a surface reachable only from a popover in the title bar
+    // is one most people never find.
+    Command::new("add-repo", "Add Repo…", || Box::new(AddRepo))
+        .key("cmd-shift-n")
         .on_workspace()
         .menu(Slot::File),
     Command::new("close-window", "Close Window", || Box::new(CloseWindow))

@@ -1260,6 +1260,10 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 /// - That task still tracks upstream closure correctly, because reconciliation
 ///   still sees the complete open set.
 ///
+/// A project's [`ProjectStatus`] narrows the same half and nothing else: an
+/// `archived` one keeps being fetched, keeps reconciling closures and keeps
+/// having its merges watched, it just stops turning issues into new tasks.
+///
 /// `trunk` is the branch that ships ([`Config::scout_base_branch`]), and is
 /// only used by [`watch_merges`], which cannot decide "shipped" without it.
 pub async fn poll_once(
@@ -1291,7 +1295,15 @@ pub async fn poll_once(
         // first would close every task whose issue merely lost the label.
         let open_numbers: Vec<u64> = issues.iter().map(|issue| issue.number).collect();
         for issue in issues {
-            if !intake.admits(&issue) {
+            // An archived project stops *gaining* tasks and nothing else —
+            // exactly the semantics an issue losing its `TASKS_INTAKE_LABEL`
+            // already has. The fetch above still happened, and the
+            // reconciliation below still runs, because closure is only ever
+            // learned from absence in the open set: an archived project that
+            // stopped being fetched would leave every task it already has
+            // stuck at `gh_state = open` forever, and a Builder PR it already
+            // opened would sit in `awaiting_merge` with nothing to resolve it.
+            if !project.status.ingests() || !intake.admits(&issue) {
                 continue;
             }
             let outcome = store.upsert_gh_issue(&project.id, issue).await?;
@@ -1954,7 +1966,7 @@ async fn top_up(
 
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
 /// applies), state `Queued` (explicitly picked up), still open on GitHub, not in flight, not past the
-/// attempt cap.
+/// attempt cap, and belonging to a project the dispatcher is still working on.
 ///
 /// A task at the cap is rejected the moment it gets there, so the attempt
 /// filter here is belt-and-braces: it also covers rows an older build (or a
@@ -1975,6 +1987,12 @@ async fn next_dispatchable(
             warn!(task_id = %task.id, project_id = %task.project_id, "task references a missing project");
             continue;
         };
+        // `continue`, not `break`: a paused repo at the head of the queue must
+        // not starve the ones behind it — that is the whole difference between
+        // pausing one repo and pausing the server.
+        if !project.status.dispatches() {
+            continue;
+        }
         return Ok(Some((task, project)));
     }
     Ok(None)
@@ -2499,7 +2517,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::models::ProjectId;
+    use crate::models::{ProjectId, ProjectStatus};
 
     fn config() -> Config {
         Config {
@@ -2536,6 +2554,7 @@ mod tests {
             repo_owner: "iamnbutler".into(),
             repo_name: "tasks".into(),
             added_at: Utc::now(),
+            status: ProjectStatus::Active,
         }
     }
 
@@ -2733,6 +2752,56 @@ mod tests {
         };
         store.insert_task(&task).await.unwrap();
         task
+    }
+
+    /// A paused repo is a repo the dispatcher walks *past*, not one it stops
+    /// at. That `continue` rather than `break` is the whole difference between
+    /// pausing one repo and pausing the server.
+    #[tokio::test]
+    async fn next_dispatchable_skips_a_paused_repo_without_starving_the_queue() {
+        let store = Store::open_in_memory().await.unwrap();
+        let paused = project();
+        store.insert_project(&paused).await.unwrap();
+        let live = Project {
+            id: ProjectId::new(),
+            repo_owner: "iamnbutler".into(),
+            repo_name: "other".into(),
+            added_at: Utc::now(),
+            status: ProjectStatus::Active,
+        };
+        store.insert_project(&live).await.unwrap();
+
+        // The paused repo's task is at the head of the queue.
+        let head = seed_task(&store, &paused, 1, TaskState::Queued).await;
+        let behind = seed_task(&store, &live, 2, TaskState::Queued).await;
+        store
+            .set_queue_order(&[head.id.clone(), behind.id.clone()])
+            .await
+            .unwrap();
+        store
+            .set_project_status(&paused.id, ProjectStatus::Paused)
+            .await
+            .unwrap();
+
+        let skip = HashSet::new();
+        let (task, project) = next_dispatchable(&store, &skip)
+            .await
+            .unwrap()
+            .expect("the repo behind the paused one is still dispatchable");
+        assert_eq!(task.id, behind.id);
+        assert_eq!(project.id, live.id);
+
+        // Pause that one too and there is simply nothing to dispatch — the
+        // head's task is still `queued`, not rejected or returned.
+        store
+            .set_project_status(&live.id, ProjectStatus::Paused)
+            .await
+            .unwrap();
+        assert!(next_dispatchable(&store, &skip).await.unwrap().is_none());
+        assert_eq!(
+            store.get_task(&head.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
     }
 
     /// The whole closure-derived retirement path: issues vanish from the open

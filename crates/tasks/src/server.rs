@@ -31,7 +31,7 @@ use tasks_api::http::{
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
     EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
     ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest,
-    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
+    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
@@ -41,9 +41,9 @@ use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
     Complexity, Decision, DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ProjectId, RunKind, ScoutNotes, Session, SessionId,
-    SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
-    TranscriptOwner,
+    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind, ScoutNotes, Session,
+    SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -193,6 +193,7 @@ pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
         // answers while everything else might still be wrong.
         .route("/version", get(get_version))
         .route("/projects", get(list_projects).post(create_project))
+        .route("/projects/{project_id}/status", post(set_project_status))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/queue", post(queue_task))
@@ -348,24 +349,74 @@ async fn get_version() -> Json<tasks_api::version::VersionInfo> {
 
 // --- projects ---
 
+/// Every project, including archived ones.
+///
+/// Archived projects are returned deliberately: a task whose project is
+/// archived still carries that `project_id`, and a filtered list would leave
+/// the row with no repo to name. Hiding them is a view concern and belongs in
+/// the view — which sorts them last rather than dropping them, so a repo you
+/// cannot select is not a repo you cannot un-archive.
 async fn list_projects(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Project>>> {
     Ok(Json(store.list_projects().await?))
 }
 
+/// Trim the incidental punctuation a human pastes around a repo name, so
+/// `owner/repo`, ` owner/repo ` and `owner/repo/` are one project rather than
+/// three.
+///
+/// The server normalizes rather than the client, so there is one parser: a
+/// second one in the app would be a second thing to keep in step.
+fn normalize_repo(part: &str) -> String {
+    part.trim().trim_matches('/').trim().to_string()
+}
+
+/// `POST /projects` — start tracking a repository.
+///
+/// **Human-only, and not charter-gated**, on the `build-now` precedent: adding
+/// a repo commits VM hours and authorises pull requests against somebody's
+/// repository. That is not a unit of work *inside* the pipeline — it decides
+/// what the pipeline is pointed at — and none of the nine capabilities
+/// describes it. If it is ever granted it wants its own named capability.
+///
+/// Nothing is dispatched by this: ingested issues land in `backlog`, and
+/// backlog never dispatches.
 async fn create_project(
     State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateProject>,
 ) -> ApiResult<(StatusCode, Json<Project>)> {
-    if body.repo_owner.is_empty() || body.repo_name.is_empty() {
+    if actor_of(&store, &headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "adding a repository is the human's alone: it commits VM hours and authorises \
+             pull requests against somebody's repository, and no charter capability covers \
+             that. Propose it to the human."
+                .into(),
+        ));
+    }
+    let repo_owner = normalize_repo(&body.repo_owner);
+    let repo_name = normalize_repo(&body.repo_name);
+    if repo_owner.is_empty() || repo_name.is_empty() {
         return Err(ApiError::BadRequest(
             "repo_owner and repo_name must be non-empty".into(),
         ));
     }
+    // Case-insensitively, because `UNIQUE(repo_owner, repo_name)` is not:
+    // `Owner/Repo` beside `owner/repo` would be two projects for one repo, and
+    // then `resolve_project` can no longer answer "the only one there is".
+    if let Some(existing) = store.find_project_by_repo(&repo_owner, &repo_name).await? {
+        return Err(ApiError::BadRequest(format!(
+            "{} is already tracked as {} ({})",
+            existing.slug(),
+            existing.id,
+            existing.status
+        )));
+    }
     let project = Project {
         id: ProjectId::new(),
-        repo_owner: body.repo_owner,
-        repo_name: body.repo_name,
+        repo_owner,
+        repo_name,
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await?;
     store
@@ -374,6 +425,40 @@ async fn create_project(
         })
         .await?;
     Ok((StatusCode::CREATED, Json(project)))
+}
+
+/// `POST /projects/{project_id}/status` — pause, archive, or reactivate a repo.
+///
+/// **Human-only, and not charter-gated**, for the same reason as
+/// `create_project`: pausing or archiving stops every scout and every build
+/// for a repository.
+///
+/// There is no delete, and this is what stands in for one. `decisions` is
+/// append-only and keyed to a project's tasks, and `tasks.project_id` is
+/// `ON DELETE CASCADE`, so deleting a project would take the audit trail the
+/// whole charter rests on with it.
+async fn set_project_status(
+    State(store): State<Arc<Store>>,
+    Path(project_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetProjectStatus>,
+) -> ApiResult<Json<Project>> {
+    if actor_of(&store, &headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "pausing or archiving a repository is the human's alone: it stops every scout \
+             and every build for it, and no charter capability covers that. Propose it to \
+             the human."
+                .into(),
+        ));
+    }
+    let status = ProjectStatus::from_str(&body.status).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown status: {} — expected active, paused or archived",
+            body.status
+        ))
+    })?;
+    let id = ProjectId::from_raw(project_id);
+    Ok(Json(store.set_project_status(&id, status).await?))
 }
 
 // --- tasks ---
@@ -1297,8 +1382,15 @@ fn shadowed(decision_seq: i64, effect: &str) -> Response {
         .into_response()
 }
 
-/// The project a write targets: the one named, or the only one there is.
+/// The project a write targets: the one named, or the only one still live.
 /// Guessing between several would be a coin flip with a GitHub write attached.
+///
+/// Archived projects do not count towards "the only one there is", or
+/// archiving a repo would silently break `POST /issues` for the one that is
+/// left — a 400 saying "2 projects configured" about a server with one live
+/// repo reads as a bug. Naming an archived project explicitly still resolves
+/// it: commenting on its open PR and closing its issue are exactly the work
+/// archiving does not abandon.
 async fn resolve_project(store: &Store, id: Option<ProjectId>) -> ApiResult<Project> {
     match id {
         Some(id) => store
@@ -1307,9 +1399,14 @@ async fn resolve_project(store: &Store, id: Option<ProjectId>) -> ApiResult<Proj
             .ok_or_else(|| ApiError::NotFound(format!("project {id}"))),
         None => {
             let mut projects = store.list_projects().await?;
+            projects.retain(|p| p.status != ProjectStatus::Archived);
             match projects.len() {
                 1 => Ok(projects.remove(0)),
-                0 => Err(ApiError::BadRequest("no projects configured".into())),
+                0 => Err(ApiError::BadRequest(
+                    "no projects configured (archived ones do not count — name one with \
+                     project_id)"
+                        .into(),
+                )),
                 n => Err(ApiError::BadRequest(format!(
                     "{n} projects configured — name one with project_id"
                 ))),
@@ -2500,6 +2597,7 @@ mod tests {
             repo_owner: "iamnbutler".into(),
             repo_name: "tasks".into(),
             added_at: Utc::now(),
+            status: ProjectStatus::Active,
         };
         store.insert_project(&project).await.unwrap();
         (store, project)
@@ -2607,6 +2705,261 @@ mod tests {
                 project_id: created.id
             }
         );
+    }
+
+    /// A project is born `active` — the column backfills every repo to what it
+    /// already was, and a client that predates it reads the same thing.
+    #[tokio::test]
+    async fn a_new_project_is_active() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let created: Project = http
+            .post(format!("{base}/projects"))
+            .json(&json!({"repo_owner": "iamnbutler", "repo_name": "tasks"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(created.status, ProjectStatus::Active);
+        assert_eq!(created.slug(), "iamnbutler/tasks");
+    }
+
+    /// `UNIQUE(repo_owner, repo_name)` is case-sensitive, so the duplicate
+    /// check cannot be left to it: two rows for one repo would cost
+    /// `resolve_project` its answer and have the poller ingest every issue
+    /// twice.
+    #[tokio::test]
+    async fn adding_the_same_repo_in_a_different_case_is_refused() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        http.post(format!("{base}/projects"))
+            .json(&json!({"repo_owner": "iamnbutler", "repo_name": "tasks"}))
+            .send()
+            .await
+            .unwrap();
+        let resp = http
+            .post(format!("{base}/projects"))
+            // Different case, and the stray whitespace/slash a paste carries.
+            .json(&json!({"repo_owner": " IamNButler ", "repo_name": "Tasks/"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: ErrorResponse = resp.json().await.unwrap();
+        assert!(
+            body.error.contains("already tracked"),
+            "says what is wrong: {}",
+            body.error
+        );
+        assert_eq!(store.list_projects().await.unwrap().len(), 1);
+    }
+
+    /// Normalizing on the way in, not just on the way to the duplicate check:
+    /// what is stored is what every clone URL and every list is built from.
+    #[tokio::test]
+    async fn a_pasted_repo_is_stored_trimmed() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let base = spawn(store.clone()).await;
+
+        let created: Project = reqwest::Client::new()
+            .post(format!("{base}/projects"))
+            .json(&json!({"repo_owner": " iamnbutler ", "repo_name": "tasks/"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(created.slug(), "iamnbutler/tasks");
+        assert_eq!(
+            store
+                .get_project(&created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .slug(),
+            "iamnbutler/tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_status_moves_and_names_itself_on_the_event_log() {
+        let (store, project) = store_with_project().await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let paused: Project = http
+            .post(format!("{base}/projects/{}/status", project.id))
+            .json(&json!({"status": "paused"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(paused.status, ProjectStatus::Paused);
+        assert!(!paused.status.dispatches());
+        assert!(paused.status.ingests(), "a paused repo is still polled");
+
+        let archived: Project = http
+            .post(format!("{base}/projects/{}/status", project.id))
+            .json(&json!({"status": "archived"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!archived.status.ingests());
+
+        // Back again: archiving is the only removal there is, so it has to be
+        // undoable.
+        let active: Project = http
+            .post(format!("{base}/projects/{}/status", project.id))
+            .json(&json!({"status": "active"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(active.status, ProjectStatus::Active);
+
+        let statuses: Vec<ProjectStatus> = store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                EventPayload::ProjectStatusChanged { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ProjectStatus::Paused,
+                ProjectStatus::Archived,
+                ProjectStatus::Active
+            ],
+            "the status is in the payload so a client can narrate the change \
+             without refetching /projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_project_status_names_the_legal_ones() {
+        let (store, project) = store_with_project().await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .post(format!("{base}/projects/{}/status", project.id))
+            .json(&json!({"status": "pasued"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: ErrorResponse = resp.json().await.unwrap();
+        assert!(
+            body.error.contains("active")
+                && body.error.contains("paused")
+                && body.error.contains("archived"),
+            "names the three legal ones rather than serde's variant list: {}",
+            body.error
+        );
+    }
+
+    /// Human-only, and *not* charter-gated: every capability is `live` and
+    /// both writes are still 403. What repositories the pipeline is pointed at
+    /// is not a unit of work inside it.
+    #[tokio::test]
+    async fn project_writes_refuse_the_orchestrator_however_wide_its_charter() {
+        let (store, project) = store_with_project().await;
+        for capability in [
+            Capability::CaptureWork,
+            Capability::CurateWork,
+            Capability::QueueTasks,
+            Capability::DispatchBuilds,
+        ] {
+            store
+                .set_charter(capability, CharterLevel::Live, None)
+                .await
+                .unwrap();
+        }
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+        let claim = format!("orchestrator {}", store.actor_token());
+
+        let resp = http
+            .post(format!("{base}/projects"))
+            .header(ACTOR_HEADER, &claim)
+            .json(&json!({"repo_owner": "someone", "repo_name": "else"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert_eq!(store.list_projects().await.unwrap().len(), 1);
+
+        let resp = http
+            .post(format!("{base}/projects/{}/status", project.id))
+            .header(ACTOR_HEADER, &claim)
+            .json(&json!({"status": "archived"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        assert_eq!(
+            store
+                .get_project(&project.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ProjectStatus::Active
+        );
+    }
+
+    /// Archiving one of two repos must not break `POST /issues` for the one
+    /// that is left: a 400 saying "2 projects configured" about a server with
+    /// one live repo reads as a bug.
+    #[tokio::test]
+    async fn an_archived_project_does_not_count_towards_ambiguity() {
+        let (store, live) = store_with_project().await;
+        let archived = Project {
+            id: ProjectId::new(),
+            repo_owner: "iamnbutler".into(),
+            repo_name: "old".into(),
+            added_at: Utc::now(),
+            status: ProjectStatus::Active,
+        };
+        store.insert_project(&archived).await.unwrap();
+
+        assert!(
+            resolve_project(&store, None).await.is_err(),
+            "two live projects is genuinely ambiguous"
+        );
+
+        store
+            .set_project_status(&archived.id, ProjectStatus::Archived)
+            .await
+            .unwrap();
+        let resolved = resolve_project(&store, None).await.unwrap();
+        assert_eq!(resolved.id, live.id);
+
+        // Naming it explicitly still resolves it: commenting on its open PR
+        // and closing its issue are exactly the work archiving does not
+        // abandon.
+        let named = resolve_project(&store, Some(archived.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(named.id, archived.id);
     }
 
     #[tokio::test]
@@ -3598,6 +3951,7 @@ mod tests {
                 repo_owner: "o".into(),
                 repo_name: "r".into(),
                 added_at: Utc::now(),
+                status: ProjectStatus::Active,
             };
             store.insert_project(&project).await.unwrap();
             project

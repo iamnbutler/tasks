@@ -18,6 +18,7 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Task, TaskState};
 
 use crate::components::{status_badge, task_state_color, title_case};
+use crate::projects::{self, ProjectFilter};
 use crate::time;
 use crate::workspace::Workspace;
 
@@ -30,16 +31,24 @@ use crate::workspace::Workspace;
 /// currently hidden, so the footer's number does not move when the toggle
 /// does.
 ///
+/// The repo filter is applied **first**, so the footer's done count is the
+/// count for the repo on screen — a footer offering to reveal work that
+/// belongs to a repository this window is not showing is a receipt for the
+/// wrong thing.
+///
 /// `Rejected` is deliberately not archived: the ask was to archive done, and
 /// rejected work is one predicate away — changing it should be a decision,
 /// not a refactor.
-fn archive(tasks: &[Task], show_done: bool) -> (Vec<&Task>, usize) {
-    let done = tasks
-        .iter()
+fn archive<'a>(
+    tasks: &'a [Task],
+    show_done: bool,
+    filter: &ProjectFilter,
+) -> (Vec<&'a Task>, usize) {
+    let in_view = || tasks.iter().filter(|task| filter.admits(&task.project_id));
+    let done = in_view()
         .filter(|task| task.state == TaskState::Done)
         .count();
-    let visible = tasks
-        .iter()
+    let visible = in_view()
         .filter(|task| show_done || task.state != TaskState::Done)
         .collect();
     (visible, done)
@@ -51,7 +60,11 @@ impl Workspace {
         let state = self.app_state.read(cx);
         let selected = self.selected_task.clone();
 
-        let (visible, done_count) = archive(&state.tasks, self.show_done);
+        let (visible, done_count) = archive(&state.tasks, self.show_done, &self.project_filter);
+        // A row names its repo only when the rows *on screen* disagree about
+        // it, which keeps a single-repo window pixel-identical to the one
+        // before multi-repo.
+        let ambiguous = projects::rows_are_ambiguous(visible.iter().map(|task| &task.project_id));
         let rows: Vec<_> = visible
             .into_iter()
             .map(|task| {
@@ -61,6 +74,9 @@ impl Workspace {
                     task.title.clone(),
                     task.state,
                     task.updated_at,
+                    ambiguous
+                        .then(|| projects::row_label(&state.projects, &task.project_id))
+                        .flatten(),
                 )
             })
             .collect();
@@ -95,78 +111,81 @@ impl Workspace {
                                 }),
                         )
                     })
-                    .children(
-                        rows.into_iter()
-                            .map(|(id, number, title, task_state, updated)| {
-                                let is_selected = selected.as_ref() == Some(&id);
-                                let color = task_state_color(task_state);
-                                let row = div()
-                                    // Keyed by task, not by index: with rows
-                                    // appearing and disappearing behind the
-                                    // toggle, index N is a different task before
-                                    // and after, and gpui treats a repeated id
-                                    // across frames as the same node.
-                                    .id(SharedString::from(format!("task-{id}")))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .mx(px(6.))
-                                    .px(px(10.))
-                                    .py(px(4.))
-                                    .rounded(px(5.))
-                                    .cursor_pointer()
-                                    .when(!is_selected, |el| {
-                                        let hover_bg = theme.surface_secondary();
-                                        el.hover(move |el| el.bg(hover_bg))
-                                    })
-                                    .when(is_selected, |el| el.bg(theme.surface_tertiary()))
-                                    .on_click(cx.listener({
-                                        let id = id.clone();
-                                        move |this, _event, _window, cx| {
-                                            this.select_task(id.clone(), cx);
-                                        }
-                                    }))
-                                    .child(
-                                        div()
-                                            .w(px(52.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.fg_muted())
-                                            .child(format!("#{number}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .text_sm()
-                                            .text_color(theme.fg())
-                                            .truncate()
-                                            .child(title),
-                                    )
-                                    .when(task_state != TaskState::Backlog, |el| {
-                                        el.child(status_badge(
-                                            title_case(task_state.as_str()),
-                                            color,
-                                        ))
-                                    })
-                                    .child(
-                                        div()
-                                            .w(px(36.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.fg_muted())
-                                            .child(time::relative(updated)),
-                                    );
-                                // Right-click offers everything the inspector
-                                // does and more, greyed to this row's state.
-                                // Keyed by task for the same reason the row
-                                // is: index N is a different task once the
-                                // archive toggle moves.
-                                context_menu(SharedString::from(format!("row-menu-{id}")), row)
-                                    .menu(Workspace::row_menu(id, cx))
-                            }),
-                    ),
+                    .children(rows.into_iter().map(
+                        |(id, number, title, task_state, updated, repo)| {
+                            let is_selected = selected.as_ref() == Some(&id);
+                            let color = task_state_color(task_state);
+                            let row = div()
+                                // Keyed by task, not by index: with rows
+                                // appearing and disappearing behind the
+                                // toggle, index N is a different task before
+                                // and after, and gpui treats a repeated id
+                                // across frames as the same node.
+                                .id(SharedString::from(format!("task-{id}")))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
+                                .mx(px(6.))
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .when(!is_selected, |el| {
+                                    let hover_bg = theme.surface_secondary();
+                                    el.hover(move |el| el.bg(hover_bg))
+                                })
+                                .when(is_selected, |el| el.bg(theme.surface_tertiary()))
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _event, _window, cx| {
+                                        this.select_task(id.clone(), cx);
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .w(px(52.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.fg_muted())
+                                        .child(format!("#{number}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .text_sm()
+                                        .text_color(theme.fg())
+                                        .truncate()
+                                        .child(title),
+                                )
+                                .children(repo.map(|repo| {
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.fg_muted())
+                                        .child(repo)
+                                }))
+                                .when(task_state != TaskState::Backlog, |el| {
+                                    el.child(status_badge(title_case(task_state.as_str()), color))
+                                })
+                                .child(
+                                    div()
+                                        .w(px(36.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.fg_muted())
+                                        .child(time::relative(updated)),
+                                );
+                            // Right-click offers everything the inspector
+                            // does and more, greyed to this row's state.
+                            // Keyed by task for the same reason the row
+                            // is: index N is a different task once the
+                            // archive toggle moves.
+                            context_menu(SharedString::from(format!("row-menu-{id}")), row)
+                                .menu(Workspace::row_menu(id, cx))
+                        },
+                    )),
             )
             // The archive's receipt. Present whenever any task is done —
             // including while they are shown, so the way back is the same
@@ -240,9 +259,13 @@ mod tests {
     use super::*;
 
     fn task(number: u64, state: TaskState) -> Task {
+        in_project("proj-1", number, state)
+    }
+
+    fn in_project(project: &str, number: u64, state: TaskState) -> Task {
         Task {
-            id: TaskId::from_raw(format!("task-{number}")),
-            project_id: ProjectId::from_raw("proj-1"),
+            id: TaskId::from_raw(format!("task-{project}-{number}")),
+            project_id: ProjectId::from_raw(project),
             gh_issue_number: number,
             title: format!("issue {number}"),
             body: String::new(),
@@ -261,6 +284,10 @@ mod tests {
         tasks.iter().map(|task| task.gh_issue_number).collect()
     }
 
+    /// Every existing assertion is about the archive alone, so they all run
+    /// against the filter that changes nothing.
+    const ALL: ProjectFilter = ProjectFilter::All;
+
     #[test]
     fn done_tasks_are_archived_by_default() {
         let tasks = [
@@ -268,9 +295,33 @@ mod tests {
             task(2, TaskState::Done),
             task(3, TaskState::Building),
         ];
-        let (visible, done) = archive(&tasks, false);
+        let (visible, done) = archive(&tasks, false, &ALL);
         assert_eq!(numbers(&visible), [1, 3]);
         assert_eq!(done, 1);
+    }
+
+    /// The repo filter applies first, so the footer's count is the count for
+    /// the repo on screen — not a receipt for work in a repository this window
+    /// is not showing.
+    #[test]
+    fn the_done_count_is_the_count_for_the_repo_on_screen() {
+        let tasks = [
+            in_project("proj-a", 1, TaskState::Queued),
+            in_project("proj-a", 2, TaskState::Done),
+            in_project("proj-b", 3, TaskState::Done),
+            in_project("proj-b", 4, TaskState::Done),
+        ];
+        let only_a = ProjectFilter::One(ProjectId::from_raw("proj-a"));
+        let (visible, done) = archive(&tasks, false, &only_a);
+        assert_eq!(numbers(&visible), [1]);
+        assert_eq!(done, 1, "b's two done tasks are not this footer's business");
+
+        let (visible, done) = archive(&tasks, true, &only_a);
+        assert_eq!(numbers(&visible), [1, 2]);
+        assert_eq!(done, 1);
+
+        // Unfiltered, all four are in view again.
+        assert_eq!(archive(&tasks, false, &ALL).1, 3);
     }
 
     /// The toggle restores them where the server put them — this filters, it
@@ -282,7 +333,7 @@ mod tests {
             task(2, TaskState::Queued),
             task(3, TaskState::Done),
         ];
-        let (visible, _) = archive(&tasks, true);
+        let (visible, _) = archive(&tasks, true, &ALL);
         assert_eq!(numbers(&visible), [1, 2, 3]);
     }
 
@@ -295,8 +346,8 @@ mod tests {
             task(2, TaskState::Done),
             task(3, TaskState::InReview),
         ];
-        assert_eq!(archive(&tasks, false).1, 2);
-        assert_eq!(archive(&tasks, true).1, 2);
+        assert_eq!(archive(&tasks, false, &ALL).1, 2);
+        assert_eq!(archive(&tasks, true, &ALL).1, 2);
     }
 
     /// Rejected is not done. It stays in the list, and it is not in the count
@@ -304,7 +355,7 @@ mod tests {
     #[test]
     fn rejected_is_not_archived() {
         let tasks = [task(1, TaskState::Rejected), task(2, TaskState::Done)];
-        let (visible, done) = archive(&tasks, false);
+        let (visible, done) = archive(&tasks, false, &ALL);
         assert_eq!(numbers(&visible), [1]);
         assert_eq!(done, 1);
     }

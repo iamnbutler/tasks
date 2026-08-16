@@ -1208,12 +1208,19 @@ fn system_prompt(
            no attempt is charged. `concluded: false` in the reply means the \
            request is recorded and the run has not stopped yet — watch for \
            its completion event rather than asking again\n\
+         - GET /projects — the repositories this server tracks, each with a \
+           status: active (scouted and built), paused (still polled, nothing \
+           dispatched) or archived (not even ingested). Read it before filing \
+           an issue when more than one is live\n\
          - POST /issues \
-           {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\"}} — file an \
+           {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\",\
+           \"project_id\"}} — file an \
            issue. `provenance` says where the work was discovered (\"while \
            reviewing spec_… for #812\") and is rendered into the issue body; \
-           the server refuses a capture without it. Lands in the backlog, not \
-           the queue\n\
+           the server refuses a capture without it. `project_id` says which \
+           repository, and is only optional when exactly one non-archived \
+           project exists — otherwise the server refuses to guess rather than \
+           filing into the wrong repo. Lands in the backlog, not the queue\n\
          - POST /tasks/{{id}}/close \
            {{\"reason\":\"completed|not_planned\",\"rationale\",\"evidence\"}} — \
            close the issue upstream. `completed` claims the work is done and \
@@ -1282,6 +1289,13 @@ fn system_prompt(
          no second opinion anywhere in the loop, and no charter capability \
          covers that; it answers you 403. When you think a task needs no \
          scouting, say so and let the human make the call.\n\n\
+         Also not yours: POST /projects and POST /projects/{{id}}/status — \
+         which repositories this pipeline is pointed at. Adding one commits VM \
+         hours and authorises pull requests against somebody's repository; \
+         pausing or archiving one stops every scout and every build for it. \
+         Neither is a unit of work inside the pipeline and no charter \
+         capability covers them; both answer you 403. Say which repo you think \
+         should be added, paused or archived, and why.\n\n\
          Also not yours: DELETE /builds/{{id}}/bundle — deleting the only \
          copy of an implementation. There is no undo, and the retention \
          policy already reclaims every bundle whose whole batch was rebuilt \

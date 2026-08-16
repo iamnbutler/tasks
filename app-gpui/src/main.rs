@@ -5,6 +5,8 @@ mod components;
 mod issue_composer;
 mod menus;
 mod palette;
+mod projects;
+mod repo_composer;
 mod row_menu;
 mod sections;
 mod server;

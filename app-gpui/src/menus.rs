@@ -600,11 +600,20 @@ mod tests {
     }
 
     /// New Issue joined this menu when the window that creates one landed —
-    /// the comment that used to sit here said it should.
+    /// the comment that used to sit here said it should. Add Repo joined it
+    /// with multi-repo, for the same reason: a surface reachable only from a
+    /// popover in the title bar is one most people never find.
     #[test]
     fn file_menu_only_offers_what_exists() {
         let actions: Vec<_> = items("File").into_iter().map(|(_, a)| a).collect();
-        assert_eq!(actions, ["workspace::NewIssue", "tasks::CloseWindow"]);
+        assert_eq!(
+            actions,
+            [
+                "workspace::NewIssue",
+                "workspace::AddRepo",
+                "tasks::CloseWindow"
+            ]
+        );
     }
 
     /// The bar is a fold over the registry, so nothing in the registry can be

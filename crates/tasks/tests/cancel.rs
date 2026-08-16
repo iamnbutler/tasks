@@ -29,8 +29,8 @@ use tasks::events::EventPayload;
 use tasks::github::GitHubClient;
 use tasks::models::{
     Actor, BuildStatus, Capability, CharterLevel, Complexity, DecisionAction, DecisionInput,
-    GhState, Project, ProjectId, RunKind, Session, SessionId, SessionStatus, Spec, SpecId,
-    SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    GhState, Project, ProjectId, ProjectStatus, RunKind, Session, SessionId, SessionStatus, Spec,
+    SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use tasks::store::{Store, Strike};
@@ -99,6 +99,7 @@ async fn insert_project(store: &Store) -> Project {
         repo_owner: "test".into(),
         repo_name: "repo".into(),
         added_at: Utc::now(),
+        status: ProjectStatus::Active,
     };
     store.insert_project(&project).await.unwrap();
     project

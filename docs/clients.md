@@ -89,7 +89,8 @@ No auth, loopback only — don't build a login flow.
 
 | UI action | Call | Semantics |
 | --- | --- | --- |
-| Add a repo | `POST /projects` `{"repo_owner","repo_name"}` | 201 with the project; 400 if it already exists |
+| Add a repo | `POST /projects` `{"repo_owner","repo_name"}` | 201 with the project, born `active`; 400 if the repo is already tracked — matched **case-insensitively**, so `Owner/Repo` will not become a second project for `owner/repo`. **Human-only**: any other actor is a 403, on the same footing as Build Now — adding a repo commits VM hours and authorises pull requests against somebody's repository, and no charter capability covers that. Nothing is dispatched by it: ingested issues land in `backlog`, and backlog never dispatches. |
+| Pause / archive a repo | `POST /projects/{project_id}/status` `{"status":"active"\|"paused"\|"archived"}` | How much of the pipeline runs for one repo — see the table below. Gates **new** work only, exactly like the mode: nothing here interrupts a scout or a build in flight. **Human-only** (403 otherwise), and **there is no delete** — `decisions` is append-only and keyed to a project's tasks, and `tasks.project_id` is `ON DELETE CASCADE`, so archive *is* the removal. An unknown word is a 400 naming the three legal ones. |
 | Reorder task queue (drag & drop) | `POST /queue/reorder` `{"task_ids":[...]}` | **Full order, front to back.** Ranks are rewritten 1..N transactionally; any task not listed becomes unranked and sorts after all ranked tasks (then priority desc, then ingested_at). Send the complete on-screen order after every drop. The response is the same projection as the default `GET /tasks` (closed intake hidden), so it can replace the client's list directly. |
 | Reorder spec queue | `POST /spec-queue/reorder` `{"spec_ids":[...]}` | Same full-order semantics |
 | Pick up a task | `POST /tasks/{task_id}/queue` | `backlog` → `queued`, appended at the end of the ranked order. 400 unless the task is `backlog`. The only door from the backlog into the pipeline — scouts dispatch **only** queued tasks. |
@@ -105,6 +106,37 @@ Everything else is read-only. There is deliberately no
 `POST /tasks` (tasks come from GitHub issue intake), no task-edit endpoint,
 and no way for a client to write GitHub state — GitHub writes funnel through
 the server only.
+
+### Project status
+
+| `status` | issues ingested | scouts / builds dispatched | in the client's lists |
+| --- | --- | --- | --- |
+| `active` | yes | yes | yes |
+| `paused` | yes | no | yes, badged |
+| `archived` | no | no | listed last |
+
+`archived` stops the *upsert* half of the poll and nothing else: the repo is
+still fetched, closures are still reconciled, and an open Builder PR is still
+watched. That costs one GitHub fetch per archived project per poll, forever,
+and it is the right price — closure is only ever learned from *absence* in the
+open set, so a repo that stopped being fetched would leave every task it
+already has stuck at `gh_state = open`.
+
+**Mode is global — don't render project status as a second play/pause.** Mode
+gates a dispatcher whose real constraints are server-wide (one
+`SCOUT_MAX_CONCURRENT`, one strictly serial build lane, one vm-pool), so a
+per-repo `play` could not run while another repo's build held the lane. What is
+honestly per-repo is the *subtraction*: a project the dispatcher skips.
+
+`GET /projects` returns archived projects too, deliberately: a task whose
+project is archived still carries that `project_id`, and a filtered list would
+leave the row with no repo to name. Sort them last rather than dropping them,
+or a repo you cannot select becomes a repo you cannot un-archive.
+
+Every body that writes to GitHub (`POST /issues`, the comment/edit/label/merge
+routes) carries an optional `project_id`. It is only optional when exactly one
+**non-archived** project exists; otherwise the server refuses to guess rather
+than filing into the wrong repo. Name it explicitly in a multi-repo client.
 
 ## Reads and their shapes
 
@@ -466,12 +498,19 @@ All enums are snake_case strings on the wire:
 - `Build.status`: `queued` → `running` → `succeeded` | `failed`.
 - `Complexity`: `simple`, `medium`, `complex`.
 - `Mode`: `play`, `pause`, `stop`.
+- `Project.status`: `active`, `paused`, `archived`. `#[serde(default)]` on the
+  wire — absent reads as `active`, which is what every project was before the
+  column existed.
 
 Parse enums leniently (unknown value → show raw string, don't crash): new
 states will appear as the pipeline grows.
 
 Event JSON: `{seq, timestamp, payload}` where payload is tagged by `"kind"`
-(snake_case): `project_added`, `task_ingested`, `task_state_changed`
+(snake_case): `project_added`, `project_status_changed` (`project_id`,
+`status` — the status is *in* the payload, against the usual identifier-only
+rule, because a client that had to refetch `/projects` to learn which way the
+switch moved could not narrate the event at all), `task_ingested`,
+`task_state_changed`
 (`from`/`to`), `task_gh_state_changed` (`task_id`, `gh_state` — the poller's
 snapshot of GitHub's open/closed flag moved, most often because the issue
 dropped out of the repository's open set; refetch the task or the list),

@@ -29,6 +29,16 @@
 //! concatenating the bands top to bottom would rewrite Scouting and InReview
 //! ranks to match the visual grouping, turning a local drag into a global
 //! reorder. See [`AppState::reorder_queue`] for what happens after the POST.
+//!
+//! **This section is deliberately not filtered by the title bar's repo
+//! switcher**, and that follows from the same fact. Both reorder endpoints
+//! unrank everything and assign 1..N over the ids they are given, and each
+//! drop's payload is computed from the *server's* list order — so a narrowed
+//! list would still rewrite the ranks of repos it is not showing, and a row
+//! dropped "second" would land second among rows the human cannot see. The
+//! Queue also *is* the global ordering, which is the same fact that keeps mode
+//! global. Rows name their repo instead, whenever the section holds more than
+//! one.
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context, SharedString};
@@ -37,10 +47,11 @@ use gpuikit::elements::tooltip::tooltip;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
-    BuildStatus, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    BuildStatus, ProjectId, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
 };
 
 use crate::components::{move_to, sortable, status_badge, task_state_color, title_case};
+use crate::projects;
 use crate::state::{is_picked_up, AppState};
 use crate::time;
 use crate::workspace::Workspace;
@@ -110,6 +121,7 @@ const GROUPS: [Group; 6] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BandRow {
     task_id: TaskId,
+    project_id: ProjectId,
     number: u64,
     title: String,
     /// The spec whose queue entry ranks this row. Only the review band has
@@ -122,6 +134,7 @@ struct BandRow {
 fn band_row(task: &Task) -> BandRow {
     BandRow {
         task_id: task.id.clone(),
+        project_id: task.project_id.clone(),
         number: task.gh_issue_number,
         title: task.title.clone(),
         spec_id: None,
@@ -234,11 +247,15 @@ struct QueueRow {
     /// The trailing text is a running clock, and is styled as active work
     /// rather than as a note.
     live: bool,
+    /// The repo this row belongs to, when the rows on screen disagree about
+    /// it. Attached in the render pass, because the answer is about the whole
+    /// section rather than about one band.
+    repo: Option<String>,
 }
 
 /// [`QueueRow`] for a projected row — the one place that needs specs, sessions
 /// and builds, which is why it is not part of [`bands`].
-fn queue_row(group: &Group, row: BandRow, state: &AppState) -> QueueRow {
+fn queue_row(group: &Group, row: BandRow, state: &AppState, name_repos: bool) -> QueueRow {
     let (trailing, live) = match group.state {
         TaskState::InReview | TaskState::ReadyToBuild => (
             state
@@ -263,10 +280,14 @@ fn queue_row(group: &Group, row: BandRow, state: &AppState) -> QueueRow {
         }
         _ => (None, false),
     };
+    let repo = name_repos
+        .then(|| projects::row_label(&state.projects, &row.project_id))
+        .flatten();
     QueueRow {
         row,
         trailing,
         live,
+        repo,
     }
 }
 
@@ -279,12 +300,22 @@ impl Workspace {
         // below need `cx` mutably, so no borrow of it may still be alive.
         let (bands, notice, loaded) = {
             let state = self.app_state.read(cx);
-            let bands: Vec<(Group, Vec<QueueRow>)> = bands(&state.tasks, &state.spec_queue)
+            let projected = bands(&state.tasks, &state.spec_queue);
+            // Across the whole section, not per band: the Queue *is* the
+            // global ordering (see the module comment on why it is not
+            // filtered), so a row names its repo whenever the section holds
+            // more than one.
+            let name_repos = projects::rows_are_ambiguous(
+                projected
+                    .iter()
+                    .flat_map(|(_, rows)| rows.iter().map(|row| &row.project_id)),
+            );
+            let bands: Vec<(Group, Vec<QueueRow>)> = projected
                 .into_iter()
                 .map(|(group, rows)| {
                     let rows = rows
                         .into_iter()
-                        .map(|row| queue_row(&group, row, state))
+                        .map(|row| queue_row(&group, row, state, name_repos))
                         .collect();
                     (group, rows)
                 })
@@ -412,6 +443,7 @@ impl Workspace {
             row,
             trailing,
             live,
+            repo,
         } = item;
         let theme = cx.theme().clone();
         let task_id = row.task_id.clone();
@@ -490,6 +522,16 @@ impl Workspace {
                     .truncate()
                     .child(row.title.clone()),
             )
+            // The Queue is deliberately not filtered by repo — its two reorder
+            // endpoints are bulk replaces over the *global* ordering — so a row
+            // names its repo instead.
+            .children(repo.map(|repo| {
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(repo)
+            }))
             .child(
                 div()
                     .w(px(STATUS_W))
