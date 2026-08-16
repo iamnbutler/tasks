@@ -8,6 +8,7 @@
 //! Binds to loopback only — there is no authentication.
 
 use std::convert::Infallible;
+use std::future::IntoFuture;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,28 @@ const DEFAULT_EVENT_LIMIT: i64 = 100;
 
 /// Interval between SSE keep-alive comments.
 const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// How long [`serve_on`] waits for open connections once the drain is done,
+/// before severing whatever is left and releasing the port.
+///
+/// A graceful shutdown alone cannot end this process, because half the API is
+/// streams: `/events/stream`, `/orchestrator/stream` and the two transcript
+/// tails only finish when the *client* hangs up, and the app holds all of them
+/// open for as long as it is running. So "wait for connections to close" means
+/// "wait for the user to quit the app" — the server sat there until `reload`
+/// SIGKILLed it at 75s, on every single restart.
+///
+/// Two seconds, and the arithmetic is the reason: the drain is bounded at
+/// 10 + 30 + 30 = 70s and [`crate::reload`] SIGKILLs at 75s, so this is what
+/// fits in the remainder. It buys an ordinary request the chance to finish;
+/// it deliberately does not try to outlast a stream, because no grace can.
+///
+/// Severing them is safe in a way that waiting is not: an SSE client is a
+/// tailer, `/events/stream` resumes from `?since=`, and the successor is
+/// already binding the port. A dropped stream costs a reconnect; not exiting
+/// costs the pidfile cleanup, the 75s, and — when the drain needs its full
+/// budget — the teardown SIGKILL lands in the middle of.
+const CONNECTION_GRACE: Duration = Duration::from_secs(2);
 
 /// Transcript lines `/sessions/{id}/transcript` returns without an explicit
 /// `limit`, and the ceiling on one the caller asks for. The SSE replay pages at
@@ -304,11 +327,21 @@ pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 }
 
 /// Serve the API on an already-bound listener until `shutdown` resolves, then
-/// stop accepting connections and let the in-flight ones drain.
+/// stop accepting connections and let the in-flight ones drain — for at most
+/// [`CONNECTION_GRACE`], after which whatever is still open is severed.
 ///
 /// The port is released when this returns — so anything a caller wants to
 /// finish while the API is still up belongs inside `shutdown`, not after this
 /// call.
+///
+/// The bound is not a tuning knob, it is the exit condition. Waiting on the
+/// clients alone never terminates while any of them is tailing a stream, and
+/// every one of this server's SSE routes is unbounded by construction; see
+/// [`CONNECTION_GRACE`]. Bounding it here rather than at the four stream
+/// handlers is deliberate: a handler that learns to stop is one endpoint's
+/// fix, and the next long-lived route reintroduces the hang. This is the
+/// property — *a shutdown terminates* — and it holds for routes nobody has
+/// written yet.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     store: Arc<Store>,
@@ -320,9 +353,47 @@ pub async fn serve_on(
     // stamping there would leave `/status` uptime dating from the first call
     // instead of from the moment this process started serving.
     serving_since();
-    axum::serve(listener, router_with_services(store, services))
+
+    // The caller's `shutdown` is the drain, and it is the thing whose end
+    // starts the clock — not the signal that began it. Waiting from the signal
+    // would charge the connection grace against the drain's own budget.
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = drained_tx.send(());
+    };
+
+    let serve = axum::serve(listener, router_with_services(store, services))
         .with_graceful_shutdown(shutdown)
-        .await
+        .into_future();
+    tokio::pin!(serve);
+
+    tokio::select! {
+        // Biased so that a server which closed its connections inside the
+        // grace reports its own result: the timer arm returning `Ok(())` for
+        // an accept loop that actually failed would swallow the error.
+        biased;
+        result = &mut serve => result,
+        () = async {
+            // A `RecvError` means the sender was dropped without sending,
+            // which happens only when `serve` has already returned and taken
+            // the shutdown future with it — the other arm owns that case, so
+            // this one must not fire a grace period against a live server.
+            if drained_rx.await.is_err() {
+                std::future::pending::<()>().await
+            }
+            tokio::time::sleep(CONNECTION_GRACE).await;
+        } => {
+            warn!(
+                grace_secs = CONNECTION_GRACE.as_secs(),
+                "connections still open after the drain; severing them and \
+                 releasing the port. A tailing client never closes on its own \
+                 — an open app is the ordinary case here, not an anomaly — \
+                 and waiting one out is what a shutdown cannot do"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Bind and serve in one call. [`bind`] + [`serve_on`] for callers that do not
