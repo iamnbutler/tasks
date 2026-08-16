@@ -17,7 +17,7 @@ use gpuikit::input::bind_input_keys;
 
 use workspace::{
     Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, NewIssue, ToggleLeftDock,
-    ToggleRightDock, Workspace,
+    ToggleRightDock, ToggleShowDone, Workspace,
 };
 
 /// The main window, so `Close Window` can't strand the app: clicking the Dock
@@ -54,6 +54,11 @@ fn main() {
             KeyBinding::new("cmd-3", GoToQueue, ws),
             KeyBinding::new("cmd-4", GoToActivity, ws),
             KeyBinding::new("cmd-5", GoToChat, ws),
+            // The Tasks list's archive. Bound here rather than in
+            // `menus::init` only for company — what matters is that it is
+            // bound *before* `menus::set` below, or the View item shows no
+            // key equivalent and nothing warns you.
+            KeyBinding::new("shift-cmd-d", ToggleShowDone, ws),
         ]);
 
         // The Server menu's model is a global the menu's handlers and the

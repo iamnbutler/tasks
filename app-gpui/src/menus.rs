@@ -38,7 +38,7 @@ use crate::server::{self, Op};
 use crate::server_window;
 use crate::workspace::{
     GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, SetModePause, SetModePlay, SetModeStop,
-    ToggleLeftDock, ToggleRightDock,
+    ToggleLeftDock, ToggleRightDock, ToggleShowDone,
 };
 
 actions!(
@@ -61,8 +61,8 @@ actions!(
     ]
 );
 
-/// The three facts the bar's shape depends on. Everything else about the menu
-/// is fixed at compile time.
+/// The facts the bar's shape depends on. Everything else about the menu is
+/// fixed at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MenuState {
     /// A server is answering. Drives the Restart/Start label and what can be
@@ -73,6 +73,11 @@ pub struct MenuState {
     pub mode: Option<Mode>,
     /// A `tasks` run is in flight, so a second one would be refused.
     pub busy: bool,
+    /// The Tasks list is showing its archive of done tasks, for the View
+    /// menu's checkmark. A checkmark rather than a renaming item: the item
+    /// names one thing whose state you can read at a glance, which is what
+    /// a view filter is.
+    pub show_done: bool,
 }
 
 /// The state the installed bar was built from.
@@ -200,6 +205,11 @@ fn menus(state: MenuState) -> Vec<Menu> {
             MenuItem::action("Queue", GoToQueue),
             MenuItem::action("Activity", GoToActivity),
             MenuItem::action("Chat", GoToChat),
+            MenuItem::separator(),
+            // Below the separator because it filters a section rather than
+            // going to one. Its `shift-cmd-d` is bound in `main`, with the
+            // section shortcuts and before `set` — same constraint.
+            MenuItem::action("Show Done Tasks", ToggleShowDone).checked(state.show_done),
         ]),
         // The one menu that acts on the server *process* rather than over
         // HTTP, because a server cannot gracefully swap itself out through
@@ -298,7 +308,7 @@ mod tests {
         MenuState {
             serving: true,
             mode: Some(mode),
-            busy: false,
+            ..MenuState::default()
         }
     }
 
@@ -374,9 +384,8 @@ mod tests {
     #[test]
     fn a_run_in_flight_greys_out_every_process_op() {
         let busy = MenuState {
-            serving: true,
-            mode: Some(Mode::Play),
             busy: true,
+            ..serving(Mode::Play)
         };
         assert!(item(busy, "Server", "Restart Server…").is_disabled());
         assert!(item(busy, "Server", "Restart When Idle…").is_disabled());
@@ -405,8 +414,7 @@ mod tests {
         // Before the first snapshot, nothing is claimed.
         let unknown = MenuState {
             serving: true,
-            mode: None,
-            busy: false,
+            ..MenuState::default()
         };
         assert!(!item(unknown, "Server", "Pipeline: Play").is_checked());
     }
@@ -419,9 +427,8 @@ mod tests {
             MenuState::default(),
             serving(Mode::Play),
             MenuState {
-                serving: true,
-                mode: Some(Mode::Stop),
                 busy: true,
+                ..serving(Mode::Stop)
             },
         ] {
             let mut actions: Vec<_> = items_of(state, "Server")
@@ -446,7 +453,32 @@ mod tests {
                 "workspace::GoToQueue",
                 "workspace::GoToActivity",
                 "workspace::GoToChat",
+                "workspace::ToggleShowDone",
             ]
+        );
+    }
+
+    /// One item that reads its own state, not two that say opposite things —
+    /// the archive is a filter you can see the position of.
+    #[test]
+    fn the_archive_toggle_is_a_checkmark_over_the_live_filter() {
+        let hidden = MenuState::default();
+        assert!(!item(hidden, "View", "Show Done Tasks").is_checked());
+
+        let shown = MenuState {
+            show_done: true,
+            ..MenuState::default()
+        };
+        assert!(item(shown, "View", "Show Done Tasks").is_checked());
+        // Still one item, still the same action — nothing renamed itself.
+        let labels: Vec<_> = items_of(shown, "View")
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels.iter().filter(|l| l.contains("Done")).count(),
+            1,
+            "{labels:?}"
         );
     }
 
