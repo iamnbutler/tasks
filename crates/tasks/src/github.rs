@@ -139,7 +139,16 @@ pub struct PrState {
     pub merged: bool,
     /// GitHub's mergeability verdict, or `None` while it is still computing
     /// one. Unknown is not the same as conflicted.
+    ///
+    /// **Too coarse to act on**: `false` means a conflict and nothing else, so
+    /// a pull request behind a failing required check reads `true` here. Use
+    /// [`PrState::landing`], which prefers `mergeable_state`.
     pub mergeable: Option<bool>,
+    /// GitHub's finer verdict — `clean`, `dirty`, `blocked`, `behind`,
+    /// `unstable`, `draft`, `unknown` — off the same body. `None` when the
+    /// field is absent, which is not the same as `Some("unknown")` but is
+    /// treated identically: neither is a block.
+    pub mergeable_state: Option<String>,
     /// The commit the merge produced — evidence for closing the issue the PR
     /// implements.
     ///
@@ -160,6 +169,117 @@ impl PrState {
             (GhState::Closed, false, _) => "closed unmerged",
             (GhState::Open, false, Some(false)) => "open, conflicts",
             (GhState::Open, false, _) => "open",
+        }
+    }
+
+    /// Whether GitHub would take this merge right now, read at the resolution
+    /// that can actually object.
+    ///
+    /// `mergeable_state` is consulted **before** `mergeable`, and that ordering
+    /// is the whole point: `mergeable` is `false` only for a conflict, so a
+    /// pull request sitting behind a failing *required* check answers `true`
+    /// and reads ready. Only `blocked` says otherwise.
+    ///
+    /// `merged` and closed-unmerged short-circuit first, because GitHub keeps
+    /// answering `mergeable_state` on a closed pull request and the answer is
+    /// about a merge that can no longer happen. An unrecognized or absent
+    /// state falls back to the coarse flag, and an absent flag is
+    /// [`Landing::Unknown`] — not a block, and not a clearance either.
+    pub fn landing(&self) -> Landing {
+        if self.merged {
+            return Landing::Merged;
+        }
+        if self.state == GhState::Closed {
+            return Landing::ClosedUnmerged;
+        }
+        match self.mergeable_state.as_deref() {
+            Some("clean") => Landing::Clear,
+            Some("unstable") => Landing::Unstable,
+            Some("dirty") => Landing::Blocked(BLOCKED_CONFLICT),
+            Some("blocked") => Landing::Blocked(BLOCKED_REQUIRED),
+            Some("draft") => Landing::Blocked(BLOCKED_DRAFT),
+            Some("behind") => Landing::Blocked(BLOCKED_BEHIND),
+            // "unknown", anything GitHub adds later, or no field at all: the
+            // coarse flag is all there is, and it is allowed to be absent.
+            _ => match self.mergeable {
+                Some(true) => Landing::Clear,
+                Some(false) => Landing::Blocked(BLOCKED_CONFLICT),
+                None => Landing::Unknown,
+            },
+        }
+    }
+}
+
+/// The reasons a [`Landing::Blocked`] carries. A fixed set of `&'static str`
+/// rather than GitHub's own prose, so tests can assert on them and a caller
+/// cannot end up rendering a message nobody wrote — a future case that needs
+/// GitHub's words wants its own variant, not a `String` here.
+const BLOCKED_CONFLICT: &str = "the branch conflicts with its base";
+const BLOCKED_REQUIRED: &str = "a required review or status check has not passed";
+const BLOCKED_DRAFT: &str = "the pull request is still a draft";
+const BLOCKED_BEHIND: &str =
+    "the branch is behind its base and the repository requires it to be current";
+
+/// Whether a pull request can be landed *as a merge* — never whether the
+/// change is any good.
+///
+/// The distinction is load-bearing. This repository has no workflows and no
+/// branch protection, so `blocked` cannot arise in it at all and [`Self::Clear`]
+/// is a statement about git, not about the code. Anything reading this to
+/// decide whether work is safe to ship needs a second source of evidence; see
+/// `builder::verification_report`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// Nothing in the way of the merge itself.
+    Clear,
+    /// Mergeable, with a non-required check failing or still running.
+    Unstable,
+    /// GitHub would refuse the merge, for the named reason.
+    Blocked(&'static str),
+    /// GitHub has not computed a verdict yet. Not a block.
+    Unknown,
+    /// Already merged into its base — which is not the same as shipped.
+    Merged,
+    /// Closed without merging.
+    ClosedUnmerged,
+}
+
+impl Landing {
+    /// One sentence for a brief line.
+    ///
+    /// [`Self::Clear`] deliberately says what it does *not* mean. A reader —
+    /// human or agent — who takes "clean" for "verified" is reading a signal
+    /// that, in a repository with no required checks, is structurally
+    /// incapable of objecting to a change that does not work.
+    pub fn describe(&self) -> String {
+        match self {
+            Landing::Clear => "GitHub reports nothing in the way of the merge itself — no \
+                 conflict with the base, and no check it is waiting on. That says \
+                 nothing about whether the change works; no check here is capable \
+                 of objecting to that."
+                .to_string(),
+            Landing::Unstable => {
+                "GitHub would take the merge, with a non-required check failing or \
+                 still running. That says nothing about whether the change works."
+                    .to_string()
+            }
+            Landing::Blocked(reason) => format!(
+                "GitHub would refuse this merge: {reason}. A merge call now would \
+                 be refused, so that has to be cleared first."
+            ),
+            Landing::Unknown => "GitHub has not computed a mergeability verdict yet (it does that \
+                 lazily, usually within seconds of a push). That is not a block — \
+                 the next reminder asks again."
+                .to_string(),
+            Landing::Merged => {
+                "the pull request is already merged into its base, which is not the \
+                 same as having reached the trunk."
+                    .to_string()
+            }
+            Landing::ClosedUnmerged => {
+                "the pull request was closed without merging, so there is no merge left to make."
+                    .to_string()
+            }
         }
     }
 }
@@ -809,6 +929,13 @@ impl GitHubClient {
             // "unknown", not "conflicted", and the distinction matters to a
             // reader deciding whether to act.
             mergeable: body.get("mergeable").and_then(|m| m.as_bool()),
+            // The finer verdict, off the same body — no second request. This
+            // is the field `landing()` reads first, because it is the only one
+            // that can say "a required check has not passed".
+            mergeable_state: body
+                .get("mergeable_state")
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
             merge_commit_sha: body
                 .get("merge_commit_sha")
                 .and_then(|s| s.as_str())
@@ -1366,5 +1493,147 @@ mod tests {
         let client = GitHubClient::with_base_url("token", url);
         let issues = client.list_open_issues("own", "repo").await.unwrap();
         assert!(issues.is_empty());
+    }
+
+    fn pr(state: GhState, merged: bool, mergeable: Option<bool>, ms: Option<&str>) -> PrState {
+        PrState {
+            state,
+            merged,
+            mergeable,
+            mergeable_state: ms.map(str::to_owned),
+            merge_commit_sha: None,
+            base_ref: Some("main".into()),
+        }
+    }
+
+    /// The reason `mergeable_state` is read at all: a pull request behind a
+    /// failing *required* check answers `mergeable: true`, so the coarse flag
+    /// alone reads it as ready.
+    #[test]
+    fn a_blocked_pr_is_blocked_however_mergeable_the_coarse_flag_says_it_is() {
+        assert_eq!(
+            pr(GhState::Open, false, Some(true), Some("blocked")).landing(),
+            Landing::Blocked(BLOCKED_REQUIRED)
+        );
+    }
+
+    #[test]
+    fn each_mergeable_state_maps_to_one_verdict() {
+        let landing = |state| pr(GhState::Open, false, Some(true), Some(state)).landing();
+        assert_eq!(landing("clean"), Landing::Clear);
+        assert_eq!(landing("unstable"), Landing::Unstable);
+        assert_eq!(landing("dirty"), Landing::Blocked(BLOCKED_CONFLICT));
+        assert_eq!(landing("draft"), Landing::Blocked(BLOCKED_DRAFT));
+        assert_eq!(landing("behind"), Landing::Blocked(BLOCKED_BEHIND));
+    }
+
+    /// Unknown is its own answer. GitHub computes mergeability lazily, so the
+    /// seconds after a push read exactly like this — and reporting them as a
+    /// block would park work on a verdict that has not been rendered.
+    #[test]
+    fn an_uncomputed_verdict_is_unknown_rather_than_blocked() {
+        assert_eq!(
+            pr(GhState::Open, false, None, Some("unknown")).landing(),
+            Landing::Unknown
+        );
+        assert_eq!(
+            pr(GhState::Open, false, None, None).landing(),
+            Landing::Unknown
+        );
+        // A state nobody here has heard of falls back rather than guessing.
+        assert_eq!(
+            pr(GhState::Open, false, None, Some("has_hooks")).landing(),
+            Landing::Unknown
+        );
+        assert!(
+            Landing::Unknown.describe().contains("not a block"),
+            "{}",
+            Landing::Unknown.describe()
+        );
+    }
+
+    /// With no `mergeable_state` at all — an older API, a partial body — the
+    /// coarse flag is all there is, and it still has to answer something.
+    #[test]
+    fn the_coarse_flag_is_the_fallback_and_only_the_fallback() {
+        assert_eq!(
+            pr(GhState::Open, false, Some(true), None).landing(),
+            Landing::Clear
+        );
+        assert_eq!(
+            pr(GhState::Open, false, Some(false), None).landing(),
+            Landing::Blocked(BLOCKED_CONFLICT)
+        );
+    }
+
+    /// GitHub keeps answering `mergeable_state` on a closed pull request, and
+    /// that answer is about a merge that can no longer be made.
+    #[test]
+    fn merged_and_closed_outrank_any_mergeability() {
+        assert_eq!(
+            pr(GhState::Closed, true, Some(false), Some("dirty")).landing(),
+            Landing::Merged
+        );
+        assert_eq!(
+            pr(GhState::Closed, false, Some(true), Some("clean")).landing(),
+            Landing::ClosedUnmerged
+        );
+        // And `merged` still means "reached its base", nothing more.
+        assert!(
+            Landing::Merged.describe().contains("not the same as"),
+            "{}",
+            Landing::Merged.describe()
+        );
+    }
+
+    /// The wording is pinned because it is the load-bearing part. There are no
+    /// workflows and no branch protection in this repository, so `clean` is a
+    /// statement about git and cannot object to a change that does not work —
+    /// a describe() that read as a clearance would be instructing every future
+    /// turn to land unverified work.
+    #[test]
+    fn clear_says_what_it_does_not_mean() {
+        let said = Landing::Clear.describe();
+        assert!(
+            said.contains("says nothing about whether the change works"),
+            "{said}"
+        );
+        for forbidden in ["good to merge", "ready to merge", "safe"] {
+            assert!(!said.contains(forbidden), "{forbidden:?} in: {said}");
+        }
+        // Blocked names its reason and says the call itself would fail.
+        let blocked = Landing::Blocked(BLOCKED_REQUIRED).describe();
+        assert!(blocked.contains(BLOCKED_REQUIRED), "{blocked}");
+        assert!(blocked.contains("would be refused"), "{blocked}");
+    }
+
+    /// The field comes off the body `pull_request_state` already fetches — no
+    /// second request, which is what makes putting it on the brief affordable.
+    #[tokio::test]
+    async fn pull_request_state_reads_mergeable_state_off_the_same_body() {
+        let app = Router::new().route(
+            "/repos/{owner}/{repo}/pulls/{number}",
+            axum::routing::get(|| async {
+                AxumJson(json!({
+                    "state": "open",
+                    "merged": false,
+                    "mergeable": true,
+                    "mergeable_state": "blocked",
+                    "merge_commit_sha": "abc",
+                    "base": { "ref": "main" },
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = GitHubClient::new("token").with_rest_base_url(base);
+        let state = client.pull_request_state("own", "repo", 7).await.unwrap();
+
+        assert_eq!(state.mergeable_state.as_deref(), Some("blocked"));
+        assert_eq!(state.landing(), Landing::Blocked(BLOCKED_REQUIRED));
+        // …and the coarse label is unchanged: the two are read together.
+        assert_eq!(state.label(), "open");
     }
 }

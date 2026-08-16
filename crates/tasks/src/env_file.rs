@@ -48,15 +48,42 @@
 //! It is deliberately *not* part of [`crate::run::Config::from_env`]. Tests
 //! build configs, and a suite whose results depended on a developer's
 //! untracked `.env` would be a worse bug than the one this fixes.
+//!
+//! # Turning it off
+//!
+//! [`DISABLE_VAR`] (`TASKS_ENV_FILES=off`) skips the search entirely. It exists
+//! for tests that *exec the `tasks` binary*, and the thing it fixes is subtle
+//! enough to be worth stating: `Command::env_remove` is the **opposite** of a
+//! scrub here. The real environment is the only thing a `.env` entry loses to,
+//! so removing a variable from a child's environment is precisely what hands
+//! the decision to the file — and `.env` is gitignored, so a maintainer with
+//! `TASKS_DEFAULT_MODE=play` in one fails a restart suite on their machine and
+//! nowhere else. A test that spawns `tasks` has to set this, not unset that.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use thiserror::Error;
 use tracing::{info, warn};
 
 /// The file `.env` loading looks for, at every candidate root.
 const FILE_NAME: &str = ".env";
+
+/// Set to `off` to skip `.env` loading entirely. See the module docs.
+pub const DISABLE_VAR: &str = "TASKS_ENV_FILES";
+
+/// [`DISABLE_VAR`] held something that is neither on nor off.
+///
+/// An error rather than a fallback, and deliberately not `.ok()`-able: mapping
+/// an unreadable value to "load the files anyway" is the one direction this
+/// switch must not fail in, since the caller setting it is trying to *stop*
+/// ambient configuration from deciding a result.
+#[derive(Debug, Error)]
+#[error("{DISABLE_VAR} must be `on` or `off`, not {value:?}")]
+pub struct BadSetting {
+    pub value: String,
+}
 
 /// One file that was found, and what it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +107,10 @@ pub struct Source {
 /// read. Returns what it did for [`report`] to log once a subscriber exists —
 /// the logging is split out because a `.env` may itself set `RUST_LOG`, so
 /// loading has to precede `tracing_subscriber` initialization.
-pub fn load() -> Vec<Source> {
+pub fn load() -> Result<Vec<Source>, BadSetting> {
+    if !enabled(std::env::var_os(DISABLE_VAR).as_deref())? {
+        return Ok(Vec::new());
+    }
     let data_dir = tasks_api::paths::data_dir();
     let cwd = std::env::current_dir().ok();
     let exe = std::env::current_exe().ok();
@@ -91,7 +121,31 @@ pub fn load() -> Vec<Source> {
         let Some(source) = apply(&path) else { continue };
         sources.push(source);
     }
-    sources
+    Ok(sources)
+}
+
+/// Whether to search for `.env` files at all, given [`DISABLE_VAR`]'s raw
+/// value. Absent means yes — the switch is opt-out.
+///
+/// A value that is not UTF-8 is a [`BadSetting`], never "absent": a caller who
+/// set this variable meant something by it, and silently ignoring it would
+/// re-enable exactly the mechanism they were turning off.
+fn enabled(raw: Option<&OsStr>) -> Result<bool, BadSetting> {
+    let Some(raw) = raw else { return Ok(true) };
+    let bad = || BadSetting {
+        value: raw.to_string_lossy().into_owned(),
+    };
+    match raw
+        .to_str()
+        .ok_or_else(bad)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" => Ok(false),
+        "on" | "1" | "true" => Ok(true),
+        _ => Err(bad()),
+    }
 }
 
 /// Log what [`load`] did, once there is a subscriber to log to.
@@ -392,6 +446,34 @@ mod tests {
     fn an_absent_file_is_not_a_source() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(apply(&tmp.path().join("nope.env")).is_none());
+    }
+
+    /// The opt-out switch, including the direction an unreadable value has to
+    /// fail in. `.ok()` here would mean "load the files anyway", which is the
+    /// one answer a caller trying to stop ambient configuration cannot use.
+    #[test]
+    fn the_disable_switch_is_opt_out_and_refuses_what_it_cannot_read() {
+        let val = |s: &str| OsString::from(s);
+
+        assert!(enabled(None).unwrap(), "absent means load them");
+        for on in ["on", "1", "true", " ON "] {
+            assert!(enabled(Some(&val(on))).unwrap(), "{on}");
+        }
+        for off in ["off", "0", "false", "OFF"] {
+            assert!(!enabled(Some(&val(off))).unwrap(), "{off}");
+        }
+
+        let err = enabled(Some(&val("maybe"))).expect_err("not a setting");
+        assert!(err.to_string().contains("maybe"), "{err}");
+        assert!(err.to_string().contains(DISABLE_VAR), "{err}");
+
+        // Not UTF-8: a `BadSetting`, never "absent".
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(vec![0xff, 0xfe]);
+            assert!(enabled(Some(&raw)).is_err());
+        }
     }
 
     /// Variables defined before a malformed line still apply — losing a whole

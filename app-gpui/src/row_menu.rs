@@ -306,7 +306,11 @@ fn cancel_refusal(context: RowContext) -> Option<&'static str> {
     match context.task_state {
         TaskState::Scouting | TaskState::Building => None,
         TaskState::Backlog | TaskState::Queued => Some("nothing has started yet"),
-        TaskState::InReview | TaskState::ReadyToBuild => Some("nothing is running"),
+        // `AwaitingMerge` is past the run, not in it: the build concluded and
+        // opened a PR, so there is nothing here to stop.
+        TaskState::InReview | TaskState::ReadyToBuild | TaskState::AwaitingMerge => {
+            Some("nothing is running")
+        }
         TaskState::Done => Some("this task is done"),
         TaskState::Rejected => Some("this task was rejected"),
     }

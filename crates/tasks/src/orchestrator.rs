@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::brief::Brief;
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Actor, BuildStatus, CharterEntry, CharterLevel, Obligation, ObligationKind,
+    Actor, BuildStatus, Capability, CharterEntry, CharterLevel, Obligation, ObligationKind,
     OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
 use crate::store::{ACTOR_HEADER, Store, StoreError};
@@ -815,6 +815,31 @@ pub async fn format_obligations(
         ));
     }
 
+    // And the same argument for landing: with `land_builds` live, the default
+    // for an open PR is to merge it, and the facts that decide it are right
+    // below. Said here for the same reason batching is — the standing prompt
+    // may be a long way up the conversation by now. Nothing at all under
+    // Shadow or Off, or when the charter cannot be read: this line claims an
+    // authority, and claiming one the server will refuse is worse than silence.
+    let to_land = obligations
+        .iter()
+        .filter(|o| o.kind == ObligationKind::LandBatch)
+        .count();
+    if to_land > 0
+        && matches!(
+            store.charter_entry(Capability::LandBuilds).await,
+            Ok(entry) if entry.level == CharterLevel::Live
+        )
+    {
+        header.push_str(&format!(
+            "\n\n{to_land} open pull request(s) below are yours to land: merging is \
+             your call under the charter, and the facts beneath each build say what \
+             GitHub reports about the merge, what the build claimed about its own \
+             test run, and how much of it nothing here could have checked. Not \
+             merging one is a decision too — say which of those three is why."
+        ));
+    }
+
     let mut sections = Vec::new();
     for obligation in obligations {
         // Before the `SpecId`, deliberately: `LandBatch`'s subject is a build
@@ -985,6 +1010,63 @@ fn workdir_section(is_checkout: bool) -> &'static str {
     }
 }
 
+/// What to do with a pull request that has not landed, generated from the
+/// `land_builds` charter row.
+///
+/// Generated for the reason [`authority_section`] is, and for one more: the
+/// hand-written sentence this replaces said "landing it is the human's" while
+/// the charter shipped `land_builds` **live**. That one sentence was the whole
+/// of the "nothing drives a PR to landed" gap — the capability existed, the
+/// endpoint worked, and the prompt told the agent not to use it.
+///
+/// The three carve-outs are exhaustive on purpose. "Hand it over when in
+/// doubt" is what the old sentence effectively said, and doubt is unbounded;
+/// "hand it over when GitHub would refuse it, when no test run backs it, or
+/// when nothing here could have checked it" is not. The third exists because
+/// this repository has no workflows and no branch protection, so GitHub's
+/// verdict is structurally incapable of objecting to a change that does not
+/// work — see [`crate::github::Landing`].
+///
+/// A missing row reads as `Off`, the safe direction `authority_section` takes.
+fn landing_section(charter: &[CharterEntry]) -> &'static str {
+    let level = charter
+        .iter()
+        .find(|e| e.capability == Capability::LandBuilds)
+        .map(|e| e.level)
+        .unwrap_or(CharterLevel::Off);
+    match level {
+        CharterLevel::Live => {
+            "Landing it is YOURS, and waiting is not the default: merge it this \
+             turn with POST /pull-requests/{number}/merge, and say that you did. \
+             The brief above has already asked the three questions that could \
+             stop you, and they are the whole list: (a) GitHub would refuse the \
+             merge — say which reason and stop; (b) the build reported no \
+             passing test run of its own, or a failing one — hand it to the \
+             human, since nothing re-runs its tests for you and this repository \
+             requires no checks of its own; (c) nothing runnable here could have \
+             checked it — the app-gpui rendering case. Say which of the three it \
+             is rather than defaulting to caution, and if it is none of them, \
+             merge it."
+        }
+        CharterLevel::Shadow => {
+            "Landing it is yours to decide and not to do: call POST \
+             /pull-requests/{number}/merge as you otherwise would — the server \
+             records the judgment, applies nothing, and answers `shadowed: true` \
+             — and then say what you decided and why. Judge it on the same three \
+             questions the brief answers: whether GitHub would refuse the merge, \
+             whether the build reported a passing test run of its own, and \
+             whether anything runnable here could have checked it."
+        }
+        CharterLevel::Off => {
+            "Landing it is not yours. Report what it is waiting on, and say \
+             which of the three questions the brief answers would have decided \
+             it: whether GitHub would refuse the merge, whether the build \
+             reported a passing test run of its own, and whether anything \
+             runnable here could have checked it."
+        }
+    }
+}
+
 /// What this boot cannot do regardless of what the charter permits, or empty
 /// when nothing is degraded.
 ///
@@ -1014,6 +1096,7 @@ fn system_prompt(
     github_configured: bool,
 ) -> String {
     let authority = authority_section(charter);
+    let landing = landing_section(charter);
     let workdir = workdir_section(workdir_is_checkout);
     let degradation = degradation_section(github_configured);
     let curl_config = curl_config.display();
@@ -1064,8 +1147,8 @@ fn system_prompt(
            a PR merged into another build's branch ships nothing until that \
            branch reaches the trunk. The server resolves this on whether the \
            merge commit is an ancestor of the trunk, never on `merged` — so a \
-           batch parked behind a merged PR is correct, not stale. Report what \
-           it is waiting on; landing it is the human's.\n\
+           batch parked behind a merged PR is correct, not stale. \
+           {landing}\n\
          - Scout or build FAILED → investigate (transcript, build row, \
            events) and report the cause and what you'd do about it.\n\
          - New tasks → note anything urgent or related to in-flight work; \
@@ -1533,6 +1616,65 @@ mod tests {
         // every denial would grow with the enum for no benefit.
         assert!(!p.contains("close issues that are done"), "{p}");
         assert!(p.contains("anything not listed here is the human's"), "{p}");
+    }
+
+    /// The `land_batch` bullet is generated from the charter for the same
+    /// reason the authority section is — and here the hand-written version was
+    /// not merely redundant but *wrong*: it said landing was the human's while
+    /// the charter shipped `land_builds` live, which is the whole of "nothing
+    /// drives a PR to landed".
+    #[test]
+    fn what_to_do_with_an_open_pr_comes_from_the_charter() {
+        use crate::models::Capability;
+
+        let charter = |level| {
+            vec![CharterEntry {
+                capability: Capability::LandBuilds,
+                level,
+                daily_limit: None,
+                updated_at: chrono::Utc::now(),
+            }]
+        };
+
+        let live = prompt(4800, &charter(CharterLevel::Live));
+        assert!(live.contains("Landing it is YOURS"), "{live}");
+        assert!(
+            live.contains("POST /pull-requests/{number}/merge"),
+            "the spliced section is not re-formatted, so a bare brace is fine here: {live}"
+        );
+        assert!(live.contains("if it is none of them, merge it"), "{live}");
+        // The regression that matters: the old sentence is *gone*, not merely
+        // outvoted by a newer one further down.
+        assert!(!live.contains("landing it is the human's"), "{live}");
+
+        let shadow = prompt(4800, &charter(CharterLevel::Shadow));
+        assert!(shadow.contains("yours to decide and not to do"), "{shadow}");
+        assert!(!shadow.contains("Landing it is YOURS"), "{shadow}");
+
+        let off = prompt(4800, &charter(CharterLevel::Off));
+        assert!(off.contains("Landing it is not yours"), "{off}");
+        assert!(!off.contains("merge it this turn"), "{off}");
+
+        // An absent row is `off` — `Store::charter_entry` reads a missing row
+        // that way, so the prompt has to as well or the two disagree.
+        assert_eq!(
+            landing_section(&[]),
+            landing_section(&charter(CharterLevel::Off))
+        );
+
+        // All three name the three carve-outs, so the standard a batch is
+        // judged against does not change with who applies it.
+        for section in [
+            landing_section(&charter(CharterLevel::Live)),
+            landing_section(&charter(CharterLevel::Shadow)),
+            landing_section(&charter(CharterLevel::Off)),
+        ] {
+            assert!(section.contains("three"), "{section}");
+            assert!(
+                section.contains("app-gpui") || section.contains("runnable here"),
+                "{section}"
+            );
+        }
     }
 
     /// The credential the agent can actually present. The old scheme asked it

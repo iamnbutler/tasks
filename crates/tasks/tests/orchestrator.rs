@@ -938,6 +938,50 @@ async fn several_unbuilt_specs_ask_to_be_batched() {
     assert!(many.contains("one `POST /builds`"), "{many}");
 }
 
+/// The `land_batch` turn has to say whose job landing is, and it has to get
+/// that from the charter rather than from a sentence somebody wrote once. The
+/// bug: the charter shipped `land_builds` **live** while the prompt said
+/// landing was the human's, so every parked PR was reported and none was
+/// merged.
+#[tokio::test]
+async fn a_land_batch_turn_says_merging_is_the_orchestrators_only_when_the_charter_does() {
+    use tasks::models::{Capability, CharterLevel};
+
+    let store = Store::open_in_memory().await.unwrap();
+    let brief = tasks::brief::Brief::new(&store, None, "main");
+    let obligation = tasks::models::Obligation {
+        kind: ObligationKind::LandBatch,
+        subject_id: "build_1".to_string(),
+        summary: "PR #906 has been open for 3 days".into(),
+        since: Utc::now(),
+    };
+
+    // Live is the shipped default, and it is what the charter migration
+    // inserts — so this is what a real turn reads.
+    let live =
+        tasks::orchestrator::format_obligations(&store, &brief, std::slice::from_ref(&obligation))
+            .await;
+    assert!(live.contains("yours to land"), "{live}");
+    assert!(live.contains("say which of those three is why"), "{live}");
+
+    for level in [CharterLevel::Shadow, CharterLevel::Off] {
+        store
+            .set_charter(Capability::LandBuilds, level, None)
+            .await
+            .unwrap();
+        let turn = tasks::orchestrator::format_obligations(
+            &store,
+            &brief,
+            std::slice::from_ref(&obligation),
+        )
+        .await;
+        assert!(
+            !turn.contains("yours to land"),
+            "{level:?} must not claim an authority the server will refuse: {turn}"
+        );
+    }
+}
+
 /// A spec sitting in `pending_review`, with the task and session behind it.
 async fn seed_pending_spec(store: &Store) -> Spec {
     let now = Utc::now();

@@ -714,9 +714,96 @@ fn render_prompt(batch: &[(Spec, Task)]) -> String {
          describing the change, suitable as a pull request body. Do not use \
          GitHub closing keywords (`Closes #N`, `Fixes #N`) — the server \
          links the issues itself.\n\
-         5. Do NOT push and do NOT open a PR — the server does both.\n",
+         5. End `SUMMARY.md` with one line saying whether you actually ran the \
+         tests, in exactly this shape:\n\
+         `Verification: PASSED — <the command you ran>`\n\
+         `Verification: FAILED — <the command, and what failed>`\n\
+         `Verification: NOT RUN — <why not>`\n\
+         Report what actually happened. Nothing re-runs this suite for you \
+         downstream, so this line is the only evidence anyone has that the \
+         change works — claiming a run you did not make is the one thing here \
+         that cannot be caught later, and \"NOT RUN\" costs the batch a look \
+         from a human rather than costing you anything.\n\
+         6. Do NOT push and do NOT open a PR — the server does both.\n",
     );
     out
+}
+
+/// The marker a Builder's `SUMMARY.md` carries its test-run claim under.
+///
+/// A trailer in the summary, rather than a column or a protocol field, for one
+/// reason worth stating: the summary is *already* stored and *already* the PR
+/// body, so one sentence serves the human reading the PR on GitHub and the
+/// brief reading it back, with no migration, no `BuildEvent` field and no
+/// builder-image rebuild in between. It also degrades correctly on rows that
+/// predate it — they parse as [`VerificationReport::Unreported`].
+pub const VERIFICATION_PREFIX: &str = "Verification:";
+
+/// Detail longer than this is truncated. One line, bounded: this ends up in a
+/// brief, whose whole value is being cheaper to read than the thing it summarizes.
+const MAX_VERIFICATION_DETAIL: usize = 200;
+
+/// What a build claimed about its own test run.
+///
+/// A *claim*, never a check — nothing here re-runs anything. The point of
+/// keeping [`Self::Unreported`] separate from [`Self::NotRun`] is that they
+/// mean different things: one build said it skipped the tests, the other said
+/// nothing at all, and only the second is compatible with "the tests passed
+/// and the line was forgotten".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationReport {
+    Passed(String),
+    Failed(String),
+    NotRun(String),
+    Unreported,
+}
+
+/// Read the verification trailer out of a `SUMMARY.md`.
+///
+/// Scans every line because agents append trailers, takes the first marker it
+/// recognizes, and is deliberately forgiving about the shape agents actually
+/// produce — bullets, casing, `—`/`-`/`:` between the marker and the detail.
+/// Anything it cannot recognize is [`VerificationReport::Unreported`] and
+/// **never** a pass: the direction a mistake here has to fall is towards a
+/// human looking at it.
+pub fn verification_report(summary: Option<&str>) -> VerificationReport {
+    let Some(summary) = summary else {
+        return VerificationReport::Unreported;
+    };
+    for line in summary.lines() {
+        // Bullets and emphasis around the trailer: `- **Verification:** …`.
+        let line = line.trim().trim_start_matches(['-', '*', '#', ' ']).trim();
+        let Some(rest) = strip_prefix_ci(line, VERIFICATION_PREFIX) else {
+            continue;
+        };
+        // `**Verification:** …` leaves the closing emphasis behind.
+        let rest = rest.trim_start_matches(['*', ' ']).trim();
+        for (marker, build) in [
+            ("PASSED", VerificationReport::Passed as fn(String) -> _),
+            ("FAILED", VerificationReport::Failed as fn(String) -> _),
+            ("NOT RUN", VerificationReport::NotRun as fn(String) -> _),
+            ("NOT_RUN", VerificationReport::NotRun as fn(String) -> _),
+        ] {
+            let Some(detail) = strip_prefix_ci(rest, marker) else {
+                continue;
+            };
+            let detail = detail
+                .trim_start_matches(['—', '–', '-', ':', ' '])
+                .trim()
+                .chars()
+                .take(MAX_VERIFICATION_DETAIL)
+                .collect::<String>();
+            return build(detail);
+        }
+    }
+    VerificationReport::Unreported
+}
+
+/// `strip_prefix`, ASCII-case-insensitively.
+fn strip_prefix_ci<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = haystack.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &haystack[prefix.len()..])
 }
 
 /// PR title + body. Body prefers the agent's SUMMARY.md; falls back to the
@@ -854,6 +941,89 @@ mod tests {
         // scout touched, not the issue body (the spec subsumes it).
         assert!(!prompt.contains("secret_scout_file.rs"));
         assert!(!prompt.contains("issue body"));
+    }
+
+    /// The Builder's own test run is the only evidence this repository can
+    /// produce that a change works — there are no workflows and no required
+    /// checks — so the prompt has to ask for it, and has to ask for it
+    /// *truthfully*. A line that agents learn to write unconditionally is
+    /// worse than no line, because the brief reads it back as evidence.
+    #[test]
+    fn the_prompt_asks_for_the_verification_line_and_for_the_truth() {
+        let prompt = render_prompt(&[pair(7, "A thing", "spec")]);
+        assert!(prompt.contains("Verification: PASSED"), "{prompt}");
+        assert!(prompt.contains("Verification: FAILED"), "{prompt}");
+        assert!(prompt.contains("Verification: NOT RUN"), "{prompt}");
+        assert!(prompt.contains("Report what actually happened"), "{prompt}");
+        assert!(
+            prompt.contains("cannot be caught later"),
+            "the reason the line has to be honest: {prompt}"
+        );
+        // The step it displaced is still there, renumbered.
+        assert!(prompt.contains("6. Do NOT push"), "{prompt}");
+    }
+
+    /// The parser meets agents where they write. What it must never do is
+    /// promote something it did not understand into a pass.
+    #[test]
+    fn the_verification_trailer_survives_the_shapes_agents_write() {
+        let report = |s: &str| verification_report(Some(s));
+
+        assert_eq!(
+            report("Did the thing.\n\nVerification: PASSED — make test (579 tests)"),
+            VerificationReport::Passed("make test (579 tests)".into())
+        );
+        // Case, bullets and emphasis.
+        assert_eq!(
+            report("- **verification:** passed - cargo test"),
+            VerificationReport::Passed("cargo test".into())
+        );
+        assert_eq!(
+            report("* Verification: FAILED: make test, 2 store tests red"),
+            VerificationReport::Failed("make test, 2 store tests red".into())
+        );
+        assert_eq!(
+            report("Verification: not run — the suite needs a display"),
+            VerificationReport::NotRun("the suite needs a display".into())
+        );
+        assert_eq!(
+            report("Verification: NOT_RUN — no test runner in the image"),
+            VerificationReport::NotRun("no test runner in the image".into())
+        );
+        // The first marker wins; a summary that argues with itself is not a
+        // reason to search for the most favourable line.
+        assert_eq!(
+            report("Verification: FAILED — one test red\nVerification: PASSED — later"),
+            VerificationReport::Failed("one test red".into())
+        );
+
+        // Everything unrecognized, including a build that predates the line.
+        assert_eq!(verification_report(None), VerificationReport::Unreported);
+        assert_eq!(
+            report("Just prose about the change."),
+            VerificationReport::Unreported
+        );
+        assert_eq!(
+            report("Verification: probably fine"),
+            VerificationReport::Unreported
+        );
+        assert_eq!(
+            report("The tests passed."),
+            VerificationReport::Unreported,
+            "prose about passing is not the trailer"
+        );
+    }
+
+    #[test]
+    fn the_verification_detail_is_one_bounded_line() {
+        let long = format!("Verification: PASSED — {}\nmore prose", "x".repeat(500));
+        match verification_report(Some(&long)) {
+            VerificationReport::Passed(detail) => {
+                assert_eq!(detail.chars().count(), MAX_VERIFICATION_DETAIL);
+                assert!(!detail.contains("more prose"));
+            }
+            other => panic!("expected a pass, got {other:?}"),
+        }
     }
 
     #[test]
