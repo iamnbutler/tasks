@@ -363,6 +363,84 @@ async fn a_blocked_spec_brief_names_the_failures() {
     assert!(text.contains(&build.id.to_string()), "{text}");
 }
 
+/// A batch parked behind a PR stacked on another build's branch. The brief has
+/// to name the base and spell out that merging this PR ships nothing — that
+/// misreading is how PR #863 was lost, and a branch name does not carry it.
+#[tokio::test]
+async fn a_stranded_build_brief_spells_out_a_base_that_is_not_the_trunk() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+    let spec = approved_spec(&store, &project, 878, &["src/a.rs"]).await;
+
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "build/underneath",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+    store
+        .finalize_build_succeeded(&build.id, "headsha", 863, None, &[])
+        .await
+        .unwrap();
+
+    let brief = Brief::new(&store, None, "main");
+    let text = joined(&brief.for_stranded_build(&build.id).await.unwrap());
+    assert!(text.contains("build/underneath"), "{text}");
+    assert!(text.contains("NOT the trunk"), "{text}");
+    assert!(text.contains("#863"), "{text}");
+    assert!(
+        text.contains("#878"),
+        "names whose issue is waiting: {text}"
+    );
+
+    // The obligation's section heading is the *build*, not a spec conjured out
+    // of a build id — the failure mode `format_obligations` branches to avoid.
+    let turn = tasks::orchestrator::format_obligations(
+        &store,
+        &brief,
+        &[Obligation {
+            kind: ObligationKind::LandBatch,
+            subject_id: build.id.to_string(),
+            summary: "PR #863 has been open".into(),
+            since: Utc::now(),
+        }],
+    )
+    .await;
+    assert!(turn.contains(&format!("On build {}", build.id)), "{turn}");
+    assert!(turn.contains("NOT the trunk"), "{turn}");
+}
+
+/// The unstacked case reads differently on purpose: merging the PR really does
+/// ship the work, and saying so is what makes the stacked warning worth reading.
+#[tokio::test]
+async fn a_stranded_build_based_on_the_trunk_says_merging_ships_it() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+    let spec = approved_spec(&store, &project, 879, &["src/b.rs"]).await;
+
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+    store
+        .finalize_build_succeeded(&build.id, "headsha", 864, None, &[])
+        .await
+        .unwrap();
+
+    let brief = Brief::new(&store, None, "main");
+    let text = joined(&brief.for_stranded_build(&build.id).await.unwrap());
+    assert!(text.contains("its base IS the trunk"), "{text}");
+    assert!(!text.contains("NOT the trunk"), "{text}");
+}
+
 /// The two lines of `pipeline` describe two populations, and a reader who
 /// cannot tell them apart learns to re-derive both. A spec keeps its
 /// `approved` status for the whole build carrying it, so the waiting count has

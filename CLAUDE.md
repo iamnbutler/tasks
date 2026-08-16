@@ -34,6 +34,40 @@ implementation.
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
   through the server, never through agents.
+- **`done` means shipped, and it is written in exactly one place.** A build
+  that opens a PR has made a claim, not a delivery, so it parks its batch in
+  `awaiting_merge`; the only thing that writes `done` is closure-derived
+  retirement, so `done` always means "the issue is closed upstream". Each poll
+  reads the unresolved PR (`watch_merges`) and either closes the issue as
+  completed — through the server, under `retire_work`, with the merge commit
+  as evidence — or unwinds the batch back to `ready_to_build` with a build
+  attempt charged. Unwinding restores the *option* to rebuild; nothing
+  dispatches a build by itself, which is what keeps that safe. The cost is one
+  REST call per open Builder PR per poll, forever, and that is the right
+  price: the moment it is cached in a `last_checked` column, the thing being
+  cached is a GitHub-owned fact with a timestamp on it.
+- **A PR's `merged` means "reached its base", never "shipped" — the pipeline
+  stacks builds routinely.** A build based on another build's branch reads
+  `merged: true` the instant that branch takes it, whether or not the branch
+  ever lands, so `watch_merges` resolves `awaiting_merge` on whether the merge
+  commit is an **ancestor of the trunk** (`SCOUT_BASE_BRANCH`) and never on
+  `merged`. `run::shipped` is that predicate: `base_ref == trunk`
+  short-circuits, so the ordinary unstacked case costs no extra call, and only
+  a stacked PR spends a `GET /compare/{trunk}...{sha}` — which reads *head
+  relative to base*, so reachable is `identical` or `behind`, and reversing the
+  operands inverts the verdict. Every unreadable answer is `false`, because the
+  two mistakes are not symmetric: staying parked costs one call on the next
+  poll, while concluding wrongly writes `done` over work that shipped nothing
+  and no pass revisits `done`. This is not hypothetical — **PR #863 was
+  `merged: true` and its work never reached `main`**, which is the failure
+  above, one level up. A batch that has merged but not reached the trunk
+  therefore **stays parked rather than unwinding**, and that is what makes both
+  manual merge orders safe: merge the base first and the dependent's commit is
+  already reachable, or merge the dependent first and a later poll finds it
+  once the base lands. Reachability is monotone, so polling can never un-ship
+  something it concluded had landed. Nothing auto-unwinds a stranded batch;
+  `ObligationKind::LandBatch` makes it loud instead, and it is the first
+  obligation whose subject is a **build** id rather than a spec id.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only

@@ -56,7 +56,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::{VmConfig, VmId};
 
@@ -64,8 +64,11 @@ use crate::brief::Brief;
 use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::events::EventPayload;
-use crate::github::{GitHubClient, IntakeFilter};
-use crate::models::{ChatRole, GhState, Mode, Project, Spec, Task, TaskId, TaskState};
+use crate::github::{GitHubClient, IntakeFilter, PrState};
+use crate::models::{
+    Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput, GhState,
+    Mode, Project, Spec, Task, TaskId, TaskState,
+};
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::reattach;
@@ -1135,11 +1138,13 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
     loop {
         match store.get_mode().await {
             Ok(Mode::Stop) => {}
-            Ok(_) => match poll_once(&store, &github, &config.intake).await {
-                Ok(0) => {}
-                Ok(n) => info!(ingested = n, "poll ingested new tasks"),
-                Err(e) => warn!(error = %e, "poll failed"),
-            },
+            Ok(_) => {
+                match poll_once(&store, &github, &config.intake, &config.scout_base_branch).await {
+                    Ok(0) => {}
+                    Ok(n) => info!(ingested = n, "poll ingested new tasks"),
+                    Err(e) => warn!(error = %e, "poll failed"),
+                }
+            }
             Err(e) => warn!(error = %e, "could not read mode; skipping poll"),
         }
 
@@ -1175,10 +1180,14 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 ///   the API's job.
 /// - That task still tracks upstream closure correctly, because reconciliation
 ///   still sees the complete open set.
+///
+/// `trunk` is the branch that ships ([`Config::scout_base_branch`]), and is
+/// only used by [`watch_merges`], which cannot decide "shipped" without it.
 pub async fn poll_once(
     store: &Store,
     github: &GitHubClient,
     intake: &IntakeFilter,
+    trunk: &str,
 ) -> Result<usize, StoreError> {
     let mut ingested = 0;
     for project in store.list_projects().await? {
@@ -1238,53 +1247,323 @@ pub async fn poll_once(
                 .await?;
         }
 
-        // Closure-derived retirement: issue closure IS the "done" signal for
-        // picked-up work — there is no manual mark-done. The close *reason* is
-        // GitHub-owned, so it's queried here at decision time, never persisted.
-        let retirable = store.list_retirable_tasks(&project.id).await?;
-        if retirable.is_empty() {
-            continue;
+        retire_closed_issues(store, github, &project).await?;
+        // After retirement, deliberately. A merge closes the issue, so the
+        // poll that follows one finds the task retirable; running this first
+        // would find it still `awaiting_merge` and close an already-closed
+        // issue a second time — a wasted PATCH and a duplicate ledger row.
+        // `list_builds_awaiting_merge` filters on the open issue as well, so
+        // the two passes cannot claim the same row either way.
+        watch_merges(store, github, &project, trunk).await?;
+    }
+    Ok(ingested)
+}
+
+/// Closure-derived retirement: issue closure IS the "done" signal for picked-up
+/// work — there is no manual mark-done. The close *reason* is GitHub-owned, so
+/// it is queried here at decision time and never persisted.
+///
+/// A failed lookup leaves the candidates picked up and returns: they are still
+/// candidates, and the next poll asks again.
+async fn retire_closed_issues(
+    store: &Store,
+    github: &GitHubClient,
+    project: &Project,
+) -> Result<(), StoreError> {
+    let retirable = store.list_retirable_tasks(&project.id).await?;
+    if retirable.is_empty() {
+        return Ok(());
+    }
+    let numbers: Vec<u64> = retirable.iter().map(|t| t.gh_issue_number).collect();
+    let info = match github
+        .issue_close_info(&project.repo_owner, &project.repo_name, &numbers)
+        .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(error = %e, "fetching close reasons failed; retiring next poll");
+            return Ok(());
         }
-        let numbers: Vec<u64> = retirable.iter().map(|t| t.gh_issue_number).collect();
-        let info = match github
-            .issue_close_info(&project.repo_owner, &project.repo_name, &numbers)
+    };
+    for task in retirable {
+        let to = match info.get(&task.gh_issue_number) {
+            // Reopened between the open-set fetch and this lookup; the
+            // next poll's upsert refreshes gh_state and it flows again.
+            Some(i) if i.state == GhState::Open => continue,
+            Some(i) => match i.state_reason.as_deref() {
+                Some("NOT_PLANNED") | Some("DUPLICATE") => TaskState::Rejected,
+                _ => TaskState::Done,
+            },
+            // Deleted / converted to a discussion — it is never coming
+            // back as an issue, so the work is concluded either way.
+            None => {
+                warn!(
+                    issue = task.gh_issue_number,
+                    "issue no longer resolvable; retiring as done"
+                );
+                TaskState::Done
+            }
+        };
+        if let Some(retired) = store.retire_task(&task.id, to).await? {
+            info!(
+                issue = retired.gh_issue_number,
+                to = to.as_str(),
+                "issue closed upstream; retired its task"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Did this pull request's work actually reach the branch that ships?
+///
+/// **Not `pr.merged`.** `merged` is a statement about the PR's *base*, and the
+/// pipeline stacks builds routinely — a PR based on another build's branch
+/// reads merged the moment that branch takes it, whether or not the branch
+/// ever lands. That is not hypothetical: PR #863 was `merged: true` and its
+/// work never reached `main`, which is the failure this whole pass exists to
+/// prevent, one level up.
+///
+/// The base is checked first and short-circuits, so the ordinary unstacked
+/// case — `base_ref == trunk` — costs **no extra API call at all**; the
+/// compare is spent only on a stacked PR.
+///
+/// Every unreadable answer returns `false`, because the two mistakes are not
+/// symmetric. Saying "not yet" costs one REST call on the next poll and is
+/// undone by it; saying "shipped" wrongly writes `done` over work that shipped
+/// nothing, and no pass ever revisits `done`.
+async fn shipped(
+    github: &GitHubClient,
+    project: &Project,
+    trunk: &str,
+    pr: &PrState,
+    pr_number: u64,
+) -> bool {
+    if !pr.merged {
+        return false;
+    }
+    if pr.base_ref.as_deref() == Some(trunk) {
+        return true;
+    }
+    let Some(sha) = pr.merge_commit_sha.as_deref() else {
+        warn!(
+            pr = pr_number,
+            base = pr.base_ref.as_deref().unwrap_or("(unknown)"),
+            "merged into a branch that is not the trunk and named no merge commit; \
+             staying parked"
+        );
+        return false;
+    };
+    match github
+        .merge_reached_trunk(&project.repo_owner, &project.repo_name, trunk, sha)
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            info!(
+                pr = pr_number,
+                base = pr.base_ref.as_deref().unwrap_or("(unknown)"),
+                sha,
+                trunk,
+                "merged into a branch that has not reached the trunk; staying parked"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                pr = pr_number,
+                sha,
+                error = %e,
+                "could not tell whether the merge reached the trunk; staying parked"
+            );
+            false
+        }
+    }
+}
+
+/// Resolve the pull requests behind `awaiting_merge` work: a PR whose work
+/// reached the trunk closes the issues it implements, an unmerged close returns
+/// the batch to `ready_to_build`, and anything else is left parked.
+///
+/// This is the other half of "`done` means shipped". `finalize_build_succeeded`
+/// parks a batch at `awaiting_merge` because a PR that opened is a claim, not a
+/// delivery; the fact that settles it lives on GitHub, so it is read here at
+/// decision time and never stored. The ongoing cost is one REST call per
+/// unresolved PR per poll, bounded by how many Builder PRs are open at once
+/// (builds are serial). Caching the answer in a `last_checked` column would be
+/// persisting a GitHub-owned fact with a timestamp on it.
+///
+/// Closing an issue is `retire_work`, so the charter governs it exactly as it
+/// governs the endpoint — and it governs the whole pass, not just the GitHub
+/// write: `off` does not even spend the read, `shadow` records what it would
+/// have done and applies nothing (including the unwind), `live` acts. The
+/// daily cap is deliberately not consulted: `orchestrator_actions_today`
+/// counts the *orchestrator's* writes and exists to bound a runaway agent
+/// loop, while one close per merged PR is bounded by how many PRs a human
+/// merged.
+///
+/// A failed PR read or a failed close is a warning and a skip — the task stays
+/// `awaiting_merge` and the next poll asks again.
+///
+/// A batch that merged but has *not* reached `trunk` stays parked rather than
+/// unwinding, deliberately, and that handles both stack orders: when a stack
+/// is merged correctly the base lands afterwards and the merge commit becomes
+/// reachable on a later poll, closing normally. Reachability is monotone, so
+/// polling can never un-ship something it already concluded had landed.
+/// Nothing here notices that a batch has been parked *too long* — that is
+/// [`ObligationKind::LandBatch`]'s job.
+async fn watch_merges(
+    store: &Store,
+    github: &GitHubClient,
+    project: &Project,
+    trunk: &str,
+) -> Result<(), StoreError> {
+    let awaiting = store.list_builds_awaiting_merge(&project.id).await?;
+    if awaiting.is_empty() {
+        return Ok(());
+    }
+    // A standing configuration, not an event: at `info` this would repeat
+    // every poll interval for as long as the charter says so.
+    let level = store.charter_entry(Capability::RetireWork).await?.level;
+    if level == CharterLevel::Off {
+        debug!(
+            builds = awaiting.len(),
+            "retire_work is off; leaving merged PRs' issues open"
+        );
+        return Ok(());
+    }
+
+    for build in awaiting {
+        let pr = match github
+            .pull_request_state(&project.repo_owner, &project.repo_name, build.pr_number)
             .await
         {
-            Ok(info) => info,
+            Ok(pr) => pr,
             Err(e) => {
-                warn!(error = %e, "fetching close reasons failed; retiring next poll");
+                warn!(
+                    pr = build.pr_number,
+                    error = %e,
+                    "reading the pull request failed; asking again next poll"
+                );
                 continue;
             }
         };
-        for task in retirable {
-            let to = match info.get(&task.gh_issue_number) {
-                // Reopened between the open-set fetch and this lookup; the
-                // next poll's upsert refreshes gh_state and it flows again.
-                Some(i) if i.state == GhState::Open => continue,
-                Some(i) => match i.state_reason.as_deref() {
-                    Some("NOT_PLANNED") | Some("DUPLICATE") => TaskState::Rejected,
-                    _ => TaskState::Done,
-                },
-                // Deleted / converted to a discussion — it is never coming
-                // back as an issue, so the work is concluded either way.
-                None => {
+
+        // Not `pr.merged` — see [`shipped`]. `merged` says the PR reached its
+        // base, which for a stacked build is another build's branch, and
+        // `merge_commit_sha` is populated on *open* PRs too from GitHub's
+        // speculative test merge. Only "the merge commit is on the trunk"
+        // means the work shipped.
+        if shipped(github, project, trunk, &pr, build.pr_number).await {
+            let rationale = format!(
+                "PR #{} merged and its commit is on {trunk} (build {}); \
+                 closing the issue it implements",
+                build.pr_number, build.build_id
+            );
+            let evidence = serde_json::json!({
+                "build_id": build.build_id.as_str(),
+                "pr_number": build.pr_number,
+                "merge_commit_sha": pr.merge_commit_sha,
+                "base_ref": pr.base_ref,
+                "trunk": trunk,
+            });
+            for task in &build.tasks {
+                if level == CharterLevel::Shadow {
+                    // A shadowed close changes nothing, so this build is on
+                    // the list again next poll. Record the judgment once.
+                    if store
+                        .has_decision("task", task.id.as_str(), DecisionAction::RetireWork, false)
+                        .await?
+                    {
+                        continue;
+                    }
+                    store
+                        .record_decision(
+                            "task",
+                            task.id.as_str(),
+                            DecisionAction::RetireWork,
+                            DecisionInput {
+                                actor: Actor::System,
+                                rationale: Some(rationale.clone()),
+                                evidence: Some(evidence.clone()),
+                            },
+                            false,
+                        )
+                        .await?;
+                    info!(
+                        issue = task.gh_issue_number,
+                        pr = build.pr_number,
+                        "retire_work is in shadow; recorded the close, applied nothing"
+                    );
+                    continue;
+                }
+
+                if let Err(e) = github
+                    .close_issue(
+                        &project.repo_owner,
+                        &project.repo_name,
+                        task.gh_issue_number,
+                        CloseReason::Completed,
+                    )
+                    .await
+                {
                     warn!(
                         issue = task.gh_issue_number,
-                        "issue no longer resolvable; retiring as done"
+                        pr = build.pr_number,
+                        error = %e,
+                        "closing the issue failed; asking again next poll"
                     );
-                    TaskState::Done
+                    continue;
                 }
-            };
-            if let Some(retired) = store.retire_task(&task.id, to).await? {
+                store
+                    .record_issue_closed(
+                        &task.id,
+                        CloseReason::Completed,
+                        DecisionInput {
+                            actor: Actor::System,
+                            rationale: Some(rationale.clone()),
+                            evidence: Some(evidence.clone()),
+                        },
+                    )
+                    .await?;
                 info!(
-                    issue = retired.gh_issue_number,
-                    to = to.as_str(),
-                    "issue closed upstream; retired its task"
+                    issue = task.gh_issue_number,
+                    pr = build.pr_number,
+                    "pull request merged; closed the issue it implements"
+                );
+            }
+        } else if !pr.merged && pr.state == GhState::Closed {
+            // `!pr.merged` is load-bearing now that `shipped` can decline a
+            // merged PR: a merged PR is also a *closed* one, so without it a
+            // batch merged into a branch that has not landed yet would be
+            // unwound to `ready_to_build` — which is precisely the legitimate
+            // stack order this pass has to wait out, and it would rebuild work
+            // that is sitting in an open stack.
+            //
+            // The charter gates the pass, not just its GitHub write: `off`
+            // never looks, `shadow` looks and reports, `live` acts. A demoted
+            // capability that still quietly rewrote pipeline state would be a
+            // kill switch that does not switch anything off.
+            if level == CharterLevel::Shadow {
+                info!(
+                    pr = build.pr_number,
+                    build = %build.build_id,
+                    "retire_work is in shadow; the PR closed unmerged and the batch stays parked"
+                );
+                continue;
+            }
+            let returned = store.unwind_unmerged_build(&build.build_id).await?;
+            if !returned.is_empty() {
+                info!(
+                    pr = build.pr_number,
+                    build = %build.build_id,
+                    tasks = returned.len(),
+                    "pull request closed unmerged; the batch is ready to build again"
                 );
             }
         }
     }
-    Ok(ingested)
+    Ok(())
 }
 
 // --- scout dispatch ---
@@ -2309,7 +2588,7 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github, &IntakeFilter::All)
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap();
 
@@ -2363,7 +2642,7 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github, &IntakeFilter::All)
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap();
 

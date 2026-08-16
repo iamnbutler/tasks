@@ -125,7 +125,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     let store = Store::open_in_memory().await.unwrap();
     let project = insert_project(&store).await;
 
-    let ingested = run::poll_once(&store, &github, &IntakeFilter::All)
+    let ingested = run::poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(ingested, 2);
@@ -143,7 +143,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
 
     // Re-poll: nothing new, and the closed issue's task is marked closed
     // without being re-ingested or losing its id.
-    let ingested = run::poll_once(&store, &github, &IntakeFilter::All)
+    let ingested = run::poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(ingested, 0);
@@ -203,7 +203,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     let project = insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         3
@@ -220,7 +220,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     };
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0,
@@ -253,7 +253,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     // The canned server repeats its last page, so a third poll sees the same
     // open set: no further writes, no duplicate events.
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0
@@ -275,7 +275,7 @@ async fn a_failed_fetch_reconciles_nothing() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         2
@@ -283,7 +283,7 @@ async fn a_failed_fetch_reconciles_nothing() {
 
     // The project is skipped, not failed: intake for other projects goes on.
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0
@@ -314,14 +314,14 @@ async fn a_reopened_issue_polls_back_to_open() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         1
     );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
 
-    run::poll_once(&store, &github, &IntakeFilter::All)
+    run::poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(
@@ -330,7 +330,7 @@ async fn a_reopened_issue_polls_back_to_open() {
     );
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0,
@@ -365,7 +365,12 @@ async fn a_label_filter_ingests_only_labelled_issues() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 2);
+    assert_eq!(
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
+        2
+    );
     let mut numbers: Vec<u64> = store
         .list_tasks()
         .await
@@ -396,7 +401,7 @@ async fn an_unset_filter_ingests_everything() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All)
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         2
@@ -419,10 +424,20 @@ async fn an_issue_that_gains_the_label_is_ingested_on_the_next_poll() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 0);
+    assert_eq!(
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
+        0
+    );
     assert!(store.list_tasks().await.unwrap().is_empty());
 
-    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    assert_eq!(
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
+        1
+    );
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "now labelled");
@@ -448,7 +463,12 @@ async fn a_task_whose_issue_loses_the_label_is_kept_and_left_alone() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    assert_eq!(
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
+        1
+    );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
     // Picked up by a human before the label came off.
     store
@@ -461,7 +481,9 @@ async fn a_task_whose_issue_loses_the_label_is_kept_and_left_alone() {
         .unwrap();
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake).await.unwrap(),
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
         0,
         "nothing new to ingest"
     );
@@ -497,16 +519,25 @@ async fn an_unlabelled_task_still_tracks_upstream_closure() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
 
-    assert_eq!(run::poll_once(&store, &github, &intake).await.unwrap(), 1);
+    assert_eq!(
+        run::poll_once(&store, &github, &intake, "main")
+            .await
+            .unwrap(),
+        1
+    );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
 
-    run::poll_once(&store, &github, &intake).await.unwrap();
+    run::poll_once(&store, &github, &intake, "main")
+        .await
+        .unwrap();
     assert_eq!(
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Open
     );
 
-    run::poll_once(&store, &github, &intake).await.unwrap();
+    run::poll_once(&store, &github, &intake, "main")
+        .await
+        .unwrap();
     assert_eq!(
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Closed,

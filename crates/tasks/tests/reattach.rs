@@ -478,7 +478,7 @@ async fn a_restart_reattaches_to_a_build_and_still_lands_the_branch() {
     );
     assert_eq!(
         store.get_task(&task.id).await.unwrap().unwrap().state,
-        TaskState::Done
+        TaskState::AwaitingMerge
     );
 }
 

@@ -178,6 +178,20 @@ impl ResumedWork {
     }
 }
 
+/// A succeeded build whose pull request nobody has resolved yet, and the tasks
+/// parked behind it.
+///
+/// The unit is the build rather than the task on purpose: a batch ships or
+/// fails to ship together, so one PR read answers for every task in it — one
+/// API call, N issues. See [`Store::list_builds_awaiting_merge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingMergeBuild {
+    pub build_id: BuildId,
+    pub pr_number: u64,
+    /// The `awaiting_merge` tasks in this batch, with their issue numbers.
+    pub tasks: Vec<Task>,
+}
+
 /// Run the migrations and report which ones *this* run applied.
 ///
 /// The diff is taken around [`MIGRATOR::run`] rather than read off the
@@ -501,14 +515,22 @@ impl Store {
         row.map(task_from_row).transpose()
     }
 
-    /// List tasks in queue order: manual rank first (nulls last), then derived
-    /// priority descending, then oldest first.
+    /// List tasks in queue order: concluded work last, then manual rank
+    /// (nulls last), then derived priority descending, then oldest first.
+    ///
+    /// The leading term is [`TaskState::ORDER_TERMINAL_LAST_SQL`] — a task
+    /// nobody can act on any more should not sit above one somebody has to.
+    /// It groups `done` and `rejected` together rather than ordering the whole
+    /// enum: sorting the pipeline by state would override `manual_rank`, which
+    /// is the human's statement of what to do next.
     pub async fn list_tasks(&self) -> Result<Vec<Task>, StoreError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
              state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
-        )
+             FROM tasks ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, \
+             ingested_at",
+            TaskState::ORDER_TERMINAL_LAST_SQL
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
@@ -522,16 +544,20 @@ impl Store {
     /// Everything in between stays visible whatever GitHub thinks of the
     /// issue — in-flight work must not vanish from a client's list because
     /// someone closed the issue behind it; the poller will retire it properly.
-    /// A terminal task whose issue is still *open* also stays visible: it is
-    /// the "close the issue or re-queue?" decision surface. Full history is
-    /// [`Self::list_tasks`] (`GET /tasks?all=true`). Ordering is identical.
+    /// `awaiting_merge` is squarely in that band: the merge is what closes the
+    /// issue, so the row must survive the closure it caused long enough to be
+    /// retired. A terminal task whose issue is still *open* also stays
+    /// visible: it is the "close the issue or re-queue?" decision surface.
+    /// Full history is [`Self::list_tasks`] (`GET /tasks?all=true`). Ordering
+    /// is identical.
     pub async fn list_active_tasks(&self) -> Result<Vec<Task>, StoreError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
              state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
              FROM tasks WHERE NOT (gh_state = ? AND state IN (?, ?, ?)) \
-             ORDER BY manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
-        )
+             ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
+            TaskState::ORDER_TERMINAL_LAST_SQL
+        ))
         .bind(GhState::Closed.as_str())
         .bind(TaskState::Backlog.as_str())
         .bind(TaskState::Done.as_str())
@@ -945,15 +971,18 @@ impl Store {
     }
 
     /// Tasks whose GitHub issue is closed but whose Tasks-owned state still
-    /// says the work is picked up: `queued`, `in_review`, or `ready_to_build`.
+    /// says the work is picked up: `queued`, `in_review`, `ready_to_build`, or
+    /// `awaiting_merge`.
     ///
     /// These are the closure-derived retirement candidates — issue closure IS
-    /// the "done" signal, there is no manual mark-done. `scouting` is
-    /// deliberately excluded: a scout in flight runs to completion, lands the
-    /// task in `in_review`, and the next poll retires it from there. The list
-    /// is not limited to issues closed *this* poll, so rows that predate this
-    /// mechanism (or that a failed reason-lookup skipped) self-heal on any
-    /// later pass.
+    /// the "done" signal, there is no manual mark-done. `awaiting_merge` is
+    /// what turns a merge into `done` one poll later: the merge closes the
+    /// issue (see [`crate::run::watch_merges`]), and this path concludes the
+    /// task from the closure like any other. `scouting` and `building` are
+    /// deliberately excluded: a run in flight finishes first and retires from
+    /// the state it lands in. The list is not limited to issues closed *this*
+    /// poll, so rows that predate this mechanism (or that a failed
+    /// reason-lookup skipped) self-heal on any later pass.
     pub async fn list_retirable_tasks(
         &self,
         project_id: &ProjectId,
@@ -961,7 +990,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
              state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE project_id = ? AND gh_state = ? AND state IN (?, ?, ?) \
+             FROM tasks WHERE project_id = ? AND gh_state = ? AND state IN (?, ?, ?, ?) \
              ORDER BY ingested_at",
         )
         .bind(project_id.as_str())
@@ -969,6 +998,7 @@ impl Store {
         .bind(TaskState::Queued.as_str())
         .bind(TaskState::InReview.as_str())
         .bind(TaskState::ReadyToBuild.as_str())
+        .bind(TaskState::AwaitingMerge.as_str())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(task_from_row).collect()
@@ -1003,7 +1033,10 @@ impl Store {
         let retirable = task.gh_state == GhState::Closed
             && matches!(
                 task.state,
-                TaskState::Queued | TaskState::InReview | TaskState::ReadyToBuild
+                TaskState::Queued
+                    | TaskState::InReview
+                    | TaskState::ReadyToBuild
+                    | TaskState::AwaitingMerge
             );
         if !retirable {
             return Ok(None);
@@ -2474,7 +2507,13 @@ impl Store {
 
     /// Terminal success: branch pushed, PR open. In one transaction the build
     /// row is completed, the batch's specs drain `approved → built` (a spec
-    /// cannot be built twice), and their tasks conclude `building → done`.
+    /// cannot be built twice), and their tasks park at
+    /// `building → awaiting_merge`.
+    ///
+    /// Terminal for the *build*, not for the work. A PR that opened is a
+    /// claim; `done` is written in one place only — closure-derived retirement
+    /// — so it always means "the issue is closed upstream". What happens to
+    /// the PR is [`crate::run::watch_merges`]'s business.
     pub async fn finalize_build_succeeded(
         &self,
         id: &BuildId,
@@ -2510,7 +2549,7 @@ impl Store {
         .fetch_all(&mut *tx)
         .await?;
         let mut built_specs = Vec::new();
-        let mut done_tasks = Vec::new();
+        let mut parked_tasks = Vec::new();
         for row in spec_rows {
             let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
             sqlx::query("UPDATE spec_queue SET status = ? WHERE spec_id = ?")
@@ -2522,14 +2561,14 @@ impl Store {
 
             let task_id = TaskId::from_raw(row.try_get::<String, _>("task_id")?);
             let state: String = row.try_get("state")?;
-            if state == TaskState::Building.as_str() && !done_tasks.contains(&task_id) {
+            if state == TaskState::Building.as_str() && !parked_tasks.contains(&task_id) {
                 sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
-                    .bind(TaskState::Done.as_str())
+                    .bind(TaskState::AwaitingMerge.as_str())
                     .bind(now.to_rfc3339())
                     .bind(task_id.as_str())
                     .execute(&mut *tx)
                     .await?;
-                done_tasks.push(task_id);
+                parked_tasks.push(task_id);
             }
         }
         tx.commit().await?;
@@ -2546,11 +2585,11 @@ impl Store {
             })
             .await?;
         }
-        for task_id in done_tasks {
+        for task_id in parked_tasks {
             self.append_event(EventPayload::TaskStateChanged {
                 task_id,
                 from: TaskState::Building,
-                to: TaskState::Done,
+                to: TaskState::AwaitingMerge,
             })
             .await?;
         }
@@ -2703,6 +2742,172 @@ impl Store {
         self.get_build(id)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("build {id}")))
+    }
+
+    /// Succeeded builds in this project whose PR is still unresolved: they
+    /// carry a `pr_number` and at least one task is still `awaiting_merge`.
+    ///
+    /// Restricted to tasks whose issue is still **open**, which is what keeps
+    /// this pass and closure-derived retirement off each other's rows. Once
+    /// the merge closes the issue the build drops off this list and the task
+    /// is retired from the closure instead — otherwise the poll right after a
+    /// close would close the same issue a second time.
+    pub async fn list_builds_awaiting_merge(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<AwaitingMergeBuild>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT b.id AS build_id, b.pr_number, t.id AS task_id \
+             FROM builds b \
+             JOIN build_specs bs ON bs.build_id = b.id \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE b.project_id = ? AND b.status = ? AND b.pr_number IS NOT NULL \
+               AND t.state = ? AND t.gh_state = ? \
+             ORDER BY b.created_at, b.rowid, t.ingested_at",
+        )
+        .bind(project_id.as_str())
+        .bind(BuildStatus::Succeeded.as_str())
+        .bind(TaskState::AwaitingMerge.as_str())
+        .bind(GhState::Open.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: Vec<AwaitingMergeBuild> = Vec::new();
+        for row in rows {
+            let build_id = BuildId::from_raw(row.try_get::<String, _>("build_id")?);
+            let pr_number = row.try_get::<i64, _>("pr_number")? as u64;
+            let task_id = TaskId::from_raw(row.try_get::<String, _>("task_id")?);
+            let Some(task) = self.get_task(&task_id).await? else {
+                continue;
+            };
+            match out.iter_mut().find(|b| b.build_id == build_id) {
+                Some(existing) => existing.tasks.push(task),
+                None => out.push(AwaitingMergeBuild {
+                    build_id,
+                    pr_number,
+                    tasks: vec![task],
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The PR was closed without merging: put the batch back where a rebuild
+    /// is possible. Returns the tasks that moved.
+    ///
+    /// Specs go `built → approved` with a strike charged, and a spec that has
+    /// run out of attempts is `blocked` — the same exhaustion check
+    /// [`Self::finalize_build_failed_with`] applies. Three PRs from one spec
+    /// that nobody would land is the spec's problem, and the attempt cap is
+    /// what ends it. Tasks then return `awaiting_merge → ready_to_build`,
+    /// which restores the *option* to rebuild rather than triggering one:
+    /// nothing dispatches a build without being asked.
+    ///
+    /// The build row is deliberately left alone. It did succeed — branch
+    /// pushed, PR opened — and rewriting a terminal row to match a later
+    /// opinion is how audit trails stop being audit trails.
+    pub async fn unwind_unmerged_build(&self, id: &BuildId) -> Result<Vec<TaskId>, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        let built = sqlx::query(
+            "SELECT spec_id FROM spec_queue \
+             WHERE status = ? AND spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
+        )
+        .bind(SpecQueueStatus::Built.as_str())
+        .bind(id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut reopened = Vec::new();
+        for row in built {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            sqlx::query(
+                "UPDATE spec_queue SET status = ?, build_attempts = build_attempts + 1 \
+                 WHERE spec_id = ?",
+            )
+            .bind(SpecQueueStatus::Approved.as_str())
+            .bind(spec_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            reopened.push(spec_id);
+        }
+
+        let exhausted = sqlx::query(
+            "SELECT spec_id FROM spec_queue \
+             WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?) \
+               AND status = ? AND build_attempts >= ?",
+        )
+        .bind(id.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(MAX_BUILD_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut blocked = Vec::new();
+        for row in exhausted {
+            let spec_id = SpecId::from_raw(row.try_get::<String, _>("spec_id")?);
+            sqlx::query("UPDATE spec_queue SET status = ? WHERE spec_id = ?")
+                .bind(SpecQueueStatus::Blocked.as_str())
+                .bind(spec_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            blocked.push(spec_id);
+        }
+
+        let task_rows = sqlx::query(
+            "SELECT DISTINCT t.id FROM build_specs bs \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE bs.build_id = ? AND t.state = ?",
+        )
+        .bind(id.as_str())
+        .bind(TaskState::AwaitingMerge.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut returned = Vec::new();
+        for row in task_rows {
+            let task_id = TaskId::from_raw(row.try_get::<String, _>("id")?);
+            sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+                .bind(TaskState::ReadyToBuild.as_str())
+                .bind(now.to_rfc3339())
+                .bind(task_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            returned.push(task_id);
+        }
+        tx.commit().await?;
+
+        // No actor on any of these: nobody here chose anything, the choice was
+        // made on GitHub. That is also what keeps them nudge-worthy.
+        for spec_id in &reopened {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id: spec_id.clone(),
+                from: Some(SpecQueueStatus::Built),
+                to: SpecQueueStatus::Approved,
+                actor: None,
+                decision_seq: None,
+            })
+            .await?;
+        }
+        for spec_id in &blocked {
+            self.append_event(EventPayload::SpecQueueStatusChanged {
+                spec_id: spec_id.clone(),
+                from: Some(SpecQueueStatus::Approved),
+                to: SpecQueueStatus::Blocked,
+                actor: None,
+                decision_seq: None,
+            })
+            .await?;
+        }
+        for task_id in &returned {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id: task_id.clone(),
+                from: TaskState::AwaitingMerge,
+                to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+        Ok(returned)
     }
 
     // --- orchestrator ---
@@ -3088,6 +3293,68 @@ impl Store {
             });
         }
 
+        // A batch that succeeded, opened a pull request, and is still sitting
+        // behind it. A PR is not delivery any more than approval is: nothing
+        // in the pipeline lands one, so without this a stack whose base never
+        // merged parks forever as a row nobody scrolls to. It keeps being
+        // raised for as long as the batch is stranded, which is the point —
+        // this is the only thing in the system that notices stranding at all.
+        //
+        // Keyed to the **build**, not the spec: a batch ships or strands
+        // together, and one merge answers for every task in it. That makes it
+        // the first obligation whose `subject_id` is a build id — see
+        // `ObligationKind::LandBatch` and `orchestrator::format_nudge`.
+        //
+        // `since` is `completed_at`, so the grace period is measured from when
+        // the PR opened rather than from when the spec was written.
+        let rows = sqlx::query(
+            "SELECT b.id AS build_id, b.pr_number, b.branch, b.base_branch, b.completed_at, \
+                    COUNT(DISTINCT t.id) AS task_count, MIN(t.gh_issue_number) AS first_issue \
+             FROM builds b \
+             JOIN build_specs bs ON bs.build_id = b.id \
+             JOIN specs s ON s.id = bs.spec_id \
+             JOIN tasks t ON t.id = s.task_id \
+             WHERE b.status = ? AND b.pr_number IS NOT NULL \
+               AND b.completed_at IS NOT NULL AND b.completed_at <= ? \
+               AND t.state = ? \
+             GROUP BY b.id \
+             ORDER BY b.completed_at",
+        )
+        .bind(BuildStatus::Succeeded.as_str())
+        .bind(&cutoff)
+        .bind(TaskState::AwaitingMerge.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("completed_at")?, "completed_at")?;
+            let pr_number: i64 = row.try_get("pr_number")?;
+            let count: i64 = row.try_get("task_count")?;
+            let issue: i64 = row.try_get("first_issue")?;
+            let base_branch: String = row.try_get::<String, _>("base_branch")?;
+            // Deliberately no verdict on whether `base_branch` is the trunk:
+            // the store does not know what the trunk is (`SCOUT_BASE_BRANCH`
+            // is the server's config), so it states the base and leaves the
+            // reading to `Brief::for_stranded_build`, which does.
+            let summary = format!(
+                "PR #{pr_number} (branch {}, base {base_branch}) has been open since {} \
+                 with #{issue}{} still waiting on it — a merged pull request is not a \
+                 shipped one until its commit is on the trunk",
+                row.try_get::<String, _>("branch")?,
+                since.format("%Y-%m-%d %H:%M UTC"),
+                if count > 1 {
+                    format!(" and {} other task(s)", count - 1)
+                } else {
+                    String::new()
+                },
+            );
+            obligations.push(Obligation {
+                kind: ObligationKind::LandBatch,
+                subject_id: row.try_get::<String, _>("build_id")?,
+                summary,
+                since,
+            });
+        }
+
         obligations.sort_by_key(|o| o.since);
         Ok(obligations)
     }
@@ -3197,6 +3464,33 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(seq)
+    }
+
+    /// Whether this exact judgment is already in the ledger.
+    ///
+    /// For callers that are re-asked the same question on a timer. A shadowed
+    /// decision changes nothing, so its subject is still on the list at the
+    /// next poll — without this the ledger grows a row a minute and buries the
+    /// reasoning it exists to preserve.
+    pub async fn has_decision(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: DecisionAction,
+        enforced: bool,
+    ) -> Result<bool, StoreError> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM decisions \
+             WHERE subject_kind = ? AND subject_id = ? AND action = ? AND enforced = ? \
+             LIMIT 1",
+        )
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(action.as_str())
+        .bind(enforced as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
     }
 
     // --- charter ---
@@ -5650,6 +5944,79 @@ mod tests {
         );
     }
 
+    /// A pull request is not delivery. A batch parked behind one keeps saying
+    /// so, because nothing else in the system notices a stranded stack — and
+    /// its subject is a build id, which is why `format_nudge` has to branch
+    /// before it builds a `SpecId` out of one.
+    #[tokio::test]
+    async fn a_batch_parked_behind_a_pull_request_is_standing_work() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "build/underneath",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap();
+        store
+            .finalize_build_succeeded(&build.id, "headsha", 863, None, &[])
+            .await
+            .unwrap();
+
+        let open = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap();
+        assert_eq!(
+            open.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![ObligationKind::LandBatch],
+            "the dispatch obligation is discharged; landing it is not"
+        );
+        assert_eq!(open[0].subject_id, build.id.to_string());
+        assert!(open[0].summary.contains("#863"), "{}", open[0].summary);
+        assert!(
+            open[0].summary.contains("build/underneath"),
+            "states the base, so a stacked PR is readable as one: {}",
+            open[0].summary
+        );
+
+        // Fresh work is left alone — the PR was opened seconds ago, and the
+        // ordinary nudge already said so.
+        assert!(
+            store
+                .open_obligations(chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Shipped work stops asking. `done` is what closure-derived retirement
+        // writes, and this row is only about work that has not got there.
+        store
+            .update_task_state(&spec.task_id, TaskState::Done)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .open_obligations(chrono::Duration::zero())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// A dispatch that never gets a VM is the pool's failure, not the spec's.
     /// Charging it would let a full pool `blocked` three good specs a minute,
     /// and the one signal meaning "this cannot be built" would then be
@@ -7692,9 +8059,11 @@ mod tests {
                 .status,
             SpecQueueStatus::Built
         );
+        // `done` is not a build's to write: the PR is open, and nothing has
+        // shipped until the issue closes upstream.
         assert_eq!(
             store.get_task(&task.id).await.unwrap().unwrap().state,
-            TaskState::Done
+            TaskState::AwaitingMerge
         );
         let err = store
             .create_build(
@@ -7733,6 +8102,251 @@ mod tests {
             build_id: build.id,
             status: BuildStatus::Succeeded,
         }));
+    }
+
+    /// One PR, N issues: the batch is the unit the merge watcher reads, and it
+    /// only lists work whose issue is still open — once the merge closes the
+    /// issue, retirement owns the row and this pass must let go of it.
+    #[tokio::test]
+    async fn builds_awaiting_merge_are_listed_by_batch_until_the_issue_closes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task_a, spec_a) = approved_spec(&store, &project, 1).await;
+        let (task_b, spec_b) = approved_spec(&store, &project, 2).await;
+        let build = store
+            .create_build(
+                &[spec_a.id.clone(), spec_b.id.clone()],
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+        store
+            .finalize_build_succeeded(&build.id, "headsha", 91, None, &[])
+            .await
+            .unwrap();
+
+        let awaiting = store.list_builds_awaiting_merge(&project.id).await.unwrap();
+        assert_eq!(awaiting.len(), 1, "one PR, one entry");
+        assert_eq!(awaiting[0].build_id, build.id);
+        assert_eq!(awaiting[0].pr_number, 91);
+        let mut issues: Vec<u64> = awaiting[0]
+            .tasks
+            .iter()
+            .map(|t| t.gh_issue_number)
+            .collect();
+        issues.sort_unstable();
+        assert_eq!(issues, vec![1, 2], "every task in the batch");
+
+        // The merge closed both issues; retirement takes it from here.
+        store
+            .reconcile_closed_issues(&project.id, &[])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_builds_awaiting_merge(&project.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a closed issue is retirement's row, not this pass's"
+        );
+        let retirable: Vec<TaskId> = store
+            .list_retirable_tasks(&project.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(retirable.contains(&task_a.id) && retirable.contains(&task_b.id));
+    }
+
+    /// The data migration, run against rows the old rule wrote. It cannot be
+    /// exercised by opening a store (an empty database has nothing to move),
+    /// so the file is replayed here over a seeded one — which also keeps the
+    /// SQL itself honest.
+    ///
+    /// Both conditions matter: a `done` task whose issue is *closed* is a real
+    /// retirement whoever performed it, and one with no build behind it was
+    /// concluded some other way. Neither may be reopened as pipeline state.
+    #[tokio::test]
+    async fn the_migration_only_reopens_done_rows_that_a_build_left_hanging() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        // Three tasks the old rule could have produced.
+        let mut ids = Vec::new();
+        for issue in [1, 2] {
+            let (task, spec) = approved_spec(&store, &project, issue).await;
+            let build = store
+                .create_build(&[spec.id], "main", DecisionInput::human())
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap().unwrap();
+            store
+                .finalize_build_succeeded(&build.id, "headsha", 100 + issue, None, &[])
+                .await
+                .unwrap();
+            // What `finalize_build_succeeded` used to write.
+            store
+                .update_task_state(&task.id, TaskState::Done)
+                .await
+                .unwrap();
+            ids.push(task.id);
+        }
+        // The second one's issue really was closed: a genuine retirement.
+        sqlx::query("UPDATE tasks SET gh_state = ? WHERE id = ?")
+            .bind(GhState::Closed.as_str())
+            .bind(ids[1].as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        // And a `done` task with no build behind it at all.
+        let mut orphan = sample_task(&project.id);
+        orphan.gh_issue_number = 3;
+        orphan.state = TaskState::Done;
+        store.insert_task(&orphan).await.unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260815164324_awaiting_merge.sql"
+        ))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.get_task(&ids[0]).await.unwrap().unwrap().state,
+            TaskState::AwaitingMerge,
+            "a PR that opened and an issue still open: the new pass owns it"
+        );
+        assert_eq!(
+            store.get_task(&ids[1]).await.unwrap().unwrap().state,
+            TaskState::Done,
+            "a closed issue is a real retirement"
+        );
+        assert_eq!(
+            store.get_task(&orphan.id).await.unwrap().unwrap().state,
+            TaskState::Done,
+            "no build behind it, so nothing to infer"
+        );
+    }
+
+    /// A closed issue concludes `awaiting_merge` work like any other picked-up
+    /// state — which is how a merge becomes `done` one poll later.
+    #[tokio::test]
+    async fn awaiting_merge_retires_when_the_issue_closes() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let mut task = sample_task(&project.id);
+        task.state = TaskState::AwaitingMerge;
+        task.gh_state = GhState::Closed;
+        store.insert_task(&task).await.unwrap();
+
+        let retired = store
+            .retire_task(&task.id, TaskState::Done)
+            .await
+            .unwrap()
+            .expect("awaiting_merge is a retirement candidate");
+        assert_eq!(retired.state, TaskState::Done);
+    }
+
+    /// A PR closed unmerged puts the batch back on the shelf: specs return to
+    /// `approved` with a strike charged, tasks to `ready_to_build`, and the
+    /// build row is left exactly as it was — it did succeed. Three unlanded
+    /// PRs from one spec is the spec's problem, and the attempt cap ends it.
+    #[tokio::test]
+    async fn an_unmerged_pull_request_unwinds_the_batch_and_charges_a_strike() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+
+        for attempt in 1..=MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap().unwrap();
+            store
+                .finalize_build_succeeded(&build.id, "headsha", 50 + attempt as u64, None, &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_task(&task.id).await.unwrap().unwrap().state,
+                TaskState::AwaitingMerge
+            );
+
+            let returned = store.unwind_unmerged_build(&build.id).await.unwrap();
+            assert_eq!(returned, vec![task.id.clone()]);
+
+            let entry = store.get_spec_queue_entry(&spec.id).await.unwrap().unwrap();
+            let after = store.get_build(&build.id).await.unwrap().unwrap();
+            assert_eq!(
+                after.status,
+                BuildStatus::Succeeded,
+                "the build row is history, not an opinion"
+            );
+            assert_eq!(after.pr_number, Some(50 + attempt as u64));
+
+            if attempt < MAX_BUILD_ATTEMPTS {
+                assert_eq!(entry.status, SpecQueueStatus::Approved);
+                assert_eq!(
+                    store.get_task(&task.id).await.unwrap().unwrap().state,
+                    TaskState::ReadyToBuild,
+                    "attempt {attempt} restores the option to rebuild"
+                );
+            } else {
+                assert_eq!(
+                    entry.status,
+                    SpecQueueStatus::Blocked,
+                    "the attempt cap ends it"
+                );
+            }
+        }
+    }
+
+    /// Concluded work sorts below work somebody can still act on, and does not
+    /// otherwise disturb the human's ordering.
+    #[tokio::test]
+    async fn task_listings_sort_terminal_work_last() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        for (issue, state, rank) in [
+            (1, TaskState::Done, Some(1)),
+            (2, TaskState::Queued, Some(2)),
+            (3, TaskState::Rejected, None),
+            (4, TaskState::AwaitingMerge, None),
+        ] {
+            let mut task = sample_task(&project.id);
+            task.gh_issue_number = issue;
+            task.state = state;
+            task.manual_rank = rank;
+            store.insert_task(&task).await.unwrap();
+        }
+
+        let numbers = |tasks: Vec<Task>| -> Vec<u64> {
+            tasks.into_iter().map(|t| t.gh_issue_number).collect()
+        };
+        assert_eq!(
+            numbers(store.list_tasks().await.unwrap()),
+            vec![2, 4, 1, 3],
+            "ranked live work, then unranked live work, then the terminal pair"
+        );
+        assert_eq!(
+            numbers(store.list_active_tasks().await.unwrap()),
+            vec![2, 4, 1, 3],
+            "the two listings are documented as ordering identically"
+        );
     }
 
     #[tokio::test]

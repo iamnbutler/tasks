@@ -17,6 +17,9 @@ pub fn task_state_color(state: TaskState) -> Hsla {
         TaskState::InReview => color(280., 0.70, 0.68),
         TaskState::ReadyToBuild => color(175., 0.60, 0.50),
         TaskState::Building => color(240., 0.65, 0.68),
+        // A step short of done: the same green, desaturated, because the PR
+        // is open and nothing has shipped yet.
+        TaskState::AwaitingMerge => color(135., 0.30, 0.52),
         TaskState::Done => color(135., 0.55, 0.52),
         TaskState::Rejected => color(0., 0.80, 0.62),
     }

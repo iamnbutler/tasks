@@ -130,10 +130,26 @@ pub struct IssueCloseInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrState {
     pub state: GhState,
+    /// **"Reached its base", not "shipped."** A stacked PR based on another
+    /// build's branch reads `merged: true` the moment that branch takes it,
+    /// and the branch itself may never reach the trunk — which is exactly how
+    /// PR #863 was lost. Anything deciding delivery has to ask whether the
+    /// merge commit is an ancestor of the trunk; see
+    /// [`GitHubClient::merge_reached_trunk`] and `run::shipped`.
     pub merged: bool,
     /// GitHub's mergeability verdict, or `None` while it is still computing
     /// one. Unknown is not the same as conflicted.
     pub mergeable: Option<bool>,
+    /// The commit the merge produced — evidence for closing the issue the PR
+    /// implements.
+    ///
+    /// **Populated on open PRs too**, from GitHub's speculative test merge, so
+    /// its presence says nothing about whether anything landed. Check `merged`
+    /// first, always.
+    pub merge_commit_sha: Option<String>,
+    /// The branch this PR merges *into* — `base.ref`. The cheap half of the
+    /// shipped question: a PR based on the trunk needs no further reads.
+    pub base_ref: Option<String>,
 }
 
 impl PrState {
@@ -793,7 +809,63 @@ impl GitHubClient {
             // "unknown", not "conflicted", and the distinction matters to a
             // reader deciding whether to act.
             mergeable: body.get("mergeable").and_then(|m| m.as_bool()),
+            merge_commit_sha: body
+                .get("merge_commit_sha")
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
+            base_ref: body
+                .get("base")
+                .and_then(|base| base.get("ref"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
         })
+    }
+
+    /// Is `sha` an ancestor of `trunk` — i.e. did that commit actually reach
+    /// the branch that ships?
+    ///
+    /// `GET /compare/{base}...{head}` reads **`head` relative to `base`**, so
+    /// with `base = trunk` and `head = sha` the answer is `identical` when the
+    /// trunk tip *is* that commit and `behind` when the trunk has moved on
+    /// past it. Anything else — `ahead` (the commit is off to one side),
+    /// `diverged` — means it is not on the trunk. **Reversing the operands
+    /// inverts the verdict**, which would silently close exactly the issues
+    /// that should stay open.
+    ///
+    /// This exists because `merged` only ever meant "reached its base", and
+    /// the pipeline stacks builds routinely.
+    pub async fn merge_reached_trunk(
+        &self,
+        owner: &str,
+        name: &str,
+        trunk: &str,
+        sha: &str,
+    ) -> Result<bool, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/compare/{trunk}...{sha}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            let msg = body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("(no message)");
+            return Err(GhError::Rest(format!(
+                "compare {trunk}...{sha}: {status}: {msg}"
+            )));
+        }
+        let compare_status = body.get("status").and_then(|s| s.as_str());
+        debug!(owner, name, trunk, sha, status = compare_status, "compared");
+        Ok(matches!(compare_status, Some("identical") | Some("behind")))
     }
 
     /// Names of the entries directly inside `path` on `git_ref`.

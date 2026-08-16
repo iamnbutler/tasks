@@ -137,7 +137,16 @@ pub enum TaskState {
     /// A Builder run is implementing this task's spec (possibly batched with
     /// others). Failure returns to `ReadyToBuild` — the spec is still good.
     Building,
-    /// Completed through the pipeline.
+    /// The Builder's pull request is open and nobody has resolved it yet.
+    ///
+    /// Live work, not history: a PR that opened is a claim, not a delivery.
+    /// The poller reads the PR at decision time and either retires the task
+    /// (merged → the issue is closed as completed → `Done` on the next pass)
+    /// or returns the batch to `ReadyToBuild` (closed unmerged).
+    AwaitingMerge,
+    /// Completed through the pipeline — which here means exactly one thing:
+    /// the GitHub issue is closed upstream. Written only by closure-derived
+    /// retirement, never by a build.
     Done,
     /// Rejected and won't be pursued.
     Rejected,
@@ -152,6 +161,7 @@ impl TaskState {
             TaskState::InReview => "in_review",
             TaskState::ReadyToBuild => "ready_to_build",
             TaskState::Building => "building",
+            TaskState::AwaitingMerge => "awaiting_merge",
             TaskState::Done => "done",
             TaskState::Rejected => "rejected",
         }
@@ -165,11 +175,28 @@ impl TaskState {
             "in_review" => Some(TaskState::InReview),
             "ready_to_build" => Some(TaskState::ReadyToBuild),
             "building" => Some(TaskState::Building),
+            "awaiting_merge" => Some(TaskState::AwaitingMerge),
             "done" => Some(TaskState::Done),
             "rejected" => Some(TaskState::Rejected),
             _ => None,
         }
     }
+
+    /// Whether the pipeline is finished with this task. Nothing here is live
+    /// work — `awaiting_merge` deliberately is not terminal, because the
+    /// poller is still driving it.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TaskState::Done | TaskState::Rejected)
+    }
+
+    /// A leading `ORDER BY` term that sorts terminal states last, for the
+    /// listing queries that share one ordering.
+    ///
+    /// It lives next to [`TaskState::is_terminal`] because SQLite cannot call
+    /// that method and the two must agree; the unit test below iterates every
+    /// variant and fails when they drift.
+    pub const ORDER_TERMINAL_LAST_SQL: &'static str =
+        "CASE WHEN state IN ('done', 'rejected') THEN 1 ELSE 0 END";
 }
 
 /// A Scout run — one VM executing a throwaway implementation for a task.
@@ -722,6 +749,17 @@ pub enum ObligationKind {
     /// A batch burned through its build attempts and stopped. Nothing will
     /// pick it up again until someone decides what to do.
     UnblockSpec,
+    /// A succeeded build's pull request has been open, or merged into a branch
+    /// that never reached the trunk, for longer than the grace period. A pull
+    /// request is not delivery any more than approval is — this is
+    /// [`ObligationKind::DispatchBuild`] one stage later, and it is the only
+    /// thing in the system that notices a stranded stack.
+    ///
+    /// **Its `subject_id` is a build id, not a spec id** — the first kind of
+    /// which that is true. A batch ships or strands together, so the build is
+    /// the honest unit; anything constructing a `SpecId` from `subject_id`
+    /// must branch on the kind first.
+    LandBatch,
 }
 
 impl ObligationKind {
@@ -730,6 +768,7 @@ impl ObligationKind {
             ObligationKind::ReviewSpec => "review_spec",
             ObligationKind::DispatchBuild => "dispatch_build",
             ObligationKind::UnblockSpec => "unblock_spec",
+            ObligationKind::LandBatch => "land_batch",
         }
     }
 }
@@ -751,6 +790,15 @@ pub enum Actor {
     #[default]
     Human,
     Orchestrator,
+    /// The server itself, acting on a fact it observed rather than a judgment
+    /// it made — the poller closing an issue because the PR that implements it
+    /// merged.
+    ///
+    /// Deliberately not `Human`: a write the server misattributes to the human
+    /// does not fail closed, it *escalates*, because the human is never gated.
+    /// Never resolved from the actor header either — only in-process code can
+    /// write it.
+    System,
 }
 
 impl Actor {
@@ -758,6 +806,7 @@ impl Actor {
         match self {
             Actor::Human => "human",
             Actor::Orchestrator => "orchestrator",
+            Actor::System => "system",
         }
     }
 
@@ -765,6 +814,7 @@ impl Actor {
         match s {
             "human" => Some(Actor::Human),
             "orchestrator" => Some(Actor::Orchestrator),
+            "system" => Some(Actor::System),
             _ => None,
         }
     }
@@ -1175,4 +1225,71 @@ pub enum OrchestratorFeedEvent {
     Tool { label: String },
     /// The tick finished; fetch `/orchestrator/messages` for the reply.
     Done,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pipeline state, in declaration order. Kept honest by
+    /// [`all_states_lists_every_variant`]: a new variant is a compile error in
+    /// that test's match, and a runtime failure until it is listed here too.
+    const ALL_STATES: [TaskState; 9] = [
+        TaskState::Backlog,
+        TaskState::Queued,
+        TaskState::Scouting,
+        TaskState::InReview,
+        TaskState::ReadyToBuild,
+        TaskState::Building,
+        TaskState::AwaitingMerge,
+        TaskState::Done,
+        TaskState::Rejected,
+    ];
+
+    #[test]
+    fn all_states_lists_every_variant() {
+        // The match is exhaustive on purpose: adding a variant stops this
+        // compiling, and the assertion then stops it passing until the array
+        // above grows too.
+        for state in ALL_STATES {
+            let listed = match state {
+                TaskState::Backlog
+                | TaskState::Queued
+                | TaskState::Scouting
+                | TaskState::InReview
+                | TaskState::ReadyToBuild
+                | TaskState::Building
+                | TaskState::AwaitingMerge
+                | TaskState::Done
+                | TaskState::Rejected => ALL_STATES.contains(&state),
+            };
+            assert!(listed, "{} is missing from ALL_STATES", state.as_str());
+            assert_eq!(TaskState::from_str(state.as_str()), Some(state));
+        }
+    }
+
+    /// SQLite cannot call [`TaskState::is_terminal`], so the clause spells the
+    /// terminal states out. This is the seam that notices when the two drift.
+    #[test]
+    fn the_terminal_sort_clause_names_exactly_the_terminal_states() {
+        for state in ALL_STATES {
+            let named =
+                TaskState::ORDER_TERMINAL_LAST_SQL.contains(&format!("'{}'", state.as_str()));
+            assert_eq!(
+                named,
+                state.is_terminal(),
+                "{} is named in ORDER_TERMINAL_LAST_SQL but is_terminal() disagrees",
+                state.as_str()
+            );
+        }
+    }
+
+    /// `awaiting_merge` is live work: a PR that opened is a claim, not a
+    /// delivery, and the poller is still driving it.
+    #[test]
+    fn awaiting_merge_is_not_terminal() {
+        assert!(!TaskState::AwaitingMerge.is_terminal());
+        assert!(TaskState::Done.is_terminal());
+        assert!(TaskState::Rejected.is_terminal());
+    }
 }

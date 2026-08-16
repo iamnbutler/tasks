@@ -109,13 +109,20 @@ the server only.
 - `GET /tasks` — already in queue order; render it as-is, don't re-sort.
   Task: `{id, project_id, gh_issue_number, title, body, labels, gh_state,
   state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at}`.
+  Ordering is **terminal states last** (`done`, `rejected`), then
+  `manual_rank` (nulls last), then priority descending, then oldest first.
+  Only the terminal group is pulled out: sorting the whole pipeline by state
+  would override `manual_rank`, which is the human's statement of what to do
+  next.
   By default the list **omits tasks whose issue is closed on GitHub and whose
   state is `backlog`, `done`, or `rejected`** — closed-before-any-work intake
   noise, and work already concluded (closure-derived retirement's output).
   In-flight work stays visible whatever its `gh_state` (the poller retires it
-  properly), and a `done`/`rejected` task whose issue is still *open* also
-  shows — that's the "close the issue or re-queue?" decision surface.
-  `GET /tasks?all=true` returns every row. Ordering is identical either way.
+  properly) — including `awaiting_merge`, where the merge is the very thing
+  that closed the issue — and a `done`/`rejected` task whose issue is still
+  *open* also shows, that's the "close the issue or re-queue?" decision
+  surface. `GET /tasks?all=true` returns every row. Ordering is identical
+  either way.
 - `GET /sessions` / `GET /sessions/{id}` — scout runs. `status` has a third
   terminal value besides `scout_succeeded` / `scout_failed`:
   **`scout_stopped_early`** — the run ended without a spec but left notes
@@ -356,22 +363,41 @@ All enums are snake_case strings on the wire:
   (explicitly picked up — the Queue, ordered by `manual_rank`) → `scouting` →
   `in_review` (spec awaits a verdict) → `ready_to_build` (approved, parked
   for a Builder) → `building` (a Builder run is implementing it, possibly
-  batched with others) → `done`, with `rejected` as the terminal failure
-  state. A failed build returns `building → ready_to_build` — the spec is
-  still good.
+  batched with others) → `awaiting_merge` (its PR is open and unresolved) →
+  `done`, with `rejected` as the terminal failure state. A failed build
+  returns `building → ready_to_build` — the spec is still good.
   Scout failures and `needs_revision` verdicts return to `queued`, never
   `backlog` — picked-up work stays picked up.
   One edge skips the middle: `backlog`/`queued` → `ready_to_build` when a
   human writes the spec themselves via `POST /tasks/{id}/build-now`. Switch
   on `to` rather than on the `(from, to)` pair and it costs nothing.
+- **`done` means shipped, not "a PR exists".** A successful build parks its
+  tasks in `awaiting_merge`; each poll reads the pull request at decision
+  time and resolves it. Merged *and the merge commit is on the trunk* → the
+  server closes the issue as completed, and the next poll retires the task to
+  `done` through the ordinary closure-derived path. Closed unmerged → the
+  batch's specs go back to `approved` (with a build attempt charged) and the
+  tasks to `ready_to_build`, which restores the *option* to rebuild; nothing
+  dispatches a build by itself. Still open → nothing happens, and the next
+  poll asks again. `awaiting_merge` is **live work**: count it as active, and
+  keep showing it even once its issue reads closed.
+- **A PR's `merged` is not the test, and clients should not present it as
+  one.** `merged` says the PR reached its *base*, and builds stack: a PR based
+  on another build's branch reads merged the moment that branch takes it, and
+  ships nothing until the branch itself lands. The server resolves
+  `awaiting_merge` on whether the merge commit is an ancestor of
+  `SCOUT_BASE_BRANCH`, so a batch can sit in `awaiting_merge` with a *merged*
+  PR behind it — that is correct, not stale, and it stays that way until the
+  stack lands (or a human unwinds it). It is never auto-unwound, because the
+  legitimate stack order has the base merging afterwards.
 - There is no "mark done" endpoint, deliberately: **closing the GitHub issue
   is the done signal.** When a picked-up task's issue closes, the next poll
-  retires it — `queued`/`in_review`/`ready_to_build` become `done` (or
-  `rejected` if the issue was closed as not-planned / duplicate), the task's
-  `manual_rank` clears, and a normal `task_state_changed` event fires. A
-  `scouting` task is left to finish first and retires from `in_review` on the
-  following poll. Clients shouldn't offer a complete/done action; link to the
-  issue instead.
+  retires it — `queued`/`in_review`/`ready_to_build`/`awaiting_merge` become
+  `done` (or `rejected` if the issue was closed as not-planned / duplicate),
+  the task's `manual_rank` clears, and a normal `task_state_changed` event
+  fires. A `scouting` task is left to finish first and retires from
+  `in_review` on the following poll. Clients shouldn't offer a complete/done
+  action; link to the issue instead.
 - `Session.status`: `running`, `scout_succeeded`, `scout_failed`, `cancelled`.
 - `SpecQueueEntry.status`: `pending_review`, `approved`, `needs_revision`,
   `blocked`, `rejected`, `built` (only the three verdict values are accepted
