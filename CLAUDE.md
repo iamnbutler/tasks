@@ -209,6 +209,26 @@ in the feed at the next boot. Shutdown holds the HTTP port through the whole
 drain (so a restart is a hand-over, not an outage) and releases it last, which
 means a successor waits for this process to exit before it can bind.
 
+**vm-pool is upgraded separately, and it goes first.** It is a long-lived
+daemon that a server restart does not restart, so a freshly built server
+routinely talks to the binary vm-pool was started with. `serde(default)` makes
+an added *field* survive that skew (`seq` on `vm_app`, `protocol_version` on
+`pool_status`); it cannot make an added *command* survive it, because an old
+service rejects the whole line at decode time and the client sees an ordinary
+`ClientError::Service` — indistinguishable, without matching serde's message
+text, from a real failure to attach to a VM that does exist. So `attach` is
+gated: `reattach::attach_support` asks `status` once per boot and reads the
+`protocol_version` it reports (absent ⇒ `PRE_VERSIONING`), and
+`resume_in_flight` returns empty **before claiming any row** if the answer is
+too old, unanswerable, or unreachable — `ResumedWork` membership is a promise
+to conclude the row, so a claim made against a pool that cannot decode `attach`
+would fail the run rather than lose the stream. The remaining cost is the
+one-time restart itself: whatever vm-pool is holding is lost once (the event
+log is in memory), and the leaked VMs are collected by the sweep on the next
+connect. `dispatch_loop` logs the skew on every connect, because the bill
+otherwise only arrives at the next restart, by which point the work it costs is
+already in flight.
+
 ### Tests
 
 ```sh

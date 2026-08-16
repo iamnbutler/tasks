@@ -689,7 +689,179 @@ async fn an_unreachable_vm_pool_falls_back_to_reconciliation() {
     );
 }
 
+/// The other degraded path, and the one that used to be *worse* than no
+/// reattachment at all: vm-pool is a separate daemon, upgraded separately, so
+/// a freshly built server routinely meets a service that predates `attach`.
+/// Such a service rejects the command at decode time, the client surfaces an
+/// ordinary service error, and a reattach — contractually obliged to conclude
+/// the row it was handed — writes off a run that was alive and recoverable.
+///
+/// The gate has to sit *before* any row is claimed, which is what the last
+/// assertion here pins down: `attach` is never sent at all.
+#[tokio::test]
+async fn a_vm_pool_that_predates_attach_falls_back_to_reconciliation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (socket, commands) = spawn_pre_attach_vm_pool(tmp.path()).await;
+    let mut config = test_config(&socket, tmp.path(), &tmp.path().join("repos"));
+    config.github_token = Some("token".into());
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let project = insert_project(&store).await;
+
+    // A scout in flight…
+    let scouting = insert_task(&store, &project, TaskState::Scouting).await;
+    let session = Session {
+        id: SessionId::new(),
+        task_id: scouting.id.clone(),
+        vm_id: Some("vm-still-scouting".into()),
+        branch: String::new(),
+        status: SessionStatus::Running,
+        started_at: Utc::now(),
+        completed_at: None,
+        exit_reason: None,
+        usage: None,
+    };
+    store.insert_session(&session).await.unwrap();
+
+    // …and a build in flight, which has more at stake.
+    let (building, spec) = seed_approved(&store, &project).await;
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+    store
+        .set_build_vm(&build.id, "vm-still-building")
+        .await
+        .unwrap();
+
+    let in_flight = InFlight::default();
+    let resumed = run::resume_in_flight(&store, &config, &in_flight).await;
+    assert!(
+        resumed.is_empty(),
+        "a pool that cannot decode attach must have nothing claimed against it"
+    );
+    run::reconcile_startup_except(&store, &resumed)
+        .await
+        .unwrap();
+
+    // Written off synchronously by reconciliation, exactly as a server with no
+    // reattachment at all did. The exit reason is the tell: "attach failed: …"
+    // would mean the server claimed the row and then killed the run itself.
+    let concluded = store.get_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(concluded.status, SessionStatus::ScoutFailed);
+    assert_eq!(
+        concluded.exit_reason.as_deref(),
+        Some("orphaned by server restart")
+    );
+    assert_eq!(
+        store.get_task(&scouting.id).await.unwrap().unwrap().state,
+        TaskState::Queued
+    );
+
+    let concluded = store.get_build(&build.id).await.unwrap().unwrap();
+    assert_eq!(concluded.status, BuildStatus::Failed);
+    assert_eq!(
+        concluded.exit_reason.as_deref(),
+        Some("orphaned by server restart")
+    );
+
+    // And the work itself is intact: the spec is still approved and its task
+    // is back in the build queue, not blamed for the operator's skew.
+    assert_eq!(
+        store
+            .get_spec_queue_entry(&spec.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        SpecQueueStatus::Approved
+    );
+    assert_eq!(
+        store.get_task(&building.id).await.unwrap().unwrap().state,
+        TaskState::ReadyToBuild
+    );
+
+    // The crux. Not "attach failed gracefully" — attach was never sent, which
+    // is the only version of this that cannot cost a run.
+    let asked = commands.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|c| c == "status"),
+        "the gate is one status round trip: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|c| c == "attach"),
+        "nothing may be claimed before the pool says it speaks attach: {asked:?}"
+    );
+}
+
 // --- helpers ---
+
+/// A vm-pool from before `attach` existed, as raw bytes on a real socket.
+///
+/// Deliberately not a mock: what is under test is compatibility with a binary
+/// this tree no longer contains, so the wire form it emitted is the only
+/// honest thing left to test against. It answers `status` in the old shape
+/// (no `protocol_version`), and rejects everything else the way the service's
+/// read loop does — serde's own message, correlated to the request id, which
+/// is why this failure showed up as a killed run rather than as a hang.
+///
+/// Returns the socket path and the list of command types it was asked for.
+async fn spawn_pre_attach_vm_pool(dir: &Path) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+    let socket = dir.join("pre-attach.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let recorded = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let request: Value = serde_json::from_str(line.trim()).unwrap();
+                    let id = &request["id"];
+                    let command = request["command"]["type"].as_str().unwrap_or_default();
+                    recorded.lock().unwrap().push(command.to_string());
+
+                    let event = if command == "status" {
+                        json!({
+                            "type": "pool_status",
+                            "total": 3, "available": 2, "allocated": 1,
+                        })
+                    } else {
+                        json!({
+                            "type": "error",
+                            "message": format!(
+                                "invalid request: unknown variant `{command}`, expected one of \
+                                 `allocate`, `deallocate`, `send`, `snapshot`, `restore`, \
+                                 `status`, `tail_logs`, `subscribe_logs`, `unsubscribe_logs` \
+                                 at line 1 column 1"
+                            ),
+                        })
+                    };
+                    let reply = json!({ "id": id, "event": event }).to_string();
+                    writer.write_all(reply.as_bytes()).await.unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                    writer.flush().await.unwrap();
+                    line.clear();
+                }
+            });
+        }
+    });
+
+    (socket, seen)
+}
 
 async fn wait_for_build_vm(store: &Arc<Store>, build_id: &tasks::models::BuildId) -> Build {
     let s = store.clone();

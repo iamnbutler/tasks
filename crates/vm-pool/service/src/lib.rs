@@ -250,6 +250,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                     total: status.total,
                     available: status.available,
                     allocated: status.allocated,
+                    protocol_version: vm_pool_protocol::PROTOCOL_VERSION,
                 }
             }
 
@@ -404,6 +405,7 @@ mod tests {
                 total: 3,
                 available: 3,
                 allocated: 0,
+                protocol_version: vm_pool_protocol::PROTOCOL_VERSION,
             }
         );
     }
@@ -436,6 +438,7 @@ mod tests {
                 total: 3,
                 available: 2,
                 allocated: 1,
+                protocol_version: vm_pool_protocol::PROTOCOL_VERSION,
             }
         );
 
@@ -455,6 +458,7 @@ mod tests {
                 total: 3,
                 available: 3,
                 allocated: 0,
+                protocol_version: vm_pool_protocol::PROTOCOL_VERSION,
             }
         );
     }
