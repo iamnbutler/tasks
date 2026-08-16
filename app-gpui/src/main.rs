@@ -1,8 +1,10 @@
 mod about;
 mod chat_log;
+mod commands;
 mod components;
 mod issue_composer;
 mod menus;
+mod palette;
 mod row_menu;
 mod sections;
 mod server;
@@ -12,15 +14,12 @@ mod time;
 mod workspace;
 
 use gpui::{
-    point, px, size, App, AppContext, Application, Bounds, Global, KeyBinding, TitlebarOptions,
-    WindowBounds, WindowHandle, WindowOptions,
+    point, px, size, App, AppContext, Application, Bounds, Global, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowOptions,
 };
 use gpuikit::input::bind_input_keys;
 
-use workspace::{
-    Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, NewIssue, ToggleLeftDock,
-    ToggleRightDock, ToggleShowDone, Workspace,
-};
+use workspace::Workspace;
 
 /// The main window, so `Close Window` can't strand the app: clicking the Dock
 /// icon reopens it rather than stacking a second one.
@@ -43,25 +42,18 @@ fn main() {
         gpuikit::theme::init(cx);
         bind_input_keys(cx, None);
 
-        // Dock toggles match Zed's defaults.
-        let ws = Some("Workspace");
-        cx.bind_keys([
-            KeyBinding::new("cmd-b", ToggleLeftDock, ws),
-            KeyBinding::new("cmd-r", ToggleRightDock, ws),
-            KeyBinding::new("cmd-n", NewIssue, ws),
-            KeyBinding::new("escape", Dismiss, ws),
-            // Section switching, in sidebar order.
-            KeyBinding::new("cmd-1", GoToHome, ws),
-            KeyBinding::new("cmd-2", GoToTasks, ws),
-            KeyBinding::new("cmd-3", GoToQueue, ws),
-            KeyBinding::new("cmd-4", GoToActivity, ws),
-            KeyBinding::new("cmd-5", GoToChat, ws),
-            // The Tasks list's archive. Bound here rather than in
-            // `menus::init` only for company — what matters is that it is
-            // bound *before* `menus::set` below, or the View item shows no
-            // key equivalent and nothing warns you.
-            KeyBinding::new("shift-cmd-d", ToggleShowDone, ws),
-        ]);
+        // **After `bind_input_keys`, and this is not stylistic.** The
+        // palette's ↑/↓ are bound in `"Palette > Input"`, which ties with
+        // gpuikit's own `Input` bindings on context depth — and gpui breaks a
+        // depth tie on registration order, later wins. Swap these two lines
+        // and ↑/↓ silently go back to moving the text cursor.
+        palette::bind_keys(cx);
+
+        // Every key equivalent in the app, from the one table that also builds
+        // the menu bar. Before `menus::set` below: gpui reads shortcuts out of
+        // the keymap while building the bar, once, and a binding installed
+        // afterwards shows no key equivalent with nothing to warn you.
+        commands::bind_keys(cx);
 
         // The Server menu's model is a global the menu's handlers and the
         // workspace both reach, so it exists before either.

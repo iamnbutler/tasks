@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, list, px, App, ClipboardItem, Context, Div, Entity, Focusable, FollowMode,
-    ListAlignment, ListState, MouseButton, Window, WindowHandle,
+    actions, div, list, px, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    FollowMode, ListAlignment, ListState, MouseButton, Window, WindowHandle,
 };
 use gpuikit::elements::context_menu::{menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
@@ -31,11 +31,15 @@ use tasks_client::api::models::{
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
+use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
     markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
+use crate::palette::{
+    GoToAnything, PaletteKind, PaletteState, SelectNextRow, SelectPrevRow, ShowCommandPalette,
+};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
 use crate::state::{is_picked_up, AppState};
@@ -167,6 +171,18 @@ impl Section {
 }
 
 pub struct Workspace {
+    /// The root's own focus handle.
+    ///
+    /// Without one, `key_context("Workspace")` on the root was decorative:
+    /// gpui falls back to the root dispatch node when the focused handle is
+    /// absent from the rendered frame, and the *root* node carries no context,
+    /// so the stack came out empty and every `Some("Workspace")` binding was
+    /// dead at rest (#902). `Workspace::new` used to focus the chat composer,
+    /// which only exists while the Chat section is rendered — which is exactly
+    /// the frame in which the context vanished. Everything that moves focus
+    /// away has to be able to hand it back here, which is also what the
+    /// palette needs when it closes.
+    pub(crate) focus_handle: FocusHandle,
     pub(crate) section: Section,
     pub(crate) left_sidebar: SidebarState,
     pub(crate) right_sidebar: SidebarState,
@@ -236,6 +252,12 @@ pub struct Workspace {
     /// the way instead. Cleared by the next mouse-down anywhere, which is
     /// also when the menu closes.
     row_menu_open: bool,
+    /// The open palette (⌘⇧P or ⌘P), if one is up.
+    pub(crate) palette: Option<PaletteState>,
+    /// The palette's query field. Owned here like every other composer, and
+    /// one field for both palettes: they never show together, and the query
+    /// is cleared on each open anyway.
+    pub(crate) palette_input: Entity<InputState>,
 }
 
 impl Workspace {
@@ -341,7 +363,31 @@ impl Workspace {
             state.set_placeholder("Describe the issue…", cx);
             state
         });
-        window.focus(&input.focus_handle(cx), cx);
+
+        // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
+        // escape is gpuikit's own blur, and the blur is how the palette learns
+        // it was dismissed — but only when the input is still on screen to
+        // paint it, which is why click-away has its own handler on the
+        // backdrop.
+        let palette_input = Self::new_palette_input(cx);
+        cx.observe(&palette_input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &palette_input,
+            window,
+            |this, _, event: &InputStateEvent, window, cx| match event {
+                InputStateEvent::Submit => this.confirm_palette(window, cx),
+                InputStateEvent::Blur if this.palette_is_open() => this.close_palette(window, cx),
+                _ => {}
+            },
+        )
+        .detach();
+
+        // Focus the root, not the chat composer: the composer is only
+        // rendered in the Chat section, and a focused handle that is absent
+        // from the frame drops the whole context stack — which is #902, and
+        // which would leave every `Workspace`-context binding dead at rest.
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
 
         // Follow the conversation tail: top-aligned with `FollowMode::Tail`
         // (not `ListAlignment::Bottom` — a short conversation should read
@@ -366,6 +412,7 @@ impl Workspace {
         }
 
         Self {
+            focus_handle,
             section: Section::Home,
             left_sidebar: SidebarState::new(true),
             // The inspector is a reading surface (specs, task bodies) —
@@ -388,6 +435,8 @@ impl Workspace {
             expanded_tools: HashSet::new(),
             markdown: RefCell::new(MarkdownCache::new()),
             row_menu_open: false,
+            palette: None,
+            palette_input,
         }
     }
 
@@ -409,8 +458,25 @@ impl Workspace {
         cx.notify();
     }
 
-    fn go_to_section(&mut self, section: Section, cx: &mut Context<Self>) {
+    /// Switch sections, and put focus somewhere that is actually drawn.
+    ///
+    /// The focus move is the other half of #902 and is not housekeeping: Chat
+    /// is the one section with a composer worth landing in, and everywhere else
+    /// the composer is not rendered at all. A focus handle that is absent from
+    /// the frame drops the context stack, so leaving Chat without handing focus
+    /// back to the root kills every `Workspace`-context binding until something
+    /// else takes focus.
+    pub(crate) fn go_to_section(
+        &mut self,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.section = section;
+        match section {
+            Section::Chat => window.focus(&self.input.focus_handle(cx), cx),
+            _ => window.focus(&self.focus_handle, cx),
+        }
         cx.notify();
     }
 
@@ -438,15 +504,25 @@ impl Workspace {
     /// both entities and from `toggle_show_done`; a no-op unless something
     /// moved.
     fn sync_menus(&self, cx: &mut Context<Self>) {
+        let menu_state = self.menu_state(cx);
+        menus::sync(cx, menu_state);
+    }
+
+    /// The facts the bar's shape depends on, read out of the two entities that
+    /// hold them plus this window's own archive toggle.
+    ///
+    /// Extracted from [`Self::sync_menus`] because the command palette greys
+    /// its rows against the same facts, and two derivations of "can this run?"
+    /// is how the two surfaces stop agreeing.
+    pub(crate) fn menu_state(&self, cx: &App) -> MenuState {
         let busy = self.server_control.read(cx).busy();
         let state = self.app_state.read(cx);
-        let menu_state = MenuState {
+        MenuState {
             serving: state.connected,
             mode: state.mode,
             busy,
             show_done: self.show_done,
-        };
-        menus::sync(cx, menu_state);
+        }
     }
 
     // --- selection (called from section rows) ---
@@ -764,7 +840,7 @@ impl Workspace {
 
     /// Say something in the sidebar banner. Same slot the server's own errors
     /// use, and cleared by the next successful refresh.
-    fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+    pub(crate) fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         self.app_state
             .update(cx, |state, cx| state.report(message, cx));
     }
@@ -1016,8 +1092,8 @@ impl Workspace {
                         .cursor_pointer()
                         .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
                         .when(selected, |el| el.bg(selected_bg))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.go_to_section(section, cx);
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.go_to_section(section, window, cx);
                         }))
                         .child(
                             section
@@ -1673,9 +1749,16 @@ impl Render for Workspace {
         self.right_sidebar.set_width(right_width, viewport_width);
 
         self.sync_chat_list(cx);
+        self.sync_palette(cx);
 
         div()
-            .key_context("Workspace")
+            .key_context(WORKSPACE_CONTEXT)
+            // The context above is only real because of this: gpui falls back
+            // to the root dispatch node when the focused handle is absent from
+            // the rendered frame, and that node carries no context of its own.
+            .track_focus(&self.focus_handle)
+            // The containing block the palette overlay positions against.
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -1702,6 +1785,24 @@ impl Render for Workspace {
             // would throw away the row the menu is about and leave the menu
             // itself up, since a handled action stops the event before the
             // listener phase. Propagating instead lets the menu close itself.
+            // The two palettes. Both toggle: the same keystroke that opened
+            // one closes it, and the other keystroke switches between them
+            // without a round trip through the workspace.
+            .on_action(cx.listener(|this, _: &ShowCommandPalette, window, cx| {
+                this.toggle_palette(PaletteKind::Commands, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoToAnything, window, cx| {
+                this.toggle_palette(PaletteKind::Navigate, window, cx);
+            }))
+            // Bound in `"Palette > Input"`, so they only ever arrive with the
+            // palette's query field focused — but handled here, because the
+            // panel is drawn by this view and the selection lives on it.
+            .on_action(cx.listener(|this, _: &SelectNextRow, _window, cx| {
+                this.move_palette_selection(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevRow, _window, cx| {
+                this.move_palette_selection(-1, cx);
+            }))
             .on_action(cx.listener(|this, _: &Dismiss, _window, cx| {
                 if this.row_menu_open {
                     this.row_menu_open = false;
@@ -1722,20 +1823,20 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ApproveSelectedSpec, window, cx| {
                 this.run_on_selection(RowAction::ApproveSpec, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToHome, _window, cx| {
-                this.go_to_section(Section::Home, cx);
+            .on_action(cx.listener(|this, _: &GoToHome, window, cx| {
+                this.go_to_section(Section::Home, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToTasks, _window, cx| {
-                this.go_to_section(Section::Tasks, cx);
+            .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
+                this.go_to_section(Section::Tasks, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToQueue, _window, cx| {
-                this.go_to_section(Section::Queue, cx);
+            .on_action(cx.listener(|this, _: &GoToQueue, window, cx| {
+                this.go_to_section(Section::Queue, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToActivity, _window, cx| {
-                this.go_to_section(Section::Activity, cx);
+            .on_action(cx.listener(|this, _: &GoToActivity, window, cx| {
+                this.go_to_section(Section::Activity, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToChat, _window, cx| {
-                this.go_to_section(Section::Chat, cx);
+            .on_action(cx.listener(|this, _: &GoToChat, window, cx| {
+                this.go_to_section(Section::Chat, window, cx);
             }))
             // A view filter over this window's Tasks list, so it is the
             // workspace's to handle and greys out with no workspace focused.
@@ -1804,5 +1905,17 @@ impl Render for Workspace {
                         el.child(self.render_right_sidebar(cx))
                     }),
             )
+            // Last, so it paints above both sidebars. Two siblings, not a
+            // parent and a child: gpui delivers a click to the topmost element
+            // and bubbles it through *ancestors*, so a backdrop wrapping the
+            // panel would never see a click on the rows underneath it — and
+            // would swallow every click on the panel itself.
+            .children(self.render_palette(cx).into_iter().flatten())
+    }
+}
+
+impl Focusable for Workspace {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
