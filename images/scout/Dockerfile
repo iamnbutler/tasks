@@ -10,16 +10,30 @@ USER root
 COPY scout-supervisor /usr/local/bin/scout-supervisor
 RUN chmod +x /usr/local/bin/scout-supervisor
 
-# cargo-nextest, from the official prebuilt tarball. Without it `make test`
-# hard-fails with an install hint and pushes the agent onto bare
-# `cargo test --workspace` — the exact command whose parallel links OOM.
+# cargo-nextest, pinned, from the release archive it is actually published to.
+# Without it `make test` hard-fails with an install hint and pushes the agent
+# onto bare `cargo test --workspace` — the exact command whose parallel links
+# OOM.
+#
+# Not `get.nextest.dev`: that redirector now answers NXDOMAIN, and since the
+# fetch was piped straight into `tar`, the build died reporting `tar: Child
+# returned status 1` — a name that would not resolve, wearing an archive
+# error's clothes. Every image build failed on it, which is how a fortnight of
+# supervisor fixes stayed undeployed while the fixes themselves sat on main.
+# A pinned release URL cannot vanish out from under a rebuild, and landing the
+# download in a file first means the next failure names itself.
+ARG NEXTEST_VERSION=0.9.143
 RUN arch="$(uname -m)" && \
     case "$arch" in \
-      aarch64|arm64) url=https://get.nextest.dev/latest/linux-arm ;; \
-      x86_64) url=https://get.nextest.dev/latest/linux ;; \
+      aarch64|arm64) target=aarch64-unknown-linux-gnu ;; \
+      x86_64) target=x86_64-unknown-linux-gnu ;; \
       *) echo "no nextest build for $arch" >&2; exit 1 ;; \
     esac && \
-    curl -LsSf "$url" | tar zxf - -C /usr/local/bin
+    curl -LsSf -o /tmp/nextest.tar.gz \
+      "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${target}.tar.gz" && \
+    tar zxf /tmp/nextest.tar.gz -C /usr/local/bin && \
+    rm /tmp/nextest.tar.gz && \
+    test -x /usr/local/bin/cargo-nextest
 
 # app-gpui's build dependencies. Without them `cd app-gpui && cargo test`
 # fails in a build script — `yeslogic-fontconfig-sys` probes pkg-config for
