@@ -26,10 +26,11 @@ use base64::Engine as _;
 use chrono::Utc;
 use thiserror::Error;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
+use crate::bundles::{self, RejectedBundles};
 use crate::cancel::Bounded;
 use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient};
@@ -117,7 +118,11 @@ pub struct BuilderConfig {
     /// Wall-clock budget for one build, allocation included.
     pub timeout: Duration,
     /// Where per-build scratch repos live (removed after each build,
-    /// success or failure).
+    /// success or failure) — and, under `rejected/`, the bundles egress could
+    /// not push, which are **not** removed. See [`crate::bundles`]: that
+    /// directory is the only record there is of an implementation whose branch
+    /// never landed, and [`crate::run::reclaim_bundles`] is the only thing
+    /// that empties it.
     pub scratch_root: PathBuf,
 }
 
@@ -588,45 +593,69 @@ impl Builder {
     /// egress failure used to destroy the whole implementation with nothing
     /// left to recover it from. Best-effort: a failure to preserve is appended
     /// to the reason rather than replacing it, because the original failure is
-    /// still the thing that went wrong.
+    /// still the thing that went wrong, and this line is then the only trace
+    /// the work ever existed.
+    ///
+    /// The `BundlePreserved` event is what puts the file in front of a human
+    /// without anybody going looking: it is the one moment at which the
+    /// server knows an implementation now exists in exactly one place.
     async fn preserve_bundle(
         &self,
         build: &Build,
         outcome: &BuildOutcome,
         why: &str,
     ) -> BuilderError {
-        let dir = self.config.scratch_root.join(REJECTED_BUNDLE_DIR);
-        let path = dir.join(format!("{}.bundle", build.id));
+        let bundles = RejectedBundles::under(&self.config.scratch_root);
 
         let saved = async {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&outcome.bundle_base64)
                 .map_err(|e| format!("bundle base64: {e}"))?;
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| format!("rejected bundle dir: {e}"))?;
-            tokio::fs::write(&path, bytes)
+            let path = bundles
+                .preserve(&build.id, &bytes)
                 .await
                 .map_err(|e| format!("rejected bundle write: {e}"))?;
-            Ok::<(), String>(())
+            Ok::<(std::path::PathBuf, u64), String>((path, bytes.len() as u64))
         }
         .await;
 
         BuilderError::Egress(match saved {
-            Ok(()) => {
+            Ok((path, bytes)) => {
                 warn!(
                     build_id = %build.id,
                     bundle = %path.display(),
+                    bytes,
                     "egress failed; the build's commits were preserved"
                 );
+                if let Err(e) = self
+                    .store
+                    .append_event(EventPayload::BundlePreserved {
+                        build_id: build.id.clone(),
+                        bytes,
+                    })
+                    .await
+                {
+                    // The file is what matters and it is already on disk; the
+                    // event is how anybody finds out. Losing it costs
+                    // discovery, not the work.
+                    warn!(build_id = %build.id, error = %e, "could not announce the preserved bundle");
+                }
                 format!(
                     "{why}; the build's commits were kept at {bundle} — recover them with \
-                     git fetch {bundle} '{branch}:{branch}'",
+                     {command}",
                     bundle = path.display(),
-                    branch = build.branch,
+                    command = bundles::recovery_command(&path, &build.branch),
                 )
             }
-            Err(e) => format!("{why}; the build's commits could not be preserved either: {e}"),
+            Err(e) => {
+                error!(
+                    build_id = %build.id,
+                    error = %e,
+                    "egress failed AND the build's commits could not be preserved — \
+                     this implementation is gone"
+                );
+                format!("{why}; the build's commits could not be preserved either: {e}")
+            }
         })
     }
 
@@ -688,13 +717,6 @@ impl Builder {
         Ok(())
     }
 }
-
-/// Where a bundle that could not be pushed is written, under
-/// [`BuilderConfig::scratch_root`] and deliberately **outside** the per-build
-/// scratch repo — that repo is still removed after every build, this is not.
-/// Its contents are whole implementations, so removing one is a human's call,
-/// which also makes it unbounded by design.
-const REJECTED_BUNDLE_DIR: &str = "rejected";
 
 /// Least wall-clock budget a resumed build gets, however long the server was
 /// down. See `scout::RESUME_MIN_BUDGET` — same reasoning, and here the

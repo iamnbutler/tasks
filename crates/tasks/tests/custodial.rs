@@ -201,7 +201,13 @@ async fn harness(with_github: bool) -> Harness {
         )
     });
 
-    let app = tasks::server::router_with_services(store.clone(), None, github);
+    let app = tasks::server::router_with_services(
+        store.clone(),
+        tasks::server::Services {
+            github,
+            ..Default::default()
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

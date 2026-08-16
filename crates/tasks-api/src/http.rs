@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BriefingSection, Build, Mode, ProjectId, RunKind, SpecId, TaskId};
+use crate::models::{BriefingSection, Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
 
 /// Body of `POST /projects`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -489,6 +489,54 @@ pub struct SetLabelsRequest {
     pub rationale: Option<String>,
     #[serde(default)]
     pub evidence: Option<serde_json::Value>,
+}
+
+/// A build whose branch could not be pushed, and whose commits were written
+/// down instead — one entry of `GET /bundles`, and the whole of
+/// `GET /builds/{id}/bundle`.
+///
+/// **Derived, never stored.** Everything here is read at request time: the
+/// file's size and mtime from `read_dir`, the rest from the build row. There
+/// is no bundles table and no cached size, because the directory is one a
+/// human works in — recovering a bundle means `cd`-ing there and running git —
+/// and a row asserting a file exists goes stale the moment somebody `rm`s one.
+///
+/// The bundle is **thin**: it carries the build's commits and not the commit
+/// they grew from, so [`Self::recovery_command`] only reconstructs the branch
+/// in a repository that already has `base_sha`. A clone of the trunk normally
+/// does; a build stacked on another build's branch may not — which is why
+/// `base_sha` is reported beside the command rather than left implied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RejectedBundle {
+    pub build_id: BuildId,
+    /// Absolute path **on the server host**. The app is loopback-local today,
+    /// but this is still a path in someone else's filesystem as far as any
+    /// client is concerned — which is why recovery is a command to run and
+    /// not a button to press.
+    pub path: String,
+    pub bytes: u64,
+    /// The file's mtime: when egress failed and the bundle was written.
+    pub created_at: DateTime<Utc>,
+    pub branch: String,
+    /// The commit the branch grew from — the bundle's prerequisite.
+    pub base_sha: Option<String>,
+    pub head_sha: Option<String>,
+    /// Why the build failed, as the build row records it. The reason egress
+    /// was refused is the first thing a human needs in order to decide
+    /// whether recovering is worth it.
+    pub exit_reason: Option<String>,
+    /// The tasks this build implements. A build that never landed a branch has
+    /// no PR and appears nowhere else in a UI, so the bundle is shown against
+    /// the *work* rather than against an id nobody recognises. Computed
+    /// server-side because a client has no build→spec→task join to do it with.
+    pub task_ids: Vec<TaskId>,
+    /// The `git fetch` that gets the work back, shell-quoted and complete.
+    pub recovery_command: String,
+    /// Whether the retention policy would reclaim this: every spec in the
+    /// batch carried by a later build that succeeded, and every task in it
+    /// `done`. Reported so a human deleting one by hand can see whether they
+    /// are throwing away the only copy of something.
+    pub superseded: bool,
 }
 
 /// One entry of `GET /labels`: the repository's label vocabulary.

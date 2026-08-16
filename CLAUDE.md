@@ -226,6 +226,35 @@ implementation.
   build, because the VM is deallocated before egress runs, so a rejected bundle
   is written to `<scratch_root>/rejected/` (deliberately never swept) with the
   `git fetch` that recovers it named in the failure reason.
+- **A preserved bundle is deleted only once its work has been reproduced —
+  never by age, never by disk usage.** A build whose branch cannot be pushed
+  holds the only copy of a finished implementation, because the VM is
+  deallocated before egress runs; `<scratch_root>/rejected/<build_id>.bundle`
+  is that copy. So the retention policy (`run::reclaim_bundles`, driven by
+  `Store::build_superseded`) deletes one only when **every spec in its batch
+  was carried by a later build that `succeeded` and every task in it is
+  `done`**. Both halves are load-bearing and neither is a proxy for the other:
+  a later build that only opened a PR is not evidence, since `watch_merges`
+  can still find that PR closed unmerged and unwind the batch back to
+  `ready_to_build`, at which point the bundle is the head start again — and
+  `done` means the issue closed upstream, which is exactly "the merge landed".
+  One unreproduced spec keeps the whole bundle, because a bundle is one file
+  over a whole batch and there is no half-bundle to keep. "Later" is `rowid`
+  and not `created_at`: two builds stamped inside the same second would let a
+  build supersede *itself*. A bundle nobody ever rebuilt is therefore kept
+  forever, and that is the behaviour rather than the leak. The **filesystem is
+  the only record** — `crates/tasks/src/bundles.rs` reads the directory on
+  every request, and there is no table, no migration and no cached size,
+  because that directory is one a human works in and a row asserting a file
+  exists goes stale the moment somebody `rm`s one. Two consequences: a router
+  without the bundle service answers **503 and never `[]`** ("nothing was
+  preserved" is the one wrong answer to give about work that exists in exactly
+  one place), and `DELETE /builds/{id}/bundle` is **human-only**, refused to
+  the orchestrator outright like `build-now` — what survives the policy is by
+  construction work nobody reproduced, and there is no undo. Recovery is a
+  `git fetch` printed in full rather than a button, because the file is on the
+  server host and the fetch runs in the human's own checkout; the bundle is
+  thin, so `base_sha` is reported beside the command rather than left implied.
 - **A cancel interrupts the dispatcher's drain; it never just removes the VM.**
   `POST /sessions/{id}/cancel` and `POST /builds/{id}/cancel` write a durable
   `cancellations` row, and `crate::cancel::bounded` — the `tokio::select!` the

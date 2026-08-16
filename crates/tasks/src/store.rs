@@ -2649,6 +2649,75 @@ impl Store {
             .collect()
     }
 
+    /// The tasks a build implements, in batch order, deduplicated.
+    ///
+    /// A build that never landed a branch has no PR and appears nowhere a
+    /// human looks, so anything that has to be *shown* about such a build —
+    /// today, a preserved bundle — is shown against its work instead of
+    /// against a build id nobody recognises.
+    pub async fn build_task_ids(&self, id: &BuildId) -> Result<Vec<TaskId>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT s.task_id AS task_id, MIN(bs.position) AS pos \
+             FROM build_specs bs JOIN specs s ON s.id = bs.spec_id \
+             WHERE bs.build_id = ? GROUP BY s.task_id ORDER BY pos",
+        )
+        .bind(id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(TaskId::from_raw(row.try_get::<String, _>("task_id")?)))
+            .collect()
+    }
+
+    /// The retention predicate for a preserved bundle: has this build's work
+    /// been *reproduced and shipped* by something later?
+    ///
+    /// True only when **every** spec in the batch was carried by a later build
+    /// that `succeeded` **and every task** in the batch is `done`. Both halves
+    /// are load-bearing, and neither is a proxy for the other:
+    ///
+    /// - A later build that only opened a PR is not evidence. `watch_merges`
+    ///   can still find that PR closed unmerged and unwind the batch back to
+    ///   `ready_to_build`, at which point this bundle is the head start again.
+    ///   `done` in this system means the issue is closed upstream, which is
+    ///   exactly "the merge landed".
+    /// - One unreproduced spec keeps the whole bundle. A bundle is one file
+    ///   over a whole batch; there is no half-bundle to keep.
+    ///
+    /// "Later" is `rowid` — insertion order — and deliberately not
+    /// `created_at`: two builds stamped within the same second would let a
+    /// build supersede itself, and `rowid` cannot.
+    ///
+    /// An empty batch is never superseded. It cannot happen (a build is
+    /// created over specs), but the vacuous `NOT EXISTS` would answer "yes"
+    /// and delete work, which is the one direction this must not fail in.
+    pub async fn build_superseded(&self, id: &BuildId) -> Result<bool, StoreError> {
+        let row = sqlx::query(
+            "SELECT \
+               (SELECT COUNT(*) FROM build_specs WHERE build_id = ?1) AS total_specs, \
+               (SELECT COUNT(*) FROM build_specs bs WHERE bs.build_id = ?1 AND EXISTS ( \
+                    SELECT 1 FROM build_specs later JOIN builds b ON b.id = later.build_id \
+                    WHERE later.spec_id = bs.spec_id AND b.status = 'succeeded' \
+                      AND b.rowid > (SELECT rowid FROM builds WHERE id = ?1))) AS carried, \
+               (SELECT COUNT(DISTINCT s.task_id) FROM build_specs bs \
+                    JOIN specs s ON s.id = bs.spec_id WHERE bs.build_id = ?1) AS total_tasks, \
+               (SELECT COUNT(DISTINCT s.task_id) FROM build_specs bs \
+                    JOIN specs s ON s.id = bs.spec_id JOIN tasks t ON t.id = s.task_id \
+                    WHERE bs.build_id = ?1 AND t.state = 'done') AS done_tasks",
+        )
+        .bind(id.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        let total_specs: i64 = row.try_get("total_specs")?;
+        let carried: i64 = row.try_get("carried")?;
+        let total_tasks: i64 = row.try_get("total_tasks")?;
+        let done_tasks: i64 = row.try_get("done_tasks")?;
+        Ok(total_specs > 0
+            && carried == total_specs
+            && total_tasks > 0
+            && done_tasks == total_tasks)
+    }
+
     pub async fn set_build_vm(&self, id: &BuildId, vm_id: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE builds SET vm_id = ? WHERE id = ?")
             .bind(vm_id)

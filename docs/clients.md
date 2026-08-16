@@ -97,6 +97,7 @@ No auth, loopback only — don't build a login flow.
 | Scout now | `POST /tasks/{task_id}/scout` | Queue the task (from `backlog` or `queued`) at the **front**, shifting everything else down. The dispatch loop picks it up on its next tick; the concurrency cap still applies — it jumps the queue, it doesn't bypass it. |
 | Build now | `POST /tasks/{task_id}/build-now` `{"content"?,"complexity"?,"base_branch"?,"rationale"?}` | Skip the Scout for a task whose issue body already *is* the spec. Writes the spec by hand, approves it, and queues a Builder run over it in one call; **202** with the same `{..., spec_ids}` shape as `POST /builds`. Legal only from `backlog` or `queued` — the states where no Scout has run and none is running (`backlog` → `ready_to_build` is a new edge). Every field is optional: the spec defaults to the issue body, complexity to `simple`. A supplied `content` **replaces** the body rather than extending it. 400 if that leaves nothing to build from. **Human-only**: any other actor is a 403, because this authors, approves and dispatches with no second opinion anywhere in the loop — no charter capability covers that. |
 | Cancel a run | `POST /sessions/{session_id}/cancel` \| `POST /builds/{build_id}/cancel` `{"rationale"?}` | Stop a scout or a build that is already in flight. 404 for a run that does not exist, 409 for one that has already concluded. The run ends as **`cancelled`** — never `failed` — with the actor and rationale in `exit_reason`, and the work comes back: a scout's task to **`backlog`** (not `queued`, or the dispatch loop would start a replacement within the tick) and a build's specs to `approved` with no attempt charged. The ack is `{run_kind, run_id, concluded, status, decision_seq, note}`; **`concluded: false` is not a failure** — the request is recorded and the dispatcher following the run concludes it, so watch for `session_completed` / `build_completed` rather than retrying. A queued build is cancelled outright (nothing is following it). Cancelling a run that finishes in the same breath leaves the run's real outcome standing and says so. |
+| Delete a preserved bundle | `DELETE /builds/{build_id}/bundle` | Throw away the only copy of an implementation whose branch never landed. **204**; 404 when there is nothing there (a second click, or the retention policy got there first); 503 without a bundle directory. **Human-only** — the orchestrator is a 403, on the same footing as Build Now: there is no undo, and anything the retention policy has not already reclaimed is by construction work nobody reproduced. Arm it behind a second click and say what is being lost. |
 | Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected`. `approved` → task `ready_to_build`; `needs_revision` → task returns to `queued` for a re-scout (feedback reaches the next scout's prompt); `rejected` → dead end. |
 | Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running — cancelling one is `POST /sessions/{id}/cancel`, above). The mode is **not** remembered across restarts: every boot starts in the server's configured `TASKS_DEFAULT_MODE` (default `pause`), and only `tasks reload` carries the old mode to its replacement. So a client that survives a server restart must re-read `/mode` (or `/status`) rather than trusting its last snapshot — reconnecting to the event stream and resnapshotting, which a restart forces anyway, already does this. |
 
@@ -134,6 +135,13 @@ the server only.
   checkpointed, and it costs the task no dispatch attempt.
 - `GET /sessions/{id}/notes` — salvage from a run that stopped early;
   **404 when there is none**, which is the ordinary case.
+- `GET /bundles` / `GET /builds/{id}/bundle` — implementations whose branch
+  could not be pushed; see *Preserved bundles* below. Newest first, an empty
+  list is ordinary, and the per-build read is **404 when there is none** (the
+  `/sessions/{id}/notes` shape). A server with no bundle directory answers
+  **503 rather than `[]`** — "nothing was preserved" is the one wrong answer to
+  give about work that exists in exactly one place, so treat 503 as "cannot
+  say" and show nothing rather than "none".
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,
   `agent_exit_code`. **`session_id` is nullable**: null means no Scout ran and
@@ -288,6 +296,49 @@ The task returns to `queued` and the attempt still counts against the cap, so a
 scout that stops early at the same point every time is still retired after
 three tries.
 
+## Preserved bundles — a finished implementation with nowhere to go
+
+A Builder VM is deallocated *before* the server pushes its branch, so when the
+push or the PR is refused, the thin git bundle the VM sent is the only copy of
+that implementation there is. It is written to
+`<scratch_root>/rejected/<build_id>.bundle` and never swept, and the build's
+`exit_reason` names both the file and the `git fetch` that recovers it.
+
+`GET /bundles` (newest first) and `GET /builds/{id}/bundle`:
+
+```json
+{"build_id": "build_…", "path": "/…/rejected/build_….bundle", "bytes": 41234,
+ "created_at": "…", "branch": "build/build_…", "base_sha": "…", "head_sha": "…",
+ "exit_reason": "branch egress: …", "task_ids": ["task_…"],
+ "recovery_command": "git fetch '/…/build_….bundle' 'build/x:build/x'",
+ "superseded": false}
+```
+
+Four things a client should get right:
+
+- **Show it against the tasks, not the build.** A build that never landed a
+  branch has no PR and appears nowhere else in a UI; `task_ids` is on the wire
+  type precisely so the block can hang off the work a human recognises.
+- **Recovery does not happen in your app.** The file is on the server host and
+  the fetch runs in whatever checkout the human works in, so render
+  `recovery_command` in full and make it copyable rather than offering a
+  Recover button that would have to lie about where it ran.
+- **The bundle is thin.** It carries the build's commits and not the commit
+  they grew from, so the fetch only reconstructs the branch in a repository
+  that already has `base_sha` — state it beside the command.
+- **Nothing is derived from a table.** The server reads the directory on every
+  request, so a bundle a human `rm`s on the server host simply stops being
+  listed. Don't cache the size.
+
+Retention deletes **only reproduced work**, never by age and never by disk
+usage: a bundle goes when every spec in its batch has been carried by a *later*
+build that succeeded **and** every task in it is `done` — which in this system
+means the issue closed upstream. A later build that has only opened a PR is not
+evidence, because `watch_merges` can still find that PR closed unmerged and
+unwind the batch, at which point the bundle is the head start again. So a
+bundle for work nobody ever rebuilt is kept forever, and that is the intended
+behaviour rather than a leak.
+
 ## Transcripts
 
 Agent output is a **separate channel from the event log**, on purpose (see
@@ -433,6 +484,13 @@ dropped out of the repository's open set; refetch the task or the list),
 `decision_seq` — somebody asked for a run to stop; the *request*, not the
 outcome, which arrives as that run's ordinary completion event with a
 `cancelled` status),
+`bundle_preserved` (`build_id`, `bytes` — a build's branch could not be
+pushed and its commits were written down; at that moment the file is the only
+copy of that implementation anywhere),
+`bundle_removed` (`build_id`, `superseded`, `actor` — **`superseded` is the
+whole difference**: `true` is the retention policy reclaiming work that has
+since been rebuilt and shipped, `false` is somebody throwing an implementation
+away, and the two want very different sentences in a feed),
 `pull_request_opened` (`build_id`, `pr_number`),
 `orchestrator_message` (`seq`, `role` — refetch `/orchestrator/messages`),
 `mode_changed` (a `POST /mode` only — a boot's mode is set before the listener

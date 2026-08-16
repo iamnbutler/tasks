@@ -29,12 +29,13 @@ use tracing::{error, info, warn};
 use tasks_api::http::{
     AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, ReopenTaskRequest,
-    ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, SendMessage, ServerStatus,
-    SetCharter, SetLabelsRequest, SetMode, ShadowAck,
+    EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
+    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest,
+    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
+use crate::bundles::RejectedBundles;
 use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
@@ -121,16 +122,34 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-/// Router state: the store plus the services that need credentials or
-/// background work. Both optional so `router(store)` (tests, embedded uses)
-/// keeps working — without the briefing service `GET /briefings` serves stored
-/// copies and never regenerates, and without a GitHub client the endpoints
-/// that write upstream answer 503 instead of pretending.
+/// The services a router is given besides the store: the ones that need
+/// credentials, background work, or a filesystem the process owns.
+///
+/// A struct rather than positional arguments. Two options read fine; the
+/// third is where `serve_on(listener, store, None, None, None, shutdown)`
+/// stops saying anything about what is missing — and every one of them is an
+/// `Option<Arc<_>>`, so transposing two is a silent behaviour change rather
+/// than a type error.
+///
+/// Each is optional so `router(store)` (tests, embedded uses) keeps working,
+/// and each absence has a defined answer rather than a pretended one: without
+/// the briefing service `GET /briefings` serves stored copies and never
+/// regenerates, without a GitHub client the endpoints that write upstream
+/// answer 503, and without a bundle service `GET /bundles` answers 503 — never
+/// `[]`, because "nothing was preserved" is the one wrong answer to give about
+/// a directory nobody looked in.
+#[derive(Clone, Default)]
+pub struct Services {
+    pub briefings: Option<Arc<Briefings>>,
+    pub github: Option<Arc<GitHubClient>>,
+    pub bundles: Option<Arc<RejectedBundles>>,
+}
+
+/// Router state: the store plus [`Services`].
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Store>,
-    briefings: Option<Arc<Briefings>>,
-    github: Option<Arc<GitHubClient>>,
+    services: Services,
 }
 
 impl FromRef<AppState> for Arc<Store> {
@@ -141,31 +160,34 @@ impl FromRef<AppState> for Arc<Store> {
 
 impl FromRef<AppState> for Option<Arc<Briefings>> {
     fn from_ref(state: &AppState) -> Self {
-        state.briefings.clone()
+        state.services.briefings.clone()
     }
 }
 
 impl FromRef<AppState> for Option<Arc<GitHubClient>> {
     fn from_ref(state: &AppState) -> Self {
-        state.github.clone()
+        state.services.github.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.bundles.clone()
     }
 }
 
 /// Build the API router over a store alone. Exposed separately from [`serve`]
 /// so tests can bind their own listener.
 pub fn router(store: Arc<Store>) -> Router {
-    router_with_services(store, None, None)
+    router_with_services(store, Services::default())
 }
 
 /// Build the full API router. `serve` passes the briefing service so
-/// `GET /briefings` can kick stale-while-revalidate regenerations, and the
-/// GitHub client so issue writes can go through the server rather than
-/// through an agent's own credential.
-pub fn router_with_services(
-    store: Arc<Store>,
-    briefings: Option<Arc<Briefings>>,
-    github: Option<Arc<GitHubClient>>,
-) -> Router {
+/// `GET /briefings` can kick stale-while-revalidate regenerations, the GitHub
+/// client so issue writes can go through the server rather than through an
+/// agent's own credential, and the bundle service so a preserved
+/// implementation can be found without an `ls` on the server host.
+pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
     Router::new()
         // First on purpose: no state, no store, no auth — the one route that
         // answers while everything else might still be wrong.
@@ -210,6 +232,11 @@ pub fn router_with_services(
         .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
         .route("/builds/{build_id}/cancel", post(cancel_build))
+        .route(
+            "/builds/{build_id}/bundle",
+            get(get_build_bundle).delete(delete_build_bundle),
+        )
+        .route("/bundles", get(list_bundles))
         .route("/builds/{build_id}/transcript", get(list_build_transcript))
         .route(
             "/builds/{build_id}/transcript/stream",
@@ -235,16 +262,12 @@ pub fn router_with_services(
         .route("/briefings", get(list_briefings))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
-        .with_state(AppState {
-            store,
-            briefings,
-            github,
-        })
+        .with_state(AppState { store, services })
 }
 
 /// Serve the API on loopback at `port`. Runs until the process is killed.
 pub async fn serve(store: Arc<Store>, port: u16) -> std::io::Result<()> {
-    serve_with_shutdown(store, None, None, port, std::future::pending()).await
+    serve_with_shutdown(store, Services::default(), port, std::future::pending()).await
 }
 
 /// When this process started serving, stamped once by [`serve_on`].
@@ -288,8 +311,7 @@ pub async fn bind(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     store: Arc<Store>,
-    briefings: Option<Arc<Briefings>>,
-    github: Option<Arc<GitHubClient>>,
+    services: Services,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     // Stamped here rather than in `serve_with_shutdown`, because `tasks serve`
@@ -297,7 +319,7 @@ pub async fn serve_on(
     // stamping there would leave `/status` uptime dating from the first call
     // instead of from the moment this process started serving.
     serving_since();
-    axum::serve(listener, router_with_services(store, briefings, github))
+    axum::serve(listener, router_with_services(store, services))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -306,12 +328,11 @@ pub async fn serve_on(
 /// need to do anything in between.
 pub async fn serve_with_shutdown(
     store: Arc<Store>,
-    briefings: Option<Arc<Briefings>>,
-    github: Option<Arc<GitHubClient>>,
+    services: Services,
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    serve_on(bind(port).await?, store, briefings, github, shutdown).await
+    serve_on(bind(port).await?, store, services, shutdown).await
 }
 
 // --- version ---
@@ -1923,6 +1944,152 @@ async fn get_build(
         .ok_or_else(|| ApiError::NotFound(format!("build {id}")))?;
     let spec_ids = store.build_spec_ids(&id).await?;
     Ok(Json(BuildDetail { build, spec_ids }))
+}
+
+// --- preserved bundles ---
+
+/// The bundle service, or a 503 that says what is missing.
+///
+/// Never an empty list: a server with no bundle service has not looked in the
+/// directory, and answering `[]` would say it looked and found nothing. That
+/// is the one wrong answer to give about work that exists in exactly one
+/// place.
+fn bundle_service(bundles: &Option<Arc<RejectedBundles>>) -> ApiResult<&Arc<RejectedBundles>> {
+    bundles.as_ref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "this server has no bundle directory configured, so it cannot say what was \
+             preserved — which is not the same as nothing having been"
+                .into(),
+        )
+    })
+}
+
+/// Everything a client needs about one preserved bundle, joined from the file
+/// and the build row at request time. Nothing here is stored.
+async fn describe_bundle(
+    store: &Store,
+    file: crate::bundles::BundleFile,
+) -> ApiResult<Option<RejectedBundle>> {
+    // A bundle whose build row is gone — a wiped database, a file copied in
+    // by hand — has no branch and no base, so there is no honest recovery
+    // command to print. Reported as absent rather than guessed at; the file
+    // stays on disk, which is the safe direction.
+    let Some(build) = store.get_build(&file.build_id).await? else {
+        return Ok(None);
+    };
+    let task_ids = store.build_task_ids(&file.build_id).await?;
+    let superseded = store.build_superseded(&file.build_id).await?;
+    Ok(Some(RejectedBundle {
+        recovery_command: crate::bundles::recovery_command(&file.path, &build.branch),
+        build_id: file.build_id,
+        path: file.path.display().to_string(),
+        bytes: file.bytes,
+        created_at: file.created_at,
+        branch: build.branch,
+        base_sha: build.base_sha,
+        head_sha: build.head_sha,
+        exit_reason: build.exit_reason,
+        task_ids,
+        superseded,
+    }))
+}
+
+/// `GET /bundles` — every implementation whose branch could not be pushed,
+/// newest first. An empty list is the ordinary answer.
+async fn list_bundles(
+    State(store): State<Arc<Store>>,
+    State(bundles): State<Option<Arc<RejectedBundles>>>,
+) -> ApiResult<Json<Vec<RejectedBundle>>> {
+    let bundles = bundle_service(&bundles)?;
+    let files = bundles
+        .list()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        match describe_bundle(&store, file).await? {
+            Some(bundle) => out.push(bundle),
+            None => continue,
+        }
+    }
+    Ok(Json(out))
+}
+
+/// `GET /builds/{build_id}/bundle` — 404 when there is none, which is the
+/// ordinary case for every build that landed its branch. Same shape as
+/// `GET /sessions/{id}/notes`.
+async fn get_build_bundle(
+    State(store): State<Arc<Store>>,
+    State(bundles): State<Option<Arc<RejectedBundles>>>,
+    Path(build_id): Path<String>,
+) -> ApiResult<Json<RejectedBundle>> {
+    let bundles = bundle_service(&bundles)?;
+    let id = BuildId::from_raw(build_id);
+    let missing = || ApiError::NotFound(format!("no preserved bundle for build {id}"));
+    let file = bundles
+        .stat(&id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(missing)?;
+    describe_bundle(&store, file)
+        .await?
+        .map(Json)
+        .ok_or_else(missing)
+}
+
+/// `DELETE /builds/{build_id}/bundle` — throw an implementation away.
+///
+/// **Human-only, and refused to the orchestrator outright** rather than
+/// charter-gated. The retention policy ([`crate::run::reclaim_bundles`])
+/// already deletes everything that has demonstrably been reproduced and
+/// shipped; what is left is by definition work that exists in exactly one
+/// place, and deciding it is not worth keeping is a judgment with no recourse
+/// afterwards. There is no capability that covers that today, and if one is
+/// ever wanted it should be named and argued for rather than folded into
+/// `dispatch_builds`.
+///
+/// 204 on success, 404 when there was nothing there — so a second click, or a
+/// reclaim that got there first, is honest rather than an error.
+async fn delete_build_bundle(
+    State(store): State<Arc<Store>>,
+    State(bundles): State<Option<Arc<RejectedBundles>>>,
+    Path(build_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<StatusCode> {
+    let bundles = bundle_service(&bundles)?;
+    let actor = actor_of(&store, &headers)?;
+    if actor != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "deleting a preserved bundle is the human's alone: it is the only copy of an \
+             implementation, and nothing recovers it afterwards. Work that has been \
+             reproduced and shipped is reclaimed by the retention policy without anyone \
+             asking. Say which bundle you think is redundant and why."
+                .into(),
+        ));
+    }
+    let id = BuildId::from_raw(build_id);
+    // Read before the delete: after it, nothing can say whether this was
+    // bookkeeping or a loss, and that distinction is the whole of what the
+    // event is for.
+    let superseded = store.build_superseded(&id).await.unwrap_or(false);
+    if !bundles
+        .remove(&id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+    {
+        return Err(ApiError::NotFound(format!(
+            "no preserved bundle for build {id}"
+        )));
+    }
+    warn!(build_id = %id, superseded, "a preserved bundle was deleted by hand");
+    store
+        .append_event(EventPayload::BundleRemoved {
+            build_id: id,
+            superseded,
+            actor,
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- orchestrator ---

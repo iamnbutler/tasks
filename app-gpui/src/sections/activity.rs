@@ -128,6 +128,28 @@ impl Workspace {
                     EventPayload::BuildCompleted { status, .. } => {
                         format!("Build {}", status.as_str())
                     }
+                    // The one line that says an implementation now exists in
+                    // exactly one place. Worth its own sentence rather than
+                    // being folded into the build's failure row.
+                    EventPayload::BundlePreserved { bytes, .. } => format!(
+                        "Branch could not be pushed — kept the build's commits ({})",
+                        crate::components::byte_size(*bytes)
+                    ),
+                    // Two very different things behind one kind, told apart by
+                    // `superseded` alone: bookkeeping, or work destroyed.
+                    EventPayload::BundleRemoved {
+                        superseded, actor, ..
+                    } => {
+                        if *superseded {
+                            "Reclaimed a kept implementation — it was rebuilt and shipped"
+                                .to_string()
+                        } else {
+                            format!(
+                                "Deleted a kept implementation that was never rebuilt ({})",
+                                actor.as_str()
+                            )
+                        }
+                    }
                     EventPayload::PullRequestOpened { pr_number, .. } => {
                         format!("Opened PR #{pr_number}")
                     }

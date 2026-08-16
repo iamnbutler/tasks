@@ -179,6 +179,15 @@ pub struct Workspace {
     pub(crate) server_control: Entity<ServerControl>,
     /// Task shown in the inspector (right sidebar).
     pub(crate) selected_task: Option<TaskId>,
+    /// The preserved bundle whose Delete has been armed by a first click, if
+    /// any. Two clicks because there is no undo and no second copy: the file
+    /// is the whole of an implementation whose branch never landed.
+    ///
+    /// Disarmed by any selection at all — a row click, the ✕, escape — rather
+    /// than only by a *change* of selection. An armed button that outlives a
+    /// click elsewhere is a trap: the second click would land on a different
+    /// task's only copy, and re-arming costs one click.
+    pub(crate) bundle_delete_armed: Option<tasks_client::api::models::BuildId>,
     /// Whether the Tasks list shows its archive of done tasks. Per-window and
     /// resets on relaunch: the app has no settings store, and a view filter
     /// that states its own count in a footer does not need one.
@@ -366,6 +375,7 @@ impl Workspace {
             app_state,
             server_control,
             selected_task: None,
+            bundle_delete_armed: None,
             show_done: false,
             input,
             review_input,
@@ -452,6 +462,8 @@ impl Workspace {
                 .update(cx, |input, cx| input.set_content("", cx));
         }
         self.selected_task = Some(id);
+        // Never carry an armed Delete to another task's bundle.
+        self.bundle_delete_armed = None;
         // `reveal`, not `force_open`: a row click is the content asking to be
         // seen, and it must not undo a dismissal the user made deliberately.
         self.right_sidebar.reveal();
@@ -771,6 +783,7 @@ impl Workspace {
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_task = None;
+        self.bundle_delete_armed = None;
         // `hide`, not `toggle`: escape and the inspector's ✕ mean "clear this",
         // never "and don't come back". The next row click opens it again.
         self.right_sidebar.hide();
