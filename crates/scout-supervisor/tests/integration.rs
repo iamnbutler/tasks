@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tasks_protocol::{
-    BuildCommand, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
+    BuildCommand, FailureClass, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -262,20 +262,25 @@ async fn start_scout_fails_if_agent_missing_spec() {
     while failure.is_none() {
         match sup.recv().await {
             VmEvent::App {
-                payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
+                payload: TaskEvent::Scout(evt @ ScoutEvent::Failed { .. }),
             } => {
-                failure = Some(ScoutEvent::Failed { reason });
+                failure = Some(evt);
             }
             VmEvent::App { .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
     match failure.unwrap() {
-        ScoutEvent::Failed { reason } => assert!(
-            reason.contains("SPEC.md"),
-            "expected SPEC.md failure, got: {reason}"
-        ),
-        _ => unreachable!(),
+        ScoutEvent::Failed { reason, class } => {
+            assert!(
+                reason.contains("SPEC.md"),
+                "expected SPEC.md failure, got: {reason}"
+            );
+            // An agent that ran to completion and wrote no spec judged the
+            // work, and is charged for it.
+            assert_eq!(class, FailureClass::Verdict);
+        }
+        other => unreachable!("{other:?}"),
     }
 
     sup.send(VmCommand::Shutdown).await;
@@ -315,15 +320,19 @@ async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
                 payload: TaskEvent::Scout(ScoutEvent::ImplementationFinished { exit_code: code }),
             } => exit_code = Some(code),
             VmEvent::App {
-                payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
-            } => failure = Some(reason),
+                payload: TaskEvent::Scout(ScoutEvent::Failed { reason, class }),
+            } => failure = Some((reason, class)),
             VmEvent::App { .. } => {}
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     assert_eq!(exit_code, Some(137), "SIGKILL should surface as 128 + 9");
-    let reason = failure.unwrap();
+    let (reason, class) = failure.unwrap();
+    // An OOM kill is deliberately still charged: a memory limit is a real
+    // property of the work in that VM, and #828 exists so a memory death is
+    // legible as itself rather than lumped in with a dropped connection.
+    assert_eq!(class, FailureClass::Verdict, "reason: {reason}");
     assert!(
         reason.contains("killed by signal 9 (SIGKILL)"),
         "reason did not name the signal: {reason}"
@@ -355,9 +364,12 @@ async fn start_scout_fails_on_clone_error() {
     // First event should be a Failed (clone error) — we should not see Started.
     match sup.recv().await {
         VmEvent::App {
-            payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
+            payload: TaskEvent::Scout(ScoutEvent::Failed { reason, class }),
         } => {
             assert!(reason.contains("clone"), "reason: {reason}");
+            // A clone that fails against a base branch that is gone fails
+            // identically every time; waiving it would retry forever.
+            assert_eq!(class, FailureClass::Verdict);
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -389,8 +401,11 @@ async fn a_build_command_is_refused_not_acted_on() {
 
     match sup.recv().await {
         VmEvent::App {
-            payload: TaskEvent::Scout(ScoutEvent::Failed { reason }),
-        } => assert!(reason.contains("scout"), "reason: {reason}"),
+            payload: TaskEvent::Scout(ScoutEvent::Failed { reason, class }),
+        } => {
+            assert!(reason.contains("scout"), "reason: {reason}");
+            assert_eq!(class, FailureClass::Verdict);
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
 
@@ -446,7 +461,10 @@ async fn an_interrupted_run_is_salvaged_and_never_reported_as_a_spec() {
             reason,
             notes_markdown,
             files_touched,
+            class,
         } => {
+            // The agent concluded; it just concluded without a spec.
+            assert_eq!(class, FailureClass::Verdict);
             // The reason names what the spec was still missing, so the next
             // attempt (and any human reading the session) knows why.
             assert!(
@@ -641,8 +659,13 @@ async fn an_unresumable_transport_death_names_itself_and_keeps_its_salvage() {
         ScoutEvent::StoppedEarly {
             reason,
             notes_markdown,
+            class,
             ..
         } => {
+            // The whole point of #884: this run never judged the work, and
+            // the host reads that off the field rather than off the prose
+            // below it.
+            assert_eq!(class, FailureClass::Transport);
             assert!(
                 reason.contains("connection to the API failed"),
                 "the reason must name the transport failure: {reason}"

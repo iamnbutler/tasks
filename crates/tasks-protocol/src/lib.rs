@@ -15,11 +15,127 @@
 //! handed Scout traffic by accident, because the mismatch is a rejection at
 //! the supervisor, not a convention in the caller.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use vm_pool_protocol::AppProtocol;
 
 pub mod agent_run;
 pub mod vm_memory;
+
+/// Whether a terminal failure is a verdict on the *work*, or something that
+/// happened *to* the run.
+///
+/// `dispatch_attempts` and `build_attempts` exist so that work which genuinely
+/// cannot be done stops consuming the pipeline after three tries. That cap is
+/// only meaningful for a run that actually judged the work: a dropped API
+/// connection, a deliberate cancel or a server restart says nothing about the
+/// task, and charging one identically means three infrastructure deaths reject
+/// a good task or `blocked` a good spec having learned nothing (#884, and #825
+/// where five scout attempts burned in one night without a single verdict
+/// among them).
+///
+/// The class is stamped by the supervisor — the only thing that knows how the
+/// agent died — and read off the *field* by the host. Never off the reason
+/// text: a reason is prose written for a human, and a strike decision that
+/// greps it would change meaning the next time someone improves a sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    /// The run judged the work: an agent that ran to completion and produced
+    /// nothing usable, a clone that cannot succeed, a budget spent in full.
+    /// This is the case the attempt cap was written for, and the default —
+    /// including for every event that predates the field.
+    #[default]
+    Verdict,
+    /// The agent's connection to the API failed (#845). Transient by nature,
+    /// and below the agent in the VM's network path, so nothing about the work
+    /// is implicated.
+    Transport,
+    /// Somebody stopped the run on purpose, before it could show whether it
+    /// would have worked.
+    Cancelled,
+    /// The host could not pick the run back up after a restart. Never crosses
+    /// the wire — no supervisor is alive to send it — but it is the same
+    /// question, so it is the same enum.
+    Orphaned,
+}
+
+impl FailureClass {
+    /// The wire form, and what a note or a log line prints.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verdict => "verdict",
+            Self::Transport => "transport",
+            Self::Cancelled => "cancelled",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    /// Whether this failure judged the work, and therefore costs an attempt.
+    pub fn is_verdict(&self) -> bool {
+        matches!(self, Self::Verdict)
+    }
+
+    /// Why the attempt was not charged, in a clause a note can carry. `None`
+    /// for a verdict, which is charged.
+    pub fn waiver_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Verdict => None,
+            Self::Transport => Some(
+                "the agent's connection to the API failed, which is an infrastructure \
+                 failure and not a verdict on the work",
+            ),
+            Self::Cancelled => Some(
+                "the run was stopped deliberately, before it could show whether it would \
+                 have worked",
+            ),
+            Self::Orphaned => Some(
+                "the run could not be picked up after a server restart, which is the \
+                 restart's fault and not the work's",
+            ),
+        }
+    }
+
+    /// The wire form, read forgivingly: anything unrecognised is a
+    /// [`FailureClass::Verdict`]. See the [`Deserialize`] impl for why.
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "transport" => Self::Transport,
+            "cancelled" => Self::Cancelled,
+            "orphaned" => Self::Orphaned,
+            _ => Self::Verdict,
+        }
+    }
+}
+
+impl std::fmt::Display for FailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Skew runs in both directions, and only one of them is obvious.
+///
+/// An *older* supervisor image omitting the field is the routine one, and
+/// `#[serde(default)]` on the field covers it. The other direction is why this
+/// impl is hand-written: a *newer* supervisor sending a class this binary has
+/// never heard of must not make the terminal event undecodable, because a lost
+/// terminal event does not cost a strike — it costs the run its outcome, and
+/// hangs it until the deadline. Unknown decays to `Verdict`: today's
+/// behaviour, and never a silent waive.
+///
+/// `#[serde(other)]` cannot express this — it is rejected on a plain
+/// externally-tagged unit-variant enum — and reading the value as a
+/// `serde_json::Value` first means a class sent as a number or a null decays
+/// the same way a misspelt string does.
+impl<'de> Deserialize<'de> for FailureClass {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(raw
+            .as_str()
+            .map(FailureClass::from_wire)
+            .unwrap_or_default())
+    }
+}
 
 /// The application protocol tasks uses with vm-pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +221,10 @@ pub enum ScoutEvent {
         reason: String,
         notes_markdown: String,
         files_touched: Vec<String>,
+        /// Whether the run judged the work. The host reads this field and
+        /// never `reason`, which is prose. See [`FailureClass`].
+        #[serde(default)]
+        class: FailureClass,
     },
     /// Terminal failure with *nothing to salvage*; `reason` is a short
     /// diagnostic and the supervisor has already exited or is about to.
@@ -112,7 +232,12 @@ pub enum ScoutEvent {
     /// Distinct from [`ScoutEvent::StoppedEarly`] on purpose: "we salvaged
     /// something" and "there was nothing" are different facts, and a retry
     /// that cannot tell them apart re-derives what it already had.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+        /// Whether the run judged the work. See [`FailureClass`].
+        #[serde(default)]
+        class: FailureClass,
+    },
 }
 
 /// Hard cap on the notes carried by [`ScoutEvent::Checkpoint`] and
@@ -174,7 +299,13 @@ pub enum BuildEvent {
     },
     /// Terminal failure. An empty branch (`head == base`) lands here — the
     /// Builder analogue of a Scout's missing SPEC.md.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+        /// Whether the run judged the work. The host reads this field and
+        /// never `reason`. See [`FailureClass`].
+        #[serde(default)]
+        class: FailureClass,
+    },
 }
 
 /// Hard cap on the base64-encoded bundle carried in [`BuildEvent::Completed`].
@@ -282,11 +413,111 @@ mod tests {
             reason: "agent exited 1 with an unfinished SPEC.md".into(),
             notes_markdown: "# Notes".into(),
             files_touched: vec!["src/lib.rs".into()],
+            class: FailureClass::Transport,
         });
         let json = serde_json::to_string(&stopped).unwrap();
         assert!(json.contains("\"kind\":\"stopped_early\""));
         assert!(!json.contains("spec_markdown"));
         assert_eq!(serde_json::from_str::<TaskEvent>(&json).unwrap(), stopped);
+    }
+
+    /// Skew in the direction that happens every time a supervisor change is
+    /// made: the image still runs the *old* binary, which knows nothing about
+    /// `class`. The field defaults, and the default is what the host did
+    /// before the field existed — charge the attempt.
+    #[test]
+    fn an_older_supervisor_omitting_the_class_still_reads_as_a_verdict() {
+        let old_failed = r#"{"role":"scout","kind":"failed","reason":"SPEC.md not found"}"#;
+        assert_eq!(
+            serde_json::from_str::<TaskEvent>(old_failed).unwrap(),
+            TaskEvent::Scout(ScoutEvent::Failed {
+                reason: "SPEC.md not found".into(),
+                class: FailureClass::Verdict,
+            })
+        );
+
+        let old_stopped = r##"{"role":"scout","kind":"stopped_early","reason":"no spec",
+                              "notes_markdown":"# Notes","files_touched":[]}"##;
+        assert!(matches!(
+            serde_json::from_str::<TaskEvent>(old_stopped).unwrap(),
+            TaskEvent::Scout(ScoutEvent::StoppedEarly {
+                class: FailureClass::Verdict,
+                ..
+            })
+        ));
+
+        let old_build = r#"{"role":"build","kind":"failed","reason":"agent produced no commits"}"#;
+        assert_eq!(
+            serde_json::from_str::<TaskEvent>(old_build).unwrap(),
+            TaskEvent::Build(BuildEvent::Failed {
+                reason: "agent produced no commits".into(),
+                class: FailureClass::Verdict,
+            })
+        );
+    }
+
+    /// The other direction, and the one that has to be hand-written: a
+    /// *newer* supervisor naming a class this binary has never heard of. The
+    /// event must still decode — a lost terminal event does not cost a
+    /// strike, it costs the run its outcome and hangs it until the deadline —
+    /// and it must decay to `Verdict`, never to a silent waive.
+    #[test]
+    fn an_unknown_class_decays_to_a_verdict_rather_than_failing_the_event() {
+        for raw in [
+            r#""quantum_flux""#,
+            r#""VERDICT""#,
+            r#""""#,
+            "17",
+            "null",
+            "true",
+        ] {
+            let json =
+                format!(r#"{{"role":"scout","kind":"failed","reason":"whatever","class":{raw}}}"#);
+            assert_eq!(
+                serde_json::from_str::<TaskEvent>(&json).unwrap(),
+                TaskEvent::Scout(ScoutEvent::Failed {
+                    reason: "whatever".into(),
+                    class: FailureClass::Verdict,
+                }),
+                "class: {raw}"
+            );
+        }
+
+        // And the classes that *are* known still round-trip by name.
+        for class in [
+            FailureClass::Verdict,
+            FailureClass::Transport,
+            FailureClass::Cancelled,
+            FailureClass::Orphaned,
+        ] {
+            let evt = TaskEvent::Build(BuildEvent::Failed {
+                reason: "r".into(),
+                class,
+            });
+            let json = serde_json::to_string(&evt).unwrap();
+            assert!(
+                json.contains(&format!("\"class\":\"{}\"", class.as_str())),
+                "{json}"
+            );
+            assert_eq!(serde_json::from_str::<TaskEvent>(&json).unwrap(), evt);
+        }
+    }
+
+    /// Only a verdict is charged, and every waiver says why in words a note
+    /// can carry.
+    #[test]
+    fn only_a_verdict_is_charged() {
+        assert!(FailureClass::Verdict.is_verdict());
+        assert_eq!(FailureClass::Verdict.waiver_reason(), None);
+        for class in [
+            FailureClass::Transport,
+            FailureClass::Cancelled,
+            FailureClass::Orphaned,
+        ] {
+            assert!(!class.is_verdict(), "{class}");
+            assert!(class.waiver_reason().is_some(), "{class}");
+        }
+        assert_eq!(FailureClass::default(), FailureClass::Verdict);
     }
 
     #[test]
@@ -329,6 +560,7 @@ mod tests {
         let wrapped: VmEvent<TasksProtocol> = VmEvent::App {
             payload: TaskEvent::Scout(ScoutEvent::Failed {
                 reason: "clone timed out".into(),
+                class: FailureClass::Verdict,
             }),
         };
         let json = serde_json::to_string(&wrapped).unwrap();

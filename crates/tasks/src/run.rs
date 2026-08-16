@@ -74,7 +74,7 @@ use crate::protocol::TasksProtocol;
 use crate::reattach;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
-use crate::store::{ResumedWork, Store, StoreError};
+use crate::store::{ResumedWork, Store, StoreError, Strike};
 
 pub const DEFAULT_PORT: u16 = 4800;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
@@ -1932,24 +1932,6 @@ async fn record_outcome(
         return Ok(ConnectionLost(true));
     }
 
-    // A run that could not be picked up after a restart is the restart's
-    // fault, not the task's. Reconciliation never charged a strike for
-    // orphaning either, and charging one here would mean three restarts could
-    // reject a task nobody has anything against.
-    if let ScoutError::NotResumable(reason) = &error {
-        warn!(task_id = %task_id, reason, "a scout could not be resumed");
-        store
-            .append_event(EventPayload::Note {
-                source: DISPATCHER.into(),
-                message: format!(
-                    "the scout for {task_id} could not be resumed after a restart \
-                     ({reason}); the task is back in the queue and keeps its attempts"
-                ),
-            })
-            .await?;
-        return Ok(ConnectionLost(false));
-    }
-
     // A cancel is a decision, not a failure. It costs the task no attempt (the
     // run was stopped before it could show whether it would have worked) and
     // the task is already back in the backlog, put there by
@@ -1972,11 +1954,40 @@ async fn record_outcome(
         return Ok(ConnectionLost(false));
     }
 
+    // The one decision point: only a run that judged the work costs the task
+    // an attempt. Read off the class the supervisor stamped on its terminal
+    // event, never off the reason text — a reason is prose written for a
+    // human, and a strike decision that greps it would change meaning the next
+    // time someone improves a sentence. #825 burned five scout attempts in one
+    // night without a single verdict among them.
+    let class = error.failure_class();
+    if Strike::for_class(class) == Strike::Waive {
+        let waiver = class
+            .waiver_reason()
+            .expect("a waived strike has a reason to waive it");
+        let attempts = store
+            .get_task(task_id)
+            .await?
+            .map(|t| t.dispatch_attempts)
+            .unwrap_or_default();
+        warn!(task_id = %task_id, %class, error = %error, "a scout failed without judging the work");
+        store
+            .append_event(EventPayload::Note {
+                source: DISPATCHER.into(),
+                message: format!(
+                    "the scout for {task_id} failed as {class}, so the task keeps its \
+                     {attempts} attempt(s): {waiver} ({error})"
+                ),
+            })
+            .await?;
+        return Ok(ConnectionLost(false));
+    }
+
     // Read off the error variant alone, never off the notes table: a task can
     // carry salvage from an *earlier* attempt, and the event log must not
     // credit this run for it.
     let outcome = match &error {
-        ScoutError::StoppedEarly(_) => "stopped early (notes salvaged)",
+        ScoutError::StoppedEarly { .. } => "stopped early (notes salvaged)",
         _ => "failed",
     };
 

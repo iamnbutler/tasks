@@ -115,7 +115,28 @@ pub async fn write_supervisor_wrapper(
     agent_cmd: &str,
     workdir_root: &Path,
 ) -> PathBuf {
+    write_supervisor_wrapper_with_env(dir, supervisor_bin, agent_cmd, workdir_root, &[]).await
+}
+
+/// [`write_supervisor_wrapper`], plus environment the supervisor reads
+/// *inside* the VM.
+///
+/// `SCOUT_MAX_RESUMES` and friends are read by the supervisor process, not by
+/// the host, so a host-side test has no other seam to set them through — and
+/// leaving the default in place means a test whose agent always dies of a
+/// dropped connection pays the full resume backoff on every dispatch.
+pub async fn write_supervisor_wrapper_with_env(
+    dir: &Path,
+    supervisor_bin: &Path,
+    agent_cmd: &str,
+    workdir_root: &Path,
+    extra_env: &[(&str, &str)],
+) -> PathBuf {
     let wrapper = dir.join("supervisor-wrapper.sh");
+    let exports: String = extra_env
+        .iter()
+        .map(|(k, v)| format!("export {k}={}\n", shell_escape(v)))
+        .collect();
     // The 1s checkpoint interval (30s in the image) lets a test watch NOTES.md
     // reach the host without sleeping through a real interval. Harmless for
     // the agents that never write notes: no file, no event.
@@ -124,6 +145,7 @@ pub async fn write_supervisor_wrapper(
          export SCOUT_AGENT_CMD={agent}\n\
          export SCOUT_WORKDIR_ROOT={root}\n\
          export SCOUT_CHECKPOINT_INTERVAL_SECS=1\n\
+         {exports}\
          exec {bin}\n",
         agent = shell_escape(agent_cmd),
         root = shell_escape(&workdir_root.display().to_string()),
@@ -244,6 +266,24 @@ pub fn gated_builder_agent_path() -> PathBuf {
         .join("gated-builder-agent.sh")
 }
 
+/// A stand-in scout agent whose API connection dies on every attempt (#845),
+/// leaving notes behind. Stateless on purpose — see the fixture's own comment.
+pub fn api_death_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("api-death-agent.sh")
+}
+
+/// [`api_death_agent_path`] for builds: dies the same way, having committed
+/// nothing.
+pub fn api_death_builder_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("api-death-builder-agent.sh")
+}
+
 /// A stand-in agent that echoes a credentialed clone URL on stdout, inside a
 /// stream-json record, and on stderr — the leak #840 closed.
 pub fn credential_echo_agent_path() -> PathBuf {
@@ -332,11 +372,30 @@ pub async fn write_builder_supervisor_wrapper(
     agent_cmd: &str,
     workdir_root: &Path,
 ) -> PathBuf {
+    write_builder_supervisor_wrapper_with_env(dir, supervisor_bin, agent_cmd, workdir_root, &[])
+        .await
+}
+
+/// [`write_builder_supervisor_wrapper`], plus in-VM environment — the builder
+/// twin of [`write_supervisor_wrapper_with_env`], and needed for the same
+/// reason: `BUILDER_MAX_RESUMES` is read inside the VM.
+pub async fn write_builder_supervisor_wrapper_with_env(
+    dir: &Path,
+    supervisor_bin: &Path,
+    agent_cmd: &str,
+    workdir_root: &Path,
+    extra_env: &[(&str, &str)],
+) -> PathBuf {
     let wrapper = dir.join("builder-supervisor-wrapper.sh");
+    let exports: String = extra_env
+        .iter()
+        .map(|(k, v)| format!("export {k}={}\n", shell_escape(v)))
+        .collect();
     let script = format!(
         "#!/bin/sh\n\
          export BUILDER_AGENT_CMD={agent}\n\
          export BUILDER_WORKDIR_ROOT={root}\n\
+         {exports}\
          exec {bin}\n",
         agent = shell_escape(agent_cmd),
         root = shell_escape(&workdir_root.display().to_string()),

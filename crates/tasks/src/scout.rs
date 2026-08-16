@@ -30,7 +30,9 @@ use crate::models::{
     Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
     TranscriptStream,
 };
-use crate::protocol::{LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol};
+use crate::protocol::{
+    FailureClass, LogStream, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
+};
 use crate::reattach::{AppEvents, Origin};
 use crate::store::{CancelRequest, Store, StoreError};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
@@ -41,23 +43,27 @@ pub enum ScoutError {
     Store(#[from] StoreError),
     #[error("vm-pool client: {0}")]
     Client(#[from] ClientError),
-    #[error("scout failed: {0}")]
-    ScoutFailed(String),
+    /// The supervisor reported a terminal failure with nothing to salvage.
+    /// `class` is *its* answer to whether the run judged the work, carried on
+    /// the event itself — see [`FailureClass`].
+    #[error("scout failed: {reason}")]
+    ScoutFailed { reason: String, class: FailureClass },
     /// The session could not be picked up after a restart: no VM recorded, the
     /// pool no longer has it, and nothing terminal in the replay. The run is
     /// lost, but — see [`crate::run::record_outcome`] — it is *not* the task's
     /// fault, so it must not burn a dispatch attempt. Reconciliation never
     /// charged one either; three restarts would otherwise reject a perfectly
-    /// good task.
+    /// good task. Classified [`FailureClass::Orphaned`], which is the same
+    /// question one level up.
     #[error("scout could not be resumed: {0}")]
     NotResumable(String),
     /// The run ended without a spec but left notes behind. Still an error —
-    /// so [`crate::run::record_outcome`] ticks the attempt count and a scout
-    /// that dies at the same point every time cannot retry forever — but a
-    /// distinguishable one, because the salvage changes what the next attempt
-    /// is given.
-    #[error("scout stopped early: {0}")]
-    StoppedEarly(String),
+    /// so [`crate::run::record_outcome`] ticks the attempt count when the run
+    /// was a verdict, and a scout that dies at the same point every time
+    /// cannot retry forever — but a distinguishable one, because the salvage
+    /// changes what the next attempt is given.
+    #[error("scout stopped early: {reason}")]
+    StoppedEarly { reason: String, class: FailureClass },
     /// Somebody stopped the run on purpose. Carries the whole request, because
     /// what makes a cancel legible afterwards is the actor and the rationale —
     /// [`crate::run::record_outcome`] therefore charges no dispatch attempt,
@@ -71,6 +77,29 @@ pub enum ScoutError {
     /// `timed out` — including the one where the run was salvaged.
     #[error("scout timed out after {secs}s")]
     Timeout { secs: u64 },
+}
+
+impl ScoutError {
+    /// Whether this failure judged the work — the one decision point this
+    /// dispatcher has, read by [`crate::run::record_outcome`].
+    ///
+    /// Everything not named here is a [`FailureClass::Verdict`], and two of
+    /// those are deliberate. A `Timeout` had the entire wall-clock budget and
+    /// still produced nothing, which is as much of a verdict as an agent that
+    /// concluded empty-handed. And a `Store` or `Client` failure that reaches
+    /// here is not a disconnect — `crate::run::is_disconnect` answers that
+    /// separately and earlier, because it also decides whether to drop the
+    /// vm-pool client, which this question does not.
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            Self::ScoutFailed { class, .. } | Self::StoppedEarly { class, .. } => *class,
+            Self::NotResumable(_) => FailureClass::Orphaned,
+            Self::Cancelled(_) => FailureClass::Cancelled,
+            Self::Store(_) | Self::Client(_) | Self::StreamClosed | Self::Timeout { .. } => {
+                FailureClass::Verdict
+            }
+        }
+    }
 }
 
 /// How this dispatcher boots a Scout VM. Uniform across dispatches — anything
@@ -465,6 +494,7 @@ impl Scout {
                 reason,
                 notes_markdown,
                 files_touched,
+                class,
             }) => {
                 self.finalize_stopped_early(
                     session_id,
@@ -475,7 +505,7 @@ impl Scout {
                     files_touched,
                 )
                 .await?;
-                Err(ScoutError::StoppedEarly(reason))
+                Err(ScoutError::StoppedEarly { reason, class })
             }
             // A deliberate stop, and therefore neither a failure nor a run
             // that ended on its own terms: its own terminal path, so nothing
@@ -838,6 +868,10 @@ enum DrainOutcome {
         reason: String,
         notes_markdown: String,
         files_touched: Vec<String>,
+        /// The supervisor's own answer to whether the run judged the work.
+        /// Carried through the drain rather than re-derived, because this is
+        /// the only place it is known.
+        class: FailureClass,
     },
 }
 
@@ -1027,15 +1061,17 @@ async fn drain_scout_events(
                     reason,
                     notes_markdown,
                     files_touched,
+                    class,
                 } => {
                     return Ok(DrainOutcome::StoppedEarly {
                         reason,
                         notes_markdown,
                         files_touched,
+                        class,
                     });
                 }
-                ScoutEvent::Failed { reason } => {
-                    return Err(ScoutError::ScoutFailed(reason));
+                ScoutEvent::Failed { reason, class } => {
+                    return Err(ScoutError::ScoutFailed { reason, class });
                 }
             },
             // A Builder VM's traffic on the same connection. Not ours.

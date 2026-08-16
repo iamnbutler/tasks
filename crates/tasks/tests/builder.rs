@@ -37,8 +37,9 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    history_rewriting_builder_agent_path, make_fixture_repo, silent_builder_agent_path,
-    spawn_vm_pool, stub_builder_agent_path, workspace_bin, write_builder_supervisor_wrapper,
+    api_death_builder_agent_path, history_rewriting_builder_agent_path, make_fixture_repo,
+    silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path, workspace_bin,
+    write_builder_supervisor_wrapper_with_env,
 };
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -152,10 +153,22 @@ struct Harness {
 }
 
 async fn harness(agent_cmd: &str) -> Harness {
+    harness_with_env(agent_cmd, &[]).await
+}
+
+/// [`harness`], plus environment the builder-supervisor reads *inside* the VM
+/// (`BUILDER_MAX_RESUMES` has no other seam from out here).
+async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let supervisor_bin = workspace_bin("builder-supervisor").await;
-    let wrapper =
-        write_builder_supervisor_wrapper(tmp.path(), &supervisor_bin, agent_cmd, tmp.path()).await;
+    let wrapper = write_builder_supervisor_wrapper_with_env(
+        tmp.path(),
+        &supervisor_bin,
+        agent_cmd,
+        tmp.path(),
+        supervisor_env,
+    )
+    .await;
     let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
     let client = Client::<TasksProtocol>::connect(&socket).await.unwrap();
 
@@ -323,6 +336,15 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
 
     let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
     assert!(format!("{err}").contains("no commits"), "{err}");
+    // An agent that ran to completion and committed nothing judged the specs,
+    // and burns one of their three. Waiving this would be switching the cap
+    // off — see `a_transport_death_costs_the_batch_no_build_attempt` for the
+    // case that is waived.
+    assert_eq!(
+        err.failure_class(),
+        tasks::protocol::FailureClass::Verdict,
+        "{err:?}"
+    );
 
     let after = h.store.get_build(&build.id).await.unwrap().unwrap();
     assert_eq!(after.status, BuildStatus::Failed);
@@ -370,6 +392,82 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
     assert_eq!(
         h.store.claim_next_queued_build().await.unwrap().unwrap().id,
         again.id
+    );
+}
+
+/// #884 for Diamond 2: a build whose agent lost its API connection commits
+/// nothing and fails — but it never judged the specs, so it spends none of
+/// their three attempts.
+///
+/// Four consecutive deaths, one past the cap. Before this the batch would have
+/// been `blocked` after the third, having learned nothing about whether the
+/// work can be built.
+#[tokio::test]
+async fn a_transport_death_costs_the_batch_no_build_attempt() {
+    // Resuming off: the supervisor's own retry loop is #845's and is tested
+    // there. What is under test here is the host's accounting.
+    let h = harness_with_env(
+        api_death_builder_agent_path().to_str().unwrap(),
+        &[("BUILDER_MAX_RESUMES", "0")],
+    )
+    .await;
+    let (task, spec) = seed_approved(&h.store, &h.project, 7, "The network, not the spec").await;
+
+    for attempt in 1..=4 {
+        h.store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("attempt {attempt} could not be queued: {e}"));
+        let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+        let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+
+        // The symptom is still the symptom — the class is what the host reads.
+        assert!(format!("{err}").contains("no commits"), "{err}");
+        assert_eq!(
+            err.failure_class(),
+            tasks::protocol::FailureClass::Transport,
+            "attempt {attempt}: {err:?}"
+        );
+        assert_eq!(
+            h.store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Approved,
+            "attempt {attempt}: the spec is still buildable"
+        );
+    }
+
+    assert_eq!(
+        h.store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::ReadyToBuild
+    );
+    // An unspent strike has to be legible, or it is indistinguishable from a
+    // cap that has been switched off.
+    let notes: Vec<String> = h
+        .store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            tasks::events::EventPayload::Note { source, message } if source == "dispatcher" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|m| m.contains("failed as transport") && m.contains("keep their build attempts")),
+        "the waiver has to be on the log: {notes:?}"
     );
 }
 

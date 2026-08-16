@@ -33,7 +33,7 @@ use tasks::models::{
     SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
-use tasks::store::{SpecStrike, Store};
+use tasks::store::{Store, Strike};
 use tasks_protocol::TasksProtocol;
 use vm_pool_client::Client;
 
@@ -772,7 +772,7 @@ async fn three_cancelled_builds_do_not_block_a_spec() {
     store.claim_next_queued_build().await.unwrap().unwrap();
     store.set_build_vm(&build.id, "vm-allocated").await.unwrap();
     store
-        .finalize_build_failed_with(&build.id, "the agent died", SpecStrike::Charge)
+        .finalize_build_failed_with(&build.id, "the agent died", Strike::Charge)
         .await
         .unwrap();
     assert_eq!(

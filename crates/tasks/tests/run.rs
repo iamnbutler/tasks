@@ -31,8 +31,8 @@ use tasks::store::Store;
 
 mod common;
 use common::{
-    make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until, workspace_bin,
-    write_supervisor_wrapper,
+    api_death_agent_path, make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until,
+    workspace_bin, write_supervisor_wrapper_with_env,
 };
 
 // --- GitHub poll loop ---
@@ -720,6 +720,21 @@ async fn dispatch_harness_with_agent(
     Config,
     Arc<Service<SupervisorRuntime, TasksProtocol>>,
 ) {
+    dispatch_harness_with_agent_env(max_concurrent, agent_cmd, &[]).await
+}
+
+/// [`dispatch_harness_with_agent`], plus environment for the supervisor
+/// *inside* the VM — `SCOUT_MAX_RESUMES` has no other seam from out here.
+async fn dispatch_harness_with_agent_env(
+    max_concurrent: usize,
+    agent_cmd: &str,
+    supervisor_env: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    Arc<Store>,
+    Config,
+    Arc<Service<SupervisorRuntime, TasksProtocol>>,
+) {
     let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let clone_root = tmp.path().join("repos");
@@ -727,8 +742,14 @@ async fn dispatch_harness_with_agent(
 
     let workdir_root = tmp.path().join("scout-workdirs");
     tokio::fs::create_dir_all(&workdir_root).await.unwrap();
-    let wrapper =
-        write_supervisor_wrapper(tmp.path(), &supervisor_bin, agent_cmd, &workdir_root).await;
+    let wrapper = write_supervisor_wrapper_with_env(
+        tmp.path(),
+        &supervisor_bin,
+        agent_cmd,
+        &workdir_root,
+        supervisor_env,
+    )
+    .await;
     let (service, socket) = spawn_vm_pool(tmp.path(), &wrapper, max_concurrent.max(1)).await;
 
     let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
@@ -934,8 +955,13 @@ async fn wait_for_state(store: &Arc<Store>, task_id: &TaskId, state: TaskState) 
 
 /// A task whose scout can never succeed gets three tries and is then rejected,
 /// with the count on the row so a later process can't hand it three more.
+///
+/// This is also #884's negative case: an agent that ran to completion and
+/// produced nothing usable *is* a verdict on the work, and still burns its
+/// three. Without this the classification would be indistinguishable from
+/// having switched the cap off.
 #[tokio::test]
-async fn three_failed_dispatches_reject_the_task() {
+async fn an_agent_that_concluded_with_nothing_still_burns_its_three() {
     let (_tmp, store, config, _service) = dispatch_harness_with_agent(1, "true").await;
     let project = insert_project(&store).await;
     let task = insert_task(&store, &project, 1, "no spec, ever").await;
@@ -996,6 +1022,94 @@ async fn three_failed_dispatches_reject_the_task() {
                 if source == "dispatcher" && message.contains("rejecting")
         )),
         "with a breadcrumb saying why"
+    );
+}
+
+/// #884, the other half of the test above: a scout that dies of something
+/// unrelated to the work is charged nothing, however often it happens.
+///
+/// The agent's API connection drops on every attempt (#845), so the task never
+/// gets a verdict — and three of those used to reject it having learned
+/// nothing. Here it stays queued past the cap, its attempt count untouched,
+/// with the waiver on the event log so an unspent strike is not silently
+/// indistinguishable from a cap that has been switched off.
+#[tokio::test]
+async fn an_infrastructure_death_never_rejects_the_task() {
+    // Resuming off: the supervisor's own retry loop is #845's fix and is
+    // tested there. What is under test here is the host's accounting, and the
+    // rising backoff would otherwise be paid on every dispatch.
+    let (_tmp, store, config, _service) = dispatch_harness_with_agent_env(
+        1,
+        api_death_agent_path().to_str().unwrap(),
+        &[("SCOUT_MAX_RESUMES", "0")],
+    )
+    .await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "the network, not the task").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        shutdown_rx,
+    ));
+
+    // Four dispatches: one more than the cap that would have rejected it.
+    let s = store.clone();
+    wait_until(Duration::from_secs(180), || {
+        let s = s.clone();
+        async move { dispatch_order(&s).await.len() >= 4 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.dispatch_attempts, 0,
+        "an infrastructure death is not the task's fault"
+    );
+    assert_ne!(
+        stored.state,
+        TaskState::Rejected,
+        "the task is still work worth doing"
+    );
+
+    // Salvage still travels: a transport death is worth the next attempt's
+    // while, which is the whole reason not to charge for it.
+    let sessions = store.list_sessions().await.unwrap();
+    assert!(
+        sessions
+            .iter()
+            .all(|s| s.status == SessionStatus::ScoutStoppedEarly),
+        "sessions: {sessions:?}"
+    );
+
+    let notes: Vec<String> = store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EventPayload::Note { source, message } if source == "dispatcher" => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|m| m.contains("failed as transport") && m.contains("keeps its")),
+        "the waiver has to be legible on the log: {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|m| m.contains("rejecting")),
+        "nothing was rejected: {notes:?}"
     );
 }
 

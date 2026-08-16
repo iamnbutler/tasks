@@ -31,12 +31,15 @@ use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::cancel::Bounded;
+use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient};
 use crate::models::{Build, Project, RunKind, Spec, Task, TranscriptOwner, TranscriptStream};
-use crate::protocol::{BuildCommand, BuildEvent, TaskCommand, TaskEvent, TasksProtocol};
+use crate::protocol::{
+    BuildCommand, BuildEvent, FailureClass, TaskCommand, TaskEvent, TasksProtocol,
+};
 use crate::reattach::AppEvents;
 use crate::redact::{redact, redact_line};
-use crate::store::{CancelRequest, SpecStrike, Store, StoreError};
+use crate::store::{CancelRequest, Store, StoreError, Strike};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
 #[derive(Debug, Error)]
@@ -47,8 +50,11 @@ pub enum BuilderError {
     Client(#[from] ClientError),
     #[error("github: {0}")]
     GitHub(#[from] GhError),
-    #[error("build failed: {0}")]
-    BuildFailed(String),
+    /// The supervisor reported a terminal failure. `class` is *its* answer to
+    /// whether the run judged the work, carried on the event itself — see
+    /// [`FailureClass`].
+    #[error("build failed: {reason}")]
+    BuildFailed { reason: String, class: FailureClass },
     /// The build could not be picked up after a restart: no VM recorded, the
     /// pool no longer has it, and nothing terminal in the replay. The batch's
     /// specs stay approved and the queue is left claimable, exactly as
@@ -67,6 +73,39 @@ pub enum BuilderError {
     /// [`Store::finalize_build_cancelled`] writes them into `exit_reason`.
     #[error("build cancelled by {}", .0.actor.as_str())]
     Cancelled(CancelRequest),
+}
+
+impl BuilderError {
+    /// Whether this failure judged the work — the one decision point this
+    /// dispatcher has, read by [`Builder::conclude`].
+    ///
+    /// `Egress` is `Transport`: it happens *after* an implementation exists,
+    /// so nothing about it judged the work. Surfacing and charging are
+    /// separable — the waive path appends a `Note` naming the class and the
+    /// underlying error, so the failure stays exactly as visible, and what
+    /// charging would add is only the strike. `Timeout` is charged for the
+    /// reason a scout's is: the run had the entire budget.
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            Self::BuildFailed { class, .. } => *class,
+            Self::NotResumable(_) => FailureClass::Orphaned,
+            Self::Cancelled(_) => FailureClass::Cancelled,
+            // Egress is transport in the most literal sense: the agent ran to
+            // completion, an implementation exists, and the push is what
+            // failed. Nothing judged the work. Waiving the strike does not
+            // hide the failure — the waive path appends a `Note` naming the
+            // class and the underlying error, and since #891 the bundle is
+            // preserved with the `git fetch` that recovers it. #873 is the
+            // case: 102 turns, exit 0, rejected by `bundle tip … does not
+            // match the reported head …`, and charged for it.
+            Self::Egress(_) => FailureClass::Transport,
+            Self::Store(_)
+            | Self::Client(_)
+            | Self::GitHub(_)
+            | Self::StreamClosed
+            | Self::Timeout { .. } => FailureClass::Verdict,
+        }
+    }
 }
 
 /// How this dispatcher boots a Builder VM.
@@ -148,19 +187,51 @@ impl Builder {
             Err(e) => {
                 let reason = redact(&format!("{e}"));
                 warn!(build_id = %build.id, reason, "build failed");
-                // A build nobody could pick up after a restart says nothing
-                // about its specs, so it must not spend one of their attempts
-                // — three restarts would otherwise `blocked` a batch that has
-                // never actually failed to build.
-                let strike = match e {
-                    BuilderError::NotResumable(_) => SpecStrike::Waive,
-                    _ => SpecStrike::Charge,
-                };
+                // A failure that says nothing about the specs must not spend
+                // one of their attempts — a dropped API connection, or a build
+                // nobody could pick up after a restart. Three of those would
+                // otherwise `blocked` a batch that has never actually failed
+                // to build. One decision point, off the class the supervisor
+                // stamped and never off `reason`.
+                let class = e.failure_class();
+                let strike = Strike::for_class(class);
+                if let Some(waiver) = class.waiver_reason() {
+                    self.note_waived_strike(build, class, waiver, &reason).await;
+                }
                 self.store
                     .finalize_build_failed_with(&build.id, &reason, strike)
                     .await?;
                 Err(e)
             }
+        }
+    }
+
+    /// Say, on the event log, that a failure cost the batch nothing.
+    ///
+    /// Without this the waiver is invisible: the build row reads `failed` and
+    /// the specs' `build_attempts` simply do not move, which is
+    /// indistinguishable from the cap having been switched off. Best-effort —
+    /// a breadcrumb must never cost the finalization that follows it.
+    async fn note_waived_strike(
+        &self,
+        build: &Build,
+        class: FailureClass,
+        waiver: &str,
+        reason: &str,
+    ) {
+        if let Err(e) = self
+            .store
+            .append_event(EventPayload::Note {
+                source: crate::run::DISPATCHER.into(),
+                message: format!(
+                    "build {} failed as {class}, so its specs keep their build attempts: \
+                     {waiver} ({reason})",
+                    build.id
+                ),
+            })
+            .await
+        {
+            warn!(build_id = %build.id, error = %e, "recording a waived build strike failed");
         }
     }
 
@@ -390,7 +461,10 @@ impl Builder {
             batch.push((spec, task));
         }
         if batch.is_empty() {
-            return Err(BuilderError::BuildFailed("build has no specs".into()));
+            return Err(BuilderError::BuildFailed {
+                reason: "build has no specs".into(),
+                class: FailureClass::Verdict,
+            });
         }
         Ok(batch)
     }
@@ -450,8 +524,8 @@ impl Builder {
                             files_touched,
                         });
                     }
-                    BuildEvent::Failed { reason } => {
-                        return Err(BuilderError::BuildFailed(reason));
+                    BuildEvent::Failed { reason, class } => {
+                        return Err(BuilderError::BuildFailed { reason, class });
                     }
                 },
                 // A Scout VM's traffic on the same connection. Not ours.
@@ -921,6 +995,35 @@ mod tests {
                 updated_at: Utc::now(),
             },
         )
+    }
+
+    #[test]
+    fn a_failed_egress_is_transport_and_a_concluded_build_is_a_verdict() {
+        // #873 ran 102 turns, exited 0, and was rejected by the tip check.
+        // Nothing judged that implementation, so it must not spend a strike;
+        // the negative half is what keeps this from reading as "cap off".
+        assert_eq!(
+            BuilderError::Egress("bundle tip does not match".into()).failure_class(),
+            FailureClass::Transport,
+        );
+        assert!(
+            !BuilderError::Egress("x".into())
+                .failure_class()
+                .is_verdict()
+        );
+
+        assert_eq!(
+            BuilderError::BuildFailed {
+                reason: "agent produced no commits".into(),
+                class: FailureClass::Verdict,
+            }
+            .failure_class(),
+            FailureClass::Verdict,
+        );
+        assert_eq!(
+            BuilderError::Timeout { secs: 1 }.failure_class(),
+            FailureClass::Verdict,
+        );
     }
 
     #[test]

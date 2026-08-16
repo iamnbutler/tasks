@@ -175,9 +175,34 @@ implementation.
   it in the conversation, and re-sending it is how a resume silently becomes a
   restart. A transport death also names itself in the terminal reason; "SPEC.md
   not found" or "no commits" alone reads as a verdict on work that was never
-  judged. `dispatch_attempts` is still charged for one — see #845 for the
-  remaining piece, which must key off a classification field on the event, not
-  a string match on the reason text.
+  judged — and it is no longer charged for one either, which is the rule below.
+- **A strike is charged for a verdict, and for nothing else.**
+  `dispatch_attempts` and `build_attempts` exist so that work which genuinely
+  cannot be done stops consuming the pipeline after three tries; a run that died
+  of something unrelated to the work has learned nothing, so charging it
+  identically means three infrastructure deaths reject a good task or `blocked`
+  a good spec (#884, and #825 where five scout attempts burned in one night
+  without a verdict among them). `FailureClass` (`Verdict` | `Transport` |
+  `Cancelled` | `Orphaned`) is stamped by the **supervisor** — the only thing
+  that knows how the agent died, from `AgentEnding::is_transport()` — and read
+  by the host **off the field, never off the reason text**: a reason is prose
+  written for a human, and a decision that greps it changes meaning the next
+  time someone improves a sentence. One decision point per dispatcher
+  (`ScoutError::failure_class` / `BuilderError::failure_class` into
+  `Strike::for_class`), so the restart-orphan exclusion is a *class* rather than
+  a second mechanism beside it. Wire skew runs both ways and only one way is
+  obvious: `#[serde(default)]` covers an older supervisor omitting the field,
+  while a hand-written `Deserialize` decays an *unknown* class to `Verdict`,
+  because a lost terminal event does not cost a strike — it costs the run its
+  outcome and hangs it until the deadline. What stays charged is deliberate and
+  is what the negative tests pin: an agent that ran to completion and produced
+  nothing usable, a `Timeout` that had the entire budget, an OOM kill (a memory
+  limit is a real property of the work in that VM, and #828 exists to make that
+  death legible as itself), and every pre-agent setup failure — a clone against
+  a base branch that is gone fails identically every time, and waiving it would
+  retry forever with nothing to stop it. Every waived strike appends a `Note`
+  naming the class and the unchanged count, because an attempt that was not
+  spent is otherwise indistinguishable from a cap that has been switched off.
 - **A build is whichever tip the reconciliation chooses, and the head is read
   out of the bundle — in that order.** `git rev-parse HEAD` and
   `refs/heads/<branch>` are the same commit only while HEAD stays symbolically
