@@ -184,6 +184,24 @@ Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
 polling, an unreachable vm-pool disables dispatch and reconnects periodically,
 and the API stays up either way.
 
+**A boot does not resume the mode; it takes `TASKS_DEFAULT_MODE` (default
+`pause`) and overwrites the stored one** (`apply_startup_mode`, before the
+listener binds). Starting a server is therefore never the same act as resuming
+dispatch: a crash, a `launchd` `KeepAlive` or an infrastructure problem brings
+the pipeline back quiet, and `pause` rather than `stop` keeps intake and the
+API alive while it is. The one exception is a deliberate upgrade — see below.
+If you want a host to come back dispatching, the honest way to say so is
+`TASKS_DEFAULT_MODE=play` on that host, not re-reading the column. The column
+itself stays: it is still the live mode for the rest of the process's life
+(`GET /mode`, `POST /mode`, and the three loops that read it every tick), it
+has only stopped being consulted at boot — **do not delete it** without first
+moving mode into process memory. Two details are load-bearing and cheap to
+"clean up" by accident: the boot breadcrumb is a `Note` and not `ModeChanged`,
+because `ModeChanged` is nudge-worthy and would spend an orchestrator turn on
+every restart; and the transition happens *before* `server::bind`, so no
+client — and no `reload` verifying a swap — can observe the previous run's
+mode.
+
 ### Upgrading a running server
 
 `tasks reload` (alias `restart`, `crates/tasks/src/reload.rs`) is the upgrade
@@ -196,6 +214,23 @@ for the wait, `--force` swaps anyway); an owed orchestrator turn is reported
 but never blocks, since the obligation loop keeps producing input and the
 answered watermark means a restart mid-turn only costs one turn. Exit codes: 3
 busy, 4 drain timed out, 5 the swap did not land.
+
+**An upgrade is the one path that carries the mode over, and it carries it in
+the child's environment.** `ModeHandover` snapshots the running server's mode
+*before* the drain (the pause `--when-idle` installs is the tool, not the
+intent), passes it to the new process as `TASKS_DEFAULT_MODE` — for the spawned
+and the `--foreground`-exec'd server alike — and then verifies against the new
+pid's `/status` that it came up in it, reporting the `curl` that fixes it if
+not. It is not a `POST /mode` after the boot, for three independent reasons: a
+POST leaves a window in which the new server runs in its configured default
+(with `TASKS_DEFAULT_MODE=play` against a paused old server, that window
+*dispatches*), `--foreground` execs so there is no "later" to restore anything
+in, and the real environment outranks every `.env`. A cold start, and a
+`--force` swap of a server too wedged to answer `/status`, carry nothing —
+unknown resolves to quiet, never to dispatching. `reload` resolves
+`TASKS_DEFAULT_MODE` as step **0**, before the build: an unusable value is a
+hard `serve` startup error, and discovering that after the SIGTERM turns a typo
+into an outage.
 
 Nothing in `reload` opens the store — `Store::open` runs migrations, so a
 supervisor that opened the database would apply the new schema before the new
@@ -318,6 +353,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | --- | --- | --- |
 | `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
 | `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
+| `TASKS_DEFAULT_MODE` | `pause` | the mode **every** boot starts in, overwriting whatever the last process left in the store — `play`, `pause` or `stop`, and an unparseable value refuses to boot rather than being ignored. Only `tasks reload` overrides it, by passing the old server's mode to the new one |
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |

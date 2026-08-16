@@ -8,6 +8,13 @@
 //! `Child::try_wait`: these children are not reaped promptly (the test is
 //! blocked inside `reload`), so "has it exited" and "has it been reaped"
 //! differ, and the reap races with tokio's SIGCHLD handling.
+//!
+//! Two environment variables are scrubbed from every child. `TASKS_DEFAULT_MODE`
+//! decides what a boot comes up in, and an ambient one would silently decide
+//! the result of every test here. `ORCHESTRATOR_CMD` is pointed at a stub: the
+//! default is `claude`, so on any machine that has it installed the mode flips
+//! below started a live agent turn that the shutdown then waited out — which
+//! is minutes of wall clock spent on nothing, in a suite about restarts.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -60,6 +67,22 @@ async fn free_port() -> u16 {
     port
 }
 
+/// An orchestrator that costs nothing: a shell script that reads its prompt
+/// and answers. Without it, `ORCHESTRATOR_CMD` defaults to `claude` and every
+/// nudge-worthy event in this file spawns a real agent turn.
+fn stub_orchestrator(data_dir: &Path) -> PathBuf {
+    let stub = data_dir.join("stub-orchestrator.sh");
+    if !stub.exists() {
+        std::fs::write(&stub, "#!/bin/sh\ncat > /dev/null\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    stub
+}
+
 /// `tasks serve`, wired to nothing external: no GitHub token (polling off) and
 /// a vm-pool socket that does not exist (dispatch off, API up).
 fn serve_command(data_dir: &Path, port: u16) -> Command {
@@ -72,7 +95,9 @@ fn serve_command(data_dir: &Path, port: u16) -> Command {
     cmd.args(["serve", "--port", &port.to_string()])
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
+        .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
         .env_remove("GITHUB_TOKEN")
+        .env_remove("TASKS_DEFAULT_MODE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
@@ -125,15 +150,28 @@ async fn mode(port: u16) -> Mode {
 
 /// Run the CLI against `data_dir` and return (exit code, stdout, stderr).
 async fn cli(data_dir: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(tasks_bin())
-        .args(args)
+    cli_with(data_dir, args, None).await
+}
+
+/// The same, with an explicit `TASKS_DEFAULT_MODE` — which the server `reload`
+/// spawns inherits, exactly as it would from an operator's shell or a `.env`.
+async fn cli_with(
+    data_dir: &Path,
+    args: &[&str],
+    default_mode: Option<&str>,
+) -> (i32, String, String) {
+    let mut cmd = Command::new(tasks_bin());
+    cmd.args(args)
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
+        .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
         .env_remove("GITHUB_TOKEN")
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .unwrap();
+        .stdin(Stdio::null());
+    match default_mode {
+        Some(mode) => cmd.env("TASKS_DEFAULT_MODE", mode),
+        None => cmd.env_remove("TASKS_DEFAULT_MODE"),
+    };
+    let output = cmd.output().await.unwrap();
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -270,8 +308,8 @@ async fn a_scout_in_flight_refuses_the_swap_until_forced() {
 }
 
 /// `--when-idle` pauses dispatch (without which the wait never terminates),
-/// waits for the work to land, swaps, and puts the mode back — after the new
-/// server answers, never before.
+/// waits for the work to land, swaps, and hands the *pre-drain* mode to the
+/// new server — the pause it installed is the tool, not the intent.
 #[tokio::test]
 async fn when_idle_waits_for_the_drain_and_restores_the_mode() {
     let dir = DataDir::new();
@@ -313,6 +351,7 @@ async fn when_idle_waits_for_the_drain_and_restores_the_mode() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("paused dispatch"), "{stdout}");
     assert!(stdout.contains("drained"), "{stdout}");
+    assert!(stdout.contains("mode carried over: play"), "{stdout}");
 
     wait_until_gone(before.pid).await;
     let after = wait_serving(port).await;
@@ -352,6 +391,124 @@ async fn a_drain_that_times_out_restarts_nothing() {
     let still = fetch_status(port).await.unwrap();
     assert_eq!(still.pid, before.pid);
     assert_eq!(still.mode, Mode::Play, "the mode was put back");
+
+    let _ = old.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The rule this file exists to pin down: an *upgrade* resumes the mode, a
+/// cold start takes the default. Here is the cold start — a `play` server is
+/// stopped and a fresh one is started over the same database, and it comes up
+/// paused rather than quietly resuming dispatch on a machine nobody is
+/// watching.
+#[tokio::test]
+async fn a_cold_start_after_a_playing_server_comes_up_paused() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut old, before) = start_server(dir.path(), port).await;
+    assert_eq!(before.mode, Mode::Pause, "the default on a fresh database");
+    set_mode(port, Mode::Play).await;
+    assert_eq!(mode(port).await, Mode::Play);
+
+    cli(dir.path(), &["stop"]).await;
+    wait_until_gone(before.pid).await;
+    let _ = old.start_kill();
+
+    // Not a reload: this is what a crash loop, a `launchd` KeepAlive or a
+    // hand-typed `tasks serve` looks like.
+    let (mut server, after) = start_server(dir.path(), port).await;
+    assert_ne!(after.pid, before.pid);
+    assert_eq!(
+        after.mode,
+        Mode::Pause,
+        "starting a server must not be the same act as resuming dispatch"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// …and `TASKS_DEFAULT_MODE=play` is the honest way to ask a host to come back
+/// dispatching, rather than re-reading the stored column.
+#[tokio::test]
+async fn a_configured_default_mode_is_what_a_boot_takes() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let mut server = serve_command(dir.path(), port)
+        .env("TASKS_DEFAULT_MODE", "play")
+        .spawn()
+        .unwrap();
+    let status = wait_serving(port).await;
+    assert_eq!(status.mode, Mode::Play);
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// An upgrade is the one path that carries the mode: it travels in the child's
+/// environment (so there is no window in which the new server runs in the
+/// default) and is verified against the new pid before `reload` claims it.
+#[tokio::test]
+async fn an_upgrade_carries_the_mode_over() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut old, before) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["reload", "--no-build"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("mode carried over: play"), "{stdout}");
+
+    wait_until_gone(before.pid).await;
+    let after = wait_serving(port).await;
+    assert_ne!(after.pid, before.pid);
+    assert_eq!(after.mode, Mode::Play, "an upgrade resumes the mode");
+
+    let _ = old.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// A mode that already matches the default is not a carry, and `reload` does
+/// not claim one: a carry is an override, and one that agrees with the default
+/// is noise.
+#[tokio::test]
+async fn a_swap_of_a_paused_server_carries_nothing() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut old, before) = start_server(dir.path(), port).await;
+    assert_eq!(before.mode, Mode::Pause);
+
+    let (code, stdout, stderr) = cli(dir.path(), &["reload", "--no-build"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(!stdout.contains("carried over"), "{stdout}");
+
+    wait_until_gone(before.pid).await;
+    assert_eq!(wait_serving(port).await.mode, Mode::Pause);
+
+    let _ = old.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// An unusable `TASKS_DEFAULT_MODE` makes `serve` refuse to boot, so `reload`
+/// resolves it as step 0 — before the build, and long before anything is
+/// signalled. Finding out after the SIGTERM would turn a typo into an outage.
+#[tokio::test]
+async fn an_unusable_default_mode_is_refused_before_anything_is_signalled() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut old, before) = start_server(dir.path(), port).await;
+
+    let (code, stdout, stderr) =
+        cli_with(dir.path(), &["reload", "--no-build"], Some("playing")).await;
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("TASKS_DEFAULT_MODE"), "{stderr}");
+    assert!(stderr.contains("nothing was touched"), "{stderr}");
+    assert!(
+        !stdout.contains("stopping pid"),
+        "the server must not be signalled: {stdout}"
+    );
+    assert!(pidfile::pid_alive(before.pid));
+    assert_eq!(fetch_status(port).await.unwrap().pid, before.pid);
 
     let _ = old.start_kill();
     cli(dir.path(), &["stop"]).await;

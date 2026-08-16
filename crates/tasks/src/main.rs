@@ -36,8 +36,8 @@ usage:
 
 reload flags:
   --when-idle                   wait for in-flight scouts/builds to finish
-                                (pauses dispatch for the wait, restores the
-                                mode once the new server is up)
+                                (pauses dispatch for the wait; the new server
+                                comes up in the mode the old one was in)
   --drain-timeout SECS          how long --when-idle waits (default 3900)
   --force                       swap even with work in flight
   --no-build                    skip the build and swap in this binary
@@ -55,6 +55,9 @@ above the cwd, then the nearest above this binary; the real environment wins):
   TASKS_DATA_DIR         where tasks.db lives (default ~/.local/state/tasks-v2)
   TASKS_SERVER_PORT      default port for `serve`
   TASKS_POLL_INTERVAL    seconds between GitHub polls (default 60)
+  TASKS_DEFAULT_MODE     mode every boot starts in: play/pause/stop (default
+                         pause). The stored mode is never resumed — only
+                         `tasks reload` carries it to the new server
   TASKS_INTAKE_LABEL     ingest only issues carrying this label (default: all)
   SCOUT_MAX_CONCURRENT   scouts running at once (default 2)
   SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)

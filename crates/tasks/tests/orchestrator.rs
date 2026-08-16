@@ -1163,6 +1163,50 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
     nudge_loop.abort();
 }
 
+/// A shutdown that arrives *mid-burst* has to stop the loop.
+///
+/// `watch::Receiver::changed()` marks the value seen when it returns, so the
+/// batch loop's `select!` consumes the shutdown and the outer `changed()` then
+/// waits for a second change that never comes — parking on `events.recv()`
+/// forever. `run()`'s drain awaits this task unbounded, so the whole process
+/// hung until its supervisor's SIGKILL: `tasks stop` took 75s and every
+/// `tasks reload` swap took ~75s. `POST /mode` is nudge-worthy, which made
+/// "pause the pipeline, then restart it" hit it every single time.
+#[tokio::test]
+async fn a_shutdown_mid_burst_stops_the_nudge_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // A debounce long enough that the shutdown lands while the loop is inside
+    // the batch loop, which is the only place it can be swallowed.
+    let nudge_loop = tokio::spawn(orchestrator_nudge_loop(
+        store.clone(),
+        common::offline_config(tmp.path()),
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+        shutdown_rx,
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // One nudge-worthy event opens the burst — a mode flip, the very thing an
+    // operator does just before restarting.
+    store
+        .append_event(EventPayload::ModeChanged {
+            from: tasks::models::Mode::Play,
+            to: tasks::models::Mode::Pause,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), nudge_loop)
+        .await
+        .expect("the nudge loop must return on shutdown, not park on recv()")
+        .unwrap();
+}
+
 /// The interactive-checkout lifecycle over HTTP: no session → 409; with a
 /// session, checkout marks it held (suspending ticks) and release clears it.
 #[tokio::test]

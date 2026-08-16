@@ -639,6 +639,7 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         data_dir: clone_root.to_path_buf(),
         port: 0,
         poll_interval: Duration::from_secs(3600),
+        startup_mode: tasks::run::DEFAULT_STARTUP_MODE,
         scout_max_concurrent: max_concurrent,
         scout_image: "agent:v1".into(),
         scout_timeout: Duration::from_secs(300),

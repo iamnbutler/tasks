@@ -19,6 +19,15 @@
 //! - `Pause` — poll, but start no new scouts.
 //! - `Stop` — neither poll nor dispatch.
 //!
+//! The mode a process *starts* in is configured, not remembered:
+//! [`apply_startup_mode`] overwrites the stored value with
+//! `TASKS_DEFAULT_MODE` (default [`DEFAULT_STARTUP_MODE`]) before the listener
+//! binds. Starting a server is therefore never the same act as resuming
+//! dispatch — a crash, a `launchd` restart or an infrastructure problem brings
+//! the pipeline back quiet. The one exception is a deliberate upgrade:
+//! [`crate::reload`] hands the running server's mode to its replacement
+//! through the child's environment. See [`startup_mode_from_env`].
+//!
 //! Mode gates *new* dispatches only. A scout already in flight runs to
 //! completion or to its deadline: there is no in-band cancel command (see
 //! [`crate::protocol::ScoutCommand`]), so cancelling means deallocating the
@@ -110,6 +119,16 @@ const NUDGE_MAX_WAIT: Duration = Duration::from_secs(30);
 const DEFAULT_SCOUT_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_CLONE_URL_BASE: &str = "https://github.com";
 
+/// The mode every boot starts in when `TASKS_DEFAULT_MODE` says nothing.
+///
+/// `Pause` rather than `Stop`: a server that came back on its own should not
+/// dispatch, but it should still ingest issues and answer the API, so a human
+/// arriving at it sees the current state of the world and one button to press.
+pub const DEFAULT_STARTUP_MODE: Mode = Mode::Pause;
+
+/// `source` on the breadcrumb [`apply_startup_mode`] writes.
+const STARTUP: &str = "startup";
+
 /// How often the dispatch loop re-reads mode + queue.
 const DISPATCH_TICK: Duration = Duration::from_millis(500);
 
@@ -178,6 +197,10 @@ pub struct Config {
     pub port: u16,
     /// Gap between GitHub polls (`TASKS_POLL_INTERVAL`, seconds).
     pub poll_interval: Duration,
+    /// The mode this boot puts the pipeline into (`TASKS_DEFAULT_MODE`),
+    /// overwriting whatever the last process left behind. See
+    /// [`apply_startup_mode`].
+    pub startup_mode: Mode,
     /// Concurrent scout dispatches (`SCOUT_MAX_CONCURRENT`).
     pub scout_max_concurrent: usize,
     /// vm-pool image scouts run in (`SCOUT_IMAGE`).
@@ -243,6 +266,7 @@ impl Config {
                 "a number of seconds",
                 DEFAULT_POLL_INTERVAL_SECS,
             )?),
+            startup_mode: startup_mode_from_env()?,
             scout_max_concurrent: parse_env(
                 "SCOUT_MAX_CONCURRENT",
                 "a positive integer",
@@ -465,6 +489,79 @@ fn parse_env<T: std::str::FromStr>(
     }
 }
 
+/// The mode a boot starts in, out of `TASKS_DEFAULT_MODE`.
+///
+/// Public because [`crate::reload`] resolves the same value from the same
+/// environment, one step *before* it builds: it has to know what the server it
+/// is about to start would come up in, and a typo here must cost nothing while
+/// the old server is still up and unsignalled.
+pub fn startup_mode_from_env() -> Result<Mode, ConfigError> {
+    parse_startup_mode(env_string("TASKS_DEFAULT_MODE").as_deref())
+}
+
+/// The pure half of [`startup_mode_from_env`] — separated so it is testable
+/// without mutating the process environment, which under `cargo test` is
+/// shared by every test in the binary.
+///
+/// An unparseable value is a hard startup error rather than a fallback to the
+/// default. This variable decides whether a machine comes back dispatching, so
+/// "it was silently ignored" is the one outcome that must not be possible.
+fn parse_startup_mode(raw: Option<&str>) -> Result<Mode, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_STARTUP_MODE);
+    };
+    Mode::from_str(raw.trim()).ok_or(ConfigError::Invalid {
+        var: "TASKS_DEFAULT_MODE",
+        expected: "play, pause or stop",
+        value: raw.to_string(),
+    })
+}
+
+/// Put the pipeline into `mode`, whatever the last process left in the store.
+///
+/// Called from [`run`] immediately after the store opens and **before**
+/// [`server::bind`], so no client — and no `tasks reload` verifying a swap —
+/// can ever observe the previous run's mode on this process.
+///
+/// The stored column is deliberately kept rather than deleted: it is still the
+/// live mode for the rest of this process's life (`GET /mode`, `POST /mode`
+/// and the three loops all read it every tick), it has just stopped being
+/// consulted at boot. **Do not delete it** — a field that is written and never
+/// read *at startup* is exactly the kind of thing a later cleanup removes
+/// without noticing it is load-bearing at runtime.
+///
+/// The breadcrumb is a [`EventPayload::Note`] and not `ModeChanged` on
+/// purpose: [`orchestrator::nudge_worthy`] treats a mode change as news, so a
+/// boot-time transition would spend an agent turn on every single restart, on
+/// something the orchestrator has no capability to act on. Clients lose
+/// nothing, because the transition happens before the listener binds — it is
+/// only ever reached through the reconnect-and-resnapshot a restart forces
+/// anyway.
+pub async fn apply_startup_mode(store: &Store, mode: Mode) -> Result<(), StoreError> {
+    let stored = store.get_mode().await?;
+    store.set_mode(mode).await?;
+    if stored == mode {
+        info!(mode = mode.as_str(), "startup mode");
+        return Ok(());
+    }
+    info!(
+        mode = mode.as_str(),
+        was = stored.as_str(),
+        "startup mode (the stored mode is not resumed; see TASKS_DEFAULT_MODE)"
+    );
+    store
+        .append_event(EventPayload::Note {
+            source: STARTUP.into(),
+            message: format!(
+                "startup mode {} (was {}); a restart does not resume the previous mode",
+                mode.as_str(),
+                stored.as_str()
+            ),
+        })
+        .await?;
+    Ok(())
+}
+
 /// `$TASKS_DATA_DIR`, else `$HOME/.local/state/tasks-v2`.
 ///
 /// The rule itself lives in [`tasks_api::paths`] — clients resolve the same
@@ -575,6 +672,9 @@ impl Drop for InFlightGuard {
 /// process that refused a moment later would already have migrated the
 /// running server's database on its way in.
 ///
+/// The mode comes from [`apply_startup_mode`] and not from the store, before
+/// anything binds: starting a server is not the same act as resuming dispatch.
+///
 /// Shutdown is a hand-over rather than an outage. The HTTP listener is held
 /// through the whole drain — the API keeps answering while in-flight work
 /// finishes — and is released last, when this function returns. That is a real
@@ -597,6 +697,11 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     }
 
     let store = Arc::new(open_store(&config.data_dir).await?);
+
+    // Before the listener binds: the mode this process runs in is decided by
+    // configuration, not by what the last one left behind, and nobody should
+    // ever be able to read the previous run's mode off this server.
+    apply_startup_mode(&store, config.startup_mode).await?;
 
     // The port is taken here so a clash is a startup error, before any work is
     // resumed — but the listener is not dropped until this function returns.
@@ -1638,6 +1743,15 @@ pub async fn orchestrator_loop(
 ///
 /// `debounce`/`max_wait` are parameters so tests can run in milliseconds;
 /// production passes [`NUDGE_DEBOUNCE`]/[`NUDGE_MAX_WAIT`].
+///
+/// The `*shutdown.borrow()` at the top of the outer loop is load-bearing, not
+/// symmetry with the other loops. [`watch::Receiver::changed`] marks the value
+/// seen when it *returns*, so a shutdown consumed by the inner batch loop's
+/// `select!` leaves the outer `changed()` waiting for a second change that
+/// never comes — parking on `events.recv()` forever while the drain awaits
+/// this task unbounded. One nudge-worthy event near a restart was enough to
+/// wedge the whole process until its supervisor's SIGKILL, and `POST /mode` is
+/// one such event, so "pause the pipeline, then restart it" hit it every time.
 pub async fn orchestrator_nudge_loop(
     store: Arc<Store>,
     config: Config,
@@ -1652,6 +1766,9 @@ pub async fn orchestrator_nudge_loop(
     let github = config.github_client();
     let mut events = store.subscribe_events();
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let first = tokio::select! {
             _ = shutdown.changed() => return,
             received = events.recv() => match received {
@@ -1928,6 +2045,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp"),
             port: 0,
             poll_interval: Duration::from_secs(60),
+            startup_mode: DEFAULT_STARTUP_MODE,
             scout_max_concurrent: 1,
             scout_image: DEFAULT_SCOUT_IMAGE.into(),
             scout_timeout: Duration::from_secs(DEFAULT_SCOUT_TIMEOUT_SECS),
@@ -2008,6 +2126,97 @@ mod tests {
             clone_url(&config, &project()),
             "file:///srv/repos/iamnbutler/tasks.git"
         );
+    }
+
+    /// Unset is the whole point of the change: a machine that comes back on
+    /// its own comes back quiet.
+    #[test]
+    fn an_unset_startup_mode_is_pause() {
+        assert_eq!(parse_startup_mode(None).unwrap(), Mode::Pause);
+        assert_eq!(DEFAULT_STARTUP_MODE, Mode::Pause);
+    }
+
+    #[test]
+    fn a_configured_startup_mode_is_taken_verbatim() {
+        assert_eq!(parse_startup_mode(Some("play")).unwrap(), Mode::Play);
+        assert_eq!(parse_startup_mode(Some("pause")).unwrap(), Mode::Pause);
+        assert_eq!(parse_startup_mode(Some("stop")).unwrap(), Mode::Stop);
+        // `.env` files carry stray whitespace; a mode is still a mode.
+        assert_eq!(parse_startup_mode(Some("  play  ")).unwrap(), Mode::Play);
+    }
+
+    /// This variable decides whether a machine comes back dispatching, so
+    /// "silently ignored" is the one outcome that must not be possible.
+    #[test]
+    fn an_unparseable_startup_mode_refuses_to_boot() {
+        let err = parse_startup_mode(Some("yes")).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("TASKS_DEFAULT_MODE"), "{message}");
+        assert!(message.contains("play, pause or stop"), "{message}");
+        assert!(message.contains("yes"), "{message}");
+    }
+
+    async fn mode_events(store: &Store) -> Vec<EventPayload> {
+        store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .filter(|p| {
+                matches!(
+                    p,
+                    EventPayload::ModeChanged { .. } | EventPayload::Note { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The stored mode is overwritten rather than resumed — and the breadcrumb
+    /// is a `Note`, because `ModeChanged` is nudge-worthy and would spend an
+    /// orchestrator turn on every single restart.
+    #[tokio::test]
+    async fn a_boot_overwrites_the_stored_mode_without_nudging() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.set_mode(Mode::Play).await.unwrap();
+
+        apply_startup_mode(&store, Mode::Pause).await.unwrap();
+
+        assert_eq!(store.get_mode().await.unwrap(), Mode::Pause);
+        let events = mode_events(&store).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let EventPayload::Note { source, message } = &events[0] else {
+            panic!("a boot must not emit ModeChanged: {events:?}");
+        };
+        assert_eq!(source, STARTUP);
+        assert!(message.contains("pause"), "{message}");
+        assert!(message.contains("was play"), "{message}");
+    }
+
+    /// `TASKS_DEFAULT_MODE=play` is the honest way to keep a host dispatching
+    /// across restarts.
+    #[tokio::test]
+    async fn a_configured_play_boots_playing() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.set_mode(Mode::Stop).await.unwrap();
+
+        apply_startup_mode(&store, Mode::Play).await.unwrap();
+
+        assert_eq!(store.get_mode().await.unwrap(), Mode::Play);
+        assert_eq!(mode_events(&store).await.len(), 1, "the transition is news");
+    }
+
+    /// Nothing moved, so nothing is said: the common case is a restart of a
+    /// paused server, and a breadcrumb per boot is noise in the feed.
+    #[tokio::test]
+    async fn a_boot_into_the_stored_mode_says_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        store.set_mode(Mode::Pause).await.unwrap();
+
+        apply_startup_mode(&store, Mode::Pause).await.unwrap();
+
+        assert_eq!(store.get_mode().await.unwrap(), Mode::Pause);
+        assert!(mode_events(&store).await.is_empty());
     }
 
     /// Fake GraphQL endpoint that pops canned responses in request order —
