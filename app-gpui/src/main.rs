@@ -1,4 +1,5 @@
 mod about;
+mod chat_log;
 mod components;
 mod issue_composer;
 mod menus;

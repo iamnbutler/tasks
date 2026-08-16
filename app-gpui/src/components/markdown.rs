@@ -55,10 +55,13 @@ impl MarkdownCache {
         }
     }
 
-    /// Drop every cached entry — for when a surface's identity space resets
-    /// (e.g. the server was wiped and message seqs start over).
-    pub fn clear(&mut self) {
-        self.entries.clear();
+    /// Drop one cached entry — for a key that has left its surface (a chat
+    /// row that retired, a seq that will never be asked for again). One cache
+    /// serves chat, specs and briefings, so eviction is per-key on purpose:
+    /// a chat reset must not throw away spec parses. Without it the cache
+    /// grows by one orphaned parse per turn, forever.
+    pub fn remove(&mut self, key: impl Into<SharedString>) {
+        self.entries.remove(&key.into());
     }
 }
 
