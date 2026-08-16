@@ -89,7 +89,8 @@ No auth, loopback only — don't build a login flow.
 
 | UI action | Call | Semantics |
 | --- | --- | --- |
-| Add a repo | `POST /projects` `{"repo_owner","repo_name"}` | 201 with the project; 400 if it already exists |
+| Add a repo | `POST /projects` `{"repo_owner","repo_name"}` | 201 with the project; 400 if it already exists (matched **case-insensitively** — `Owner/Repo` beside `owner/repo` would be two projects for one repo). The server normalizes the slug, so don't parse it client-side: a second parser is a second thing to keep in step. Nothing is dispatched by this — ingested issues land in `backlog`, and backlog never dispatches. **Human-only**: the orchestrator is a 403, on the same footing as Build Now. |
+| Pause / archive / reactivate a repo | `POST /projects/{project_id}/status` `{"status":"active"\|"paused"\|"archived"}` | The per-repo subtraction from the pipeline, and the only way to stop working on a repository — **there is no delete**, because `decisions` is append-only and `tasks.project_id` cascades, so deleting a project would take the audit trail with it. `active` ingests and dispatches; `paused` still ingests but dispatches nothing; `archived` does neither (its already-ingested tasks are still reconciled against GitHub, so closure and open PRs are still tracked). Gates **new** work only — nothing here interrupts a run in flight. 200 with the project, 400 on an unknown word, 404 for an unknown project. **Human-only**, same 403. |
 | Reorder task queue (drag & drop) | `POST /queue/reorder` `{"task_ids":[...]}` | **Full order, front to back.** Ranks are rewritten 1..N transactionally; any task not listed becomes unranked and sorts after all ranked tasks (then priority desc, then ingested_at). Send the complete on-screen order after every drop. The response is the same projection as the default `GET /tasks` (closed intake hidden), so it can replace the client's list directly. |
 | Reorder spec queue | `POST /spec-queue/reorder` `{"spec_ids":[...]}` | Same full-order semantics |
 | Pick up a task | `POST /tasks/{task_id}/queue` | `backlog` → `queued`, appended at the end of the ranked order. 400 unless the task is `backlog`. The only door from the backlog into the pipeline — scouts dispatch **only** queued tasks. |
@@ -108,6 +109,28 @@ the server only.
 
 ## Reads and their shapes
 
+- `GET /projects` — the repositories being tracked, oldest first.
+  Project: `{id, repo_owner, repo_name, status, added_at}`, `status` ∈
+  `active` | `paused` | `archived`. **Archived projects are included**: a task
+  whose project is archived still carries that `project_id`, and a filtered
+  list would leave the row with no repo to name. Hiding them is a view concern
+  — sort them last rather than dropping them, so a repo you cannot select is
+  not a repo you cannot un-archive.
+
+  **Mode is global; project status is not a second play/pause.** The
+  dispatcher's real constraints are server-wide (one `SCOUT_MAX_CONCURRENT`,
+  one strictly serial build lane, one vm-pool), so a per-repo "play" could not
+  run while another repo's build held the lane. Project status only ever
+  *subtracts* — render it as a state on the repo (a badge, a menu item), not as
+  a transport control beside the title bar's play/pause.
+
+  A repo switcher belongs in the client as a **filter over one working set**,
+  not as a server-side query parameter: `GET /tasks` is shared with the
+  orchestrator, the briefing generator and `tasks status`, and a view
+  preference does not belong in it. Note the one thing that must *not* be
+  filtered: the queue reorder endpoints are bulk replaces over the whole
+  ordering (below), so a narrowed list still rewrites the ranks of repos it is
+  not showing.
 - `GET /tasks` — already in queue order; render it as-is, don't re-sort.
   Task: `{id, project_id, gh_issue_number, title, body, labels, gh_state,
   state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at}`.
@@ -471,7 +494,11 @@ Parse enums leniently (unknown value → show raw string, don't crash): new
 states will appear as the pipeline grows.
 
 Event JSON: `{seq, timestamp, payload}` where payload is tagged by `"kind"`
-(snake_case): `project_added`, `task_ingested`, `task_state_changed`
+(snake_case): `project_added`,
+`project_status_changed` (`project_id`, `status` — the one payload that
+carries state rather than only an identifier, because a client that had to
+refetch `/projects` to learn which way the switch moved could not narrate it),
+`task_ingested`, `task_state_changed`
 (`from`/`to`), `task_gh_state_changed` (`task_id`, `gh_state` — the poller's
 snapshot of GitHub's open/closed flag moved, most often because the issue
 dropped out of the repository's open set; refetch the task or the list),

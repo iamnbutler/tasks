@@ -43,7 +43,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tasks::models::{
-    GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
+    GhState, Mode, Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Task,
+    TaskId, TaskState,
 };
 use tasks::pidfile;
 use tasks::store::Store;
@@ -222,6 +223,7 @@ async fn insert_running_session(data_dir: &Path) -> SessionId {
         id: ProjectId::new(),
         repo_owner: "iamnbutler".into(),
         repo_name: "tasks".into(),
+        status: ProjectStatus::Active,
         added_at: chrono::Utc::now(),
     };
     store.insert_project(&project).await.unwrap();

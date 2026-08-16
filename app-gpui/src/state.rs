@@ -15,8 +15,8 @@ use tasks_client::api::events::Event;
 use tasks_client::api::http::{BriefingStatus, RejectedBundle};
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, Project, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task,
-    TaskId, TaskState,
+    OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -809,6 +809,33 @@ impl AppState {
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.set_mode(mode));
+    }
+
+    /// Track a repository. Nothing is dispatched by it — ingested issues land
+    /// in `backlog`, and backlog never dispatches — so this is as cheap as it
+    /// looks, however many open issues the repo has.
+    ///
+    /// The slug is sent as the human typed it, in halves: the server
+    /// normalizes, and a second parser in the client would be a second thing to
+    /// keep in step with it.
+    pub fn add_project(&mut self, repo_owner: String, repo_name: String, cx: &mut Context<Self>) {
+        self.run(cx, move |client| {
+            client.create_project(repo_owner, repo_name)
+        });
+    }
+
+    /// Pause, archive, or reactivate a repo. Nothing is applied locally — the
+    /// refresh reads it back, like every other mutation here.
+    ///
+    /// Gates **new** work only, so a scout or a build already running for this
+    /// repo is untouched. Cancelling one is `cancel_run`, as it always was.
+    pub fn set_project_status(
+        &mut self,
+        id: ProjectId,
+        status: ProjectStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.run(cx, move |client| client.set_project_status(&id, status));
     }
 
     pub fn review_spec(

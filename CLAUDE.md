@@ -115,6 +115,37 @@ implementation.
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
   and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
   rather than beside it: it is per-task, human-only, and one call is one build.
+- **Mode is global, `projects.status` is the per-repo subtraction, and there
+  is no delete.** The dispatcher's real constraints are server-wide — one
+  `SCOUT_MAX_CONCURRENT`, one strictly serial build lane, one vm-pool — so a
+  per-repo `play` could not run while another repo's build held the lane, and
+  the setting would promise what the architecture cannot deliver
+  (`store::tests::one_repos_running_build_holds_the_lane_against_every_other_repo`
+  pins that argument in code). What is honestly per-repo is what the pipeline
+  *skips*: `active` ingests and dispatches, `paused` still ingests but
+  dispatches nothing, `archived` does neither. One ordered column and not two
+  flags, because archived already implies not dispatching and a pair of
+  booleans would have a meaningless fourth state. Two halves are load-bearing.
+  Archiving stops only the **upsert** — closure is only ever learned from
+  absence in the open set, so a repo that stopped being fetched would strand
+  every task it already has at `gh_state = open`, including one with a Builder
+  PR open; that costs one GitHub fetch per archived project per poll, and it
+  is the right price. And the build's check lives **inside**
+  `claim_next_queued_build`'s transaction, because claim-then-release would
+  flip the build `queued → running → queued` every tick and drag its batch's
+  tasks to `building` with it. A paused repo at the head of either queue is
+  `continue`d past, never stopped at — that is the whole difference between
+  pausing one repo and pausing the server. **Removing a repo is archiving it**:
+  `decisions` is append-only and keyed to a project's tasks, and
+  `tasks.project_id` is `ON DELETE CASCADE`, so a delete would take the audit
+  trail the whole charter rests on with it. `POST /projects` and
+  `POST /projects/{id}/status` are **human-only and refused to the
+  orchestrator outright**, on the `build-now` precedent: they decide what the
+  pipeline is pointed at rather than doing work inside it, and no capability
+  describes that. A client-side repo switcher is a *filter over one working
+  set* and never a query parameter — with one exception it must respect: the
+  Queue is the global ordering and its reorder endpoints are bulk replaces, so
+  narrowing it would rewrite the ranks of repos the human cannot see.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
   prompt.** Nine independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,

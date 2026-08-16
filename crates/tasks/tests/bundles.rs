@@ -14,8 +14,8 @@ use chrono::Utc;
 use tasks::bundles::RejectedBundles;
 use tasks::events::EventPayload;
 use tasks::models::{
-    Build, Complexity, DecisionInput, GhState, Project, ProjectId, Spec, SpecId, SpecQueueEntry,
-    SpecQueueStatus, Task, TaskId, TaskState,
+    Build, Complexity, DecisionInput, GhState, Project, ProjectId, ProjectStatus, Spec, SpecId,
+    SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::store::Store;
 
@@ -48,6 +48,7 @@ async fn harness(with_service: bool) -> Harness {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: Utc::now(),
     };
     store.insert_project(&project).await.unwrap();

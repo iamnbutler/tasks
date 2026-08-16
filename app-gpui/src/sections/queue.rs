@@ -29,6 +29,14 @@
 //! concatenating the bands top to bottom would rewrite Scouting and InReview
 //! ranks to match the visual grouping, turning a local drag into a global
 //! reorder. See [`AppState::reorder_queue`] for what happens after the POST.
+//!
+//! **This section is deliberately not filtered by the title bar's repo
+//! switcher**, and that is the same fact one level down. A narrowed list would
+//! still rewrite the ranks of the repos it is not showing, and a row dropped
+//! "second" would land second among rows the human cannot see. The Queue also
+//! *is* the global ordering — the same argument that keeps mode global — so
+//! rows name their repo instead, and only when the rows on screen disagree
+//! about it.
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context, SharedString};
@@ -41,6 +49,7 @@ use tasks_client::api::models::{
 };
 
 use crate::components::{move_to, sortable, status_badge, task_state_color, title_case};
+use crate::projects;
 use crate::state::{is_picked_up, AppState};
 use crate::time;
 use crate::workspace::Workspace;
@@ -226,6 +235,19 @@ const ISSUE_W: f32 = 46.;
 const STATUS_W: f32 = 92.;
 const TRAILING_W: f32 = 58.;
 
+/// Whether the queue's rows disagree about which repo they belong to.
+///
+/// Over the whole section rather than per band: the bands are one ordering cut
+/// into attention groups, and a row that names its repo in one band and not in
+/// the next would read as a difference between the bands.
+fn queue_is_ambiguous(tasks: &[Task]) -> bool {
+    let shown: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| is_picked_up(task.state))
+        .collect();
+    projects::rows_are_ambiguous(&shown)
+}
+
 /// A row with the accessory the render pass attached: a complexity word, or a
 /// live clock.
 struct QueueRow {
@@ -234,11 +256,15 @@ struct QueueRow {
     /// The trailing text is a running clock, and is styled as active work
     /// rather than as a note.
     live: bool,
+    /// The repository this row's task belongs to, when the rows on screen
+    /// disagree about that. `None` in the single-repo case, which is what keeps
+    /// this section pixel-identical to the one before multi-repo.
+    repo: Option<String>,
 }
 
 /// [`QueueRow`] for a projected row — the one place that needs specs, sessions
 /// and builds, which is why it is not part of [`bands`].
-fn queue_row(group: &Group, row: BandRow, state: &AppState) -> QueueRow {
+fn queue_row(group: &Group, row: BandRow, ambiguous: bool, state: &AppState) -> QueueRow {
     let (trailing, live) = match group.state {
         TaskState::InReview | TaskState::ReadyToBuild => (
             state
@@ -263,10 +289,18 @@ fn queue_row(group: &Group, row: BandRow, state: &AppState) -> QueueRow {
         }
         _ => (None, false),
     };
+    let repo = ambiguous
+        .then(|| {
+            state
+                .task(&row.task_id)
+                .and_then(|task| projects::row_repo_name(&state.projects, task))
+        })
+        .flatten();
     QueueRow {
         row,
         trailing,
         live,
+        repo,
     }
 }
 
@@ -279,12 +313,13 @@ impl Workspace {
         // below need `cx` mutably, so no borrow of it may still be alive.
         let (bands, notice, loaded) = {
             let state = self.app_state.read(cx);
+            let ambiguous = queue_is_ambiguous(&state.tasks);
             let bands: Vec<(Group, Vec<QueueRow>)> = bands(&state.tasks, &state.spec_queue)
                 .into_iter()
                 .map(|(group, rows)| {
                     let rows = rows
                         .into_iter()
-                        .map(|row| queue_row(&group, row, state))
+                        .map(|row| queue_row(&group, row, ambiguous, state))
                         .collect();
                     (group, rows)
                 })
@@ -412,6 +447,7 @@ impl Workspace {
             row,
             trailing,
             live,
+            repo,
         } = item;
         let theme = cx.theme().clone();
         let task_id = row.task_id.clone();
@@ -490,6 +526,22 @@ impl Workspace {
                     .truncate()
                     .child(row.title.clone()),
             )
+            // The Queue is deliberately *not* filtered by the repo switcher —
+            // its reorder endpoints are bulk replaces over the whole ordering,
+            // so a narrowed list would still rewrite the ranks of repos it is
+            // not showing, and a row dropped "second" would land second among
+            // rows the human cannot see. The Queue also *is* the global
+            // ordering, the same fact that keeps mode global. So rows name
+            // their repo instead.
+            .when_some(repo, |el, repo| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(repo),
+                )
+            })
             .child(
                 div()
                     .w(px(STATUS_W))

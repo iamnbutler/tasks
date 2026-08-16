@@ -22,8 +22,8 @@ use tasks::brief::Brief;
 use tasks::github::GitHubClient;
 use tasks::models::{
     Actor, Build, Complexity, DecisionInput, GhState, Obligation, ObligationKind, Project,
-    ProjectId, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
-    Task, TaskId, TaskState,
+    ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::store::Store;
 
@@ -33,6 +33,7 @@ async fn seed_project(store: &Store) -> Project {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: Utc::now(),
     };
     store.insert_project(&project).await.unwrap();

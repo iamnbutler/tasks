@@ -1291,7 +1291,15 @@ pub async fn poll_once(
         // first would close every task whose issue merely lost the label.
         let open_numbers: Vec<u64> = issues.iter().map(|issue| issue.number).collect();
         for issue in issues {
-            if !intake.admits(&issue) {
+            // An archived project stops *ingesting*, and only that. Closure is
+            // learned from absence in the open set, so the reconciliation
+            // below has to keep running: a repo that stopped being fetched
+            // would leave every task it already has at `gh_state = open`
+            // forever, and an archived repo with a Builder PR open would be
+            // stranded with nothing to make it loud. This is precisely the
+            // semantics an issue losing its `TASKS_INTAKE_LABEL` already has,
+            // and it costs one GitHub fetch per archived project per poll.
+            if !project.status.ingests() || !intake.admits(&issue) {
                 continue;
             }
             let outcome = store.upsert_gh_issue(&project.id, issue).await?;
@@ -1954,11 +1962,15 @@ async fn top_up(
 
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
 /// applies), state `Queued` (explicitly picked up), still open on GitHub, not in flight, not past the
-/// attempt cap.
+/// attempt cap, and belonging to a repo the pipeline is still working on.
 ///
 /// A task at the cap is rejected the moment it gets there, so the attempt
 /// filter here is belt-and-braces: it also covers rows an older build (or a
 /// crash between the increment and the rejection) left `Queued` at three strikes.
+///
+/// A paused or archived project's task is **skipped over, not stopped at**:
+/// `continue`, so the tasks behind it in the queue still dispatch. That is the
+/// whole difference between pausing one repo and pausing the server.
 async fn next_dispatchable(
     store: &Store,
     skip: &HashSet<TaskId>,
@@ -1975,6 +1987,9 @@ async fn next_dispatchable(
             warn!(task_id = %task.id, project_id = %task.project_id, "task references a missing project");
             continue;
         };
+        if !project.status.dispatches() {
+            continue;
+        }
         return Ok(Some((task, project)));
     }
     Ok(None)
@@ -2499,7 +2514,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::models::ProjectId;
+    use crate::models::{ProjectId, ProjectStatus};
 
     fn config() -> Config {
         Config {
@@ -2535,6 +2550,7 @@ mod tests {
             id: ProjectId::new(),
             repo_owner: "iamnbutler".into(),
             repo_name: "tasks".into(),
+            status: ProjectStatus::Active,
             added_at: Utc::now(),
         }
     }
@@ -2556,6 +2572,80 @@ mod tests {
         // vm-pool's own default shape, and anything smaller, still builds.
         assert_eq!(build_jobs(2, 2048), 1);
         assert_eq!(build_jobs(1, 65536), 1);
+    }
+
+    /// A queued task in a repo the dispatcher is not working on is skipped —
+    /// and skipped *over*, not stopped at: `next_dispatchable` `continue`s, so
+    /// the queue behind a paused repo still moves. That is the whole difference
+    /// between pausing one repo and pausing the server.
+    #[tokio::test]
+    async fn a_paused_repo_is_skipped_without_starving_the_queue_behind_it() {
+        use crate::models::{GhState, Task, TaskId, TaskState};
+
+        let store = Store::open_in_memory().await.unwrap();
+        let paused = project();
+        let other = Project {
+            id: ProjectId::new(),
+            repo_owner: "iamnbutler".into(),
+            repo_name: "other".into(),
+            status: ProjectStatus::Active,
+            added_at: Utc::now(),
+        };
+        store.insert_project(&paused).await.unwrap();
+        store.insert_project(&other).await.unwrap();
+
+        let queued = |project: &Project, number: u64| Task {
+            id: TaskId::new(),
+            project_id: project.id.clone(),
+            gh_issue_number: number,
+            title: format!("task {number}"),
+            body: String::new(),
+            labels: vec![],
+            gh_state: GhState::Open,
+            state: TaskState::Queued,
+            priority: 0,
+            manual_rank: Some(number as i32),
+            dispatch_attempts: 0,
+            ingested_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let first = queued(&paused, 1);
+        let second = queued(&other, 2);
+        store.insert_task(&first).await.unwrap();
+        store.insert_task(&second).await.unwrap();
+
+        // Both active: queue order decides.
+        let skip = HashSet::new();
+        assert_eq!(
+            next_dispatchable(&store, &skip)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .id,
+            first.id
+        );
+
+        for status in [ProjectStatus::Paused, ProjectStatus::Archived] {
+            store.set_project_status(&paused.id, status).await.unwrap();
+            assert_eq!(
+                next_dispatchable(&store, &skip)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .id,
+                second.id,
+                "{status:?} skips its own task and leaves the queue moving"
+            );
+        }
+
+        // And with every repo out, there is simply nothing to dispatch.
+        store
+            .set_project_status(&other.id, ProjectStatus::Paused)
+            .await
+            .unwrap();
+        assert!(next_dispatchable(&store, &skip).await.unwrap().is_none());
     }
 
     #[test]

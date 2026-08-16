@@ -37,9 +37,9 @@ use crate::about;
 use crate::server::{self, Op};
 use crate::server_window;
 use crate::workspace::{
-    ApproveSelectedSpec, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, QueueSelectedTask,
-    ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock, ToggleRightDock,
-    ToggleShowDone,
+    AddRepo, ApproveSelectedSpec, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks,
+    QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock,
+    ToggleRightDock, ToggleShowDone,
 };
 
 actions!(
@@ -241,6 +241,14 @@ fn menus(state: MenuState) -> Vec<Menu> {
         Menu::new("File").items([
             // `New Issue` goes here when the window that creates one lands —
             // one `MenuItem::action` line plus its `cmd-n` binding in `init`.
+            //
+            // Add Repo is here and *not* in the switcher alone: the switcher
+            // renders nothing at all until the first snapshot, so on a server
+            // with no projects it would be the one control that cannot be
+            // reached. No key equivalent — adding a repo is rare, and the
+            // shortcuts worth spending are the ones used daily.
+            MenuItem::action("Add Repo…", AddRepo),
+            MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),
         // These dispatch gpuikit's *own* input actions rather than new ones,
@@ -687,9 +695,12 @@ mod tests {
         );
     }
 
+    /// The File menu offers exactly what has a window behind it. Add Repo is
+    /// the reachable path to a repo switcher that renders nothing before the
+    /// first snapshot — on a server with no projects it is the only one.
     #[test]
     fn file_menu_only_offers_what_exists() {
         let actions: Vec<_> = items("File").into_iter().map(|(_, a)| a).collect();
-        assert_eq!(actions, ["tasks::CloseWindow"]);
+        assert_eq!(actions, ["workspace::AddRepo", "tasks::CloseWindow"]);
     }
 }

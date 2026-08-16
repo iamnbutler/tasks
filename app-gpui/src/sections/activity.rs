@@ -7,7 +7,7 @@ use gpui::{div, px, Context, SharedString};
 use gpuikit::elements::context_menu::context_menu;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::events::EventPayload;
-use tasks_client::api::models::TaskId;
+use tasks_client::api::models::{ProjectStatus, TaskId};
 
 use crate::components::title_case;
 use crate::time;
@@ -51,6 +51,23 @@ impl Workspace {
                 let subject = subject_task(&event.payload, state);
                 let sentence = match &event.payload {
                     EventPayload::ProjectAdded { .. } => "Project added".to_string(),
+                    // The status is in the payload precisely so this row can
+                    // say which way the switch moved without a refetch.
+                    EventPayload::ProjectStatusChanged { project_id, status } => {
+                        let repo = state
+                            .projects
+                            .iter()
+                            .find(|project| &project.id == project_id)
+                            .map(|project| project.slug())
+                            .unwrap_or_else(|| project_id.to_string());
+                        match status {
+                            ProjectStatus::Active => format!("{repo} is active again"),
+                            ProjectStatus::Paused => format!("{repo} paused — nothing dispatches"),
+                            ProjectStatus::Archived => {
+                                format!("{repo} archived — no new issues, no new work")
+                            }
+                        }
+                    }
                     EventPayload::TaskIngested { task_id, .. } => {
                         format!("Ingested “{}”", title_for(task_id))
                     }

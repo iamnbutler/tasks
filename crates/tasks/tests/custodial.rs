@@ -18,7 +18,8 @@ use axum::routing::{post, put};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tasks::models::{
-    Actor, Capability, CharterLevel, GhState, Project, ProjectId, Task, TaskId, TaskState,
+    Actor, Capability, CharterLevel, GhState, Project, ProjectId, ProjectStatus, Task, TaskId,
+    TaskState,
 };
 use tasks::store::Store;
 
@@ -189,6 +190,7 @@ async fn harness(with_github: bool) -> Harness {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: Utc::now(),
     };
     store.insert_project(&project).await.unwrap();

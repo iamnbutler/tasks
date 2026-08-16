@@ -8,9 +8,9 @@ use std::time::Duration;
 use chrono::Utc;
 use tasks::events::EventPayload;
 use tasks::models::{
-    ChatRole, Complexity, GhState, ObligationKind, Project, ProjectId, Session, SessionEndReason,
-    SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId,
-    TaskState,
+    ChatRole, Complexity, GhState, ObligationKind, Project, ProjectId, ProjectStatus, Session,
+    SessionEndReason, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
+    Task, TaskId, TaskState,
 };
 use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
 use tasks::run::orchestrator_nudge_loop;
@@ -989,6 +989,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: now,
     };
     store.insert_project(&project).await.unwrap();
@@ -1099,6 +1100,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: Utc::now(),
     };
     store.insert_project(&project).await.unwrap();

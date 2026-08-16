@@ -1208,12 +1208,20 @@ fn system_prompt(
            no attempt is charged. `concluded: false` in the reply means the \
            request is recorded and the run has not stopped yet — watch for \
            its completion event rather than asking again\n\
+         - GET /projects — the repositories being tracked, and each one's \
+           `status`: active (scouts and builds dispatch), paused (issues are \
+           still ingested, nothing dispatches) or archived (neither). Read it \
+           before you conclude a queued task is stuck — its repo may simply \
+           be paused\n\
          - POST /issues \
-           {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\"}} — file an \
+           {{\"title\",\"body\",\"labels\",\"provenance\",\"project_id\",\
+           \"rationale\"}} — file an \
            issue. `provenance` says where the work was discovered (\"while \
            reviewing spec_… for #812\") and is rendered into the issue body; \
-           the server refuses a capture without it. Lands in the backlog, not \
-           the queue\n\
+           the server refuses a capture without it. `project_id` says which \
+           repository, and is required whenever more than one non-archived \
+           project exists — the server refuses to guess rather than filing \
+           into the wrong repo. Lands in the backlog, not the queue\n\
          - POST /tasks/{{id}}/close \
            {{\"reason\":\"completed|not_planned\",\"rationale\",\"evidence\"}} — \
            close the issue upstream. `completed` claims the work is done and \
@@ -1288,6 +1296,14 @@ fn system_prompt(
          and shipped, so what is left is by construction work nobody \
          reproduced; it answers you 403 too. Say which one you think is \
          redundant and why.\n\n\
+         Also not yours: POST /projects and POST /projects/{{id}}/status — \
+         adding a repository, and pausing or archiving one. Adding a repo \
+         commits VM hours and authorises pull requests against somebody's \
+         repository; pausing or archiving one stops every scout and every \
+         build for it. Neither is a unit of work inside the pipeline — they \
+         decide what the pipeline is pointed at — and no charter capability \
+         covers that; both answer you 403. Propose the change and let the \
+         human make it.\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
            building → awaiting_merge → done (rejected = terminal). Issue \

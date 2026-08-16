@@ -63,7 +63,89 @@ pub struct Project {
     pub id: ProjectId,
     pub repo_owner: String,
     pub repo_name: String,
+    /// How much of the pipeline still runs for this repo. `#[serde(default)]`
+    /// so a client built from this repo can read a server that predates the
+    /// column: the absent answer is `active`, which is what every project was.
+    #[serde(default)]
+    pub status: ProjectStatus,
     pub added_at: DateTime<Utc>,
+}
+
+impl Project {
+    /// `owner/repo` — the form a human names a repository in, and the form the
+    /// switcher, the composer and the CLI all print. One implementation
+    /// because three copies of a format string is how they stop agreeing.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.repo_owner, self.repo_name)
+    }
+}
+
+/// The per-repo counterpart of the global [`Mode`]: how much of the pipeline
+/// still runs for one project.
+///
+/// One ordered value rather than two flags. `paused` and `archived` are not
+/// orthogonal — archived already implies not dispatching — so a pair of
+/// booleans would have a meaningless fourth state, and unarchiving would have
+/// to remember which switch it was allowed to touch. The two predicates below
+/// name the only two decisions anything actually makes from it.
+///
+/// | | issues ingested | scouts / builds dispatched |
+/// | --- | --- | --- |
+/// | `active` | yes | yes |
+/// | `paused` | yes | no |
+/// | `archived` | no | no |
+///
+/// Like mode, it gates **new** work only: nothing here interrupts a run that
+/// is already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectStatus {
+    #[default]
+    Active,
+    Paused,
+    Archived,
+}
+
+impl ProjectStatus {
+    pub const ALL: [ProjectStatus; 3] = [
+        ProjectStatus::Active,
+        ProjectStatus::Paused,
+        ProjectStatus::Archived,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProjectStatus::Active => "active",
+            ProjectStatus::Paused => "paused",
+            ProjectStatus::Archived => "archived",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(ProjectStatus::Active),
+            "paused" => Some(ProjectStatus::Paused),
+            "archived" => Some(ProjectStatus::Archived),
+            _ => None,
+        }
+    }
+
+    /// Whether a scout or a build may be *started* for this repo. The build
+    /// half is checked inside the claim transaction, not around it — see
+    /// [`crate`]-adjacent notes in `Store::claim_next_queued_build`.
+    pub fn dispatches(&self) -> bool {
+        matches!(self, ProjectStatus::Active)
+    }
+
+    /// Whether the poller ingests this repo's open issues into new tasks.
+    ///
+    /// Only the *upsert* half of a poll: closure is learned from absence in
+    /// the open set, so an archived project is still fetched and still
+    /// reconciled, or every task it already has would sit at `gh_state = open`
+    /// forever with nothing to make it loud.
+    pub fn ingests(&self) -> bool {
+        !matches!(self, ProjectStatus::Archived)
+    }
 }
 
 /// A unit of work, sourced from a GitHub issue.

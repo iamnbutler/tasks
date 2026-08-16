@@ -1,0 +1,30 @@
+-- Per-repo status: the honest counterpart of the global `/mode` (#903).
+--
+-- Mode gates a dispatcher whose real constraints are server-wide — one
+-- SCOUT_MAX_CONCURRENT, one strictly serial build lane, one vm-pool — so a
+-- per-repo `play` could not run while another repo's build held the lane, and
+-- the setting would promise what the architecture cannot deliver. What is
+-- honestly per-repo is the *subtraction*: a project the dispatcher skips.
+--
+-- One ordered column rather than two booleans. `paused` and `archived` are not
+-- orthogonal — archived already implies not dispatching — so a pair of flags
+-- would have a meaningless fourth state, and unarchiving would have to remember
+-- which switch it was allowed to touch.
+--
+--   active    issues ingested, scouts and builds dispatched
+--   paused    issues ingested, nothing dispatched
+--   archived  nothing ingested, nothing dispatched
+--
+-- Additive with a default, so every project that already exists is backfilled
+-- to exactly what it was. There is deliberately no `DELETE`: `decisions` is
+-- append-only and keyed to a project's tasks, and `tasks.project_id` is
+-- ON DELETE CASCADE, so dropping a project would take the audit trail the whole
+-- charter rests on with it. Archive is the way out.
+--
+-- No CHECK constraint and no unique index alongside it, deliberately. The
+-- vocabulary is enforced in `ProjectStatus::from_str` at both ends, and the
+-- case-insensitive duplicate check that guards `UNIQUE(repo_owner, repo_name)`
+-- lives in the two add paths rather than here: a `CREATE UNIQUE INDEX` can
+-- *fail* on a database that already holds the duplicate, and a failed migration
+-- is a boot failure in a process that has already taken the port.
+ALTER TABLE projects ADD COLUMN status TEXT NOT NULL DEFAULT 'active';

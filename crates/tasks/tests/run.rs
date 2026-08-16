@@ -24,7 +24,8 @@ use tasks_protocol::TasksProtocol;
 use tasks::events::EventPayload;
 use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::models::{
-    GhState, Mode, Project, ProjectId, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
+    GhState, Mode, Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Task,
+    TaskId, TaskState,
 };
 use tasks::run::{self, Config, InFlight};
 use tasks::store::Store;
@@ -103,6 +104,7 @@ async fn insert_project(store: &Store) -> Project {
         id: ProjectId::new(),
         repo_owner: "test".into(),
         repo_name: "repo".into(),
+        status: ProjectStatus::Active,
         added_at: Utc::now(),
     };
     store.insert_project(&project).await.unwrap();
@@ -542,6 +544,96 @@ async fn an_unlabelled_task_still_tracks_upstream_closure() {
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Closed,
         "absence from the open set is still a closure"
+    );
+    assert_eq!(
+        gh_state_changes(&store).await,
+        vec![(task_id, GhState::Closed)]
+    );
+}
+
+/// An archived project stops ingesting new issues. `paused` does not — it is
+/// the dispatcher it subtracts from, not the intake.
+#[tokio::test]
+async fn an_archived_project_stops_ingesting_and_a_paused_one_does_not() {
+    let url = spawn_fake_github(vec![
+        page(vec![issue(1, "first", "OPEN")]),
+        page(vec![issue(1, "first", "OPEN"), issue(2, "second", "OPEN")]),
+        page(vec![
+            issue(1, "first", "OPEN"),
+            issue(2, "second", "OPEN"),
+            issue(3, "third", "OPEN"),
+        ]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    let project = insert_project(&store).await;
+
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+            .await
+            .unwrap(),
+        1
+    );
+
+    store
+        .set_project_status(&project.id, ProjectStatus::Paused)
+        .await
+        .unwrap();
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+            .await
+            .unwrap(),
+        1,
+        "paused subtracts from the dispatcher, not from intake"
+    );
+
+    store
+        .set_project_status(&project.id, ProjectStatus::Archived)
+        .await
+        .unwrap();
+    assert_eq!(
+        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.list_tasks().await.unwrap().len(), 2);
+}
+
+/// Only the *upsert* is skipped. Closure is only ever learned from absence in
+/// the open set, so an archived project that stopped being fetched would leave
+/// every task it already has at `gh_state = open` forever — and an archived
+/// repo with a Builder PR open would be stranded with nothing to make it loud.
+#[tokio::test]
+async fn an_archived_project_still_learns_its_issues_closed() {
+    let url = spawn_fake_github(vec![
+        page(vec![issue(1, "first", "OPEN")]),
+        // Archived by now, and the issue has left the open set.
+        page(vec![]),
+    ])
+    .await;
+    let github = GitHubClient::with_base_url("token", url);
+
+    let store = Store::open_in_memory().await.unwrap();
+    let project = insert_project(&store).await;
+    run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        .await
+        .unwrap();
+    let task_id = store.list_tasks().await.unwrap()[0].id.clone();
+
+    store
+        .set_project_status(&project.id, ProjectStatus::Archived)
+        .await
+        .unwrap();
+    run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_task(&task_id).await.unwrap().unwrap().gh_state,
+        GhState::Closed,
+        "archiving stops intake, never resolution"
     );
     assert_eq!(
         gh_state_changes(&store).await,

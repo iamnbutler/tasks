@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{
     Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode, ProjectId,
-    RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus, TaskId,
-    TaskState,
+    ProjectStatus, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus,
+    TaskId, TaskState,
 };
 
 /// A timestamped, sequenced record. `seq` is assigned by the store on append.
@@ -29,6 +29,17 @@ pub struct Event {
 pub enum EventPayload {
     ProjectAdded {
         project_id: ProjectId,
+    },
+    /// A repo was paused, archived, or made active again.
+    ///
+    /// The status is *in* the payload, against the identifier-only rule the
+    /// rest of this enum follows, because it is one word and the feed's whole
+    /// job here is to say which way the switch moved. A client that had to
+    /// refetch `/projects` to narrate it would either say nothing or say
+    /// whatever the switch was set to by the time it asked.
+    ProjectStatusChanged {
+        project_id: ProjectId,
+        status: ProjectStatus,
     },
     TaskIngested {
         task_id: TaskId,
@@ -210,6 +221,7 @@ impl EventPayload {
     pub fn kind(&self) -> &'static str {
         match self {
             EventPayload::ProjectAdded { .. } => "project_added",
+            EventPayload::ProjectStatusChanged { .. } => "project_status_changed",
             EventPayload::TaskIngested { .. } => "task_ingested",
             EventPayload::TaskStateChanged { .. } => "task_state_changed",
             EventPayload::TaskGhStateChanged { .. } => "task_gh_state_changed",
@@ -242,8 +254,8 @@ mod tests {
     use super::*;
     use crate::models::{
         Actor, BriefingSection, BuildId, BuildStatus, ChatRole, CloseReason, GhState, Mode,
-        ProjectId, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId, SpecQueueStatus,
-        TaskId, TaskState,
+        ProjectId, ProjectStatus, RunKind, SessionEndReason, SessionId, SessionStatus, SpecId,
+        SpecQueueStatus, TaskId, TaskState,
     };
 
     fn task() -> TaskId {
@@ -257,6 +269,10 @@ mod tests {
         let samples = vec![
             EventPayload::ProjectAdded {
                 project_id: ProjectId::from_raw("proj_1"),
+            },
+            EventPayload::ProjectStatusChanged {
+                project_id: ProjectId::from_raw("proj_1"),
+                status: ProjectStatus::Paused,
             },
             EventPayload::TaskIngested {
                 task_id: task(),
@@ -468,9 +484,24 @@ mod tests {
         assert!(wire.get("id").is_none());
     }
 
+    /// The one payload that carries state rather than only an identifier, and
+    /// the reason it does: a feed row has to say which way the switch moved.
+    #[test]
+    fn a_project_status_change_carries_the_status_it_moved_to() {
+        let wire = serde_json::to_value(EventPayload::ProjectStatusChanged {
+            project_id: ProjectId::from_raw("proj_1"),
+            status: ProjectStatus::Archived,
+        })
+        .unwrap();
+        assert_eq!(wire["kind"], "project_status_changed");
+        assert_eq!(wire["project_id"], "proj_1");
+        assert_eq!(wire["status"], "archived");
+    }
+
     /// Every kind string, for the vocabulary test.
     const KINDS: &[&str] = &[
         "project_added",
+        "project_status_changed",
         "task_ingested",
         "task_state_changed",
         "task_gh_state_changed",
