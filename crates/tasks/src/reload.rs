@@ -2,6 +2,9 @@
 //!
 //! The upgrade loop the server was missing. The order is the whole point:
 //!
+//! 0. **resolve `TASKS_DEFAULT_MODE`**, because a typo in it makes `serve`
+//!    refuse to boot, and discovering that *after* SIGTERMing the old server
+//!    turns a typo into an outage. Same rule as "build first";
 //! 1. **build** first, so a compile error costs nothing — the old server is
 //!    still up and was never signalled;
 //! 2. **report** what is in flight, with ages, so "this would kill a scout
@@ -21,6 +24,14 @@
 //! binary's schema *before* the new binary booted, masking exactly the
 //! failure it exists to catch, while the old server is still serving the old
 //! schema.
+//!
+//! A third fact travels the other way. A boot no longer resumes the stored
+//! mode ([`crate::run::apply_startup_mode`]), so **an upgrade is the one path
+//! that carries it**: [`ModeHandover`] snapshots the old server's mode before
+//! the drain and hands it to the child as `TASKS_DEFAULT_MODE`, then verifies
+//! against the new pid's `/status` that it came up in it. Everything that is a
+//! cold start — a crash loop, `launchd` `KeepAlive`, `tasks serve` by hand —
+//! carries nothing and comes back quiet.
 //!
 //! This is not a service manager: no supervision, no restart-on-crash, no
 //! daemon. The pidfile is a discovery record and the swap is one-shot;
@@ -128,10 +139,42 @@ impl ReloadOptions {
     }
 }
 
+/// What this swap owes the pipeline's mode.
+///
+/// Two separate facts, deliberately not one `Option<Mode>`. `carry` is the
+/// mode the *new* server must come up in; `paused_for_drain` records that the
+/// drain left the old one paused, which only matters when the swap fails and
+/// there is an undo to print. A drain of a `play` server sets both; a
+/// `--when-idle` of an already-paused server sets neither.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModeHandover {
+    /// Handed to the child as `TASKS_DEFAULT_MODE`, and verified afterwards.
+    /// `None` means "whatever the new server's own configuration says", which
+    /// is what every cold start gets.
+    carry: Option<Mode>,
+    /// The drain paused dispatch. No later boot will unpause it, so a failed
+    /// swap has to say so.
+    paused_for_drain: bool,
+}
+
+impl ModeHandover {
+    /// Carry nothing: unknown resolves to quiet, never to dispatching.
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// Build, report, gate, drain, swap, verify. See the module docs for why in
 /// that order.
 pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
-    // 1. Build first: a failure here must cost nothing, and it can only cost
+    // 0. Resolve the mode the replacement would boot into. Before the build
+    //    and before anything is signalled, because an unusable
+    //    TASKS_DEFAULT_MODE is a hard `serve` startup error: finding that out
+    //    after the SIGTERM would leave nothing serving at all.
+    let default_mode = crate::run::startup_mode_from_env()
+        .map_err(|err| ReloadError::Other(format!("{err}; nothing was touched")))?;
+
+    // 1. Build: a failure here must cost nothing, and it can only cost
     //    nothing while the old server has not been signalled.
     let binary = match opts.build {
         true => build(opts.repo.as_deref()).await?,
@@ -157,8 +200,9 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         .unwrap_or(crate::run::DEFAULT_PORT);
 
     let Some(existing) = existing else {
-        // Nothing is running: a reload is just a start.
-        return start(&binary, port, &opts, None).await;
+        // Nothing is running: a reload is just a start, and a start is a cold
+        // start — there is no mode to carry from anywhere.
+        return start(&binary, port, &opts, ModeHandover::none()).await;
     };
 
     // 3. Gate. A live pid that will not answer may be mid-shutdown; killing
@@ -172,10 +216,22 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
                 existing.pid, existing.port
             )));
         }
-        return swap(&binary, &existing, port, &opts, None).await;
+        // A server too wedged to answer `/status` never told us its mode, and
+        // guessing `play` at a machine nobody is watching is the wrong way to
+        // be wrong.
+        return swap(&binary, &existing, port, &opts, ModeHandover::none()).await;
     };
 
-    let mut restore_mode = None;
+    // The mode to carry is read *now*, before the drain: `--when-idle` writes
+    // `pause` to make the wait terminate, so reading it afterwards would carry
+    // the tool instead of the intent. Nothing is carried when it matches what
+    // the new server would take anyway — a carry is an override, and an
+    // override that agrees with the default is just noise in the output.
+    let mut handover = ModeHandover {
+        carry: (status.mode != default_mode).then_some(status.mode),
+        paused_for_drain: false,
+    };
+
     if status.in_flight.is_destructible() && !opts.force {
         if !opts.when_idle {
             return Err(ReloadError::Busy(format!(
@@ -187,7 +243,7 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         // 4. Drain. Pausing is load-bearing, not politeness: with a non-empty
         //    queue the dispatcher starts a fresh scout the moment one
         //    finishes, so a wait that did not pause would never terminate.
-        restore_mode = drain(existing.port, status.mode, opts.drain_timeout).await?;
+        handover.paused_for_drain = drain(existing.port, status.mode, opts.drain_timeout).await?;
     }
 
     if status.in_flight.orchestrator.is_some() {
@@ -197,31 +253,32 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         );
     }
 
-    swap(&binary, &existing, port, &opts, restore_mode).await
+    swap(&binary, &existing, port, &opts, handover).await
 }
 
-/// SIGTERM the old server, start the new one, verify, restore the mode.
+/// SIGTERM the old server, start the new one, verify, carry the mode over.
 async fn swap(
     binary: &Path,
     existing: &PidFile,
     port: u16,
     opts: &ReloadOptions,
-    restore_mode: Option<Mode>,
+    handover: ModeHandover,
 ) -> Result<(), ReloadError> {
     println!("stopping pid {}…", existing.pid);
     stop_pid(existing.pid).await?;
     println!("stopped");
-    match start(binary, port, opts, restore_mode).await {
+    match start(binary, port, opts, handover).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            if let Some(mode) = restore_mode {
-                // The pipeline is paused and the server that could unpause it
-                // did not come up. Say so, with the undo.
+            if handover.paused_for_drain {
+                // The drain paused the pipeline, the server that could unpause
+                // it did not come up, and no later boot will do it either —
+                // a boot takes its configured default, not the stored mode.
+                // Say so, with the undo.
                 println!(
                     "the pipeline is still paused; once a server is up: \
                      curl -sS -X POST localhost:{port}/mode -H 'content-type: application/json' \
-                     -d '{{\"mode\":\"{}\"}}'",
-                    mode.as_str()
+                     -d '{{\"mode\":\"play\"}}'"
                 );
             }
             Err(err)
@@ -230,25 +287,31 @@ async fn swap(
 }
 
 /// Launch the new server and prove it is the one answering.
+///
+/// The mode travels in the child's *environment*, never as a `POST /mode`
+/// after the boot. Three reasons, any one of them sufficient: a POST leaves a
+/// window in which the new server is already running in its configured default
+/// (with `TASKS_DEFAULT_MODE=play` and a paused old server, that window
+/// dispatches); `--foreground` execs, so there is no "later" in which to
+/// restore anything; and the real environment outranks every `.env`, which is
+/// exactly the precedence an explicit upgrade wants.
 async fn start(
     binary: &Path,
     port: u16,
     opts: &ReloadOptions,
-    restore_mode: Option<Mode>,
+    handover: ModeHandover,
 ) -> Result<(), ReloadError> {
     if opts.foreground {
         // exec, so the log in this terminal is the server's own and ctrl-c
-        // reaches it directly. Nothing after this line runs — including a
-        // mode restore, so say so rather than leaving it paused in silence.
-        if let Some(mode) = restore_mode {
-            println!(
-                "the drain paused dispatch; once this server is up: \
-                 curl -sS -X POST localhost:{port}/mode \
-                 -H 'content-type: application/json' -d '{{\"mode\":\"{}\"}}'",
-                mode.as_str()
-            );
-        }
-        return Err(exec_foreground(binary, port, &opts.data_dir));
+        // reaches it directly. Nothing after this line runs — which is fine
+        // for the mode, because it is passed in the environment rather than
+        // applied afterwards.
+        return Err(exec_foreground(
+            binary,
+            port,
+            &opts.data_dir,
+            handover.carry,
+        ));
     }
 
     let log_path = tasks_api::paths::serve_log(&opts.data_dir);
@@ -257,7 +320,8 @@ async fn start(
         .create(true)
         .append(true)
         .open(&log_path)?;
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
@@ -266,8 +330,11 @@ async fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some(mode) = handover.carry {
+        command.env("TASKS_DEFAULT_MODE", mode.as_str());
+    }
+    let mut child = command.spawn()?;
     let child_pid = child.id().unwrap_or(0);
 
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
@@ -306,47 +373,64 @@ async fn start(
     );
     println!("{}", render_migrations(&status));
 
-    // Restoring the mode only after the new server answers is the only
-    // correct order: mode lives in the store, so it survives the restart, and
-    // unpausing before the swap landed would let the old server dispatch.
-    if let Some(mode) = restore_mode {
-        match set_mode(port, mode).await {
-            Ok(()) => println!("mode restored to {}", mode.as_str()),
-            Err(err) => println!("could not restore mode to {}: {err}", mode.as_str()),
+    // The carry is verified, not assumed — same posture as the migration
+    // check, and for the same reason: it is a claim about the new process that
+    // only the new process can settle. A `.env` that sets `TASKS_DEFAULT_MODE`
+    // cannot beat the environment we spawned with, but an old binary that does
+    // not read the variable at all can, and that is worth being told about.
+    if let Some(mode) = handover.carry {
+        if status.mode == mode {
+            println!("mode carried over: {}", mode.as_str());
+        } else {
+            println!(
+                "mode did not carry over: asked for {}, came up in {}; \
+                 curl -sS -X POST localhost:{port}/mode -H 'content-type: application/json' \
+                 -d '{{\"mode\":\"{}\"}}'",
+                mode.as_str(),
+                status.mode.as_str(),
+                mode.as_str()
+            );
         }
     }
     Ok(())
 }
 
 /// Replace this process with `tasks serve`. Only returns on failure.
-fn exec_foreground(binary: &Path, port: u16, data_dir: &Path) -> ReloadError {
+fn exec_foreground(binary: &Path, port: u16, data_dir: &Path, carry: Option<Mode>) -> ReloadError {
     use std::os::unix::process::CommandExt;
     println!("exec {} serve --port {port}", binary.display());
-    let err = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
-        .env("TASKS_DATA_DIR", data_dir)
-        .exec();
-    ReloadError::Io(err)
+        .env("TASKS_DATA_DIR", data_dir);
+    if let Some(mode) = carry {
+        println!("carrying the mode over: {}", mode.as_str());
+        command.env("TASKS_DEFAULT_MODE", mode.as_str());
+    }
+    ReloadError::Io(command.exec())
 }
 
-/// Pause dispatch, wait for destructible work to finish, and report the mode
-/// that has to be restored once the new server is up (`None` when the
-/// pipeline was not playing to begin with).
-async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<Option<Mode>, ReloadError> {
-    let restore = match mode {
+/// Pause dispatch, wait for destructible work to finish, and report whether
+/// this pause is ours to undo (`false` when the pipeline was not playing to
+/// begin with, so there was nothing to pause).
+///
+/// The pause is the tool and not the intent, which is why the mode the swap
+/// carries is snapshotted by the caller *before* this runs.
+async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<bool, ReloadError> {
+    let paused = match mode {
         Mode::Play => {
             set_mode(port, Mode::Pause)
                 .await
                 .map_err(ReloadError::Other)?;
-            println!("paused dispatch for the drain (mode will be restored to play)");
-            Some(Mode::Play)
+            println!("paused dispatch for the drain (the new server comes up in play)");
+            true
         }
-        // Already not dispatching; nothing to pause and nothing to restore.
+        // Already not dispatching; nothing to pause and nothing to undo.
         other => {
             println!("mode is {}; nothing new will be dispatched", other.as_str());
-            None
+            false
         }
     };
 
@@ -356,7 +440,7 @@ async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<Option<Mode>,
         match fetch_status(port).await {
             Ok(status) if !status.in_flight.is_destructible() => {
                 println!("drained");
-                return Ok(restore);
+                return Ok(paused);
             }
             Ok(status) => {
                 let line = describe(&status.in_flight);
@@ -373,11 +457,11 @@ async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<Option<Mode>,
         }
         if tokio::time::Instant::now() >= deadline {
             // Restore immediately: this restarts nothing, so leaving the
-            // pipeline paused would be a side effect of a no-op.
-            if let Some(mode) = restore
-                && let Err(err) = set_mode(port, mode).await
-            {
-                println!("could not restore mode to {}: {err}", mode.as_str());
+            // pipeline paused would be a side effect of a no-op. It has to
+            // happen here and not at the next boot — a boot takes its
+            // configured default now, so nothing else would ever undo it.
+            if paused && let Err(err) = set_mode(port, Mode::Play).await {
+                println!("could not restore mode to play: {err}");
             }
             return Err(ReloadError::DrainTimeout(format!(
                 "still busy after {}s; nothing was restarted",

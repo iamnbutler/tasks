@@ -153,6 +153,7 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         data_dir: data_dir.to_path_buf(),
         port: 0,
         poll_interval: Duration::from_secs(3600),
+        startup_mode: tasks::run::DEFAULT_STARTUP_MODE,
         scout_max_concurrent: 1,
         scout_image: "agent:v1".into(),
         scout_timeout: Duration::from_secs(300),
