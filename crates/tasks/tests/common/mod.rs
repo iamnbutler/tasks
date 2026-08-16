@@ -349,6 +349,12 @@ pub fn stub_builder_agent_path() -> PathBuf {
     builder_agent_fixture("stub-builder-agent.sh")
 }
 
+/// A stand-in builder agent that tidies its commits from a detached HEAD, so
+/// `refs/heads/<branch>` stops tracking the work — #891's shape.
+pub fn history_rewriting_builder_agent_path() -> PathBuf {
+    builder_agent_fixture("history-rewriting-agent.sh")
+}
+
 /// A stand-in builder agent that talks on both pipes, commits nothing and
 /// exits non-zero: the silent-failure shape from #825.
 pub fn silent_builder_agent_path() -> PathBuf {

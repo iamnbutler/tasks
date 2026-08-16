@@ -133,7 +133,7 @@ fn start(repo_url: String) -> TVmCommand {
             build_id: "build_1".into(),
             repo_clone_url: repo_url,
             base_branch: "main".into(),
-            branch: "build/build_1".into(),
+            branch: BRANCH.into(),
             prompt: "## Spec 1 of 1: do the thing".into(),
         }),
     }
@@ -141,21 +141,283 @@ fn start(repo_url: String) -> TVmCommand {
 
 /// Drain until a terminal event, asserting the lifecycle shape on the way.
 async fn drain(sup: &mut SupervisorProc) -> BuildEvent {
+    drain_with_progress(sup).await.0
+}
+
+/// [`drain`], keeping the `Progress` lines — the transcript (#825) is where a
+/// reviewer reads what the supervisor did to the branch.
+async fn drain_with_progress(sup: &mut SupervisorProc) -> (BuildEvent, Vec<String>) {
+    let mut progress = Vec::new();
     loop {
         match sup.recv().await {
             VmEvent::App {
                 payload: TaskEvent::Build(evt),
             } => match evt {
-                BuildEvent::Started { .. }
-                | BuildEvent::Progress { .. }
-                | BuildEvent::ImplementationFinished { .. } => continue,
+                BuildEvent::Progress { line, .. } => progress.push(line),
+                BuildEvent::Started { .. } | BuildEvent::ImplementationFinished { .. } => continue,
                 terminal @ (BuildEvent::Completed { .. } | BuildEvent::Failed { .. }) => {
-                    return terminal;
+                    return (terminal, progress);
                 }
             },
             other => panic!("unexpected event: {other:?}"),
         }
     }
+}
+
+const BRANCH: &str = "build/build_1";
+const BRANCH_REF: &str = "refs/heads/build/build_1";
+const ABANDONED_REF: &str = "refs/abandoned/build/build_1";
+
+/// A finished build, landed the way the server lands it.
+struct Landed {
+    head_sha: String,
+    files: Vec<String>,
+    summary: Option<String>,
+    progress: Vec<String>,
+    /// Whether the bundle also carried `refs/abandoned/<branch>`. The server
+    /// never fetches it — nothing may push it — but nothing may lose it either.
+    abandoned: bool,
+    scratch: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl Landed {
+    async fn tree(&self, r#ref: &str) -> String {
+        run_git(&self.scratch, &["ls-tree", "-r", "--name-only", r#ref]).await
+    }
+
+    async fn blob(&self, r#ref: &str, path: &str) -> String {
+        run_git(&self.scratch, &["show", &format!("{}:{path}", r#ref)]).await
+    }
+
+    fn said(&self, needle: &str) -> bool {
+        self.progress.iter().any(|l| l.contains(needle))
+    }
+}
+
+/// Run one build to `Completed` and unbundle it into a scratch repo **exactly
+/// as the server will** — fetch the base from the remote, fetch the branch out
+/// of the bundle by name, and run the server's tip check right here. A bundle
+/// that agreed with the reported head by shipping the wrong ref would sail
+/// through that comparison, so every caller then asserts on the contents.
+async fn land(agent: &Path) -> Landed {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let mut sup =
+        SupervisorProc::spawn(&supervisor_bin(), agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url.clone())).await;
+
+    let (terminal, progress) = drain_with_progress(&mut sup).await;
+    let (base_sha, head_sha, bundle_base64, summary, files) = match terminal {
+        BuildEvent::Completed {
+            base_sha,
+            head_sha,
+            bundle_base64,
+            summary,
+            files_touched,
+        } => (base_sha, head_sha, bundle_base64, summary, files_touched),
+        other => panic!("expected Completed, got {other:?}"),
+    };
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+
+    let scratch = tmp.path().join("scratch.git");
+    tokio::fs::create_dir_all(&scratch).await.unwrap();
+    run_git(&scratch, &["init", "--bare"]).await;
+    run_git(&scratch, &["fetch", &repo_url, "main:refs/heads/main"]).await;
+    let bundle_path = tmp.path().join("egress.bundle");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle_base64)
+        .expect("valid base64");
+    tokio::fs::write(&bundle_path, bytes).await.unwrap();
+    let bundle_arg = bundle_path.to_str().unwrap().to_string();
+    run_git(
+        &scratch,
+        &["fetch", &bundle_arg, &format!("{BRANCH_REF}:{BRANCH_REF}")],
+    )
+    .await;
+
+    // #891 itself: the check that discarded a finished build.
+    let tip = run_git(&scratch, &["rev-parse", BRANCH_REF]).await;
+    assert_eq!(tip, head_sha, "the server would reject this bundle");
+    assert_ne!(head_sha, base_sha, "the branch grew");
+
+    // The abandoned tip, if one rode along. Fetching one ref out of a two-ref
+    // bundle works, which is also why `git push <branch_ref>` can never carry
+    // the other one.
+    let abandoned = git_ok(
+        &scratch,
+        &[
+            "fetch",
+            &bundle_arg,
+            &format!("{ABANDONED_REF}:{ABANDONED_REF}"),
+        ],
+    )
+    .await;
+
+    Landed {
+        head_sha,
+        files,
+        summary,
+        progress,
+        abandoned,
+        scratch,
+        _tmp: tmp,
+    }
+}
+
+async fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .await
+        .unwrap()
+        .status
+        .success()
+}
+
+/// #891 as reported: an agent that tidies its history from a detached HEAD.
+///
+/// The build branch stops tracking the work at the detach, so the supervisor
+/// reported one commit (HEAD) and bundled another (the branch), and the server
+/// threw the whole implementation away. The reconciliation takes HEAD, the
+/// reported head is read back out of the bundle, and the old tip is kept.
+#[tokio::test]
+async fn a_rewritten_history_ships_where_the_agent_finished() {
+    let landed = land(&fixture("history-rewriting-agent.sh")).await;
+
+    let tree = landed.tree(BRANCH_REF).await;
+    for file in ["src/one.rs", "src/two.rs", "src/three.rs"] {
+        assert!(
+            tree.contains(file),
+            "{file} missing from the branch:\n{tree}"
+        );
+    }
+    assert!(
+        landed.files.contains(&"src/three.rs".to_string()),
+        "files_touched is computed over base..head: {:?}",
+        landed.files
+    );
+    assert!(
+        landed.said("have diverged"),
+        "the reconciliation is not in the transcript: {:?}",
+        landed.progress
+    );
+    assert!(
+        landed
+            .summary
+            .as_deref()
+            .expect("summary")
+            .contains("coherent series"),
+        "SUMMARY.md is read before the artifacts are removed"
+    );
+
+    // The tip that was decided against is still in the bundle: no arm of the
+    // reconciliation may lose a commit.
+    assert!(landed.abandoned, "the pre-rewrite tip was not kept");
+    assert!(landed.tree(ABANDONED_REF).await.contains("src/one.rs"));
+    assert_ne!(
+        run_git(&landed.scratch, &["rev-parse", ABANDONED_REF]).await,
+        landed.head_sha,
+        "the abandoned tip is the stale ref, not the commit that ships"
+    );
+}
+
+/// The work is on the branch and HEAD is a stale checkout of the base — the
+/// case where deriving the head from the bundle *alone* would agree on the
+/// wrong tip and push a truncated branch with no complaint at all.
+#[tokio::test]
+async fn a_stranded_head_ships_the_branch_it_left_behind() {
+    let landed = land(&fixture("stranded-head-agent.sh")).await;
+
+    let tree = landed.tree(BRANCH_REF).await;
+    assert!(
+        tree.contains("src/implementation.rs"),
+        "the implementation is missing:\n{tree}"
+    );
+    assert!(!tree.contains("PROMPT.md") && !tree.contains("SUMMARY.md"));
+    assert!(
+        landed.said("stale checkout"),
+        "reconciliation missing: {:?}",
+        landed.progress
+    );
+}
+
+/// The reviewer's case, and the one that goes wrong if the sweep runs first:
+/// work on the branch, HEAD detached on the base, and one file written *after*
+/// the detach. Sweep-first commits that file onto the base, the two tips then
+/// stand in no ancestor relation, the divergence arm prefers HEAD, and the PR
+/// contains the sweep and none of the implementation.
+#[tokio::test]
+async fn a_dirty_stranded_head_keeps_the_branch_and_the_scratch_apart() {
+    let landed = land(&fixture("stranded-dirty-head-agent.sh")).await;
+
+    let tree = landed.tree(BRANCH_REF).await;
+    assert!(
+        tree.contains("src/implementation.rs"),
+        "the implementation is missing from the branch:\n{tree}"
+    );
+    assert!(
+        !tree.contains("src/scratch.rs"),
+        "work from the abandoned checkout leaked onto the branch:\n{tree}"
+    );
+
+    assert!(landed.abandoned, "the stranded work was dropped");
+    let kept = landed.tree(ABANDONED_REF).await;
+    assert!(
+        kept.contains("src/scratch.rs"),
+        "the stranded file is nowhere:\n{kept}"
+    );
+    assert!(
+        landed.said("left uncommitted off the build branch"),
+        "the rescue is not in the transcript: {:?}",
+        landed.progress
+    );
+}
+
+/// A rebase left in progress: git parks HEAD on a partial replay while the
+/// branch still holds the complete pre-rebase history, which ancestry cannot
+/// tell apart from an ordinary divergence.
+#[tokio::test]
+async fn an_abandoned_rebase_ships_the_complete_pre_rebase_history() {
+    let landed = land(&fixture("abandoned-rebase-agent.sh")).await;
+
+    let tree = landed.tree(BRANCH_REF).await;
+    assert!(
+        tree.contains("src/implementation.rs"),
+        "the implementation is missing:\n{tree}"
+    );
+    // The branch's own version of the conflicted file, not a replay of it.
+    assert_eq!(landed.blob(BRANCH_REF, "src/conflict.rs").await, "ours");
+    assert!(
+        landed.said("a rebase is in progress"),
+        "the rebase guard is not in the transcript: {:?}",
+        landed.progress
+    );
+}
+
+/// `git checkout --orphan` leaves HEAD unborn, so `git rev-parse HEAD` fails
+/// outright — which used to be a fatal error *before* there was a bundle, the
+/// one shape where the implementation is unrecoverable.
+#[tokio::test]
+async fn an_unborn_head_still_ships_the_branch() {
+    let landed = land(&fixture("orphan-head-agent.sh")).await;
+
+    let tree = landed.tree(BRANCH_REF).await;
+    assert!(
+        tree.contains("src/implementation.rs"),
+        "the implementation is missing:\n{tree}"
+    );
+    assert!(!tree.contains("PROMPT.md") && !tree.contains("SUMMARY.md"));
+    assert!(
+        landed.said("HEAD is unborn"),
+        "reconciliation missing: {:?}",
+        landed.progress
+    );
 }
 
 #[tokio::test]

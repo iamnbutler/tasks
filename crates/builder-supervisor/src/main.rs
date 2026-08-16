@@ -19,12 +19,19 @@
 //!      worktree survives with the conversation, which is the whole point for
 //!      a Builder. See [`tasks_protocol::agent_run`]
 //!   6. Reads `SUMMARY.md` (optional PR prose), then removes both artifacts
-//!      from the worktree and sweeps everything else the agent left
-//!      uncommitted into a final commit — losing a build to a forgotten
-//!      `git commit` is a bad failure mode
-//!   7. `head == base` → `Failed` (the analogue of a scout's missing SPEC.md);
+//!      from the worktree
+//!   7. [`reconcile_checkout`]s the build branch with wherever the agent
+//!      actually finished — HEAD is only the branch while it stays
+//!      symbolically attached to it, and a rebase or a `git checkout <sha>`
+//!      breaks that silently. **Before** the sweep, always: the sweep commits
+//!      onto whatever HEAD is
+//!   8. Sweeps everything the agent left uncommitted into a final commit —
+//!      losing a build to a forgotten `git commit` is a bad failure mode
+//!   9. `tip == base` → `Failed` (the analogue of a scout's missing SPEC.md);
 //!      otherwise emits `Completed` with a base64 thin bundle of
-//!      `base_sha..branch`
+//!      `base_sha..branch`, whose `head_sha` is read back **out of the
+//!      bundle** so there is one value where there used to be two that had to
+//!      agree
 //!
 //! No credential ever needs to enter this VM for egress: the bundle rides the
 //! event stream and the server pushes with its own token.
@@ -254,41 +261,65 @@ async fn run_build(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Remove the artifacts from the worktree, then sweep. `git add -A` stages
-    // the removals as deletions if the agent committed them, alongside any
-    // implementation work the agent left uncommitted.
-    for artifact in ["PROMPT.md", "SUMMARY.md"] {
-        let _ = tokio::fs::remove_file(workdir.join(artifact)).await;
-    }
-    if let Err(e) = git(&workdir, &["add", "-A"]).await {
-        fail!("sweep add: {e}");
-    }
-    let staged = git(&workdir, &["diff", "--cached", "--quiet"])
-        .await
-        .is_err();
-    if staged
-        && let Err(e) = git(
-            &workdir,
-            &["commit", "-m", "Sweep: work the agent left uncommitted"],
-        )
-        .await
-    {
-        fail!("sweep commit: {e}");
+    // Remove the artifacts from the worktree, reconcile, then sweep. `git add
+    // -A` stages the removals as deletions if the agent committed them,
+    // alongside any implementation work the agent left uncommitted.
+    remove_artifacts(&workdir).await;
+
+    // The reconciliation runs BEFORE the sweep, and the order is load-bearing:
+    // the sweep commits onto whatever HEAD is, so on a stranded checkout a
+    // sweep-first ordering manufactures a divergence no ancestry rule can
+    // undo — and the build ships a PR containing the sweep and none of the
+    // implementation. See [`reconcile_checkout`].
+    let abandoned = match reconcile_checkout(&workdir, branch, &tx).await {
+        Ok(abandoned) => abandoned,
+        Err(e) => fail!("reconcile: {e}"),
+    };
+    // A `checkout --force` back onto the branch can restore an artifact the
+    // agent had committed there; removing them again turns that into a
+    // deletion the sweep below picks up.
+    remove_artifacts(&workdir).await;
+
+    if let Err(e) = commit_worktree(&workdir, SWEEP_MESSAGE).await {
+        fail!("sweep: {e}");
     }
 
-    let head_sha = match git_stdout(&workdir, &["rev-parse", "HEAD"]).await {
+    let branch_ref = format!("refs/heads/{branch}");
+    let tip = match git_stdout(&workdir, &["rev-parse", &branch_ref]).await {
         Ok(sha) => sha,
-        Err(e) => fail!("rev-parse head: {e}"),
+        Err(e) => fail!("rev-parse branch: {e}"),
     };
-    if head_sha == base_sha {
+    if tip == base_sha {
         // "no commits" on its own reads as a verdict on the agent's work, so
         // an OOM kill, a signal death or a dropped API connection (#845) is
         // named here rather than left for someone to infer from a budget that
         // vanished.
         fail!(
-            "agent produced no commits (head == base){}",
+            "agent produced no commits (tip == base){}",
             run.failure_context()
         );
+    }
+
+    // Thin bundle with base_sha as its prerequisite, carrying the branch ref
+    // the server will fetch by name — and the head is read back out of it.
+    let (bundle_base64, head_sha) =
+        match package_bundle(&workdir, &base_sha, branch, abandoned.as_deref(), &tx).await {
+            Ok(packaged) => packaged,
+            Err(e) => fail!("bundle: {e}"),
+        };
+    if head_sha != tip {
+        // Not fatal: the bundle is the deliverable and `head_sha` now
+        // describes it. Loud, because nothing should be able to cause this.
+        progress(
+            &tx,
+            format!(
+                "builder-supervisor: the bundle carries {branch} at {} but the worktree reads \
+                 {}; shipping the bundle's, which is what the server receives",
+                short(&head_sha),
+                short(&tip)
+            ),
+        )
+        .await;
     }
 
     let files_touched = match git_stdout(
@@ -304,35 +335,6 @@ async fn run_build(
         }
     };
 
-    // Thin bundle with base_sha as its prerequisite, carrying the branch ref
-    // the server will fetch by name.
-    let bundle_path = workdir.join(".git").join("egress.bundle");
-    if let Err(e) = git(
-        &workdir,
-        &[
-            "bundle",
-            "create",
-            &bundle_path.display().to_string(),
-            &format!("{base_sha}..refs/heads/{branch}"),
-        ],
-    )
-    .await
-    {
-        fail!("bundle: {e}");
-    }
-    let bundle_bytes = match tokio::fs::read(&bundle_path).await {
-        Ok(b) => b,
-        Err(e) => fail!("bundle read: {e}"),
-    };
-    let bundle_base64 = base64::engine::general_purpose::STANDARD.encode(&bundle_bytes);
-    if bundle_base64.len() > MAX_BUNDLE_BASE64_BYTES {
-        fail!(
-            "bundle too large: {} bytes encoded (cap {})",
-            bundle_base64.len(),
-            MAX_BUNDLE_BASE64_BYTES
-        );
-    }
-
     emit(
         &tx,
         BuildEvent::Completed {
@@ -344,6 +346,409 @@ async fn run_build(
         },
     )
     .await;
+}
+
+/// The sweep commit: work the agent left uncommitted *on* the build branch.
+const SWEEP_MESSAGE: &str = "Sweep: work the agent left uncommitted";
+
+/// The rescue commit: work the agent left uncommitted on a checkout the
+/// reconciliation is about to leave. It is never pushed — it rides the bundle
+/// as `refs/abandoned/<branch>`.
+const STRANDED_MESSAGE: &str = "Stranded: work the agent left uncommitted off the build branch";
+
+/// Both supervisor-written artifacts, out of the worktree. Best-effort: a
+/// missing file is the ordinary case (the agent committed it, or never had
+/// one), and the sweep turns a committed one into a deletion.
+async fn remove_artifacts(workdir: &Path) {
+    for artifact in ["PROMPT.md", "SUMMARY.md"] {
+        let _ = tokio::fs::remove_file(workdir.join(artifact)).await;
+    }
+}
+
+/// Decide which tip this build *is*, and leave HEAD attached to the build
+/// branch at it.
+///
+/// The supervisor reports one commit and bundles another: `git rev-parse HEAD`
+/// and `refs/heads/<branch>` are the same commit only while HEAD stays
+/// symbolically attached to the host-chosen branch. A rebase, a `git checkout
+/// <sha>` to look at something, or a branch of the agent's own detaches HEAD,
+/// and from that moment the branch ref silently stops tracking the work. That
+/// is #891, where a finished build was discarded for a mismatch it could not
+/// have avoided — and, worse, where reading the head out of the bundle *alone*
+/// would have shipped the stale tip with no complaint at all.
+///
+/// **This must run before the sweep.** The sweep commits onto whatever HEAD
+/// is; on a stranded checkout that manufactures a divergence no ancestry rule
+/// can undo, and the build opens a PR containing the sweep and none of the
+/// implementation.
+///
+/// Returns the tip it decided *against*, when that tip is not reachable from
+/// the one it chose. The caller packages it as `refs/abandoned/<branch>`, so no
+/// arm of this can lose a commit.
+async fn reconcile_checkout(
+    workdir: &Path,
+    branch: &str,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<Option<String>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let head = git_stdout(workdir, &["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|s| !s.is_empty());
+    let attached = git_stdout(workdir, &["symbolic-ref", "--quiet", "HEAD"])
+        .await
+        .is_ok_and(|r| r == branch_ref);
+    // `--verify --quiet`, so a ref that does not exist is None rather than the
+    // string echoed back at us.
+    let tip = git_stdout(
+        workdir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{branch_ref}^{{commit}}"),
+        ],
+    )
+    .await
+    .ok()
+    .filter(|s| !s.is_empty());
+
+    // 1. Attached and equal — the overwhelmingly common path. Its whole cost
+    //    is one extra rev-parse and one symbolic-ref.
+    if attached
+        && let (Some(head), Some(tip)) = (&head, &tip)
+        && head == tip
+    {
+        return Ok(None);
+    }
+
+    // 2. HEAD unborn (`git checkout --orphan`). Nothing to compare, but the
+    //    branch may hold a whole implementation — and this used to die on
+    //    `rev-parse head:`, before there was a bundle for the server to keep.
+    let Some(head) = head else {
+        let tip = tip.context("HEAD is unborn and the build branch does not exist")?;
+        reconciling(
+            tx,
+            format!(
+                "HEAD is unborn (git checkout --orphan); taking {branch} at {}",
+                short(&tip)
+            ),
+        )
+        .await;
+        return take_branch(workdir, branch, tx).await;
+    };
+
+    // 3. A rebase in progress is the trap in "prefer HEAD when diverged": git
+    //    leaves HEAD on a partial replay and keeps the branch at the complete
+    //    pre-rebase tip, which ancestry cannot tell apart from an ordinary
+    //    divergence. Checked *before* ancestry for that reason. Preferring the
+    //    branch here can never lose work, because replayed commits are
+    //    rewrites of commits the branch already has.
+    if let Some(tip) = &tip
+        && rebase_in_progress(workdir).await
+    {
+        reconciling(
+            tx,
+            format!(
+                "a rebase is in progress on a detached HEAD; taking {branch} at {}, which still \
+                 holds the complete pre-rebase history",
+                short(tip)
+            ),
+        )
+        .await;
+        return take_branch(workdir, branch, tx).await;
+    }
+
+    // 4. The branch ref is gone — the agent deleted or renamed it.
+    let Some(tip) = tip else {
+        reconciling(
+            tx,
+            format!(
+                "{branch} no longer exists; recreating it at HEAD {}",
+                short(&head)
+            ),
+        )
+        .await;
+        take_head(workdir, branch, &head).await?;
+        return Ok(None);
+    };
+
+    // 5. The branch is an ancestor of HEAD (or equal): the agent moved on and
+    //    left the ref behind. Nothing is abandoned — the tip is reachable.
+    if is_ancestor(workdir, &tip, &head).await {
+        reconciling(
+            tx,
+            format!(
+                "{branch} at {} is behind HEAD {}; moving the branch to HEAD",
+                short(&tip),
+                short(&head)
+            ),
+        )
+        .await;
+        take_head(workdir, branch, &head).await?;
+        return Ok(None);
+    }
+
+    // 6. HEAD is a stale checkout; the branch already holds the work.
+    if is_ancestor(workdir, &head, &tip).await {
+        reconciling(
+            tx,
+            format!(
+                "HEAD {} is a stale checkout of {branch} {}; taking the branch",
+                short(&head),
+                short(&tip)
+            ),
+        )
+        .await;
+        return take_branch(workdir, branch, tx).await;
+    }
+
+    // 7. Diverged: the agent rewrote its history from a detached HEAD, and
+    //    where it finished is HEAD. The old tip rides along abandoned.
+    reconciling(
+        tx,
+        format!(
+            "HEAD {} and {branch} {} have diverged (the agent rewrote its history); taking HEAD \
+             and keeping the old tip as refs/abandoned/{branch}",
+            short(&head),
+            short(&tip)
+        ),
+    )
+    .await;
+    take_head(workdir, branch, &head).await?;
+    Ok(Some(tip))
+}
+
+/// A reconciliation line, in the build transcript (#825). Every case but the
+/// common one says what it did, so a reviewer reads it there instead of
+/// re-deriving it from SHAs in an error string.
+async fn reconciling(tx: &mpsc::Sender<TaskVmEvent>, line: String) {
+    progress(
+        tx,
+        format!("builder-supervisor: reconciling the build branch: {line}"),
+    )
+    .await;
+}
+
+/// Point the build branch at `head` and reattach HEAD to it.
+///
+/// `git symbolic-ref` and not `git checkout`: the branch now points at the
+/// commit that is already checked out, so nothing about the index or the
+/// worktree may change — and a `checkout` with local modifications can refuse
+/// outright. The sweep that follows is then byte-for-byte the ordinary one.
+async fn take_head(workdir: &Path, branch: &str, head: &str) -> Result<()> {
+    let branch_ref = format!("refs/heads/{branch}");
+    git(workdir, &["update-ref", &branch_ref, head])
+        .await
+        .context("update-ref")?;
+    git(workdir, &["symbolic-ref", "HEAD", &branch_ref])
+        .await
+        .context("symbolic-ref")?;
+    Ok(())
+}
+
+/// Move to the build branch, keeping whatever the checkout being left holds.
+///
+/// The dirty worktree is committed **first**: those changes belong to the
+/// checkout the agent is standing on, not to the branch, and the `checkout
+/// --force` below would otherwise delete them. Moving to a *different* commit
+/// is exactly the case that needs `--force`, which is why the commit comes
+/// first rather than the other way round.
+///
+/// Returns the tip left behind, when it is not reachable from the branch.
+async fn take_branch(
+    workdir: &Path,
+    branch: &str,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<Option<String>> {
+    let stranded = commit_worktree(workdir, STRANDED_MESSAGE)
+        .await
+        .context("stranded commit")?;
+    let left = git_stdout(workdir, &["rev-parse", "HEAD"])
+        .await
+        .ok()
+        .filter(|s| !s.is_empty());
+    if stranded && let Some(sha) = &left {
+        reconciling(
+            tx,
+            format!(
+                "work the agent left uncommitted off the build branch was committed at {} and \
+                 rides the bundle as refs/abandoned/{branch}",
+                short(sha)
+            ),
+        )
+        .await;
+    }
+    // Best-effort: an abort restores HEAD to the branch and clears the replay
+    // state. Failing that, the `--force` checkout below still lands.
+    if rebase_in_progress(workdir).await {
+        let _ = git(workdir, &["rebase", "--abort"]).await;
+    }
+    git(workdir, &["checkout", "--force", branch])
+        .await
+        .context("checkout")?;
+    let now = git_stdout(workdir, &["rev-parse", "HEAD"])
+        .await
+        .context("rev-parse after checkout")?;
+    Ok(match left {
+        Some(left) if !is_ancestor(workdir, &left, &now).await => Some(left),
+        _ => None,
+    })
+}
+
+/// Commit everything the worktree holds onto the current HEAD; `true` if there
+/// was anything to commit.
+///
+/// Shared by the sweep and by the reconciliation's rescue of stranded work —
+/// losing a build to a forgotten `git commit` is a bad failure mode wherever
+/// the agent left it.
+async fn commit_worktree(workdir: &Path, message: &str) -> Result<bool> {
+    git(workdir, &["add", "-A"]).await.context("add")?;
+    let staged = git(workdir, &["diff", "--cached", "--quiet"])
+        .await
+        .is_err();
+    if staged {
+        git(workdir, &["commit", "-m", message])
+            .await
+            .context("commit")?;
+    }
+    Ok(staged)
+}
+
+/// Whether `ancestor` is reachable from `descendant` (equal counts).
+///
+/// Anything but exit 0 is "no" — an unreadable answer routes to the arm that
+/// keeps both tips rather than to one that drops a commit.
+async fn is_ancestor(workdir: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(
+        workdir,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )
+    .await
+    .is_ok()
+}
+
+/// Whether git is part-way through a rebase. Merge, cherry-pick and revert
+/// leave HEAD attached to the branch, so only this one can reach the
+/// divergence arm.
+async fn rebase_in_progress(workdir: &Path) -> bool {
+    let Ok(git_dir) = git_stdout(workdir, &["rev-parse", "--git-dir"]).await else {
+        return false;
+    };
+    // `--git-dir` answers relatively (`.git`) from a worktree root; joining an
+    // absolute answer onto the workdir replaces it.
+    let git_dir = workdir.join(git_dir);
+    git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+}
+
+/// Bundle `base_sha..refs/heads/<branch>` — plus the abandoned tip when there
+/// is one — and read the branch's tip back **out of the bundle**.
+///
+/// That read is the second half of #891's fix: `head_sha` used to be a second,
+/// independently observed value that had to agree with what was packaged, and
+/// the two came from different refs. There is one value now, and it describes
+/// the bytes the server actually receives.
+async fn package_bundle(
+    workdir: &Path,
+    base_sha: &str,
+    branch: &str,
+    abandoned: Option<&str>,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<(String, String)> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let abandoned_ref = format!("refs/abandoned/{branch}");
+    let bundle_path = workdir.join(".git").join("egress.bundle");
+    let bundle_arg = bundle_path.display().to_string();
+
+    let mut carry_abandoned = false;
+    if let Some(sha) = abandoned {
+        match git(workdir, &["update-ref", &abandoned_ref, sha]).await {
+            Ok(()) => carry_abandoned = true,
+            Err(e) => {
+                progress(
+                    tx,
+                    format!(
+                        "builder-supervisor: could not record the abandoned tip {} as \
+                         {abandoned_ref}: {e}",
+                        short(sha)
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    loop {
+        let mut args = vec![
+            "bundle".to_string(),
+            "create".to_string(),
+            bundle_arg.clone(),
+            format!("{base_sha}..{branch_ref}"),
+        ];
+        if carry_abandoned {
+            args.push(format!("{base_sha}..{abandoned_ref}"));
+        }
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        let attempt = async {
+            git(workdir, &argv).await.context("bundle create")?;
+            let bytes = tokio::fs::read(&bundle_path).await.context("bundle read")?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            anyhow::ensure!(
+                encoded.len() <= MAX_BUNDLE_BASE64_BYTES,
+                "bundle too large: {} bytes encoded (cap {MAX_BUNDLE_BASE64_BYTES})",
+                encoded.len()
+            );
+            Ok::<String, anyhow::Error>(encoded)
+        }
+        .await;
+
+        match attempt {
+            Ok(bundle_base64) => {
+                let tip = bundle_head(workdir, &bundle_path, &branch_ref).await?;
+                return Ok((bundle_base64, tip));
+            }
+            // Insurance must never cost the thing it insures: drop the
+            // abandoned ref and ship the branch alone.
+            Err(e) if carry_abandoned => {
+                progress(
+                    tx,
+                    format!(
+                        "builder-supervisor: could not ship {abandoned_ref} alongside the build \
+                         branch ({e}); shipping the branch alone"
+                    ),
+                )
+                .await;
+                carry_abandoned = false;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The tip `git bundle create` actually packaged for `ref_name`.
+///
+/// `git bundle list-heads` prints one `<sha> <ref>` line per packaged ref, so
+/// this selects on the ref name; taking the first line would read the
+/// abandoned tip whenever one rides along.
+async fn bundle_head(workdir: &Path, bundle: &Path, ref_name: &str) -> Result<String> {
+    let listing = git_stdout(
+        workdir,
+        &["bundle", "list-heads", &bundle.display().to_string()],
+    )
+    .await
+    .context("bundle list-heads")?;
+    listing
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(_, name)| name.trim() == ref_name)
+        .map(|(sha, _)| sha.trim().to_string())
+        .with_context(|| format!("{ref_name} is not in the bundle"))
+}
+
+/// A SHA, shortened for a log line.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 fn make_workdir(build_id: &str) -> Result<PathBuf> {
