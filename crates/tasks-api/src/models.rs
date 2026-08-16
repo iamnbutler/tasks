@@ -340,11 +340,21 @@ pub struct ScoutNotes {
     pub updated_at: DateTime<Utc>,
 }
 
-/// The distilled artifact a Scout produces.
+/// The distilled artifact a Scout produces — or, rarely, one a human wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub id: SpecId,
-    pub session_id: SessionId,
+    /// The Scout run this came out of, and **the provenance contract**: `None`
+    /// means no Scout ever ran, because a human wrote the spec by hand through
+    /// `POST /tasks/{id}/build-now` for a task whose issue body already was the
+    /// specification.
+    ///
+    /// That is the only difference such a spec has. It carries no transcript,
+    /// no session to link to, and no independent reviewer — the human who
+    /// wrote it *is* the review — so a client that renders a scout link should
+    /// say "human-authored" here rather than leave the absence to be inferred.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub task_id: TaskId,
     pub content: String,
     pub complexity: Complexity,
@@ -770,6 +780,14 @@ pub enum DecisionAction {
     NeedsRevision,
     Reject,
     RequestBuild,
+    /// A human wrote a spec by hand for a task too simple to scout, and it was
+    /// approved in the same act.
+    ///
+    /// Deliberately not an `Approve`. An approval claims a second opinion was
+    /// rendered on somebody else's artifact; here there is only one opinion in
+    /// the whole loop, and one ledger row should say so rather than let a
+    /// later reader mistake it for a review that happened.
+    AuthorSpec,
     /// A task was moved from the backlog into the queue, where a Scout will
     /// pick it up. Recorded because it is where spend begins.
     QueueTask,
@@ -808,6 +826,7 @@ impl DecisionAction {
             DecisionAction::NeedsRevision => "needs_revision",
             DecisionAction::Reject => "reject",
             DecisionAction::RequestBuild => "request_build",
+            DecisionAction::AuthorSpec => "author_spec",
             DecisionAction::QueueTask => "queue_task",
             DecisionAction::CaptureWork => "capture_work",
             DecisionAction::RetireWork => "retire_work",
@@ -827,6 +846,7 @@ impl DecisionAction {
             "needs_revision" => Some(DecisionAction::NeedsRevision),
             "reject" => Some(DecisionAction::Reject),
             "request_build" => Some(DecisionAction::RequestBuild),
+            "author_spec" => Some(DecisionAction::AuthorSpec),
             "queue_task" => Some(DecisionAction::QueueTask),
             "capture_work" => Some(DecisionAction::CaptureWork),
             "retire_work" => Some(DecisionAction::RetireWork),

@@ -10,8 +10,8 @@ use tasks::server::router;
 use tasks::store::Store;
 use tasks_api::events::EventPayload;
 use tasks_api::models::{
-    CloseReason, GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId,
-    TaskState, TranscriptOwner, TranscriptStream,
+    BuildStatus, CloseReason, GhState, Mode, Project, Session, SessionId, SessionStatus, Task,
+    TaskId, TaskState, TranscriptOwner, TranscriptStream,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -124,6 +124,34 @@ fn queue_flow_round_trips_typed_states() {
     let back = server.client.dequeue_task(&task.id).unwrap();
     assert_eq!(back.state, TaskState::Backlog);
     assert_eq!(back.manual_rank, None);
+}
+
+/// "Build now" as a client sees it: one call turns a backlog task into an
+/// approved, human-authored spec and a queued build.
+///
+/// The provenance is the assertion worth making — `session_id: None` is how a
+/// client knows nobody but the author ever read this spec, and it has to
+/// survive the round trip through JSON rather than only through Rust.
+#[test]
+fn build_now_returns_a_queued_build_over_a_human_authored_spec() {
+    let server = spawn_server();
+    let project = server.client.create_project("iamnbutler", "tasks").unwrap();
+    let task = server.seed_task(&project, 12);
+
+    let detail = server
+        .client
+        .build_task_now(&task.id, Some("the issue body is the spec".into()))
+        .unwrap();
+    assert_eq!(detail.build.status, BuildStatus::Queued);
+    assert_eq!(detail.spec_ids.len(), 1);
+
+    let spec = server.client.spec(&detail.spec_ids[0]).unwrap();
+    assert_eq!(spec.session_id, None, "no Scout ran");
+    assert_eq!(spec.content, task.body);
+    assert_eq!(
+        server.client.task(&task.id).unwrap().state,
+        TaskState::ReadyToBuild
+    );
 }
 
 /// Retiring work and taking that back are the same power, so the client has

@@ -95,6 +95,7 @@ No auth, loopback only — don't build a login flow.
 | Pick up a task | `POST /tasks/{task_id}/queue` | `backlog` → `queued`, appended at the end of the ranked order. 400 unless the task is `backlog`. The only door from the backlog into the pipeline — scouts dispatch **only** queued tasks. |
 | Un-pick a task | `POST /tasks/{task_id}/dequeue` | `queued` → `backlog`, rank cleared. 400 once work has started (past `queued`). |
 | Scout now | `POST /tasks/{task_id}/scout` | Queue the task (from `backlog` or `queued`) at the **front**, shifting everything else down. The dispatch loop picks it up on its next tick; the concurrency cap still applies — it jumps the queue, it doesn't bypass it. |
+| Build now | `POST /tasks/{task_id}/build-now` `{"content"?,"complexity"?,"base_branch"?,"rationale"?}` | Skip the Scout for a task whose issue body already *is* the spec. Writes the spec by hand, approves it, and queues a Builder run over it in one call; **202** with the same `{..., spec_ids}` shape as `POST /builds`. Legal only from `backlog` or `queued` — the states where no Scout has run and none is running (`backlog` → `ready_to_build` is a new edge). Every field is optional: the spec defaults to the issue body, complexity to `simple`. A supplied `content` **replaces** the body rather than extending it. 400 if that leaves nothing to build from. **Human-only**: any other actor is a 403, because this authors, approves and dispatches with no second opinion anywhere in the loop — no charter capability covers that. |
 | Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected`. `approved` → task `ready_to_build`; `needs_revision` → task returns to `queued` for a re-scout (feedback reaches the next scout's prompt); `rejected` → dead end. |
 | Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running). |
 
@@ -123,7 +124,13 @@ the server only.
   **404 when there is none**, which is the ordinary case.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,
-  `agent_exit_code`.
+  `agent_exit_code`. **`session_id` is nullable**: null means no Scout ran and
+  a human wrote this spec by hand (`POST /tasks/{id}/build-now`). Such a spec
+  has no transcript, no session to link to, and no independent reviewer — the
+  human who wrote it is the review. Say "human-authored" where the scout link
+  would go rather than leaving the absence to be inferred, and keep
+  `files_touched` empty as the server does: it is genuinely unknown, and an
+  invented one feeds the overlap briefs a lie rather than an omission.
 - `GET /spec-queue` — `{entry: {...}, task_id}` items for the review screen.
 - `POST /builds` `{"spec_ids": [...], "base_branch"?}` — queue a Builder run
   over a set of **approved** specs; **202** with the build (`{..., spec_ids}`).
@@ -354,6 +361,9 @@ All enums are snake_case strings on the wire:
   still good.
   Scout failures and `needs_revision` verdicts return to `queued`, never
   `backlog` — picked-up work stays picked up.
+  One edge skips the middle: `backlog`/`queued` → `ready_to_build` when a
+  human writes the spec themselves via `POST /tasks/{id}/build-now`. Switch
+  on `to` rather than on the `(from, to)` pair and it costs nothing.
 - There is no "mark done" endpoint, deliberately: **closing the GitHub issue
   is the done signal.** When a picked-up task's issue closes, the next poll
   retires it — `queued`/`in_review`/`ready_to_build` become `done` (or
@@ -380,7 +390,8 @@ Event JSON: `{seq, timestamp, payload}` where payload is tagged by `"kind"`
 (`from`/`to`), `task_gh_state_changed` (`task_id`, `gh_state` — the poller's
 snapshot of GitHub's open/closed flag moved, most often because the issue
 dropped out of the repository's open set; refetch the task or the list),
-`session_started`, `session_completed`, `spec_created`,
+`session_started`, `session_completed`, `spec_created` (`spec_id`,
+`task_id`, `session_id` — **nullable**, absent for a human-authored spec),
 `spec_queue_status_changed`, `queue_reordered`, `spec_queue_reordered`,
 `build_requested` (`build_id`, `spec_ids`), `build_started`,
 `build_completed` (`build_id`, `status` — refetch the build for detail),

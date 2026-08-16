@@ -101,7 +101,7 @@ async fn seed_spec(h: &Harness, issue: u64) -> Spec {
     h.store.insert_session(&session).await.unwrap();
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task.id,
         content: "## Spec".into(),
         complexity: Complexity::Simple,

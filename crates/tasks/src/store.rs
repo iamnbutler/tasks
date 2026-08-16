@@ -1766,7 +1766,7 @@ impl Store {
              files_touched, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(spec.id.as_str())
-        .bind(spec.session_id.as_str())
+        .bind(spec.session_id.as_ref().map(|id| id.as_str()))
         .bind(spec.task_id.as_str())
         .bind(&spec.content)
         .bind(spec.complexity.as_str())
@@ -2026,6 +2026,136 @@ impl Store {
             feedback,
             ..entry
         })
+    }
+
+    /// Write a spec by hand and approve it in the same act, for a task whose
+    /// issue body already is the specification (#869).
+    ///
+    /// One transaction, because from the human's side this is one decision:
+    /// the spec lands with `session_id NULL` (no Scout ran), its queue entry
+    /// lands `approved`, the ledger gets a single `author_spec` row, and the
+    /// task moves to `ready_to_build` for an ordinary `create_build` to pick
+    /// up. What is skipped is not only the scouting but the **review** — there
+    /// is no independent artifact to rule on, so the human writing this is the
+    /// review, and the ledger says `author_spec` rather than `approve`
+    /// precisely so nobody later reads a second opinion into it.
+    ///
+    /// `files_touched` stays empty and is not a placeholder to fill in later:
+    /// [`crate::brief`] derives its overlap facts from that list, and an
+    /// invented one would feed the brief a lie rather than an omission.
+    ///
+    /// Legal only from `Backlog` or `Queued` — the two states from which no
+    /// Scout has run and none is running. A `Queued` task may already carry a
+    /// spec (a `needs_revision` verdict returns it there), and that is allowed:
+    /// the human read the feedback and decided to write it themselves. The
+    /// older spec keeps its verdict; `latest_spec` and `create_build` see only
+    /// this one. Every refusal happens before the transaction opens.
+    pub async fn author_spec(
+        &self,
+        task_id: &TaskId,
+        content: &str,
+        complexity: Complexity,
+        decision: DecisionInput,
+    ) -> Result<Spec, StoreError> {
+        if content.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "a hand-written spec needs content — there is nothing for the Builder to \
+                 read otherwise"
+                    .into(),
+            ));
+        }
+        require_rationale(&decision)?;
+
+        let task = self
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        if !matches!(task.state, TaskState::Backlog | TaskState::Queued) {
+            return Err(StoreError::Invalid(format!(
+                "task {task_id} is {}, and build-now only writes a spec for work no Scout \
+                 has started — review the spec it already has instead",
+                task.state.as_str()
+            )));
+        }
+
+        let now = Utc::now();
+        let spec = Spec {
+            id: SpecId::new(),
+            session_id: None,
+            task_id: task_id.clone(),
+            content: content.to_string(),
+            complexity,
+            files_touched: vec![],
+            created_at: now,
+        };
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, \
+             files_touched, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?)",
+        )
+        .bind(spec.id.as_str())
+        .bind(spec.task_id.as_str())
+        .bind(&spec.content)
+        .bind(spec.complexity.as_str())
+        .bind(serde_json::to_string(&spec.files_touched)?)
+        .bind(spec.created_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO spec_queue (spec_id, status, rank, approved_at, feedback, \
+             blocking_dependencies) VALUES (?, ?, NULL, ?, NULL, '[]')",
+        )
+        .bind(spec.id.as_str())
+        .bind(SpecQueueStatus::Approved.as_str())
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        // The ledger row lands with the writes it authorizes, as in
+        // `review_spec`: this is the only judgment anywhere in this path, so a
+        // crash that kept the approved spec and lost the reason would leave
+        // nothing to review it by.
+        let decision_seq = insert_decision(
+            &mut tx,
+            "spec",
+            spec.id.as_str(),
+            DecisionAction::AuthorSpec,
+            &decision,
+            now,
+        )
+        .await?;
+        sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(TaskState::ReadyToBuild.as_str())
+            .bind(now.to_rfc3339())
+            .bind(task.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        self.append_event(EventPayload::SpecCreated {
+            spec_id: spec.id.clone(),
+            task_id: spec.task_id.clone(),
+            session_id: None,
+        })
+        .await?;
+        self.append_event(EventPayload::SpecQueueStatusChanged {
+            spec_id: spec.id.clone(),
+            from: None,
+            to: SpecQueueStatus::Approved,
+            actor: Some(decision.actor),
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+        if task.state != TaskState::ReadyToBuild {
+            self.append_event(EventPayload::TaskStateChanged {
+                task_id: task.id.clone(),
+                from: task.state,
+                to: TaskState::ReadyToBuild,
+            })
+            .await?;
+        }
+
+        Ok(spec)
     }
 
     // --- builds ---
@@ -3729,7 +3859,10 @@ fn spec_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Spec, StoreError> {
     let files_raw: String = row.try_get("files_touched")?;
     Ok(Spec {
         id: SpecId::from_raw(row.try_get::<String, _>("id")?),
-        session_id: SessionId::from_raw(row.try_get::<String, _>("session_id")?),
+        // NULL is the tell that no Scout ran — a human wrote this one.
+        session_id: row
+            .try_get::<Option<String>, _>("session_id")?
+            .map(SessionId::from_raw),
         task_id: TaskId::from_raw(row.try_get::<String, _>("task_id")?),
         content: row.try_get("content")?,
         complexity: Complexity::from_str(&complexity_raw).ok_or(StoreError::BadEnum {
@@ -4195,7 +4328,7 @@ mod tests {
 
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session.id.clone(),
+            session_id: Some(session.id.clone()),
             task_id: task.id.clone(),
             content: "## Spec\nTODO".into(),
             complexity: Complexity::Medium,
@@ -4232,7 +4365,7 @@ mod tests {
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session.id.clone(),
+            session_id: Some(session.id.clone()),
             task_id: task.id.clone(),
             content: "## Spec".into(),
             complexity: Complexity::Simple,
@@ -5326,7 +5459,7 @@ mod tests {
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session.id.clone(),
+            session_id: Some(session.id.clone()),
             task_id: task.id.clone(),
             content: "## Spec".into(),
             complexity: Complexity::Simple,
@@ -6188,7 +6321,7 @@ mod tests {
         store.insert_session(&session).await.unwrap();
         let second = Spec {
             id: SpecId::new(),
-            session_id: session.id.clone(),
+            session_id: Some(session.id.clone()),
             task_id: task.id.clone(),
             content: "## Spec two".into(),
             complexity: Complexity::Simple,
@@ -6383,7 +6516,7 @@ mod tests {
     async fn transcript_seqs_run_per_owner_and_never_cross() {
         let store = Store::open_in_memory().await.unwrap();
         let (_task, spec) = seed_spec(&store, 1).await;
-        let session_owner = TranscriptOwner::session(&spec.session_id);
+        let session_owner = TranscriptOwner::session(spec.session_id.as_ref().unwrap());
         approve(&store, &spec).await;
         let build = store
             .create_build(
@@ -6460,7 +6593,7 @@ mod tests {
         for (session_id, build_id) in [
             (None, None),
             (
-                Some(spec.session_id.to_string()),
+                Some(spec.session_id.as_ref().unwrap().to_string()),
                 Some(build.id.to_string()),
             ),
         ] {
@@ -7051,7 +7184,7 @@ mod tests {
 
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session.id,
+            session_id: Some(session.id),
             task_id: task.id.clone(),
             content: format!("## Spec: issue {issue}"),
             complexity: Complexity::Simple,
@@ -7229,6 +7362,245 @@ mod tests {
         );
         let next = store.claim_next_queued_build().await.unwrap().unwrap();
         assert_eq!(next.status, BuildStatus::Running);
+    }
+
+    // --- hand-written specs (#869) ---
+
+    /// A spec a human wrote is buildable by exactly the ordinary path: nothing
+    /// downstream of `author_spec` knows or cares that no Scout ran.
+    #[tokio::test]
+    async fn a_hand_written_spec_builds_like_any_other() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+
+        let spec = store
+            .author_spec(
+                &task.id,
+                "## Spec\nFlip the default.",
+                Complexity::Simple,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spec.session_id, None);
+        assert!(spec.files_touched.is_empty());
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild
+        );
+        // Round-trips through SQL as NULL, not as an empty string.
+        assert_eq!(
+            store.get_spec(&spec.id).await.unwrap().unwrap().session_id,
+            None
+        );
+
+        // `create_build` accepts it on its own terms — it only ever asked
+        // whether the queue entry was approved.
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let claimed = store.claim_next_queued_build().await.unwrap().unwrap();
+        assert_eq!(claimed.id, build.id);
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Building
+        );
+
+        // The events a client needs to follow this, in order, and the
+        // provenance rides the first one.
+        let kinds: Vec<&str> = store
+            .all_events()
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.payload.kind())
+            .collect();
+        assert!(kinds.contains(&"spec_created"));
+        assert!(kinds.contains(&"spec_queue_status_changed"));
+        assert!(kinds.contains(&"task_state_changed"));
+        let created = store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.payload {
+                EventPayload::SpecCreated { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .expect("a spec_created event");
+        assert_eq!(created, None, "no session to name");
+    }
+
+    /// The two states a Scout has not touched are legal; everything else is
+    /// refused. `Queued` is legal even when it already carries a spec — a
+    /// `needs_revision` verdict returns a task there, and the human who read
+    /// that feedback may well decide to write the spec themselves.
+    #[tokio::test]
+    async fn author_spec_accepts_only_the_states_before_a_scout() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        for (issue, state) in [(1, TaskState::Backlog), (2, TaskState::Queued)] {
+            let mut task = sample_task(&project.id);
+            task.gh_issue_number = issue;
+            task.state = state;
+            store.insert_task(&task).await.unwrap();
+            store
+                .author_spec(
+                    &task.id,
+                    "## Spec",
+                    Complexity::Simple,
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{} should be legal: {e}", state.as_str()));
+        }
+
+        for (issue, state) in [
+            (10, TaskState::Scouting),
+            (11, TaskState::InReview),
+            (12, TaskState::ReadyToBuild),
+            (13, TaskState::Building),
+            (14, TaskState::Done),
+            (15, TaskState::Rejected),
+        ] {
+            let mut task = sample_task(&project.id);
+            task.gh_issue_number = issue;
+            task.state = state;
+            store.insert_task(&task).await.unwrap();
+            let err = store
+                .author_spec(
+                    &task.id,
+                    "## Spec",
+                    Complexity::Simple,
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::Invalid(_)),
+                "{} should be refused, got {err:?}",
+                state.as_str()
+            );
+        }
+
+        // A `queued` task that already carries a scout's rejected spec still
+        // qualifies: the human read the verdict and is writing their own.
+        let (task, scouted) = approved_spec(&store, &project, 99).await;
+        store
+            .review_spec(
+                &scouted.id,
+                SpecQueueStatus::NeedsRevision,
+                Some("too vague".into()),
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        let mine = store
+            .author_spec(
+                &task.id,
+                "## Spec\nWhat the scout should have written.",
+                Complexity::Simple,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&scouted.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::NeedsRevision,
+            "the older spec keeps its verdict"
+        );
+        assert_eq!(
+            store
+                .latest_reviewed_spec(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .spec
+                .id,
+            mine.id,
+            "the newest spec is the one anything downstream sees"
+        );
+    }
+
+    /// Every refusal happens before the transaction opens, so a rejected call
+    /// leaves nothing at all: no spec, no queue entry, no ledger row, no
+    /// event, and the task where it was.
+    #[tokio::test]
+    async fn a_refused_author_spec_writes_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+
+        for content in ["", "   \n  "] {
+            assert!(matches!(
+                store
+                    .author_spec(
+                        &task.id,
+                        content,
+                        Complexity::Simple,
+                        DecisionInput::human()
+                    )
+                    .await
+                    .unwrap_err(),
+                StoreError::Invalid(_)
+            ));
+        }
+        // An orchestrator that somehow reached the store still owes a
+        // rationale, on the same rule as every other decision.
+        assert!(matches!(
+            store
+                .author_spec(
+                    &task.id,
+                    "## Spec",
+                    Complexity::Simple,
+                    DecisionInput {
+                        actor: Actor::Orchestrator,
+                        rationale: None,
+                        evidence: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+            StoreError::Invalid(_)
+        ));
+        assert!(matches!(
+            store
+                .author_spec(
+                    &TaskId::new(),
+                    "## Spec",
+                    Complexity::Simple,
+                    DecisionInput::human()
+                )
+                .await
+                .unwrap_err(),
+            StoreError::NotFound(_)
+        ));
+
+        assert!(store.list_specs().await.unwrap().is_empty());
+        assert!(store.list_spec_queue().await.unwrap().is_empty());
+        assert!(store.decisions(None, 10).await.unwrap().is_empty());
+        assert!(store.all_events().await.unwrap().is_empty());
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Backlog
+        );
     }
 
     /// A build has two durations, and conflating them is what made an

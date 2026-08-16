@@ -19,6 +19,17 @@ implementation.
   quoted as explicitly unverified leads. Reporting a partial spec *as* a spec
   would be worse than losing the run, because a half-explored spec in the
   review queue looks finished. Promoting notes into a spec stays a human act.
+  A human may also skip the Scout outright — `POST /tasks/{id}/build-now`
+  writes a spec by hand for a task whose issue body already is one, and its
+  `specs.session_id IS NULL` is the tell. It changes nothing below: the spec is
+  text, so the Builder cannot distinguish it. What it skips is not only the
+  scouting but the **review**, since there is no independent artifact to rule
+  on — hence a single `author_spec` decision row rather than an `approve`,
+  which would claim a second opinion that does not exist. It is human-only and
+  refuses the orchestrator outright rather than being charter-gated: authoring,
+  approving and dispatching one's own work with no second opinion anywhere in
+  the loop is a different autonomy from `dispatch_builds`, and if it is ever
+  granted it wants its own named capability.
 - **Never persist a GitHub-owned fact** (PR mergeable/SHA/CI, issue
   open-closed, labels). Query at decision time. Persist only Tasks-owned
   state plus append-only decisions keyed to immutable SHAs. GitHub writes go
@@ -35,7 +46,8 @@ implementation.
   accountable actor is fine — the orchestrator may do it when `queue_tasks` is
   live in the charter. The invariant is upheld by the pipeline's shape, not by
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
-  and builds are serial.
+  and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
+  rather than beside it: it is per-task, human-only, and one call is one build.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
   prompt.** Eight independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,

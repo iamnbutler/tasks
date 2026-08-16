@@ -25,9 +25,27 @@ struct TaskView {
     updated_at: chrono::DateTime<chrono::Utc>,
     body: String,
     github_url: Option<String>,
-    /// `(spec id, complexity, content)` when the task sits in review with a
-    /// pending verdict.
-    pending_spec: Option<(SpecId, Complexity, String)>,
+    /// The task's newest spec, whatever the queue has decided about it —
+    /// which is why it is not gated on `in_review`. A spec is the best
+    /// description of the work there is; hiding it the moment a verdict lands
+    /// left the inspector showing the issue body for everything downstream of
+    /// review.
+    spec: Option<SpecView>,
+    /// The spec id when that spec is still awaiting a verdict. What the review
+    /// actions key off — approving something already approved is not an
+    /// action, it is a second click that means nothing.
+    pending_spec: Option<SpecId>,
+}
+
+/// The spec as the inspector renders it.
+struct SpecView {
+    id: SpecId,
+    complexity: Complexity,
+    content: String,
+    /// No Scout ran: a human wrote this spec through Build Now, and there is
+    /// no session, no transcript and no second opinion behind it. Rendered
+    /// rather than inferred from a missing scout link.
+    human_authored: bool,
 }
 
 impl Workspace {
@@ -38,26 +56,32 @@ impl Workspace {
             self.selected_task
                 .as_ref()
                 .and_then(|id| state.task(id))
-                .map(|task| TaskView {
-                    id: task.id.clone(),
-                    title: task.title.clone(),
-                    number: task.gh_issue_number,
-                    state: task.state,
-                    gh_state: task.gh_state,
-                    labels: task.labels.clone(),
-                    updated_at: task.updated_at,
-                    body: task.body.clone(),
-                    github_url: state.github_url(task),
-                    pending_spec: (task.state == TaskState::InReview)
-                        .then(|| state.latest_spec(&task.id))
-                        .flatten()
-                        .filter(|spec| {
-                            state.spec_queue.iter().any(|item| {
-                                item.entry.spec_id == spec.id
-                                    && item.entry.status == SpecQueueStatus::PendingReview
-                            })
+                .map(|task| {
+                    let spec = state.latest_spec(&task.id);
+                    let pending = spec.filter(|spec| {
+                        state.spec_queue.iter().any(|item| {
+                            item.entry.spec_id == spec.id
+                                && item.entry.status == SpecQueueStatus::PendingReview
                         })
-                        .map(|spec| (spec.id.clone(), spec.complexity, spec.content.clone())),
+                    });
+                    TaskView {
+                        id: task.id.clone(),
+                        title: task.title.clone(),
+                        number: task.gh_issue_number,
+                        state: task.state,
+                        gh_state: task.gh_state,
+                        labels: task.labels.clone(),
+                        updated_at: task.updated_at,
+                        body: task.body.clone(),
+                        github_url: state.github_url(task),
+                        spec: spec.map(|spec| SpecView {
+                            id: spec.id.clone(),
+                            complexity: spec.complexity,
+                            content: spec.content.clone(),
+                            human_authored: spec.session_id.is_none(),
+                        }),
+                        pending_spec: pending.map(|spec| spec.id.clone()),
+                    }
                 })
         };
 
@@ -218,7 +242,7 @@ impl Workspace {
             }
             _ => {}
         }
-        if let Some((spec_id, _, _)) = &task.pending_spec {
+        if let Some(spec_id) = &task.pending_spec {
             any_action = true;
             actions = actions.child(self.action_button(
                 "approve-spec",
@@ -256,7 +280,7 @@ impl Workspace {
         // orchestrator conversation for anything that isn't a verdict yet:
         // "is this already done?", "should we close this?". Reject lives
         // here, quieter than Approve — in practice you ask before you reject.
-        if let Some((spec_id, _, _)) = &task.pending_spec {
+        if let Some(spec_id) = &task.pending_spec {
             let has_text = !self.review_input.read(cx).content().trim().is_empty();
             pane = pane.child(
                 div()
@@ -342,19 +366,85 @@ impl Workspace {
             );
         }
 
+        // Build now: skip the Scout for a task whose issue body already is the
+        // spec. Only before any work has started — past `queued` a Scout has
+        // run or is running, and the server refuses it anyway.
+        //
+        // The draft is the *rationale*, and the button is inert without it.
+        // Nothing else in this path carries a second opinion — the human
+        // writing the spec is the review — so the reason it needed none is the
+        // only thing a later reader has. The server does not demand it; this
+        // form demands it of itself, because a one-click path to an unreviewed
+        // build is not worth the seconds it saves.
+        if matches!(task.state, TaskState::Backlog | TaskState::Queued) {
+            let has_text = !self.build_input.read(cx).content().trim().is_empty();
+            pane = pane.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child("BUILD NOW — the issue body becomes the spec, unreviewed"),
+                    )
+                    .child(
+                        div()
+                            .h(px(52.))
+                            .p(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.border_secondary())
+                            .bg(theme.bg())
+                            .text_sm()
+                            .child(text_area(&self.build_input, cx).size_full()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(self.form_button(
+                                "build-now",
+                                "Build Now",
+                                gpui::hsla(200. / 360., 0.70, 0.58, 1.),
+                                has_text,
+                                cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.build_selected_task_now(cx);
+                                }),
+                                cx,
+                            )),
+                    ),
+            );
+        }
+
         // Specs and issue bodies are markdown at the source (agent output,
         // GitHub issues) — render them as such, through the shared cache.
-        if let Some((spec_id, complexity, content)) = task.pending_spec {
+        //
+        // The spec shows whatever the queue has decided about it, not only
+        // while a verdict is pending: it is the best description of the work
+        // there is, and hiding it once it is approved left every task past
+        // review showing its issue body instead.
+        if let Some(SpecView {
+            id: spec_id,
+            complexity,
+            content,
+            human_authored,
+        }) = task.spec
+        {
             let entity = self
                 .markdown_cache()
                 .entity(format!("spec:{spec_id}"), &content, cx);
+            let mut header = format!("SPEC · {}", complexity.as_str().to_uppercase());
+            if human_authored {
+                // Said rather than left to be inferred from a scout link that
+                // isn't there: nobody but the author ever read this one.
+                header.push_str(" · HUMAN-AUTHORED");
+            }
             pane = pane
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.fg_muted())
-                        .child(format!("SPEC · {}", complexity.as_str().to_uppercase())),
-                )
+                .child(div().text_xs().text_color(theme.fg_muted()).child(header))
                 .child(
                     div()
                         .p(px(8.))

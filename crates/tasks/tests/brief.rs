@@ -82,7 +82,7 @@ async fn seed_spec_for_task(
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task_id.clone(),
         content: "## Spec".into(),
         complexity: Complexity::Simple,

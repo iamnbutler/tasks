@@ -716,6 +716,19 @@ impl AppState {
         self.run(cx, move |client| client.request_build(vec![id], None));
     }
 
+    /// "Build now": write the task's issue body as its spec, approve it, and
+    /// queue the Builder run — one call, because it is one decision.
+    ///
+    /// For a task whose issue body already *is* the specification. `rationale`
+    /// is the only record of why this skipped its Scout *and* its review, so
+    /// the caller is expected to have one; the server does not require it.
+    /// 202 and nothing applied locally — the refresh reads the new state back.
+    pub fn build_task_now(&mut self, id: TaskId, rationale: String, cx: &mut Context<Self>) {
+        self.run(cx, move |client| {
+            client.build_task_now(&id, Some(rationale))
+        });
+    }
+
     /// Put a message in the sidebar banner without a server round trip — how
     /// a refused keystroke says why instead of doing nothing. Cleared by the
     /// next successful refresh, like any other banner text.
