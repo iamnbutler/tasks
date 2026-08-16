@@ -492,6 +492,29 @@ in the feed at the next boot. Shutdown holds the HTTP port through the whole
 drain (so a restart is a hand-over, not an outage) and releases it last, which
 means a successor waits for this process to exit before it can bind.
 
+**Which is why the last thing a shutdown waits on is bounded too: the clients.**
+A graceful shutdown that waits for open connections never returns here, because
+half this API is streams — `/events/stream`, `/orchestrator/stream` and the two
+transcript tails end when the *client* hangs up, and the app holds them for as
+long as it is open. So "wait for connections to close" reads as "wait for the
+user to quit the app", and the observed behaviour was a **75s SIGKILL on every
+single restart**, with `drain complete` in the log a millisecond after the
+SIGTERM. The 75s is not merely the cost: `reload`'s grace is 75s and the drain's
+own budget is 70s, so a process that always burns the full grace leaves 5s of
+margin, and a drain that genuinely needs its budget is severed mid-teardown by
+the kill that should never have been reached — plus the pidfile cleanup after
+`serve_on` that a SIGKILL skips. `CONNECTION_GRACE` (2s, the remainder of that
+same arithmetic) is the exit condition, not a tuning knob. It lives in
+`server::serve_on` rather than in the four stream handlers deliberately: a
+handler taught to stop is one endpoint's fix and the next long-lived route
+brings the hang back, whereas the property *a shutdown terminates* holds for
+routes nobody has written yet. Severing a tail is safe in the way waiting is
+not — an SSE client resumes from `?since=`, so it costs a reconnect to a
+successor that is already binding. The `biased` select is load-bearing for the
+same reason it is in `cancel::bounded`: a server that closed its connections
+inside the grace reports its own result, so a genuine accept-loop error is
+never overwritten with the timer arm's `Ok(())`.
+
 **The drain is bounded at every stage, and it names whatever it walked away
 from.** `poll`, `nudge` and `obligations` used to be awaited *unbounded* and
 unnamed, while scouts/builds and the orchestrator turn already had
