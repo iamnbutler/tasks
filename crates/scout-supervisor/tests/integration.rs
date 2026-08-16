@@ -80,6 +80,15 @@ struct SupervisorProc {
 
 impl SupervisorProc {
     async fn spawn(binary: &Path, agent_cmd: &str, workdir_root: &Path) -> Self {
+        Self::spawn_with_env(binary, agent_cmd, workdir_root, &[]).await
+    }
+
+    async fn spawn_with_env(
+        binary: &Path,
+        agent_cmd: &str,
+        workdir_root: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let mut cmd = Command::new(binary);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -90,6 +99,9 @@ impl SupervisorProc {
             // change without sleeping through a real interval. Harmless for
             // the tests whose agents never write notes: no file, no event.
             .env("SCOUT_CHECKPOINT_INTERVAL_SECS", "1");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
         let mut child = cmd.spawn().expect("spawn supervisor");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -460,6 +472,200 @@ async fn an_interrupted_run_is_salvaged_and_never_reported_as_a_spec() {
         }
         other => panic!("a half-written spec must not complete the run: {other:?}"),
     }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// A directory for a fixture's own state, outside the clone. A marker file
+/// inside the workdir would show up in `files_touched` and change what the
+/// test is measuring.
+fn stub_state(tmp: &Path) -> PathBuf {
+    let dir = tmp.join("stub-state");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// #845: the agent's API connection dies mid-response, and the run continues
+/// instead of ending.
+///
+/// The whole point is that this happens *inside the VM* — the resumed agent
+/// gets the same conversation and the same worktree, so the notes it wrote
+/// before the death are still there. A host-side retry would get neither.
+#[tokio::test]
+async fn a_dropped_api_connection_is_resumed_and_the_run_completes() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("stub-agent-api-death.sh");
+    let state = stub_state(tmp.path());
+
+    // One resume is enough to prove the loop, and each one costs a real 2s
+    // backoff — the delay is not faked.
+    let mut sup = SupervisorProc::spawn_with_env(
+        &binary,
+        agent.to_str().unwrap(),
+        tmp.path(),
+        &[
+            ("STUB_STATE", state.to_str().unwrap()),
+            ("SCOUT_MAX_RESUMES", "1"),
+        ],
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_845".into(),
+            repo_clone_url: repo_url,
+            base_branch: "main".into(),
+            prompt: "Explore #845.".into(),
+        }),
+    })
+    .await;
+
+    let mut exit_code = None;
+    let mut announced_resume = false;
+    let mut terminal = None;
+    while terminal.is_none() {
+        match sup.recv().await {
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::Progress { line, .. }),
+            } => {
+                if line.contains("resuming session") {
+                    announced_resume = true;
+                }
+            }
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::ImplementationFinished { exit_code: code }),
+            } => exit_code = Some(code),
+            VmEvent::App {
+                payload:
+                    TaskEvent::Scout(
+                        evt @ (ScoutEvent::Completed { .. }
+                        | ScoutEvent::StoppedEarly { .. }
+                        | ScoutEvent::Failed { .. }),
+                    ),
+            } => terminal = Some(evt),
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    assert!(
+        announced_resume,
+        "the resume boundary must reach the transcript as a Progress line"
+    );
+    // The LAST attempt's code, not the death's: this event describes the run.
+    assert_eq!(exit_code, Some(0));
+
+    match terminal.unwrap() {
+        ScoutEvent::Completed {
+            spec_markdown,
+            files_touched,
+        } => {
+            assert!(
+                spec_markdown.contains("Survived a dropped connection"),
+                "spec: {spec_markdown}"
+            );
+            assert!(files_touched.contains(&"src/resumed.rs".to_string()));
+        }
+        other => panic!("a resumed run should complete: {other:?}"),
+    }
+
+    // The fixture asserts on its own side that it was handed the session id it
+    // announced, and exits 9 if not — so two attempts and a clean finish is
+    // proof the resume named the right conversation.
+    let attempts = std::fs::read_to_string(state.join("attempts")).unwrap();
+    assert_eq!(attempts.trim(), "2", "expected exactly one resume");
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// The connection dies on every attempt: the budget runs out and the run ends.
+///
+/// Two things must survive that. The salvage — notes written before the first
+/// death are still worth the next attempt's while — and a terminal reason that
+/// names the transport failure. "SPEC.md not found" on its own reads as a
+/// verdict on the exploration, which is exactly what it was not.
+#[tokio::test]
+async fn an_unresumable_transport_death_names_itself_and_keeps_its_salvage() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("stub-agent-api-death-always.sh");
+    let state = stub_state(tmp.path());
+
+    let mut sup = SupervisorProc::spawn_with_env(
+        &binary,
+        agent.to_str().unwrap(),
+        tmp.path(),
+        &[
+            ("STUB_STATE", state.to_str().unwrap()),
+            ("SCOUT_MAX_RESUMES", "1"),
+        ],
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_845_hopeless".into(),
+            repo_clone_url: repo_url,
+            base_branch: "main".into(),
+            prompt: "Explore #845.".into(),
+        }),
+    })
+    .await;
+
+    let mut terminal = None;
+    while terminal.is_none() {
+        match sup.recv().await {
+            VmEvent::App {
+                payload:
+                    TaskEvent::Scout(
+                        evt @ (ScoutEvent::Completed { .. }
+                        | ScoutEvent::StoppedEarly { .. }
+                        | ScoutEvent::Failed { .. }),
+                    ),
+            } => terminal = Some(evt),
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    match terminal.unwrap() {
+        ScoutEvent::StoppedEarly {
+            reason,
+            notes_markdown,
+            ..
+        } => {
+            assert!(
+                reason.contains("connection to the API failed"),
+                "the reason must name the transport failure: {reason}"
+            );
+            assert!(reason.contains("HTTP 529"), "reason: {reason}");
+            assert!(
+                reason.contains("not a verdict on the work"),
+                "reason: {reason}"
+            );
+            assert!(reason.contains("resumed 1 time(s)"), "reason: {reason}");
+            assert!(
+                reason.contains("resume budget is spent"),
+                "reason: {reason}"
+            );
+            // The symptom is still there — it just no longer stands alone.
+            assert!(reason.contains("SPEC.md"), "reason: {reason}");
+            assert!(notes_markdown.contains("First finding"), "{notes_markdown}");
+        }
+        other => panic!("expected salvage, got {other:?}"),
+    }
+
+    let attempts = std::fs::read_to_string(state.join("attempts")).unwrap();
+    assert_eq!(attempts.trim(), "2", "one resume, then the budget is spent");
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;

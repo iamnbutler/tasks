@@ -52,4 +52,16 @@ ENV SCOUT_AGENT_CMD="claude --print --output-format stream-json --verbose --dang
 # already received is all there will ever be.
 ENV SCOUT_CHECKPOINT_INTERVAL_SECS=30
 
+# How many times the supervisor re-invokes a dead agent with
+# `--resume <session_id>` when its API connection dropped mid-response (#845).
+# Set here rather than in the server's env for the same reason as the line
+# above: it is read *inside* the VM. `0` disables resuming.
+#
+# The resume happens in this VM, so the conversation, the worktree and NOTES.md
+# all survive it — a host-side retry would get a new VM and a fresh clone and
+# keep none of them. Only a transport death is retried; an OOM kill, a
+# deallocated VM and an agent that concluded are all left alone. See
+# crates/tasks-protocol/src/agent_run.rs.
+ENV SCOUT_MAX_RESUMES=2
+
 ENTRYPOINT ["/usr/local/bin/scout-supervisor"]

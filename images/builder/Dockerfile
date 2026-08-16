@@ -37,4 +37,10 @@ ENV CARGO_BUILD_JOBS=1
 # Credentials (ANTHROPIC_API_KEY) are injected per-VM, never baked in.
 ENV BUILDER_AGENT_CMD="claude --print --output-format stream-json --verbose --dangerously-skip-permissions"
 
+# Resumes allowed after a dropped API connection (#845) — read inside the VM,
+# so it is set here rather than in the server's env. `0` disables resuming.
+# See images/scout/Dockerfile; it matters more here, because a Builder's
+# worktree is the implementation and only an in-VM resume keeps it.
+ENV BUILDER_MAX_RESUMES=2
+
 ENTRYPOINT ["/usr/local/bin/builder-supervisor"]

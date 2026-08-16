@@ -9,7 +9,9 @@
 //!   3. Creates a throwaway branch `scout/<task_id>-<short-uuid>`
 //!   4. Writes the prompt to `PROMPT.md` (reference copy) and pipes it to the
 //!      agent's stdin
-//!   5. Runs the configured agent command with cwd = workdir
+//!   5. Runs the configured agent command with cwd = workdir, resuming it in
+//!      place (`--resume <session_id>`, up to `SCOUT_MAX_RESUMES`) if its API
+//!      connection drops mid-response — see [`tasks_protocol::agent_run`]
 //!   6. Streams agent stdout/stderr as `ScoutEvent::Progress`, and `NOTES.md`
 //!      as `ScoutEvent::Checkpoint` every `SCOUT_CHECKPOINT_INTERVAL_SECS`
 //!   7. On exit: reads `SPEC.md` if present, emits `Completed`; else
@@ -40,7 +42,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tasks_protocol::vm_memory::{AgentOutcome, sample_memory};
+use tasks_protocol::agent_run::{
+    AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, max_resumes_from_env,
+};
+use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
     LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
 };
@@ -257,8 +262,8 @@ async fn run_scout(
     // after the terminal event that supersedes it.
     watcher.abort();
 
-    let outcome = match agent {
-        Ok(outcome) => outcome,
+    let run = match agent {
+        Ok(run) => run,
         Err(e) => {
             emit(
                 &tx,
@@ -270,16 +275,19 @@ async fn run_scout(
             return;
         }
     };
+    // The exit code of the *last* attempt, so a run that was resumed and then
+    // finished cleanly reports 0. This event describes the run, not the first
+    // process — see [`AgentRun`].
     emit(
         &tx,
         ScoutEvent::ImplementationFinished {
-            exit_code: outcome.exit_code,
+            exit_code: run.outcome.exit_code,
         },
     )
     .await;
 
     // 5. Spec, or salvage, or nothing.
-    report_outcome(&workdir, &base_sha, &outcome, &tx).await;
+    report_outcome(&workdir, &base_sha, &run, &tx).await;
 }
 
 /// Decide what the run produced and emit the one terminal event that says so.
@@ -291,7 +299,7 @@ async fn run_scout(
 async fn report_outcome(
     workdir: &Path,
     base_sha: &str,
-    outcome: &AgentOutcome,
+    run: &AgentRun,
     tx: &mpsc::Sender<TaskVmEvent>,
 ) {
     let spec_path = workdir.join(SPEC_FILE);
@@ -300,22 +308,24 @@ async fn report_outcome(
 
     // Why the run is not being reported as a spec. `None` means it is.
     let shortfall = match &spec {
-        Ok(content) => match spec_verdict(content, outcome.exit_code) {
+        Ok(content) => match spec_verdict(content, run.outcome.exit_code) {
             SpecVerdict::Spec => None,
             SpecVerdict::Unfinished { missing } => Some(format!(
                 "SPEC.md is not a spec yet — {} {} missing or still template{}",
                 missing.join(", "),
                 if missing.len() == 1 { "is" } else { "are" },
-                outcome.failure_context()
+                run.failure_context()
             )),
         },
         // The most common cause of a missing spec is an agent that never got
-        // to write one — including one the OOM killer took out. Say so here:
-        // for a Scout this reason is the whole postmortem.
+        // to write one — including one the OOM killer took out, and one whose
+        // API connection died (#845). Say so here: for a Scout this reason is
+        // the whole postmortem, and "SPEC.md not found" on its own reads as a
+        // verdict on the exploration when it was a dropped connection.
         Err(e) => Some(format!(
             "SPEC.md not found at {}: {e}{}",
             spec_path.display(),
-            outcome.failure_context()
+            run.failure_context()
         )),
     };
 
@@ -693,26 +703,118 @@ async fn git_diff_name_only(workdir: &Path, base_sha: &str) -> Result<Vec<String
         .collect())
 }
 
-/// Run the agent, streaming its output, and report how it ended.
+/// Run the agent to a conclusion, resuming it across dropped API connections,
+/// and report how the whole run ended.
 ///
-/// The run is bracketed by cgroup memory samples: an OOM kill inside this VM
-/// is otherwise invisible, because the kernel usually kills a compiler or
-/// linker job the agent merely sees as a failed command. See
-/// [`tasks_protocol::vm_memory`].
+/// The loop is #845's fix. An agent whose connection dies mid-response is
+/// re-invoked with `--resume <session_id>` **in this VM**: same conversation,
+/// same worktree, same `NOTES.md`. A host-side retry would get a new VM and a
+/// fresh clone and lose all three. Everything about when *not* to resume lives
+/// in [`tasks_protocol::agent_run`], where it is testable without a process.
+///
+/// The run is bracketed by cgroup memory samples taken once around the *whole*
+/// loop: an OOM kill inside this VM is otherwise invisible, because the kernel
+/// usually kills a compiler or linker job the agent merely sees as a failed
+/// command. See [`tasks_protocol::vm_memory`].
 async fn run_agent(
     workdir: &Path,
     prompt: &str,
     tx: mpsc::Sender<TaskVmEvent>,
-) -> Result<AgentOutcome> {
+) -> Result<AgentRun> {
     let cmd_str = std::env::var("SCOUT_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
-    let mut parts = cmd_str.split_whitespace();
-    let prog = parts.next().context("SCOUT_AGENT_CMD is empty")?;
-    let args: Vec<&str> = parts.collect();
-    info!(?prog, ?args, workdir = %workdir.display(), "running agent");
+    let argv: Vec<String> = cmd_str.split_whitespace().map(str::to_string).collect();
+    anyhow::ensure!(!argv.is_empty(), "SCOUT_AGENT_CMD is empty");
+    let max_resumes = max_resumes_from_env("SCOUT_MAX_RESUMES");
 
     let before = sample_memory();
+    let mut attempt_argv = argv.clone();
+    let mut input = prompt.to_string();
+    let mut resumes = 0u32;
+
+    loop {
+        let (outcome, watcher) = spawn_attempt(&attempt_argv, workdir, &input, before, &tx).await?;
+
+        match tasks_protocol::agent_run::decide(&watcher, &outcome, &argv, resumes, max_resumes) {
+            ResumeDecision::Resume {
+                argv: next,
+                delay,
+                attempt,
+            } => {
+                // Resume boundaries go out as stderr Progress lines, which is
+                // how they reach the transcript — and how often they appear is
+                // the direct measurement of how often #845 is happening, which
+                // the issue itself could only infer from five runs.
+                let line = format!(
+                    "scout-supervisor: the agent's API connection dropped; resuming session \
+                     {} in {}s (resume {attempt} of {max_resumes})",
+                    watcher.session_id().unwrap_or("?"),
+                    delay.as_secs()
+                );
+                warn!(%line, "resuming agent");
+                progress(&tx, line).await;
+                tokio::time::sleep(delay).await;
+                attempt_argv = next;
+                input = RESUME_PROMPT.to_string();
+                resumes = attempt;
+            }
+            ResumeDecision::Stop(no_resume) => {
+                let ending = watcher.ending();
+                if ending.is_transport() {
+                    let line = format!(
+                        "scout-supervisor: the agent's API connection dropped and the run was \
+                         not resumed — {}",
+                        no_resume.describe()
+                    );
+                    warn!(%line, "agent run ending without a resume");
+                    progress(&tx, line).await;
+                }
+                // Emitted on every run, not just failures: a scout that exits 0
+                // having achieved nothing looks identical to one that did
+                // nothing, unless the kill count is on the record either way.
+                if let Some(summary) = outcome.memory_summary() {
+                    info!(%summary, "VM memory");
+                    progress(&tx, format!("scout-supervisor: VM memory: {summary}")).await;
+                }
+                return Ok(AgentRun {
+                    outcome,
+                    ending,
+                    resumes,
+                    no_resume: Some(no_resume),
+                });
+            }
+        }
+    }
+}
+
+/// A stderr `Progress` line from the supervisor itself.
+async fn progress(tx: &mpsc::Sender<TaskVmEvent>, line: String) {
+    emit(
+        tx,
+        ScoutEvent::Progress {
+            stream: LogStream::Stderr,
+            line,
+        },
+    )
+    .await;
+}
+
+/// Run the agent process once, streaming its output.
+///
+/// The [`ResultWatcher`] rides the *same* stdout loop that forwards `Progress`
+/// lines, so what it classifies is byte-for-byte what was reported and the two
+/// cannot disagree.
+async fn spawn_attempt(
+    argv: &[String],
+    workdir: &Path,
+    input: &str,
+    before: Option<MemorySample>,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<(AgentOutcome, ResultWatcher)> {
+    let (prog, args) = argv.split_first().context("SCOUT_AGENT_CMD is empty")?;
+    info!(?prog, ?args, workdir = %workdir.display(), "running agent");
+
     let mut child = Command::new(prog)
-        .args(&args)
+        .args(args)
         .current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -724,9 +826,9 @@ async fn run_agent(
     // Write errors are ignored: an agent that exits without reading (or never
     // reads stdin) is its own kind of failure, surfaced via exit code.
     let mut stdin = child.stdin.take().context("agent stdin")?;
-    let prompt_owned = prompt.to_string();
+    let input_owned = input.to_string();
     tokio::spawn(async move {
-        let _ = stdin.write_all(prompt_owned.as_bytes()).await;
+        let _ = stdin.write_all(input_owned.as_bytes()).await;
         let _ = stdin.write_all(b"\n").await;
         let _ = stdin.flush().await;
         drop(stdin);
@@ -737,8 +839,10 @@ async fn run_agent(
 
     let tx_out = tx.clone();
     let stdout_task = tokio::spawn(async move {
+        let mut watcher = ResultWatcher::new();
         let mut r = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = r.next_line().await {
+            watcher.observe(&line);
             emit(
                 &tx_out,
                 ScoutEvent::Progress {
@@ -748,6 +852,7 @@ async fn run_agent(
             )
             .await;
         }
+        watcher
     });
     let tx_err = tx.clone();
     let stderr_task = tokio::spawn(async move {
@@ -765,25 +870,13 @@ async fn run_agent(
     });
 
     let status = child.wait().await.context("wait for agent")?;
-    let _ = stdout_task.await;
+    // The stdout side now carries a value, so it cannot be discarded. A
+    // panicked reader degrades to a default watcher — `Silent`, which resumes
+    // nothing — rather than taking the run down with it.
+    let watcher = stdout_task.await.unwrap_or_default();
     let _ = stderr_task.await;
 
-    let outcome = AgentOutcome::new(status, before, sample_memory());
-    // Emitted on every run, not just failures: a scout that exits 0 having
-    // achieved nothing looks identical to one that did nothing, unless the
-    // kill count is on the record either way.
-    if let Some(summary) = outcome.memory_summary() {
-        info!(%summary, "VM memory");
-        emit(
-            &tx,
-            ScoutEvent::Progress {
-                stream: LogStream::Stderr,
-                line: format!("scout-supervisor: VM memory: {summary}"),
-            },
-        )
-        .await;
-    }
-    Ok(outcome)
+    Ok((AgentOutcome::new(status, before, sample_memory()), watcher))
 }
 
 #[cfg(test)]

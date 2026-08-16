@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+# Promoted from a dev-dependency by `agent_run`, which reads the agent's own
+# stream-json to classify how a run ended. Still a light dependency set: this
+# crate is shared with the supervisors and must stay cheap to build in a VM.
+serde_json.workspace = true
 vm-pool-protocol.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
