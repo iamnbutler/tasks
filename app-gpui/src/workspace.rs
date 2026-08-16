@@ -663,6 +663,9 @@ impl Workspace {
             RowAction::ScoutNow => self
                 .app_state
                 .update(cx, |state, cx| state.scout_task_now(id, cx)),
+            RowAction::CancelRun => self
+                .app_state
+                .update(cx, |state, cx| state.cancel_run(id, cx)),
             RowAction::ApproveSpec => {
                 if let Some(spec_id) = self.latest_spec_id(&id, cx) {
                     self.app_state.update(cx, |state, cx| {

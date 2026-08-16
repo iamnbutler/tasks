@@ -30,12 +30,13 @@ use tracing::{debug, info, warn};
 use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
+use crate::cancel::Bounded;
 use crate::github::{GhError, GitHubClient};
-use crate::models::{Build, Project, Spec, Task, TranscriptOwner, TranscriptStream};
+use crate::models::{Build, Project, RunKind, Spec, Task, TranscriptOwner, TranscriptStream};
 use crate::protocol::{BuildCommand, BuildEvent, TaskCommand, TaskEvent, TasksProtocol};
 use crate::reattach::AppEvents;
 use crate::redact::{redact, redact_line};
-use crate::store::{SpecStrike, Store, StoreError};
+use crate::store::{CancelRequest, SpecStrike, Store, StoreError};
 use crate::transcript::{TranscriptSink, spawn_transcript_writer, transcript_stream};
 
 #[derive(Debug, Error)]
@@ -60,6 +61,12 @@ pub enum BuilderError {
     StreamClosed,
     #[error("build timed out after {secs}s")]
     Timeout { secs: u64 },
+    /// Somebody stopped the run on purpose. Carries the whole request: the
+    /// actor and the rationale are what make a cancelled build distinguishable
+    /// from a failed one when the row is read back, and
+    /// [`Store::finalize_build_cancelled`] writes them into `exit_reason`.
+    #[error("build cancelled by {}", .0.actor.as_str())]
+    Cancelled(CancelRequest),
 }
 
 /// How this dispatcher boots a Builder VM.
@@ -126,6 +133,18 @@ impl Builder {
     ) -> Result<Build, BuilderError> {
         match outcome {
             Ok(done) => Ok(done),
+            // A deliberate stop by an accountable actor, so it is `cancelled`
+            // rather than `failed` and costs the batch no attempt: the specs go
+            // back to `approved` and their tasks to `ready_to_build`, ready for
+            // whoever stopped it to decide what happens next.
+            Err(BuilderError::Cancelled(request)) => {
+                let reason = request.exit_reason();
+                warn!(build_id = %build.id, reason, "build cancelled");
+                self.store
+                    .finalize_build_cancelled(&build.id, &reason)
+                    .await?;
+                Err(BuilderError::Cancelled(request))
+            }
             Err(e) => {
                 let reason = redact(&format!("{e}"));
                 warn!(build_id = %build.id, reason, "build failed");
@@ -243,14 +262,30 @@ impl Builder {
     ) -> Result<Build, BuilderError> {
         let (mut sink, writer) =
             spawn_transcript_writer(self.store.clone(), TranscriptOwner::build(&build.id));
-        let result = match tokio::time::timeout(
+        // A cancel rides the same `select!` the deadline does — see
+        // `crate::cancel`. Destroying the VM alone would leave this drain
+        // parked on a stream that never speaks again, which is the bug (#876),
+        // not the fix.
+        let result = match crate::cancel::bounded(
+            &self.store,
+            RunKind::Build,
+            build.id.as_str(),
             budget,
             self.drain_build_events(&mut events, &build.id, &mut sink),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_elapsed) => {
+            Bounded::Completed(result) => result,
+            Bounded::Cancelled(request) => {
+                warn!(
+                    build_id = %build.id,
+                    %vm_id,
+                    actor = request.actor.as_str(),
+                    "build cancelled; tearing the VM down"
+                );
+                Err(BuilderError::Cancelled(request))
+            }
+            Bounded::TimedOut => {
                 // Said here rather than only in `dispatch`'s failure warn,
                 // which runs *after* teardown: in the incident that was 15:37
                 // to 17:50 of silence between the budget expiring and anyone

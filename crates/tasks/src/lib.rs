@@ -7,6 +7,7 @@
 pub mod brief;
 pub mod briefing;
 pub mod builder;
+pub mod cancel;
 pub mod env_file;
 pub mod github;
 /// The migration set plus the naming rule that keeps parallel branches from
