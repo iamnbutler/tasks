@@ -5,6 +5,7 @@ mod markdown;
 mod sidebar;
 mod sortable;
 mod status_badge;
+mod text_field;
 mod titlebar;
 
 pub use byte_size::byte_size;
@@ -12,4 +13,5 @@ pub use markdown::{markdown_block, MarkdownCache};
 pub use sidebar::{sidebar, SidebarSide, SidebarState};
 pub use sortable::{move_to, sortable};
 pub use status_badge::{status_badge, task_state_color, title_case};
+pub use text_field::text_field;
 pub use titlebar::title_bar;

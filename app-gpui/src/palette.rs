@@ -39,13 +39,12 @@ use gpui::{
     actions, div, px, App, Context, Entity, Focusable, FontWeight, HighlightStyle, KeyBinding,
     MouseButton, ScrollHandle, StyledText, Window,
 };
-use gpuikit::elements::input::input;
 use gpuikit::input::{InputState, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{BuildStatus, TaskId};
 
 use crate::commands::{Command, Facts, Selection, COMMANDS};
-use crate::components::title_case;
+use crate::components::{text_field, title_case};
 use crate::state::is_picked_up;
 use crate::workspace::{Section, Workspace};
 
@@ -759,6 +758,19 @@ impl Workspace {
                     // — its padding, its footer — would fall through and
                     // dismiss the thing being clicked.
                     .id("palette-panel")
+                    // A click that lands on the panel rather than on the query
+                    // field puts the caret back in it: the header's padding and
+                    // the gap beside a short query are the easy misses, and a
+                    // palette whose keystrokes go nowhere is indistinguishable
+                    // from one that has stopped responding. Rows keep their own
+                    // click — this fires on mouse *down*, so confirming a row
+                    // still runs on the mouse up that follows.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            window.focus(&this.palette_input.focus_handle(cx), cx);
+                        }),
+                    )
                     .w(px(560.))
                     .flex()
                     .flex_col()
@@ -775,11 +787,11 @@ impl Workspace {
                             .border_b_1()
                             .border_color(theme.border_subtle())
                             .text_sm()
-                            .child(
-                                input(&self.palette_input, cx)
-                                    .placeholder(state.kind.placeholder())
-                                    .w_full(),
-                            ),
+                            .child(text_field(
+                                &self.palette_input,
+                                state.kind.placeholder(),
+                                cx,
+                            )),
                     )
                     .map(|el| match rows.is_empty() {
                         true => el.child(

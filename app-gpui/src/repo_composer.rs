@@ -12,13 +12,13 @@
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, size, App, Bounds, Context, Entity, Focusable, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowOptions,
+    div, px, size, App, Bounds, Context, Entity, Focusable, MouseButton, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions,
 };
-use gpuikit::elements::input::input;
 use gpuikit::input::{InputState, InputStateEvent};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
+use crate::components::text_field;
 use crate::state::AppState;
 use crate::workspace::Workspace;
 
@@ -118,6 +118,18 @@ impl Render for RepoComposer {
 
         div()
             .key_context("RepoComposer")
+            // A miss lands in the field anyway. There is one control on this
+            // surface, so a click on the label, the margin or the empty half of
+            // the row means "type here" and nothing else — and gpuikit raises
+            // `Blur` from the input's *paint*, so a click that moves focus
+            // nowhere raises no blur and cannot close the window on the way.
+            .id("repo-composer")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -140,7 +152,19 @@ impl Render for RepoComposer {
                             .text_color(theme.fg_muted())
                             .child("Repository"),
                     )
-                    .child(input(&self.input, cx).w_full()),
+                    // The box is this window's, not the field's: with one
+                    // control on the surface and nothing else to click, an
+                    // unframed line of text does not read as somewhere to type.
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(8.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.input_border())
+                            .bg(theme.input_bg())
+                            .child(text_field(&self.input, "owner/repo", cx)),
+                    ),
             )
             .child(
                 div()
