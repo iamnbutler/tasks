@@ -12,6 +12,7 @@
 
 use gpui::prelude::*;
 use gpui::{div, px, Context, SharedString};
+use gpuikit::elements::context_menu::context_menu;
 use gpuikit::elements::tooltip::tooltip;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Task, TaskState};
@@ -99,7 +100,7 @@ impl Workspace {
                             .map(|(id, number, title, task_state, updated)| {
                                 let is_selected = selected.as_ref() == Some(&id);
                                 let color = task_state_color(task_state);
-                                div()
+                                let row = div()
                                     // Keyed by task, not by index: with rows
                                     // appearing and disappearing behind the
                                     // toggle, index N is a different task before
@@ -120,8 +121,11 @@ impl Workspace {
                                         el.hover(move |el| el.bg(hover_bg))
                                     })
                                     .when(is_selected, |el| el.bg(theme.surface_tertiary()))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        this.select_task(id.clone(), cx);
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _event, _window, cx| {
+                                            this.select_task(id.clone(), cx);
+                                        }
                                     }))
                                     .child(
                                         div()
@@ -153,7 +157,14 @@ impl Workspace {
                                             .text_xs()
                                             .text_color(theme.fg_muted())
                                             .child(time::relative(updated)),
-                                    )
+                                    );
+                                // Right-click offers everything the inspector
+                                // does and more, greyed to this row's state.
+                                // Keyed by task for the same reason the row
+                                // is: index N is a different task once the
+                                // archive toggle moves.
+                                context_menu(SharedString::from(format!("row-menu-{id}")), row)
+                                    .menu(Workspace::row_menu(id, cx))
                             }),
                     ),
             )

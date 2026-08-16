@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, list, px, ClipboardItem, Context, Div, Entity, Focusable, FollowMode,
+    actions, div, list, px, App, ClipboardItem, Context, Div, Entity, Focusable, FollowMode,
     ListAlignment, ListState, MouseButton, Window, WindowHandle,
 };
+use gpuikit::elements::context_menu::{menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::elements::kbd::kbd;
@@ -25,7 +26,8 @@ use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
-    BuildStatus, ChatRole, Mode, SessionStatus, SpecQueueStatus, TaskId, TaskState,
+    BuildStatus, ChatRole, CloseReason, Mode, SessionStatus, SpecId, SpecQueueStatus, TaskId,
+    TaskState,
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
@@ -34,6 +36,7 @@ use crate::components::{
 };
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
+use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
 use crate::state::AppState;
 use crate::time;
@@ -59,7 +62,13 @@ actions!(
         SetModePlay,
         SetModePause,
         SetModeStop,
-        ToggleShowDone
+        ToggleShowDone,
+        // The Task menu's three verbs. They act on the selected row, so they
+        // are element-handled like the dock toggles: with no workspace
+        // focused there is no selection to act on, and greying out says so.
+        QueueSelectedTask,
+        ScoutSelectedTask,
+        ApproveSelectedSpec
     ]
 );
 
@@ -199,6 +208,18 @@ pub struct Workspace {
     /// Parsed-markdown entities for every reading surface, so re-renders
     /// don't re-parse. `RefCell` because most render paths hold `&self`.
     markdown: RefCell<MarkdownCache>,
+    /// A row's context menu was opened and has not been chosen from or
+    /// clicked away yet.
+    ///
+    /// gpuikit owns the menu itself (state, popup, dismissal), so this is not
+    /// a duplicate of that state — it exists for exactly one thing: escape.
+    /// Key bindings are dispatched *before* key-down listeners, so `escape`
+    /// would reach this workspace's `Dismiss` handler first and throw away
+    /// the selection the menu was about, while the menu — whose own escape
+    /// handler never runs — stayed up. `Dismiss` checks this and gets out of
+    /// the way instead. Cleared by the next mouse-down anywhere, which is
+    /// also when the menu closes.
+    row_menu_open: bool,
 }
 
 impl Workspace {
@@ -336,6 +357,7 @@ impl Workspace {
             chat_tick_revision: 0,
             expanded_tools: HashSet::new(),
             markdown: RefCell::new(MarkdownCache::new()),
+            row_menu_open: false,
         }
     }
 
@@ -467,6 +489,213 @@ impl Workspace {
             "Re: task #{number} \"{title}\" — its spec ({spec_id}) is pending review.\n\n{text}"
         );
         self.ask_orchestrator(message, cx);
+    }
+
+    // --- the row context menu ---
+
+    /// What the menu's shape depends on, for the row about `id`. `None` when
+    /// the task has left the working set between render and click.
+    pub(crate) fn row_context(&self, id: &TaskId, cx: &App) -> Option<RowContext> {
+        let state = self.app_state.read(cx);
+        let task = state.task(id)?;
+        Some(RowContext {
+            task_state: task.state,
+            gh_state: task.gh_state,
+            has_github_url: state.github_url(task).is_some(),
+            spec: state.latest_queue_entry(id).map(|item| item.entry.status),
+        })
+    }
+
+    /// The menu a right-click on the row about `id` opens, as gpuikit's
+    /// builder callback.
+    ///
+    /// Built fresh on every open, so it greys against the state at the moment
+    /// of the click rather than the state of the last frame. An associated
+    /// function rather than a method: the sections call it from inside their
+    /// row closures, where a borrow of `self` would collide with the `cx` the
+    /// same closure is already holding.
+    pub(crate) fn row_menu(
+        id: TaskId,
+        cx: &Context<Self>,
+    ) -> impl Fn(MenuItems, &mut Window, &mut App) -> MenuItems + 'static {
+        let workspace = cx.entity().downgrade();
+        move |menu, _window, cx| {
+            let Some(entity) = workspace.upgrade() else {
+                return menu;
+            };
+            let workspace = workspace.clone();
+            let id = id.clone();
+            entity.update(cx, move |this, cx| {
+                // Right-click also selects. Half these verbs act on a spec
+                // only the inspector renders, and a menu acting on a row you
+                // cannot see is how you approve the wrong spec — it is also
+                // what gives "Review Spec…" somewhere to land.
+                this.select_task(id.clone(), cx);
+                let Some(context) = this.row_context(&id, cx) else {
+                    return menu;
+                };
+                this.row_menu_open = true;
+                row_menu::entries(context)
+                    .into_iter()
+                    .fold(menu, |menu, entry| match entry {
+                        RowEntry::Separator => menu.separator(),
+                        RowEntry::Item(row) => {
+                            let mut item =
+                                menu_item(row.menu_label()).disabled(row.disabled.is_some());
+                            if row.destructive {
+                                item = item.destructive();
+                            }
+                            if let Some(shortcut) = row.kbd {
+                                item = item.kbd(shortcut);
+                            }
+                            let action = row.action;
+                            let id = id.clone();
+                            let workspace = workspace.clone();
+                            menu.item(item.on_click(move |window, cx| {
+                                workspace
+                                    .update(cx, |this, cx| {
+                                        this.perform_row_action(action, id.clone(), window, cx);
+                                    })
+                                    .ok();
+                            }))
+                        }
+                    })
+            })
+        }
+    }
+
+    /// Run one row verb, having re-checked that it can run.
+    ///
+    /// The check is not belt-and-braces: the menu greyed against the state at
+    /// open time, and the keyboard path never saw a menu at all. A refusal
+    /// goes to the banner — a verb that quietly does nothing reads as a bug,
+    /// and the reason reads as an answer. The server is still the authority,
+    /// so anything that gets past this comes back as its own message.
+    pub(crate) fn perform_row_action(
+        &mut self,
+        action: RowAction,
+        id: TaskId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.row_menu_open = false;
+        let Some(context) = self.row_context(&id, cx) else {
+            self.report("that task is no longer in the working set", cx);
+            return;
+        };
+        if let Some(item) = row_menu::item(context, action) {
+            if let Some(reason) = item.disabled {
+                self.report(format!("{} — {reason}", item.label), cx);
+                return;
+            }
+        }
+
+        match action {
+            RowAction::Queue => self
+                .app_state
+                .update(cx, |state, cx| state.queue_task(id, cx)),
+            RowAction::Dequeue => self
+                .app_state
+                .update(cx, |state, cx| state.dequeue_task(id, cx)),
+            RowAction::ScoutNow => self
+                .app_state
+                .update(cx, |state, cx| state.scout_task_now(id, cx)),
+            RowAction::ApproveSpec => {
+                if let Some(spec_id) = self.latest_spec_id(&id, cx) {
+                    self.app_state.update(cx, |state, cx| {
+                        state.review_spec(spec_id, SpecQueueStatus::Approved, None, cx)
+                    });
+                }
+            }
+            // The one verb that opens something, and the reason it ends in an
+            // ellipsis: the verdict needs text, and the place to write it is
+            // next to the spec it is about.
+            RowAction::ReviewSpec => self.begin_review(id, window, cx),
+            RowAction::RequestBuild => {
+                if let Some(spec_id) = self.latest_spec_id(&id, cx) {
+                    self.app_state
+                        .update(cx, |state, cx| state.build_spec(spec_id, cx));
+                }
+            }
+            RowAction::CloseCompleted => self.app_state.update(cx, |state, cx| {
+                state.close_task(id, CloseReason::Completed, cx)
+            }),
+            RowAction::CloseNotPlanned => self.app_state.update(cx, |state, cx| {
+                state.close_task(id, CloseReason::NotPlanned, cx)
+            }),
+            RowAction::Reopen => self
+                .app_state
+                .update(cx, |state, cx| state.reopen_task(id, cx)),
+            RowAction::OpenOnGitHub => {
+                if let Some(url) = self.github_url(&id, cx) {
+                    cx.open_url(&url);
+                }
+            }
+            RowAction::CopyNumber => {
+                if let Some(number) = self
+                    .app_state
+                    .read(cx)
+                    .task(&id)
+                    .map(|task| task.gh_issue_number)
+                {
+                    // With the `#`, because that is the form that means
+                    // something wherever it is being pasted.
+                    cx.write_to_clipboard(ClipboardItem::new_string(format!("#{number}")));
+                }
+            }
+            RowAction::CopyUrl => {
+                if let Some(url) = self.github_url(&id, cx) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url));
+                }
+            }
+        }
+    }
+
+    /// Show the task's spec in the inspector with the review composer focused
+    /// — "Review Spec…" landing where the spec text already is, rather than in
+    /// a modal that would cover the thing being judged.
+    fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_task(id, cx);
+        self.right_sidebar.open = true;
+        window.focus(&self.review_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Run a row verb against the selected row — the Task menu and its key
+    /// equivalents. Menu-bar items cannot grey per selection (`set_menus`
+    /// leaks a boxed action per item on every rebuild, and the selection moves
+    /// on every arrow key), so the refusal is reported rather than shown in
+    /// advance.
+    pub(crate) fn run_on_selection(
+        &mut self,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_task.clone() else {
+            self.report("select a task first", cx);
+            return;
+        };
+        self.perform_row_action(action, id, window, cx);
+    }
+
+    /// Say something in the sidebar banner. Same slot the server's own errors
+    /// use, and cleared by the next successful refresh.
+    fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.app_state
+            .update(cx, |state, cx| state.report(message, cx));
+    }
+
+    fn latest_spec_id(&self, id: &TaskId, cx: &App) -> Option<SpecId> {
+        self.app_state
+            .read(cx)
+            .latest_spec(id)
+            .map(|spec| spec.id.clone())
+    }
+
+    fn github_url(&self, id: &TaskId, cx: &App) -> Option<String> {
+        let state = self.app_state.read(cx);
+        state.github_url(state.task(id)?)
     }
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
@@ -1386,10 +1615,33 @@ impl Render for Workspace {
             // Layered dismissal: escape in a focused input blurs it (the
             // input's own binding); the next escape lands here and puts the
             // inspector away.
+            //
+            // An open row menu takes the first escape, and takes it by
+            // *stepping aside*: gpui dispatches key bindings before key-down
+            // listeners, so this handler runs before the menu's own escape
+            // handler ever sees the keystroke. Clearing the selection here
+            // would throw away the row the menu is about and leave the menu
+            // itself up, since a handled action stops the event before the
+            // listener phase. Propagating instead lets the menu close itself.
             .on_action(cx.listener(|this, _: &Dismiss, _window, cx| {
+                if this.row_menu_open {
+                    this.row_menu_open = false;
+                    cx.propagate();
+                    return;
+                }
                 if this.selected_task.is_some() || this.right_sidebar.open {
                     this.clear_selection(cx);
                 }
+            }))
+            // The Task menu's verbs, on the selected row.
+            .on_action(cx.listener(|this, _: &QueueSelectedTask, window, cx| {
+                this.run_on_selection(RowAction::Queue, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScoutSelectedTask, window, cx| {
+                this.run_on_selection(RowAction::ScoutNow, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApproveSelectedSpec, window, cx| {
+                this.run_on_selection(RowAction::ApproveSpec, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToHome, _window, cx| {
                 this.go_to_section(Section::Home, cx);
@@ -1449,6 +1701,15 @@ impl Render for Workspace {
                     }
                 }),
             )
+            // Any press outside an open row menu closes it — clicking away,
+            // or right-clicking a different row. Capture phase, so it runs
+            // before the row that is about to open the *next* menu sets the
+            // flag again; the popup occludes the pointer, so a press on the
+            // menu itself never reaches here (choosing an item clears it on
+            // its own way through `perform_row_action`).
+            .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
+                this.row_menu_open = false;
+            }))
             .child(self.render_title_bar(cx))
             .child(
                 div()

@@ -28,6 +28,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
         check-nextest test-bins test test-ci test-cargo app run \
+        app-check app-stubs app-test \
         server serve restart status stop migration
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
@@ -62,6 +63,39 @@ app:
 run: app
 	@pkill -x Tasks 2>/dev/null || true
 	open ~/Applications/Tasks.app
+
+# Typecheck and test the GUI on a machine with no display, no X11 dev
+# packages and no Mac — which is every agent VM, and used to mean every
+# app-gpui change was written without a compile, let alone a test.
+#
+# Two obstacles, both worked around here rather than by installing anything:
+#
+#   * `yeslogic-fontconfig-sys`'s build.rs calls `pkg_config::find_library`
+#     and fails without it — but the same build.rs skips pkg-config entirely
+#     when RUST_FONTCONFIG_DLOPEN is set, which is all `app-check` needs.
+#   * linking the *test* binary additionally wants -lxcb and -lxkbcommon(-x11).
+#     Nothing in these tests calls them: they are pure functions over view
+#     state and never enter the platform layer. Empty stub .so's satisfy the
+#     linker, and a test that did reach the platform would fail loudly rather
+#     than quietly pass.
+#
+# The app itself still comes from `make app` on a Mac; this proves the code
+# compiles and its logic holds, not that a pixel landed anywhere. On macOS the
+# stubs are unnecessary (and `cd app-gpui && cargo test` is the shorter path).
+APP_STUB_DIR := $(abspath $(CARGO_TARGET_DIR)/app-link-stubs)
+
+app-check:
+	cd app-gpui && RUST_FONTCONFIG_DLOPEN=1 cargo check --all-targets
+
+app-stubs:
+	@mkdir -p $(APP_STUB_DIR)
+	@printf 'void tasks_gpui_link_stub(void) {}\n' > $(APP_STUB_DIR)/stub.c
+	@for lib in xcb xkbcommon xkbcommon-x11; do \
+		cc -shared -fPIC -o $(APP_STUB_DIR)/lib$$lib.so $(APP_STUB_DIR)/stub.c || exit 1; \
+	done
+
+app-test: app-stubs
+	cd app-gpui && RUST_FONTCONFIG_DLOPEN=1 RUSTFLAGS="-L $(APP_STUB_DIR)" cargo test
 
 # The server's own build/run loop, the same shape as `make run` for the app:
 # these swap a running server rather than refusing. Every target builds first,

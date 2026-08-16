@@ -47,12 +47,7 @@ impl Workspace {
                     labels: task.labels.clone(),
                     updated_at: task.updated_at,
                     body: task.body.clone(),
-                    github_url: state.project(task).map(|project| {
-                        format!(
-                            "https://github.com/{}/{}/issues/{}",
-                            project.repo_owner, project.repo_name, task.gh_issue_number
-                        )
-                    }),
+                    github_url: state.github_url(task),
                     pending_spec: (task.state == TaskState::InReview)
                         .then(|| state.latest_spec(&task.id))
                         .flatten()

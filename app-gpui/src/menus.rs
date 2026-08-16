@@ -37,8 +37,9 @@ use crate::about;
 use crate::server::{self, Op};
 use crate::server_window;
 use crate::workspace::{
-    GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, SetModePause, SetModePlay, SetModeStop,
-    ToggleLeftDock, ToggleRightDock, ToggleShowDone,
+    ApproveSelectedSpec, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks, QueueSelectedTask,
+    ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock, ToggleRightDock,
+    ToggleShowDone,
 };
 
 actions!(
@@ -60,6 +61,51 @@ actions!(
         OpenDataDirectory
     ]
 );
+
+/// The Task menu's three key equivalents, as the keymap spells them.
+///
+/// Public because the row menu advertises the same shortcuts next to the same
+/// verbs, and it *renders* these rather than restating them — see
+/// [`rendered_keystroke`]. Only these three: they are the safe verbs, and
+/// nothing that closes an issue is bound, for the same reason nothing in the
+/// Server menu is.
+///
+/// `shift-cmd-u` rather than the mnemonic `shift-cmd-q`, because ⇧⌘Q is macOS's
+/// own Log Out shortcut and the system takes it first. "Queue *up*" is the
+/// mnemonic that was available.
+pub const QUEUE_KEYSTROKE: &str = "shift-cmd-u";
+pub const SCOUT_KEYSTROKE: &str = "shift-cmd-s";
+pub const APPROVE_KEYSTROKE: &str = "shift-cmd-a";
+
+/// A keymap keystroke (`"shift-cmd-s"`) as macOS writes it (`"⇧⌘S"`),
+/// modifiers in the platform's canonical order.
+///
+/// The menu bar never needs this — gpui reads shortcuts out of the keymap
+/// while building the bar — but a gpuikit context-menu item takes its
+/// shortcut as text, and a hand-written one is a second string that can
+/// drift from the binding. This derives it from the binding instead. Only
+/// rich enough for the bindings this app installs.
+pub fn rendered_keystroke(keystroke: &str) -> String {
+    let parts: Vec<&str> = keystroke.split('-').collect();
+    let has = |name: &str| parts.contains(&name);
+    let mut rendered = String::new();
+    if has("ctrl") || has("control") {
+        rendered.push('⌃');
+    }
+    if has("alt") {
+        rendered.push('⌥');
+    }
+    if has("shift") {
+        rendered.push('⇧');
+    }
+    if has("cmd") || has("platform") {
+        rendered.push('⌘');
+    }
+    if let Some(key) = parts.last() {
+        rendered.push_str(&key.to_uppercase());
+    }
+    rendered
+}
 
 /// The facts the bar's shape depends on. Everything else about the menu is
 /// fixed at compile time.
@@ -142,6 +188,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
     ]);
+
+    // The Task menu's three verbs, in the workspace's context: they act on
+    // the selected row, so they should grey out with no workspace focused —
+    // and they must be bound *here*, before `set`, for the same reason as
+    // everything else in this bar.
+    //
+    // Only these three, and only the safe ones. Closing an issue is one
+    // click in the row menu and no keystroke anywhere: it is the one verb
+    // here that changes something outside this machine.
+    let ws = Some("Workspace");
+    cx.bind_keys([
+        KeyBinding::new(QUEUE_KEYSTROKE, QueueSelectedTask, ws),
+        KeyBinding::new(SCOUT_KEYSTROKE, ScoutSelectedTask, ws),
+        KeyBinding::new(APPROVE_KEYSTROKE, ApproveSelectedSpec, ws),
+    ]);
 }
 
 /// Install the menu bar. Call after [`init`].
@@ -210,6 +271,23 @@ fn menus(state: MenuState) -> Vec<Menu> {
             // going to one. Its `shift-cmd-d` is bound in `main`, with the
             // section shortcuts and before `set` — same constraint.
             MenuItem::action("Show Done Tasks", ToggleShowDone).checked(state.show_done),
+        ]),
+        // The selected row's safe verbs, so the three that are worth a
+        // keystroke have somewhere to announce themselves. The rest of the
+        // row's verbs live in its context menu, which can grey per row;
+        // these cannot.
+        //
+        // Nothing here greys with the selection, deliberately: `set_menus`
+        // leaks a boxed action per item on every rebuild (see the module
+        // docs) and the selection changes on every arrow key, so rebuilding
+        // the bar per selection is not an option. A verb that cannot run
+        // says so in the sidebar banner when it is asked to — a keystroke
+        // that quietly does nothing reads as a bug, the reason reads as an
+        // answer.
+        Menu::new("Task").items([
+            MenuItem::action("Add to Queue", QueueSelectedTask),
+            MenuItem::action("Scout Now", ScoutSelectedTask),
+            MenuItem::action("Approve Spec", ApproveSelectedSpec),
         ]),
         // The one menu that acts on the server *process* rather than over
         // HTTP, because a server cannot gracefully swap itself out through
@@ -313,12 +391,67 @@ mod tests {
     }
 
     #[test]
-    fn bar_has_the_six_menus_in_order() {
+    fn bar_has_the_seven_menus_in_order() {
         let names: Vec<_> = menus(MenuState::default())
             .iter()
             .map(|menu| menu.name.to_string())
             .collect();
-        assert_eq!(names, ["Tasks", "File", "Edit", "View", "Server", "Window"]);
+        assert_eq!(
+            names,
+            ["Tasks", "File", "Edit", "View", "Task", "Server", "Window"]
+        );
+    }
+
+    /// The three safe verbs, and only those. Closing an issue is a row-menu
+    /// click with no menu-bar item and no keystroke anywhere.
+    #[test]
+    fn the_task_menu_carries_the_three_safe_verbs() {
+        let actions: Vec<_> = items("Task").into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            actions,
+            [
+                "workspace::QueueSelectedTask",
+                "workspace::ScoutSelectedTask",
+                "workspace::ApproveSelectedSpec",
+            ]
+        );
+    }
+
+    /// Nothing in the Task menu greys itself: the bar cannot rebuild per
+    /// selection, so legality is re-derived when the item is chosen.
+    #[test]
+    fn the_task_menu_never_greys_itself() {
+        for state in [
+            MenuState::default(),
+            serving(Mode::Play),
+            MenuState {
+                busy: true,
+                ..serving(Mode::Stop)
+            },
+        ] {
+            for label in ["Add to Queue", "Scout Now", "Approve Spec"] {
+                assert!(!item(state, "Task", label).is_disabled(), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn keystrokes_render_the_way_macos_writes_them() {
+        assert_eq!(rendered_keystroke("shift-cmd-u"), "⇧⌘U");
+        assert_eq!(rendered_keystroke("shift-cmd-s"), "⇧⌘S");
+        assert_eq!(rendered_keystroke("cmd-1"), "⌘1");
+        // Canonical order, whatever order the keymap spelled it in.
+        assert_eq!(rendered_keystroke("cmd-shift-alt-ctrl-k"), "⌃⌥⇧⌘K");
+    }
+
+    /// ⇧⌘Q is macOS's Log Out, so the mnemonic one is not available; this is
+    /// the check that keeps it from creeping back in.
+    #[test]
+    fn no_task_shortcut_collides_with_a_macos_system_binding() {
+        for keystroke in [QUEUE_KEYSTROKE, SCOUT_KEYSTROKE, APPROVE_KEYSTROKE] {
+            assert_ne!(keystroke, "shift-cmd-q");
+            assert_ne!(keystroke, "ctrl-cmd-q");
+        }
     }
 
     /// Status first: you should be able to see what you are about to

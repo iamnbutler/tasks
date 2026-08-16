@@ -2,7 +2,8 @@
 //! the Swift app — Needs you / Running / Building / Up next / Ready to build.
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, Context};
+use gpui::{div, px, AnyElement, Context, SharedString};
+use gpuikit::elements::context_menu::context_menu;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{BuildStatus, TaskId, TaskState};
 
@@ -160,7 +161,7 @@ impl Workspace {
         let is_selected = selected == Some(&item.task_id);
         let task_id = item.task_id.clone();
 
-        div()
+        let row = div()
             .id((group, ix))
             .flex()
             .flex_row()
@@ -176,8 +177,11 @@ impl Workspace {
                 el.hover(move |el| el.bg(hover_bg))
             })
             .when(is_selected, |el| el.bg(theme.surface_tertiary()))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.select_task(task_id.clone(), cx);
+            .on_click(cx.listener({
+                let task_id = task_id.clone();
+                move |this, _event, _window, cx| {
+                    this.select_task(task_id.clone(), cx);
+                }
             }))
             .child(
                 div()
@@ -209,7 +213,13 @@ impl Workspace {
                         })
                         .child(trailing),
                 )
-            })
+            });
+
+        // Same menu as the Tasks list: a queue row is a task row, addressed
+        // by where it sits rather than by what it is. Keyed by group and
+        // index, like the row itself — a task appears in exactly one group.
+        context_menu(SharedString::from(format!("row-menu-{group}-{ix}")), row)
+            .menu(Workspace::row_menu(task_id, cx))
             .into_any_element()
     }
 }

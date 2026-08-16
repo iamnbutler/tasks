@@ -14,8 +14,8 @@ use gpui::Context;
 use tasks_client::api::events::Event;
 use tasks_client::api::http::BriefingStatus;
 use tasks_client::api::models::{
-    Build, ChatRole, Mode, OrchestratorFeedEvent, OrchestratorMessage, Project, Session, Spec,
-    SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    Build, ChatRole, CloseReason, Mode, OrchestratorFeedEvent, OrchestratorMessage, Project,
+    Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -616,6 +616,36 @@ impl AppState {
         self.run(cx, move |client| client.scout_task_now(&id));
     }
 
+    /// Close the GitHub issue behind a task. 202 and nothing applied locally:
+    /// the poller reads the closure back, so `gh_state` here lags by up to a
+    /// poll interval — which is why nothing greys the undo on it.
+    ///
+    /// No rationale: the client speaks for the human, who owes none. Only the
+    /// orchestrator does, and it does not speak through this client.
+    pub fn close_task(&mut self, id: TaskId, reason: CloseReason, cx: &mut Context<Self>) {
+        self.run(cx, move |client| client.close_task(&id, reason, None));
+    }
+
+    /// The undo for [`Self::close_task`], on the same path.
+    pub fn reopen_task(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        self.run(cx, move |client| client.reopen_task(&id, None));
+    }
+
+    /// Queue a Builder run over one approved spec. Builds are serial, so this
+    /// is a request rather than a start; the server answers 202 and the event
+    /// stream reports what happens next.
+    pub fn build_spec(&mut self, id: SpecId, cx: &mut Context<Self>) {
+        self.run(cx, move |client| client.request_build(vec![id], None));
+    }
+
+    /// Put a message in the sidebar banner without a server round trip — how
+    /// a refused keystroke says why instead of doing nothing. Cleared by the
+    /// next successful refresh, like any other banner text.
+    pub fn report(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.error = Some(message.into());
+        cx.notify();
+    }
+
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.set_mode(mode));
     }
@@ -669,6 +699,33 @@ impl AppState {
             .iter()
             .filter(|spec| &spec.task_id == id)
             .max_by_key(|spec| spec.created_at)
+    }
+
+    /// The queue entry for a task's latest spec, if that spec ever reached the
+    /// queue.
+    ///
+    /// The verdict lives on the entry, not on the spec — a spec is the
+    /// artifact, `spec_queue` is what was decided about it — so anything that
+    /// asks "is this approved?" has to come through here.
+    pub fn latest_queue_entry(&self, id: &TaskId) -> Option<&SpecQueueItem> {
+        let spec = self.latest_spec(id)?;
+        self.spec_queue
+            .iter()
+            .find(|item| item.entry.spec_id == spec.id)
+    }
+
+    /// The issue's URL on GitHub, when the task's project is known.
+    ///
+    /// Shared rather than rebuilt per call site: the inspector's link, the
+    /// row menu's "Open on GitHub", and its "Copy Issue URL" must agree, and
+    /// three copies of one format string is how they stop agreeing.
+    pub fn github_url(&self, task: &Task) -> Option<String> {
+        self.project(task).map(|project| {
+            format!(
+                "https://github.com/{}/{}/issues/{}",
+                project.repo_owner, project.repo_name, task.gh_issue_number
+            )
+        })
     }
 
     /// The running session for a task, if one is live.
