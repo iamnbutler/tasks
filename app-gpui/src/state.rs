@@ -835,6 +835,11 @@ impl AppState {
 /// dispatched; `Done` and `Rejected` are finished. One definition rather than
 /// the predicate written out at each call site, because the queue's rows and
 /// the nav badge's count have to be about the same set of tasks.
+///
+/// `AwaitingMerge` is in the set: an open pull request is work in flight, and
+/// dropping it here would take a batch off the queue and out of the nav badge
+/// the moment its build succeeded — the "done means a PR opened" illusion
+/// again, one layer up.
 pub fn is_picked_up(state: TaskState) -> bool {
     matches!(
         state,
@@ -843,6 +848,7 @@ pub fn is_picked_up(state: TaskState) -> bool {
             | TaskState::InReview
             | TaskState::ReadyToBuild
             | TaskState::Building
+            | TaskState::AwaitingMerge
     )
 }
 
@@ -1103,6 +1109,7 @@ mod tests {
             TaskState::InReview,
             TaskState::ReadyToBuild,
             TaskState::Building,
+            TaskState::AwaitingMerge,
         ] {
             assert!(is_picked_up(state), "{state:?}");
         }

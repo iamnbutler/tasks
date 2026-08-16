@@ -1241,9 +1241,14 @@ struct ProjectQuery {
 /// in public under the owner's name, and a reader on GitHub with no access to
 /// the ledger should not have to guess which it was.
 fn attributed(body: &str, actor: Actor) -> String {
+    // `System` is unreachable here — the poller writes no comments — and it is
+    // grouped with the orchestrator because "not the human" is the property
+    // this cares about.
     match actor {
         Actor::Human => body.to_string(),
-        Actor::Orchestrator => format!("{body}\n\n---\nPosted by the Tasks orchestrator."),
+        Actor::Orchestrator | Actor::System => {
+            format!("{body}\n\n---\nPosted by the Tasks orchestrator.")
+        }
     }
 }
 
@@ -1294,8 +1299,11 @@ async fn resolve_project(store: &Store, id: Option<ProjectId>) -> ApiResult<Proj
 /// left off, and kept out of the stored `body` so the poller's refresh from
 /// GitHub does not fight with it.
 fn issue_body(body: &str, actor: Actor, provenance: Option<&str>) -> String {
+    // As in `attributed`: `System` cannot reach this — the poller files no
+    // issues — and shares the orchestrator's line because the distinction that
+    // matters to a reader of the issue is "not the human".
     let who = match actor {
-        Actor::Orchestrator => "Filed by the Tasks orchestrator",
+        Actor::Orchestrator | Actor::System => "Filed by the Tasks orchestrator",
         Actor::Human => "Filed via Tasks",
     };
     match provenance.map(str::trim).filter(|p| !p.is_empty()) {

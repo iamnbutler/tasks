@@ -1,6 +1,6 @@
 //! The Queue section: picked-up work as a column-aligned table of draggable
-//! rows, in attention order — Needs you / Running / Building / Up next /
-//! Ready to build.
+//! rows, in attention order — Needs you / Running / Building / Awaiting merge /
+//! Up next / Ready to build.
 //!
 //! **The order of the rows is the priority, and a drag writes it.** Two
 //! orderings meet in this one view, and each band is sorted by, and writes,
@@ -12,8 +12,11 @@
 //!   `tasks.manual_rank`, via `POST /queue/reorder` — the ordering
 //!   `next_dispatchable` walks, so a drag there decides what a Scout picks up
 //!   next.
-//! - **Running** and **Building** are already dispatched. They wear a lock,
-//!   say why in a tooltip, and are not drop targets.
+//! - **Running**, **Building** and **Awaiting merge** are out of the list's
+//!   hands. They wear a lock, say why in a tooltip, and are not drop targets.
+//!   Awaiting merge matters most here: it shares `tasks.manual_rank` with Up
+//!   next and Ready to build, so making it draggable would let a drop rewrite
+//!   the rank of work whose place a pull request already decided.
 //!
 //! A band must be *sorted by* the ordering it writes: sorting Needs you by
 //! `manual_rank` while posting spec ranks would land a drag that succeeded and
@@ -23,10 +26,9 @@
 //! everything and then assign 1..N over the ids they are given. So every drop
 //! posts a complete statement of the order, and the base it is computed from
 //! is the *server's* list order with one row moved, never the display order:
-//! concatenating the five bands top to bottom would rewrite Scouting and
-//! InReview ranks to match the visual grouping, turning a local drag into a
-//! global reorder. See [`AppState::reorder_queue`] for what happens after the
-//! POST.
+//! concatenating the bands top to bottom would rewrite Scouting and InReview
+//! ranks to match the visual grouping, turning a local drag into a global
+//! reorder. See [`AppState::reorder_queue`] for what happens after the POST.
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context, SharedString};
@@ -64,7 +66,7 @@ struct Group {
 
 /// The bands, in attention order. The one place a band's label, its state and
 /// the ordering it writes are stated together.
-const GROUPS: [Group; 5] = [
+const GROUPS: [Group; 6] = [
     Group {
         label: "Needs you",
         state: TaskState::InReview,
@@ -81,6 +83,14 @@ const GROUPS: [Group; 5] = [
         reorder: Reorder::Fixed(
             "A Builder is running — already dispatched, so its place is spent.",
         ),
+    },
+    // Between Building and Up next: the work is written but not shipped, and
+    // the poller is still driving it. A pull request decides its place, so the
+    // list does not.
+    Group {
+        label: "Awaiting merge",
+        state: TaskState::AwaitingMerge,
+        reorder: Reorder::Fixed("Its pull request is open — the merge decides what happens next."),
     },
     Group {
         label: "Up next",
@@ -637,12 +647,14 @@ mod tests {
             task(2, TaskState::Queued),
             task(4, TaskState::ReadyToBuild),
             task(5, TaskState::Building),
+            task(6, TaskState::AwaitingMerge),
         ];
         let bands = bands(&tasks, &[]);
         assert_eq!(band(&bands, "Up next"), [3, 2]);
         assert_eq!(band(&bands, "Running"), [1]);
         assert_eq!(band(&bands, "Ready to build"), [4]);
         assert_eq!(band(&bands, "Building"), [5]);
+        assert_eq!(band(&bands, "Awaiting merge"), [6]);
     }
 
     /// Needs you follows `spec_queue`, which is the ordering it writes — not
@@ -766,5 +778,9 @@ mod tests {
         assert_eq!(verdict("Ready to build"), Reorder::TaskQueue);
         assert!(matches!(verdict("Running"), Reorder::Fixed(_)));
         assert!(matches!(verdict("Building"), Reorder::Fixed(_)));
+        // Not merely undispatchable: it shares `manual_rank` with the two
+        // TaskQueue bands, so a drop here would rewrite ranks a pull request
+        // owns.
+        assert!(matches!(verdict("Awaiting merge"), Reorder::Fixed(_)));
     }
 }

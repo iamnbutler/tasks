@@ -245,6 +245,7 @@ fn queue_refusal(context: RowContext) -> Option<&'static str> {
         TaskState::InReview => Some("its spec is in review"),
         TaskState::ReadyToBuild => Some("its spec is approved"),
         TaskState::Building => Some("a build is running"),
+        TaskState::AwaitingMerge => Some("its pull request is open"),
         TaskState::Done => Some("this task is done"),
         TaskState::Rejected => Some("this task was rejected"),
     }
@@ -257,9 +258,10 @@ fn dequeue_refusal(context: RowContext) -> Option<&'static str> {
         TaskState::Scouting => Some("a scout is running"),
         // Work past `Queued` cannot be un-picked: it stays picked up, and a
         // spec's fate is decided by reviewing it.
-        TaskState::InReview | TaskState::ReadyToBuild | TaskState::Building => {
-            Some("work has already started")
-        }
+        TaskState::InReview
+        | TaskState::ReadyToBuild
+        | TaskState::Building
+        | TaskState::AwaitingMerge => Some("work has already started"),
         TaskState::Done => Some("this task is done"),
         TaskState::Rejected => Some("this task was rejected"),
     }
@@ -272,6 +274,7 @@ fn scout_refusal(context: RowContext) -> Option<&'static str> {
         TaskState::InReview => Some("its spec is in review"),
         TaskState::ReadyToBuild => Some("its spec is approved"),
         TaskState::Building => Some("a build is running"),
+        TaskState::AwaitingMerge => Some("its pull request is open"),
         TaskState::Done => Some("this task is done"),
         TaskState::Rejected => Some("this task was rejected"),
     }
@@ -364,7 +367,7 @@ mod tests {
         item(context, action).and_then(|item| item.disabled)
     }
 
-    /// Every combination of row state there is — 8 task states x 2 GitHub
+    /// Every combination of row state there is — 9 task states x 2 GitHub
     /// states x 2 project-known x 7 spec statuses (including none).
     fn every_context() -> Vec<RowContext> {
         let states = [
@@ -374,6 +377,7 @@ mod tests {
             TaskState::InReview,
             TaskState::ReadyToBuild,
             TaskState::Building,
+            TaskState::AwaitingMerge,
             TaskState::Done,
             TaskState::Rejected,
         ];

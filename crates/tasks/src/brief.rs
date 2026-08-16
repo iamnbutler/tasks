@@ -29,7 +29,8 @@ use tracing::{debug, warn};
 
 use crate::github::GitHubClient;
 use crate::models::{
-    Build, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueStatus, Task, TaskId,
+    Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueStatus, Task, TaskId,
+    TaskState,
 };
 use crate::store::{Store, StoreError};
 
@@ -144,6 +145,64 @@ impl<'a> Brief<'a> {
                  attempt on record, which is itself worth looking into"
                     .into(),
             );
+        }
+        Ok(lines)
+    }
+
+    /// Facts for a batch parked behind a pull request that has not landed:
+    /// which branch it is, what it merges *into*, and whose issues are waiting.
+    ///
+    /// The base is the point. A build stacked on another build's branch merges
+    /// cleanly, reads `merged: true`, and ships nothing until that branch
+    /// itself reaches the trunk — so when the base is not the trunk this spells
+    /// the trap out rather than leaving it to be inferred from a branch name.
+    /// It is how PR #863 was lost.
+    pub async fn for_stranded_build(&self, build_id: &BuildId) -> Result<Vec<String>, StoreError> {
+        let Some(build) = self.store.get_build(build_id).await? else {
+            return Ok(vec![format!(
+                "build {build_id} is not in the store — the obligation named a row that is gone"
+            )]);
+        };
+        let world = self.world().await?;
+        let mut lines = vec![format!(
+            "branch {} merges into {}, and PR #{} carries it",
+            build.branch,
+            build.base_branch,
+            build
+                .pr_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(none)".into()),
+        )];
+        if build.base_branch == self.base_branch {
+            lines.push(format!(
+                "its base IS the trunk ({}), so merging the PR ships the work",
+                self.base_branch
+            ));
+        } else {
+            lines.push(format!(
+                "its base is NOT the trunk ({}): merging this PR only moves the work onto {}, \
+                 and the tasks stay parked until {} itself reaches the trunk. Merge the base \
+                 first, or merge this one and then land {} — either order works, but neither \
+                 is done until the commit is on {}",
+                self.base_branch,
+                build.base_branch,
+                build.base_branch,
+                build.base_branch,
+                self.base_branch,
+            ));
+        }
+        let waiting: Vec<String> = world
+            .build_specs
+            .get(build_key(&build))
+            .into_iter()
+            .flatten()
+            .filter_map(|spec_id| world.specs.iter().find(|s| &s.id == spec_id))
+            .filter_map(|spec| world.tasks.get(&spec.task_id))
+            .filter(|task| task.state == TaskState::AwaitingMerge)
+            .map(|task| format!("#{}", task.gh_issue_number))
+            .collect();
+        if !waiting.is_empty() {
+            lines.push(format!("still awaiting merge: {}", waiting.join(", ")));
         }
         Ok(lines)
     }

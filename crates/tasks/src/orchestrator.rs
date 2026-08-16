@@ -690,12 +690,22 @@ pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) ->
                     task_ref(store, task_id).await
                 ));
             }
-            EventPayload::SpecQueueStatusChanged { spec_id, to, .. } => {
+            EventPayload::SpecQueueStatusChanged {
+                spec_id, from, to, ..
+            } => {
                 let task = match store.get_spec(spec_id).await {
                     Ok(Some(spec)) => task_ref(store, &spec.task_id).await,
                     _ => spec_id.to_string(),
                 };
-                lines.push(format!("- Review verdict on {task}: {}", to.as_str()));
+                // `built → approved` is the one transition nobody rendered a
+                // verdict on: a Builder's PR was closed unmerged and the batch
+                // went back on the shelf.
+                lines.push(match (from, to) {
+                    (Some(SpecQueueStatus::Built), SpecQueueStatus::Approved) => {
+                        format!("- PR closed unmerged: {task} is ready to build again")
+                    }
+                    _ => format!("- Review verdict on {task}: {}", to.as_str()),
+                });
             }
             EventPayload::BuildCompleted { build_id, status } => {
                 let line = match store.get_build(build_id).await {
@@ -801,6 +811,18 @@ pub async fn format_obligations(
 
     let mut sections = Vec::new();
     for obligation in obligations {
+        // Before the `SpecId`, deliberately: `LandBatch`'s subject is a build
+        // id, and constructing a `SpecId` out of one is not a type error —
+        // it would silently head the section with a spec that does not exist.
+        if obligation.kind == ObligationKind::LandBatch {
+            let build_id = crate::models::BuildId::from_raw(&obligation.subject_id);
+            let facts = match brief.for_stranded_build(&build_id).await {
+                Ok(facts) => facts,
+                Err(e) => vec![brief_unavailable(&e)],
+            };
+            sections.push((format!("On build {build_id}:"), facts));
+            continue;
+        }
         let spec_id = crate::models::SpecId::from_raw(&obligation.subject_id);
         let facts = match obligation.kind {
             // Dispatch wants the same facts as review: overlap with in-flight
@@ -814,6 +836,8 @@ pub async fn format_obligations(
                 Ok(facts) => facts,
                 Err(e) => vec![brief_unavailable(&e)],
             },
+            // Handled above, before the `SpecId` this arm cannot use.
+            ObligationKind::LandBatch => unreachable!(),
         };
         sections.push((spec_heading(store, &spec_id).await, facts));
     }
@@ -1027,6 +1051,15 @@ fn system_prompt(
            obligation will eventually chase an approved spec nobody built, but \
            that is the safety net catching a dropped ball, not the normal \
            path.\n\
+         - `land_batch` obligation → a succeeded build's PR has not shipped. \
+           Its subject is a BUILD id, not a spec id. A pull request is not \
+           delivery any more than approval is, and a PR reading \"merged\" is \
+           not either: merged means it reached its BASE, and builds stack, so \
+           a PR merged into another build's branch ships nothing until that \
+           branch reaches the trunk. The server resolves this on whether the \
+           merge commit is an ancestor of the trunk, never on `merged` — so a \
+           batch parked behind a merged PR is correct, not stale. Report what \
+           it is waiting on; landing it is the human's.\n\
          - Scout or build FAILED → investigate (transcript, build row, \
            events) and report the cause and what you'd do about it.\n\
          - New tasks → note anything urgent or related to in-flight work; \
@@ -1130,9 +1163,11 @@ fn system_prompt(
            window: it is a log, not a state snapshot, and re-deriving the \
            present from it costs far more of your context than asking for the \
            present directly. Retired tasks are hidden from GET /tasks but \
-           reachable at GET /tasks/{{id}}. Nothing on the wire counts merged \
-           PRs — pull_request_opened fires at open; check merge state via gh, \
-           or say \"opened\", not \"shipped\"\n\
+           reachable at GET /tasks/{{id}}. pull_request_opened fires at open \
+           and says nothing about landing: a task in awaiting_merge has an \
+           unresolved PR, so say \"opened\", not \"shipped\", until the poller \
+           moves it to done — and a `gh` that reports MERGED is not enough \
+           either, because merged means \"reached its base\"\n\
          - GET /mode, POST /mode {{\"mode\":\"play|pause|stop\"}} — play runs \
            scouts+builds, pause only polls, stop is everything off\n\n\
          Not yours: POST /tasks/{{id}}/build-now — the human's shortcut past \
@@ -1143,8 +1178,13 @@ fn system_prompt(
          scouting, say so and let the human make the call.\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
-           building → done (rejected = terminal). Issue closure on GitHub \
-           retires work automatically; there is no manual mark-done.\n\
+           building → awaiting_merge → done (rejected = terminal). Issue \
+           closure on GitHub retires work automatically; there is no manual \
+           mark-done.\n\
+         - done means shipped. A build that opens a PR parks its tasks in \
+           awaiting_merge, not done: the poller reads the PR and either closes \
+           the issue as completed (merged) or returns the batch to \
+           ready_to_build (closed unmerged). Never call an opened PR done.\n\
          - The checkout is shared with the human and other agents. Never \
            switch branches, stash, or discard changes you did not make; do \
            your own work on branches and leave the tree as you found it.\n\
