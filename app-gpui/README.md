@@ -2,7 +2,7 @@
 
 The gpui port of the Tasks app (`tasks/app`, the Swift client). Built on
 [gpui-unofficial](https://github.com/iamnbutler/gpui-unofficial) 1.14.2 and
-[gpuikit](https://github.com/iamnbutler/gpuikit), talking to the tasks
+[gpuikit](https://github.com/iamnbutler/gpuikit) 0.7, talking to the tasks
 server through the workspace's own crates: `tasks-api` (shared wire types)
 and `tasks-client` (typed blocking client + reconnecting SSE streams).
 
@@ -74,6 +74,37 @@ Theming is gpuikit's system (`gpuikit::theme`): a `Themeable` trait contract
 accessed via `cx.theme()`, initialized with `gpuikit::theme::init`. Icons
 and the input stack (`InputState` + `text_area`) also come from gpuikit;
 SVG assets are served by `Application::with_assets(gpuikit::assets())`.
+
+## Dependencies
+
+Everything comes from crates.io — there is no git dependency, and
+`grep git+ Cargo.lock` returning nothing is the check that keeps it that way.
+
+**`gpui` and `gpui_platform` are pinned exactly (`=1.14.2`), not with a
+caret.** gpuikit asks for `^1.14.2`, so an exact pin unifies with it rather
+than fighting it, and the day a gpuikit release needs 1.15 that becomes a
+loud resolution error here instead of a silent bump under an app that has no
+CI compiling it.
+
+**`Cargo.lock` is committed**, which needs a `!/app-gpui/Cargo.lock` negation
+in the root `.gitignore` (the blanket `Cargo.lock` line above it is why this
+crate went without one for so long). app-gpui is deliberately not a workspace
+member, so it resolves its own graph and ships as an app — it wants that graph
+reproducible. The negation is load-bearing rather than cosmetic: `git add -f`
+would commit the file once and then hide every later regeneration from
+`git status`.
+
+One thing to know before regenerating it. The gpui crates are published as a
+lockstep family, and the core crate requires only `^1.14.2` of its own
+support crates (`gpui-util`, `gpui-shared-string`, `collections`, …) — so a
+plain `cargo generate-lockfile` will happily pair a 1.14.2 core with 1.15.0
+support crates, a combination upstream never ships or tests. The lockfile
+holds the whole `*-gpui-unofficial` family at 1.14.2 on purpose. If you
+regenerate, put them back:
+
+```sh
+cargo update -p <crate>-gpui-unofficial --precise 1.14.2
+```
 
 ## Running
 

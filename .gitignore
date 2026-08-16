@@ -8,6 +8,11 @@ dist/
 # Rust
 target/
 Cargo.lock
+# ...except app-gpui's: it is not a workspace member, so it resolves its own
+# dependency graph and ships as an app, which wants a reproducible one. The
+# negation is load-bearing — `git add -f` would commit the file once and then
+# hide every later regeneration from `git status`.
+!/app-gpui/Cargo.lock
 .claude/worktrees/
 .worktrees/
 
