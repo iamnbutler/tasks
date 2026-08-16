@@ -76,12 +76,24 @@ struct SupervisorProc {
 
 impl SupervisorProc {
     async fn spawn(binary: &Path, agent_cmd: &str, workdir_root: &Path) -> Self {
+        Self::spawn_with_env(binary, agent_cmd, workdir_root, &[]).await
+    }
+
+    async fn spawn_with_env(
+        binary: &Path,
+        agent_cmd: &str,
+        workdir_root: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let mut cmd = Command::new(binary);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .env("BUILDER_AGENT_CMD", agent_cmd)
             .env("BUILDER_WORKDIR_ROOT", workdir_root);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
         let mut child = cmd.spawn().expect("spawn supervisor");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -277,6 +289,124 @@ async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
         reason.contains("killed by signal 9 (SIGKILL)"),
         "reason did not name the signal: {reason}"
     );
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// #845 on the Builder side: the agent's API connection dies mid-response and
+/// the build still ships.
+///
+/// The resume happens inside this VM, so the conversation *and* the worktree
+/// survive — the commit the agent made before the drop is still there for it
+/// to build on. A host-side retry would get a new VM and a fresh clone, and
+/// for a Builder that worktree is the implementation. The bundle carrying both
+/// halves is the proof.
+#[tokio::test]
+async fn a_dropped_api_connection_is_resumed_and_the_build_still_ships() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+    let agent = fixture("stub-builder-agent-api-death.sh");
+    let state = tmp.path().join("stub-state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    // One resume: enough to prove the loop, and the 2s backoff is real.
+    let mut sup = SupervisorProc::spawn_with_env(
+        &binary,
+        agent.to_str().unwrap(),
+        tmp.path(),
+        &[
+            ("STUB_STATE", state.to_str().unwrap()),
+            ("BUILDER_MAX_RESUMES", "1"),
+        ],
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url.clone())).await;
+
+    let mut announced_resume = false;
+    let mut exit_code = None;
+    let terminal = loop {
+        match sup.recv().await {
+            VmEvent::App {
+                payload: TaskEvent::Build(BuildEvent::Progress { line, .. }),
+            } => {
+                if line.contains("resuming session") {
+                    announced_resume = true;
+                }
+            }
+            VmEvent::App {
+                payload: TaskEvent::Build(BuildEvent::ImplementationFinished { exit_code: code }),
+            } => exit_code = Some(code),
+            VmEvent::App {
+                payload:
+                    TaskEvent::Build(evt @ (BuildEvent::Completed { .. } | BuildEvent::Failed { .. })),
+            } => break evt,
+            VmEvent::App { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+
+    assert!(
+        announced_resume,
+        "the resume boundary must reach the build transcript as a Progress line"
+    );
+    // The LAST attempt's code, not the death's: this event describes the run.
+    assert_eq!(exit_code, Some(0));
+
+    let (head_sha, bundle_base64, summary, files) = match terminal {
+        BuildEvent::Completed {
+            head_sha,
+            bundle_base64,
+            summary,
+            files_touched,
+            ..
+        } => (head_sha, bundle_base64, summary, files_touched),
+        other => panic!("a resumed build should complete: {other:?}"),
+    };
+
+    // Both halves: the one committed before the connection died and the one
+    // committed after. Losing the first is what a host-side retry would cost.
+    assert!(
+        files.contains(&"src/first_half.rs".to_string()),
+        "{files:?}"
+    );
+    assert!(
+        files.contains(&"src/second_half.rs".to_string()),
+        "{files:?}"
+    );
+    assert!(summary.expect("summary").contains("resumed once"));
+
+    // Unbundle exactly as the server will: the branch must carry both commits.
+    let scratch = tmp.path().join("scratch.git");
+    tokio::fs::create_dir_all(&scratch).await.unwrap();
+    run_git(&scratch, &["init", "--bare"]).await;
+    run_git(&scratch, &["fetch", &repo_url, "main:refs/heads/main"]).await;
+    let bundle_path = tmp.path().join("egress.bundle");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle_base64)
+        .expect("valid base64");
+    tokio::fs::write(&bundle_path, bytes).await.unwrap();
+    run_git(
+        &scratch,
+        &[
+            "fetch",
+            bundle_path.to_str().unwrap(),
+            "refs/heads/build/build_1:refs/heads/build/build_1",
+        ],
+    )
+    .await;
+    let listing = run_git(&scratch, &["ls-tree", "-r", "--name-only", &head_sha]).await;
+    assert!(listing.contains("src/first_half.rs"), "{listing}");
+    assert!(listing.contains("src/second_half.rs"), "{listing}");
+
+    // The fixture exits 9 if it is resumed into the wrong conversation or
+    // finds its worktree missing, so two attempts and a clean build is the
+    // proof that neither happened.
+    let attempts = std::fs::read_to_string(state.join("attempts")).unwrap();
+    assert_eq!(attempts.trim(), "2", "expected exactly one resume");
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;

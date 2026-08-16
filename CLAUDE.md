@@ -73,6 +73,28 @@ implementation.
 - **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
   loop.** The server consumes Claude Code's typed output (stream-json, hooks,
   MCP tools, structured outputs); it does not reimplement the loop.
+- **A dead API connection is resumed in the supervisor, never re-dispatched
+  from the host.** Agent processes die intermittently at ~380s elapsed (#845)
+  when the connection drops mid-response — below the agent, in the VM's network
+  path, so nothing here can prevent it. What the supervisor can do is re-invoke
+  the agent with `--resume <session_id>`, read out of the stream-json it is
+  already forwarding: same conversation, same worktree, same `NOTES.md`. A
+  host-side retry would get a new VM and a fresh clone and keep none of the
+  three — and for a Builder that worktree *is* the implementation. The
+  classifier and every guard live in `crates/tasks-protocol/src/agent_run.rs`,
+  and **the guards are the load-bearing part**, because the failures you must
+  not retry look superficially like the one you must: an OOM kill meets the
+  same limit with a larger conversation, a missing terminal record means the
+  host is deallocating this VM right now, and a command that already selects a
+  session belongs to the operator. Two other rules hold that shape: read the
+  session id, never inject one (`--session-id` would overwrite the operator's
+  command), and never restate the task in the resume prompt — the task is above
+  it in the conversation, and re-sending it is how a resume silently becomes a
+  restart. A transport death also names itself in the terminal reason; "SPEC.md
+  not found" or "no commits" alone reads as a verdict on work that was never
+  judged. `dispatch_attempts` is still charged for one — see #845 for the
+  remaining piece, which must key off a classification field on the event, not
+  a string match on the reason text.
 
 ## Project structure
 
@@ -269,6 +291,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
 | `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
+| `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES` | 2 | times a supervisor re-invokes an agent with `--resume <session_id>` after its API connection dropped mid-response (#845). Only a transport death is retried, and the backoff rises 2s / 15s / 30s. `0` disables it. Read *inside* the VM, so both live in `images/{scout,builder}/Dockerfile` |
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |

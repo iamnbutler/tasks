@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 use vm_pool_protocol::AppProtocol;
 
+pub mod agent_run;
 pub mod vm_memory;
 
 /// The application protocol tasks uses with vm-pool.

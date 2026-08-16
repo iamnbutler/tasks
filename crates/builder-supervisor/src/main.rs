@@ -13,7 +13,11 @@
 //!   3. Records the base commit SHA, checks out the HOST-chosen `branch`
 //!      (the server pushes it, so the server names it)
 //!   4. Writes the prompt to `PROMPT.md` and pipes it to the agent's stdin
-//!   5. Runs the configured agent command, streaming stdout/stderr as Progress
+//!   5. Runs the configured agent command, streaming stdout/stderr as Progress,
+//!      and resumes it in place (`--resume <session_id>`, up to
+//!      `BUILDER_MAX_RESUMES`) if its API connection drops mid-response — the
+//!      worktree survives with the conversation, which is the whole point for
+//!      a Builder. See [`tasks_protocol::agent_run`]
 //!   6. Reads `SUMMARY.md` (optional PR prose), then removes both artifacts
 //!      from the worktree and sweeps everything else the agent left
 //!      uncommitted into a final commit — losing a build to a forgotten
@@ -33,7 +37,10 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use tasks_protocol::vm_memory::{AgentOutcome, sample_memory};
+use tasks_protocol::agent_run::{
+    AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, max_resumes_from_env,
+};
+use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
     BuildCommand, BuildEvent, LogStream, MAX_BUNDLE_BASE64_BYTES, TaskCommand, TaskEvent,
     TasksProtocol,
@@ -224,14 +231,17 @@ async fn run_build(
         fail!("prompt write: {e}");
     }
 
-    let outcome = match run_agent(&workdir, prompt, tx.clone()).await {
-        Ok(outcome) => outcome,
+    let run = match run_agent(&workdir, prompt, tx.clone()).await {
+        Ok(run) => run,
         Err(e) => fail!("agent: {e}"),
     };
+    // The exit code of the *last* attempt, so a build that was resumed across
+    // a dropped connection and then finished cleanly reports 0. This event
+    // describes the run, not the first process — see [`AgentRun`].
     emit(
         &tx,
         BuildEvent::ImplementationFinished {
-            exit_code: outcome.exit_code,
+            exit_code: run.outcome.exit_code,
         },
     )
     .await;
@@ -271,12 +281,13 @@ async fn run_build(
         Err(e) => fail!("rev-parse head: {e}"),
     };
     if head_sha == base_sha {
-        // A build with no transcript (#825) has only this string to explain
-        // itself, so an OOM kill or a signal death is named here rather than
-        // left for someone to infer from a budget that vanished.
+        // "no commits" on its own reads as a verdict on the agent's work, so
+        // an OOM kill, a signal death or a dropped API connection (#845) is
+        // named here rather than left for someone to infer from a budget that
+        // vanished.
         fail!(
             "agent produced no commits (head == base){}",
-            outcome.failure_context()
+            run.failure_context()
         );
     }
 
@@ -383,24 +394,113 @@ async fn git_stdout(workdir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Run the agent, streaming its output, and report how it ended — including
-/// whether anything in this VM was OOM-killed while it ran. See
-/// [`tasks_protocol::vm_memory`] for why the exit code alone cannot answer
-/// that.
+/// Run the agent to a conclusion, resuming it across dropped API connections,
+/// and report how the whole run ended — including whether anything in this VM
+/// was OOM-killed while it ran. See [`tasks_protocol::vm_memory`] for why the
+/// exit code alone cannot answer that.
+///
+/// The resume loop is #845's fix, and it matters more here than for a scout:
+/// resuming happens **in this VM**, so the conversation *and* the worktree
+/// survive. A host-side retry would get a new VM and a fresh clone — and for a
+/// Builder, that worktree is the implementation. Everything about when not to
+/// resume lives in [`tasks_protocol::agent_run`].
 async fn run_agent(
     workdir: &Path,
     prompt: &str,
     tx: mpsc::Sender<TaskVmEvent>,
-) -> Result<AgentOutcome> {
+) -> Result<AgentRun> {
     let cmd_str = std::env::var("BUILDER_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
-    let mut parts = cmd_str.split_whitespace();
-    let prog = parts.next().context("BUILDER_AGENT_CMD is empty")?;
-    let args: Vec<&str> = parts.collect();
-    info!(?prog, ?args, workdir = %workdir.display(), "running agent");
+    let argv: Vec<String> = cmd_str.split_whitespace().map(str::to_string).collect();
+    anyhow::ensure!(!argv.is_empty(), "BUILDER_AGENT_CMD is empty");
+    let max_resumes = max_resumes_from_env("BUILDER_MAX_RESUMES");
 
     let before = sample_memory();
+    let mut attempt_argv = argv.clone();
+    let mut input = prompt.to_string();
+    let mut resumes = 0u32;
+
+    loop {
+        let (outcome, watcher) = spawn_attempt(&attempt_argv, workdir, &input, before, &tx).await?;
+
+        match tasks_protocol::agent_run::decide(&watcher, &outcome, &argv, resumes, max_resumes) {
+            ResumeDecision::Resume {
+                argv: next,
+                delay,
+                attempt,
+            } => {
+                // Resume boundaries go out as stderr Progress lines, which is
+                // how they reach the build transcript (#825).
+                let line = format!(
+                    "builder-supervisor: the agent's API connection dropped; resuming session \
+                     {} in {}s (resume {attempt} of {max_resumes})",
+                    watcher.session_id().unwrap_or("?"),
+                    delay.as_secs()
+                );
+                warn!(%line, "resuming agent");
+                progress(&tx, line).await;
+                tokio::time::sleep(delay).await;
+                attempt_argv = next;
+                input = RESUME_PROMPT.to_string();
+                resumes = attempt;
+            }
+            ResumeDecision::Stop(no_resume) => {
+                let ending = watcher.ending();
+                if ending.is_transport() {
+                    let line = format!(
+                        "builder-supervisor: the agent's API connection dropped and the run was \
+                         not resumed — {}",
+                        no_resume.describe()
+                    );
+                    warn!(%line, "agent run ending without a resume");
+                    progress(&tx, line).await;
+                }
+                // Every run, not just the failing ones — an agent that exits 0
+                // after the OOM killer ate its build is the case this is here
+                // to catch.
+                if let Some(summary) = outcome.memory_summary() {
+                    info!(%summary, "VM memory");
+                    progress(&tx, format!("builder-supervisor: VM memory: {summary}")).await;
+                }
+                return Ok(AgentRun {
+                    outcome,
+                    ending,
+                    resumes,
+                    no_resume: Some(no_resume),
+                });
+            }
+        }
+    }
+}
+
+/// A stderr `Progress` line from the supervisor itself.
+async fn progress(tx: &mpsc::Sender<TaskVmEvent>, line: String) {
+    emit(
+        tx,
+        BuildEvent::Progress {
+            stream: LogStream::Stderr,
+            line,
+        },
+    )
+    .await;
+}
+
+/// Run the agent process once, streaming its output.
+///
+/// The [`ResultWatcher`] rides the *same* stdout loop that forwards `Progress`
+/// lines, so what it classifies is byte-for-byte what was reported — and since
+/// #825 that is also what lands in the build transcript.
+async fn spawn_attempt(
+    argv: &[String],
+    workdir: &Path,
+    input: &str,
+    before: Option<MemorySample>,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<(AgentOutcome, ResultWatcher)> {
+    let (prog, args) = argv.split_first().context("BUILDER_AGENT_CMD is empty")?;
+    info!(?prog, ?args, workdir = %workdir.display(), "running agent");
+
     let mut child = Command::new(prog)
-        .args(&args)
+        .args(args)
         .current_dir(workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -409,9 +509,9 @@ async fn run_agent(
         .context("spawn agent")?;
 
     let mut stdin = child.stdin.take().context("agent stdin")?;
-    let prompt_owned = prompt.to_string();
+    let input_owned = input.to_string();
     tokio::spawn(async move {
-        let _ = stdin.write_all(prompt_owned.as_bytes()).await;
+        let _ = stdin.write_all(input_owned.as_bytes()).await;
         let _ = stdin.write_all(b"\n").await;
         let _ = stdin.flush().await;
         drop(stdin);
@@ -422,8 +522,10 @@ async fn run_agent(
 
     let tx_out = tx.clone();
     let stdout_task = tokio::spawn(async move {
+        let mut watcher = ResultWatcher::new();
         let mut r = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = r.next_line().await {
+            watcher.observe(&line);
             emit(
                 &tx_out,
                 BuildEvent::Progress {
@@ -433,6 +535,7 @@ async fn run_agent(
             )
             .await;
         }
+        watcher
     });
     let tx_err = tx.clone();
     let stderr_task = tokio::spawn(async move {
@@ -450,22 +553,11 @@ async fn run_agent(
     });
 
     let status = child.wait().await.context("wait for agent")?;
-    let _ = stdout_task.await;
+    // The stdout side now carries a value, so it cannot be discarded. A
+    // panicked reader degrades to a default watcher — `Silent`, which resumes
+    // nothing — rather than taking the run down with it.
+    let watcher = stdout_task.await.unwrap_or_default();
     let _ = stderr_task.await;
 
-    let outcome = AgentOutcome::new(status, before, sample_memory());
-    // Every run, not just the failing ones — an agent that exits 0 after the
-    // OOM killer ate its build is the case this is here to catch.
-    if let Some(summary) = outcome.memory_summary() {
-        info!(%summary, "VM memory");
-        emit(
-            &tx,
-            BuildEvent::Progress {
-                stream: LogStream::Stderr,
-                line: format!("builder-supervisor: VM memory: {summary}"),
-            },
-        )
-        .await;
-    }
-    Ok(outcome)
+    Ok((AgentOutcome::new(status, before, sample_memory()), watcher))
 }
