@@ -10,6 +10,22 @@ implementation.
 - **The Scout/Builder information barrier is inviolable.** Builders never see
   Scout code — the spec is the deliverable. Specs are text, so a Builder run
   can batch N specs into one branch. Never propose reusing Scout branches.
+  Because the deliverable is text, a Scout is not the only thing that can
+  produce one: `POST /tasks/{id}/build-now` lets a **human** write a spec by
+  hand for a task whose issue body already *is* the specification, and the
+  Builder cannot tell the difference. Such a spec is an ordinary `Spec` row
+  with `session_id = NULL` — the tell that no Scout ran, and the reason that
+  column is nullable. What is skipped is not only the scouting but the
+  **review**: there is no independent artifact to rule on, so the human who
+  writes the spec *is* the review, and one `author_spec` decision (never an
+  `approve`, which would imply a second opinion) carries the whole judgment.
+  The endpoint is **human-only and refuses the orchestrator outright** rather
+  than being charter-gated — authoring, approving and dispatching its own
+  work with no second opinion anywhere is a materially different autonomy
+  from `dispatch_builds`, and if it is ever granted it wants its own named
+  capability. `files_touched` stays `[]` on a hand-written spec: `brief.rs`
+  derives overlap facts from that list, and an invented one would feed the
+  brief a lie rather than an omission.
 - **Salvage is never a spec.** A Scout writes two files with two meanings:
   `SPEC.md` means "I concluded", `NOTES.md` means "here is what I have so
   far". Notes stream back as checkpoints during the run (the VM is destroyed
@@ -35,7 +51,11 @@ implementation.
   accountable actor is fine — the orchestrator may do it when `queue_tasks` is
   live in the charter. The invariant is upheld by the pipeline's shape, not by
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
-  and builds are serial.
+  and builds are serial. `build-now` is the one door from `backlog` straight
+  to `ready_to_build`, and it does not weaken this: it is per-task, human-only
+  (a 403 for the orchestrator at any charter level), and the builds it queues
+  are the same serial ones. Bulk intake still cannot become bulk work,
+  because nothing but a person can walk through that door.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
   prompt.** Eight independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,

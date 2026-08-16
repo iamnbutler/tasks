@@ -23,9 +23,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildRequest, CaptureIssue, CloseTaskRequest, CreateProject,
-    ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage,
-    ServerStatus, SetCharter, SetMode,
+    BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CaptureIssue, CloseTaskRequest,
+    CreateProject, ErrorResponse, ModeResponse, ReorderQueue, ReorderSpecQueue, ReviewRequest,
+    SendMessage, ServerStatus, SetCharter, SetMode,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -262,6 +262,33 @@ impl Client {
     /// "Scout now": queue at the front; the dispatch loop picks it up.
     pub fn scout_task_now(&self, id: &TaskId) -> Result<Task> {
         self.post_empty(&format!("/tasks/{id}/scout"))
+    }
+
+    /// "Build now": write the spec by hand and queue a Builder run over it,
+    /// skipping the Scout for a task whose issue body already *is* the spec.
+    ///
+    /// `content` **replaces** the issue body rather than adding to it — the
+    /// Builder prompt is spec content alone — so pass `None` for the common
+    /// case. The `rationale` is the only record of why this did not need
+    /// scouting; the server does not demand one, because the human is never
+    /// gated, but there is nowhere else the judgment is written down.
+    ///
+    /// Human-only: the server answers 403 to the orchestrator whatever the
+    /// charter says.
+    pub fn build_task_now(
+        &self,
+        id: &TaskId,
+        content: Option<String>,
+        rationale: Option<String>,
+    ) -> Result<BuildDetail> {
+        self.post_json(
+            &format!("/tasks/{id}/build-now"),
+            &BuildNowRequest {
+                content,
+                rationale,
+                ..Default::default()
+            },
+        )
     }
 
     /// File an issue upstream and track it. Lands in the backlog — capturing

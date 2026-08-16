@@ -101,7 +101,7 @@ async fn seed_spec(h: &Harness, issue: u64) -> Spec {
     h.store.insert_session(&session).await.unwrap();
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task.id,
         content: "## Spec".into(),
         complexity: Complexity::Simple,
@@ -402,4 +402,67 @@ async fn capabilities_are_independent() {
         .unwrap();
     assert_eq!(resp.status(), 202);
     assert_eq!(resp.json::<Value>().await.unwrap()["shadowed"], true);
+}
+
+/// Build-now is outside the charter entirely, in the direction that matters:
+/// no level of any capability reaches it.
+///
+/// Writing a spec, approving it and dispatching the build is three judgments
+/// with no second opinion anywhere in the loop — a materially different
+/// autonomy from `dispatch_builds`, which still requires that a spec someone
+/// else wrote was approved by someone else again. So the refusal is a flat
+/// 403 rather than a `shadow`: shadow means "we would like to read your
+/// reasoning about this", and there is no capability here whose reasoning
+/// this would be. If it is ever granted, it wants a capability of its own.
+#[tokio::test]
+async fn build_now_is_outside_the_charter_and_the_orchestrator_cannot_reach_it() {
+    let h = harness().await;
+    for capability in [
+        Capability::QueueTasks,
+        Capability::DispatchBuilds,
+        Capability::AutoReviewSpecs,
+        Capability::CaptureWork,
+        Capability::CurateWork,
+        Capability::LandBuilds,
+    ] {
+        h.set(capability, CharterLevel::Live, None).await;
+    }
+    let task = seed_task(&h, 900, TaskState::Backlog).await;
+
+    let resp = h
+        .as_orchestrator(
+            h.http
+                .post(format!("{}/tasks/{}/build-now", h.base, task.id)),
+        )
+        .json(&json!({"rationale": "this one looks trivial to me"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("/scout"),
+        "the refusal should point at what the orchestrator may do instead: {message}"
+    );
+
+    // Not shadowed: no spec, no build, no ledger row, and the task never moved.
+    assert!(h.store.list_specs().await.unwrap().is_empty());
+    assert!(h.store.list_builds().await.unwrap().is_empty());
+    assert!(h.store.decisions(None, 100).await.unwrap().is_empty());
+    assert_eq!(
+        h.store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::Backlog
+    );
+
+    // The same call as the human, on the same server, goes through.
+    let resp = h
+        .http
+        .post(format!("{}/tasks/{}/build-now", h.base, task.id))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    assert_eq!(h.store.list_specs().await.unwrap().len(), 1);
 }

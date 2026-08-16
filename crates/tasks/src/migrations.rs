@@ -235,6 +235,145 @@ mod tests {
         );
     }
 
+    /// Version of the migration that makes `specs.session_id` nullable — the
+    /// one the test below stops short of, seeds around, and then applies.
+    const HUMAN_AUTHORED_SPECS: i64 = 20260816010503;
+
+    /// Making `specs.session_id` nullable is a copy/drop/rename, and `specs`
+    /// is a *parent*: `spec_queue` cascades off it and `build_specs`
+    /// references it with no ON DELETE action at all. With foreign keys
+    /// enforced — sqlx enables them by default, so this is the real
+    /// configuration — `DROP TABLE specs` runs an implicit `DELETE FROM
+    /// specs`, and an unguarded swap would take the queue with it.
+    ///
+    /// This is the only way to see that: an empty database migrates cleanly
+    /// whether or not the guard is there. So the set is applied *up to* the
+    /// migration, rows are seeded into all three tables, and only then does it
+    /// run. It also pins the thing that was expected to blow up and did not —
+    /// `ALTER TABLE specs_new RENAME TO specs` while two tables hold foreign
+    /// keys into a `specs` that no longer exists, with no
+    /// `PRAGMA legacy_alter_table`.
+    #[tokio::test]
+    async fn the_nullable_session_id_swap_keeps_the_queue_and_the_build_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("migrations");
+        std::fs::create_dir(&staged).unwrap();
+
+        // Everything before the swap, copied out of the real set.
+        let source = migrations_dir();
+        let mut later: Vec<String> = Vec::new();
+        for migration in MIGRATOR.iter() {
+            let name = file_name(migration.version, &migration.description);
+            if migration.version < HUMAN_AUTHORED_SPECS {
+                std::fs::copy(source.join(&name), staged.join(&name)).unwrap();
+            } else {
+                later.push(name);
+            }
+        }
+        assert!(
+            later.contains(&format!("{HUMAN_AUTHORED_SPECS}_human_authored_specs.sql")),
+            "the migration under test is not in the set: {later:?}"
+        );
+
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("swap.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        Migrator::new(staged.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        // A spec with a scout session, its approved queue entry, and a build
+        // that names it — one row in each table the swap could destroy.
+        for statement in [
+            "INSERT INTO projects (id, repo_owner, repo_name, added_at) \
+             VALUES ('p1', 'o', 'r', '2026-01-01T00:00:00Z')",
+            "INSERT INTO tasks (id, project_id, gh_issue_number, title, body, labels, \
+             gh_state, state, priority, ingested_at, updated_at) \
+             VALUES ('t1', 'p1', 1, 'title', 'body', '[]', 'open', 'in_review', 0, \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            "INSERT INTO sessions (id, task_id, status, branch, started_at) \
+             VALUES ('s1', 't1', 'scout_succeeded', 'scout/s1', '2026-01-01T00:00:00Z')",
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, files_touched, \
+             created_at) VALUES ('sp1', 's1', 't1', 'spec text', 'simple', '[]', \
+             '2026-01-01T00:00:00Z')",
+            "INSERT INTO spec_queue (spec_id, status, rank, approved_at, blocking_dependencies) \
+             VALUES ('sp1', 'approved', 3, '2026-01-01T00:00:00Z', '[]')",
+            "INSERT INTO builds (id, project_id, branch, base_branch, status, created_at) \
+             VALUES ('b1', 'p1', 'build/b1', 'main', 'queued', '2026-01-01T00:00:00Z')",
+            "INSERT INTO build_specs (build_id, spec_id, position) VALUES ('b1', 'sp1', 1)",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        let enforced: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(enforced, 1, "sqlx enforces foreign keys; the guard is real");
+
+        // The swap itself, applied to a populated database.
+        for name in &later {
+            std::fs::copy(source.join(name), staged.join(name)).unwrap();
+        }
+        Migrator::new(staged.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        let (queue_status, rank): (String, i64) =
+            sqlx::query_as("SELECT status, rank FROM spec_queue WHERE spec_id = 'sp1'")
+                .fetch_one(&pool)
+                .await
+                .expect("the queue entry survived the swap, verbatim");
+        assert_eq!((queue_status.as_str(), rank), ("approved", 3));
+        let position: i64 =
+            sqlx::query_scalar("SELECT position FROM build_specs WHERE build_id = 'b1'")
+                .fetch_one(&pool)
+                .await
+                .expect("the build batch survived the swap");
+        assert_eq!(position, 1);
+        let session: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM specs WHERE id = 'sp1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            session.as_deref(),
+            Some("s1"),
+            "an existing spec keeps naming its scout run"
+        );
+
+        // The point of the whole exercise: a spec with no session is now legal,
+        // and its foreign keys still bite.
+        sqlx::query(
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, files_touched, \
+             created_at) VALUES ('sp2', NULL, 't1', 'hand-written', 'simple', '[]', \
+             '2026-01-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a hand-written spec names no session");
+        let err = sqlx::query(
+            "INSERT INTO specs (id, session_id, task_id, content, complexity, files_touched, \
+             created_at) VALUES ('sp3', NULL, 'nosuchtask', 'x', 'simple', '[]', \
+             '2026-01-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("the task foreign key survived the rebuild");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "expected a foreign key violation, got: {err}"
+        );
+    }
+
     /// The boundary itself, without a filesystem: what counts as a version.
     #[test]
     fn allowed_versions_are_the_frozen_sequence_and_real_instants() {

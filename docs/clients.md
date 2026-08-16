@@ -95,6 +95,7 @@ No auth, loopback only — don't build a login flow.
 | Pick up a task | `POST /tasks/{task_id}/queue` | `backlog` → `queued`, appended at the end of the ranked order. 400 unless the task is `backlog`. The only door from the backlog into the pipeline — scouts dispatch **only** queued tasks. |
 | Un-pick a task | `POST /tasks/{task_id}/dequeue` | `queued` → `backlog`, rank cleared. 400 once work has started (past `queued`). |
 | Scout now | `POST /tasks/{task_id}/scout` | Queue the task (from `backlog` or `queued`) at the **front**, shifting everything else down. The dispatch loop picks it up on its next tick; the concurrency cap still applies — it jumps the queue, it doesn't bypass it. |
+| Build now (skip scouting) | `POST /tasks/{task_id}/build-now` `{"content"?,"complexity"?,"base_branch"?,"rationale"?,"evidence"?}` | For a task whose issue body already **is** the spec. Writes a `Spec` by hand (`session_id: null`), approves its queue entry, and queues a Builder run — one call, because it is one decision. **202** with the same `{...build, spec_ids}` shape as `POST /builds`. Every field optional: the common case is an empty body, where the **issue body becomes the spec**. A supplied `content` *replaces* it (the Builder prompt is spec content alone), `complexity` defaults to `simple`. Legal only from `backlog` or `queued` → task lands in `ready_to_build`; 400 past that, and 400 when the body is empty and no `content` was sent. **Human-only:** the orchestrator gets a **403** whatever the charter says, so don't offer it on an agent surface. What is skipped is review as well as scouting — there is no independent artifact to rule on, so a single `author_spec` decision (never an `approve`) carries the whole judgment. The rationale is not required by the server, but it is the only record of why this needed no scouting; the app requires it of itself. |
 | Review a spec | `POST /spec-queue/{spec_id}/review` `{"status","feedback"?}` | `status` ∈ `approved` \| `needs_revision` \| `rejected`. `approved` → task `ready_to_build`; `needs_revision` → task returns to `queued` for a re-scout (feedback reaches the next scout's prompt); `rejected` → dead end. |
 | Play / pause / stop | `POST /mode` `{"mode":"play"\|"pause"\|"stop"}` | Gates **new** work only. A mode change never interrupts a scout in flight — reflect that in the UI (pausing ≠ cancelling; show in-flight sessions still running). |
 
@@ -124,6 +125,13 @@ the server only.
 - `GET /specs` / `GET /specs/{id}` — `spec_markdown` is the deliverable;
   render it as Markdown. Also carries `files_touched`, `complexity`,
   `agent_exit_code`.
+  **`session_id` is nullable, and null is a fact worth rendering:** it means
+  no Scout ran and a human wrote the spec by hand through
+  `POST /tasks/{id}/build-now`. There is no session, no transcript and no
+  independent review behind it — the author was the reviewer. Say so (the app
+  labels it `SPEC · SIMPLE · HUMAN-AUTHORED`) rather than leaving a missing
+  scout link to be inferred. `files_touched` is `[]` on such a spec, always:
+  nobody explored the code, so there is nothing honest to put there.
 - `GET /spec-queue` — `{entry: {...}, task_id}` items for the review screen.
 - `POST /builds` `{"spec_ids": [...], "base_branch"?}` — queue a Builder run
   over a set of **approved** specs; **202** with the build (`{..., spec_ids}`).
@@ -354,6 +362,10 @@ All enums are snake_case strings on the wire:
   still good.
   Scout failures and `needs_revision` verdicts return to `queued`, never
   `backlog` — picked-up work stays picked up.
+  One edge skips the middle: `build-now` takes `backlog` **or** `queued`
+  straight to `ready_to_build`, because the human wrote and approved the spec
+  in one act. Switch on `to` (or on the task id), never on the `(from, to)`
+  pair, and this costs you nothing.
 - There is no "mark done" endpoint, deliberately: **closing the GitHub issue
   is the done signal.** When a picked-up task's issue closes, the next poll
   retires it — `queued`/`in_review`/`ready_to_build` become `done` (or
@@ -380,7 +392,9 @@ Event JSON: `{seq, timestamp, payload}` where payload is tagged by `"kind"`
 (`from`/`to`), `task_gh_state_changed` (`task_id`, `gh_state` — the poller's
 snapshot of GitHub's open/closed flag moved, most often because the issue
 dropped out of the repository's open set; refetch the task or the list),
-`session_started`, `session_completed`, `spec_created`,
+`session_started`, `session_completed`, `spec_created` (`spec_id`, `task_id`,
+`session_id` — **nullable**, and null means a human wrote the spec without a
+Scout; same contract as `Spec.session_id` above),
 `spec_queue_status_changed`, `queue_reordered`, `spec_queue_reordered`,
 `build_requested` (`build_id`, `spec_ids`), `build_started`,
 `build_completed` (`build_id`, `status` — refetch the build for detail),

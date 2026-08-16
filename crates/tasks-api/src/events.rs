@@ -73,10 +73,13 @@ pub enum EventPayload {
         task_id: TaskId,
         status: SessionStatus,
     },
+    /// A spec exists for a task. `session_id` is `None` when no Scout ran and
+    /// a human wrote it — see [`crate::models::Spec::session_id`].
     SpecCreated {
         spec_id: SpecId,
         task_id: TaskId,
-        session_id: SessionId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
     },
     /// A spec's review state changed. `actor` is who decided — the
     /// orchestrator must never be nudged about its own verdicts — and
@@ -254,7 +257,7 @@ mod tests {
             EventPayload::SpecCreated {
                 spec_id: SpecId::from_raw("spec_1"),
                 task_id: task(),
-                session_id: SessionId::from_raw("sess_1"),
+                session_id: Some(SessionId::from_raw("sess_1")),
             },
             EventPayload::SpecQueueStatusChanged {
                 spec_id: SpecId::from_raw("spec_1"),

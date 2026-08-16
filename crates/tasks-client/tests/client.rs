@@ -10,8 +10,8 @@ use tasks::server::router;
 use tasks::store::Store;
 use tasks_api::events::EventPayload;
 use tasks_api::models::{
-    GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId, TaskState,
-    TranscriptOwner, TranscriptStream,
+    BuildStatus, GhState, Mode, Project, Session, SessionId, SessionStatus, Task, TaskId,
+    TaskState, TranscriptOwner, TranscriptStream,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -124,6 +124,33 @@ fn queue_flow_round_trips_typed_states() {
     let back = server.client.dequeue_task(&task.id).unwrap();
     assert_eq!(back.state, TaskState::Backlog);
     assert_eq!(back.manual_rank, None);
+}
+
+/// Build-now over the typed client: one call takes a backlog task all the way
+/// to a queued Builder run, and the spec it wrote names no session — the tell
+/// that no Scout ran, which is what a client renders as provenance.
+#[test]
+fn build_now_writes_a_spec_with_no_session_and_queues_the_build() {
+    let server = spawn_server();
+    let project = server.client.create_project("iamnbutler", "tasks").unwrap();
+    let task = server.seed_task(&project, 11);
+
+    let detail = server
+        .client
+        .build_task_now(&task.id, None, Some("the issue body is the spec".into()))
+        .unwrap();
+    assert_eq!(detail.build.status, BuildStatus::Queued);
+    assert_eq!(detail.spec_ids.len(), 1);
+
+    let spec = server.client.spec(&detail.spec_ids[0]).unwrap();
+    assert_eq!(spec.session_id, None, "no Scout ran");
+    assert_eq!(spec.task_id, task.id);
+    assert_eq!(spec.content, task.body);
+
+    assert_eq!(
+        server.client.task(&task.id).unwrap().state,
+        TaskState::ReadyToBuild
+    );
 }
 
 #[test]

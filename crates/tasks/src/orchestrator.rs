@@ -1061,6 +1061,13 @@ fn system_prompt(
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
+         - POST /tasks/{{id}}/build-now — **not yours.** The human writes the \
+           spec by hand and builds it without scouting, for a task whose issue \
+           body already is the spec. It authors, approves and dispatches in \
+           one act with no second opinion anywhere, so no charter capability \
+           grants it and you will get a 403. When you think a task deserves \
+           it, say so and let the human make the call; /scout is your \
+           equivalent\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /builds/{{id}}/transcript?since=N — the builder agent's own \
            output, line by line. Read this FIRST when a build failed: the \
@@ -1130,8 +1137,10 @@ fn system_prompt(
            scouts+builds, pause only polls, stop is everything off\n\n\
          Rules:\n\
          - States: backlog → queued → scouting → in_review → ready_to_build → \
-           building → done (rejected = terminal). Issue closure on GitHub \
-           retires work automatically; there is no manual mark-done.\n\
+           building → done (rejected = terminal). A human build-now jumps \
+           straight to ready_to_build with a spec that names no scout session. \
+           Issue closure on GitHub retires work automatically; there is no \
+           manual mark-done.\n\
          - The checkout is shared with the human and other agents. Never \
            switch branches, stash, or discard changes you did not make; do \
            your own work on branches and leave the tree as you found it.\n\
@@ -1159,7 +1168,7 @@ mod tests {
         assert!(nudge_worthy(&EventPayload::SpecCreated {
             spec_id: spec(),
             task_id: task(),
-            session_id: sess(),
+            session_id: Some(sess()),
         }));
         assert!(nudge_worthy(&EventPayload::SessionCompleted {
             session_id: sess(),

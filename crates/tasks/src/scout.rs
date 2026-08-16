@@ -528,7 +528,7 @@ impl Scout {
             parse_complexity(&spec_markdown).unwrap_or_else(|| infer_complexity(&files_touched));
         let spec = Spec {
             id: SpecId::new(),
-            session_id: session_id.clone(),
+            session_id: Some(session_id.clone()),
             task_id: task.id.clone(),
             content: spec_markdown,
             complexity,
@@ -565,7 +565,7 @@ impl Scout {
             .append_event(EventPayload::SpecCreated {
                 spec_id: spec.id.clone(),
                 task_id: task.id.clone(),
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
             })
             .await?;
         self.store
@@ -1155,7 +1155,7 @@ mod tests {
         ReviewedSpec {
             spec: Spec {
                 id: SpecId::new(),
-                session_id: SessionId::new(),
+                session_id: Some(SessionId::new()),
                 task_id: crate::models::TaskId::new(),
                 content: content.into(),
                 complexity: Complexity::Simple,

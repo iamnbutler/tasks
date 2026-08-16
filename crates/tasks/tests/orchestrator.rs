@@ -978,7 +978,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
         id: SpecId::new(),
-        session_id: session.id,
+        session_id: Some(session.id),
         task_id: task.id,
         content: "## Spec\n\nDo the thing.".into(),
         complexity: Complexity::Simple,

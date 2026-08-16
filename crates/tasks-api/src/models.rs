@@ -340,11 +340,19 @@ pub struct ScoutNotes {
     pub updated_at: DateTime<Utc>,
 }
 
-/// The distilled artifact a Scout produces.
+/// The distilled artifact a Scout produces — or, when a human decided the
+/// task was too simple to be worth scouting, the one they wrote by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub id: SpecId,
-    pub session_id: SessionId,
+    /// The Scout run this spec came out of, and the provenance contract:
+    /// `None` means **no Scout ran**. A hand-written spec
+    /// (`POST /tasks/{id}/build-now`) has no session, no transcript and no
+    /// independent review — the human who wrote it *is* the review, recorded
+    /// as a single `author_spec` decision. Clients should say so rather than
+    /// leave a missing scout link to be inferred.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub task_id: TaskId,
     pub content: String,
     pub complexity: Complexity,
@@ -799,6 +807,11 @@ pub enum DecisionAction {
     EditIssue,
     /// An issue's labels were replaced.
     LabelIssue,
+    /// A spec was written by hand, skipping the Scout. Deliberately not an
+    /// `Approve`: approving implies a second opinion on someone else's
+    /// artifact, and there is none here — the author is the reviewer, and one
+    /// row carries the whole judgment.
+    AuthorSpec,
 }
 
 impl DecisionAction {
@@ -818,6 +831,7 @@ impl DecisionAction {
             DecisionAction::ReviewComment => "review_comment",
             DecisionAction::EditIssue => "edit_issue",
             DecisionAction::LabelIssue => "label_issue",
+            DecisionAction::AuthorSpec => "author_spec",
         }
     }
 
@@ -837,6 +851,7 @@ impl DecisionAction {
             "review_comment" => Some(DecisionAction::ReviewComment),
             "edit_issue" => Some(DecisionAction::EditIssue),
             "label_issue" => Some(DecisionAction::LabelIssue),
+            "author_spec" => Some(DecisionAction::AuthorSpec),
             _ => None,
         }
     }

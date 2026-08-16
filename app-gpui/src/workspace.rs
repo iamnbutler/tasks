@@ -179,6 +179,9 @@ pub struct Workspace {
     /// Review-form composer in the inspector — feedback for a re-scout or a
     /// question for the orchestrator, depending on which button submits it.
     pub(crate) review_input: Entity<InputState>,
+    /// Build-now composer in the inspector. The draft is the *rationale* for
+    /// skipping the Scout — never the spec, which is always the issue body.
+    pub(crate) build_input: Entity<InputState>,
     /// Issue-draft composer shown in the cmd-n window. Owned here, not by
     /// the window, so a dismissed draft survives to the next cmd-n.
     pub(crate) issue_input: Entity<InputState>,
@@ -269,10 +272,16 @@ impl Workspace {
             state.set_placeholder("Feedback or a question about this spec…", cx);
             state
         });
+        let build_input = cx.new(|cx| {
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("Why this doesn't need scouting…", cx);
+            state
+        });
         // The composers gate their submit buttons on content, so keystrokes
         // must re-render the workspace, not just the input element.
         cx.observe(&input, |_, _, cx| cx.notify()).detach();
         cx.observe(&review_input, |_, _, cx| cx.notify()).detach();
+        cx.observe(&build_input, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&input, |this, _, event: &InputStateEvent, cx| {
             if matches!(event, InputStateEvent::Submit) {
                 this.send_chat(cx);
@@ -282,6 +291,12 @@ impl Workspace {
         cx.subscribe(&review_input, |this, _, event: &InputStateEvent, cx| {
             if matches!(event, InputStateEvent::Submit) {
                 this.ask_about_selected_spec(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&build_input, |this, _, event: &InputStateEvent, cx| {
+            if matches!(event, InputStateEvent::Submit) {
+                this.build_selected_task_now(cx);
             }
         })
         .detach();
@@ -329,6 +344,7 @@ impl Workspace {
             show_done: false,
             input,
             review_input,
+            build_input,
             issue_input,
             issue_window: None,
             chat_list,
@@ -405,6 +421,10 @@ impl Workspace {
             // Draft feedback is about one spec — don't carry it to another.
             self.review_input
                 .update(cx, |input, cx| input.set_content("", cx));
+            // Same for a build-now rationale: it justifies skipping the Scout
+            // for *this* task, and would be a lie about the next one.
+            self.build_input
+                .update(cx, |input, cx| input.set_content("", cx));
         }
         self.selected_task = Some(id);
         self.right_sidebar.open = true;
@@ -467,6 +487,45 @@ impl Workspace {
             "Re: task #{number} \"{title}\" — its spec ({spec_id}) is pending review.\n\n{text}"
         );
         self.ask_orchestrator(message, cx);
+    }
+
+    /// Submit the build-now form for the selected task — the form's primary
+    /// (cmd-enter) action.
+    ///
+    /// No-op without a selected task in `backlog` or `queued`, or without
+    /// draft text. The rationale is required *by the app*, not by the server:
+    /// a one-click path to a build nobody reviewed is not worth the seconds
+    /// it saves, and the rationale is the only place the judgment is written
+    /// down. The spec is always the issue body; the draft never becomes spec
+    /// content.
+    pub(crate) fn build_selected_task_now(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = ({
+            let state = self.app_state.read(cx);
+            self.selected_task
+                .as_ref()
+                .and_then(|id| state.task(id))
+                .filter(|task| matches!(task.state, TaskState::Backlog | TaskState::Queued))
+                .map(|task| task.id.clone())
+        }) else {
+            return;
+        };
+        let Some(rationale) = self.take_build_draft(cx) else {
+            return;
+        };
+        self.app_state
+            .update(cx, |state, cx| state.build_task_now(id, rationale, cx));
+    }
+
+    /// The trimmed build-now rationale, clearing the composer — `None` if
+    /// empty.
+    pub(crate) fn take_build_draft(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let text = self.build_input.read(cx).content().trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        self.build_input
+            .update(cx, |input, cx| input.set_content("", cx));
+        Some(text)
     }
 
     pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {

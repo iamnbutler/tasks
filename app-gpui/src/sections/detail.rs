@@ -26,8 +26,22 @@ struct TaskView {
     body: String,
     github_url: Option<String>,
     /// `(spec id, complexity, content)` when the task sits in review with a
-    /// pending verdict.
+    /// pending verdict — i.e. when the review form should be offered.
     pending_spec: Option<(SpecId, Complexity, String)>,
+    /// The task's latest spec, whatever its review state. Rendered as the
+    /// reading surface in place of the issue body: once a spec exists it is
+    /// what the Builder acts on, so it is what the inspector should show.
+    latest_spec: Option<SpecView>,
+}
+
+/// Enough of a spec to render it, plus its provenance.
+struct SpecView {
+    id: SpecId,
+    complexity: Complexity,
+    content: String,
+    /// True when no Scout ran and a human wrote this spec by hand. Stated in
+    /// the header rather than left to be inferred from a missing scout link.
+    human_authored: bool,
 }
 
 impl Workspace {
@@ -63,6 +77,12 @@ impl Workspace {
                             })
                         })
                         .map(|spec| (spec.id.clone(), spec.complexity, spec.content.clone())),
+                    latest_spec: state.latest_spec(&task.id).map(|spec| SpecView {
+                        id: spec.id.clone(),
+                        complexity: spec.complexity,
+                        content: spec.content.clone(),
+                        human_authored: spec.session_id.is_none(),
+                    }),
                 })
         };
 
@@ -347,19 +367,79 @@ impl Workspace {
             );
         }
 
+        // Build-now: write the spec by hand and skip the Scout, for a task
+        // whose issue body already is the spec. Offered only where no Scout
+        // has run — the same two states the server accepts.
+        //
+        // The draft is the *rationale*, never the spec: if the issue body is
+        // not the spec, the honest answers are to scout the task or edit the
+        // issue, not to type a description only Tasks can see. The button
+        // stays inert until it has text — this is the one path to a build
+        // nobody else reviewed, and a one-click version is not worth the
+        // seconds it saves.
+        if matches!(task.state, TaskState::Backlog | TaskState::Queued) {
+            let has_text = !self.build_input.read(cx).content().trim().is_empty();
+            pane = pane.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child("BUILD NOW · SKIP THE SCOUT, BUILD THE ISSUE BODY"),
+                    )
+                    .child(
+                        div()
+                            .h(px(56.))
+                            .p(px(4.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.border_secondary())
+                            .bg(theme.bg())
+                            .text_sm()
+                            .child(text_area(&self.build_input, cx).size_full()),
+                    )
+                    .child(div().flex().flex_row().items_center().gap(px(6.)).child(
+                        self.form_button(
+                            "build-now",
+                            "Build Now",
+                            gpui::hsla(205. / 360., 0.70, 0.58, 1.),
+                            has_text,
+                            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.build_selected_task_now(cx);
+                            }),
+                            cx,
+                        ),
+                    )),
+            );
+        }
+
         // Specs and issue bodies are markdown at the source (agent output,
         // GitHub issues) — render them as such, through the shared cache.
-        if let Some((spec_id, complexity, content)) = task.pending_spec {
+        //
+        // A spec is shown whatever its review state, not only while it is
+        // pending: once one exists it is what a Builder acts on, so it is the
+        // thing worth reading. Its header carries provenance, because a
+        // hand-written spec has no scout run behind it and that should be
+        // stated rather than inferred from a link that isn't there.
+        if let Some(spec) = task.latest_spec {
+            let SpecView {
+                id: spec_id,
+                complexity,
+                content,
+                human_authored,
+            } = spec;
             let entity = self
                 .markdown_cache()
                 .entity(format!("spec:{spec_id}"), &content, cx);
+            let mut header = format!("SPEC · {}", complexity.as_str().to_uppercase());
+            if human_authored {
+                header.push_str(" · HUMAN-AUTHORED");
+            }
             pane = pane
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.fg_muted())
-                        .child(format!("SPEC · {}", complexity.as_str().to_uppercase())),
-                )
+                .child(div().text_xs().text_color(theme.fg_muted()).child(header))
                 .child(
                     div()
                         .p(px(8.))

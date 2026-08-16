@@ -94,7 +94,10 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
         .await
         .expect("dispatch");
 
-    let session_id = spec.session_id.clone();
+    let session_id = spec
+        .session_id
+        .clone()
+        .expect("a scout-produced spec names its session");
     let lines = store
         .transcript_since(&TranscriptOwner::session(&session_id), 0, 1000)
         .await
@@ -214,7 +217,15 @@ async fn the_transcript_is_complete_before_the_session_completes() {
     assert!(saw_completion, "no session_completed event was appended");
 
     let lines = store
-        .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
+        .transcript_since(
+            &TranscriptOwner::session(
+                spec.session_id
+                    .as_ref()
+                    .expect("a scout-produced spec names its session"),
+            ),
+            0,
+            1000,
+        )
         .await
         .unwrap();
     assert!(
@@ -274,7 +285,15 @@ async fn a_credential_echoed_by_the_agent_never_reaches_the_transcript() {
         .expect("dispatch");
 
     let lines = store
-        .transcript_since(&TranscriptOwner::session(&spec.session_id), 0, 1000)
+        .transcript_since(
+            &TranscriptOwner::session(
+                spec.session_id
+                    .as_ref()
+                    .expect("a scout-produced spec names its session"),
+            ),
+            0,
+            1000,
+        )
         .await
         .unwrap();
     let joined = lines
@@ -306,6 +325,8 @@ async fn a_credential_echoed_by_the_agent_never_reaches_the_transcript() {
     let body = reqwest::get(format!(
         "{base}/sessions/{}/transcript?limit=2000",
         spec.session_id
+            .as_ref()
+            .expect("a scout-produced spec names its session")
     ))
     .await
     .unwrap()

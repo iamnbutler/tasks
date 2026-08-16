@@ -616,6 +616,19 @@ impl AppState {
         self.run(cx, move |client| client.scout_task_now(&id));
     }
 
+    /// "Build now": skip the Scout, take the issue body as the spec, and
+    /// queue a Builder run over it.
+    ///
+    /// The app never sends `content`. In the UI the draft is the *rationale*
+    /// and the spec is always the issue body: if the body is not the spec,
+    /// the honest answers are to scout the task or edit the issue, not to
+    /// type a description that only Tasks can see.
+    pub fn build_task_now(&mut self, id: TaskId, rationale: String, cx: &mut Context<Self>) {
+        self.run(cx, move |client| {
+            client.build_task_now(&id, None, Some(rationale))
+        });
+    }
+
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.set_mode(mode));
     }

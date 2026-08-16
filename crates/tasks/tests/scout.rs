@@ -124,7 +124,12 @@ async fn scout_dispatch_end_to_end_produces_spec() {
     assert_eq!(queue_entry.status, SpecQueueStatus::PendingReview);
 
     let session = store
-        .get_session(&stored_spec.session_id)
+        .get_session(
+            stored_spec
+                .session_id
+                .as_ref()
+                .expect("a scout-produced spec names its session"),
+        )
         .await
         .unwrap()
         .unwrap();

@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BriefingSection, Build, Mode, ProjectId, SpecId, TaskId};
+use crate::models::{BriefingSection, Build, Complexity, Mode, ProjectId, SpecId, TaskId};
 
 /// Body of `POST /projects`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +206,36 @@ pub struct BuildRequest {
     pub base_branch: Option<String>,
     /// Why this batch, now. Required of the orchestrator — batching and
     /// ordering are judgment calls, so the reasoning is the record.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// What the decider checked, free-form JSON. Stored on the decision.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /tasks/{task_id}/build-now`.
+///
+/// Every field is optional, because the common case — "the issue body already
+/// *is* the spec" — is an empty body. Human-only: the orchestrator gets a 403
+/// whatever its charter says, since authoring and approving its own work with
+/// no second opinion anywhere in the loop is a different autonomy from
+/// `dispatch_builds`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuildNowRequest {
+    /// The spec text. **Replaces** the issue body rather than adding to it —
+    /// the Builder prompt is spec content alone, so anything supplied here is
+    /// everything the Builder will see. Omit it to use the issue body.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// How big the work is. Defaults to `simple`: a task worth skipping the
+    /// Scout for is one whose shape is already known.
+    #[serde(default)]
+    pub complexity: Option<Complexity>,
+    /// Branch the build is cut from and PR'd against. Defaults to `main`.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Why this task did not need scouting. Not required — the human is never
+    /// gated — but it is the only record of the judgment.
     #[serde(default)]
     pub rationale: Option<String>,
     /// What the decider checked, free-form JSON. Stored on the decision.
