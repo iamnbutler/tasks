@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
+use crate::builder::{VerificationReport, verification_report};
 use crate::github::GitHubClient;
 use crate::models::{
     Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueStatus, Task, TaskId,
@@ -37,7 +38,21 @@ use crate::store::{Store, StoreError};
 /// Whole-brief budget for GitHub reads. Past this the DB-derived facts still
 /// ship — a late brief is worse than a partial one, since the turn it rides on
 /// is what makes work happen.
+///
+/// **Whole-brief, and enforced as one deadline** ([`Brief::within_github_budget`]):
+/// a per-call timeout of the same size lets a turn briefing four subjects spend
+/// forty seconds, which is not what this number says.
 const GITHUB_BUDGET: Duration = Duration::from_secs(10);
+
+/// The part of the tree nothing runnable on a Linux builder can *see*.
+///
+/// It compiles and unit-tests here — `make app-check` / `make app-test`, since
+/// #877/#893 put the five packages in the images — but those tests are pure
+/// functions over view state, so whether a pixel landed anywhere is still a
+/// `make app` on a Mac. Naming the boundary this precisely is what keeps the
+/// rule narrow: "the GUI is unreviewable" is both false and, being false,
+/// ignored.
+const VISUAL_SURFACE: &str = "app-gpui/";
 
 /// Most overlapping paths to name before summarizing the rest. Enough to
 /// recognize *what* overlaps; the count carries the scale.
@@ -70,6 +85,9 @@ pub struct Brief<'a> {
     /// times, and — more importantly — every line in one `[brief]` block
     /// describes the same instant.
     world: tokio::sync::OnceCell<World>,
+    /// Set at the first GitHub read and shared by every later one, so
+    /// [`GITHUB_BUDGET`] bounds the brief rather than each call inside it.
+    github_deadline: tokio::sync::OnceCell<tokio::time::Instant>,
 }
 
 /// Everything the DB half of a brief reads, loaded once per brief rather than
@@ -92,6 +110,7 @@ impl<'a> Brief<'a> {
             github,
             base_branch,
             world: tokio::sync::OnceCell::new(),
+            github_deadline: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -157,6 +176,13 @@ impl<'a> Brief<'a> {
     /// itself reaches the trunk — so when the base is not the trunk this spells
     /// the trap out rather than leaving it to be inferred from a branch name.
     /// It is how PR #863 was lost.
+    ///
+    /// Three further lines answer the three questions that decide whether this
+    /// PR can be landed at all: what GitHub says about the merge, what the
+    /// build claimed about its own test run, and how much of the batch nothing
+    /// runnable here could have checked. All three are facts — who acts on
+    /// them is stated once, in the generated `land_batch` section of the
+    /// orchestrator's prompt, and nowhere else.
     pub async fn for_stranded_build(&self, build_id: &BuildId) -> Result<Vec<String>, StoreError> {
         let Some(build) = self.store.get_build(build_id).await? else {
             return Ok(vec![format!(
@@ -204,6 +230,9 @@ impl<'a> Brief<'a> {
         if !waiting.is_empty() {
             lines.push(format!("still awaiting merge: {}", waiting.join(", ")));
         }
+        lines.push(verification_line(build.summary.as_deref()));
+        lines.push(verification_surface(&build.files_touched));
+        lines.extend(self.landing_facts(&build, world).await);
         Ok(lines)
     }
 
@@ -256,6 +285,27 @@ impl<'a> Brief<'a> {
                  into a Builder run"
             ));
         }
+
+        // What is parked behind an open PR, read from the store rather than
+        // from `world.builds`: `load_world` drops anything finished more than
+        // BUILD_RECENCY_DAYS ago, which is exactly the batch that has been
+        // stranded longest. This is also the query `run::watch_merges` walks,
+        // so the line and the poll cannot describe different sets.
+        for project in world.projects.values() {
+            for parked in self.store.list_builds_awaiting_merge(&project.id).await? {
+                let issues: Vec<String> = parked
+                    .tasks
+                    .iter()
+                    .map(|t| format!("#{}", t.gh_issue_number))
+                    .collect();
+                lines.push(format!(
+                    "build {} is parked behind PR #{}: {} still awaiting merge",
+                    parked.build_id,
+                    parked.pr_number,
+                    issues.join(", "),
+                ));
+            }
+        }
         Ok(lines)
     }
 
@@ -294,6 +344,148 @@ impl<'a> Brief<'a> {
     /// once.
     async fn world(&self) -> Result<&World, StoreError> {
         self.world.get_or_try_init(|| self.load_world()).await
+    }
+
+    /// Run one GitHub read inside the brief's *shared* [`GITHUB_BUDGET`],
+    /// answering `None` when it did not fit.
+    ///
+    /// The deadline is taken at the first read and reused, so a turn briefing
+    /// four subjects still spends ten seconds on GitHub in total. The explicit
+    /// expiry check ahead of `timeout_at` is what makes an exhausted budget
+    /// answer *without issuing a request*: `timeout_at` polls its inner future
+    /// once before consulting the timer, and that first poll is the one that
+    /// opens the connection.
+    async fn within_github_budget<F: std::future::Future>(&self, fut: F) -> Option<F::Output> {
+        let deadline = *self
+            .github_deadline
+            .get_or_init(|| async { tokio::time::Instant::now() + GITHUB_BUDGET })
+            .await;
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::timeout_at(deadline, fut).await.ok()
+    }
+
+    /// The live half of a stranded build's brief: what GitHub says about
+    /// landing this pull request, and — only for a stacked build — where its
+    /// base stands relative to the trunk.
+    ///
+    /// Every guard gets its own line rather than falling through to silence.
+    /// A missing fact and a clean one read identically otherwise, and of the
+    /// two only one of them is safe to act on.
+    async fn landing_facts(&self, build: &Build, world: &World) -> Vec<String> {
+        let Some(number) = build.pr_number else {
+            return vec![
+                "no pull request is recorded on this build, so there is nothing to land \
+                 here — the batch is parked on a claim nothing was opened for"
+                    .into(),
+            ];
+        };
+        let Some(github) = self.github else {
+            return vec![format!(
+                "GitHub was not consulted (the server has no token): whether PR #{number} \
+                 can be merged is unchecked rather than fine"
+            )];
+        };
+        let Some(project) = world.projects.get(&build.project_id) else {
+            return vec![format!(
+                "the project row for this build is gone, so PR #{number} could not be \
+                 looked up"
+            )];
+        };
+        match self
+            .within_github_budget(self.live_landing_facts(github, project, build, number))
+            .await
+        {
+            Some(lines) => lines,
+            None => {
+                warn!(build = %build.id, number, "landing facts timed out; briefing without them");
+                vec![format!(
+                    "GitHub did not answer within the brief's {}s budget: whether PR \
+                     #{number} can be merged is unchecked rather than fine",
+                    GITHUB_BUDGET.as_secs()
+                )]
+            }
+        }
+    }
+
+    async fn live_landing_facts(
+        &self,
+        github: &GitHubClient,
+        project: &Project,
+        build: &Build,
+        number: u64,
+    ) -> Vec<String> {
+        let owner = &project.repo_owner;
+        let name = &project.repo_name;
+        let pr = match github.pull_request_state(owner, name, number).await {
+            Ok(pr) => pr,
+            Err(e) => {
+                debug!(error = %e, number, "pr state unavailable");
+                return vec![format!(
+                    "PR #{number} could not be read ({e}): its mergeability is unknown \
+                     rather than fine"
+                )];
+            }
+        };
+        let mut lines = vec![format!(
+            "PR #{number} is {}: {}",
+            pr.label(),
+            pr.landing().describe()
+        )];
+
+        // The stacked question, and only for a stacked build: an unstacked one
+        // has its answer in `base_ref` already and must cost no extra call.
+        if build.base_branch == self.base_branch {
+            return lines;
+        }
+        // Once merged, GitHub deletes head branches, so `compare/{trunk}...
+        // {branch}` 404s — the merge commit is the ref that still resolves.
+        // While the PR is open the branch is the live question and the merge
+        // commit is only a speculative test merge.
+        let (git_ref, about_the_merge) = match (pr.merged, pr.merge_commit_sha.as_deref()) {
+            (true, Some(sha)) => (sha.to_string(), true),
+            _ => (build.base_branch.clone(), false),
+        };
+        // `trunk...ref`: reachable reads as `identical` or `behind`, and
+        // reversing the operands inverts the verdict.
+        match github
+            .merge_reached_trunk(owner, name, self.base_branch, &git_ref)
+            .await
+        {
+            Ok(reached) => lines.push(match (about_the_merge, reached) {
+                (true, true) => format!(
+                    "the merge commit {git_ref} IS on {}, so this batch has shipped and \
+                     the next poll should retire it",
+                    self.base_branch
+                ),
+                (true, false) => format!(
+                    "the merge commit {git_ref} is NOT on {} yet: this PR reached its \
+                     base and nothing more, so the batch stays parked until {} lands",
+                    self.base_branch, build.base_branch
+                ),
+                (false, false) => format!(
+                    "its base {} has not reached {} yet, so merging this PR now ships \
+                     nothing until {} itself lands",
+                    build.base_branch, self.base_branch, build.base_branch
+                ),
+                (false, true) => format!(
+                    "its base {} has ALREADY reached {}, so merging this PR now only \
+                     adds a commit to a branch nothing will pick up — it wants \
+                     retargeting at {} first",
+                    build.base_branch, self.base_branch, self.base_branch
+                ),
+            }),
+            Err(e) => {
+                debug!(error = %e, number, "compare unavailable");
+                lines.push(format!(
+                    "could not check whether {git_ref} has reached {} ({e}) — treat that \
+                     as unknown, never as landed",
+                    self.base_branch
+                ));
+            }
+        }
+        lines
     }
 
     async fn load_world(&self) -> Result<World, StoreError> {
@@ -416,18 +608,16 @@ impl<'a> Brief<'a> {
         let Some(project) = self.project_of(spec, world) else {
             return Vec::new();
         };
-        match tokio::time::timeout(
-            GITHUB_BUDGET,
-            self.live_github_facts(github, project, spec, world),
-        )
-        .await
+        match self
+            .within_github_budget(self.live_github_facts(github, project, spec, world))
+            .await
         {
-            Ok(lines) => lines,
-            Err(_) => {
+            Some(lines) => lines,
+            None => {
                 warn!(spec = %spec.id, "github facts timed out; briefing without them");
                 vec![format!(
-                    "GitHub did not answer within {}s: PR state and base-branch checks \
-                     were skipped",
+                    "GitHub did not answer within the brief's {}s budget: PR state and \
+                     base-branch checks were skipped",
                     GITHUB_BUDGET.as_secs()
                 )]
             }
@@ -540,6 +730,86 @@ impl<'a> Brief<'a> {
 }
 
 // --- pure fact functions ---
+
+/// What the build said about its own test run, attributed as a claim.
+///
+/// It *is* a claim — nothing here re-ran anything, and this repository has no
+/// workflows and no required checks, so there is no second opinion anywhere in
+/// the loop. Saying so on the line is the difference between evidence and the
+/// appearance of evidence.
+fn verification_line(summary: Option<&str>) -> String {
+    match verification_report(summary) {
+        VerificationReport::Passed(detail) => format!(
+            "the build reported its own tests PASSED ({}) — its claim, not an \
+             independent run, and the only evidence here that the change works",
+            or_unspecified(&detail),
+        ),
+        VerificationReport::Failed(detail) => format!(
+            "the build reported its own tests FAILED ({}) — its claim, not an \
+             independent run, and nothing downstream re-runs them, so no passing \
+             run backs this batch",
+            or_unspecified(&detail),
+        ),
+        VerificationReport::NotRun(detail) => format!(
+            "the build reported that it did NOT RUN the tests ({}) — so no run at \
+             all backs this batch, and nothing downstream will make one",
+            or_unspecified(&detail),
+        ),
+        VerificationReport::Unreported => {
+            "the build recorded no verification line, so there is no test run at all on \
+             record: whether anything ran is unknown rather than known-skipped \
+             (builds from before the line was asked for read the same way)"
+                .to_string()
+        }
+    }
+}
+
+/// How much of this batch nothing runnable here could have checked.
+///
+/// A count rather than a verdict. `app-gpui` compiles and unit-tests on a Linux
+/// builder (`make app-check`, `make app-test`) — what does not is the
+/// rendering, which is why this measures the *surface* and leaves who acts on
+/// it to the prompt.
+fn verification_surface(files: &[String]) -> String {
+    let total = files.len();
+    if total == 0 {
+        return "no changed files are recorded on this build, so what it touches — and \
+                therefore what could have checked it — is unknown"
+            .to_string();
+    }
+    let visual = files
+        .iter()
+        .filter(|f| f.starts_with(VISUAL_SURFACE))
+        .count();
+    match visual {
+        0 => format!(
+            "none of the {total} changed file(s) are under `{VISUAL_SURFACE}`, so all of \
+             this is reachable by `make test`"
+        ),
+        n if n == total => format!(
+            "all {total} changed file(s) are under `{VISUAL_SURFACE}`: that compiles and \
+             unit-tests here (`make app-check`, `make app-test`), but those tests are \
+             pure functions over view state — whether anything actually rendered takes \
+             a Mac"
+        ),
+        n => format!(
+            "{n} of {total} changed file(s) are under `{VISUAL_SURFACE}`: the other \
+             {} are reachable by `make test`, and the app half compiles and unit-tests \
+             here (`make app-check`, `make app-test`) — only whether it rendered takes \
+             a Mac",
+            total - n
+        ),
+    }
+}
+
+/// Agents leave the detail off sometimes; an empty parenthesis reads as a bug.
+fn or_unspecified(detail: &str) -> &str {
+    if detail.trim().is_empty() {
+        "no command named"
+    } else {
+        detail
+    }
+}
 
 /// Other live specs claiming the same files. The duplicate-work check, in the
 /// form that catches two scouts sent at overlapping problems.
@@ -802,5 +1072,108 @@ mod tests {
         let long = format!("first line\n{}", "x".repeat(500));
         assert_eq!(first_line(&long), "first line");
         assert!(first_line(&"y".repeat(500)).chars().count() <= 160);
+    }
+
+    /// Four cases and never silent — the count is the fact, and the "takes a
+    /// Mac" clause belongs only to the part that really does.
+    #[test]
+    fn the_verification_surface_is_counted_and_never_overstated() {
+        let files =
+            |paths: &[&str]| -> Vec<String> { paths.iter().map(|p| p.to_string()).collect() };
+
+        let none = verification_surface(&[]);
+        assert!(none.contains("no changed files are recorded"), "{none}");
+
+        let server = verification_surface(&files(&["crates/tasks/src/run.rs"]));
+        assert!(server.contains("make test"), "{server}");
+        assert!(
+            !server.contains("Mac"),
+            "nothing here needs one, and saying so teaches the rule to be ignored: {server}"
+        );
+
+        let app = verification_surface(&files(&[
+            "app-gpui/src/sections/queue.rs",
+            "app-gpui/src/lib.rs",
+        ]));
+        assert!(app.contains("Mac"), "{app}");
+        // …and it must say what *can* be checked here, or the rule overstates
+        // the gap: #877/#893 put the packages in the images on purpose.
+        assert!(app.contains("make app-test"), "{app}");
+        assert!(app.contains("make app-check"), "{app}");
+
+        let mixed = verification_surface(&files(&[
+            "crates/tasks/src/brief.rs",
+            "app-gpui/src/sections/queue.rs",
+            "crates/tasks/src/run.rs",
+        ]));
+        assert!(mixed.contains("1 of 3"), "{mixed}");
+        assert!(mixed.contains("make test"), "{mixed}");
+        assert!(mixed.contains("Mac"), "{mixed}");
+    }
+
+    /// The line is a *claim*, and each of the four states has to read
+    /// differently — "no line" and "did not run" especially, since one is
+    /// compatible with a passing run nobody wrote down and the other is not.
+    #[test]
+    fn the_verification_line_attributes_the_claim_in_all_four_states() {
+        let passed = verification_line(Some("Verification: PASSED — make test"));
+        assert!(passed.contains("PASSED"), "{passed}");
+        assert!(passed.contains("make test"), "{passed}");
+        assert!(
+            passed.contains("its claim, not an independent run"),
+            "{passed}"
+        );
+
+        let failed = verification_line(Some("Verification: FAILED — make test, 2 red"));
+        assert!(failed.contains("FAILED"), "{failed}");
+        assert!(failed.contains("no passing run"), "{failed}");
+
+        let not_run = verification_line(Some("Verification: NOT RUN — no runner"));
+        assert!(not_run.contains("NOT RUN"), "{not_run}");
+        assert!(not_run.contains("no run at all"), "{not_run}");
+
+        let silent = verification_line(Some("Just prose."));
+        assert!(silent.contains("no test run at all"), "{silent}");
+        assert!(
+            silent.contains("unknown rather than known-skipped"),
+            "{silent}"
+        );
+        assert_eq!(
+            silent,
+            verification_line(None),
+            "a build from before the line reads the same"
+        );
+    }
+
+    /// [`GITHUB_BUDGET`] is documented as the whole brief's, and a per-call
+    /// timeout of the same size would let a turn briefing four subjects spend
+    /// forty seconds. Asserted on the clock, because a per-call version also
+    /// answers `None` — just ten seconds later.
+    #[tokio::test]
+    async fn the_github_budget_is_spent_once_for_the_whole_brief() {
+        // Opened before the clock is paused, deliberately: sqlx's pool acquire
+        // is itself on a timer, and under a paused clock it times out
+        // instantly. `start_paused` would do it the wrong way round.
+        let store = Store::open_in_memory().await.unwrap();
+        tokio::time::pause();
+        let brief = Brief::new(&store, None, "main");
+        let start = tokio::time::Instant::now();
+
+        // Two reads that never answer: the first spends the budget, and the
+        // second must cost nothing at all rather than another full window.
+        for _ in 0..2 {
+            let answered: Option<()> = brief
+                .within_github_budget(std::future::pending::<()>())
+                .await;
+            assert!(answered.is_none());
+        }
+
+        // One budget, not two. The margin is tokio's timer granularity, which
+        // rounds a deadline up by a millisecond; two budgets would be 20s.
+        let spent = start.elapsed();
+        assert!(
+            spent >= GITHUB_BUDGET && spent < GITHUB_BUDGET + Duration::from_secs(1),
+            "the budget bounds the brief, not each call in it: spent {spent:?}"
+        );
     }
 }

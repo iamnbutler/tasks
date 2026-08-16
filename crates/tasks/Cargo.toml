@@ -38,3 +38,6 @@ build-stamp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `full` deliberately excludes `test-util`, so the paused clock the brief's
+# shared-budget test asserts on has to be asked for here.
+tokio = { workspace = true, features = ["test-util"] }
