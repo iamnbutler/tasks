@@ -110,6 +110,21 @@ pub enum Section {
     Chat,
 }
 
+/// Where focus belongs once a section is on screen.
+///
+/// A value rather than a `window.focus` call inside the match, so the rule can
+/// be asserted without a `Window` — the app's tests are pure functions over
+/// view state (a `#[gpui::test]` would need gpui's `test-support` feature,
+/// which the Makefile's stub-`.so` fallback cannot link).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum FocusTarget {
+    /// The workspace root — the section draws no composer of its own, so the
+    /// root is the only element guaranteed to be in the frame.
+    Workspace,
+    /// The chat composer, which only exists while [`Section::Chat`] is drawn.
+    ChatComposer,
+}
+
 impl Section {
     const ALL: [Section; 5] = [
         Section::Home,
@@ -153,6 +168,24 @@ impl Section {
             Section::Queue => "nav-queue",
             Section::Activity => "nav-activity",
             Section::Chat => "nav-chat",
+        }
+    }
+
+    /// Where focus lands when this section becomes the visible one.
+    ///
+    /// Chat gets its composer — arriving ready to type is what the app did
+    /// before, by accident of a startup focus that pointed at the composer
+    /// whether or not it was drawn. Every other section gets the workspace
+    /// root, because a focus handle absent from the frame is treated exactly
+    /// like no focus at all (#902): the dispatch path falls back to the
+    /// *window* root, which carries no key context, and every
+    /// `Workspace`-context binding goes dead.
+    fn focus_target(self) -> FocusTarget {
+        match self {
+            Section::Chat => FocusTarget::ChatComposer,
+            Section::Home | Section::Tasks | Section::Queue | Section::Activity => {
+                FocusTarget::Workspace
+            }
         }
     }
 
@@ -389,6 +422,20 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        // …and take it back whenever the focused element leaves the tree: an
+        // input blurring itself on escape, a popup closing, a panel dismissed
+        // with its composer focused. gpui runs this only when the window has
+        // *nothing* focused and holds the result still for one draw, so it
+        // cannot loop; the paths above that hand focus back explicitly do it a
+        // frame earlier, and this is the backstop for the ones that don't —
+        // including anything added later that forgets. It cannot cover
+        // startup, whose guard requires a non-empty previous focus path, which
+        // is why the line above is still explicit.
+        cx.on_focus_lost(window, |this, window, cx| {
+            window.focus(&this.focus_handle, cx);
+        })
+        .detach();
+
         // Follow the conversation tail: top-aligned with `FollowMode::Tail`
         // (not `ListAlignment::Bottom` — a short conversation should read
         // from the top). The pin releases when the user scrolls up and
@@ -473,11 +520,18 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.section = section;
-        match section {
-            Section::Chat => window.focus(&self.input.focus_handle(cx), cx),
-            _ => window.focus(&self.focus_handle, cx),
-        }
+        self.place_focus(section.focus_target(), window, cx);
         cx.notify();
+    }
+
+    /// Put focus on the named element. The one place `window.focus` is called
+    /// with a choice in it, so "the handle must be in the frame this section
+    /// draws" is checked once rather than at each call site.
+    fn place_focus(&self, target: FocusTarget, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            FocusTarget::Workspace => window.focus(&self.focus_handle, cx),
+            FocusTarget::ChatComposer => window.focus(&self.input.focus_handle(cx), cx),
+        }
     }
 
     /// Show or hide the Tasks list's archive of done tasks — the list's
@@ -857,12 +911,19 @@ impl Workspace {
         state.github_url(state.task(id)?)
     }
 
-    pub(crate) fn clear_selection(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_task = None;
         self.bundle_delete_armed = None;
         // `hide`, not `toggle`: escape and the inspector's ✕ mean "clear this",
         // never "and don't come back". The next row click opens it again.
         self.right_sidebar.hide();
+        // The panel this just put away may have held the focused element — the
+        // review composer `begin_review` focuses. Hand focus back to the root
+        // rather than to the section's own target: this is a dismissal, so the
+        // caret should not land back in a composer the human just escaped out
+        // of. `on_focus_lost` would catch it a frame later; doing it here means
+        // there is no frame in between with no keyboard.
+        self.place_focus(FocusTarget::Workspace, window, cx);
         cx.notify();
     }
 
@@ -1752,10 +1813,22 @@ impl Render for Workspace {
         self.sync_palette(cx);
 
         div()
+            // A name rather than an index, per #861: this sits at the root of
+            // every descendant's id path. It is not decoration either — gpui
+            // logs `note_focus_without_node` for a focusable element with no
+            // element id, and a node reaches the a11y tree only with both an
+            // id and a non-`None` role, so without these three a screen reader
+            // announces the whole window in place of the focused workspace.
+            .id("workspace")
+            .role(gpui::Role::Group)
+            .aria_label("Workspace")
             .key_context(WORKSPACE_CONTEXT)
             // The context above is only real because of this: gpui falls back
             // to the root dispatch node when the focused handle is absent from
             // the rendered frame, and that node carries no context of its own.
+            // It also registers a bubble-phase mouse-down that focuses the
+            // workspace, which is what makes clicking the background *restore*
+            // the shortcuts rather than leave them with nowhere to dispatch.
             .track_focus(&self.focus_handle)
             // The containing block the palette overlay positions against.
             .relative()
@@ -1803,14 +1876,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SelectPrevRow, _window, cx| {
                 this.move_palette_selection(-1, cx);
             }))
-            .on_action(cx.listener(|this, _: &Dismiss, _window, cx| {
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
                 if this.row_menu_open {
                     this.row_menu_open = false;
                     cx.propagate();
                     return;
                 }
                 if this.selected_task.is_some() || this.right_sidebar.is_open() {
-                    this.clear_selection(cx);
+                    this.clear_selection(window, cx);
                 }
             }))
             // The Task menu's verbs, on the selected row.
@@ -1917,5 +1990,42 @@ impl Render for Workspace {
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule #902 is about, in both directions and over every section:
+    /// focus may only ever name an element the section being switched to
+    /// actually draws. Chat is the one section with a composer, so arriving
+    /// there lands in it — and leaving takes focus back, because
+    /// `window.focus` on a handle that is absent from the frame does not fail
+    /// or warn, it behaves exactly like no focus at all and takes the whole
+    /// key context down with it.
+    #[test]
+    fn only_chat_focuses_a_composer() {
+        for section in Section::ALL {
+            let expected = match section {
+                Section::Chat => FocusTarget::ChatComposer,
+                _ => FocusTarget::Workspace,
+            };
+            assert_eq!(
+                section.focus_target(),
+                expected,
+                "{} focuses the wrong element",
+                section.label()
+            );
+        }
+    }
+
+    /// The section a window opens on, spelled out on its own: the startup
+    /// frame draws no composer, so the only handle that can hold focus at rest
+    /// is the root's. Focusing the chat composer here — which is what `new`
+    /// used to do — is the whole of #902.
+    #[test]
+    fn the_section_a_window_opens_on_focuses_the_root() {
+        assert_eq!(Section::Home.focus_target(), FocusTarget::Workspace);
     }
 }

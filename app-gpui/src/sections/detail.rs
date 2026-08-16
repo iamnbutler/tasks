@@ -143,8 +143,8 @@ impl Workspace {
                         .text_xs()
                         .text_color(theme.fg_muted())
                         .hover(|el| el.opacity(0.7))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.clear_selection(cx);
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.clear_selection(window, cx);
                         }))
                         .child("✕"),
                 ),
