@@ -27,7 +27,6 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
     BuildStatus, ChatRole, CloseReason, Mode, SessionStatus, SpecId, SpecQueueStatus, TaskId,
-    TaskState,
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
@@ -38,7 +37,7 @@ use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
-use crate::state::AppState;
+use crate::state::{is_picked_up, AppState};
 use crate::time;
 
 pub(crate) const FONT: &str = "Menlo";
@@ -847,19 +846,12 @@ impl Workspace {
         };
 
         let state = self.app_state.read(cx);
+        // The same predicate the Queue section's rows are built from — the
+        // badge counts what that section shows.
         let queued_work = state
             .tasks
             .iter()
-            .filter(|task| {
-                matches!(
-                    task.state,
-                    TaskState::Queued
-                        | TaskState::Scouting
-                        | TaskState::InReview
-                        | TaskState::ReadyToBuild
-                        | TaskState::Building
-                )
-            })
+            .filter(|task| is_picked_up(task.state))
             .count();
         // A proactive tick is invisible from every section but Chat, so the
         // Chat row wears the clock. Same slot the Queue count uses.

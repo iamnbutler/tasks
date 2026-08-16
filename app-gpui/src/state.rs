@@ -15,7 +15,7 @@ use tasks_client::api::events::Event;
 use tasks_client::api::http::BriefingStatus;
 use tasks_client::api::models::{
     Build, ChatRole, CloseReason, Mode, OrchestratorFeedEvent, OrchestratorMessage, Project,
-    Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
+    Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -103,6 +103,11 @@ pub struct AppState {
     /// banner, because when this app is under the floor, whatever failed
     /// underneath is the symptom.
     pub build_warning: Option<String>,
+    /// A correction the server made to the last reorder, in the Queue
+    /// section's own words. Not an error — the POST succeeded — which is why
+    /// it does not go through [`AppState::error`]: see
+    /// [`AppState::reorder_queue`].
+    pub queue_notice: Option<String>,
 
     refreshing: bool,
     /// An event arrived while a refresh was in flight — go again after.
@@ -272,6 +277,7 @@ impl AppState {
             loaded: false,
             error: None,
             build_warning: None,
+            queue_notice: None,
             refreshing: false,
             dirty: false,
         }
@@ -585,12 +591,33 @@ impl AppState {
         op: impl FnOnce(&Client) -> Result<T, ClientError> + Send + 'static,
         rollback: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
+        self.run_settling(cx, op, |_, _, _| {}, rollback);
+    }
+
+    /// [`Self::run_rolling_back`], plus a `settle` that is handed what the
+    /// server answered.
+    ///
+    /// The refresh still follows, so this is not a way to keep a response the
+    /// snapshot would disagree with — it is for the endpoints whose reply
+    /// says something the next `GET` cannot, because it is about the *write*:
+    /// the reorder endpoints answer with the order they actually assigned,
+    /// which is where a bulk replace's corrections become visible.
+    fn run_settling<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&Client) -> Result<T, ClientError> + Send + 'static,
+        settle: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+        rollback: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
         let client = self.client.clone();
         let work = cx.background_executor().spawn(async move { op(&client) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             this.update(cx, |state, cx| match result {
-                Ok(_) => state.refresh(cx),
+                Ok(value) => {
+                    settle(state, value, cx);
+                    state.refresh(cx);
+                }
                 Err(err) => {
                     rollback(state, cx);
                     state.error = Some(err.to_string());
@@ -614,6 +641,57 @@ impl AppState {
 
     pub fn scout_task_now(&mut self, id: TaskId, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.scout_task_now(&id));
+    }
+
+    /// Write the task queue's order: `order` is the complete list of picked-up
+    /// tasks, front to back, and it is what `next_dispatchable` will walk.
+    ///
+    /// **A complete statement, never a patch.** `POST /queue/reorder` unranks
+    /// every task and then assigns 1..N over the ids it is given, so posting
+    /// only the band that was dragged in would unrank all the others.
+    ///
+    /// Applied locally first, so the row stays where it was dropped instead of
+    /// snapping back for a round trip, then replaced by what the server
+    /// answers — which is the authority, and which is *read* rather than
+    /// assumed: an order computed from a snapshot taken before a concurrent
+    /// `POST /tasks/{id}/queue` omits the newly queued task, and a bulk
+    /// replace leaves it unranked at the bottom. That is inherent to the
+    /// endpoint; [`Self::queue_notice`] is what keeps it from being silent.
+    pub fn reorder_queue(&mut self, order: Vec<TaskId>, cx: &mut Context<Self>) {
+        let rollback = self.tasks.clone();
+        ranked_first(&mut self.tasks, &order, |task| &task.id);
+        self.queue_notice = None;
+        cx.notify();
+        self.run_settling(
+            cx,
+            move |client| client.reorder_queue(order),
+            |state, tasks: Vec<Task>, _cx| {
+                state.queue_notice = lost_queue_places(&tasks);
+                state.tasks = tasks;
+            },
+            move |state, _cx| state.tasks = rollback,
+        );
+    }
+
+    /// [`Self::reorder_queue`] for the review queue: `order` is every spec
+    /// queue entry, front to back, and it writes `spec_queue.rank`.
+    ///
+    /// Same bulk-replace semantics, hence the same rule — every entry, not
+    /// just the pending-review ones the Needs you band shows.
+    pub fn reorder_spec_queue(&mut self, order: Vec<SpecId>, cx: &mut Context<Self>) {
+        let rollback = self.spec_queue.clone();
+        ranked_first(&mut self.spec_queue, &order, |item| &item.entry.spec_id);
+        self.queue_notice = None;
+        cx.notify();
+        self.run_settling(
+            cx,
+            move |client| client.reorder_spec_queue(order),
+            |state, queue: Vec<SpecQueueItem>, _cx| {
+                state.queue_notice = lost_review_places(&queue, &state.tasks);
+                state.spec_queue = queue;
+            },
+            move |state, _cx| state.spec_queue = rollback,
+        );
     }
 
     /// Close the GitHub issue behind a task. 202 and nothing applied locally:
@@ -734,5 +812,289 @@ impl AppState {
             &session.task_id == id
                 && session.status == tasks_client::api::models::SessionStatus::Running
         })
+    }
+}
+
+/// Work a human has picked up: everything from `Queued` onward, which is
+/// exactly the set the task queue ranks.
+///
+/// `Backlog` is the ingested mirror of the repo's open issues and is never
+/// dispatched; `Done` and `Rejected` are finished. One definition rather than
+/// the predicate written out at each call site, because the queue's rows and
+/// the nav badge's count have to be about the same set of tasks.
+pub fn is_picked_up(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Queued
+            | TaskState::Scouting
+            | TaskState::InReview
+            | TaskState::ReadyToBuild
+            | TaskState::Building
+    )
+}
+
+/// Sort `items` the way the server's bulk-replace reorder endpoints leave a
+/// list: the posted ids take ranks 1..N in the order given, everything else is
+/// unranked, and unranked sorts last.
+///
+/// The server's full ordering is `rank IS NULL, rank, …` with more tiebreaks
+/// after it, and this reimplements none of them: because the POST covers every
+/// ranked row, the tiebreaks only ever apply to the unranked tail, which is
+/// already sitting in the server's order. A **stable** sort therefore preserves
+/// it — which is the whole reason this can be four lines instead of a copy of
+/// the `ORDER BY`.
+fn ranked_first<T, I: PartialEq>(items: &mut [T], order: &[I], id: impl Fn(&T) -> &I) {
+    items.sort_by_key(
+        |item| match order.iter().position(|posted| posted == id(item)) {
+            Some(rank) => (0, rank),
+            None => (1, 0),
+        },
+    );
+}
+
+/// What a queue reorder left unranked, if anything: a task that is picked up
+/// but came back with no `manual_rank` was not in the order that was posted,
+/// so it lost its place.
+fn lost_queue_places(tasks: &[Task]) -> Option<String> {
+    let lost: Vec<u64> = tasks
+        .iter()
+        .filter(|task| is_picked_up(task.state) && task.manual_rank.is_none())
+        .map(|task| task.gh_issue_number)
+        .collect();
+    lost_notice(&lost, "the queue")
+}
+
+/// [`lost_queue_places`] for the review queue: a pending-review entry that
+/// came back with no rank was not in the order that was posted.
+fn lost_review_places(spec_queue: &[SpecQueueItem], tasks: &[Task]) -> Option<String> {
+    let lost: Vec<u64> = spec_queue
+        .iter()
+        .filter(|item| {
+            item.entry.status == SpecQueueStatus::PendingReview && item.entry.rank.is_none()
+        })
+        .filter_map(|item| tasks.iter().find(|task| task.id == item.task_id))
+        .map(|task| task.gh_issue_number)
+        .collect();
+    lost_notice(&lost, "the review queue")
+}
+
+/// The sentence both of the above produce, naming up to three issues.
+fn lost_notice(numbers: &[u64], queue: &str) -> Option<String> {
+    if numbers.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = numbers.iter().take(3).map(|n| format!("#{n}")).collect();
+    let subject = match numbers.len() {
+        n if n > named.len() => format!("{} and {} more", named.join(", "), n - named.len()),
+        _ => match named.as_slice() {
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+            [] => unreachable!("empty is handled above"),
+        },
+    };
+    let pronoun = if numbers.len() == 1 { "it" } else { "they" };
+    Some(format!(
+        "{subject} fell to the end of {queue}: the order was posted from a list taken before \
+         {pronoun} joined it. Drag back into place to fix the order."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use tasks_client::api::models::{GhState, ProjectId, SpecQueueEntry};
+
+    use super::*;
+
+    fn task(number: u64, state: TaskState, manual_rank: Option<i32>) -> Task {
+        Task {
+            id: TaskId::from_raw(format!("task-{number}")),
+            project_id: ProjectId::from_raw("proj-1"),
+            gh_issue_number: number,
+            title: format!("issue {number}"),
+            body: String::new(),
+            labels: Vec::new(),
+            gh_state: GhState::Open,
+            state,
+            priority: 0,
+            manual_rank,
+            dispatch_attempts: 0,
+            ingested_at: Utc.timestamp_opt(0, 0).unwrap(),
+            updated_at: Utc.timestamp_opt(0, 0).unwrap(),
+        }
+    }
+
+    fn entry(number: u64, status: SpecQueueStatus, rank: Option<i32>) -> SpecQueueItem {
+        SpecQueueItem {
+            entry: SpecQueueEntry {
+                spec_id: SpecId::from_raw(format!("spec-{number}")),
+                status,
+                rank,
+                approved_at: None,
+                feedback: None,
+                blocking_dependencies: Vec::new(),
+            },
+            task_id: TaskId::from_raw(format!("task-{number}")),
+        }
+    }
+
+    fn numbers(tasks: &[Task]) -> Vec<u64> {
+        tasks.iter().map(|task| task.gh_issue_number).collect()
+    }
+
+    fn task_ids(numbers: &[u64]) -> Vec<TaskId> {
+        numbers
+            .iter()
+            .map(|n| TaskId::from_raw(format!("task-{n}")))
+            .collect()
+    }
+
+    #[test]
+    fn posted_ids_take_the_front_in_the_order_given() {
+        let mut tasks = vec![
+            task(1, TaskState::Queued, Some(1)),
+            task(2, TaskState::Queued, Some(2)),
+            task(3, TaskState::Queued, Some(3)),
+        ];
+        ranked_first(&mut tasks, &task_ids(&[3, 1, 2]), |task| &task.id);
+        assert_eq!(numbers(&tasks), [3, 1, 2]);
+    }
+
+    #[test]
+    fn everything_unposted_falls_behind_everything_posted() {
+        let mut tasks = vec![
+            task(1, TaskState::Backlog, None),
+            task(2, TaskState::Queued, Some(1)),
+            task(3, TaskState::Backlog, None),
+        ];
+        ranked_first(&mut tasks, &task_ids(&[2]), |task| &task.id);
+        assert_eq!(numbers(&tasks), [2, 1, 3]);
+    }
+
+    /// The sort has to be stable: the unranked tail is already in the server's
+    /// order (priority, then ingest time), and this reimplements none of that.
+    #[test]
+    fn the_unranked_tail_keeps_the_servers_order() {
+        let mut tasks = vec![
+            task(7, TaskState::Backlog, None),
+            task(4, TaskState::Backlog, None),
+            task(9, TaskState::Queued, Some(1)),
+            task(1, TaskState::Backlog, None),
+        ];
+        ranked_first(&mut tasks, &task_ids(&[9]), |task| &task.id);
+        assert_eq!(numbers(&tasks), [9, 7, 4, 1]);
+    }
+
+    #[test]
+    fn an_id_the_list_does_not_have_ranks_nothing() {
+        let mut tasks = vec![
+            task(1, TaskState::Queued, Some(1)),
+            task(2, TaskState::Queued, Some(2)),
+        ];
+        ranked_first(&mut tasks, &task_ids(&[99, 2]), |task| &task.id);
+        assert_eq!(numbers(&tasks), [2, 1]);
+    }
+
+    #[test]
+    fn the_spec_queue_sorts_by_its_own_id() {
+        let mut queue = vec![
+            entry(1, SpecQueueStatus::PendingReview, Some(1)),
+            entry(2, SpecQueueStatus::PendingReview, Some(2)),
+        ];
+        let order = vec![SpecId::from_raw("spec-2"), SpecId::from_raw("spec-1")];
+        ranked_first(&mut queue, &order, |item| &item.entry.spec_id);
+        assert_eq!(queue[0].entry.spec_id, SpecId::from_raw("spec-2"));
+    }
+
+    #[test]
+    fn an_order_the_server_kept_whole_says_nothing() {
+        let tasks = [
+            task(1, TaskState::Queued, Some(1)),
+            task(2, TaskState::Scouting, Some(2)),
+            // Not picked up, so never ranked, and never news.
+            task(3, TaskState::Backlog, None),
+        ];
+        assert!(lost_queue_places(&tasks).is_none());
+    }
+
+    #[test]
+    fn a_picked_up_task_that_came_back_unranked_is_named() {
+        let tasks = [
+            task(1, TaskState::Queued, Some(1)),
+            task(42, TaskState::Queued, None),
+        ];
+        let notice = lost_queue_places(&tasks).expect("a task lost its place");
+        assert!(notice.contains("#42"), "{notice}");
+        assert!(notice.contains("it joined"), "{notice}");
+    }
+
+    #[test]
+    fn two_lost_places_are_listed_and_read_as_plural() {
+        let tasks = [
+            task(7, TaskState::Building, None),
+            task(9, TaskState::InReview, None),
+        ];
+        let notice = lost_queue_places(&tasks).expect("two tasks lost their place");
+        assert!(notice.starts_with("#7 and #9 "), "{notice}");
+        assert!(notice.contains("they joined"), "{notice}");
+    }
+
+    /// Four is where the sentence stops naming and starts counting.
+    #[test]
+    fn past_three_the_rest_are_counted() {
+        let tasks = [
+            task(1, TaskState::Queued, None),
+            task(2, TaskState::Queued, None),
+            task(3, TaskState::Queued, None),
+            task(4, TaskState::Queued, None),
+            task(5, TaskState::Queued, None),
+        ];
+        let notice = lost_queue_places(&tasks).expect("five tasks lost their place");
+        assert!(notice.starts_with("#1, #2, #3 and 2 more "), "{notice}");
+    }
+
+    #[test]
+    fn a_pending_entry_that_came_back_unranked_is_named_by_its_issue() {
+        let tasks = [task(11, TaskState::InReview, Some(1))];
+        let queue = [
+            entry(11, SpecQueueStatus::PendingReview, None),
+            // Approved entries are posted too, but a rank they never had is
+            // not something the reviewer just lost.
+            entry(12, SpecQueueStatus::Approved, None),
+        ];
+        let notice = lost_review_places(&queue, &tasks).expect("an entry lost its place");
+        assert!(notice.contains("#11"), "{notice}");
+        assert!(notice.contains("the review queue"), "{notice}");
+    }
+
+    /// An entry whose task the client cannot see is not something it can name,
+    /// and a sentence about "#0" would be worse than silence.
+    #[test]
+    fn an_entry_with_no_task_in_hand_is_not_named() {
+        let queue = [entry(11, SpecQueueStatus::PendingReview, None)];
+        assert!(lost_review_places(&queue, &[]).is_none());
+    }
+
+    #[test]
+    fn a_review_queue_the_server_kept_whole_says_nothing() {
+        let tasks = [task(11, TaskState::InReview, Some(1))];
+        let queue = [entry(11, SpecQueueStatus::PendingReview, Some(1))];
+        assert!(lost_review_places(&queue, &tasks).is_none());
+    }
+
+    #[test]
+    fn picked_up_is_everything_from_queued_onward() {
+        for state in [
+            TaskState::Queued,
+            TaskState::Scouting,
+            TaskState::InReview,
+            TaskState::ReadyToBuild,
+            TaskState::Building,
+        ] {
+            assert!(is_picked_up(state), "{state:?}");
+        }
+        for state in [TaskState::Backlog, TaskState::Done, TaskState::Rejected] {
+            assert!(!is_picked_up(state), "{state:?}");
+        }
     }
 }
