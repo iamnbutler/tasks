@@ -56,7 +56,8 @@ actions!(
         GoToChat,
         SetModePlay,
         SetModePause,
-        SetModeStop
+        SetModeStop,
+        ToggleShowDone
     ]
 );
 
@@ -87,6 +88,9 @@ impl Section {
         Section::Chat,
     ];
 
+    /// The section's name. Rendered exactly once now — in the title bar's
+    /// centre. The nav rows are icons and carry it as an accessible name;
+    /// `render_center` no longer spends a row on it.
     fn label(self) -> &'static str {
         match self {
             Section::Home => "Home",
@@ -94,6 +98,43 @@ impl Section {
             Section::Queue => "Queue",
             Section::Activity => "Activity",
             Section::Chat => "Chat",
+        }
+    }
+
+    /// The icon a nav row wears in place of its label.
+    fn icon(self) -> gpui::Svg {
+        match self {
+            Section::Home => Icons::home(),
+            Section::Tasks => Icons::list_bullet(),
+            Section::Queue => Icons::layers(),
+            Section::Activity => Icons::activity_log(),
+            Section::Chat => Icons::chat_bubble(),
+        }
+    }
+
+    /// Element id for the nav row. A name rather than the enumeration index:
+    /// these rows have no id'd ancestor, so a bare integer sits at the root
+    /// of the id path, which is exactly the collision class #861 is about.
+    fn nav_id(self) -> &'static str {
+        match self {
+            Section::Home => "nav-home",
+            Section::Tasks => "nav-tasks",
+            Section::Queue => "nav-queue",
+            Section::Activity => "nav-activity",
+            Section::Chat => "nav-chat",
+        }
+    }
+
+    /// The ⌘-digit that reaches this section. Bound in `main`; repeated here
+    /// only to be *announced* — in the row's tooltip and, via
+    /// `aria_keyshortcuts`, to assistive technology.
+    fn shortcut(self) -> &'static str {
+        match self {
+            Section::Home => "⌘1",
+            Section::Tasks => "⌘2",
+            Section::Queue => "⌘3",
+            Section::Activity => "⌘4",
+            Section::Chat => "⌘5",
         }
     }
 }
@@ -111,6 +152,10 @@ pub struct Workspace {
     pub(crate) server_control: Entity<ServerControl>,
     /// Task shown in the inspector (right sidebar).
     pub(crate) selected_task: Option<TaskId>,
+    /// Whether the Tasks list shows its archive of done tasks. Per-window and
+    /// resets on relaunch: the app has no settings store, and a view filter
+    /// that states its own count in a footer does not need one.
+    pub(crate) show_done: bool,
     /// Chat composer.
     pub(crate) input: Entity<InputState>,
     /// Review-form composer in the inspector — feedback for a re-scout or a
@@ -261,6 +306,7 @@ impl Workspace {
             app_state,
             server_control,
             selected_task: None,
+            show_done: false,
             input,
             review_input,
             issue_input,
@@ -297,6 +343,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show or hide the Tasks list's archive of done tasks — the list's
+    /// footer button, `View ▸ Show Done Tasks` and `shift-cmd-d`, on one
+    /// path. The menu's checkmark is part of [`MenuState`], so this has to
+    /// re-derive the bar as well as re-render.
+    pub(crate) fn toggle_show_done(&mut self, cx: &mut Context<Self>) {
+        self.show_done = !self.show_done;
+        self.sync_menus(cx);
+        cx.notify();
+    }
+
     /// Set the pipeline mode — the title bar's play/pause buttons and the
     /// Server menu's radio group, on one path.
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -304,10 +360,12 @@ impl Workspace {
             .update(cx, |state, cx| state.set_mode(mode, cx));
     }
 
-    /// Rebuild the menu bar from the three facts it depends on, which live in
-    /// two entities: `AppState` knows whether a server is answering and what
-    /// mode it is in, `ServerControl` knows whether a `tasks` run is in
-    /// flight. Called from observers on both; a no-op unless something moved.
+    /// Rebuild the menu bar from the facts it depends on, which live in three
+    /// places: `AppState` knows whether a server is answering and what mode it
+    /// is in, `ServerControl` knows whether a `tasks` run is in flight, and
+    /// the archive toggle is the workspace's own. Called from observers on
+    /// both entities and from `toggle_show_done`; a no-op unless something
+    /// moved.
     fn sync_menus(&self, cx: &mut Context<Self>) {
         let busy = self.server_control.read(cx).busy();
         let state = self.app_state.read(cx);
@@ -315,6 +373,7 @@ impl Workspace {
             serving: state.connected,
             mode: state.mode,
             busy,
+            show_done: self.show_done,
         };
         menus::sync(cx, menu_state);
     }
@@ -447,7 +506,20 @@ impl Workspace {
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.app_state.read(cx).mode;
+        // The repo the working set belongs to. A label, not a button: the
+        // server offers no way to switch projects yet, and a control that
+        // looks live and isn't is worse than a word. Nothing renders before
+        // the first snapshot — a placeholder would be a claim about a repo
+        // we have not read.
+        let (mode, project) = {
+            let state = self.app_state.read(cx);
+            let project = state
+                .projects
+                .first()
+                .map(|project| format!("{}/{}", project.repo_owner, project.repo_name));
+            (state.mode, project)
+        };
+        let text_muted = cx.theme().fg_muted();
 
         title_bar()
             .child_left(
@@ -459,13 +531,16 @@ impl Workspace {
                     }),
             )
             .child_left(
-                Self::title_bar_button("open-chat", Icons::chat_bubble())
-                    .tooltip(tooltip("Open chat (⌘5)"))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.go_to_section(Section::Chat, cx);
-                    })),
+                div()
+                    .pl(px(6.))
+                    .text_sm()
+                    .text_color(text_muted)
+                    .children(project),
             )
-            .child_center(div().child("tasks"))
+            // The section you are looking at, named once. The sidebar's rows
+            // are icons and `render_center` draws no header, so this is the
+            // only place the word appears.
+            .child_center(div().child(self.section.label()))
             .child_right(
                 Self::title_bar_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
@@ -579,8 +654,14 @@ impl Workspace {
                     }
                 }
             })
+            // The rows are icons: the title bar names the section you are in,
+            // so spelling it again here would be the second of two. What the
+            // word used to do — say which row this is — the tooltip and the
+            // accessible name now do. `role` is not decoration: a node reaches
+            // the a11y tree only with *both* an id and a non-`None` role, so
+            // an `aria_label` on a roleless div is dropped silently.
             .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
-                Section::ALL.into_iter().enumerate().map(|(ix, section)| {
+                Section::ALL.into_iter().map(|section| {
                     let selected = section == active;
                     let badge = match section {
                         Section::Queue if queued_work > 0 => Some(queued_work.to_string()),
@@ -588,7 +669,15 @@ impl Workspace {
                         _ => None,
                     };
                     div()
-                        .id(ix)
+                        .id(section.nav_id())
+                        .role(gpui::Role::Tab)
+                        .aria_label(section.label())
+                        .aria_keyshortcuts(section.shortcut())
+                        .tooltip(tooltip(format!(
+                            "{} ({})",
+                            section.label(),
+                            section.shortcut()
+                        )))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -603,12 +692,13 @@ impl Workspace {
                             this.go_to_section(section, cx);
                         }))
                         .child(
-                            div()
-                                .flex_1()
-                                .text_sm()
-                                .text_color(if selected { text } else { text_muted })
-                                .child(section.label()),
+                            section
+                                .icon()
+                                .flex_none()
+                                .size(px(15.))
+                                .text_color(if selected { text } else { text_muted }),
                         )
+                        .child(div().flex_1())
                         .when_some(badge, |el, badge| {
                             el.child(
                                 div()
@@ -1028,7 +1118,7 @@ impl Workspace {
         let theme = cx.theme().clone();
         let loaded = self.app_state.read(cx).loaded;
 
-        let mut pane = div()
+        let pane = div()
             .flex()
             .flex_col()
             .flex_grow(1.)
@@ -1046,22 +1136,14 @@ impl Workspace {
             );
         }
 
-        // Chat is a full-height conversation — the sidebar already names it,
-        // so it skips the header rather than spending a row on the word
-        // "Chat".
-        if self.section != Section::Chat {
-            pane = pane.child(
-                div()
-                    .flex_none()
-                    .px(px(16.))
-                    .py(px(10.))
-                    .text_color(theme.fg())
-                    .child(self.section.label()),
-            );
-        }
-
+        // No header row. Chat always worked this way — "the sidebar already
+        // names it" — and now the title bar names every section, so a header
+        // here would be the second rendering of a word that should appear
+        // once. (If the name belongs back in the pane, this block and the
+        // `child_center` in `render_title_bar` are the pair to revert.)
+        //
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
-        // never `size_full`: 100% of the pane plus the header above it
+        // never `size_full`: 100% of the pane plus anything above it
         // overflows the clip and cuts off the bottom (chat's composer).
         let body = match self.section {
             Section::Home => self.render_home(cx).into_any_element(),
@@ -1169,6 +1251,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &GoToChat, _window, cx| {
                 this.go_to_section(Section::Chat, cx);
+            }))
+            // A view filter over this window's Tasks list, so it is the
+            // workspace's to handle and greys out with no workspace focused.
+            .on_action(cx.listener(|this, _: &ToggleShowDone, _window, cx| {
+                this.toggle_show_done(cx);
             }))
             // Element-level, like the dock toggles: the pipeline is the
             // workspace's business, so these grey out with no workspace

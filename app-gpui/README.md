@@ -21,11 +21,30 @@ components are built and how data moves):
   message in the sidebar banner; the server stays the authority on which
   transitions are legal.
 - **`workspace.rs`** — the root view. Owns UI state (active section,
-  per-sidebar open/width, selection, resize-drag tracking), observes
-  `AppState`, and registers action handlers. Actions:
-  `workspace::ToggleLeftDock` (`cmd-b`), `workspace::ToggleRightDock`
-  (`cmd-r`) — Zed's defaults. Title bar carries play/pause (mode gates
-  *new* work only) and refresh.
+  per-sidebar open/width, selection, resize-drag tracking, the Tasks
+  archive toggle), observes `AppState`, and registers action handlers.
+  Actions: `workspace::ToggleLeftDock` (`cmd-b`),
+  `workspace::ToggleRightDock` (`cmd-r`) — Zed's defaults —
+  `workspace::ToggleShowDone` (`shift-cmd-d`), and `⌘1`–`⌘5` for the
+  sections.
+
+  **Every section is named exactly once.** The title bar's centre carries
+  the name of the section you are looking at; the sidebar's nav rows are
+  icons, and `render_center` draws no header. The rows carry the word as a
+  tooltip (`"Tasks (⌘2)"`) and as an accessible name — `role(Role::Tab)` +
+  `aria_label` + `aria_keyshortcuts`, and the role is load-bearing: a node
+  reaches the a11y tree only with *both* a global element id and a
+  non-`None` role, so an `aria_label` on a roleless div is dropped
+  silently. (gpuikit's `IconButton` sets an id and a tooltip but no role or
+  label, so the title bar's icon buttons still have no accessible name.
+  That is upstream's to fix.)
+
+  The title bar's left slot names the current project (`owner/name`) as a
+  label, not a button — the server offers no way to switch projects yet,
+  and a control that looks live and isn't is worse than a word. Nothing
+  renders there before the first snapshot. The right slot carries
+  play/pause (mode gates *new* work only) and refresh; chat is reached from
+  the sidebar, `⌘5` or `View ▸ Chat` rather than from the chrome.
 - **`menus.rs`** — the menu bar (App / File / Edit / View / Server /
   Window) and its actions. Handlers are global, not the workspace's,
   because Minimize / Zoom / Close act on whichever window is focused; the
@@ -35,7 +54,9 @@ components are built and how data moves):
   the bar. `menus()` is a pure function of `MenuState { serving, mode,
   busy }`; `sync()` reinstalls the bar only when that state actually
   changes, because `set_menus` leaks a boxed action per item on every
-  rebuild.
+  rebuild. `MenuState` also carries `show_done`, so `View ▸ Show Done
+  Tasks` is a checkmark over live state rather than an item that renames
+  itself.
 - **`server.rs` / `server_window.rs`** — the Server menu: the one thing
   the app cannot do over HTTP, because a server cannot gracefully swap
   itself out through its own API. It shells out to the `tasks` binary
@@ -51,7 +72,8 @@ components are built and how data moves):
   `build.rs` stamped from git. `0.1.0` with `commit unknown` means the
   binary was built without git in reach.
 - **`sections/`** — one file per sidebar section (`impl Workspace` blocks):
-  Tasks (Linear-style rows → inspector), Queue (attention-ordered groups:
+  Tasks (Linear-style rows → inspector, with done tasks archived behind a
+  toggle — see below), Queue (attention-ordered groups:
   Needs you / Running / Building / Up next / Ready to build, with live
   elapsed clocks — a clock reads as working, a spinner reads as hung),
   Home (briefing slots + needs-you rows), Activity (typed event sentences —
@@ -69,6 +91,36 @@ components are built and how data moves):
     at the window level because the pointer outruns the handle immediately.
   - `status_badge.rs` — the status→color vocabulary and capsule badges
     (colored text on a 15% wash), matching the Swift app.
+
+## The Tasks archive
+
+`GET /tasks` already drops closed-issue terminal work, so what piles up in
+the list is terminal work whose GitHub issue is still open. The Tasks
+section archives `done` out of the list by default, behind a footer that
+always states the count: `"3 done · Show"` / `"3 done · Hide"`, also
+`View ▸ Show Done Tasks` and `shift-cmd-d`.
+
+Three properties, and each is deliberate:
+
+- **It is a client-side view filter, not a query parameter.** `GET /tasks`
+  is shared with the orchestrator, the briefing generator and `tasks
+  status`; one client's view preference does not belong in it. The rows are
+  a few hundred at most, so filtering locally is cheaper than a refetch per
+  toggle, and the server stays the single authority on which tasks exist
+  and in what order.
+- **It drops rows, never sorts them** (`archive()` in `sections/tasks.rs`,
+  a pure function with unit tests). Whatever ordering the server ships
+  survives the filter untouched.
+- **The count is of what is *done*, not of what is hidden**, so the number
+  does not move when the toggle does. Hiding work is only a problem when it
+  is silent; a footer that says "5 done · Show" and reverses in one click
+  is not.
+
+`Rejected` is not archived — the archive is about work that finished, and
+rejected work is one predicate away, so changing that should be a decision
+rather than a refactor. `show_done` is per-window and resets on relaunch;
+the app has no settings store, and a filter that states its own position
+does not need one.
 
 Theming is gpuikit's system (`gpuikit::theme`): a `Themeable` trait contract
 accessed via `cx.theme()`, initialized with `gpuikit::theme::init`. Icons
