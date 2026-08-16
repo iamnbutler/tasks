@@ -79,20 +79,29 @@ impl BuilderError {
     /// Whether this failure judged the work — the one decision point this
     /// dispatcher has, read by [`Builder::conclude`].
     ///
-    /// `Egress` is a judgement call, and it lands on `Verdict` deliberately: a
-    /// push that fails is arguably infrastructure, but it happens *after* an
-    /// implementation exists, and it is worth surfacing against the batch
-    /// rather than swallowing. `Timeout` is charged for the reason a scout's
-    /// is: the run had the entire budget.
+    /// `Egress` is `Transport`: it happens *after* an implementation exists,
+    /// so nothing about it judged the work. Surfacing and charging are
+    /// separable — the waive path appends a `Note` naming the class and the
+    /// underlying error, so the failure stays exactly as visible, and what
+    /// charging would add is only the strike. `Timeout` is charged for the
+    /// reason a scout's is: the run had the entire budget.
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::BuildFailed { class, .. } => *class,
             Self::NotResumable(_) => FailureClass::Orphaned,
             Self::Cancelled(_) => FailureClass::Cancelled,
+            // Egress is transport in the most literal sense: the agent ran to
+            // completion, an implementation exists, and the push is what
+            // failed. Nothing judged the work. Waiving the strike does not
+            // hide the failure — the waive path appends a `Note` naming the
+            // class and the underlying error, and since #891 the bundle is
+            // preserved with the `git fetch` that recovers it. #873 is the
+            // case: 102 turns, exit 0, rejected by `bundle tip … does not
+            // match the reported head …`, and charged for it.
+            Self::Egress(_) => FailureClass::Transport,
             Self::Store(_)
             | Self::Client(_)
             | Self::GitHub(_)
-            | Self::Egress(_)
             | Self::StreamClosed
             | Self::Timeout { .. } => FailureClass::Verdict,
         }
@@ -986,6 +995,35 @@ mod tests {
                 updated_at: Utc::now(),
             },
         )
+    }
+
+    #[test]
+    fn a_failed_egress_is_transport_and_a_concluded_build_is_a_verdict() {
+        // #873 ran 102 turns, exited 0, and was rejected by the tip check.
+        // Nothing judged that implementation, so it must not spend a strike;
+        // the negative half is what keeps this from reading as "cap off".
+        assert_eq!(
+            BuilderError::Egress("bundle tip does not match".into()).failure_class(),
+            FailureClass::Transport,
+        );
+        assert!(
+            !BuilderError::Egress("x".into())
+                .failure_class()
+                .is_verdict()
+        );
+
+        assert_eq!(
+            BuilderError::BuildFailed {
+                reason: "agent produced no commits".into(),
+                class: FailureClass::Verdict,
+            }
+            .failure_class(),
+            FailureClass::Verdict,
+        );
+        assert_eq!(
+            BuilderError::Timeout { secs: 1 }.failure_class(),
+            FailureClass::Verdict,
+        );
     }
 
     #[test]
