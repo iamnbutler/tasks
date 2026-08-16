@@ -237,6 +237,7 @@ make serve                             # build, take over, log to this terminal
 make restart                           # build, take over, background it
 make restart RELOAD=--when-idle        # ...but wait out in-flight scouts first
 make status / make stop
+make stop STOP=--when-idle             # ...but wait out in-flight scouts first
 cargo run -p tasks -- add-project owner/repo
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make test                              # see Tests below
@@ -296,6 +297,29 @@ unknown resolves to quiet, never to dispatching. `reload` resolves
 `TASKS_DEFAULT_MODE` as step **0**, before the build: an unusable value is a
 hard `serve` startup error, and discovering that after the SIGTERM turns a typo
 into an outage.
+
+**`tasks stop --when-idle` waits on the same predicate, and differs in exactly
+one lasting way.** Idle is `InFlight::is_destructible()` and there is one of it,
+so Restart When Idle and Stop When Idle cannot disagree about what they are
+waiting for; `--drain-timeout SECS` and exit codes 3 and 4 mean what they mean
+in `reload` (5 has no meaning for a stop and is never returned). What differs is
+the mode: **a stop leaves dispatch paused**, and says so in the help, in the
+drain output, on the way out and in the app. Not taste — the only slot in which
+a stop could write the mode back is *before* the SIGTERM, and unpausing a server
+that is still running hands the dispatcher a window to launch one last scout,
+which is precisely the unattended VM the flag exists to prevent (nothing here
+may open the store to do it afterwards, for the reason below, and after the
+SIGTERM there is no server to `POST /mode`). The drain *timeout* still restores
+the mode, because nothing was stopped and a no-op must not have side effects; an
+idle server is never paused at all, for the same reason. `ModeAfterDrain` is the
+single place that asymmetry is written down, so a third caller of `drain` has to
+answer the question rather than inherit an answer. Plain `tasks stop` is
+unchanged — immediate and ungated, because it is the counterpart of
+`reload --force`, the thing `make stop` and the reload path already rely on, and
+the documented way through both new refusals. The GUI is where the missing
+question lives: an immediate **Stop** with work in flight raises a three-way
+prompt (wait / stop anyway / cancel) off the Server window's existing `/status`
+poll — up to 5s stale, so it is a courtesy and never a lock.
 
 Nothing in `reload` opens the store — `Store::open` runs migrations, so a
 supervisor that opened the database would apply the new schema before the new

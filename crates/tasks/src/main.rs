@@ -14,7 +14,7 @@ use chrono::Utc;
 
 use tasks::events::EventPayload;
 use tasks::models::{Project, ProjectId};
-use tasks::reload::{self, ReloadOptions};
+use tasks::reload::{self, ReloadOptions, StopOptions};
 use tasks::run::{self, Config};
 use tasks::store::Store;
 
@@ -28,7 +28,7 @@ usage:
   tasks reload [flags]          build, then swap the running server for the
                                 new binary (alias: restart)
   tasks status                  who is serving, since when, what is in flight
-  tasks stop                    SIGTERM the running server and wait for it
+  tasks stop [flags]            SIGTERM the running server and wait for it
   tasks add-project <owner/repo>  track a GitHub repository
   tasks vm-pool                 run the vm-pool service specialized for
                                 scouts (ContainerRuntime + TasksProtocol)
@@ -49,6 +49,18 @@ reload flags:
 
 reload exit codes:
   3 busy (work in flight)   4 drain timed out   5 the swap did not land
+
+stop flags:
+  --when-idle                   wait for in-flight scouts/builds to finish
+                                before stopping (pauses dispatch for the wait
+                                — and leaves it paused, since no boot resumes
+                                the stored mode). Plain `tasks stop` is
+                                unchanged: immediate and ungated
+  --drain-timeout SECS          how long --when-idle waits (default 3900)
+
+stop exit codes:
+  3 --when-idle against a server that will not say what is in flight
+  4 drain timed out (nothing was stopped)
 
 environment (also read from .env — the data dir's, then the nearest one at or
 above the cwd, then the nearest above this binary; the real environment wins):
@@ -99,7 +111,7 @@ async fn dispatch() -> Result<()> {
         Some("serve") => serve(&args[1..]).await,
         Some("reload") | Some("restart") => reload_cmd(&args[1..]).await,
         Some("status") => status_cmd().await,
-        Some("stop") => stop_cmd().await,
+        Some("stop") => stop_cmd(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
         Some("vm-pool") => vm_pool().await,
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -190,11 +202,39 @@ async fn status_cmd() -> Result<()> {
 
 /// `tasks stop`: SIGTERM and wait until it is actually gone — the same
 /// implementation the swap uses.
-async fn stop_cmd() -> Result<()> {
+///
+/// `--when-idle` waits for a drain point first, on the same predicate
+/// `reload --when-idle` waits on, and exits with the same codes for the same
+/// reasons (3 busy, 4 drain timed out). The one thing it leaves behind is a
+/// paused pipeline, and that is the last thing it prints.
+async fn stop_cmd(args: &[String]) -> Result<()> {
     let data_dir = run::data_dir()?;
-    match reload::stop(&data_dir).await {
-        Ok(Some(file)) => {
-            println!("stopped pid {} (port {})", file.pid, file.port);
+    let mut opts = StopOptions::default();
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--when-idle" => opts.when_idle = true,
+            "--drain-timeout" => {
+                let raw = rest.next().context("--drain-timeout requires a value")?;
+                opts.drain_timeout = Duration::from_secs(
+                    raw.parse()
+                        .with_context(|| format!("not a number of seconds: {raw}"))?,
+                );
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+
+    match reload::stop(&data_dir, opts).await {
+        Ok(Some(stopped)) => {
+            println!(
+                "stopped pid {} (port {})",
+                stopped.file.pid, stopped.file.port
+            );
+            if stopped.left_paused {
+                println!("{}", reload::render_left_paused(stopped.file.port));
+            }
             Ok(())
         }
         Ok(None) => {

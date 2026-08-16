@@ -57,6 +57,7 @@ actions!(
         RestartServer,
         RestartServerWhenIdle,
         StopServer,
+        StopServerWhenIdle,
         RevealServeLog,
         OpenDataDirectory
     ]
@@ -154,6 +155,9 @@ pub fn init(cx: &mut App) {
         server_window::run(cx, Op::RestartWhenIdle);
     });
     cx.on_action(|_: &StopServer, cx| server_window::run(cx, Op::Stop));
+    cx.on_action(|_: &StopServerWhenIdle, cx| {
+        server_window::run(cx, Op::StopWhenIdle);
+    });
     cx.on_action(|_: &RevealServeLog, _cx| {
         if let Some(dir) = tasks_api::paths::data_dir() {
             let log = tasks_api::paths::serve_log(&dir);
@@ -314,7 +318,13 @@ fn menus(state: MenuState) -> Vec<Menu> {
             // second nothing to stop.
             MenuItem::action("Restart When Idle…", RestartServerWhenIdle)
                 .disabled(state.busy || !state.serving),
-            MenuItem::action("Stop Server", StopServer).disabled(state.busy || !state.serving),
+            // "Stop Server…" earned its ellipsis: with work in flight it now
+            // asks in the Server window rather than ending the process under
+            // it. "Stop When Idle…" sits beside it exactly as the restart pair
+            // does, and greys out on the same two facts.
+            MenuItem::action("Stop Server…", StopServer).disabled(state.busy || !state.serving),
+            MenuItem::action("Stop When Idle…", StopServerWhenIdle)
+                .disabled(state.busy || !state.serving),
             MenuItem::separator(),
             MenuItem::action("Pipeline: Play", SetModePlay).checked(state.mode == Some(Mode::Play)),
             MenuItem::action("Pipeline: Pause", SetModePause)
@@ -469,6 +479,7 @@ mod tests {
                 "tasks::RestartServer",
                 "tasks::RestartServerWhenIdle",
                 "tasks::StopServer",
+                "tasks::StopServerWhenIdle",
                 "workspace::SetModePlay",
                 "workspace::SetModePause",
                 "workspace::SetModeStop",
@@ -509,7 +520,27 @@ mod tests {
         let idle = MenuState::default();
         assert!(!item(idle, "Server", "Start Server").is_disabled());
         assert!(item(idle, "Server", "Restart When Idle…").is_disabled());
-        assert!(item(idle, "Server", "Stop Server").is_disabled());
+        assert!(item(idle, "Server", "Stop Server…").is_disabled());
+        assert!(item(idle, "Server", "Stop When Idle…").is_disabled());
+    }
+
+    /// The two pairs read the same way round: an immediate verb and a patient
+    /// one beside it, both of which may now ask before they act.
+    #[test]
+    fn stopping_offers_the_same_pair_restarting_does() {
+        let labels: Vec<_> = items_of(serving(Mode::Play), "Server")
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        let index = |label: &str| {
+            labels
+                .iter()
+                .position(|item| item == label)
+                .unwrap_or_else(|| panic!("no {label:?} item in {labels:?}"))
+        };
+        assert!(index("Restart Server…") < index("Restart When Idle…"));
+        assert!(index("Restart When Idle…") < index("Stop Server…"));
+        assert!(index("Stop Server…") < index("Stop When Idle…"));
     }
 
     /// Two concurrent runs are refused in `ServerControl::start`; the greying
@@ -522,7 +553,8 @@ mod tests {
         };
         assert!(item(busy, "Server", "Restart Server…").is_disabled());
         assert!(item(busy, "Server", "Restart When Idle…").is_disabled());
-        assert!(item(busy, "Server", "Stop Server").is_disabled());
+        assert!(item(busy, "Server", "Stop Server…").is_disabled());
+        assert!(item(busy, "Server", "Stop When Idle…").is_disabled());
         // Reading is always allowed — especially while something is running.
         assert!(!item(busy, "Server", "Server Status…").is_disabled());
     }

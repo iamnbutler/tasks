@@ -37,7 +37,7 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, Global};
-use tasks_client::api::http::ServerStatus;
+use tasks_client::api::http::{InFlight, ServerStatus};
 use tasks_client::api::models::Mode;
 use tasks_client::api::version::VersionInfo;
 use tasks_client::Client;
@@ -71,8 +71,11 @@ pub enum Op {
     RestartWhenIdle,
     /// `tasks reload --force` — swaps regardless of what is running.
     RestartAnyway,
-    /// `tasks stop`.
+    /// `tasks stop` — immediate, and the one op this window asks about first.
     Stop,
+    /// `tasks stop --when-idle` — waits for a drain point, then stops, and
+    /// leaves dispatch paused.
+    StopWhenIdle,
 }
 
 impl Op {
@@ -83,14 +86,31 @@ impl Op {
             Op::RestartWhenIdle => &["reload", "--when-idle"],
             Op::RestartAnyway => &["reload", "--force"],
             Op::Stop => &["stop"],
+            Op::StopWhenIdle => &["stop", "--when-idle"],
         }
+    }
+
+    /// Whether this op ends the server rather than replacing it. Drives the
+    /// wording of every verdict a stop and a restart do not share.
+    pub fn stops(self) -> bool {
+        matches!(self, Op::Stop | Op::StopWhenIdle)
     }
 
     /// Whether this op builds first — and so needs a workspace to build in.
     /// `stop` rejects unknown flags, so `--repo` is passed only to the ops
     /// that would use it.
     pub fn builds(self) -> bool {
-        !matches!(self, Op::Stop)
+        !self.stops()
+    }
+
+    /// Whether to ask before running it with work in flight.
+    ///
+    /// Only the immediate `Stop`: it is the one op that ends the process under
+    /// running work with nothing to hand it to. Every other op either refuses
+    /// on its own (`Restart`, exit 3), waits (`--when-idle`), or has already
+    /// been told twice (`--force`).
+    pub fn needs_confirmation(self) -> bool {
+        matches!(self, Op::Stop)
     }
 
     /// How the run names itself while it is running.
@@ -100,6 +120,7 @@ impl Op {
             Op::RestartWhenIdle => "Restarting when idle",
             Op::RestartAnyway => "Restarting anyway",
             Op::Stop => "Stopping the server",
+            Op::StopWhenIdle => "Stopping when idle",
         }
     }
 }
@@ -159,12 +180,31 @@ impl Outcome {
     pub fn headline(self, op: Op) -> String {
         match (self, op) {
             (Outcome::Done, Op::Stop) => "Stopped. Nothing is serving.".to_string(),
+            // The one lasting consequence of waiting: nothing follows a stop
+            // that could carry the mode, and no boot resumes the stored one.
+            (Outcome::Done, Op::StopWhenIdle) => {
+                "Stopped once the work had landed. Nothing is serving, and dispatch \
+                 is left paused."
+                    .to_string()
+            }
             (Outcome::Done, _) => "Up. The new build is serving.".to_string(),
             (Outcome::BuildFailed, _) => {
                 "The build failed; the running server was not touched.".to_string()
             }
+            // A stop cannot be refused for having work in flight — it is the
+            // way *through* that. Exit 3 for a stop means something else: the
+            // server would not say what is in flight, so there is no way to
+            // tell when it is idle.
+            (Outcome::Busy, op) if op.stops() => {
+                "Refused: the server would not say what is in flight, so there is no \
+                 way to tell when it is idle. Stop it now instead."
+                    .to_string()
+            }
             (Outcome::Busy, _) => {
                 "Refused: work is in flight that a restart would destroy.".to_string()
+            }
+            (Outcome::DrainTimeout, op) if op.stops() => {
+                "Gave up waiting for a drain point; nothing was stopped.".to_string()
             }
             (Outcome::DrainTimeout, _) => {
                 "Gave up waiting for a drain point; nothing was restarted.".to_string()
@@ -400,6 +440,9 @@ pub struct ServerControl {
     /// The run in flight, or the last one that finished. Kept after it ends —
     /// the verdict is most of the value, and it must survive the run.
     pub run: Option<Run>,
+    /// An op parked on a question — see [`ServerControl::request`]. At most
+    /// one, and it never survives a run starting.
+    pub pending: Option<Op>,
     pub status: Option<ServerStatus>,
     pub version: Option<VersionInfo>,
     /// Why the last probe failed. Not an error banner: "nothing is serving"
@@ -432,6 +475,7 @@ impl ServerControl {
         Self {
             client: Client::from_env(),
             run: None,
+            pending: None,
             status: None,
             version: None,
             probe_error: None,
@@ -452,6 +496,44 @@ impl ServerControl {
         self.run.as_ref().is_some_and(Run::is_running)
     }
 
+    /// Work the last probe saw that ending the process would destroy.
+    ///
+    /// A poll, up to [`crate::server_window::POLL`] stale, so what it feeds is
+    /// a question and never a lock — `--when-idle` remains the only thing that
+    /// actually guarantees a drain.
+    pub fn destructible(&self) -> Option<&InFlight> {
+        self.status
+            .as_ref()
+            .map(|status| &status.in_flight)
+            .filter(|in_flight| in_flight.is_destructible())
+    }
+
+    /// Ask for `op`: start it, or park it as a question first.
+    ///
+    /// The parking is what a GUI can do that `tasks stop` cannot — the CLI's
+    /// plain stop is deliberately ungated (scripts and `make stop` depend on
+    /// it), so the confirmation lives here, where there is somewhere to ask.
+    ///
+    /// Returns whether a run started.
+    pub fn request(&mut self, op: Op, cx: &mut Context<Self>) -> bool {
+        if self.busy() {
+            return false;
+        }
+        if op.needs_confirmation() && self.destructible().is_some() {
+            self.pending = Some(op);
+            cx.notify();
+            return false;
+        }
+        self.start(op, cx)
+    }
+
+    /// Drop the parked question, having answered it or thought better of it.
+    pub fn cancel_pending(&mut self, cx: &mut Context<Self>) {
+        if self.pending.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Start `op`, unless a run is already in flight.
     ///
     /// The refusal is the real protection against two concurrent runs; the
@@ -461,6 +543,9 @@ impl ServerControl {
         if self.busy() {
             return false;
         }
+        // Whatever was parked, this answers it: the question is about work in
+        // flight, and something is now acting on it.
+        self.pending = None;
         let command = command_for(op, self.data_dir.as_deref());
         let line = command_line(&command);
         let (tx, mut rx) = mpsc::unbounded();
@@ -529,6 +614,13 @@ impl ServerControl {
                         this.status = None;
                         this.probe_error = Some(err.to_string());
                     }
+                }
+                // The question was about work in flight; with the work landed
+                // it has no subject left, so it collapses and the click that
+                // was about to answer it is dropped. Stopping later on a
+                // question nobody is being asked any more would be worse.
+                if this.destructible().is_none() {
+                    this.pending = None;
                 }
                 // A server that answers `/status` but not `/version` predates
                 // the route; keeping the last known one would be a lie about
@@ -619,6 +711,27 @@ mod tests {
         assert_eq!(Op::RestartWhenIdle.args(), ["reload", "--when-idle"]);
         assert_eq!(Op::RestartAnyway.args(), ["reload", "--force"]);
         assert_eq!(Op::Stop.args(), ["stop"]);
+        assert_eq!(Op::StopWhenIdle.args(), ["stop", "--when-idle"]);
+    }
+
+    /// Only the immediate stop asks first: every other op either refuses on
+    /// its own, waits, or has already been told twice.
+    #[test]
+    fn only_an_immediate_stop_asks_first() {
+        assert!(Op::Stop.needs_confirmation());
+        assert!(!Op::StopWhenIdle.needs_confirmation());
+        assert!(!Op::Restart.needs_confirmation());
+        assert!(!Op::RestartWhenIdle.needs_confirmation());
+        assert!(!Op::RestartAnyway.needs_confirmation());
+    }
+
+    #[test]
+    fn the_ops_that_end_the_server_know_they_do() {
+        assert!(Op::Stop.stops());
+        assert!(Op::StopWhenIdle.stops());
+        assert!(!Op::Restart.stops());
+        assert!(!Op::RestartWhenIdle.stops());
+        assert!(!Op::RestartAnyway.stops());
     }
 
     /// `stop` rejects unknown flags, so `--repo` must never reach it.
@@ -628,6 +741,7 @@ mod tests {
         assert!(Op::RestartWhenIdle.builds());
         assert!(Op::RestartAnyway.builds());
         assert!(!Op::Stop.builds());
+        assert!(!Op::StopWhenIdle.builds());
 
         let repo = OsString::from("/w/tasks");
         assert_eq!(
@@ -635,6 +749,10 @@ mod tests {
             ["reload", "--repo", "/w/tasks"]
         );
         assert_eq!(args_for(Op::Stop, Some(&repo)), ["stop"]);
+        assert_eq!(
+            args_for(Op::StopWhenIdle, Some(&repo)),
+            ["stop", "--when-idle"]
+        );
         assert_eq!(args_for(Op::Restart, None), ["reload"]);
     }
 
@@ -683,6 +801,25 @@ mod tests {
             Outcome::Done.headline(Op::Stop),
             Outcome::Done.headline(Op::Restart)
         );
+    }
+
+    /// The three verdicts a stop and a restart cannot phrase the same way: a
+    /// waited-out stop leaves the pipeline paused, a stop that gave up stopped
+    /// nothing, and exit 3 means something else entirely for a stop.
+    #[test]
+    fn a_stop_says_what_a_restart_cannot() {
+        let done = Outcome::Done.headline(Op::StopWhenIdle);
+        assert!(done.contains("paused"), "{done}");
+
+        let timeout = Outcome::DrainTimeout.headline(Op::StopWhenIdle);
+        assert!(timeout.contains("nothing was stopped"), "{timeout}");
+        assert!(Outcome::DrainTimeout
+            .headline(Op::RestartWhenIdle)
+            .contains("nothing was restarted"));
+
+        let busy = Outcome::Busy.headline(Op::StopWhenIdle);
+        assert!(busy.contains("what is in flight"), "{busy}");
+        assert_ne!(busy, Outcome::Busy.headline(Op::Restart));
     }
 
     #[test]

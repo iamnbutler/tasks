@@ -629,6 +629,171 @@ async fn stop_is_graceful_and_clears_the_pidfile() {
     let _ = server.start_kill();
 }
 
+/// `tasks stop --when-idle` waits on the *same* predicate
+/// `reload --when-idle` waits on, and differs in exactly one lasting way:
+/// there is no successor to hand the mode to, so dispatch stays paused — and
+/// the command says so, with the undo.
+#[tokio::test]
+async fn stop_when_idle_waits_for_the_drain_and_leaves_dispatch_paused() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+    let session = insert_running_session(dir.path()).await;
+
+    let data_dir = dir.path().to_path_buf();
+    let stop = tokio::spawn(async move {
+        cli(&data_dir, &["stop", "--when-idle", "--drain-timeout", "60"]).await
+    });
+
+    // It pauses before it waits — without which the wait never terminates.
+    let mut paused = false;
+    for _ in 0..100 {
+        if mode(port).await == Mode::Pause {
+            paused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(paused, "the drain must pause dispatch or it never ends");
+    assert!(
+        pidfile::pid_alive(status.pid),
+        "nothing is signalled while it is still waiting"
+    );
+
+    // The scout lands; the stop follows.
+    finish_session(dir.path(), &session).await;
+
+    let (code, stdout, stderr) = stop.await.unwrap();
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("drained"), "{stdout}");
+    assert!(stdout.contains("stays paused after the stop"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("stopped pid {}", status.pid)),
+        "{stdout}"
+    );
+    // The one lasting consequence is the last thing said, with its undo.
+    assert!(stdout.contains("dispatch is left paused"), "{stdout}");
+    assert!(stdout.contains("/mode"), "{stdout}");
+
+    assert!(!pidfile::pid_alive(status.pid));
+    assert!(pidfile::read(dir.path()).is_none(), "no record left behind");
+    let store = Store::open(dir.path().join("tasks.db")).await.unwrap();
+    assert_eq!(
+        store.get_mode().await.unwrap(),
+        Mode::Pause,
+        "a stop leaves dispatch paused; nothing after it would unpause"
+    );
+
+    let _ = server.start_kill();
+}
+
+/// A wait that never happened must not have side effects: with nothing in
+/// flight, `--when-idle` stops immediately and does not touch the mode.
+#[tokio::test]
+async fn an_idle_stop_when_idle_leaves_the_mode_alone() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["stop", "--when-idle"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("nothing in flight"), "{stdout}");
+    assert!(!stdout.contains("paused dispatch"), "{stdout}");
+    assert!(!stdout.contains("dispatch is left paused"), "{stdout}");
+    assert!(!pidfile::pid_alive(status.pid));
+
+    let store = Store::open(dir.path().join("tasks.db")).await.unwrap();
+    assert_eq!(
+        store.get_mode().await.unwrap(),
+        Mode::Play,
+        "a stop that did not wait must not leave the pipeline paused"
+    );
+
+    let _ = server.start_kill();
+}
+
+/// A stop drain that gives up stops nothing and puts the mode back — the same
+/// contract `reload --when-idle` has, said in the stop's own words.
+#[tokio::test]
+async fn a_stop_drain_that_times_out_stops_nothing() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+    insert_running_session(dir.path()).await;
+
+    let (code, stdout, stderr) =
+        cli(dir.path(), &["stop", "--when-idle", "--drain-timeout", "1"]).await;
+    assert_eq!(code, 4, "a drain timeout has its own exit code\n{stderr}");
+    assert!(stderr.contains("nothing was stopped"), "{stderr}");
+    assert!(stdout.contains("waiting"), "{stdout}");
+
+    assert!(pidfile::pid_alive(status.pid), "nothing was stopped");
+    let still = fetch_status(port).await.unwrap();
+    assert_eq!(still.pid, status.pid);
+    assert_eq!(still.mode, Mode::Play, "the mode was put back");
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// `--when-idle` against a live pid that will not say what is in flight cannot
+/// know when idle arrives, so it refuses (3) and names the way through. The
+/// pidfile points at this test process: alive, and answering nothing.
+///
+/// A bare `tempdir` rather than [`DataDir`] on purpose — `DataDir::drop`
+/// SIGKILLs whatever the pidfile names.
+#[tokio::test]
+async fn a_stop_that_cannot_tell_when_idle_arrives_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "port": port,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "exe": tasks_bin(),
+    });
+    std::fs::write(
+        pidfile::path(dir.path()),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = cli(dir.path(), &["stop", "--when-idle"]).await;
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("not answering /status"), "{stderr}");
+    assert!(stderr.contains("`tasks stop`"), "{stderr}");
+    assert!(
+        pidfile::pid_alive(std::process::id()),
+        "a refusal must not signal anything"
+    );
+    assert!(
+        pidfile::read(dir.path()).is_some(),
+        "and must leave the record alone"
+    );
+}
+
+/// The flags a stop does not have stay errors: `--force` and `--no-build` are
+/// the other subcommand's, and a typo must not silently stop the server.
+#[tokio::test]
+async fn stop_rejects_the_flags_that_are_not_its_own() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+
+    for flag in ["--force", "--no-build", "--when-idl"] {
+        let (code, stdout, stderr) = cli(dir.path(), &["stop", flag]).await;
+        assert_ne!(code, 0, "{flag}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains("unexpected argument"), "{flag}: {stderr}");
+        assert!(pidfile::pid_alive(status.pid), "{flag} stopped the server");
+    }
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
 /// With nothing running, a reload is just a start — including on a fresh data
 /// dir, where the first boot honestly reports applying every migration.
 #[tokio::test]

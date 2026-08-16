@@ -22,7 +22,7 @@ use gpui::{
     WindowBounds, WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::http::ServerStatus;
+use tasks_client::api::http::{InFlight, ServerStatus};
 use tasks_client::api::models::Mode;
 
 use crate::about;
@@ -32,7 +32,10 @@ use crate::workspace::FONT;
 
 /// How often `/status` is re-read while the window is open. Loopback is
 /// sub-millisecond; the cost is a log line on the server and nothing else.
-const POLL: Duration = Duration::from_secs(5);
+///
+/// Public because it is the age of the answer the Stop confirmation is raised
+/// from: that prompt is a courtesy with this much staleness in it, not a lock.
+pub const POLL: Duration = Duration::from_secs(5);
 
 /// The window is a singleton: a second "Server Status…" raises the one that
 /// is already open rather than stacking another.
@@ -89,13 +92,17 @@ pub fn open(cx: &mut App) {
     }
 }
 
-/// Open the window *and* start `op`. Both, always: a menu item that starts
+/// Open the window *and* ask for `op`. Both, always: a menu item that starts
 /// minutes of staged work silently is a spinner that resolves to nothing.
+///
+/// `request` rather than `start`, so an immediate Stop with work in flight
+/// arrives here as a question in the window it just opened rather than as a
+/// process that is already gone.
 pub fn run(cx: &mut App, op: Op) {
     open(cx);
     let control = ServerControl::global(cx);
     control.update(cx, |control, cx| {
-        control.start(op, cx);
+        control.request(op, cx);
     });
 }
 
@@ -248,13 +255,29 @@ impl ServerWindow {
                 }),
                 cx,
             ))
+            // The same pair as above, the same way round: the immediate verb
+            // and the patient one beside it.
             .child(self.button(
                 "stop",
                 "Stop",
                 !busy && serving,
                 Some(gpui::hsla(0. / 360., 0.8, 0.62, 1.)),
+                // Through `request`: with work in flight this parks the
+                // question below rather than ending the process under it.
                 cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.start(Op::Stop, cx);
+                    this.control.update(cx, |control, cx| {
+                        control.request(Op::Stop, cx);
+                    });
+                }),
+                cx,
+            ))
+            .child(self.button(
+                "stop-when-idle",
+                "Stop When Idle",
+                !busy && serving,
+                None,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.start(Op::StopWhenIdle, cx);
                 }),
                 cx,
             ))
@@ -470,44 +493,142 @@ impl ServerWindow {
             .children(
                 outcome
                     .filter(|outcome| outcome.is_refusal())
-                    .map(|_| self.render_refusal(cx)),
+                    .map(|_| self.render_refusal(op, cx)),
             )
             .into_any_element()
     }
 
-    /// The fork a refusal earns. `tasks reload` could only refuse; the two
+    /// The fork a refusal earns. The CLI could only refuse and exit; the two
     /// ways forward it names in prose are buttons here.
     ///
-    /// Only a plain `Restart` ever reaches this: `--when-idle` skips the
+    /// Which two depends on what was refused. A restart's exit 3 is "work in
+    /// flight"; a stop's is "the server will not say what is in flight", which
+    /// makes waiting a retry rather than a plan — so the wording forks.
+    ///
+    /// Only the two ungated ops ever reach this: `--when-idle` skips the
     /// refusal branch entirely, and its failure is a drain timeout.
-    fn render_refusal(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_refusal(&self, op: Op, cx: &mut Context<Self>) -> gpui::AnyElement {
         let busy = self.control.read(cx).busy();
+        let (wait_id, wait_label, wait_op) = match op.stops() {
+            true => ("stop-try-again", "Try again", Op::StopWhenIdle),
+            false => (
+                "wait-then-restart",
+                "Wait, then restart",
+                Op::RestartWhenIdle,
+            ),
+        };
+        let (anyway_id, anyway_label, anyway_op) = match op.stops() {
+            true => ("stop-anyway", "Stop anyway", Op::Stop),
+            false => ("restart-anyway", "Restart anyway", Op::RestartAnyway),
+        };
         div()
             .flex_none()
             .flex()
             .flex_row()
             .gap(px(6.))
             .child(self.button(
-                "wait-then-restart",
-                "Wait, then restart",
+                wait_id,
+                wait_label,
                 !busy,
                 None,
-                cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.start(Op::RestartWhenIdle, cx);
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.start(wait_op, cx);
                 }),
                 cx,
             ))
             .child(self.button(
-                "restart-anyway",
-                "Restart anyway",
+                anyway_id,
+                anyway_label,
                 !busy,
                 Some(gpui::hsla(0. / 360., 0.8, 0.62, 1.)),
-                cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                    this.start(Op::RestartAnyway, cx);
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.start(anyway_op, cx);
                 }),
                 cx,
             ))
             .into_any_element()
+    }
+
+    // --- the parked question ---
+
+    /// The question an immediate Stop with work in flight parks instead of
+    /// answering itself.
+    ///
+    /// The CLI cannot ask — plain `tasks stop` is what scripts and the reload
+    /// path rely on, so it stays immediate — but the window has been polling
+    /// `/status` all along, so it already knows what is about to be ended.
+    /// Both halves of the trade are stated, and Cancel is a real answer.
+    ///
+    /// It is raised from a poll, so it is up to [`POLL`] stale: a courtesy,
+    /// not a lock. If the work lands while it is up the question collapses
+    /// (see `ServerControl::refresh`) and the click is dropped — stopping on a
+    /// question nobody is being asked any more would be worse.
+    fn render_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let control = self.control.read(cx);
+        let op = control.pending?;
+        let work = work_lines(control.destructible()?);
+        let theme = cx.theme().clone();
+
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .p(px(8.))
+                .rounded(px(6.))
+                .bg(theme.surface())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.fg())
+                        .child(format!("Stop now, with {work} in flight?")),
+                )
+                .child(div().text_xs().text_color(theme.fg_muted()).child(
+                    "Stopping now leaves that work's VMs running with nothing \
+                             reading them until vm-pool reaps them. Waiting stops the \
+                             server once it lands — and leaves dispatch paused, since \
+                             no boot resumes it.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.))
+                        .child(self.button(
+                            "confirm-wait-then-stop",
+                            "Wait, then stop",
+                            true,
+                            None,
+                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.start(Op::StopWhenIdle, cx);
+                            }),
+                            cx,
+                        ))
+                        .child(self.button(
+                            "confirm-stop-anyway",
+                            "Stop anyway",
+                            true,
+                            Some(gpui::hsla(0. / 360., 0.8, 0.62, 1.)),
+                            cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                this.start(op, cx);
+                            }),
+                            cx,
+                        ))
+                        .child(self.button(
+                            "confirm-cancel",
+                            "Cancel",
+                            true,
+                            None,
+                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                this.control
+                                    .update(cx, |control, cx| control.cancel_pending(cx));
+                            }),
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -517,6 +638,7 @@ impl Render for ServerWindow {
         let facts = self.render_facts(cx);
         let actions = self.render_actions(cx);
         let pipeline = self.render_pipeline(cx);
+        let confirm = self.render_confirm(cx);
         let run = self.render_run(cx);
 
         div()
@@ -531,6 +653,7 @@ impl Render for ServerWindow {
             .child(facts)
             .child(actions)
             .child(pipeline)
+            .children(confirm)
             .child(
                 div()
                     .flex_none()
@@ -557,7 +680,13 @@ fn migrations_line(status: &ServerStatus) -> String {
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
-    let in_flight = &status.in_flight;
+    work_lines(&status.in_flight)
+}
+
+/// The same list, off the [`InFlight`] alone — the Stop confirmation names
+/// what it is about to end, and it must be the same sentence the facts above
+/// it are showing.
+fn work_lines(in_flight: &InFlight) -> String {
     if in_flight.is_empty() {
         return "nothing".to_string();
     }

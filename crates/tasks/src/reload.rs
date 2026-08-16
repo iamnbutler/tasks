@@ -164,6 +164,79 @@ impl ModeHandover {
     }
 }
 
+/// What the caller of [`drain`] owes the mode once the wait succeeds.
+///
+/// The one place the restart/stop asymmetry is written down. A restart hands
+/// the pre-drain mode to the new server, so the pause it installed is undone
+/// by the swap; a stop has no successor to hand anything to, and the only slot
+/// in which it could write the mode back is *before* the SIGTERM — where
+/// unpausing a server that is still running would hand the dispatcher a window
+/// to launch one last scout, which is the unattended VM `--when-idle` exists to
+/// prevent. So a stop leaves dispatch paused, and says so.
+///
+/// If a third caller of `drain` ever appears it should have to answer this
+/// question rather than inherit an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeAfterDrain {
+    /// The swap carries the pre-drain mode to the new server.
+    Restored,
+    /// Nothing follows, so the pause outlives the command.
+    LeftPaused,
+}
+
+impl ModeAfterDrain {
+    /// What the pause sentence promises about afterwards.
+    fn pause_note(self) -> &'static str {
+        match self {
+            ModeAfterDrain::Restored => {
+                "paused dispatch for the drain (the new server comes up in play)"
+            }
+            ModeAfterDrain::LeftPaused => {
+                "paused dispatch for the drain (it stays paused after the stop)"
+            }
+        }
+    }
+
+    /// What a drain timeout did *not* do. Both variants restore the mode
+    /// there — nothing happened, and a no-op must not have side effects.
+    fn nothing_happened(self) -> &'static str {
+        match self {
+            ModeAfterDrain::Restored => "nothing was restarted",
+            ModeAfterDrain::LeftPaused => "nothing was stopped",
+        }
+    }
+}
+
+/// What `tasks stop` was asked to do.
+#[derive(Debug, Clone, Copy)]
+pub struct StopOptions {
+    /// Wait for destructible work to finish before signalling anything.
+    /// Plain `tasks stop` is unchanged: immediate and ungated, because it is
+    /// the counterpart of `reload --force` and the documented way through
+    /// every refusal below.
+    pub when_idle: bool,
+    /// How long `--when-idle` waits before giving up.
+    pub drain_timeout: Duration,
+}
+
+impl Default for StopOptions {
+    fn default() -> Self {
+        Self {
+            when_idle: false,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+/// What a stop stopped, and the one lasting consequence it had.
+#[derive(Debug, Clone)]
+pub struct Stopped {
+    pub file: PidFile,
+    /// The drain paused dispatch and nothing will undo it — a boot takes its
+    /// configured default, so the next server does not resume it either.
+    pub left_paused: bool,
+}
+
 /// Build, report, gate, drain, swap, verify. See the module docs for why in
 /// that order.
 pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
@@ -243,7 +316,13 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         // 4. Drain. Pausing is load-bearing, not politeness: with a non-empty
         //    queue the dispatcher starts a fresh scout the moment one
         //    finishes, so a wait that did not pause would never terminate.
-        handover.paused_for_drain = drain(existing.port, status.mode, opts.drain_timeout).await?;
+        handover.paused_for_drain = drain(
+            existing.port,
+            status.mode,
+            opts.drain_timeout,
+            ModeAfterDrain::Restored,
+        )
+        .await?;
     }
 
     if status.in_flight.orchestrator.is_some() {
@@ -413,18 +492,25 @@ fn exec_foreground(binary: &Path, port: u16, data_dir: &Path, carry: Option<Mode
 }
 
 /// Pause dispatch, wait for destructible work to finish, and report whether
-/// this pause is ours to undo (`false` when the pipeline was not playing to
-/// begin with, so there was nothing to pause).
+/// this pause is still outstanding (`false` when the pipeline was not playing
+/// to begin with, so there was nothing to pause).
 ///
 /// The pause is the tool and not the intent, which is why the mode the swap
-/// carries is snapshotted by the caller *before* this runs.
-async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<bool, ReloadError> {
+/// carries is snapshotted by the caller *before* this runs. What happens to it
+/// afterwards is [`ModeAfterDrain`], and every caller has to answer it: a
+/// restart hands it to the new server, a stop leaves it paused.
+async fn drain(
+    port: u16,
+    mode: Mode,
+    timeout: Duration,
+    after: ModeAfterDrain,
+) -> Result<bool, ReloadError> {
     let paused = match mode {
         Mode::Play => {
             set_mode(port, Mode::Pause)
                 .await
                 .map_err(ReloadError::Other)?;
-            println!("paused dispatch for the drain (the new server comes up in play)");
+            println!("{}", after.pause_note());
             true
         }
         // Already not dispatching; nothing to pause and nothing to undo.
@@ -456,16 +542,18 @@ async fn drain(port: u16, mode: Mode, timeout: Duration) -> Result<bool, ReloadE
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            // Restore immediately: this restarts nothing, so leaving the
-            // pipeline paused would be a side effect of a no-op. It has to
-            // happen here and not at the next boot — a boot takes its
-            // configured default now, so nothing else would ever undo it.
+            // Restore immediately, whatever the caller wanted afterwards:
+            // this restarted and stopped nothing, so leaving the pipeline
+            // paused would be a side effect of a no-op. It has to happen here
+            // and not at the next boot — a boot takes its configured default
+            // now, so nothing else would ever undo it.
             if paused && let Err(err) = set_mode(port, Mode::Play).await {
                 println!("could not restore mode to play: {err}");
             }
             return Err(ReloadError::DrainTimeout(format!(
-                "still busy after {}s; nothing was restarted",
-                timeout.as_secs()
+                "still busy after {}s; {}",
+                timeout.as_secs(),
+                after.nothing_happened()
             )));
         }
         tokio::time::sleep(DRAIN_POLL).await;
@@ -497,15 +585,73 @@ pub async fn stop_pid(pid: u32) -> Result<(), ReloadError> {
 
 /// `tasks stop`: shut down the running server, if there is one. Returns what
 /// it stopped.
-pub async fn stop(data_dir: &Path) -> Result<Option<PidFile>, ReloadError> {
+///
+/// `--when-idle` waits for a drain point first, on the *same*
+/// [`InFlight::is_destructible`] predicate `reload --when-idle` waits on — so
+/// Restart When Idle and Stop When Idle cannot disagree about what idle means.
+/// It differs in what it leaves behind: there is no successor to hand the mode
+/// to, so dispatch stays paused (see [`ModeAfterDrain`]).
+pub async fn stop(data_dir: &Path, opts: StopOptions) -> Result<Option<Stopped>, ReloadError> {
     let Some(file) = pidfile::read_live(data_dir) else {
         return Ok(None);
+    };
+    let left_paused = match opts.when_idle {
+        true => wait_for_idle(&file, opts.drain_timeout).await?,
+        false => false,
     };
     stop_pid(file.pid).await?;
     // Belt and braces: the server clears its own record on the way out, but a
     // SIGKILLed one cannot.
     pidfile::remove_if_ours(data_dir, file.pid);
-    Ok(Some(file))
+    Ok(Some(Stopped { file, left_paused }))
+}
+
+/// Report what is in flight and wait for it to land. Answers "was dispatch
+/// left paused".
+///
+/// A live pid that will not answer `/status` cannot be waited on at all —
+/// there is no way to tell when idle arrives — so this refuses (exit 3) with
+/// the server untouched and names plain `tasks stop` as the way through. That
+/// is the only refusal here: an idle server returns before touching the mode,
+/// because a wait that never happened must not leave a lasting side effect.
+async fn wait_for_idle(file: &PidFile, timeout: Duration) -> Result<bool, ReloadError> {
+    let status = fetch_status(file.port).await.ok();
+    print!("{}", render_status(Some(file), status.as_ref(), Utc::now()));
+
+    let Some(status) = status else {
+        return Err(ReloadError::Busy(format!(
+            "pid {} is alive but is not answering /status on port {}, so there is no \
+             way to tell when it is idle; `tasks stop` stops it now",
+            file.pid, file.port
+        )));
+    };
+
+    // Reported, never waited for — same reasoning as `reload`: the answered
+    // watermark means a stop mid-turn costs one turn, and nothing else can
+    // pick a turn up anyway.
+    if status.in_flight.orchestrator.is_some() {
+        println!(
+            "note: an orchestrator turn is owed; the stop costs it one turn \
+             (the next boot takes it again)"
+        );
+    }
+
+    if !status.in_flight.is_destructible() {
+        println!("nothing in flight; stopping now");
+        return Ok(false);
+    }
+
+    drain(file.port, status.mode, timeout, ModeAfterDrain::LeftPaused).await
+}
+
+/// The undo for the pause a `--when-idle` stop leaves behind. Printed last, so
+/// the lasting consequence is the last thing said.
+pub fn render_left_paused(port: u16) -> String {
+    format!(
+        "dispatch is left paused, and no boot will resume it. Once a server is up: \
+         curl -sS -X POST localhost:{port}/mode -H 'content-type: application/json' \
+         -d '{{\"mode\":\"play\"}}'"
+    )
 }
 
 /// `tasks status`: the same report `reload` prints, on its own.
@@ -959,6 +1105,48 @@ mod tests {
             render_migrations(&status),
             "migrations: applied 2 (0002_manual_rank, 0019_charter_comment_and_land)"
         );
+    }
+
+    /// The restart/stop asymmetry, in the one place it is written down: a
+    /// restart's pause is undone by the swap, a stop's outlives the command —
+    /// and a timeout did neither thing, whichever caller asked.
+    #[test]
+    fn a_drain_says_what_it_owes_the_mode() {
+        assert!(ModeAfterDrain::Restored.pause_note().contains("new server"));
+        assert!(
+            ModeAfterDrain::LeftPaused
+                .pause_note()
+                .contains("stays paused"),
+            "{}",
+            ModeAfterDrain::LeftPaused.pause_note()
+        );
+        assert_eq!(
+            ModeAfterDrain::Restored.nothing_happened(),
+            "nothing was restarted"
+        );
+        assert_eq!(
+            ModeAfterDrain::LeftPaused.nothing_happened(),
+            "nothing was stopped"
+        );
+    }
+
+    /// The lasting consequence of a `--when-idle` stop comes with its undo,
+    /// on the port the server was actually on.
+    #[test]
+    fn a_left_paused_pipeline_is_reported_with_the_curl_that_undoes_it() {
+        let note = render_left_paused(4811);
+        assert!(note.contains("paused"), "{note}");
+        assert!(note.contains("localhost:4811/mode"), "{note}");
+        assert!(note.contains("\"mode\":\"play\""), "{note}");
+    }
+
+    /// A stop defaults to what it always did: immediate, ungated, and with the
+    /// same drain budget as `reload` when asked to wait.
+    #[test]
+    fn a_stop_is_immediate_unless_asked_otherwise() {
+        let opts = StopOptions::default();
+        assert!(!opts.when_idle);
+        assert_eq!(opts.drain_timeout, DEFAULT_DRAIN_TIMEOUT);
     }
 
     #[test]

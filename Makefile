@@ -33,6 +33,9 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
 RELOAD ?=
+# ...and for `stop`, deliberately a separate variable: `stop` rejects --force
+# and --no-build, so one shared variable would turn a typo into a usage error.
+STOP ?=
 TASKS_BIN := $(CARGO_TARGET_DIR)/debug/tasks
 
 # Version identity stamped into the app (shown in About Tasks): version is
@@ -131,6 +134,7 @@ app-test: $(APP_TEST_PREREQS)
 #   make serve                    build, take over, log to this terminal
 #   make restart                  build, take over, background it
 #   make restart RELOAD=--when-idle   ... but wait out in-flight scouts first
+#   make stop STOP=--when-idle    stop, but wait out in-flight scouts first
 server:
 	cargo build -p tasks
 
@@ -146,8 +150,11 @@ restart: server
 status: server
 	@$(TASKS_BIN) status || true
 
+# `make stop STOP=--when-idle` waits out in-flight scouts and builds first,
+# on the same predicate `restart RELOAD=--when-idle` waits on. It leaves
+# dispatch paused, because nothing follows it that could carry the mode.
 stop: server
-	@$(TASKS_BIN) stop
+	@$(TASKS_BIN) stop $(STOP)
 
 # A new migration, named for this UTC instant:
 #
