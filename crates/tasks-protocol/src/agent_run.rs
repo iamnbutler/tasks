@@ -466,6 +466,21 @@ impl AgentRun {
         }
     }
 
+    /// Whether this run judged the work, for the supervisor to stamp on its
+    /// terminal event (#884).
+    ///
+    /// Read off the *final* ending only. A run that was resumed twice and then
+    /// concluded on its own terms is a verdict: the transport deaths cost it
+    /// nothing that the resume did not give back, and the thing it finally
+    /// said is what the host is being asked about.
+    pub fn failure_class(&self) -> crate::FailureClass {
+        if self.ending.is_transport() {
+            crate::FailureClass::Transport
+        } else {
+            crate::FailureClass::Verdict
+        }
+    }
+
     /// Suffix for a terminal failure reason, composing with
     /// [`AgentOutcome::failure_context`].
     ///
@@ -789,6 +804,66 @@ mod tests {
         };
         assert_eq!(run.failure_context(), "");
         assert_eq!(AgentRun::default().failure_context(), "");
+    }
+
+    /// The classification is a property of the *ending*, never of the prose.
+    /// Both directions, because this is the guard against the thing #884
+    /// forbids: a strike decision that greps a reason string would change
+    /// meaning the next time someone improves a sentence.
+    #[test]
+    fn the_class_is_independent_of_the_reason_text() {
+        use crate::FailureClass;
+
+        // A run that concluded, whose terminal reason is full of the transport
+        // vocabulary. Still a verdict: the agent said how it ended.
+        let verdict = AgentRun::single(
+            AgentOutcome::default(),
+            AgentEnding::Concluded {
+                terminal_reason: "the connection to the API failed, allegedly (api_error 529)"
+                    .into(),
+            },
+        );
+        assert_eq!(verdict.failure_class(), FailureClass::Verdict);
+
+        // And a transport death whose reason text names nothing of the sort.
+        let transport = AgentRun::single(
+            AgentOutcome::default(),
+            AgentEnding::Transport {
+                terminal_reason: "completed, honest".into(),
+                api_error_status: None,
+            },
+        );
+        assert_eq!(transport.failure_class(), FailureClass::Transport);
+
+        // A run with no stream-json at all — every shell-script agent, and the
+        // shape a SIGKILL leaves — is a verdict. An OOM kill is deliberately
+        // charged: a memory limit is a real property of the work in that VM.
+        assert_eq!(
+            AgentRun::single(
+                AgentOutcome {
+                    signal: Some("killed by signal 9 (SIGKILL)".into()),
+                    ..Default::default()
+                },
+                AgentEnding::Silent,
+            )
+            .failure_class(),
+            FailureClass::Verdict
+        );
+
+        // The *final* ending decides: a run resumed twice that then concluded
+        // badly is a verdict, whatever killed the earlier attempts.
+        let resumed_then_concluded = AgentRun {
+            outcome: AgentOutcome::default(),
+            ending: AgentEnding::Concluded {
+                terminal_reason: "completed".into(),
+            },
+            resumes: 2,
+            no_resume: None,
+        };
+        assert_eq!(
+            resumed_then_concluded.failure_class(),
+            FailureClass::Verdict
+        );
     }
 
     /// Signal and OOM reporting is unchanged: `AgentRun` composes with

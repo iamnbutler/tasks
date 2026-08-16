@@ -47,7 +47,8 @@ use tasks_protocol::agent_run::{
 };
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
-    LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
+    FailureClass, LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent,
+    TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -141,9 +142,7 @@ async fn main() -> Result<()> {
                 warn!("received a build command; this VM is a scout");
                 emit(
                     &evt_tx,
-                    ScoutEvent::Failed {
-                        reason: "this VM is a scout; refusing a build command".into(),
-                    },
+                    failed("this VM is a scout; refusing a build command".into()),
                 )
                 .await;
             }
@@ -162,6 +161,22 @@ async fn write_event(stdout: &mut tokio::io::Stdout, event: &TaskVmEvent) -> Res
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+/// A terminal failure this supervisor is sure about.
+///
+/// Everything that fails *before* the agent runs — a refused role, the
+/// workdir, the clone, the branch, the prompt, the spawn — is a
+/// [`FailureClass::Verdict`], and the inaccuracy is deliberate: a clone that
+/// fails because the base branch is gone fails identically every time, so
+/// waiving it would mean a task retrying forever with nothing to stop it. What
+/// a waiver is for is transient by nature. Only [`report_outcome`], which has
+/// an [`AgentRun`] to ask, stamps anything else.
+fn failed(reason: String) -> ScoutEvent {
+    ScoutEvent::Failed {
+        reason,
+        class: FailureClass::Verdict,
+    }
 }
 
 async fn emit(tx: &mpsc::Sender<TaskVmEvent>, event: ScoutEvent) {
@@ -183,13 +198,7 @@ async fn run_scout(
     let workdir = match make_workdir(task_id) {
         Ok(w) => w,
         Err(e) => {
-            emit(
-                &tx,
-                ScoutEvent::Failed {
-                    reason: format!("workdir: {e}"),
-                },
-            )
-            .await;
+            emit(&tx, failed(format!("workdir: {e}"))).await;
             return;
         }
     };
@@ -197,13 +206,7 @@ async fn run_scout(
 
     // 1. Clone
     if let Err(e) = git_clone(repo_clone_url, base_branch, &workdir).await {
-        emit(
-            &tx,
-            ScoutEvent::Failed {
-                reason: format!("clone: {e}"),
-            },
-        )
-        .await;
+        emit(&tx, failed(format!("clone: {e}"))).await;
         return;
     }
     // Recorded now because the agent may commit; diffing against HEAD later
@@ -211,13 +214,7 @@ async fn run_scout(
     let base_sha = match git_rev_parse_head(&workdir).await {
         Ok(sha) => sha,
         Err(e) => {
-            emit(
-                &tx,
-                ScoutEvent::Failed {
-                    reason: format!("rev-parse: {e}"),
-                },
-            )
-            .await;
+            emit(&tx, failed(format!("rev-parse: {e}"))).await;
             return;
         }
     };
@@ -226,13 +223,7 @@ async fn run_scout(
     let short_id = Uuid::new_v4().simple().to_string()[..8].to_string();
     let branch = format!("scout/{task_id}-{short_id}");
     if let Err(e) = git_checkout_new_branch(&workdir, &branch).await {
-        emit(
-            &tx,
-            ScoutEvent::Failed {
-                reason: format!("branch: {e}"),
-            },
-        )
-        .await;
+        emit(&tx, failed(format!("branch: {e}"))).await;
         return;
     }
     emit(
@@ -245,13 +236,7 @@ async fn run_scout(
 
     // 3. Prompt
     if let Err(e) = tokio::fs::write(workdir.join("PROMPT.md"), prompt).await {
-        emit(
-            &tx,
-            ScoutEvent::Failed {
-                reason: format!("prompt write: {e}"),
-            },
-        )
-        .await;
+        emit(&tx, failed(format!("prompt write: {e}"))).await;
         return;
     }
 
@@ -265,13 +250,7 @@ async fn run_scout(
     let run = match agent {
         Ok(run) => run,
         Err(e) => {
-            emit(
-                &tx,
-                ScoutEvent::Failed {
-                    reason: format!("agent: {e}"),
-                },
-            )
-            .await;
+            emit(&tx, failed(format!("agent: {e}"))).await;
             return;
         }
     };
@@ -352,22 +331,28 @@ async fn report_outcome(
         return;
     };
 
+    // The one place with an `AgentRun` to ask, so the one place that can say
+    // whether this failure judged the work. The host reads this field and
+    // never `reason` — see [`FailureClass`].
+    let class = run.failure_class();
+
     let unfinished_spec = spec.ok();
     match render_salvage(notes.as_deref(), unfinished_spec.as_deref()) {
         Some(notes_markdown) => {
-            info!(%reason, "run ended without a spec; salvaging what was written down");
+            info!(%reason, %class, "run ended without a spec; salvaging what was written down");
             emit(
                 tx,
                 ScoutEvent::StoppedEarly {
                     reason,
                     notes_markdown,
                     files_touched,
+                    class,
                 },
             )
             .await;
         }
         None => {
-            emit(tx, ScoutEvent::Failed { reason }).await;
+            emit(tx, ScoutEvent::Failed { reason, class }).await;
         }
     }
 }

@@ -24,6 +24,7 @@ use crate::models::{
     SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
     TranscriptOwner, TranscriptStream,
 };
+use crate::protocol::FailureClass;
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
 
 /// Builder runs a batch of specs may cost before the batch is retired.
@@ -141,20 +142,40 @@ impl ReconcileReport {
     }
 }
 
-/// Whether a failed build counts against its specs' build attempts.
+/// Whether a failed run counts against its attempt cap.
 ///
-/// The attempt cap exists to stop a spec that cannot be built from being
-/// retried forever. It is therefore only meaningful when the *build* was the
-/// thing that failed: charging a strike for a full pool, a dead socket, or a
-/// run this process could not pick up after a restart would blame the work for
-/// the infrastructure, and three of those would `blocked` a perfectly good
-/// spec.
+/// The cap exists to stop work that cannot be done from being retried forever.
+/// It is therefore only meaningful when the run actually judged the work:
+/// charging a strike for a full pool, a dead socket, a dropped API connection
+/// or a run this process could not pick up after a restart would blame the
+/// work for the infrastructure, and three of those would reject a perfectly
+/// good task or `blocked` a perfectly good spec.
+///
+/// One type for both counters (`tasks.dispatch_attempts` and
+/// `spec_queue.build_attempts`) so the rule is stated once — see
+/// [`Strike::for_class`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpecStrike {
-    /// The build itself failed; count it.
+pub enum Strike {
+    /// The run itself failed; count it.
     Charge,
-    /// The failure says nothing about the spec; leave the count alone.
+    /// The failure says nothing about the work; leave the count alone.
     Waive,
+}
+
+impl Strike {
+    /// The whole rule, in one place: only a verdict is charged.
+    ///
+    /// Read off the [`FailureClass`] the supervisor stamped on the terminal
+    /// event, never off the reason text — a reason is prose written for a
+    /// human, and a strike decision that greps it would change meaning the
+    /// next time someone improves a sentence.
+    pub fn for_class(class: FailureClass) -> Self {
+        if class.is_verdict() {
+            Self::Charge
+        } else {
+            Self::Waive
+        }
+    }
 }
 
 /// A standing request that a run in flight be stopped.
@@ -2780,7 +2801,7 @@ impl Store {
         id: &BuildId,
         reason: &str,
     ) -> Result<Build, StoreError> {
-        self.finalize_build_failed_with(id, reason, SpecStrike::Charge)
+        self.finalize_build_failed_with(id, reason, Strike::Charge)
             .await
     }
 
@@ -2790,7 +2811,7 @@ impl Store {
         &self,
         id: &BuildId,
         reason: &str,
-        strike: SpecStrike,
+        strike: Strike,
     ) -> Result<Build, StoreError> {
         self.finalize_build_unsuccessfully(id, BuildStatus::Failed, reason, strike)
             .await
@@ -2808,7 +2829,7 @@ impl Store {
         id: &BuildId,
         reason: &str,
     ) -> Result<Build, StoreError> {
-        self.finalize_build_unsuccessfully(id, BuildStatus::Cancelled, reason, SpecStrike::Waive)
+        self.finalize_build_unsuccessfully(id, BuildStatus::Cancelled, reason, Strike::Waive)
             .await
     }
 
@@ -2858,7 +2879,7 @@ impl Store {
         id: &BuildId,
         status: BuildStatus,
         reason: &str,
-        strike: SpecStrike,
+        strike: Strike,
     ) -> Result<Build, StoreError> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
@@ -2885,14 +2906,14 @@ impl Store {
         // reporting something else entirely.
         //
         // A caller can waive the strike for the same reason — see
-        // [`SpecStrike`].
+        // [`Strike`].
         let started = sqlx::query("SELECT vm_id FROM builds WHERE id = ?")
             .bind(id.as_str())
             .fetch_optional(&mut *tx)
             .await?
             .and_then(|row| row.try_get::<Option<String>, _>("vm_id").ok().flatten())
             .is_some();
-        if started && strike == SpecStrike::Charge {
+        if started && strike == Strike::Charge {
             sqlx::query(
                 "UPDATE spec_queue SET build_attempts = build_attempts + 1 \
                  WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
@@ -6531,6 +6552,94 @@ mod tests {
             actor: None,
             decision_seq: None,
         }));
+    }
+
+    /// The mirror image, and #884's rule at this layer: a failure that never
+    /// judged the specs is waived however often it happens. Four of them —
+    /// one past the cap — and the batch is still eligible, because a dropped
+    /// connection says nothing about whether the work can be built.
+    #[tokio::test]
+    async fn a_batch_that_keeps_dying_of_infrastructure_is_never_retired() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        for class in [
+            FailureClass::Transport,
+            FailureClass::Transport,
+            FailureClass::Orphaned,
+            FailureClass::Transport,
+        ] {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            // A VM *was* allocated: the run got as far as it could and still
+            // never reached a verdict, which is exactly the case the strike
+            // must not be charged for.
+            store.set_build_vm(&build.id, "vm-test").await.unwrap();
+            store
+                .finalize_build_failed_with(
+                    &build.id,
+                    "the connection dropped",
+                    Strike::for_class(class),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .get_spec_queue_entry(&spec.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                SpecQueueStatus::Approved,
+                "a {class} failure must not spend an attempt"
+            );
+        }
+
+        // And the cap still works afterwards: the counter was untouched, not
+        // disabled.
+        for _ in 1..=MAX_BUILD_ATTEMPTS {
+            let build = store
+                .create_build(
+                    std::slice::from_ref(&spec.id),
+                    "main",
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+            store.claim_next_queued_build().await.unwrap();
+            store.set_build_vm(&build.id, "vm-test").await.unwrap();
+            store
+                .finalize_build_failed(&build.id, "builder exited 1")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Blocked,
+            "three verdicts still retire it"
+        );
     }
 
     #[tokio::test]

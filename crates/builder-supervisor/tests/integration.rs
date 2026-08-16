@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use tasks_protocol::{
-    BuildCommand, BuildEvent, ScoutCommand, TaskCommand, TaskEvent, TasksProtocol,
+    BuildCommand, BuildEvent, FailureClass, ScoutCommand, TaskCommand, TaskEvent, TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -503,8 +503,11 @@ async fn an_empty_branch_is_a_failure() {
     sup.send(start(repo_url)).await;
 
     match drain(&mut sup).await {
-        BuildEvent::Failed { reason } => {
+        BuildEvent::Failed { reason, class } => {
             assert!(reason.contains("no commits"), "reason: {reason}");
+            // A build that committed nothing judged the work, and burns one
+            // of its three. Waiving this would be switching the cap off.
+            assert_eq!(class, FailureClass::Verdict);
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -536,8 +539,12 @@ async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
                 payload: TaskEvent::Build(BuildEvent::ImplementationFinished { exit_code: code }),
             } => exit_code = Some(code),
             VmEvent::App {
-                payload: TaskEvent::Build(BuildEvent::Failed { reason }),
-            } => break reason,
+                payload: TaskEvent::Build(BuildEvent::Failed { reason, class }),
+            } => {
+                // An OOM kill is deliberately still charged — see #828.
+                assert_eq!(class, FailureClass::Verdict, "reason: {reason}");
+                break reason;
+            }
             VmEvent::App {
                 payload: TaskEvent::Build(_),
             } => continue,
@@ -685,8 +692,11 @@ async fn a_clone_error_fails_before_started() {
 
     match sup.recv().await {
         VmEvent::App {
-            payload: TaskEvent::Build(BuildEvent::Failed { reason }),
-        } => assert!(reason.contains("clone"), "reason: {reason}"),
+            payload: TaskEvent::Build(BuildEvent::Failed { reason, class }),
+        } => {
+            assert!(reason.contains("clone"), "reason: {reason}");
+            assert_eq!(class, FailureClass::Verdict);
+        }
         other => panic!("expected Failed, got {other:?}"),
     }
 
@@ -716,8 +726,11 @@ async fn a_scout_command_is_refused_not_acted_on() {
 
     match sup.recv().await {
         VmEvent::App {
-            payload: TaskEvent::Build(BuildEvent::Failed { reason }),
-        } => assert!(reason.contains("builder"), "reason: {reason}"),
+            payload: TaskEvent::Build(BuildEvent::Failed { reason, class }),
+        } => {
+            assert!(reason.contains("builder"), "reason: {reason}");
+            assert_eq!(class, FailureClass::Verdict);
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
 

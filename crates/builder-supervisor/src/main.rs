@@ -49,8 +49,8 @@ use tasks_protocol::agent_run::{
 };
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
-    BuildCommand, BuildEvent, LogStream, MAX_BUNDLE_BASE64_BYTES, TaskCommand, TaskEvent,
-    TasksProtocol,
+    BuildCommand, BuildEvent, FailureClass, LogStream, MAX_BUNDLE_BASE64_BYTES, TaskCommand,
+    TaskEvent, TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
                     &evt_tx,
                     BuildEvent::Failed {
                         reason: "this VM is a builder; refusing a scout command".into(),
+                        class: FailureClass::Verdict,
                     },
                 )
                 .await;
@@ -185,9 +186,28 @@ async fn run_build(
     prompt: &str,
     tx: mpsc::Sender<TaskVmEvent>,
 ) {
+    // The `class:` arm must come FIRST: the catch-all below matches
+    // `class: …` too, and would wrap a classified failure in a second class.
+    //
+    // Unclassified is [`FailureClass::Verdict`], which is what every
+    // *pre-agent* site wants — a clone against a base branch that no longer
+    // exists fails identically every time, so waiving it would mean a batch
+    // retrying forever with nothing to stop it. Only the sites after the agent
+    // has run have an [`AgentRun`] to ask, and they pass `run.failure_class()`.
     macro_rules! fail {
+        (class: $class:expr, $($arg:tt)*) => {{
+            emit(&tx, BuildEvent::Failed { reason: format!($($arg)*), class: $class }).await;
+            return;
+        }};
         ($($arg:tt)*) => {{
-            emit(&tx, BuildEvent::Failed { reason: format!($($arg)*) }).await;
+            emit(
+                &tx,
+                BuildEvent::Failed {
+                    reason: format!($($arg)*),
+                    class: FailureClass::Verdict,
+                },
+            )
+            .await;
             return;
         }};
     }
@@ -273,7 +293,7 @@ async fn run_build(
     // implementation. See [`reconcile_checkout`].
     let abandoned = match reconcile_checkout(&workdir, branch, &tx).await {
         Ok(abandoned) => abandoned,
-        Err(e) => fail!("reconcile: {e}"),
+        Err(e) => fail!(class: run.failure_class(), "reconcile: {e}"),
     };
     // A `checkout --force` back onto the branch can restore an artifact the
     // agent had committed there; removing them again turns that into a
@@ -281,13 +301,13 @@ async fn run_build(
     remove_artifacts(&workdir).await;
 
     if let Err(e) = commit_worktree(&workdir, SWEEP_MESSAGE).await {
-        fail!("sweep: {e}");
+        fail!(class: run.failure_class(), "sweep: {e}");
     }
 
     let branch_ref = format!("refs/heads/{branch}");
     let tip = match git_stdout(&workdir, &["rev-parse", &branch_ref]).await {
         Ok(sha) => sha,
-        Err(e) => fail!("rev-parse branch: {e}"),
+        Err(e) => fail!(class: run.failure_class(), "rev-parse branch: {e}"),
     };
     if tip == base_sha {
         // "no commits" on its own reads as a verdict on the agent's work, so
@@ -295,6 +315,7 @@ async fn run_build(
         // named here rather than left for someone to infer from a budget that
         // vanished.
         fail!(
+            class: run.failure_class(),
             "agent produced no commits (tip == base){}",
             run.failure_context()
         );
@@ -305,7 +326,7 @@ async fn run_build(
     let (bundle_base64, head_sha) =
         match package_bundle(&workdir, &base_sha, branch, abandoned.as_deref(), &tx).await {
             Ok(packaged) => packaged,
-            Err(e) => fail!("bundle: {e}"),
+            Err(e) => fail!(class: run.failure_class(), "bundle: {e}"),
         };
     if head_sha != tip {
         // Not fatal: the bundle is the deliverable and `head_sha` now

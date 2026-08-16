@@ -455,8 +455,15 @@ async fn an_interrupted_scout_is_salvaged_without_producing_a_spec() {
         .await
         .expect_err("a run without a spec is not a success");
     assert!(
-        matches!(err, tasks::scout::ScoutError::StoppedEarly(_)),
+        matches!(err, tasks::scout::ScoutError::StoppedEarly { .. }),
         "stopping early is its own outcome, not a generic failure: {err:?}"
+    );
+    // An agent that ran to completion and produced no spec is a verdict, and
+    // is charged for it. Waiving this would be switching the cap off.
+    assert_eq!(
+        err.failure_class(),
+        tasks::protocol::FailureClass::Verdict,
+        "an agent that concluded with nothing judged the work: {err:?}"
     );
 
     // Nothing reviewable exists. This is the invariant.
