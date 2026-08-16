@@ -148,6 +148,23 @@ const VM_POOL_RETRY: Duration = Duration::from_secs(10);
 /// the thing operators actually feel. Don't lengthen it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// How long the *background* loops — poll, nudge, obligations — get, in total,
+/// before they are abandoned and named.
+///
+/// Short, and safe by construction, which is why these get a leash where a
+/// scout gets thirty seconds: a poll is idempotent, obligations are recomputed
+/// from state on every pass, and a nudge is a latency optimization the answered
+/// watermark makes good. Nothing here is work in progress.
+///
+/// The arithmetic matters. These three used to be awaited **unbounded**, and
+/// [`crate::reload`] SIGKILLs a server that has not exited within its own
+/// `STOP_GRACE` of 75s — so one loop that missed its shutdown flag turned into
+/// a hard kill with nothing in `serve.log` naming it, which is exactly what
+/// #883 cost a scout run to diagnose. Bounded, the whole drain is 10 + 30 + 30
+/// = 70s and still fits inside the 75, so a graceful stop stays graceful even
+/// when every stage runs out its clock.
+const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
+
 /// `source` on the breadcrumbs the dispatcher writes to the event log.
 /// `pub(crate)` because [`crate::scout`] emits the timeout note under the same
 /// source — it has the vm id and the deadline that make the entry useful.
@@ -797,9 +814,27 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             let _ = shutdown_tx.send(true);
 
             let drain = async {
-                let _ = poll.await;
-                let _ = nudge.await;
-                let _ = obligations.await;
+                // The background loops, bounded and named. Unbounded, one of
+                // them missing its shutdown flag is a 75s SIGKILL with nothing
+                // in the log to say which — see `drain_background`.
+                for name in drain_background(
+                    BACKGROUND_GRACE,
+                    vec![
+                        ("poll", poll),
+                        ("nudge", nudge),
+                        ("obligations", obligations),
+                    ],
+                )
+                .await
+                {
+                    warn!(
+                        loop_name = name,
+                        grace_secs = BACKGROUND_GRACE.as_secs(),
+                        "background loop did not stop when told; abandoning it. \
+                         These loops return on a flag, so this is a bug in that \
+                         loop, not slow work"
+                    );
+                }
                 // Scouts and builds first, on a short leash: whatever we walk
                 // away from, the successor attaches to.
                 if tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -865,6 +900,37 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     served?;
 
     Ok(())
+}
+
+/// Wait out the background loops under one shared deadline, and return the
+/// names of the ones that did not stop.
+///
+/// Two properties are load-bearing, and both come from the failure this exists
+/// for — a loop that never observed the shutdown flag, awaited forever, and
+/// reached the operator as a SIGKILL with an empty log.
+///
+/// The deadline is **shared**, not per-task: the total is `grace` however many
+/// loops there are, which is what lets the whole drain fit inside `reload`'s
+/// `STOP_GRACE`. And loops after the deadline passes are still *asked* — a
+/// handle that has already finished answers immediately and is not reported,
+/// while one still running is named. Reporting only whichever loop happened to
+/// run the clock out would point a reader at the first handle awaited rather
+/// than at the one that is stuck.
+///
+/// Split out of [`run`] so it is testable without a server, a signal, or a
+/// real ten-second wait.
+async fn drain_background(
+    grace: Duration,
+    handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+) -> Vec<&'static str> {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut stuck = Vec::new();
+    for (name, handle) in handles {
+        if tokio::time::timeout_at(deadline, handle).await.is_err() {
+            stuck.push(name);
+        }
+    }
+    stuck
 }
 
 /// Clean up work a previous process abandoned mid-flight.
@@ -2678,6 +2744,63 @@ mod tests {
         assert_eq!(
             store.list_retirable_tasks(&project.id).await.unwrap().len(),
             1
+        );
+    }
+
+    /// The failure #883 cost a scout run: a loop that never observed the
+    /// shutdown flag, awaited forever, and reached the operator as a SIGKILL
+    /// 75 seconds later with nothing in the log naming it.
+    #[tokio::test]
+    async fn a_background_loop_that_ignores_shutdown_is_bounded_and_named() {
+        let grace = Duration::from_millis(200);
+        let wedged = || tokio::spawn(std::future::pending::<()>());
+
+        let started = std::time::Instant::now();
+        let stuck = drain_background(
+            grace,
+            vec![
+                ("poll", wedged()),
+                ("nudge", wedged()),
+                ("obligations", wedged()),
+            ],
+        )
+        .await;
+
+        // Every one of them, not just whichever was awaited first — otherwise
+        // the log points at a handle rather than at the bug.
+        assert_eq!(stuck, vec!["poll", "nudge", "obligations"]);
+        // And one shared deadline: per-task would be ~3x this.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < grace * 3,
+            "the deadline is shared, not per task: {elapsed:?}"
+        );
+    }
+
+    /// The other half, without which the assertion above is satisfied by
+    /// reporting everything: a loop that stops when told is not reported, even
+    /// when it is awaited after the deadline has already passed.
+    #[tokio::test]
+    async fn loops_that_stop_when_told_are_not_reported() {
+        let done = || tokio::spawn(async {});
+        // Give them a moment to actually finish, so this is not a race the
+        // timeout wins by accident.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let stuck = drain_background(
+            Duration::from_millis(100),
+            vec![
+                ("poll", tokio::spawn(std::future::pending::<()>())),
+                ("nudge", done()),
+                ("obligations", done()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            stuck,
+            vec!["poll"],
+            "a finished handle answers immediately, deadline or no deadline"
         );
     }
 }
