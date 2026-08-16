@@ -1884,6 +1884,28 @@ async fn record_outcome(
         return Ok(ConnectionLost(false));
     }
 
+    // A cancel is a decision, not a failure. It costs the task no attempt (the
+    // run was stopped before it could show whether it would have worked) and
+    // the task is already back in the backlog, put there by
+    // `Scout::finalize_cancelled` — the one non-success path that does not
+    // return work to the queue, because leaving it queued would have the loop
+    // below start a replacement scout within the tick.
+    if let ScoutError::Cancelled(request) = &error {
+        let actor = request.actor.as_str();
+        info!(task_id = %task_id, actor, "a scout was cancelled");
+        store
+            .append_event(EventPayload::Note {
+                source: DISPATCHER.into(),
+                message: format!(
+                    "the scout for {task_id} was {}; the task is back in the backlog \
+                     and keeps its attempts",
+                    request.exit_reason()
+                ),
+            })
+            .await?;
+        return Ok(ConnectionLost(false));
+    }
+
     // Read off the error variant alone, never off the notes table: a task can
     // carry salvage from an *earlier* attempt, and the event log must not
     // credit this run for it.

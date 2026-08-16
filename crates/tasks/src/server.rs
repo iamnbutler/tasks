@@ -27,11 +27,11 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CaptureIssue,
-    CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse, LabelInfo,
-    MergePullRequest, ModeResponse, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
-    ReviewCommentRequest, ReviewRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest,
-    SetMode, ShadowAck,
+    AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck,
+    CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
+    EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, ReopenTaskRequest,
+    ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, SendMessage, ServerStatus,
+    SetCharter, SetLabelsRequest, SetMode, ShadowAck,
 };
 
 use crate::briefing::{self, Briefings};
@@ -40,8 +40,9 @@ use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
     Complexity, Decision, DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ProjectId, ScoutNotes, Session, SessionId, Spec, SpecId,
-    SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    OrchestratorSessionInfo, Project, ProjectId, RunKind, ScoutNotes, Session, SessionId,
+    SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
+    TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -192,6 +193,7 @@ pub fn router_with_services(
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/notes", get(get_session_notes))
+        .route("/sessions/{session_id}/cancel", post(cancel_session))
         .route("/sessions/{session_id}/transcript", get(list_transcript))
         .route(
             "/sessions/{session_id}/transcript/stream",
@@ -207,6 +209,7 @@ pub fn router_with_services(
         .route("/charter", get(get_charter))
         .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
+        .route("/builds/{build_id}/cancel", post(cancel_build))
         .route("/builds/{build_id}/transcript", get(list_build_transcript))
         .route(
             "/builds/{build_id}/transcript/stream",
@@ -1360,6 +1363,204 @@ async fn get_session_notes(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("notes for session {id}")))
+}
+
+// --- cancelling work in flight ---
+
+/// How long `cancel_run` waits to see the run actually conclude before
+/// answering.
+///
+/// Not a guarantee, and deliberately not one: the dispatcher's teardown is
+/// bounded at 120s ([`crate::teardown::DEALLOCATE_TIMEOUT`]), so a wedged pool
+/// can outlast this, and a run that got past its drain and is pushing a branch
+/// is not interruptible at all. Long enough that the ordinary case reads as
+/// done, short enough that nobody's HTTP client is left hanging on the unusual
+/// one.
+const CANCEL_SETTLE: Duration = Duration::from_secs(3);
+const CANCEL_SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// `POST /sessions/{session_id}/cancel` — stop a scout that is running.
+async fn cancel_session(
+    State(store): State<Arc<Store>>,
+    Path(session_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let id = SessionId::from_raw(session_id);
+    let session = store
+        .get_session(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
+    if session.status != SessionStatus::Running {
+        return Err(ApiError::Conflict(format!(
+            "session {id} is {} — it has already concluded",
+            session.status.as_str()
+        )));
+    }
+    cancel_run(&store, &headers, RunKind::Session, id.as_str(), body).await
+}
+
+/// `POST /builds/{build_id}/cancel` — stop a build that is queued or running.
+///
+/// A `queued` build is cancellable too, and is the one case the handler
+/// applies itself: nothing is following it, so nobody would ever read the
+/// request.
+async fn cancel_build(
+    State(store): State<Arc<Store>>,
+    Path(build_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let id = BuildId::from_raw(build_id);
+    let build = store
+        .get_build(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("build {id}")))?;
+    if build.status.is_terminal() {
+        return Err(ApiError::Conflict(format!(
+            "build {id} is {} — it has already concluded",
+            build.status.as_str()
+        )));
+    }
+    cancel_run(&store, &headers, RunKind::Build, id.as_str(), body).await
+}
+
+/// One cancel, behind both routes.
+///
+/// The order of the four writes is the whole of the care here:
+///
+/// 1. **The run is checked first** (by the callers above): 404 for one that
+///    does not exist, 409 for one that has already concluded. Nothing is
+///    recorded about a run nobody can stop.
+/// 2. **The ledger row before the cancel.** `record_decision` is what refuses
+///    an orchestrator cancel with no rationale, and that refusal has to land
+///    before any work is destroyed.
+/// 3. **The durable request before the announcing event.** A crash between the
+///    two costs the wake-up — which the observer's poll covers — rather than
+///    the cancel.
+/// 4. **Then settle**, so `concluded` is something the server observed rather
+///    than something it hopes.
+async fn cancel_run(
+    store: &Arc<Store>,
+    headers: &axum::http::HeaderMap,
+    kind: RunKind,
+    id: &str,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let actor = actor_of(store, headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale.clone(),
+        evidence: body.evidence,
+    };
+    let subject = kind.as_str();
+
+    if authorize(
+        store,
+        actor,
+        Capability::CancelRuns,
+        DecisionAction::CancelRun,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(subject, id, DecisionAction::CancelRun, decision, false)
+            .await?;
+        return Ok(shadowed(seq, "the run is still going"));
+    }
+
+    let decision_seq = store
+        .record_decision(subject, id, DecisionAction::CancelRun, decision, true)
+        .await?;
+    let request = store
+        .request_cancel(
+            kind,
+            id,
+            actor,
+            body.rationale.as_deref(),
+            Some(decision_seq),
+        )
+        .await?;
+    store
+        .append_event(EventPayload::RunCancelRequested {
+            run_kind: kind,
+            run_id: id.to_string(),
+            actor,
+            decision_seq: Some(decision_seq),
+        })
+        .await?;
+    info!(%kind, run_id = id, actor = actor.as_str(), "cancel requested");
+
+    // A queued build has no dispatcher parked on it, so the request would sit
+    // unread forever. Conditional on the status inside the store, so losing the
+    // race against the serial build loop leaves the running build's own cancel
+    // path to conclude it.
+    if kind == RunKind::Build {
+        store
+            .cancel_queued_build(&BuildId::from_raw(id.to_string()), &request.exit_reason())
+            .await?;
+    }
+
+    let (concluded, status) = settle(store, kind, id).await?;
+    let note = match concluded {
+        true => format!("the {} stopped: it is now {status}", kind.noun()),
+        // Deliberately not "teardown is underway": the other way to be here is
+        // a run that got past its drain and is landing a branch, which no
+        // cancel reaches.
+        false => format!(
+            "the cancel is recorded and the {} is still {status}; whoever is following \
+             the run concludes it, and its completion event says so",
+            kind.noun()
+        ),
+    };
+    Ok(Json(CancelAck {
+        run_kind: kind,
+        run_id: id.to_string(),
+        concluded,
+        status,
+        decision_seq,
+        note,
+    })
+    .into_response())
+}
+
+/// Poll the run for up to [`CANCEL_SETTLE`], and report where it got to.
+///
+/// Polling rather than waiting on the event stream because the run may be
+/// concluded by a *different* process (one that reattached to it), whose
+/// terminal write this server only sees in the database.
+async fn settle(store: &Store, kind: RunKind, id: &str) -> ApiResult<(bool, String)> {
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
+    loop {
+        let (concluded, status) = match kind {
+            RunKind::Session => {
+                let session = store
+                    .get_session(&SessionId::from_raw(id.to_string()))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(format!("session {id}")))?;
+                (
+                    session.status != SessionStatus::Running,
+                    session.status.as_str().to_string(),
+                )
+            }
+            RunKind::Build => {
+                let build = store
+                    .get_build(&BuildId::from_raw(id.to_string()))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(format!("build {id}")))?;
+                (
+                    build.status.is_terminal(),
+                    build.status.as_str().to_string(),
+                )
+            }
+        };
+        if concluded || tokio::time::Instant::now() >= deadline {
+            return Ok((concluded, status));
+        }
+        tokio::time::sleep(CANCEL_SETTLE_POLL).await;
+    }
 }
 
 // --- specs ---

@@ -602,9 +602,15 @@ fn tool_label(item: &serde_json::Value) -> String {
 pub fn nudge_worthy(payload: &EventPayload) -> bool {
     match payload {
         EventPayload::TaskIngested { .. }
-        | EventPayload::BuildCompleted { .. }
         | EventPayload::PullRequestOpened { .. }
         | EventPayload::ModeChanged { .. } => true,
+        // A build concluding is news — unless somebody stopped it, which is
+        // the same echo rule as a review verdict: it was a deliberate act by
+        // an accountable actor, and being told about it costs a turn to
+        // acknowledge. The obligation loop still raises the spec the cancel
+        // returned to `approved` after its grace period, which is the right
+        // amount of pause before anyone reconsiders the work.
+        EventPayload::BuildCompleted { status, .. } => *status != BuildStatus::Cancelled,
         // A spec landing is the turn it gets reviewed on — which is only true
         // of a spec a Scout wrote. A human-authored one (#869) arrives already
         // approved and already inside a build, so summoning a reviewer to it
@@ -1110,6 +1116,15 @@ fn system_prompt(
            {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
          - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
            specs into one Builder run (serial; one at a time)\n\
+         - POST /sessions/{{id}}/cancel, POST /builds/{{id}}/cancel \
+           {{\"rationale\"}} — stop a scout or a build that is already in \
+           flight. The rationale is mandatory and lands in the run's \
+           exit_reason, which is the only thing that later tells a deliberate \
+           stop from a crash. A cancelled run costs the work nothing: the \
+           task goes back to the backlog, a build's specs back to approved, \
+           no attempt is charged. `concluded: false` in the reply means the \
+           request is recorded and the run has not stopped yet — watch for \
+           its completion event rather than asking again\n\
          - POST /issues \
            {{\"title\",\"body\",\"labels\",\"provenance\",\"rationale\"}} — file an \
            issue. `provenance` says where the work was discovered (\"while \
