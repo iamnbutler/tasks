@@ -68,6 +68,39 @@ implementation.
   something it concluded had landed. Nothing auto-unwinds a stranded batch;
   `ObligationKind::LandBatch` makes it loud instead, and it is the first
   obligation whose subject is a **build** id rather than a spec id.
+- **An open PR is chased like every other stage, and the default is to land
+  it.** The pipeline used to dead-end at PR open: the `land_batch` bullet ended
+  "landing it is the human's" while the charter shipped `land_builds` **live**,
+  so every parked batch was reported and none was merged. That sentence is now
+  *generated* from the charter row (`orchestrator::landing_section`), the way
+  the authority and workdir sections are — the fix for a prompt contradicting
+  the charter is never a better sentence, it is one source. What sends a batch
+  back to a human is **unverifiability, not risk**, because "hand it over when
+  in doubt" is what the old sentence effectively said and doubt is unbounded.
+  So there are exactly three carve-outs, named as the whole list: GitHub would
+  refuse the merge, the build reported no passing test run of its own, or
+  nothing runnable here could have checked it. The third exists because this
+  repository has **no `.github/workflows` and no branch protection**, so
+  `mergeable_state` can only ever be `clean` or `dirty` and GitHub's verdict is
+  structurally incapable of objecting to a change that does not work —
+  `Landing::Clear::describe()` says so in words, and a test pins that clause
+  and the absence of "ready to merge". Read `mergeable_state` and never
+  `mergeable` alone: `false` there means a conflict and nothing else, so a red
+  PR reads ready. The only evidence that a change works is therefore the
+  Builder's own run, which it states as a `Verification: PASSED|FAILED|NOT RUN`
+  trailer in `SUMMARY.md` — a trailer and not a column, because the summary is
+  already stored and already the PR body, so one sentence serves the human
+  reading the PR and the brief reading it back with no migration, no
+  `BuildEvent` field and no image rebuild in between. It is a **claim**, not a
+  check, and the brief attributes it as one; every batch parked before it was
+  asked for parses as `Unreported`, which reads as "no run on record" and goes
+  to a human, which is the direction a mistake here has to fall. All of this
+  lands on the *brief* rather than in the obligation: refining an obligation's
+  **kind** after `Store::obligations` returns would lose its
+  `(kind, subject_id)` reminder row and nag every tick instead of every thirty
+  minutes, and it would cost a GitHub read per parked PR per tick rather than
+  one per obligation actually surfaced. Mergeability is never cached — that is
+  persisting a GitHub-owned fact with a timestamp on it.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
@@ -368,6 +401,28 @@ in the feed at the next boot. Shutdown holds the HTTP port through the whole
 drain (so a restart is a hand-over, not an outage) and releases it last, which
 means a successor waits for this process to exit before it can bind.
 
+**The drain is bounded at every stage, and it names whatever it walked away
+from.** `poll`, `nudge` and `obligations` used to be awaited *unbounded* and
+unnamed, while scouts/builds and the orchestrator turn already had
+`SHUTDOWN_GRACE` leashes. That asymmetry is what turned a one-line bug (#883:
+`orchestrator_nudge_loop` never observing the shutdown flag, because
+`watch::Receiver::changed()` marks a value seen when it *returns*, so a
+shutdown consumed by an inner `select!` parks the outer loop forever) into a
+75s SIGKILL with nothing in `serve.log` — and cost a scout run to diagnose.
+`run::drain_background` now awaits those three under one shared
+`BACKGROUND_GRACE` (10s) deadline and returns the names that did not finish,
+one `warn!` each. Shared, not per-task, so the whole drain is **10 + 30 + 30 =
+70s and still fits inside the 75s** `reload` allows before it SIGKILLs; and
+loops after the deadline are still asked, so the log names the loop that is
+stuck rather than whichever handle happened to be awaited first. Abandoning
+these three is safe *by construction*, which is why they and not scouts get the
+short leash: a poll is idempotent, obligations are recomputed from state every
+pass, and a nudge is a latency optimization the answered watermark makes good.
+The `warn!` wording is deliberate — these loops return on a flag, so there is
+no legitimate reason for one to still be running at 10s, and a reader who takes
+the message for ordinary shutdown noise is the failure mode that put #883 in
+front of a scout.
+
 **vm-pool is upgraded separately, and it goes first.** It is a long-lived
 daemon that a server restart does not restart, so a freshly built server
 routinely talks to the binary vm-pool was started with. `serde(default)` makes
@@ -467,6 +522,21 @@ tokio runtime exists (`set_var` is unsafe once threads are running). It is
 never done inside `Config::from_env` — tests build configs, and a suite that
 read the developer's untracked `.env` would be the worse bug.
 
+**`Command::env_remove` is the opposite of a scrub**, and a test that execs the
+`tasks` binary has to know it. The real environment is the only thing a `.env`
+entry loses to, so *removing* a variable from a child's environment is exactly
+what promotes the file that defines it — and `.env` is gitignored, so a
+maintainer with `TASKS_DEFAULT_MODE=play` in one fails a restart suite on their
+machine and nowhere else. `TASKS_ENV_FILES=off` is the switch for that:
+`crates/tasks/tests/reload.rs` is the only file that execs the binary (so it is
+the whole blast radius), and any future one needs the same three settings. The
+test that pins it carries a **control** — it first boots with the switch removed
+and asserts the `.env` really does decide the mode, then boots with it and
+asserts it does not. Without that half the assertion is vacuous. A value that is
+neither `on` nor `off` (including one that is not UTF-8) refuses to start rather
+than being ignored: `.ok()` there would mean "load the files anyway", the one
+direction this switch must not fail in.
+
 The matching rule for the orchestrator: **anything the system prompt claims
 about the environment is generated from it**, alongside the charter-generated
 authority section. `workdir_is_checkout` and `github_configured` decide whether
@@ -482,6 +552,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
 | `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
 | `TASKS_DEFAULT_MODE` | `pause` | the mode **every** boot starts in, overwriting whatever the last process left in the store — `play`, `pause` or `stop`, and an unparseable value refuses to boot rather than being ignored. Only `tasks reload` overrides it, by passing the old server's mode to the new one |
+| `TASKS_ENV_FILES` | `on` | `off` skips `.env` loading entirely — for tests that exec the `tasks` binary, where `env_remove` promotes a `.env` rather than scrubbing it. Anything that is neither `on` nor `off` refuses to boot |
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
