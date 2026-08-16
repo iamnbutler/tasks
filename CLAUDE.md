@@ -209,6 +209,23 @@ deliberately keeps the period short rather than waiting the leak out, which
 would cost seconds and hide a real leak. Tuning lives in
 `.config/nextest.toml`.
 
+**`app-gpui` is not a workspace member, so none of the above touches it — and
+it *can* be checked from a Linux agent VM**, which was long assumed otherwise:
+
+```sh
+make app-check   # cargo check --all-targets, ~1 minute cold
+make app-test    # the app's own unit tests
+```
+
+Neither needs a display, X11 dev packages or a Mac. `RUST_FONTCONFIG_DLOPEN=1`
+makes `yeslogic-fontconfig-sys` skip the `pkg_config` probe that is the only
+thing blocking the check, and linking the *test* binary is satisfied by three
+empty stub `.so`s (`-lxcb`, `-lxkbcommon`, `-lxkbcommon-x11`) that `app-stubs`
+generates — the tests are pure functions over view state and never enter the
+platform layer. What this cannot tell you is whether a pixel landed correctly;
+that still needs `make app` on a Mac. But "the GUI can't be compiled here" was
+costing every app-gpui change its feedback loop, and it was not true.
+
 Data dir: `~/.local/state/tasks-v2/` (override: `TASKS_DATA_DIR`).
 
 **Config is read from `.env`, not just from the environment**
