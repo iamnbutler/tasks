@@ -935,10 +935,16 @@ fn settled_overlap_count(spec: &Spec, world: &World) -> usize {
 }
 
 /// Whether this build's work is still an open claim — see [`unresolved_builds`].
+///
+/// Matched exhaustively on purpose: a new [`BuildStatus`] is a new answer to
+/// "does this still claim its files", and a wildcard would quietly pick one.
 fn is_unresolved(build: &Build, world: &World) -> bool {
     match build.status {
         BuildStatus::Queued | BuildStatus::Running => true,
-        BuildStatus::Failed => false,
+        // Neither reached a pull request, and both hand the specs back
+        // `approved` — a failed build for another attempt, a cancelled one
+        // because somebody stopped it. Nothing is holding the files.
+        BuildStatus::Failed | BuildStatus::Cancelled => false,
         BuildStatus::Succeeded => {
             let states: Vec<TaskState> = world
                 .build_specs
