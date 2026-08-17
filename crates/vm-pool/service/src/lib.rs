@@ -12,8 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 use vm_pool_manager::{
-    EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState, SnapshotStore,
-    VmRuntime,
+    DEFAULT_MAX_VMS, EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState,
+    SnapshotStore, VmRuntime,
 };
 use vm_pool_protocol::{
     AppProtocol, NullProtocol, Request, Response, ServiceCommand, ServiceEvent,
@@ -52,6 +52,71 @@ impl Default for ServiceConfig {
             snapshot_dir: state_dir.join("snapshots"),
             pool: PoolConfig::default(),
         }
+    }
+}
+
+impl ServiceConfig {
+    /// [`Default`], with [`PoolConfig::max_vms`] taken from [`MAX_VMS_ENV`].
+    ///
+    /// Deliberately *not* what `default()` does. `default()` is what tests and
+    /// embedders build a config with, and one that reads the ambient
+    /// environment lets whoever's shell happens to be running the suite decide
+    /// what it asserts.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            pool: PoolConfig {
+                max_vms: max_vms_from_env()?,
+                ..PoolConfig::default()
+            },
+            ..Self::default()
+        })
+    }
+}
+
+/// The environment variable that sizes the pool.
+pub const MAX_VMS_ENV: &str = "VM_POOL_MAX_VMS";
+
+/// Why a configuration value could not be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(
+        "{MAX_VMS_ENV} must be a positive integer (the number of VMs this pool may hold \
+         at once); got {value:?}"
+    )]
+    MaxVms { value: String },
+}
+
+/// Resolve [`PoolConfig::max_vms`] from [`MAX_VMS_ENV`].
+///
+/// Public and separate from [`ServiceConfig::from_env`] on purpose: the service
+/// has two entry points — the stock `vm-pool` binary, and any embedder that
+/// hand-builds a `ServiceConfig` because it needs a runtime or an app protocol
+/// this crate's `main` cannot name — and a knob only one of them honours is
+/// worse than no knob at all, because it is documented and ignored.
+///
+/// Unset, empty or whitespace reads as "not configured" and yields
+/// [`DEFAULT_MAX_VMS`]. Anything else that is not a positive integer is an
+/// error rather than a fallback: `0` binds the socket and answers `status`
+/// cheerfully while failing *every* allocate, and a typo silently running a
+/// capacity nobody chose is the failure this knob exists to end.
+pub fn max_vms_from_env() -> Result<usize, ConfigError> {
+    max_vms_from(std::env::var(MAX_VMS_ENV).ok())
+}
+
+/// The pure half of [`max_vms_from_env`], so tests never touch the process
+/// environment (`set_var` is `unsafe` in edition 2024 and races every other
+/// thread in the test binary).
+fn max_vms_from(value: Option<String>) -> Result<usize, ConfigError> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_MAX_VMS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_MAX_VMS);
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(ConfigError::MaxVms { value: raw }),
     }
 }
 
@@ -494,6 +559,41 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
 mod tests {
     use super::*;
     use vm_pool_protocol::{ShellCommand, ShellProtocol, VmConfig, VmId};
+
+    #[test]
+    fn an_unset_or_blank_pool_size_is_the_default() {
+        assert_eq!(max_vms_from(None).unwrap(), DEFAULT_MAX_VMS);
+        assert_eq!(max_vms_from(Some(String::new())).unwrap(), DEFAULT_MAX_VMS);
+        assert_eq!(max_vms_from(Some("  ".into())).unwrap(), DEFAULT_MAX_VMS);
+    }
+
+    #[test]
+    fn a_positive_integer_sizes_the_pool() {
+        for (raw, expected) in [("1", 1), ("6", 6), ("12", 12), (" 9 ", 9)] {
+            assert_eq!(max_vms_from(Some(raw.into())).unwrap(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_a_positive_integer_refuses_to_start() {
+        // `0` is the one that matters: it binds, answers `status`, and then
+        // fails every allocate — silently reproducing the exhaustion this knob
+        // exists to make configurable.
+        for raw in ["0", "-1", "six", "3.5", "1_000", "6 vms"] {
+            assert!(
+                max_vms_from(Some(raw.into())).is_err(),
+                "{raw:?} should be refused, not clamped or defaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_variable_and_the_value() {
+        let message = max_vms_from(Some("six".into())).unwrap_err().to_string();
+        assert!(message.contains(MAX_VMS_ENV), "{message}");
+        assert!(message.contains("six"), "{message}");
+        assert!(message.contains("positive integer"), "{message}");
+    }
 
     async fn test_service() -> Arc<Service<NoRuntime, ShellProtocol>> {
         let dir = tempfile::tempdir().unwrap();

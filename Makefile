@@ -30,7 +30,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         images-check \
         check-nextest test-bins test test-ci test-cargo app run \
         app-check app-stubs app-test \
-        server serve restart status stop migration
+        server serve restart status stop migration verify-warm
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
 RELOAD ?=
@@ -165,6 +165,27 @@ status: server
 # dispatch paused, because nothing follows it that could carry the mode.
 stop: server
 	@$(TASKS_BIN) stop $(STOP)
+
+# Prime the orchestrator's verification build directory, so the first merge
+# decision it makes is not also the first cold build.
+#
+# Path resolution mirrors `Config::orchestrator_target_dir`: ORCHESTRATOR_TARGET_DIR,
+# else <data dir>/verify-target, where the data dir is TASKS_DATA_DIR else
+# ~/.local/state/tasks-v2. `$(if $(strip ...))` rather than `?=`, because `?=`
+# treats an exported-but-empty variable as set while the server's `env_string`
+# filters empty out — the two would then disagree and this would warm a
+# directory nothing uses.
+#
+# CARGO_TARGET_DIR is set INLINE on the one command, never as a make-level
+# export: an exported one would redirect TEST_BIN_DIR (derived from it at the
+# top of this file) and the suites would look for binaries nothing built.
+VERIFY_DATA_DIR := $(if $(strip $(TASKS_DATA_DIR)),$(TASKS_DATA_DIR),$(HOME)/.local/state/tasks-v2)
+VERIFY_TARGET_DIR := $(if $(strip $(ORCHESTRATOR_TARGET_DIR)),$(ORCHESTRATOR_TARGET_DIR),$(VERIFY_DATA_DIR)/verify-target)
+
+verify-warm:
+	@echo "warming $(VERIFY_TARGET_DIR) (expect ~7.5 GB once built; nothing prunes it, by design)"
+	@mkdir -p $(VERIFY_TARGET_DIR)
+	CARGO_TARGET_DIR=$(VERIFY_TARGET_DIR) cargo test --workspace --no-run
 
 # A new migration, named for this UTC instant:
 #

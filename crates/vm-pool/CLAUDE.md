@@ -76,6 +76,43 @@ Note the package/binary names differ: package `vm-pool-supervisor` declares
 helper checks the bin name first and the package name second, so pointing the
 variable straight at `target/debug` works with no copying.
 
+## Configuration
+
+`VM_POOL_MAX_VMS` (default `DEFAULT_MAX_VMS` = 6) sizes the pool.
+
+A **slot** is a VM *this pool allocated* — an entry in its own map, what
+`allocate` counts and what `PoolStatus::total` reports. Nothing else consumes
+one. A VM the container runtime started for its own purposes (`buildkit`,
+servicing `container build`) is an ordinary host process this pool never
+allocated and does not reconcile against; it costs host memory, not a slot.
+
+**Leave slack.** Allocation at the ceiling is refused, not queued, and a caller
+that reads `pool exhausted` as "this work failed" charges it to the work. A VM
+whose owner died between allocate and deallocate holds its slot until the sweep
+reclaims it, so a pool sized exactly to its steady state is one leak away from
+refusing everything.
+
+Three rules the implementation follows, each of which has a way of being
+undone by a later "cleanup":
+
+- **Resolution is `max_vms_from_env()`, public and separate from
+  `ServiceConfig::from_env()`.** The service has two entry points — this
+  crate's `main`, and any embedder that hand-builds a `ServiceConfig` because
+  it needs a runtime or an app protocol `main` cannot name. A knob only one of
+  them honours is worse than no knob, because it is documented and ignored.
+- **It is not in `Default::default()`.** `default()` is what tests and
+  embedders build configs with, and one that reads the ambient environment lets
+  whoever's shell is running the suite decide what it asserts.
+- **Parsing is a pure `max_vms_from(Option<String>)`.** `set_var` is `unsafe`
+  in edition 2024 and races every other thread in the test binary, so the tests
+  never touch the process environment.
+
+A value that is not a positive integer **refuses to start**. Not a fallback:
+`0` binds the socket, answers `status` cheerfully and fails *every* allocate,
+silently reproducing the exhaustion the knob exists to configure, and a typo
+that defaults back to 6 runs a capacity nobody chose. Unset, empty and
+whitespace read as unset, which is a different thing from wrong.
+
 ## Key Decisions
 
 - Host runtime: Rust (edition 2024)

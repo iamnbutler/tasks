@@ -782,6 +782,13 @@ impl<'a> Brief<'a> {
 /// workflows and no required checks, so there is no second opinion anywhere in
 /// the loop. Saying so on the line is the difference between evidence and the
 /// appearance of evidence.
+///
+/// It says "no automated check" rather than "nothing downstream", and the
+/// narrowing is necessary: on a host where the orchestrator has a warm build
+/// directory, the *reader* of this brief can go and make a run, even though the
+/// *pipeline* still will not make one for it. Leaving a sentence here that says
+/// the run will not happen, beside a landing section that says go and make one,
+/// is two sources of truth about the same fact.
 fn verification_line(summary: Option<&str>) -> String {
     match verification_report(summary) {
         VerificationReport::Passed(detail) => format!(
@@ -791,13 +798,13 @@ fn verification_line(summary: Option<&str>) -> String {
         ),
         VerificationReport::Failed(detail) => format!(
             "the build reported its own tests FAILED ({}) — its claim, not an \
-             independent run, and nothing downstream re-runs them, so no passing \
+             independent run, and no automated check re-runs them, so no passing \
              run backs this batch",
             or_unspecified(&detail),
         ),
         VerificationReport::NotRun(detail) => format!(
             "the build reported that it did NOT RUN the tests ({}) — so no run at \
-             all backs this batch, and nothing downstream will make one",
+             all backs this batch, and no automated check will make one",
             or_unspecified(&detail),
         ),
         VerificationReport::Unreported => {
