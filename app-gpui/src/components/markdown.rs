@@ -1,5 +1,5 @@
 //! Markdown rendering shared by every reading surface — chat replies now,
-//! specs, briefings, and eventually transcript views.
+//! specs, task bodies, and eventually transcript views.
 //!
 //! Two pieces. [`MarkdownCache`] keeps one parsed `Markdown` entity per
 //! stable key so a re-render doesn't re-parse every message on every frame
@@ -40,7 +40,7 @@ impl MarkdownCache {
     /// how it got there — the *shape* of the text decides (see [`Update`]), so
     /// there is no second entry point for a caller to pick wrong. The chat's
     /// live row grows by pure suffix and streams; every other surface
-    /// (`spec:{id}`, `task:{id}`, briefings, the durable `chat:{seq}`) changes
+    /// (`spec:{id}`, `task:{id}`, the durable `chat:{seq}`) changes
     /// in ways that are not extensions and keeps the replacing path.
     pub fn entity(
         &mut self,
@@ -73,7 +73,7 @@ impl MarkdownCache {
 
     /// Drop one cached entry — for a key that has left its surface (a chat
     /// row that retired, a seq that will never be asked for again). One cache
-    /// serves chat, specs and briefings, so eviction is per-key on purpose:
+    /// serves chat, specs and task bodies, so eviction is per-key on purpose:
     /// a chat reset must not throw away spec parses. Without it the cache
     /// grows by one orphaned parse per turn, forever.
     pub fn remove(&mut self, key: impl Into<SharedString>) {
@@ -140,8 +140,9 @@ impl Update {
 /// The wrapper `div` exists for its id, not its box: gpuikit mints text-run
 /// ids (`md-run-1`, `md-run-2`, …) from a counter it restarts on every
 /// render, so two documents on one screen emit the same ids and collide in
-/// whatever gpui keys off the id path — which is how three briefings on Home
-/// tripped the a11y tree's uniqueness assert (#861). Giving each document a
+/// whatever gpui keys off the id path — which is how three markdown documents
+/// on one screen tripped the a11y tree's uniqueness assert (#861, back when
+/// Home rendered three briefings at once). Giving each document a
 /// distinct id ancestor makes the app immune regardless of what upstream does
 /// with that counter next. Keyed on `entity_id()` because [`MarkdownCache`]
 /// already hands out one stable entity per key, so the id is unique per

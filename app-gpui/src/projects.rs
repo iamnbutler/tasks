@@ -3,7 +3,7 @@
 //!
 //! The switcher is a **filter over one working set**, held per-window — not a
 //! scope, and not a server-side query parameter. `GET /tasks` is shared with
-//! the orchestrator, the briefing generator and `tasks status`, and a view
+//! the orchestrator and `tasks status`, and a view
 //! preference does not belong in it; it is the same argument the done-task
 //! archive in [`crate::sections::tasks`] already makes, and the rows are a few
 //! hundred at most.

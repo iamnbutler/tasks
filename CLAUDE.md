@@ -227,7 +227,14 @@ implementation.
   time someone improves a sentence. One decision point per dispatcher
   (`ScoutError::failure_class` / `BuilderError::failure_class` into
   `Strike::for_class`), so the restart-orphan exclusion is a *class* rather than
-  a second mechanism beside it. Wire skew runs both ways and only one way is
+  a second mechanism beside it. Not every class comes off a terminal event,
+  though: the failures where there *is* no terminal event are classified by the
+  **host**, in those same two functions — `Egress`, because the agent finished
+  and the push is what failed, and `StreamClosed`, because vm-pool going away
+  means the host stopped being able to observe the run at all. vm-pool is a
+  separate daemon this document says to restart *ahead* of the server, so the
+  second one is routine maintenance rather than a judgement, and it used to
+  charge the whole batch. Wire skew runs both ways and only one way is
   obvious: `#[serde(default)]` covers an older supervisor omitting the field,
   while a hand-written `Deserialize` decays an *unknown* class to `Verdict`,
   because a lost terminal event does not cost a strike — it costs the run its
@@ -711,9 +718,10 @@ entry loses to, so *removing* a variable from a child's environment is exactly
 what promotes the file that defines it — and `.env` is gitignored, so a
 maintainer with `TASKS_DEFAULT_MODE=play` in one fails a restart suite on their
 machine and nowhere else. `TASKS_ENV_FILES=off` is the switch for that:
-`crates/tasks/tests/reload.rs` is the only file that execs the binary (so it is
-the whole blast radius), and any future one needs the same three settings. The
-test that pins it carries a **control** — it first boots with the switch removed
+`crates/tasks/tests/reload.rs` and `crates/tasks/tests/cli.rs` are the only
+files that exec the binary (so they are the whole blast radius), and any future
+one needs the same settings. The
+test that pins it carries a **control** — it first boots with the switch off
 and asserts the `.env` really does decide the mode, then boots with it and
 asserts it does not. Without that half the assertion is vacuous. A value that is
 neither `on` nor `off` (including one that is not UTF-8) refuses to start rather
@@ -745,13 +753,10 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
-| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
+| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 600 | wall-clock budget per orchestrator tick |
-| `BRIEFING_CMD` | `claude --print --allowedTools "Bash(gh:*),…"` | one-shot agent command for Home briefings; must stay read-only (gh/curl/git log/git diff — never `--dangerously-skip-permissions`). Shell-style quoting supported |
-| `BRIEFING_TTL_SECS` | 900 | Home briefing freshness window (stale-while-revalidate on `GET /briefings`) |
-| `BRIEFING_TIMEOUT_SECS` | 300 | wall-clock budget per briefing generation |

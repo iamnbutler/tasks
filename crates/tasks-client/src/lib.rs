@@ -23,8 +23,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
-    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
+    BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest, CaptureIssue,
+    CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
     ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
     ServerStatus, SetCharter, SetMode, SetProjectStatus,
 };
@@ -641,14 +641,6 @@ impl Client {
             },
         )?;
         Ok(response.mode)
-    }
-
-    // --- briefings ---
-
-    /// Stale-while-revalidate: this read *is* the regeneration demand signal.
-    /// Refetch on `briefing_updated` events; never poll on a timer.
-    pub fn briefings(&self) -> Result<Vec<BriefingStatus>> {
-        self.get_json("/briefings", &[])
     }
 
     // --- events ---

@@ -80,6 +80,121 @@ above the cwd, then the nearest above this binary; the real environment wins):
   GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com)
 ";
 
+// Per-subcommand usage. The top-level `USAGE` answers "what commands are
+// there"; these answer "what does this one take", which is what somebody
+// typing `--help` at an unfamiliar subcommand is actually asking.
+
+const SERVE_USAGE: &str = "\
+usage: tasks serve [--port N]
+
+Run the server in the foreground: GitHub poller, scout dispatcher, serial
+build lane and the HTTP control API. Logs to this terminal.
+
+  --port N    HTTP API port (default: TASKS_SERVER_PORT, else 4800)
+
+Every boot starts in TASKS_DEFAULT_MODE (default pause), overwriting whatever
+mode the last process left in the store.
+";
+
+const RELOAD_USAGE: &str = "\
+usage: tasks reload [flags]   (alias: tasks restart)
+
+Build, report, gate, drain, swap, verify — the upgrade loop. Refuses by
+default when a scout or a build is in flight.
+
+  --when-idle             wait for in-flight scouts/builds to finish (pauses
+                          dispatch for the wait; the new server comes up in
+                          the mode the old one was in)
+  --drain-timeout SECS    how long --when-idle waits (default 3900)
+  --force                 swap anyway, with work in flight
+  --no-build              skip the build and swap in this binary
+  --repo PATH             workspace to build in (default: detected)
+  --foreground            exec the new server here instead of backgrounding it
+  --port N                port for the new server (default: the running
+                          server's, else 4800)
+
+exit codes: 3 busy   4 drain timed out   5 the swap did not land
+";
+
+const STATUS_USAGE: &str = "\
+usage: tasks status
+
+Who is serving, since when, and what is in flight — plus the schema version
+and the identity of each VM image a run has been observed in. Takes no
+arguments. Exits 1 when nothing is serving.
+";
+
+const STOP_USAGE: &str = "\
+usage: tasks stop [flags]
+
+SIGTERM the running server and wait until it is actually gone.
+
+  --when-idle             wait for in-flight scouts/builds to finish first
+                          (pauses dispatch for the wait — and LEAVES it
+                          paused, since no boot resumes the stored mode)
+  --drain-timeout SECS    how long --when-idle waits (default 3900)
+
+Plain `tasks stop` is unchanged: immediate and ungated.
+
+exit codes: 3 --when-idle against a server that will not say what is in
+flight   4 drain timed out (nothing was stopped)
+";
+
+const ADD_PROJECT_USAGE: &str = "\
+usage: tasks add-project <owner/repo>
+
+Track a GitHub repository, writing straight to the store. Exactly one repo
+per invocation. Its issues are ingested into the backlog by the poller and
+are never dispatched until something queues them explicitly.
+
+Removal is archive, never delete: POST /projects/{id}/status.
+";
+
+const VM_POOL_USAGE: &str = "\
+usage: tasks vm-pool
+
+Run the vm-pool daemon specialized for Tasks (ContainerRuntime +
+TasksProtocol) on VM_POOL_SOCKET (default /tmp/vm-pool.sock). Takes no
+arguments; runs in the foreground until killed.
+
+It REFUSES to start when something is already listening on that socket,
+rather than taking the path over: the incumbent would go on holding its VMs
+while becoming unreachable. Stop the running daemon first, or point this one
+at a different VM_POOL_SOCKET. A socket file left behind by a dead daemon is
+unlinked and reclaimed automatically.
+";
+
+/// Whether a subcommand's arguments are asking for help.
+///
+/// Checked in [`dispatch`] **before** the subcommand function is entered,
+/// deliberately not inside each one: a check per command is one refactor away
+/// from being skipped again by the next command someone adds — which is how
+/// `tasks vm-pool --help` came to *start a daemon*, `vm_pool()` having taken
+/// no arguments at all, so an unrecognized one meant "proceed".
+///
+/// It scans every argument rather than just the first, so `tasks reload --repo
+/// --help` prints help instead of treating `--help` as a path, and `tasks
+/// vm-pool help` prints help too. Both fall in the safe direction. The only
+/// theoretical collision — a repo literally named `help` — cannot arise, since
+/// `add-project` requires an `owner/repo` slash.
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+}
+
+/// The usage text for a subcommand, or the top-level list for anything else.
+fn usage_for(command: &str) -> &'static str {
+    match command {
+        "serve" => SERVE_USAGE,
+        "reload" | "restart" => RELOAD_USAGE,
+        "status" => STATUS_USAGE,
+        "stop" => STOP_USAGE,
+        "add-project" => ADD_PROJECT_USAGE,
+        "vm-pool" => VM_POOL_USAGE,
+        _ => USAGE,
+    }
+}
+
 /// Two orderings here are load-bearing, which is why `main` is not itself the
 /// `#[tokio::main]` function.
 ///
@@ -111,13 +226,24 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn dispatch() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Ahead of every subcommand, so asking for help is a side-effect-free act
+    // no matter which one is asked. This is the whole of the `tasks vm-pool
+    // --help` defect: the daemon started before anything looked at the flag.
+    if let Some(command) = args.first()
+        && wants_help(&args[1..])
+    {
+        print!("{}", usage_for(command));
+        return Ok(());
+    }
+
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]).await,
         Some("reload") | Some("restart") => reload_cmd(&args[1..]).await,
-        Some("status") => status_cmd().await,
+        Some("status") => status_cmd(&args[1..]).await,
         Some("stop") => stop_cmd(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
-        Some("vm-pool") => vm_pool().await,
+        Some("vm-pool") => vm_pool(&args[1..]).await,
         Some("-h") | Some("--help") | Some("help") | None => {
             print!("{USAGE}");
             Ok(())
@@ -195,7 +321,12 @@ async fn reload_cmd(args: &[String]) -> Result<()> {
 
 /// `tasks status`: exits 1 when nothing is serving, so `tasks status &&
 /// something` reads the way it looks.
-async fn status_cmd() -> Result<()> {
+async fn status_cmd(args: &[String]) -> Result<()> {
+    // Like `serve`/`reload`/`stop`, which already did: an unrecognized
+    // argument never means "proceed".
+    if let Some(other) = args.first() {
+        bail!("unexpected argument: {other}\n\n{STATUS_USAGE}");
+    }
     let (report, serving) = reload::report(&run::data_dir()?).await;
     print!("{report}");
     if !serving {
@@ -256,9 +387,15 @@ async fn stop_cmd(args: &[String]) -> Result<()> {
 /// `container` CLI, ScoutCommand/ScoutEvent passthrough. The stock
 /// vm-pool-service binary is NoRuntime + ShellProtocol and can't carry our
 /// protocol.
-async fn vm_pool() -> Result<()> {
+async fn vm_pool(args: &[String]) -> Result<()> {
     use vm_pool_manager::{ContainerRuntime, PoolConfig};
     use vm_pool_service::{Service, ServiceConfig};
+
+    // It took no arguments at all, which is why an unrecognized one meant
+    // "start the daemon".
+    if let Some(other) = args.first() {
+        bail!("unexpected argument: {other}\n\n{VM_POOL_USAGE}");
+    }
 
     let socket_path = std::env::var("VM_POOL_SOCKET")
         .unwrap_or_else(|_| "/tmp/vm-pool.sock".into())
@@ -282,9 +419,12 @@ async fn vm_pool() -> Result<()> {
 }
 
 async fn add_project(args: &[String]) -> Result<()> {
-    let spec = args
-        .first()
-        .context("usage: tasks add-project <owner/repo>")?;
+    let spec = args.first().context(ADD_PROJECT_USAGE)?;
+    // It used to take `args.first()` and drop the rest in silence, so
+    // `add-project a/b c/d` tracked one repo and said nothing about the other.
+    if let Some(extra) = args.get(1) {
+        bail!("one repository at a time; unexpected argument: {extra}\n\n{ADD_PROJECT_USAGE}");
+    }
     let (owner, name) = spec
         .split_once('/')
         .filter(|(o, n)| !o.is_empty() && !n.is_empty())

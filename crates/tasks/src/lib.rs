@@ -5,7 +5,6 @@
 //! on the server stack.
 
 pub mod brief;
-pub mod briefing;
 pub mod builder;
 pub mod bundles;
 pub mod cancel;

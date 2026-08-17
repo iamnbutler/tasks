@@ -49,7 +49,7 @@ use crate::menus::{
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
 use crate::workspace::{
-    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToHome, GoToQueue, GoToTasks,
+    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToQueue, GoToTasks,
     NewIssue, QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop,
     ToggleLeftDock, ToggleRightDock, ToggleShowDone,
 };
@@ -306,20 +306,16 @@ pub const COMMANDS: &[Command] = &[
         .key("cmd-w")
         .separated(Slot::File),
     // --- View: section navigation, in sidebar order ---
-    Command::new("go-to-home", "Home", || Box::new(GoToHome))
+    Command::new("go-to-tasks", "Tasks", || Box::new(GoToTasks))
         .key("cmd-1")
         .on_workspace()
         .menu(Slot::View),
-    Command::new("go-to-tasks", "Tasks", || Box::new(GoToTasks))
+    Command::new("go-to-queue", "Queue", || Box::new(GoToQueue))
         .key("cmd-2")
         .on_workspace()
         .menu(Slot::View),
-    Command::new("go-to-queue", "Queue", || Box::new(GoToQueue))
-        .key("cmd-3")
-        .on_workspace()
-        .menu(Slot::View),
     Command::new("go-to-activity", "Activity", || Box::new(GoToActivity))
-        .key("cmd-4")
+        .key("cmd-3")
         .on_workspace()
         .menu(Slot::View),
     Command::new("go-to-chat", "Chat", || Box::new(GoToChat))
@@ -630,7 +626,7 @@ mod tests {
     #[test]
     fn what_acts_on_the_workspace_is_handled_by_the_workspace() {
         for id in [
-            "go-to-home",
+            "go-to-tasks",
             "toggle-left-dock",
             "toggle-right-dock",
             "queue-selected",

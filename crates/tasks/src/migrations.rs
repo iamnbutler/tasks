@@ -379,6 +379,112 @@ mod tests {
         assert!(violations.is_empty(), "the swap left dangling references");
     }
 
+    /// The version that removed the briefing subsystem (#918), and the one the
+    /// test below stops short of so it can seed a log containing the retired
+    /// event kind.
+    const REMOVE_BRIEFINGS: i64 = 20260817135101;
+
+    /// Deleting an [`tasks_api::events::EventPayload`] variant is not a code
+    /// change alone. The enum is internally tagged and strict, and
+    /// `Store::event_from_row` deserializes with a hard `?`, so one surviving
+    /// `briefing_updated` row makes `GET /events` and `/events/stream` fail
+    /// **forever** — the Activity feed dies permanently on every database that
+    /// ever generated a briefing, and no later pass repairs it.
+    ///
+    /// So the migration deletes those rows, and this is the test that says so.
+    /// Without the `DELETE` it fails on the `all_events()` line below, which is
+    /// the whole reason to write it. The surviving seqs are asserted to be 1
+    /// and 3: retiring a vocabulary leaves a *gap*, never a renumbering —
+    /// every reader compares seq (`>= ?`, `ORDER BY`, the orchestrator's
+    /// `> answered_seq` watermark) and none counts on contiguity.
+    #[tokio::test]
+    async fn removing_briefings_takes_their_events_with_them() {
+        use crate::store::Store;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        for entry in std::fs::read_dir(migrations_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version: i64 = match name.split('_').next().and_then(|v| v.parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            if version < REMOVE_BRIEFINGS {
+                std::fs::copy(entry.path(), earlier.join(&name)).unwrap();
+            }
+        }
+
+        let db = dir.path().join("briefings.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        Migrator::new(earlier.as_path())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+
+        // A log as it stood the day before: two ordinary notes with a
+        // now-retired briefing event between them.
+        for payload in [
+            r#"{"kind":"note","source":"test","message":"before"}"#,
+            r#"{"kind":"briefing_updated","section":"changes"}"#,
+            r#"{"kind":"note","source":"test","message":"after"}"#,
+        ] {
+            sqlx::query(
+                "INSERT INTO events (timestamp, payload) VALUES ('2026-08-17T00:00:00Z', ?)",
+            )
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+
+        // Through `Store::open`, so the removal migration is applied by the
+        // same path the server boots on.
+        let store = Store::open(&db).await.expect("the removal applies");
+        let events = store
+            .all_events()
+            .await
+            .expect("the feed still reads — a surviving briefing_updated row would 500 it");
+        let kinds: Vec<&str> = events.iter().map(|e| e.payload.kind()).collect();
+        assert_eq!(kinds, vec!["note", "note"]);
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 3],
+            "a retired kind leaves a gap in seq; it must never renumber the log"
+        );
+
+        drop(store);
+
+        // And the cache table itself is gone.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(&db))
+            .await
+            .unwrap();
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'briefings'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            tables.is_empty(),
+            "the briefings table survived: {tables:?}"
+        );
+    }
+
     /// The boundary itself, without a filesystem: what counts as a version.
     #[test]
     fn allowed_versions_are_the_frozen_sequence_and_real_instants() {

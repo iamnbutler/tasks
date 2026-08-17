@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BriefingSection, Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
+use crate::models::{Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
 use crate::version::ImageIdentity;
 
 /// Body of `POST /projects`.
@@ -464,22 +464,6 @@ pub struct InFlightItem {
     pub detail: Option<String>,
     /// When it started, so a report can age it.
     pub since: DateTime<Utc>,
-}
-
-/// One Home briefing slot as `GET /briefings` serves it. All three sections
-/// are always present; a never-generated one has no content and reads as
-/// stale.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BriefingStatus {
-    pub section: BriefingSection,
-    pub content: Option<String>,
-    pub generated_at: Option<DateTime<Utc>>,
-    pub stale: bool,
-    pub regenerating: bool,
-    /// The last generation failure, if the most recent attempt failed. The
-    /// stored content (if any) is still served alongside it — never a blank
-    /// slot, never a fabricated one.
-    pub error: Option<String>,
 }
 
 /// Error body every non-2xx response carries: `{"error": "..."}`.

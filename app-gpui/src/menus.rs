@@ -523,7 +523,6 @@ mod tests {
         assert_eq!(
             actions,
             [
-                "workspace::GoToHome",
                 "workspace::GoToTasks",
                 "workspace::GoToQueue",
                 "workspace::GoToActivity",

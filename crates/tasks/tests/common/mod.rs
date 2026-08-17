@@ -193,9 +193,6 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         orchestrator_cmd: "true".into(),
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
-        briefing_cmd: "true".into(),
-        briefing_ttl: Duration::from_secs(900),
-        briefing_timeout: Duration::from_secs(60),
     }
 }
 

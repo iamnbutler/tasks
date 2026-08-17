@@ -83,6 +83,10 @@ impl ScoutError {
     /// Whether this failure judged the work — the one decision point this
     /// dispatcher has, read by [`crate::run::record_outcome`].
     ///
+    /// `StreamClosed` is `Transport`: the vm-pool event stream ending is the
+    /// daemon going away — a routine maintenance action, not a judgement on
+    /// the work.
+    ///
     /// Everything not named here is a [`FailureClass::Verdict`], and two of
     /// those are deliberate. A `Timeout` had the entire wall-clock budget and
     /// still produced nothing, which is as much of a verdict as an agent that
@@ -95,9 +99,14 @@ impl ScoutError {
             Self::ScoutFailed { class, .. } | Self::StoppedEarly { class, .. } => *class,
             Self::NotResumable(_) => FailureClass::Orphaned,
             Self::Cancelled(_) => FailureClass::Cancelled,
-            Self::Store(_) | Self::Client(_) | Self::StreamClosed | Self::Timeout { .. } => {
-                FailureClass::Verdict
-            }
+            // `crate::run::is_disconnect` reaches this error first on the
+            // dispatch path and already spares it its attempt, so nothing
+            // here changes what a scout is charged today. It is what makes
+            // the classification honest for every *other* reader — and what
+            // keeps the two answers from disagreeing about the same error.
+            // The builder half is the live bug this mirrors.
+            Self::StreamClosed => FailureClass::Transport,
+            Self::Store(_) | Self::Client(_) | Self::Timeout { .. } => FailureClass::Verdict,
         }
     }
 }
@@ -1404,6 +1413,47 @@ mod tests {
             status: SpecQueueStatus::NeedsRevision,
             feedback: feedback.map(Into::into),
         }
+    }
+
+    /// The scout half of the `StreamClosed` move. A scout is already spared
+    /// its attempt by a *different* guard — `crate::run::is_disconnect`
+    /// returns before `failure_class` is consulted — so this pins the
+    /// classification rather than a behaviour change, which is exactly the
+    /// point: two answers about the same error must not disagree.
+    ///
+    /// The negative half is kept for the reason it is kept next door: an
+    /// assertion that nothing was charged reads identically to the cap being
+    /// switched off unless something in the same test still gets charged.
+    #[test]
+    fn a_closed_event_stream_is_transport_and_costs_the_task_no_attempt() {
+        use crate::store::Strike;
+
+        assert_eq!(
+            ScoutError::StreamClosed.failure_class(),
+            FailureClass::Transport,
+        );
+        assert!(!ScoutError::StreamClosed.failure_class().is_verdict());
+        assert_eq!(
+            Strike::for_class(ScoutError::StreamClosed.failure_class()),
+            Strike::Waive,
+        );
+
+        // Still charged: a run that concluded with nothing usable, and one
+        // that had the entire wall-clock budget.
+        assert_eq!(
+            Strike::for_class(
+                ScoutError::ScoutFailed {
+                    reason: "SPEC.md not found".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+        assert_eq!(
+            Strike::for_class(ScoutError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
+        );
     }
 
     #[test]
