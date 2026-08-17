@@ -4,8 +4,8 @@
 //! Done tasks are archived out of the list by default, behind a footer toggle
 //! that always states its count. The archive is a *client-side view filter*
 //! over the rows `GET /tasks` already returned — not a query parameter. The
-//! endpoint is shared with the orchestrator, the briefing generator and
-//! `tasks status`, and a view preference does not belong in it; the rows are a
+//! endpoint is shared with the orchestrator and `tasks status`, and a view
+//! preference does not belong in it; the rows are a
 //! few hundred at most, so filtering locally is cheaper than a refetch per
 //! toggle, and the server stays the single authority on which tasks exist and
 //! in what order.

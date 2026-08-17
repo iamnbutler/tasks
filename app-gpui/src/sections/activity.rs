@@ -187,9 +187,6 @@ impl Workspace {
                     EventPayload::ModeChanged { from, to } => {
                         format!("Mode {} → {}", from.as_str(), to.as_str())
                     }
-                    EventPayload::BriefingUpdated { section } => {
-                        format!("Briefing updated: {}", title_case(section.as_str()))
-                    }
                     EventPayload::Note { source, message } => format!("[{source}] {message}"),
                 };
                 (
@@ -255,7 +252,7 @@ impl Workspace {
 
                 // A row that names a task *is* a task row, addressed by what
                 // happened rather than by what it is — so it gets the same
-                // menu. Rows that name none (a mode change, a briefing) get
+                // menu. Rows that name none (a mode change, a note) get
                 // no menu rather than an empty one. Keyed by event seq: one
                 // task can be the subject of many rows.
                 match subject {

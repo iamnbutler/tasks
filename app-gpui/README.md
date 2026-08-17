@@ -26,13 +26,13 @@ components are built and how data moves):
   archive toggle), observes `AppState`, and registers action handlers.
   Actions: `workspace::ToggleLeftDock` (`cmd-b`),
   `workspace::ToggleRightDock` (`cmd-r`) — Zed's defaults —
-  `workspace::ToggleShowDone` (`shift-cmd-d`), and `⌘1`–`⌘5` for the
+  `workspace::ToggleShowDone` (`shift-cmd-d`), and `⌘1`–`⌘4` for the
   sections.
 
   **Every section is named exactly once.** The title bar's centre carries
   the name of the section you are looking at; the sidebar's nav rows are
   icons, and `render_center` draws no header. The rows carry the word as a
-  tooltip (`"Tasks (⌘2)"`) and as an accessible name — `role(Role::Tab)` +
+  tooltip (`"Tasks (⌘1)"`) and as an accessible name — `role(Role::Tab)` +
   `aria_label` + `aria_keyshortcuts`, and the role is load-bearing: a node
   reaches the a11y tree only with *both* a global element id and a
   non-`None` role, so an `aria_label` on a roleless div is dropped
@@ -45,7 +45,7 @@ components are built and how data moves):
   and a control that looks live and isn't is worse than a word. Nothing
   renders there before the first snapshot. The right slot carries
   play/pause (mode gates *new* work only) and refresh; chat is reached from
-  the sidebar, `⌘5` or `View ▸ Chat` rather than from the chrome.
+  the sidebar, `⌘4` or `View ▸ Chat` rather than from the chrome.
 - **`menus.rs`** — the menu bar (App / File / Edit / View / Server /
   Window) and its actions. Handlers are global, not the workspace's,
   because Minimize / Zoom / Close act on whichever window is focused; the
@@ -77,8 +77,8 @@ components are built and how data moves):
   toggle — see below), Queue (attention-ordered groups:
   Needs you / Running / Building / Up next / Ready to build, with live
   elapsed clocks — a clock reads as working, a spinner reads as hung),
-  Home (briefing slots + needs-you rows), Activity (typed event sentences —
-  exhaustive match, so a new event kind is a compile error), Chat
+  Activity (typed event sentences — exhaustive match, so a new event kind is
+  a compile error), Chat
   (orchestrator conversation, read-only so far), and `detail.rs` (the
   inspector with per-state actions: queue/dequeue/scout, approve/reject).
 - **`components/`** — presentation-only chrome. Components never reach into
@@ -104,8 +104,8 @@ always states the count: `"3 done · Show"` / `"3 done · Hide"`, also
 Three properties, and each is deliberate:
 
 - **It is a client-side view filter, not a query parameter.** `GET /tasks`
-  is shared with the orchestrator, the briefing generator and `tasks
-  status`; one client's view preference does not belong in it. The rows are
+  is shared with the orchestrator and `tasks status`; one client's view
+  preference does not belong in it. The rows are
   a few hundred at most, so filtering locally is cheaper than a refetch per
   toggle, and the server stays the single authority on which tasks exist
   and in what order.

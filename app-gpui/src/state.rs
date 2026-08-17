@@ -12,7 +12,7 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::Context;
 use tasks_client::api::events::Event;
-use tasks_client::api::http::{BriefingStatus, RejectedBundle};
+use tasks_client::api::http::RejectedBundle;
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
     OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
@@ -79,7 +79,6 @@ pub struct AppState {
     pub bundles: Vec<RejectedBundle>,
     /// Newest [`ACTIVITY_LIMIT`] events, newest first.
     pub activity: Vec<Event>,
-    pub briefings: Vec<BriefingStatus>,
     pub orchestrator_messages: Vec<OrchestratorMessage>,
     /// The tick in flight, if one is showing.
     pub orchestrator_tick: Option<OrchestratorTick>,
@@ -139,7 +138,6 @@ struct Snapshot {
     builds: Option<Vec<Build>>,
     bundles: Option<Vec<RejectedBundle>>,
     activity: Option<Vec<Event>>,
-    briefings: Option<Vec<BriefingStatus>>,
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
     mode: Option<Mode>,
     /// The first failure, if any read failed.
@@ -187,7 +185,6 @@ impl Snapshot {
                 events
             }),
         );
-        take(&mut snapshot.briefings, &mut error, client.briefings());
         take(
             &mut snapshot.orchestrator_messages,
             &mut error,
@@ -286,7 +283,6 @@ impl AppState {
             builds: Vec::new(),
             bundles: Vec::new(),
             activity: Vec::new(),
-            briefings: Vec::new(),
             orchestrator_messages: Vec::new(),
             orchestrator_tick: None,
             chat: ChatLog::new(),
@@ -531,7 +527,7 @@ impl AppState {
                 $(if let Some(value) = snapshot.$field { self.$field = value; })+
             };
         }
-        merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity, briefings);
+        merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity);
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
         // The opening window is the same code path — an empty list has no

@@ -4,6 +4,5 @@
 
 mod activity;
 mod detail;
-mod home;
 mod queue;
 mod tasks;

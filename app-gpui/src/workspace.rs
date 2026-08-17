@@ -63,7 +63,6 @@ actions!(
         NewIssue,
         AddRepo,
         Dismiss,
-        GoToHome,
         GoToTasks,
         GoToQueue,
         GoToActivity,
@@ -108,7 +107,6 @@ enum ChatRowView {
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Section {
-    Home,
     Tasks,
     Queue,
     Activity,
@@ -131,8 +129,12 @@ pub(crate) enum FocusTarget {
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
-        Section::Home,
+    /// The section a new window opens on. Named rather than spelled out at
+    /// each site: `Workspace::new` and the #902/#914 focus test both read it,
+    /// and two literals are how those two silently drift apart.
+    pub(crate) const DEFAULT: Section = Section::Tasks;
+
+    const ALL: [Section; 4] = [
         Section::Tasks,
         Section::Queue,
         Section::Activity,
@@ -144,7 +146,6 @@ impl Section {
     /// `render_center` no longer spends a row on it.
     fn label(self) -> &'static str {
         match self {
-            Section::Home => "Home",
             Section::Tasks => "Tasks",
             Section::Queue => "Queue",
             Section::Activity => "Activity",
@@ -155,7 +156,6 @@ impl Section {
     /// The icon a nav row wears in place of its label.
     fn icon(self) -> gpui::Svg {
         match self {
-            Section::Home => Icons::home(),
             Section::Tasks => Icons::list_bullet(),
             Section::Queue => Icons::layers(),
             Section::Activity => Icons::activity_log(),
@@ -168,7 +168,6 @@ impl Section {
     /// of the id path, which is exactly the collision class #861 is about.
     fn nav_id(self) -> &'static str {
         match self {
-            Section::Home => "nav-home",
             Section::Tasks => "nav-tasks",
             Section::Queue => "nav-queue",
             Section::Activity => "nav-activity",
@@ -188,9 +187,7 @@ impl Section {
     fn focus_target(self) -> FocusTarget {
         match self {
             Section::Chat => FocusTarget::ChatComposer,
-            Section::Home | Section::Tasks | Section::Queue | Section::Activity => {
-                FocusTarget::Workspace
-            }
+            Section::Tasks | Section::Queue | Section::Activity => FocusTarget::Workspace,
         }
     }
 
@@ -199,11 +196,10 @@ impl Section {
     /// `aria_keyshortcuts`, to assistive technology.
     fn shortcut(self) -> &'static str {
         match self {
-            Section::Home => "⌘1",
-            Section::Tasks => "⌘2",
-            Section::Queue => "⌘3",
-            Section::Activity => "⌘4",
-            Section::Chat => "⌘5",
+            Section::Tasks => "⌘1",
+            Section::Queue => "⌘2",
+            Section::Activity => "⌘3",
+            Section::Chat => "⌘4",
         }
     }
 }
@@ -517,7 +513,7 @@ impl Workspace {
 
         Self {
             focus_handle,
-            section: Section::Home,
+            section: Section::DEFAULT,
             left_sidebar: SidebarState::new(true),
             // The inspector is a reading surface (specs, task bodies) —
             // default it wide, like the Swift app's 460pt ideal.
@@ -2153,7 +2149,6 @@ impl Workspace {
         // never `size_full`: 100% of the pane plus anything above it
         // overflows the clip and cuts off the bottom (chat's composer).
         let body = match self.section {
-            Section::Home => self.render_home(cx).into_any_element(),
             Section::Tasks => self.render_tasks(cx).into_any_element(),
             Section::Queue => self.render_queue(cx).into_any_element(),
             Section::Activity => self.render_activity(cx).into_any_element(),
@@ -2266,9 +2261,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ApproveSelectedSpec, window, cx| {
                 this.run_on_selection(RowAction::ApproveSpec, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToHome, window, cx| {
-                this.go_to_section(Section::Home, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
                 this.go_to_section(Section::Tasks, window, cx);
@@ -2397,6 +2389,6 @@ mod tests {
     /// used to do — is the whole of #902.
     #[test]
     fn the_section_a_window_opens_on_focuses_the_root() {
-        assert_eq!(Section::Home.focus_target(), FocusTarget::Workspace);
+        assert_eq!(Section::DEFAULT.focus_target(), FocusTarget::Workspace);
     }
 }

@@ -56,7 +56,7 @@ pub enum ChatRowKey {
 
 impl ChatRowKey {
     /// The markdown cache key for this row. Distinct per row — one cache
-    /// serves chat, specs and briefings, and a growing stream re-renders
+    /// serves chat, specs and task bodies, and a growing stream re-renders
     /// every frame, so a collision here would be the loudest one.
     pub fn markdown_key(self) -> String {
         match self {

@@ -28,15 +28,13 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck,
-    CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest,
-    ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, ShadowAck,
+    AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
+    CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse,
+    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
+    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage, ServerStatus,
+    SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
 };
 
-use crate::briefing::{self, Briefings};
 use crate::bundles::RejectedBundles;
 use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
@@ -157,14 +155,12 @@ type ApiResult<T> = Result<T, ApiError>;
 ///
 /// Each is optional so `router(store)` (tests, embedded uses) keeps working,
 /// and each absence has a defined answer rather than a pretended one: without
-/// the briefing service `GET /briefings` serves stored copies and never
-/// regenerates, without a GitHub client the endpoints that write upstream
-/// answer 503, and without a bundle service `GET /bundles` answers 503 — never
-/// `[]`, because "nothing was preserved" is the one wrong answer to give about
-/// a directory nobody looked in.
+/// a GitHub client the endpoints that write upstream answer 503, and without
+/// a bundle service `GET /bundles` answers 503 — never `[]`, because "nothing
+/// was preserved" is the one wrong answer to give about a directory nobody
+/// looked in.
 #[derive(Clone, Default)]
 pub struct Services {
-    pub briefings: Option<Arc<Briefings>>,
     pub github: Option<Arc<GitHubClient>>,
     pub bundles: Option<Arc<RejectedBundles>>,
 }
@@ -179,12 +175,6 @@ pub struct AppState {
 impl FromRef<AppState> for Arc<Store> {
     fn from_ref(state: &AppState) -> Self {
         state.store.clone()
-    }
-}
-
-impl FromRef<AppState> for Option<Arc<Briefings>> {
-    fn from_ref(state: &AppState) -> Self {
-        state.services.briefings.clone()
     }
 }
 
@@ -206,11 +196,10 @@ pub fn router(store: Arc<Store>) -> Router {
     router_with_services(store, Services::default())
 }
 
-/// Build the full API router. `serve` passes the briefing service so
-/// `GET /briefings` can kick stale-while-revalidate regenerations, the GitHub
-/// client so issue writes can go through the server rather than through an
-/// agent's own credential, and the bundle service so a preserved
-/// implementation can be found without an `ls` on the server host.
+/// Build the full API router. `serve` passes the GitHub client so issue
+/// writes can go through the server rather than through an agent's own
+/// credential, and the bundle service so a preserved implementation can be
+/// found without an `ls` on the server host.
 pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
     Router::new()
         // First on purpose: no state, no store, no auth — the one route that
@@ -284,7 +273,6 @@ pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
-        .route("/briefings", get(list_briefings))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
         .with_state(AppState { store, services })
@@ -2651,25 +2639,6 @@ fn to_sse(line: &TranscriptLine) -> Option<Result<SseEvent, Infallible>> {
     }
 }
 
-// --- briefings ---
-
-/// All three Home briefing slots, stale-while-revalidate: whatever is stored
-/// returns immediately, and stale sections kick a single-flight background
-/// regeneration when a briefing service is attached (the production server).
-/// Completion arrives as a `briefing_updated` event — refetch on it. Without
-/// a service (tests, embedded routers) this only ever serves stored copies.
-async fn list_briefings(
-    State(store): State<Arc<Store>>,
-    State(briefings): State<Option<Arc<Briefings>>>,
-) -> ApiResult<Json<Vec<BriefingStatus>>> {
-    match briefings {
-        Some(service) => Ok(Json(service.get_all().await?)),
-        None => Ok(Json(
-            briefing::snapshot(&store, briefing::DEFAULT_TTL).await?,
-        )),
-    }
-}
-
 // --- events ---
 
 #[derive(Debug, Deserialize)]
@@ -4106,55 +4075,6 @@ mod tests {
                 to: Mode::Play
             }
         );
-    }
-
-    /// The `/briefings` wire shape: always all three sections, snake_case
-    /// keys, RFC3339 timestamps, and — without a briefing service attached —
-    /// stored copies only, never a regeneration.
-    #[tokio::test]
-    async fn briefings_serve_all_three_sections_from_storage() {
-        use crate::models::{Briefing, BriefingSection};
-
-        let store = Arc::new(Store::open_in_memory().await.unwrap());
-        store
-            .upsert_briefing(&Briefing {
-                section: BriefingSection::Changes,
-                content: "PR [#7](https://github.com/a/b/pull/7) is stale.".into(),
-                generated_at: Utc::now(),
-                event_high_water: 3,
-            })
-            .await
-            .unwrap();
-        let base = spawn(store.clone()).await;
-
-        let body: Vec<Value> = reqwest::get(format!("{base}/briefings"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(body.len(), 3);
-        let sections: Vec<&str> = body
-            .iter()
-            .map(|b| b["section"].as_str().unwrap())
-            .collect();
-        assert_eq!(sections, vec!["state_of_project", "changes", "issues"]);
-
-        let changes = &body[1];
-        assert_eq!(
-            changes["content"].as_str().unwrap(),
-            "PR [#7](https://github.com/a/b/pull/7) is stale."
-        );
-        assert_eq!(changes["stale"], Value::Bool(false));
-        assert_eq!(changes["regenerating"], Value::Bool(false));
-        assert!(changes["generated_at"].as_str().unwrap().contains('T'));
-
-        let never_generated = &body[0];
-        assert_eq!(never_generated["content"], Value::Null);
-        assert_eq!(never_generated["stale"], Value::Bool(true));
-
-        // No service attached: nothing regenerated behind the read.
-        assert_eq!(store.list_briefings().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

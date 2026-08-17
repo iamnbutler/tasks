@@ -61,7 +61,6 @@ use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::brief::Brief;
-use crate::briefing::{BriefingConfig, Briefings};
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::bundles::RejectedBundles;
 use crate::events::EventPayload;
@@ -95,16 +94,6 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
 const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
-/// Default agent command for Home briefing generations. Read-only on
-/// purpose: gh/curl/git-log/git-diff and nothing else — a briefing agent
-/// that can write is a misconfiguration. The quoted permission list is why
-/// `BRIEFING_CMD` gets shell-style splitting (see `briefing::split_command`).
-const DEFAULT_BRIEFING_CMD: &str = "claude --print --allowedTools \
-     \"Bash(gh:*),Bash(curl:*),Bash(git log:*),Bash(git diff:*)\"";
-/// Briefings stay fresh this long (`BRIEFING_TTL_SECS`).
-const DEFAULT_BRIEFING_TTL_SECS: u64 = 900;
-/// Wall-clock budget per briefing generation (`BRIEFING_TIMEOUT_SECS`).
-const DEFAULT_BRIEFING_TIMEOUT_SECS: u64 = 300;
 /// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 /// Debounce for pipeline-event nudges: after the first nudge-worthy event,
@@ -266,12 +255,6 @@ pub struct Config {
     /// repo clone to run the orchestrator as a full development agent
     /// (pair with `--dangerously-skip-permissions` in `ORCHESTRATOR_CMD`).
     pub orchestrator_workdir: Option<PathBuf>,
-    /// Agent command for Home briefing generations (`BRIEFING_CMD`).
-    pub briefing_cmd: String,
-    /// Freshness window for briefings (`BRIEFING_TTL_SECS`).
-    pub briefing_ttl: Duration,
-    /// Wall-clock budget per briefing generation (`BRIEFING_TIMEOUT_SECS`).
-    pub briefing_timeout: Duration,
 }
 
 impl Config {
@@ -327,23 +310,12 @@ impl Config {
                 DEFAULT_ORCHESTRATOR_TIMEOUT_SECS,
             )?),
             orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
-            briefing_cmd: env_string("BRIEFING_CMD").unwrap_or_else(|| DEFAULT_BRIEFING_CMD.into()),
-            briefing_ttl: Duration::from_secs(parse_env(
-                "BRIEFING_TTL_SECS",
-                "a number of seconds",
-                DEFAULT_BRIEFING_TTL_SECS,
-            )?),
-            briefing_timeout: Duration::from_secs(parse_env(
-                "BRIEFING_TIMEOUT_SECS",
-                "a number of seconds",
-                DEFAULT_BRIEFING_TIMEOUT_SECS,
-            )?),
         })
     }
 
-    /// The working directory both the orchestrator and briefing agents run
-    /// in: `ORCHESTRATOR_WORKDIR` (the repo checkout, in production) or a
-    /// neutral dir under the data dir.
+    /// The working directory the orchestrator agent runs in:
+    /// `ORCHESTRATOR_WORKDIR` (the repo checkout, in production) or a neutral
+    /// dir under the data dir.
     fn agent_workdir(&self) -> PathBuf {
         self.orchestrator_workdir
             .clone()
@@ -779,17 +751,6 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         OBLIGATION_TICK,
         shutdown_rx.clone(),
     ));
-    let briefings = Arc::new(Briefings::new(
-        store.clone(),
-        BriefingConfig {
-            command: config.briefing_cmd.clone(),
-            timeout: config.briefing_timeout,
-            ttl: config.briefing_ttl,
-            workdir: config.agent_workdir(),
-            api_port: config.port,
-        },
-    ));
-
     // The API's own GitHub client: issue writes go through the server, so
     // without a token those routes answer 503 rather than falling back to an
     // agent's credential.
@@ -800,7 +761,6 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         listener,
         store,
         server::Services {
-            briefings: Some(briefings),
             github: config.github_client().map(Arc::new),
             bundles: Some(Arc::new(RejectedBundles::under(
                 builder_config(&config).scratch_root,
@@ -2151,6 +2111,16 @@ async fn reject_exhausted(
 
 /// A scout error that means the vm-pool connection is gone, rather than the
 /// scout run itself having failed.
+///
+/// This decides *reconnection* — whether to drop the client and rebuild it —
+/// and, because [`record_outcome`] consults it first, it incidentally decides
+/// the strike too. For `StreamClosed` the two answers must agree, and they do:
+/// `ScoutError::failure_class` classifies it `Transport`.
+///
+/// The two must **not** be merged into one predicate. `Client(Closed |
+/// Connect(_))` is a disconnect and is still classified a verdict, so folding
+/// either into the other would start charging it — see the `Client(_)` comment
+/// on `BuilderError::failure_class` for why that is a separate argument.
 fn is_disconnect(error: &ScoutError) -> bool {
     matches!(
         error,
@@ -2542,9 +2512,6 @@ mod tests {
             orchestrator_cmd: "true".into(),
             orchestrator_timeout: Duration::from_secs(60),
             orchestrator_workdir: None,
-            briefing_cmd: "true".into(),
-            briefing_ttl: Duration::from_secs(DEFAULT_BRIEFING_TTL_SECS),
-            briefing_timeout: Duration::from_secs(DEFAULT_BRIEFING_TIMEOUT_SECS),
         }
     }
 
@@ -2753,6 +2720,60 @@ mod tests {
         };
         store.insert_task(&task).await.unwrap();
         task
+    }
+
+    /// The real `record_outcome`, against a real store, one round past
+    /// `MAX_DISPATCH_ATTEMPTS`: a vm-pool that goes away must never reject a
+    /// task, however many times it goes away.
+    ///
+    /// It also pins the *other* half of the answer — the call still reports
+    /// `ConnectionLost(true)`, because this predicate decides reconnection as
+    /// well as the strike, and a fix that waived the attempt by making the
+    /// error look ordinary would silently stop the loop rebuilding its client.
+    #[tokio::test]
+    async fn a_closed_event_stream_costs_the_task_no_dispatch_attempt() {
+        use crate::protocol::FailureClass;
+
+        let store = Store::open_in_memory().await.unwrap();
+        let project = project();
+        store.insert_project(&project).await.unwrap();
+        let task = seed_task(&store, &project, 1, TaskState::Queued).await;
+
+        for round in 1..=MAX_DISPATCH_ATTEMPTS + 1 {
+            let ConnectionLost(lost) =
+                record_outcome(&store, &task.id, Err(ScoutError::StreamClosed))
+                    .await
+                    .unwrap();
+            assert!(lost, "round {round} must still reconnect the client");
+
+            let after = store.get_task(&task.id).await.unwrap().unwrap();
+            assert_eq!(after.dispatch_attempts, 0, "round {round} charged a strike");
+            assert_eq!(
+                after.state,
+                TaskState::Queued,
+                "round {round} moved the task"
+            );
+        }
+
+        // The negative half. Three verdicts and the task really is rejected —
+        // without this, "attempts stayed 0" reads identically to the cap
+        // having been switched off.
+        let doomed = seed_task(&store, &project, 2, TaskState::Queued).await;
+        for _ in 0..MAX_DISPATCH_ATTEMPTS {
+            record_outcome(
+                &store,
+                &doomed.id,
+                Err(ScoutError::StoppedEarly {
+                    reason: "no spec".into(),
+                    class: FailureClass::Verdict,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let after = store.get_task(&doomed.id).await.unwrap().unwrap();
+        assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
+        assert_eq!(after.state, TaskState::Rejected);
     }
 
     /// A paused repo is a repo the dispatcher walks *past*, not one it stops
