@@ -6,17 +6,19 @@
 
 pub mod events;
 pub mod images;
+pub mod ledger;
 pub mod snapshot;
 pub mod transport;
 
 pub use events::{Event, EventLog, EventPayload, InfraEvent, ServiceState, VmState};
 pub use images::{ImageError, ImageMetadata, ImageRef, ImageStore, ImageType};
+pub use ledger::VmLedger;
 pub use snapshot::{SnapshotError, SnapshotMetadata, SnapshotStore};
 pub use transport::{TransportError, VmTransport, find_supervisor_binary};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
@@ -319,10 +321,16 @@ pub struct PoolConfig {
     ///
     /// Leave slack above what the workload steadily needs. Exhaustion is not a
     /// queue — an allocate that arrives at the ceiling is refused, and a caller
-    /// that reads the refusal as "this work failed" charges it to the work. A
-    /// leaked VM (one whose owner died between allocate and deallocate) holds
-    /// its slot until the sweep reclaims it, so a pool sized exactly to the
-    /// steady state is one leak from refusing everything.
+    /// that reads the refusal as "this work failed" charges it to the work.
+    ///
+    /// A VM whose owner died between allocate and deallocate holds its slot
+    /// until *something* hands it back, and there are two such somethings.
+    /// [`Pool`] frees the slot the moment the VM's event stream ends, which
+    /// covers a VM that actually died; a VM that is still running with nobody
+    /// left to talk to it holds its slot until its owner deallocates it or
+    /// [`PoolConfig::vm_timeout`] ages it out. So a pool sized exactly to its
+    /// steady state can still be refusing allocations for as long as one
+    /// abandoned VM keeps running.
     pub max_vms: usize,
     pub health_check_interval: u64,
     pub vm_timeout: u64,
@@ -350,41 +358,126 @@ struct VmEntry<P: AppProtocol = NullProtocol> {
     command_tx: Option<mpsc::Sender<VmCommand<P>>>,
 }
 
-/// Marker type for pools without a runtime.
-pub struct NoRuntime;
+/// A pool without a real VM backend: allocation is bookkeeping only.
+///
+/// It holds each VM's *event* sender for as long as the VM is allocated, so a
+/// `NoRuntime` VM looks alive to the pool until something stops it. That is
+/// not a detail — [`Pool`] now reads the end of a VM's event stream as "this
+/// VM is gone" and hands the slot back, so a runtime that dropped its senders
+/// on the way out of `start` would free every slot it had just filled.
+/// [`NoRuntime::stop`] dropping the entry is what models a VM dying.
+///
+/// The *command* side is dead from the start, and deliberately so: any
+/// `send_to_vm` against a `NoRuntime` VM fails, which is what makes it useful
+/// for exercising allocation, eviction and health-check logic with no VM
+/// backend.
+#[derive(Debug, Default)]
+pub struct NoRuntime {
+    /// Type-erased `mpsc::Sender<VmEvent<P>>`, one per live VM. Erased because
+    /// `NoRuntime` is not generic over the protocol while [`VmRuntime`] is.
+    live: std::sync::Mutex<HashMap<VmId, Box<dyn std::any::Any + Send + Sync>>>,
+}
+
+impl NoRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Everything about a pool that a per-VM task may touch, held behind an `Arc`
+/// so an event forwarder can outlive nothing and still hand a slot back.
+///
+/// Deliberately *not* the runtime. A forwarder gets a [`Weak`] to this — which
+/// is enough to free a slot and record that it did, and not enough to start or
+/// stop a VM — so the reclamation path cannot grow into a second, unsupervised
+/// lifecycle manager beside [`Pool`]. `Weak`, so a task that outlives its pool
+/// cannot resurrect it.
+struct PoolState<P: AppProtocol = NullProtocol> {
+    vms: RwLock<HashMap<VmId, VmEntry<P>>>,
+    /// VMs this pool reclaimed on its own, awaiting the owner's `deallocate`.
+    /// Bounded by "died without being deallocated, and not yet acknowledged":
+    /// the entry is consumed by the first `deallocate` that asks for it.
+    reclaimed: RwLock<HashSet<VmId>>,
+    events: Arc<EventLog<P>>,
+    ledger: VmLedger,
+}
+
+impl<P: AppProtocol> PoolState<P> {
+    /// A VM's event stream ended, which is an exact statement that the VM is
+    /// gone: the transport closed, or the runtime dropped its sender.
+    ///
+    /// Finding nothing in the map is the *common* case and means the teardown
+    /// was deliberate — `deallocate` removes the entry before it stops the VM,
+    /// and stopping it is what ends the stream. Only a VM still counted here
+    /// died on its own.
+    ///
+    /// The ledger entry is deliberately **not** forgotten. A dead transport
+    /// says the host side is gone; the container may well still be running,
+    /// and it is the successor daemon's job to stop it. Over-stopping is
+    /// idempotent, under-stopping is the leak.
+    async fn reclaim(&self, vm_id: &VmId) {
+        if self.vms.write().await.remove(vm_id).is_none() {
+            return;
+        }
+        warn!(%vm_id, "VM died without being deallocated — reclaiming its slot");
+        self.reclaimed.write().await.insert(vm_id.clone());
+        self.events
+            .append(EventPayload::VmLifecycle {
+                vm_id: vm_id.clone(),
+                state: VmState::Crashed,
+            })
+            .await;
+    }
+}
 
 /// The VM pool manager, generic over runtime backend and application protocol.
 pub struct Pool<R = NoRuntime, P: AppProtocol = NullProtocol> {
     config: PoolConfig,
-    vms: RwLock<HashMap<VmId, VmEntry<P>>>,
-    events: Arc<EventLog<P>>,
+    state: Arc<PoolState<P>>,
     runtime: R,
 }
 
 impl<P: AppProtocol> Pool<NoRuntime, P> {
     /// Create a pool without a runtime (commands to VMs will return VmNotReady).
     pub fn new(config: PoolConfig, events: Arc<EventLog<P>>) -> Arc<Self> {
-        Arc::new(Self {
-            config,
-            vms: RwLock::new(HashMap::new()),
-            events,
-            runtime: NoRuntime,
-        })
+        Self::with_runtime(config, events, NoRuntime::new())
     }
 }
 
 impl<R, P: AppProtocol> Pool<R, P> {
+    /// A pool that does not remember its VMs across its own death. Equivalent
+    /// to [`Pool::with_ledger`] with [`VmLedger::disabled`].
     pub fn with_runtime(config: PoolConfig, events: Arc<EventLog<P>>, runtime: R) -> Arc<Self> {
+        Self::with_ledger(config, events, runtime, VmLedger::disabled())
+    }
+
+    /// A pool that writes what it starts to `ledger`, so its successor on the
+    /// same socket can stop whatever it leaves behind. See [`VmLedger`].
+    pub fn with_ledger(
+        config: PoolConfig,
+        events: Arc<EventLog<P>>,
+        runtime: R,
+        ledger: VmLedger,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
-            vms: RwLock::new(HashMap::new()),
-            events,
+            state: Arc::new(PoolState {
+                vms: RwLock::new(HashMap::new()),
+                reclaimed: RwLock::new(HashSet::new()),
+                events,
+                ledger,
+            }),
             runtime,
         })
     }
 
+    /// This pool's ledger of started VMs.
+    pub fn ledger(&self) -> &VmLedger {
+        &self.state.ledger
+    }
+
     pub async fn status(&self) -> PoolStatus {
-        let vms = self.vms.read().await;
+        let vms = self.state.vms.read().await;
         PoolStatus {
             total: self.config.max_vms,
             allocated: vms.len(),
@@ -393,12 +486,12 @@ impl<R, P: AppProtocol> Pool<R, P> {
     }
 
     pub async fn get(&self, vm_id: &VmId) -> Option<VmState> {
-        let vms = self.vms.read().await;
+        let vms = self.state.vms.read().await;
         vms.get(vm_id).map(|e| e.state)
     }
 
     pub async fn list(&self) -> Vec<(VmId, VmState)> {
-        let vms = self.vms.read().await;
+        let vms = self.state.vms.read().await;
         vms.iter().map(|(id, e)| (id.clone(), e.state)).collect()
     }
 
@@ -407,7 +500,7 @@ impl<R, P: AppProtocol> Pool<R, P> {
     /// Infrastructure commands (Ping, Shutdown) are sent internally by the pool
     /// during lifecycle management — callers only send application messages.
     pub async fn send_to_vm(&self, vm_id: &VmId, command: P::Command) -> Result<(), PoolError> {
-        let vms = self.vms.read().await;
+        let vms = self.state.vms.read().await;
         let entry = vms
             .get(vm_id)
             .ok_or_else(|| PoolError::VmNotFound(vm_id.clone()))?;
@@ -422,28 +515,33 @@ impl<R, P: AppProtocol> Pool<R, P> {
     }
 }
 
-// NoRuntime implements VmRuntime as a pool-bookkeeping-only stub: allocations
-// succeed and are tracked in memory, but the returned channels are immediately
-// disconnected, so any subsequent `send_to_vm` fails. Useful for exercising
-// pool allocation/eviction/health-check logic without a real VM backend.
 impl<P: AppProtocol> VmRuntime<P> for NoRuntime {
     async fn start(
         &self,
-        _vm_id: &VmId,
+        vm_id: &VmId,
         _image: &ImageRef,
         _config: &VmConfig,
     ) -> Result<VmHandle<P>, PoolError> {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<VmCommand<P>>(1);
-        let (_evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(1);
-        // _cmd_rx and _evt_tx drop here: any send on cmd_tx returns Err,
-        // any recv on evt_rx returns None.
+        let (evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(1);
+        // `_cmd_rx` drops here: any send on cmd_tx returns Err. `evt_tx` is
+        // kept until `stop`, so the VM's event stream stays open and the pool
+        // goes on counting the slot — see the type's own docs.
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(vm_id.clone(), Box::new(evt_tx));
         Ok(VmHandle {
             command_tx: cmd_tx,
             event_rx: evt_rx,
         })
     }
 
-    async fn stop(&self, _vm_id: &VmId) -> Result<(), PoolError> {
+    async fn stop(&self, vm_id: &VmId) -> Result<(), PoolError> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(vm_id);
         Ok(())
     }
 }
@@ -451,7 +549,7 @@ impl<P: AppProtocol> VmRuntime<P> for NoRuntime {
 // Pool with a real runtime — VMs get transport channels.
 impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
     pub async fn allocate(&self, image: ImageRef, config: VmConfig) -> Result<VmId, PoolError> {
-        let mut vms = self.vms.write().await;
+        let mut vms = self.state.vms.write().await;
 
         if vms.len() >= self.config.max_vms {
             return Err(PoolError::Exhausted {
@@ -463,19 +561,28 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
         let vm_id = generate_vm_id();
         info!(%vm_id, image = %image, "allocating VM");
 
-        self.events.init_vm(&vm_id).await;
-        self.events
+        self.state.events.init_vm(&vm_id).await;
+        self.state
+            .events
             .append(EventPayload::VmLifecycle {
                 vm_id: vm_id.clone(),
                 state: VmState::Allocating,
             })
             .await;
 
+        // Write-ahead: recorded before the VM exists, so the id is on disk for
+        // the window in which this daemon can die between the spawn and the
+        // write — which is precisely the crash the ledger exists for. A VM
+        // that never starts is forgotten again below.
+        self.state.ledger.record(&vm_id);
+
         let handle = match self.runtime.start(&vm_id, &image, &config).await {
             Ok(h) => h,
             Err(e) => {
                 error!(%vm_id, error = %e, "failed to start VM");
-                self.events
+                self.state.ledger.forget(&vm_id);
+                self.state
+                    .events
                     .append(EventPayload::VmLifecycle {
                         vm_id: vm_id.clone(),
                         state: VmState::Crashed,
@@ -484,10 +591,6 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
                 return Err(e);
             }
         };
-
-        let events = self.events.clone();
-        let fwd_vm_id = vm_id.clone();
-        tokio::spawn(forward_vm_events(fwd_vm_id, handle.event_rx, events));
 
         let entry = VmEntry {
             id: vm_id.clone(),
@@ -499,7 +602,19 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
         };
         vms.insert(vm_id.clone(), entry);
 
-        self.events
+        // *After* the insert, and the write lock held across both is what makes
+        // that hold. A VM that dies instantly would otherwise find no entry to
+        // reclaim, and then have a dead one inserted on top of it — a slot
+        // leaked for the rest of the pool's life.
+        tokio::spawn(forward_vm_events(
+            vm_id.clone(),
+            handle.event_rx,
+            self.state.events.clone(),
+            Arc::downgrade(&self.state),
+        ));
+
+        self.state
+            .events
             .append(EventPayload::VmLifecycle {
                 vm_id: vm_id.clone(),
                 state: VmState::Ready,
@@ -520,7 +635,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
     ) -> Result<(VmId, Option<VmId>), PoolError> {
         // Try normal allocation first
         {
-            let vms = self.vms.read().await;
+            let vms = self.state.vms.read().await;
             if vms.len() < self.config.max_vms {
                 drop(vms);
                 let vm_id = self.allocate(image, config).await?;
@@ -530,7 +645,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
 
         // Pool is full — find the lowest-priority VM to evict
         let evict_id = {
-            let vms = self.vms.read().await;
+            let vms = self.state.vms.read().await;
             let candidate = vms
                 .iter()
                 .filter(|(_, entry)| entry.config.priority < config.priority)
@@ -563,16 +678,29 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
         Ok((vm_id, Some(evict_id)))
     }
 
+    /// Hand a VM back: stop it, free its slot, and forget it.
+    ///
+    /// Idempotent for a VM this pool already reclaimed on its own (its event
+    /// stream ended without a `deallocate`), and an error for one it never
+    /// had. Keeping those two apart is the point: `VmNotFound` means "this
+    /// pool never started that VM", and a `deallocate` that answered `Ok` for
+    /// any unknown id would let a client stop a container by guessing its
+    /// name.
+    ///
+    /// A reclaimed VM still runs the whole teardown rather than returning
+    /// early. A closed transport says the *host* side is gone — a supervisor
+    /// that died inside a container that is still running looks exactly the
+    /// same from here, and that is the leak this exists for.
     pub async fn deallocate(&self, vm_id: &VmId) -> Result<(), PoolError> {
-        let entry = {
-            let mut vms = self.vms.write().await;
-            vms.remove(vm_id)
-                .ok_or_else(|| PoolError::VmNotFound(vm_id.clone()))?
-        };
+        let entry = { self.state.vms.write().await.remove(vm_id) };
+        if entry.is_none() && !self.state.reclaimed.write().await.remove(vm_id) {
+            return Err(PoolError::VmNotFound(vm_id.clone()));
+        }
 
         info!(%vm_id, "deallocating VM");
 
-        self.events
+        self.state
+            .events
             .append(EventPayload::VmLifecycle {
                 vm_id: vm_id.clone(),
                 state: VmState::Stopping,
@@ -582,23 +710,57 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
         if let Err(e) = self.runtime.stop(vm_id).await {
             warn!(%vm_id, error = %e, "failed to stop VM via runtime");
         }
+        self.state.ledger.forget(vm_id);
 
         drop(entry);
 
-        self.events
+        self.state
+            .events
             .append(EventPayload::VmLifecycle {
                 vm_id: vm_id.clone(),
                 state: VmState::Stopped,
             })
             .await;
-        self.events.cleanup_vm(vm_id).await;
+        self.state.events.cleanup_vm(vm_id).await;
         Ok(())
+    }
+
+    /// Stop the VMs a previous daemon on this socket left running.
+    ///
+    /// Called once, before the service binds its socket, with whatever
+    /// [`VmLedger::open`] carried over — so the pool never advertises capacity
+    /// its predecessor's VMs are still consuming, and no client can allocate
+    /// against a host that is about to have containers stopped underneath it.
+    ///
+    /// Safe because `bind_socket` admits one live daemon per socket path and
+    /// the ledger is named for that path: everything in it at boot belongs to
+    /// a daemon that is gone. These VMs were never in *this* pool's map, so
+    /// this stops them through the runtime directly and then forgets each —
+    /// one at a time, so a daemon that dies partway through hands the rest on.
+    pub async fn reclaim_carried_over(&self, carried: Vec<VmId>) {
+        if carried.is_empty() {
+            return;
+        }
+        warn!(
+            count = carried.len(),
+            "stopping VMs a previous vm-pool left running"
+        );
+        for vm_id in carried {
+            match self.runtime.stop(&vm_id).await {
+                Ok(()) => info!(%vm_id, "stopped an orphaned VM"),
+                // Forgotten anyway: the stop is best-effort and a ledger entry
+                // that can never be discharged would be retried at every boot
+                // from here to the end of time.
+                Err(e) => warn!(%vm_id, error = %e, "could not stop an orphaned VM"),
+            }
+            self.state.ledger.forget(&vm_id);
+        }
     }
 
     pub async fn health_check(&self) {
         let mut timed_out = Vec::new();
         {
-            let vms = self.vms.read().await;
+            let vms = self.state.vms.read().await;
             for (vm_id, entry) in vms.iter() {
                 let age_ms = now_ms().saturating_sub(entry.started_at);
                 let age_s = age_ms / 1000;
@@ -617,10 +779,22 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
     }
 }
 
+/// Pump one VM's events into the log, and hand its slot back when they stop.
+///
+/// The end of the stream is an exact statement that the VM is gone — the
+/// transport closed, or the runtime dropped its sender — and it used to be
+/// spent on a `debug!` line while the pool went on counting the VM as
+/// allocated until `vm_timeout` aged it out, **two hours** later. That is the
+/// slot leak, reclaimed here at the instant of death from a signal the pool
+/// already had.
+///
+/// [`Weak`], because this task must not keep a pool alive, and must not be
+/// able to bring one back.
 async fn forward_vm_events<P: AppProtocol>(
     vm_id: VmId,
     mut event_rx: mpsc::Receiver<VmEvent<P>>,
     events: Arc<EventLog<P>>,
+    state: Weak<PoolState<P>>,
 ) {
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -659,6 +833,9 @@ async fn forward_vm_events<P: AppProtocol>(
         }
     }
     debug!(%vm_id, "VM event forwarder stopped");
+    if let Some(state) = state.upgrade() {
+        state.reclaim(&vm_id).await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -691,8 +868,56 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::time::Duration;
     use vm_pool_protocol::{ShellCommand, ShellEvent, ShellProtocol};
     use vm_pool_test_support::supervisor_binary;
+
+    /// Wait for `predicate`, or fail. Every reclamation here happens on a
+    /// spawned task, so the alternative is a sleep long enough to be slow and
+    /// short enough to be flaky.
+    async fn until(label: &str, mut predicate: impl AsyncFnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if predicate().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    /// A supervisor-backed pool with a real process behind every VM.
+    fn supervisor_pool(max_vms: usize) -> Arc<Pool<SupervisorRuntime, ShellProtocol>> {
+        Pool::with_runtime(
+            PoolConfig {
+                max_vms,
+                health_check_interval: 300,
+                // Deliberately the default two hours: if the timeout were
+                // doing the reclaiming, these tests would pass for the wrong
+                // reason and the bug would be untouched.
+                vm_timeout: 7200,
+            },
+            EventLog::<ShellProtocol>::new(),
+            SupervisorRuntime::new(supervisor_binary()),
+        )
+    }
+
+    /// Kill the supervisor from inside itself. `sh -c` runs as the
+    /// supervisor's child, so `$PPID` is the supervisor, and `kill -9` is a
+    /// genuine VM death — a real process dying without a shutdown, on Linux,
+    /// with no container runtime anywhere. It is the whole reason the
+    /// reclamation path is testable here rather than only on a Mac.
+    async fn kill_the_vm(pool: &Pool<SupervisorRuntime, ShellProtocol>, vm_id: &VmId) {
+        pool.send_to_vm(
+            vm_id,
+            ShellCommand::Execute {
+                command: "kill -9 $PPID".into(),
+            },
+        )
+        .await
+        .expect("the VM is alive to be killed");
+    }
 
     fn test_pool(max_vms: usize) -> Arc<Pool<NoRuntime, ShellProtocol>> {
         let events = EventLog::<ShellProtocol>::new();
@@ -949,5 +1174,245 @@ mod tests {
         );
 
         pool.deallocate(&vm_id).await.unwrap();
+    }
+
+    // Reclamation: a VM that dies without being deallocated.
+
+    /// The slot leak, as a test. The assertion that matters is the last one —
+    /// not that a counter moved, but that the freed slot can actually carry
+    /// work again. Before this, the pool went on counting a dead VM until
+    /// `vm_timeout` aged it out two hours later.
+    #[tokio::test]
+    async fn a_vm_that_dies_gives_its_slot_back_to_the_next_allocation() {
+        let pool = supervisor_pool(1);
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(pool.status().await.available, 0);
+        assert!(
+            pool.allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+                .await
+                .is_err(),
+            "the pool is full while the VM lives"
+        );
+
+        kill_the_vm(&pool, &vm_id).await;
+        until("the dead VM's slot", async || {
+            pool.status().await.available == 1
+        })
+        .await;
+        assert_eq!(pool.get(&vm_id).await, None, "and it is gone from the map");
+
+        let replacement = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .expect("the reclaimed slot carries work");
+        pool.send_to_vm(
+            &replacement,
+            ShellCommand::Execute {
+                command: "echo alive".into(),
+            },
+        )
+        .await
+        .expect("a real VM, not just a free counter");
+        pool.deallocate(&replacement).await.unwrap();
+    }
+
+    /// The owner still calls `deallocate` — it has no idea the VM died — and
+    /// that must succeed once. The teardown runs in full rather than returning
+    /// early: a closed transport says the *host* side is gone, and a
+    /// supervisor that died inside a container that is still running looks
+    /// exactly the same from here.
+    #[tokio::test]
+    async fn deallocating_a_reclaimed_vm_succeeds_exactly_once() {
+        let pool = supervisor_pool(2);
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        kill_the_vm(&pool, &vm_id).await;
+        until("the reclaim", async || pool.get(&vm_id).await.is_none()).await;
+
+        pool.deallocate(&vm_id)
+            .await
+            .expect("the owner's deallocate is not an error");
+        assert!(
+            matches!(pool.deallocate(&vm_id).await, Err(PoolError::VmNotFound(_))),
+            "the acknowledgement is consumed — this is not a pool that says Ok \
+             to any id it is handed"
+        );
+    }
+
+    /// `VmNotFound` keeps one meaning: this pool never had that VM. Widening
+    /// it would let a client stop a container by guessing a name.
+    #[tokio::test]
+    async fn a_vm_this_pool_never_had_is_still_not_found() {
+        let pool = supervisor_pool(1);
+        assert!(matches!(
+            pool.deallocate(&VmId::new("vm-someone-elses")).await,
+            Err(PoolError::VmNotFound(_))
+        ));
+    }
+
+    /// An ordinary deallocate ends the event stream too — it drops the command
+    /// sender, which ends the bridge — so the reclamation path runs on *every*
+    /// teardown. Finding nothing there is what "the teardown was deliberate"
+    /// looks like, and it must not turn into a phantom reclaimed entry.
+    #[tokio::test]
+    async fn an_ordinary_teardown_leaves_nothing_to_reclaim() {
+        let pool = supervisor_pool(1);
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        pool.deallocate(&vm_id).await.unwrap();
+
+        // Give the forwarder every chance to run late and misfile this as a
+        // death.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(pool.deallocate(&vm_id).await, Err(PoolError::VmNotFound(_))),
+            "a deliberate teardown does not leave an acknowledgement behind"
+        );
+        assert_eq!(pool.status().await.available, 1);
+    }
+
+    /// The ledger's half: what a pool started is on disk while it runs, and
+    /// off it once the VM is handed back.
+    #[tokio::test]
+    async fn the_ledger_holds_a_vm_for_exactly_as_long_as_the_pool_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, carried) = VmLedger::open(dir.path(), Path::new("/tmp/ledger-test.sock"));
+        assert!(carried.is_empty());
+        let pool = Pool::with_ledger(
+            PoolConfig {
+                max_vms: 2,
+                health_check_interval: 300,
+                vm_timeout: 7200,
+            },
+            EventLog::<ShellProtocol>::new(),
+            SupervisorRuntime::new(supervisor_binary()),
+            ledger,
+        );
+
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(pool.ledger().ids(), vec![vm_id.clone()]);
+
+        pool.deallocate(&vm_id).await.unwrap();
+        assert!(pool.ledger().ids().is_empty(), "stopped, so forgotten");
+    }
+
+    /// A dead transport is not a dead container: the host side is gone, the
+    /// container may well still be running, and stopping it is the successor's
+    /// job. So reclaiming a slot deliberately does **not** forget the ledger
+    /// entry — over-stopping is idempotent, under-stopping is the leak.
+    #[tokio::test]
+    async fn a_reclaimed_vm_keeps_its_ledger_entry_until_it_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, _) = VmLedger::open(dir.path(), Path::new("/tmp/reclaim-test.sock"));
+        let pool = Pool::with_ledger(
+            PoolConfig {
+                max_vms: 2,
+                health_check_interval: 300,
+                vm_timeout: 7200,
+            },
+            EventLog::<ShellProtocol>::new(),
+            SupervisorRuntime::new(supervisor_binary()),
+            ledger,
+        );
+
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        kill_the_vm(&pool, &vm_id).await;
+        until("the reclaim", async || pool.get(&vm_id).await.is_none()).await;
+
+        assert_eq!(
+            pool.ledger().ids(),
+            vec![vm_id.clone()],
+            "the slot came back; the container has not been stopped by anyone"
+        );
+        pool.deallocate(&vm_id).await.unwrap();
+        assert!(pool.ledger().ids().is_empty());
+    }
+
+    /// A pool started from a ledger with entries stops each one and forgets
+    /// it. There is no orphaned container to make on Linux — `container stop`
+    /// is macOS-only and this path inherits it unchanged from `deallocate` —
+    /// so what is under test is the bookkeeping: every carried id reaches the
+    /// runtime's `stop`, and the ledger is empty afterwards.
+    #[tokio::test]
+    async fn a_second_pool_stops_what_the_first_left_behind() {
+        /// A real [`NoRuntime`] with a note of what it was asked to stop. Not
+        /// a stand-in for a VM — `NoRuntime` is the shipping bookkeeping-only
+        /// backend — just the one observation this test needs, since a
+        /// supervisor process cannot outlive the pool that spawned it.
+        struct Recording {
+            inner: NoRuntime,
+            stopped: std::sync::Mutex<Vec<VmId>>,
+        }
+
+        impl VmRuntime<ShellProtocol> for Recording {
+            async fn start(
+                &self,
+                vm_id: &VmId,
+                image: &ImageRef,
+                config: &VmConfig,
+            ) -> Result<VmHandle<ShellProtocol>, PoolError> {
+                self.inner.start(vm_id, image, config).await
+            }
+
+            async fn stop(&self, vm_id: &VmId) -> Result<(), PoolError> {
+                self.stopped.lock().unwrap().push(vm_id.clone());
+                VmRuntime::<ShellProtocol>::stop(&self.inner, vm_id).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = Path::new("/tmp/carried-test.sock");
+
+        // A daemon that started two VMs and died without stopping either.
+        let (first, _) = VmLedger::open(dir.path(), socket);
+        first.record(&VmId::new("vm-orphan-1"));
+        first.record(&VmId::new("vm-orphan-2"));
+        drop(first);
+
+        let (ledger, carried) = VmLedger::open(dir.path(), socket);
+        assert_eq!(carried.len(), 2, "the successor is told what is owed");
+        let pool = Pool::with_ledger(
+            PoolConfig::default(),
+            EventLog::<ShellProtocol>::new(),
+            Recording {
+                inner: NoRuntime::new(),
+                stopped: std::sync::Mutex::new(Vec::new()),
+            },
+            ledger,
+        );
+        pool.reclaim_carried_over(carried).await;
+
+        let mut stopped = pool.runtime.stopped.lock().unwrap().clone();
+        stopped.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            stopped,
+            vec![VmId::new("vm-orphan-1"), VmId::new("vm-orphan-2")]
+        );
+        assert!(
+            pool.ledger().ids().is_empty(),
+            "discharged, so not owed again at the next boot"
+        );
+        assert_eq!(
+            pool.status().await.allocated,
+            0,
+            "the orphans were never this pool's own VMs"
+        );
+
+        // And the next daemon is told nothing.
+        let (_, carried) = VmLedger::open(dir.path(), socket);
+        assert!(carried.is_empty());
     }
 }

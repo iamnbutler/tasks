@@ -13,7 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 use vm_pool_manager::{
     DEFAULT_MAX_VMS, EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState,
-    SnapshotStore, VmRuntime,
+    SnapshotStore, VmLedger, VmRuntime,
 };
 use vm_pool_protocol::{
     AppProtocol, NullProtocol, Request, Response, ServiceCommand, ServiceEvent,
@@ -36,6 +36,16 @@ pub struct ServiceConfig {
     pub socket_path: PathBuf,
     /// Directory for snapshot storage.
     pub snapshot_dir: PathBuf,
+    /// Where to write the [`VmLedger`] — the record of the VMs this daemon
+    /// started, which its successor on the same socket reads at boot to stop
+    /// whatever a crash left running.
+    ///
+    /// `None` disables it: the service works exactly as it always did, and a
+    /// daemon that dies leaves its VMs to a human. Deliberately not derived
+    /// from [`Self::socket_path`] — the directory is shared between the pools
+    /// on a host, and it is the *file name* that carries the socket, so two
+    /// pools never read each other's VMs.
+    pub state_dir: Option<PathBuf>,
     /// Pool configuration.
     pub pool: PoolConfig,
 }
@@ -50,6 +60,7 @@ impl Default for ServiceConfig {
         Self {
             socket_path: PathBuf::from("/tmp/vm-pool.sock"),
             snapshot_dir: state_dir.join("snapshots"),
+            state_dir: Some(state_dir),
             pool: PoolConfig::default(),
         }
     }
@@ -251,25 +262,26 @@ where
 impl<P: AppProtocol> Service<NoRuntime, P> {
     /// Create a new service with the given configuration (no VM runtime backend).
     pub async fn new(config: ServiceConfig) -> anyhow::Result<Arc<Self>> {
-        let events = EventLog::<P>::new();
-        let pool = Pool::new(config.pool.clone(), events.clone());
-        let snapshots = SnapshotStore::new(&config.snapshot_dir);
-        snapshots.init().await?;
-
-        Ok(Arc::new(Self {
-            pool,
-            events,
-            snapshots,
-            config,
-        }))
+        Self::with_runtime(config, NoRuntime::new()).await
     }
 }
 
 impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
     /// Create a new service with a specific runtime backend.
+    ///
+    /// **The orphan cleanup happens here, not in [`Service::run`]**, because
+    /// it has to be finished before the socket is bound: a pool that
+    /// advertised capacity while its predecessor's containers were still
+    /// running would hand out slots the host cannot honour, and a client that
+    /// allocated in that window would watch containers stop underneath it.
     pub async fn with_runtime(config: ServiceConfig, runtime: R) -> anyhow::Result<Arc<Self>> {
         let events = EventLog::<P>::new();
-        let pool = Pool::with_runtime(config.pool.clone(), events.clone(), runtime);
+        let (ledger, carried) = match &config.state_dir {
+            Some(dir) => VmLedger::open(dir, &config.socket_path),
+            None => (VmLedger::disabled(), Vec::new()),
+        };
+        let pool = Pool::with_ledger(config.pool.clone(), events.clone(), runtime, ledger);
+        pool.reclaim_carried_over(carried).await;
         let snapshots = SnapshotStore::new(&config.snapshot_dir);
         snapshots.init().await?;
 
@@ -600,6 +612,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: dir.path().join("test.sock"),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: Some(dir.path().join("state")),
             pool: PoolConfig {
                 max_vms: 3,
                 health_check_interval: 30,
@@ -689,6 +702,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: path.clone(),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: Some(dir.path().join("state")),
             pool: PoolConfig::default(),
         };
         let svc = Service::<NoRuntime, ShellProtocol>::new(config)
@@ -699,6 +713,72 @@ mod tests {
             err.to_string().contains("refusing to start a second one"),
             "{err}"
         );
+    }
+
+    /// A service opens its predecessor's ledger and discharges it during
+    /// construction — before `run()` binds the socket, so no client can
+    /// allocate against capacity the previous daemon's VMs still consume.
+    #[tokio::test]
+    async fn a_service_takes_over_the_vms_a_previous_one_left_running() {
+        use vm_pool_manager::VmLedger;
+        use vm_pool_protocol::VmId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let socket_path = dir.path().join("takeover.sock");
+
+        let (previous, _) = VmLedger::open(&state_dir, &socket_path);
+        previous.record(&VmId::new("vm-left-running"));
+        drop(previous);
+
+        let config = ServiceConfig {
+            socket_path: socket_path.clone(),
+            snapshot_dir: dir.path().join("snapshots"),
+            state_dir: Some(state_dir.clone()),
+            pool: PoolConfig::default(),
+        };
+        let svc = Service::<NoRuntime, ShellProtocol>::new(config)
+            .await
+            .unwrap();
+        assert!(
+            svc.pool.ledger().ids().is_empty(),
+            "the orphan was stopped and struck off, not left owed forever"
+        );
+
+        // And this service's own VMs are recorded for *its* successor.
+        let ServiceEvent::VmAllocated { vm_id, .. } = svc
+            .handle_command(ServiceCommand::Allocate {
+                image: "agent:v1".into(),
+                config: VmConfig::default(),
+            })
+            .await
+        else {
+            panic!("expected VmAllocated");
+        };
+        assert_eq!(svc.pool.ledger().ids(), vec![vm_id]);
+    }
+
+    /// No state directory is a working service that simply does not remember —
+    /// the behaviour every embedder had before the ledger existed.
+    #[tokio::test]
+    async fn a_service_without_a_state_dir_keeps_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            socket_path: dir.path().join("no-ledger.sock"),
+            snapshot_dir: dir.path().join("snapshots"),
+            state_dir: None,
+            pool: PoolConfig::default(),
+        };
+        let svc = Service::<NoRuntime, ShellProtocol>::new(config)
+            .await
+            .unwrap();
+        svc.handle_command(ServiceCommand::Allocate {
+            image: "agent:v1".into(),
+            config: VmConfig::default(),
+        })
+        .await;
+        assert!(svc.pool.ledger().path().is_none());
+        assert_eq!(svc.pool.status().await.allocated, 1, "still a working pool");
     }
 
     #[tokio::test]
@@ -775,6 +855,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: dir.path().join("test.sock"),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: Some(dir.path().join("state")),
             pool: PoolConfig {
                 max_vms: 1,
                 health_check_interval: 30,

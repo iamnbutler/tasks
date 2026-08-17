@@ -694,6 +694,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: socket_path.clone(),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: Some(dir.path().join("state")),
             pool: PoolConfig {
                 max_vms,
                 health_check_interval: 300,

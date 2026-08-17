@@ -420,6 +420,12 @@ async fn vm_pool(args: &[String]) -> Result<()> {
     info!(max_vms, var = MAX_VMS_ENV, "pool capacity");
     let config = ServiceConfig {
         socket_path,
+        // Where the VM ledger goes: what this pool started, read by the next
+        // pool on this socket so a crash does not leave containers running
+        // with nobody left who knows about them. The data dir and not /tmp —
+        // a reboot clears /tmp, and the whole value of the file is that it
+        // outlives the daemon that wrote it.
+        state_dir: Some(data_dir.join("vm-pool")),
         snapshot_dir: data_dir.join("snapshots"),
         pool: PoolConfig {
             max_vms,
