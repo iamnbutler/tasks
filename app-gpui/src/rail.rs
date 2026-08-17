@@ -265,13 +265,16 @@ impl Workspace {
                     }
                 }
             })
+            // The window chrome lives here now — traffic lights, switcher,
+            // pipeline controls. No bar spans the window in the v3 design.
+            .child(self.render_rail_header(cx))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.))
-                    .pt(px(8.))
+                    .pt(px(4.))
                     // The catalog — the one place backlog lives, and where
                     // queueing happens. A static item above the tree, per the
                     // v3 design.
@@ -307,12 +310,44 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .px(px(16.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .pl(px(16.))
+                            .pr(px(10.))
                             .pt(px(14.))
                             .pb(px(4.))
-                            .text_xs()
-                            .text_color(text_muted)
-                            .child("Tasks"),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(text_muted)
+                                    .child("Tasks"),
+                            )
+                            // The section's +, per the design — the same
+                            // capture surface ⌘N opens.
+                            .child(
+                                div()
+                                    .id("rail-new-task")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(18.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .tooltip(tooltip("New Issue (⌘N)"))
+                                    .hover({
+                                        let hover_bg = theme.surface_secondary();
+                                        move |el| el.bg(hover_bg)
+                                    })
+                                    .on_click(|_event, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(crate::workspace::NewIssue),
+                                            cx,
+                                        );
+                                    })
+                                    .child(Icons::plus().size(px(12.)).text_color(text_muted)),
+                            ),
                     )
                     // The tree — the queue itself, drag to rank.
                     .child(
@@ -541,7 +576,9 @@ impl Workspace {
             .on_click(cx.listener({
                 let task_id = task_id.clone();
                 move |this, _event, _window, cx| {
-                    this.select_task(task_id.clone(), cx);
+                    // Straight to the Brief: the spec is what's awaiting
+                    // the verdict this section exists to surface.
+                    this.open_brief(task_id.clone(), cx);
                 }
             }))
             .children(project.map(|project| {
@@ -587,67 +624,75 @@ impl Workspace {
         let lines = draft.lines().count().clamp(2, 6);
         let composer_height = px(22. * lines as f32 + 16.);
 
+        // One bordered box holding the draft and its Send, the way the
+        // design draws it; the target sentence sits under the box, small,
+        // because which repo this files into must never be a guess.
         div()
             .flex_none()
             .p(px(8.))
-            .border_t_1()
-            .border_color(theme.border_subtle())
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .child(
-                div()
-                    .h(composer_height)
-                    .child(text_area(&self.rail_input, cx).size_full()),
-            )
+            .gap(px(4.))
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.))
-                    .text_xs()
-                    // Which repo this would file into — the one thing this
-                    // box must not leave to an agent to guess.
+                    .flex_col()
+                    .gap(px(4.))
+                    .p(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme.border_secondary())
+                    .bg(theme.bg())
                     .child(
                         div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .truncate()
-                            .text_color(theme.fg_muted())
-                            .child(target.sentence()),
+                            .h(composer_height)
+                            .text_sm()
+                            .child(text_area(&self.rail_input, cx).size_full()),
                     )
                     .child(
-                        div()
-                            .id("rail-send")
-                            .flex_none()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(4.))
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(5.))
-                            .border_1()
-                            .border_color(theme.border_secondary())
-                            .map(|el| {
-                                if can_send {
-                                    let hover_bg = theme.surface_secondary();
-                                    el.cursor_pointer()
-                                        .text_color(theme.fg())
-                                        .hover(move |el| el.bg(hover_bg))
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.submit_rail_composer(cx);
-                                        }))
-                                } else {
-                                    el.text_color(theme.fg_muted()).opacity(0.5)
-                                }
-                            })
-                            .child("Send")
-                            .child(kbd("⌘↩")),
+                        div().flex().flex_row().items_center().justify_end().child(
+                            div()
+                                .id("rail-send")
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .px(px(8.))
+                                .py(px(3.))
+                                .rounded(px(5.))
+                                .text_xs()
+                                .map(|el| {
+                                    if can_send {
+                                        let hover_bg = theme.surface_secondary();
+                                        el.cursor_pointer()
+                                            .text_color(theme.fg())
+                                            .hover(move |el| el.bg(hover_bg))
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.submit_rail_composer(cx);
+                                            }))
+                                    } else {
+                                        el.text_color(theme.fg_muted()).opacity(0.5)
+                                    }
+                                })
+                                .child("Send")
+                                .child(kbd("⌘↩")),
+                        ),
                     ),
             )
+            // Only when it has something to warn about: the ordinary
+            // one-repo case needs no caption under the box.
+            .when(!target.can_file() || has_text, |el| {
+                el.child(
+                    div()
+                        .px(px(2.))
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .overflow_hidden()
+                        .truncate()
+                        .child(target.sentence()),
+                )
+            })
     }
 
     /// Submit the rail draft: hand it to the orchestrator with the window's

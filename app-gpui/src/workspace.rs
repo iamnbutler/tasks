@@ -35,7 +35,7 @@ use tasks_client::api::models::{
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
@@ -206,13 +206,17 @@ pub struct Workspace {
     /// set, per-window and resetting on relaunch, exactly like [`Self::show_done`]
     /// — see [`crate::projects`] for why it is not a query parameter.
     pub(crate) project_filter: ProjectFilter,
-    /// The title bar's repo switcher.
+    /// The rail header's repo switcher.
     ///
     /// A popover rather than gpuikit's `context_menu` (right-click only) and
     /// rather than a menu-bar menu: `set_menus` leaks a boxed action per item
     /// on every rebuild, and the item list here *is* the project list, so a bar
     /// that rebuilt on every add or archive would leak per repo per change.
     project_switcher: Entity<PopoverState>,
+    /// The rail header's ⋮ menu — the chrome that lost its titlebar slot
+    /// (refresh, the Server window). A popover for the same leak reason as
+    /// the switcher.
+    rail_overflow: Entity<PopoverState>,
     /// `owner/repo` draft for the Add Repo window. Owned here, like the issue
     /// draft, so a dismissed one survives to the next open.
     pub(crate) repo_input: Entity<InputState>,
@@ -374,6 +378,20 @@ impl Workspace {
         cx.observe(&project_switcher, |_, _, cx| cx.notify())
             .detach();
 
+        let rail_overflow = {
+            let content = cx.entity().downgrade();
+            cx.new(|_cx| {
+                PopoverState::new(
+                    popover("rail-overflow")
+                        .trigger(Self::render_overflow_trigger)
+                        .content(move |window, cx| {
+                            Self::render_overflow_content(&content, window, cx)
+                        }),
+                )
+            })
+        };
+        cx.observe(&rail_overflow, |_, _, cx| cx.notify()).detach();
+
         // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
         // escape is gpuikit's own blur, and the blur is how the palette learns
         // it was dismissed — but only when the input is still on screen to
@@ -465,6 +483,7 @@ impl Workspace {
             palette_input,
             project_filter: ProjectFilter::All,
             project_switcher,
+            rail_overflow,
             repo_input,
             repo_window: None,
             pending_repo_selection: None,
@@ -854,14 +873,20 @@ impl Workspace {
         }
     }
 
-    /// Show the task with the review composer focused — "Review Spec…"
-    /// landing where the spec text already is, rather than in a modal that
-    /// would cover the thing being judged. The middle column is always
-    /// visible, so unlike the inspector era there is no panel to force open;
-    /// the form renders on the task's landing tab, which `select_task` just
-    /// reset to.
-    fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open a task on its Brief tab — the spec is the thing being ruled on,
+    /// so review-shaped entrances (the feedback list, "Review Spec…") land
+    /// beside it rather than on Overview.
+    pub(crate) fn open_brief(&mut self, id: TaskId, cx: &mut Context<Self>) {
         self.select_task(id, cx);
+        self.task_tab = TaskTab::Brief;
+        cx.notify();
+    }
+
+    /// [`Self::open_brief`] with the review composer focused — "Review
+    /// Spec…" landing where the spec text already is, rather than in a modal
+    /// that would cover the thing being judged.
+    fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_brief(id, cx);
         window.focus(&self.review_input.focus_handle(cx), cx);
         cx.notify();
     }
@@ -1070,15 +1095,14 @@ impl Workspace {
 
     // Chrome
 
-    /// A title-bar icon button at the design spec's metrics: 14px icon with
-    /// 8px horizontal / 7px vertical padding, so the button fills the bar.
-    fn title_bar_button(
+    /// A pane-header icon button: 14px icon in a slot that fills the row.
+    fn header_button(
         id: &'static str,
         icon: gpui::Svg,
     ) -> gpuikit::elements::icon_button::IconButton {
         icon_button(id, icon)
-            .width(px(30.))
-            .height(px(28.))
+            .width(px(28.))
+            .height(px(24.))
             .icon_size(px(14.))
     }
 
@@ -1286,70 +1310,184 @@ impl Workspace {
         .into_any_element()
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The left rail's header — where the window chrome lives in the v3
+    /// design: traffic lights (inset), collapse chevron, the project
+    /// switcher, then the pipeline controls at the rail's right edge. No
+    /// bar spans the window anymore.
+    pub(crate) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.app_state.read(cx).mode;
 
-        title_bar()
-            .child_left(
-                Self::title_bar_button("toggle-left-sidebar", Icons::panel_left())
-                    .selected(self.left_sidebar.is_open())
-                    .tooltip(tooltip("Toggle sidebar (⌘B)"))
+        pane_header("rail-header")
+            .traffic_light_inset()
+            .child(
+                Self::header_button("toggle-left-sidebar", Icons::panel_left())
+                    .tooltip(tooltip("Hide sidebar (⌘B)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleLeftDock), cx);
                     }),
             )
             // The repo the working set belongs to, and the control that
             // changes it.
-            .child_left(self.project_switcher.clone())
-            // The middle column's history. Greyed rather than absent at the
-            // ends of the stack, so the affordance has a fixed address.
-            .child_left(
-                Self::title_bar_button("history-back", Icons::arrow_left())
-                    .disabled(!self.nav.can_go_back())
-                    .tooltip(tooltip("Back (⌘[)"))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.history_back(cx);
-                    })),
-            )
-            .child_left(
-                Self::title_bar_button("history-forward", Icons::arrow_right())
-                    .disabled(!self.nav.can_go_forward())
-                    .tooltip(tooltip("Forward (⌘])"))
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.history_forward(cx);
-                    })),
-            )
-            .child_right(
-                Self::title_bar_button("mode-play", Icons::play())
+            .child(self.project_switcher.clone())
+            .child(div().flex_1())
+            .child(
+                Self::header_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
                     .tooltip(tooltip("Play — work moves on its own"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_mode(Mode::Play, cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("mode-pause", Icons::pause())
+            .child(
+                Self::header_button("mode-pause", Icons::pause())
                     .selected(mode == Some(Mode::Pause))
                     .tooltip(tooltip("Pause — no new work starts"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_mode(Mode::Pause, cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("refresh", Icons::reload())
-                    .tooltip(tooltip("Refresh"))
+            // The rest of the chrome, behind ⋮ — the design gives the rail
+            // exactly three controls' worth of width.
+            .child(self.rail_overflow.clone())
+    }
+
+    /// The ⋮ trigger.
+    fn render_overflow_trigger(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(26.))
+            .h(px(24.))
+            .rounded(px(5.))
+            .hover({
+                let hover_bg = theme.surface_secondary();
+                move |el| el.bg(hover_bg)
+            })
+            .child(
+                Icons::dots_vertical()
+                    .size(px(14.))
+                    .text_color(theme.fg_muted()),
+            )
+            .into_any_element()
+    }
+
+    /// The ⋮ menu: the chrome that lost its titlebar slot. Rows dispatch
+    /// and close.
+    fn render_overflow_content(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let row = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_sm()
+                .text_color(theme.fg())
+                .hover({
+                    let hover_bg = theme.surface_secondary();
+                    move |el| el.bg(hover_bg)
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .min_w(px(180.))
+            .child(row("overflow-refresh", "Refresh").on_click({
+                let workspace = workspace.clone();
+                move |_event, _window, cx| {
+                    workspace
+                        .update(cx, |this, cx| {
+                            this.close_rail_overflow(cx);
+                            this.app_state.update(cx, |state, cx| state.refresh(cx));
+                        })
+                        .ok();
+                }
+            }))
+            .child(row("overflow-server-status", "Server Status…").on_click({
+                let workspace = workspace.clone();
+                move |_event, window, cx| {
+                    workspace
+                        .update(cx, |this, cx| this.close_rail_overflow(cx))
+                        .ok();
+                    window.dispatch_action(Box::new(menus::ShowServerStatus), cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn close_rail_overflow(&mut self, cx: &mut Context<Self>) {
+        self.rail_overflow.update(cx, |popover, cx| {
+            popover.close(cx);
+        });
+    }
+
+    /// The middle column's header: history, then the selected task's tab
+    /// strip, with the chat toggle at the far edge. Takes over the traffic
+    /// light inset and the way back to the rail when the rail is hidden.
+    fn render_middle_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let rail_hidden = !self.left_sidebar.is_open();
+        let show_tabs = match self.nav.current() {
+            MiddleView::Task(id) => self.app_state.read(cx).task(id).is_some(),
+            MiddleView::AllTasks => false,
+        };
+
+        let mut header = pane_header("middle-header");
+        if rail_hidden {
+            header = header.traffic_light_inset().child(
+                Self::header_button("show-left-sidebar", Icons::panel_left())
+                    .tooltip(tooltip("Show sidebar (⌘B)"))
+                    .on_click(|_event, window, cx| {
+                        window.dispatch_action(Box::new(ToggleLeftDock), cx);
+                    }),
+            );
+        }
+        header = header
+            .child(
+                Self::header_button("history-back", Icons::arrow_left())
+                    .disabled(!self.nav.can_go_back())
+                    .tooltip(tooltip("Back (⌘[)"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.app_state.update(cx, |state, cx| state.refresh(cx));
+                        this.history_back(cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
-                    .selected(self.right_sidebar.is_open())
-                    .tooltip(tooltip("Toggle chat (⌘R)"))
-                    .on_click(|_event, window, cx| {
-                        window.dispatch_action(Box::new(ToggleRightDock), cx);
-                    }),
-            )
+            .child(
+                Self::header_button("history-forward", Icons::arrow_right())
+                    .disabled(!self.nav.can_go_forward())
+                    .tooltip(tooltip("Forward (⌘])"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.history_forward(cx);
+                    })),
+            );
+        if show_tabs {
+            header = header.child(div().w(px(8.))).child(self.render_tab_bar(cx));
+        } else {
+            header = header.child(
+                div()
+                    .pl(px(8.))
+                    .text_sm()
+                    .text_color(theme.fg_muted())
+                    .child("All Tasks"),
+            );
+        }
+        header.child(div().flex_1()).child(
+            Self::header_button("toggle-right-sidebar", Icons::panel_right())
+                .selected(self.right_sidebar.is_open())
+                .tooltip(tooltip("Toggle chat (⌘R)"))
+                .on_click(|_event, window, cx| {
+                    window.dispatch_action(Box::new(ToggleRightDock), cx);
+                }),
+        )
     }
 
     /// The right pane is the orchestrator chat — always on screen (⌘R hides
@@ -1924,7 +2062,16 @@ impl Workspace {
             .flex_grow(1.)
             .h_full()
             .overflow_hidden()
-            .bg(theme.bg());
+            .bg(theme.bg())
+            // The pane's own top row — history, tabs, the chat toggle — and
+            // the drag region this side of the window keeps.
+            .child(
+                div()
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(theme.border_subtle())
+                    .child(self.render_middle_header(cx)),
+            );
 
         if !loaded {
             return pane.child(
@@ -1946,7 +2093,8 @@ impl Workspace {
         pane.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body))
     }
 
-    /// A selected task's tab set: the strip, then the active tab's body.
+    /// A selected task's active tab body. The strip itself lives in the
+    /// middle header.
     fn render_task_pane(&self, id: &TaskId, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         // A task can leave the working set while history still points at it —
@@ -1964,59 +2112,39 @@ impl Workspace {
                 .into_any_element();
         }
 
-        let body: gpui::AnyElement = match self.task_tab {
-            // The landing tab. For now this is the inspector's content
-            // wholesale — milestone 3 redistributes it across Overview and
-            // Brief and adds the orchestrator-context block.
-            TaskTab::Overview => div()
-                .id("task-overview-scroll")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .child(self.render_inspector(cx))
-                .into_any_element(),
+        match self.task_tab {
+            TaskTab::Overview => self.render_overview(cx),
+            TaskTab::Brief => self.render_brief(cx),
             other => self.render_tab_placeholder(other, cx),
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(self.render_tab_bar(cx))
-            .child(body)
-            .into_any_element()
+        }
     }
 
-    /// The tab strip, hand-rolled in Zed's idiom: a quiet bar with a bottom
-    /// rule; the active tab reads at full contrast with an accent underline,
-    /// inactive tabs are muted and warm on hover. Stateless over
-    /// [`Self::task_tab`] — the strip is a projection, not an entity.
+    /// The tab strip, hand-rolled: text labels, the active one lifted on a
+    /// surface chip the way the design draws it, inactive ones muted and
+    /// warm on hover. Stateless over [`Self::task_tab`] — the strip is a
+    /// projection, not an entity.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         div()
-            .flex_none()
             .flex()
             .flex_row()
-            .items_end()
+            .items_center()
             .gap(px(2.))
-            .px(px(8.))
-            .border_b_1()
-            .border_color(theme.border_subtle())
             .children(TaskTab::ALL.into_iter().map(|tab| {
                 let active = tab == self.task_tab;
                 div()
                     .id(tab.id())
                     .px(px(10.))
-                    .py(px(6.))
-                    .mb(px(-1.))
-                    .border_b_2()
-                    .border_color(if active {
-                        theme.accent()
-                    } else {
-                        gpui::Hsla::transparent_black()
-                    })
+                    .py(px(3.))
+                    .rounded(px(5.))
                     .text_sm()
-                    .text_color(if active { theme.fg() } else { theme.fg_muted() })
+                    .map(|el| {
+                        if active {
+                            el.bg(theme.surface_secondary()).text_color(theme.fg())
+                        } else {
+                            el.text_color(theme.fg_muted())
+                        }
+                    })
                     .cursor_pointer()
                     .when(!active, |el| {
                         let fg = theme.fg();
@@ -2036,10 +2164,6 @@ impl Workspace {
     fn render_tab_placeholder(&self, tab: TaskTab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let (title, detail) = match tab {
-            TaskTab::Brief => (
-                "Brief",
-                "The spec and its review form land here (milestone 3).",
-            ),
             TaskTab::AgentFeed => (
                 "Agent Feed",
                 "The live Claude Code stream from this task's VM lands here (milestone 4).",
@@ -2048,7 +2172,7 @@ impl Workspace {
                 "Changes",
                 "The build's branch, summary and verification land here (milestone 5).",
             ),
-            TaskTab::Overview => ("Overview", ""),
+            TaskTab::Overview | TaskTab::Brief => unreachable!("these tabs render content"),
         };
         div()
             .flex_1()
@@ -2235,7 +2359,6 @@ impl Render for Workspace {
             .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
                 this.row_menu_open = false;
             }))
-            .child(self.render_title_bar(cx))
             .child(
                 div()
                     .flex()
