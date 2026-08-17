@@ -1993,7 +1993,8 @@ enum Capacity {
     /// The pool cannot hold what a full complement of work would need. Some
     /// dispatch will be refused with `pool exhausted`.
     Short { needed: usize, total: usize },
-    /// It fits exactly. Dispatches fine today; exhausts on the first leaked VM.
+    /// It fits exactly. Dispatches fine today; exhausts for as long as a
+    /// leaked VM holds its slot.
     NoSlack { needed: usize, total: usize },
     /// It fits with room over.
     Slack {
@@ -2024,10 +2025,15 @@ impl Capacity {
 ///
 /// `NoSlack` is a `warn!` rather than an `info!` on purpose: a pool sized
 /// exactly to the steady state dispatches perfectly well right up until one VM
-/// leaks, and then refuses everything. The operator reading this line is the
-/// person who can act on it, so both warnings name the variable *and* the fix
-/// — and the `Short` one names the alternative, since lowering
-/// `SCOUT_MAX_CONCURRENT` is as good an answer as raising the pool.
+/// leaks, and then refuses everything for as long as that leak lasts. It is a
+/// **window rather than a ratchet** — the pool frees a slot when that VM's own
+/// event stream ends, which for a scout whose owner died early can be most of
+/// an hour, and a whole daemon's worth is stopped by the next daemon on its
+/// socket. Long enough to strand a night's dispatch, which is why this is
+/// still a warning. The operator reading this line is the person who can act
+/// on it, so both warnings name the variable *and* the fix — and the `Short`
+/// one names the alternative, since lowering `SCOUT_MAX_CONCURRENT` is as good
+/// an answer as raising the pool.
 fn report_capacity(capacity: Capacity) {
     match capacity {
         Capacity::Short { needed, total } => warn!(
@@ -2043,7 +2049,8 @@ fn report_capacity(capacity: Capacity) {
             needed,
             total,
             "vm-pool fits this server exactly ({needed} of {total} slots) — one leaked \
-             VM exhausts it. Raise VM_POOL_MAX_VMS and restart `tasks vm-pool`"
+             VM exhausts it until that VM's own event stream ends, which can be most of \
+             an hour. Raise VM_POOL_MAX_VMS and restart `tasks vm-pool`"
         ),
         Capacity::Slack {
             needed,
@@ -2062,6 +2069,14 @@ fn report_capacity(capacity: Capacity) {
 ///
 /// Best-effort by construction. A failure here must not stop dispatch, since
 /// the whole point is to get slots back so dispatch can proceed.
+///
+/// **This is one of three reclamations and none of them subsumes another**, so
+/// do not collapse them. This one asks a *store* question — what does my
+/// database still point at for work that has already concluded. The pool's own
+/// per-VM forwarder asks a *liveness* question about a VM that pool holds, and
+/// frees its slot at the moment its event stream ends. The pool's ledger asks a
+/// *runtime-ownership* question — what did the last daemon on this socket
+/// start — which is the only one that survives that daemon's death.
 async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
     let leaked = match store.leaked_vm_ids().await {
         Ok(leaked) if leaked.is_empty() => return,
@@ -2078,8 +2093,12 @@ async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
     // Bounded like every other teardown: this loop is sequential and sits on
     // the dispatch loop's connect path, so one unanswered deallocate would
     // stall *all* dispatch — and it runs precisely when the pool is already
-    // in trouble. A failure or an expiry is logged; the row is cleared either
-    // way, so the next sweep retries whatever did not land.
+    // in trouble. A failure or an expiry is logged and the row is cleared
+    // anyway, which means this sweep is single-shot: clearing the row is
+    // precisely what stops it being retried. That is deliberate — a row that
+    // survived would be swept on every connect forever — and it is why the
+    // pool's own two mechanisms, which do not depend on this server's rows at
+    // all, are the ones that catch what this one walks away from.
     let handle = client.handle();
     for vm_id in leaked {
         let id = VmId::new(vm_id.clone());

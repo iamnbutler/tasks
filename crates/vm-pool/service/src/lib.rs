@@ -36,6 +36,13 @@ pub struct ServiceConfig {
     pub socket_path: PathBuf,
     /// Directory for snapshot storage.
     pub snapshot_dir: PathBuf,
+    /// Directory for this daemon's own durable state — currently the VM
+    /// ledger, one file per socket path, which is how the next daemon on this
+    /// socket learns what the last one left running.
+    ///
+    /// Deliberately somewhere that survives a reboot: a host that clears
+    /// `/tmp` would clear exactly the record needed after a restart.
+    pub state_dir: PathBuf,
     /// Pool configuration.
     pub pool: PoolConfig,
 }
@@ -50,6 +57,7 @@ impl Default for ServiceConfig {
         Self {
             socket_path: PathBuf::from("/tmp/vm-pool.sock"),
             snapshot_dir: state_dir.join("snapshots"),
+            state_dir,
             pool: PoolConfig::default(),
         }
     }
@@ -283,6 +291,17 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
 
     /// Run the service, listening for connections on the Unix socket.
     /// This blocks until the listener encounters a fatal error.
+    ///
+    /// The order is `Starting` → **bind** → adopt the ledger → reclaim what
+    /// the last daemon left → `Ready` → accept, and the position of the two
+    /// ledger steps is the whole safety argument. Construction touches the
+    /// ledger not at all, so a service whose socket is *refused* leaves the
+    /// incumbent's file byte-for-byte as it found it and stops none of its
+    /// VMs. After the bind the argument is a proof rather than an assumption:
+    /// [`bind_socket`] admits one live daemon per socket path, the ledger is
+    /// named for that path, and no command can have been processed because
+    /// nothing is accepting yet — a client that connected in between is
+    /// sitting in the kernel's backlog with its `Allocate` unread.
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         let socket_path = &self.config.socket_path;
 
@@ -296,6 +315,13 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
 
         let listener = bind_socket(socket_path).await?;
         info!("listening on {}", socket_path.display());
+
+        // Won the socket: whatever the ledger names is ours to stop.
+        let carried = self
+            .pool
+            .adopt_ledger(&self.config.state_dir, socket_path)
+            .await;
+        self.pool.reclaim_carried_over(carried).await;
 
         self.events
             .append(EventPayload::Service {
@@ -558,7 +584,211 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vm_pool_protocol::{ShellCommand, ShellProtocol, VmConfig, VmId};
+    use std::collections::HashMap;
+    use tokio::sync::{RwLock, mpsc};
+    use vm_pool_manager::{ImageRef, PoolError, VmHandle, VmLedger};
+    use vm_pool_protocol::{ShellCommand, ShellProtocol, VmCommand, VmConfig, VmEvent, VmId};
+
+    /// A [`VmRuntime`] that records what it was asked to stop.
+    ///
+    /// A stub at a seam the shipping code already has one for (`NoRuntime`),
+    /// not a mock of a process boundary — so it is within vm-pool's no-mocks
+    /// rule. It exists because "the runtime was asked to stop nothing" cannot
+    /// be observed through `SupervisorRuntime` (whose `stop` is a no-op) or
+    /// `NoRuntime`.
+    ///
+    /// Deliberately **duplicated** from the pool crate's tests rather than
+    /// shared through `vm-pool-test-support`: that crate is a dev-dependency
+    /// *of* `vm-pool-manager`, so a shared home would need a dev-dependency
+    /// cycle. Twenty lines of test code is the cheaper price.
+    /// A cloneable handle around shared state, so the test keeps one while the
+    /// service owns another — `Arc<RecordingRuntime>` would trip the orphan
+    /// rule here, since `VmRuntime` belongs to `vm-pool-manager`.
+    #[derive(Clone, Default)]
+    struct RecordingRuntime {
+        inner: Arc<RecordingInner>,
+    }
+
+    #[derive(Default)]
+    struct RecordingInner {
+        stopped: std::sync::Mutex<Vec<VmId>>,
+        senders: RwLock<HashMap<VmId, mpsc::Sender<VmEvent<ShellProtocol>>>>,
+    }
+
+    impl RecordingRuntime {
+        fn stopped(&self) -> Vec<VmId> {
+            let mut stopped = self.inner.stopped.lock().unwrap().clone();
+            stopped.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            stopped
+        }
+    }
+
+    impl VmRuntime<ShellProtocol> for RecordingRuntime {
+        async fn start(
+            &self,
+            vm_id: &VmId,
+            _image: &ImageRef,
+            _config: &VmConfig,
+        ) -> Result<VmHandle<ShellProtocol>, PoolError> {
+            let (cmd_tx, _cmd_rx) = mpsc::channel::<VmCommand<ShellProtocol>>(1);
+            let (evt_tx, evt_rx) = mpsc::channel(1);
+            self.inner
+                .senders
+                .write()
+                .await
+                .insert(vm_id.clone(), evt_tx);
+            Ok(VmHandle {
+                command_tx: cmd_tx,
+                event_rx: evt_rx,
+            })
+        }
+
+        async fn stop(&self, vm_id: &VmId) -> Result<(), PoolError> {
+            self.inner.stopped.lock().unwrap().push(vm_id.clone());
+            self.inner.senders.write().await.remove(vm_id);
+            Ok(())
+        }
+    }
+
+    /// Leave a ledger behind for `socket_path`, as a predecessor daemon would.
+    /// Returns the file it wrote.
+    async fn predecessors_ledger(state_dir: &Path, socket_path: &Path, ids: &[&str]) -> PathBuf {
+        let ledger = VmLedger::disabled();
+        ledger.enable(state_dir, socket_path).await;
+        for id in ids {
+            ledger.record(&VmId::new(*id)).await;
+        }
+        ledger.path().await.expect("an enabled ledger has a file")
+    }
+
+    async fn recording_service(
+        config: ServiceConfig,
+        runtime: RecordingRuntime,
+    ) -> Arc<Service<RecordingRuntime, ShellProtocol>> {
+        Service::<RecordingRuntime, ShellProtocol>::with_runtime(config, runtime)
+            .await
+            .unwrap()
+    }
+
+    /// Merely constructing a service must not open the ledger — the property
+    /// that would catch a refactor moving the adopt back into `with_runtime`,
+    /// where the safety argument would be circular. Observed through
+    /// `Pool::ledger_outstanding`, since every other test here starts a
+    /// service that binds.
+    #[tokio::test]
+    async fn constructing_a_service_does_not_open_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vm-pool.sock");
+        predecessors_ledger(dir.path(), &socket, &["vm-left-over"]).await;
+
+        let runtime = RecordingRuntime::default();
+        let svc = recording_service(
+            ServiceConfig {
+                socket_path: socket,
+                snapshot_dir: dir.path().join("snapshots"),
+                state_dir: dir.path().to_path_buf(),
+                pool: PoolConfig::default(),
+            },
+            runtime.clone(),
+        )
+        .await;
+
+        assert!(
+            svc.pool.ledger_outstanding().await.is_empty(),
+            "construction adopted a ledger it has no right to act on"
+        );
+        assert!(runtime.stopped().is_empty());
+    }
+
+    /// A service whose socket is refused must discharge **nothing**: it did
+    /// not win the socket, so the ids in that file may well belong to the live
+    /// daemon that did. Both halves are asserted — the runtime was asked to
+    /// stop nothing, *and* the incumbent's file is byte-for-byte what it was.
+    #[tokio::test]
+    async fn a_refused_socket_discharges_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("live.sock");
+        let ledger_path = predecessors_ledger(dir.path(), &socket, &["vm-a", "vm-b"]).await;
+        let before = std::fs::read(&ledger_path).unwrap();
+
+        let _incumbent = bind_socket(&socket).await.expect("a free path binds");
+
+        let runtime = RecordingRuntime::default();
+        let svc = recording_service(
+            ServiceConfig {
+                socket_path: socket.clone(),
+                snapshot_dir: dir.path().join("snapshots"),
+                state_dir: dir.path().to_path_buf(),
+                pool: PoolConfig::default(),
+            },
+            runtime.clone(),
+        )
+        .await;
+
+        let err = svc.run().await.expect_err("the socket is occupied");
+        assert!(
+            err.to_string().contains("refusing to start a second one"),
+            "{err}"
+        );
+        assert!(
+            runtime.stopped().is_empty(),
+            "a pool that lost the socket stopped VMs that are not its own: {:?}",
+            runtime.stopped()
+        );
+        assert_eq!(
+            std::fs::read(&ledger_path).unwrap(),
+            before,
+            "the incumbent's ledger must be exactly as it was found"
+        );
+    }
+
+    /// The control for the test above: without it, `a_refused_socket_discharges_nothing`
+    /// could pass by the feature not working at all.
+    #[tokio::test]
+    async fn a_bound_socket_discharges_the_predecessors_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vm-pool.sock");
+        let ledger_path = predecessors_ledger(dir.path(), &socket, &["vm-a", "vm-b"]).await;
+
+        let runtime = RecordingRuntime::default();
+        let svc = recording_service(
+            ServiceConfig {
+                socket_path: socket.clone(),
+                snapshot_dir: dir.path().join("snapshots"),
+                state_dir: dir.path().to_path_buf(),
+                pool: PoolConfig::default(),
+            },
+            runtime.clone(),
+        )
+        .await;
+
+        let running = svc.clone();
+        let handle = tokio::spawn(async move { running.run().await });
+
+        let mut stopped = Vec::new();
+        for _ in 0..200 {
+            stopped = runtime.stopped();
+            if stopped.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(stopped, vec![VmId::new("vm-a"), VmId::new("vm-b")]);
+        assert!(
+            svc.pool.ledger_outstanding().await.is_empty(),
+            "an id the runtime reported stopped is not carried again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ledger_path)
+                .unwrap()
+                .matches("vm-")
+                .count(),
+            0,
+            "the file should now assert nothing"
+        );
+
+        handle.abort();
+    }
 
     #[test]
     fn an_unset_or_blank_pool_size_is_the_default() {
@@ -600,6 +830,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: dir.path().join("test.sock"),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: dir.path().to_path_buf(),
             pool: PoolConfig {
                 max_vms: 3,
                 health_check_interval: 30,
@@ -689,6 +920,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: path.clone(),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: dir.path().to_path_buf(),
             pool: PoolConfig::default(),
         };
         let svc = Service::<NoRuntime, ShellProtocol>::new(config)
@@ -775,6 +1007,7 @@ mod tests {
         let config = ServiceConfig {
             socket_path: dir.path().join("test.sock"),
             snapshot_dir: dir.path().join("snapshots"),
+            state_dir: dir.path().to_path_buf(),
             pool: PoolConfig {
                 max_vms: 1,
                 health_check_interval: 30,

@@ -529,7 +529,8 @@ impl Scout {
         // Always try to deallocate, and never wait forever on it — the same
         // unbounded call that stalled the build queue holds a scout
         // concurrency slot here. Failures are not the dispatch's problem: the
-        // pool's health loop reaps if we die mid-call. For a timeout this
+        // pool frees the slot when that VM's event stream ends, and the next
+        // daemon on its socket stops what is left. For a timeout this
         // *is* the cancel — there is deliberately no in-band Cancel command,
         // so freeing the slot means destroying the VM.
         crate::teardown::deallocate_bounded(

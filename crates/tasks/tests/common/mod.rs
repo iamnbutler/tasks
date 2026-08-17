@@ -389,6 +389,7 @@ pub async fn spawn_vm_pool(
     let config = ServiceConfig {
         socket_path: socket.clone(),
         snapshot_dir,
+        state_dir: tmp.join("vm-pool-state"),
         pool: PoolConfig {
             max_vms,
             health_check_interval: 60,

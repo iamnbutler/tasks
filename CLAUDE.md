@@ -691,9 +691,36 @@ reserve ≈22 GB.
 So the recommended ceiling against the default pool is **`SCOUT_MAX_CONCURRENT
 = 3`** — 4 of 6 slots, two spare. 4 scouts is 5 of 6 and 5 is 6 of 6, where a
 single leaked VM (one whose owner died between allocate and deallocate, held
-until the sweep reclaims it) exhausts the pool and every dispatch is refused.
-To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check the memory
-ledger first.
+until its own event stream ends) exhausts the pool and every dispatch is
+refused. To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check
+the memory ledger first.
+
+**Two leaks eat slots, and they need two mechanisms — neither of which is the
+sweep the docs used to point at.** `run::sweep_leaked_vms` asks a *store*
+question ("what does my database still point at for work that has concluded"),
+and it is single-shot: the row is cleared whether or not the deallocate landed.
+It cannot see either leak below, and all three stay. A **slot leak** is a VM
+that died while the pool still counted it — the pool used to go on counting it
+until `vm_timeout`, two hours — and is now reclaimed *event-driven*, at the
+instant of death, from the end of that VM's event stream. Its owner's
+`deallocate` still succeeds and still runs the **full** teardown, because a
+supervisor that died inside a container that is still running looks identical
+from there; the acknowledgement is consumed, so a second `deallocate` is
+`VmNotFound` again and `VmNotFound` keeps its one honest meaning. An **orphan
+leak** is a VM whose whole daemon went away (`container run` outlives the
+process that spawned it), and it is stopped by the *next* daemon on that
+socket, from a write-ahead `VmLedger` under `ServiceConfig::state_dir` (the
+data dir, deliberately not `/tmp`, which a reboot may clear) keyed by socket
+path. The ledger is read and discharged strictly **between the bind and the
+accept loop** — never at construction, where a second pool started against a
+live one would kill that pool's in-flight scouts and Builder and then exit on
+`AlreadyRunning`. Two limits are stated rather than implied. Against
+`ContainerRuntime`, whose `stop` returns `Ok(())` whether or not the container
+died, orphan recovery is **single-shot**: the true sentence is "the successor
+asked the runtime to stop it", not "it is stopped". What *is* recoverable on
+every runtime is an **interrupted** reclaim, because the ledger seeds its
+in-memory set at read time and persists the remainder after each stop — so a
+daemon that dies partway through hands the rest to the next one.
 
 `VM_POOL_MAX_VMS` is read by **`tasks vm-pool`, not by the server** — both
 entry points honour it (`max_vms_from_env` is public and separate from
@@ -846,8 +873,11 @@ too old, unanswerable, or unreachable — `ResumedWork` membership is a promise
 to conclude the row, so a claim made against a pool that cannot decode `attach`
 would fail the run rather than lose the stream. The remaining cost is the
 one-time restart itself: whatever vm-pool is holding is lost once (the event
-log is in memory), and the leaked VMs are collected by the sweep on the next
-connect. `dispatch_loop` logs the skew on every connect, because the bill
+log is in memory), and the VMs it leaves running are stopped by the pool that
+takes the socket next, off the ledger the old one wrote — that is the orphan
+half of *Pool capacity* above, and it is why the restarted pool is the thing
+that cleans up rather than the server's own sweep, which never sees them.
+`dispatch_loop` logs the skew on every connect, because the bill
 otherwise only arrives at the next restart, by which point the work it costs is
 already in flight.
 
