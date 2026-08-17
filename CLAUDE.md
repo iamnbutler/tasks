@@ -227,7 +227,14 @@ implementation.
   time someone improves a sentence. One decision point per dispatcher
   (`ScoutError::failure_class` / `BuilderError::failure_class` into
   `Strike::for_class`), so the restart-orphan exclusion is a *class* rather than
-  a second mechanism beside it. Wire skew runs both ways and only one way is
+  a second mechanism beside it. Not every class comes off a terminal event,
+  though: the failures where there *is* no terminal event are classified by the
+  **host**, in those same two functions — `Egress`, because the agent finished
+  and the push is what failed, and `StreamClosed`, because vm-pool going away
+  means the host stopped being able to observe the run at all. vm-pool is a
+  separate daemon this document says to restart *ahead* of the server, so the
+  second one is routine maintenance rather than a judgement, and it used to
+  charge the whole batch. Wire skew runs both ways and only one way is
   obvious: `#[serde(default)]` covers an older supervisor omitting the field,
   while a hand-written `Deserialize` decays an *unknown* class to `Verdict`,
   because a lost terminal event does not cost a strike — it costs the run its

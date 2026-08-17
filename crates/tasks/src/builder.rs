@@ -82,12 +82,13 @@ impl BuilderError {
     /// Whether this failure judged the work — the one decision point this
     /// dispatcher has, read by [`Builder::conclude`].
     ///
-    /// `Egress` is `Transport`: it happens *after* an implementation exists,
-    /// so nothing about it judged the work. Surfacing and charging are
-    /// separable — the waive path appends a `Note` naming the class and the
-    /// underlying error, so the failure stays exactly as visible, and what
-    /// charging would add is only the strike. `Timeout` is charged for the
-    /// reason a scout's is: the run had the entire budget.
+    /// Two cases are `Transport`. `Egress` happens *after* an implementation
+    /// exists, so nothing about it judged the work; `StreamClosed` means the
+    /// host stopped being able to observe the run at all. Surfacing and
+    /// charging are separable — the waive path appends a `Note` naming the
+    /// class and the underlying error, so the failure stays exactly as
+    /// visible, and what charging would add is only the strike. `Timeout` is
+    /// charged for the reason a scout's is: the run had the entire budget.
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::BuildFailed { class, .. } => *class,
@@ -102,11 +103,26 @@ impl BuilderError {
             // case: 102 turns, exit 0, rejected by `bundle tip … does not
             // match the reported head …`, and charged for it.
             Self::Egress(_) => FailureClass::Transport,
-            Self::Store(_)
-            | Self::Client(_)
-            | Self::GitHub(_)
-            | Self::StreamClosed
-            | Self::Timeout { .. } => FailureClass::Verdict,
+            // And a closed stream meets "nothing judged the work" harder than
+            // Egress does: an egress failure at least knows the agent
+            // finished, whereas this one means the host stopped being able to
+            // observe the run at all. It recurs for a structural reason —
+            // vm-pool is a separate long-lived daemon, upgraded separately
+            // and, per CLAUDE.md, restarted *ahead* of this server — so every
+            // vm-pool restart that caught a build in flight used to charge
+            // the whole batch, and three of them `blocked` specs that had
+            // never failed to build.
+            Self::StreamClosed => FailureClass::Transport,
+            // `Client(_)` stays a verdict deliberately, not by oversight.
+            // `Store::finalize_build_unsuccessfully` only charges `if
+            // started` (the row has a `vm_id`, set immediately after
+            // `allocate`), so this arm can only bite after a VM exists —
+            // whether that is really transport is a separate question with
+            // its own argument to make, and widening it silently here would
+            // decide it for the scout too.
+            Self::Store(_) | Self::Client(_) | Self::GitHub(_) | Self::Timeout { .. } => {
+                FailureClass::Verdict
+            }
         }
     }
 }
@@ -1132,6 +1148,56 @@ mod tests {
         assert_eq!(
             BuilderError::Timeout { secs: 1 }.failure_class(),
             FailureClass::Verdict,
+        );
+    }
+
+    /// vm-pool is a separate long-lived daemon, upgraded separately and
+    /// restarted *ahead* of this server, so a restart routinely catches a
+    /// build in flight. `Builder::conclude` reads `failure_class()` straight
+    /// into `Strike::for_class`, and the arm sat four lines below the comment
+    /// arguing why `Egress` is transport — so every such restart charged the
+    /// whole batch, and three of them `blocked` specs that never failed.
+    ///
+    /// The negative half is not optional: this rule is a *cap*, and "nothing
+    /// was charged" reads identically to the cap having been switched off
+    /// unless something in the same test still gets charged.
+    #[test]
+    fn a_closed_event_stream_is_transport_and_costs_the_batch_no_attempt() {
+        use crate::store::Strike;
+
+        assert_eq!(
+            BuilderError::StreamClosed.failure_class(),
+            FailureClass::Transport,
+        );
+        assert!(!BuilderError::StreamClosed.failure_class().is_verdict());
+        assert_eq!(
+            Strike::for_class(BuilderError::StreamClosed.failure_class()),
+            Strike::Waive,
+        );
+        // And the waiver has something to log: a note that names the class and
+        // the failure is what keeps an unspent attempt distinguishable from a
+        // cap somebody switched off.
+        assert!(
+            BuilderError::StreamClosed
+                .to_string()
+                .contains("event stream closed"),
+        );
+
+        // The negative half: a run that concluded and produced nothing, and a
+        // run that had the entire budget, both still pay.
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::BuildFailed {
+                    reason: "agent produced no commits".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+        assert_eq!(
+            Strike::for_class(BuilderError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
         );
     }
 
