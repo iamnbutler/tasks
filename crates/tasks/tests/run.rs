@@ -5,12 +5,13 @@
 //! real scout-supervisor binary with a stub agent. No mocks.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
-use axum::response::Json as AxumJson;
+use axum::response::{IntoResponse, Json as AxumJson};
 use axum::routing::post;
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -23,11 +24,13 @@ use tasks_protocol::TasksProtocol;
 
 use tasks::events::EventPayload;
 use tasks::github::{GitHubClient, IntakeFilter};
+use tasks::github_health::GitHubHealth;
 use tasks::models::{
-    GhState, Mode, Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Task,
-    TaskId, TaskState,
+    Build, BuildStatus, Complexity, DecisionInput, GhState, Mode, Project, ProjectId,
+    ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
-use tasks::run::{self, Config, InFlight};
+use tasks::run::{self, Config, GitHubWatch, InFlight};
 use tasks::store::Store;
 
 mod common;
@@ -111,6 +114,325 @@ async fn insert_project(store: &Store) -> Project {
     project
 }
 
+/// [`run::poll_once`] with a throwaway reachability record.
+///
+/// Most of this file is about what a pass *does*; the tests that are about
+/// whether GitHub is answering build their own [`GitHubHealth`] and read it
+/// back. One wrapper keeps that distinction to the tests that mean it.
+async fn poll_once(
+    store: &Store,
+    github: &GitHubClient,
+    intake: &IntakeFilter,
+    trunk: &str,
+) -> Result<usize, tasks::store::StoreError> {
+    let health = GitHubHealth::default();
+    let watch = GitHubWatch::new(&health, store);
+    run::poll_once(store, github, intake, trunk, &watch).await
+}
+
+// --- GitHub reachability ---
+
+/// A GraphQL endpoint that can be taken down and brought back while a poll loop
+/// is running: while `down`, every request is a real 503 off a real server.
+async fn spawn_switchable_github(page: Value) -> (String, Arc<AtomicBool>) {
+    let down = Arc::new(AtomicBool::new(true));
+    let state = (down.clone(), page);
+    let app = Router::new()
+        .route(
+            "/graphql",
+            post(
+                move |State((down, page)): State<(Arc<AtomicBool>, Value)>,
+                      _body: String| async move {
+                    if down.load(Ordering::SeqCst) {
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            AxumJson(json!({"message": "Service Unavailable"})),
+                        )
+                            .into_response();
+                    }
+                    AxumJson(page.clone()).into_response()
+                },
+            ),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/graphql"), down)
+}
+
+/// Notes the poller wrote about GitHub's reachability, in order.
+async fn poller_notes(store: &Store) -> Vec<String> {
+    store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EventPayload::Note { source, message } if source == "poller" => Some(message),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An outage nobody could have prevented, set by hand — the state a poll loop
+/// would have left behind.
+fn unavailable() -> Result<(), tasks::github::GhError> {
+    Err(tasks::github::GhError::Rest {
+        what: "list issues".into(),
+        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        message: "Service Unavailable".into(),
+    })
+}
+
+/// The whole reachability record, driven by a real poll loop against a real
+/// server that stops answering and then starts again.
+///
+/// Three things at once, because they are the three rules: one failed call
+/// holds, the hold is announced exactly *once* however long the outage runs,
+/// and only a success releases it — after which intake resumes on its own.
+#[tokio::test]
+async fn a_failing_poll_holds_dispatch_announces_once_and_releases_on_recovery() {
+    let (github_url, down) = spawn_switchable_github(page(vec![issue(1, "first", "OPEN")])).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    insert_project(&store).await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let mut config = test_config(Path::new("/nonexistent"), Path::new("/nonexistent"), 1);
+    config.github_token = Some("token".into());
+    config.github_api_url = Some(github_url);
+    config.poll_interval = Duration::from_millis(50);
+
+    let health = Arc::new(GitHubHealth::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::poll_loop(
+        store.clone(),
+        config,
+        health.clone(),
+        shutdown_rx,
+    ));
+
+    let h = health.clone();
+    wait_until(Duration::from_secs(10), || {
+        let h = h.clone();
+        async move { h.hold(Utc::now()).is_some() }
+    })
+    .await;
+    // Several more failed passes: the hold keeps counting, and stays quiet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let held = health.hold(Utc::now()).expect("still held");
+    assert!(
+        held.failures > 1,
+        "the poller keeps looking: {} failures",
+        held.failures
+    );
+    assert!(store.list_tasks().await.unwrap().is_empty());
+    let notes = poller_notes(&store).await;
+    assert_eq!(notes.len(), 1, "one edge, one announcement: {notes:?}");
+    assert!(notes[0].contains("not answering"), "{}", notes[0]);
+    assert!(
+        notes[0].contains("nothing is charged an attempt"),
+        "{}",
+        notes[0]
+    );
+
+    // The release half. Without it, "held ⇒ nothing ingested" passes just as
+    // well when the loop is simply broken.
+    down.store(false, Ordering::SeqCst);
+    let s = store.clone();
+    wait_until(Duration::from_secs(10), || {
+        let s = s.clone();
+        async move { !s.list_tasks().await.unwrap().is_empty() }
+    })
+    .await;
+    assert!(health.hold(Utc::now()).is_none(), "a success releases it");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notes = poller_notes(&store).await;
+    assert_eq!(notes.len(), 2, "the release is one edge too: {notes:?}");
+    assert!(notes[1].contains("answering again"), "{}", notes[1]);
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("poll loop exits on shutdown")
+        .unwrap();
+}
+
+/// A Scout's first act is a clone, so a scout started during an outage dies in
+/// setup and is charged a dispatch attempt for something no task did (#939).
+///
+/// The release half is not optional: "held ⇒ nothing dispatched" passes just as
+/// well when the dispatch loop is broken, so the test flips the record back and
+/// waits for the work to actually go out.
+#[tokio::test]
+async fn a_github_hold_starts_no_scout_and_charges_nothing() {
+    let (_tmp, store, config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "waits for github").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let health = Arc::new(GitHubHealth::default());
+    health.observe(&unavailable(), Utc::now());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        health.clone(),
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "a held dispatcher starts nothing"
+    );
+    let held = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(held.state, TaskState::Queued, "and moves nothing");
+    assert_eq!(
+        held.dispatch_attempts, 0,
+        "holding costs the task no attempt — that is the whole point"
+    );
+
+    health.observe(&Ok::<(), tasks::github::GhError>(()), Utc::now());
+    let s = store.clone();
+    wait_until(Duration::from_secs(60), || {
+        let s = s.clone();
+        async move { s.list_specs().await.unwrap().len() == 1 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    assert_eq!(dispatch_order(&store).await, vec![task.id.clone()]);
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0
+    );
+}
+
+/// The serial build lane, which clones too — and where the bug was expensive:
+/// one outage charged a build attempt to every spec in the batch.
+///
+/// The hold sits in the loop's match guard, *ahead* of the claim, so a held
+/// lane must leave the build `queued` rather than flipping it `running` (and
+/// its batch's tasks to `building`) on every tick of the outage.
+#[tokio::test]
+async fn a_github_hold_never_claims_a_build() {
+    let (_tmp, store, mut config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let (task, build) = queued_build(&store, &project).await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    // An unconfigured lane disables itself, and this test would then pass for
+    // the wrong reason. The budget is short because the release half really
+    // dispatches, and `build_loop` awaits a build inline.
+    config.github_token = Some("token".into());
+    config.builder_timeout = Duration::from_secs(10);
+
+    let health = Arc::new(GitHubHealth::default());
+    health.observe(&unavailable(), Utc::now());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::build_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        health.clone(),
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        store.get_build(&build.id).await.unwrap().unwrap().status,
+        BuildStatus::Queued,
+        "a held lane never claims"
+    );
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::ReadyToBuild,
+        "and never drags its batch's tasks to `building`"
+    );
+
+    health.observe(&Ok::<(), tasks::github::GhError>(()), Utc::now());
+    let s = store.clone();
+    let id = build.id.clone();
+    wait_until(Duration::from_secs(30), || {
+        let s = s.clone();
+        let id = id.clone();
+        async move { s.get_build(&id).await.unwrap().unwrap().status != BuildStatus::Queued }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("build loop exits on shutdown")
+        .unwrap();
+}
+
+/// One approved spec, by the path a real one takes, with a build queued behind
+/// it — the state the serial lane wakes up to.
+async fn queued_build(store: &Store, project: &Project) -> (Task, Build) {
+    let now = Utc::now();
+    let task = insert_task(store, project, 90, "wants building").await;
+    store
+        .update_task_state(&task.id, TaskState::ReadyToBuild)
+        .await
+        .unwrap();
+    let session = Session {
+        id: SessionId::new(),
+        task_id: task.id.clone(),
+        vm_id: None,
+        branch: format!("scout/{}", task.id),
+        status: SessionStatus::ScoutSucceeded,
+        started_at: now,
+        completed_at: Some(now),
+        exit_reason: None,
+        usage: None,
+        directions: None,
+    };
+    store.insert_session(&session).await.unwrap();
+    let spec = Spec {
+        id: SpecId::new(),
+        session_id: Some(session.id),
+        task_id: task.id.clone(),
+        content: "## Spec".into(),
+        complexity: Complexity::Simple,
+        files_touched: vec![],
+        created_at: now,
+    };
+    store.insert_spec(&spec).await.unwrap();
+    store
+        .upsert_spec_queue_entry(&SpecQueueEntry {
+            spec_id: spec.id.clone(),
+            status: SpecQueueStatus::Approved,
+            rank: None,
+            approved_at: Some(now),
+            feedback: None,
+            blocking_dependencies: vec![],
+        })
+        .await
+        .unwrap();
+    let build = store
+        .create_build(&[spec.id], "main", DecisionInput::human())
+        .await
+        .unwrap();
+    (task, build)
+}
+
 #[tokio::test]
 async fn poll_ingests_issues_once_and_tracks_closures() {
     let url = spawn_fake_github(vec![
@@ -127,7 +449,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
     let store = Store::open_in_memory().await.unwrap();
     let project = insert_project(&store).await;
 
-    let ingested = run::poll_once(&store, &github, &IntakeFilter::All, "main")
+    let ingested = poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(ingested, 2);
@@ -145,7 +467,7 @@ async fn poll_ingests_issues_once_and_tracks_closures() {
 
     // Re-poll: nothing new, and the closed issue's task is marked closed
     // without being re-ingested or losing its id.
-    let ingested = run::poll_once(&store, &github, &IntakeFilter::All, "main")
+    let ingested = poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(ingested, 0);
@@ -205,7 +527,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     let project = insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         3
@@ -222,7 +544,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     };
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0,
@@ -255,7 +577,7 @@ async fn poll_closes_tasks_whose_issues_left_the_open_set() {
     // The canned server repeats its last page, so a third poll sees the same
     // open set: no further writes, no duplicate events.
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0
@@ -277,7 +599,7 @@ async fn a_failed_fetch_reconciles_nothing() {
     let store = Store::open_in_memory().await.unwrap();
     insert_project(&store).await;
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         2
@@ -285,7 +607,7 @@ async fn a_failed_fetch_reconciles_nothing() {
 
     // The project is skipped, not failed: intake for other projects goes on.
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0
@@ -316,14 +638,14 @@ async fn a_reopened_issue_polls_back_to_open() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         1
     );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
 
-    run::poll_once(&store, &github, &IntakeFilter::All, "main")
+    poll_once(&store, &github, &IntakeFilter::All, "main")
         .await
         .unwrap();
     assert_eq!(
@@ -332,7 +654,7 @@ async fn a_reopened_issue_polls_back_to_open() {
     );
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0,
@@ -370,7 +692,7 @@ async fn an_archived_project_stops_ingesting_but_keeps_reconciling() {
     let store = Store::open_in_memory().await.unwrap();
     let project = insert_project(&store).await;
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         1
@@ -382,7 +704,7 @@ async fn an_archived_project_stops_ingesting_but_keeps_reconciling() {
         .await
         .unwrap();
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         0,
@@ -415,7 +737,7 @@ async fn a_paused_project_still_ingests() {
         .unwrap();
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         2
@@ -451,9 +773,7 @@ async fn a_label_filter_ingests_only_labelled_issues() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         2
     );
     let mut numbers: Vec<u64> = store
@@ -486,7 +806,7 @@ async fn an_unset_filter_ingests_everything() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll_once(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap(),
         2
@@ -510,17 +830,13 @@ async fn an_issue_that_gains_the_label_is_ingested_on_the_next_poll() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         0
     );
     assert!(store.list_tasks().await.unwrap().is_empty());
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         1
     );
     let tasks = store.list_tasks().await.unwrap();
@@ -549,9 +865,7 @@ async fn a_task_whose_issue_loses_the_label_is_kept_and_left_alone() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         1
     );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
@@ -566,9 +880,7 @@ async fn a_task_whose_issue_loses_the_label_is_kept_and_left_alone() {
         .unwrap();
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         0,
         "nothing new to ingest"
     );
@@ -605,24 +917,18 @@ async fn an_unlabelled_task_still_tracks_upstream_closure() {
     insert_project(&store).await;
 
     assert_eq!(
-        run::poll_once(&store, &github, &intake, "main")
-            .await
-            .unwrap(),
+        poll_once(&store, &github, &intake, "main").await.unwrap(),
         1
     );
     let task_id = store.list_tasks().await.unwrap()[0].id.clone();
 
-    run::poll_once(&store, &github, &intake, "main")
-        .await
-        .unwrap();
+    poll_once(&store, &github, &intake, "main").await.unwrap();
     assert_eq!(
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Open
     );
 
-    run::poll_once(&store, &github, &intake, "main")
-        .await
-        .unwrap();
+    poll_once(&store, &github, &intake, "main").await.unwrap();
     assert_eq!(
         store.get_task(&task_id).await.unwrap().unwrap().gh_state,
         GhState::Closed,
@@ -654,7 +960,12 @@ async fn poll_loop_honours_the_configured_intake_label() {
     config.intake = IntakeFilter::from_label(Some("tasks".into()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::poll_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::poll_loop(
+        store.clone(),
+        config,
+        Arc::new(GitHubHealth::default()),
+        shutdown_rx,
+    ));
 
     let s = store.clone();
     wait_until(Duration::from_secs(10), || {
@@ -690,7 +1001,12 @@ async fn poll_loop_skips_polling_while_stopped() {
     config.poll_interval = Duration::from_millis(50);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = tokio::spawn(run::poll_loop(store.clone(), config, shutdown_rx));
+    let handle = tokio::spawn(run::poll_loop(
+        store.clone(),
+        config,
+        Arc::new(GitHubHealth::default()),
+        shutdown_rx,
+    ));
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -728,6 +1044,7 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 
@@ -920,6 +1237,7 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 
@@ -976,6 +1294,7 @@ async fn pause_blocks_new_dispatches() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 
@@ -988,6 +1307,12 @@ async fn pause_blocks_new_dispatches() {
 
     // Pause, then queue more work: the loop must leave it alone.
     store.set_mode(Mode::Pause).await.unwrap();
+    // One tick of daylight between the pause and the task, deliberately.
+    // `top_up` reads the mode and *then* queries the queue, so a tick that
+    // read `Play` a moment before this pause is still entitled to dispatch
+    // whatever it finds — and the assertion below would then be about which
+    // write won rather than about pausing.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let second = insert_task(&store, &project, 2, "second").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
@@ -1056,6 +1381,7 @@ async fn an_agent_that_concluded_with_nothing_still_burns_its_three() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1137,6 +1463,7 @@ async fn an_infrastructure_death_never_rejects_the_task() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 
@@ -1217,6 +1544,7 @@ async fn a_restart_resumes_the_persisted_attempt_count() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1287,6 +1615,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 
@@ -1335,6 +1664,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
         store.clone(),
         config,
         InFlight::default(),
+        Arc::new(GitHubHealth::default()),
         shutdown_rx,
     ));
 

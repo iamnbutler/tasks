@@ -21,12 +21,13 @@ use axum::extract::{Path as AxumPath, State};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tasks::github::{GitHubClient, IntakeFilter};
+use tasks::github_health::GitHubHealth;
 use tasks::models::{
     Actor, Build, Capability, CharterLevel, Complexity, DecisionAction, DecisionInput, GhState,
     Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId,
     SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
-use tasks::run::poll_once;
+use tasks::run::{GitHubWatch, poll_once};
 use tasks::store::Store;
 
 /// How the fake's pull request looks, and what it saw.
@@ -155,9 +156,19 @@ struct Harness {
 
 impl Harness {
     async fn poll(&self) {
-        poll_once(&self.store, &self.github, &IntakeFilter::All, "main")
-            .await
-            .unwrap();
+        // A throwaway reachability record: this file is about what a pass does
+        // with a pull request, not about whether GitHub is answering.
+        let health = GitHubHealth::default();
+        let watch = GitHubWatch::new(&health, &self.store);
+        poll_once(
+            &self.store,
+            &self.github,
+            &IntakeFilter::All,
+            "main",
+            &watch,
+        )
+        .await
+        .unwrap();
     }
 
     async fn task(&self, id: &TaskId) -> Task {

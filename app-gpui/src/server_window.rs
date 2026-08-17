@@ -188,12 +188,19 @@ impl ServerWindow {
             None => "—".to_string(),
         };
 
+        // Only when there is something to say — see `github_hold_line`.
+        let github = status
+            .as_ref()
+            .and_then(github_hold_line)
+            .map(|line| self.fact("GitHub", line, cx));
+
         div()
             .flex()
             .flex_col()
             .gap(px(2.))
             .child(self.fact("Server", serving, cx))
             .child(self.fact("Pipeline", mode, cx))
+            .children(github)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -717,6 +724,30 @@ fn images_line(status: &ServerStatus) -> String {
     parts.join(", ")
 }
 
+/// Why the pipeline is idle, when the reason is that GitHub is not answering —
+/// the same reading `tasks status` prints.
+///
+/// `None` when there is no hold, and the row is left out entirely: a standing
+/// "GitHub ok" line is one a reader learns to skip, and this one has to land
+/// the one time it appears.
+///
+/// Both ages are shown. How long the outage has run and how long ago the last
+/// observation was are different facts, and the gap between them is the
+/// difference between a hold somebody is still refreshing and one about to
+/// expire on its own.
+fn github_hold_line(status: &ServerStatus) -> Option<String> {
+    let hold = status.github.as_ref()?;
+    Some(format!(
+        "not answering for {} ({} failed call(s), last {} ago) — scout and build \
+         dispatch is held; queued work stays queued and nothing is charged an \
+         attempt.  {}",
+        time::since(hold.since),
+        hold.failures,
+        time::since(hold.last_seen),
+        hold.error
+    ))
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -763,7 +794,34 @@ mod tests {
             mode: Mode::Play,
             in_flight: InFlight::default(),
             images: Vec::new(),
+            github: None,
         }
+    }
+
+    /// The row exists only while there is a hold, and when it does it has to
+    /// answer the reader's real question: why is nothing being dispatched, and
+    /// is work being lost?
+    #[test]
+    fn a_github_hold_is_named_only_while_it_lasts() {
+        use tasks_client::api::http::GitHubHold;
+
+        let mut status = status();
+        assert_eq!(github_hold_line(&status), None);
+
+        status.github = Some(GitHubHold {
+            since: Utc::now() - chrono::Duration::minutes(12),
+            last_seen: Utc::now() - chrono::Duration::seconds(30),
+            failures: 12,
+            error: "rest: list issues: 503 Service Unavailable: Service Unavailable".into(),
+        });
+        let line = github_hold_line(&status).expect("a hold is worth a row");
+        assert!(line.contains("dispatch is held"), "{line}");
+        assert!(
+            line.contains("nothing is charged an attempt"),
+            "the reader's next question is whether work is being lost: {line}"
+        );
+        assert!(line.contains("12 failed call"), "{line}");
+        assert!(line.contains("503"), "{line}");
     }
 
     #[test]

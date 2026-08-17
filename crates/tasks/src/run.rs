@@ -64,7 +64,8 @@ use crate::brief::Brief;
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::bundles::RejectedBundles;
 use crate::events::EventPayload;
-use crate::github::{GitHubClient, IntakeFilter, PrState};
+use crate::github::{GhError, GitHubClient, IntakeFilter, PrState};
+use crate::github_health::{GitHubHealth, Transition};
 use crate::models::{
     Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput, GhState,
     Mode, Project, Spec, Task, TaskId, TaskState,
@@ -177,6 +178,9 @@ pub(crate) const DISPATCHER: &str = "dispatcher";
 
 /// `source` on breadcrumbs about the orchestrator's own lifecycle.
 const ORCHESTRATOR: &str = "orchestrator";
+
+/// `source` on the breadcrumbs the poller writes about GitHub's reachability.
+const POLLER: &str = "poller";
 
 /// Consecutive failed dispatches after which a task is rejected outright.
 /// Matches the re-explore cap the plan puts on the server rather than the
@@ -762,21 +766,29 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // One record, written by the poller and read by both dispatchers and
+    // `/status` — the staleness window is bound here, from the poll interval,
+    // so the three of them cannot disagree about whether a hold is in force.
+    let health = Arc::new(GitHubHealth::new(config.poll_interval));
+
     let poll = tokio::spawn(poll_loop(
         store.clone(),
         config.clone(),
+        health.clone(),
         shutdown_rx.clone(),
     ));
     let dispatch = tokio::spawn(dispatch_loop(
         store.clone(),
         config.clone(),
         in_flight.clone(),
+        health.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
         store.clone(),
         config.clone(),
         in_flight.clone(),
+        health.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -813,6 +825,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             bundles: Some(Arc::new(RejectedBundles::under(
                 builder_config(&config).scratch_root,
             ))),
+            github_health: Some(health.clone()),
         },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`
@@ -1207,11 +1220,96 @@ async fn build_task_ids(store: &Store, build_id: &crate::models::BuildId) -> Vec
 
 // --- GitHub intake ---
 
+/// The poller's view of GitHub's reachability: fold an outcome in, and announce
+/// the edge.
+///
+/// One type rather than a bare `&GitHubHealth` so that observing and announcing
+/// cannot become two things a call site can do separately — an unannounced hold
+/// is a pipeline that stopped with nothing anywhere saying why, which is the
+/// failure this whole change is about.
+///
+/// The signal deliberately cannot be read off [`poll_once`]'s return value: a
+/// failed fetch is logged and skipped so one repo cannot stall intake for the
+/// others, so the pass returns `Ok` through an outage that failed every call in
+/// it.
+pub struct GitHubWatch<'a> {
+    health: &'a GitHubHealth,
+    store: &'a Store,
+}
+
+impl<'a> GitHubWatch<'a> {
+    pub fn new(health: &'a GitHubHealth, store: &'a Store) -> Self {
+        Self { health, store }
+    }
+
+    /// Record what one GitHub call did, and say so **once** per edge.
+    ///
+    /// A [`EventPayload::Note`] rather than anything nudge-worthy: the
+    /// orchestrator cannot fix GitHub, and an undischargeable signal raised
+    /// every pass is how a signal gets trained out of use. It is on the feed
+    /// for whoever is reading, and `/status` answers for whoever arrives later.
+    pub async fn observe<T>(&self, result: &Result<T, GhError>) {
+        let transition = self.health.observe(result, chrono::Utc::now());
+        let message = match transition {
+            Transition::Unchanged => return,
+            Transition::Lost(outage) => {
+                warn!(
+                    error = %outage.error,
+                    "GitHub is not answering — holding scout and build dispatch. \
+                     A clone is the first thing a Scout or a Builder does, so work \
+                     dispatched now would fail setup and be charged an attempt for it"
+                );
+                outage.describe()
+            }
+            Transition::Recovered(outage) => {
+                info!(
+                    since = %outage.since,
+                    failures = outage.failures,
+                    "GitHub is answering again — dispatch is released"
+                );
+                format!(
+                    "GitHub is answering again after {} failed call(s) since {}; \
+                     scout and build dispatch is released",
+                    outage.failures,
+                    outage.since.to_rfc3339()
+                )
+            }
+        };
+        if let Err(e) = self
+            .store
+            .append_event(EventPayload::Note {
+                source: POLLER.into(),
+                message,
+            })
+            .await
+        {
+            warn!(error = %e, "could not record GitHub's reachability");
+        }
+    }
+}
+
+/// Whether new work must wait for GitHub.
+///
+/// One predicate, read by both dispatchers and by `GET /status`, so they cannot
+/// disagree about whether a hold is in force. **Silent**: the loops tick every
+/// 500 ms, the edge was announced by the poller, and `/status` answers for
+/// whoever arrives later.
+fn github_hold(health: &GitHubHealth) -> bool {
+    health.hold(chrono::Utc::now()).is_some()
+}
+
 /// Poll every project's open issues on an interval until `shutdown` flips.
 ///
 /// Does nothing at all without a token: intake is the only thing that needs
-/// one, and the rest of the server is still useful without it.
-pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::Receiver<bool>) {
+/// one, and the rest of the server is still useful without it. That is also why
+/// a tokenless server never holds dispatch — it makes no observations at all,
+/// and a hold nothing could ever clear is worse than the failure it prevents.
+pub async fn poll_loop(
+    store: Arc<Store>,
+    config: Config,
+    health: Arc<GitHubHealth>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let Some(github) = config.github_client() else {
         warn!("GITHUB_TOKEN not set — GitHub polling disabled");
         return;
@@ -1227,9 +1325,22 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 
     loop {
         match store.get_mode().await {
+            // `Stop` polls nothing, so the record simply goes stale while
+            // stopped and is re-derived within one poll of returning to `Play`.
+            // Do not "fix" that by clearing it on a mode change: nothing
+            // dispatches in `Stop` either, so there is nothing to release.
             Ok(Mode::Stop) => {}
             Ok(_) => {
-                match poll_once(&store, &github, &config.intake, &config.scout_base_branch).await {
+                let watch = GitHubWatch::new(&health, &store);
+                match poll_once(
+                    &store,
+                    &github,
+                    &config.intake,
+                    &config.scout_base_branch,
+                    &watch,
+                )
+                .await
+                {
                     Ok(0) => {}
                     Ok(n) => info!(ingested = n, "poll ingested new tasks"),
                     Err(e) => warn!(error = %e, "poll failed"),
@@ -1282,18 +1393,24 @@ pub async fn poll_loop(store: Arc<Store>, config: Config, mut shutdown: watch::R
 ///
 /// `trunk` is the branch that ships ([`Config::scout_base_branch`]), and is
 /// only used by [`watch_merges`], which cannot decide "shipped" without it.
+///
+/// `watch` sees **every** GitHub call this pass makes, GraphQL and REST alike:
+/// a partial outage is per-service, and the broadest evidence is the closest
+/// available proxy for "will the clone a Scout starts with work".
 pub async fn poll_once(
     store: &Store,
     github: &GitHubClient,
     intake: &IntakeFilter,
     trunk: &str,
+    watch: &GitHubWatch<'_>,
 ) -> Result<usize, StoreError> {
     let mut ingested = 0;
     for project in store.list_projects().await? {
-        let issues = match github
+        let fetched = github
             .list_open_issues(&project.repo_owner, &project.repo_name)
-            .await
-        {
+            .await;
+        watch.observe(&fetched).await;
+        let issues = match fetched {
             Ok(issues) => issues,
             Err(e) => {
                 warn!(
@@ -1354,14 +1471,14 @@ pub async fn poll_once(
                 .await?;
         }
 
-        retire_closed_issues(store, github, &project).await?;
+        retire_closed_issues(store, github, &project, watch).await?;
         // After retirement, deliberately. A merge closes the issue, so the
         // poll that follows one finds the task retirable; running this first
         // would find it still `awaiting_merge` and close an already-closed
         // issue a second time — a wasted PATCH and a duplicate ledger row.
         // `list_builds_awaiting_merge` filters on the open issue as well, so
         // the two passes cannot claim the same row either way.
-        watch_merges(store, github, &project, trunk).await?;
+        watch_merges(store, github, &project, trunk, watch).await?;
     }
     Ok(ingested)
 }
@@ -1446,16 +1563,18 @@ async fn retire_closed_issues(
     store: &Store,
     github: &GitHubClient,
     project: &Project,
+    watch: &GitHubWatch<'_>,
 ) -> Result<(), StoreError> {
     let retirable = store.list_retirable_tasks(&project.id).await?;
     if retirable.is_empty() {
         return Ok(());
     }
     let numbers: Vec<u64> = retirable.iter().map(|t| t.gh_issue_number).collect();
-    let info = match github
+    let looked_up = github
         .issue_close_info(&project.repo_owner, &project.repo_name, &numbers)
-        .await
-    {
+        .await;
+    watch.observe(&looked_up).await;
+    let info = match looked_up {
         Ok(info) => info,
         Err(e) => {
             warn!(error = %e, "fetching close reasons failed; retiring next poll");
@@ -1515,6 +1634,7 @@ async fn shipped(
     trunk: &str,
     pr: &PrState,
     pr_number: u64,
+    watch: &GitHubWatch<'_>,
 ) -> bool {
     if !pr.merged {
         return false;
@@ -1531,10 +1651,11 @@ async fn shipped(
         );
         return false;
     };
-    match github
+    let compared = github
         .merge_reached_trunk(&project.repo_owner, &project.repo_name, trunk, sha)
-        .await
-    {
+        .await;
+    watch.observe(&compared).await;
+    match compared {
         Ok(true) => true,
         Ok(false) => {
             info!(
@@ -1594,6 +1715,7 @@ async fn watch_merges(
     github: &GitHubClient,
     project: &Project,
     trunk: &str,
+    watch: &GitHubWatch<'_>,
 ) -> Result<(), StoreError> {
     let awaiting = store.list_builds_awaiting_merge(&project.id).await?;
     if awaiting.is_empty() {
@@ -1611,10 +1733,11 @@ async fn watch_merges(
     }
 
     for build in awaiting {
-        let pr = match github
+        let read = github
             .pull_request_state(&project.repo_owner, &project.repo_name, build.pr_number)
-            .await
-        {
+            .await;
+        watch.observe(&read).await;
+        let pr = match read {
             Ok(pr) => pr,
             Err(e) => {
                 warn!(
@@ -1631,7 +1754,7 @@ async fn watch_merges(
         // `merge_commit_sha` is populated on *open* PRs too from GitHub's
         // speculative test merge. Only "the merge commit is on the trunk"
         // means the work shipped.
-        if shipped(github, project, trunk, &pr, build.pr_number).await {
+        if shipped(github, project, trunk, &pr, build.pr_number, watch).await {
             let rationale = format!(
                 "PR #{} merged and its commit is on {trunk} (build {}); \
                  closing the issue it implements",
@@ -1675,15 +1798,16 @@ async fn watch_merges(
                     continue;
                 }
 
-                if let Err(e) = github
+                let closed = github
                     .close_issue(
                         &project.repo_owner,
                         &project.repo_name,
                         task.gh_issue_number,
                         CloseReason::Completed,
                     )
-                    .await
-                {
+                    .await;
+                watch.observe(&closed).await;
+                if let Err(e) = closed {
                     warn!(
                         issue = task.gh_issue_number,
                         pr = build.pr_number,
@@ -1775,10 +1899,16 @@ fn builder_config(config: &Config) -> BuilderConfig {
 /// `in_flight` carries scouts this loop did not start — runs
 /// [`resume_in_flight`] picked back up — which are otherwise invisible to its
 /// own accounting and would let a restart oversubscribe the pool.
+///
+/// `health` is the other dependency's precondition, in the same shape as the
+/// vm-pool one above it: a Scout's first act is a clone, so starting one while
+/// GitHub is not answering buys a setup failure and a dispatch strike for work
+/// that did nothing wrong.
 pub async fn dispatch_loop(
     store: Arc<Store>,
     config: Config,
     in_flight: InFlight,
+    health: Arc<GitHubHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -1804,7 +1934,7 @@ pub async fn dispatch_loop(
         report_pool(&client, &config).await;
         sweep_leaked_vms(&store, &mut client).await;
 
-        dispatch_connected(&store, &config, &in_flight, client, &mut shutdown).await;
+        dispatch_connected(&store, &config, &in_flight, &health, client, &mut shutdown).await;
     }
 }
 
@@ -1974,6 +2104,7 @@ async fn dispatch_connected(
     store: &Arc<Store>,
     config: &Config,
     resumed: &InFlight,
+    health: &GitHubHealth,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -1994,6 +2125,7 @@ async fn dispatch_connected(
                 store,
                 config,
                 resumed,
+                health,
                 &scout,
                 &mut in_flight,
                 &mut in_flight_ids,
@@ -2036,11 +2168,19 @@ async fn top_up(
     store: &Arc<Store>,
     config: &Config,
     resumed: &InFlight,
+    health: &GitHubHealth,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
 ) -> Result<(), StoreError> {
     if store.get_mode().await? != Mode::Play {
+        return Ok(());
+    }
+
+    // A stop before the queue, not a filter over it: an outage is a fact about
+    // the world, not about any one task, and skipping held work to find
+    // something else to dispatch would just pick a different victim.
+    if github_hold(health) {
         return Ok(());
     }
 
@@ -2540,6 +2680,7 @@ pub async fn build_loop(
     store: Arc<Store>,
     config: Config,
     in_flight: InFlight,
+    health: Arc<GitHubHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
@@ -2581,7 +2722,13 @@ pub async fn build_loop(
                 // `claim_next_queued_build` already refuses to start another.
                 // The counter says the same thing in the loop's own terms,
                 // where it can be read without a round trip.
-                Ok(Mode::Play) if in_flight.builds() == 0 => {
+                //
+                // The hold is in the guard, **ahead of the claim**, for the
+                // same reason the project-status check lives inside the claim's
+                // transaction: claiming moves the build to `running` and drags
+                // its batch's tasks to `building`, so a claim-then-refuse would
+                // flip that state on every tick of the outage.
+                Ok(Mode::Play) if in_flight.builds() == 0 && !github_hold(&health) => {
                     match store.claim_next_queued_build().await {
                         Ok(Some(build)) => {
                             let project = match store.get_project(&build.project_id).await {
@@ -2775,6 +2922,19 @@ mod tests {
             added_at: Utc::now(),
             status: ProjectStatus::Active,
         }
+    }
+
+    /// [`poll_once`] with a throwaway reachability record, for the tests that
+    /// are about the pass rather than about the record.
+    async fn poll(
+        store: &Store,
+        github: &GitHubClient,
+        intake: &IntakeFilter,
+        trunk: &str,
+    ) -> Result<usize, StoreError> {
+        let health = GitHubHealth::default();
+        let watch = GitHubWatch::new(&health, store);
+        poll_once(store, github, intake, trunk, &watch).await
     }
 
     /// The shape that was OOM-killing builds: cargo would have taken its
@@ -3113,7 +3273,7 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap();
 
@@ -3167,7 +3327,7 @@ mod tests {
         .await;
         let github = GitHubClient::with_base_url("token", url);
 
-        poll_once(&store, &github, &IntakeFilter::All, "main")
+        poll(&store, &github, &IntakeFilter::All, "main")
             .await
             .unwrap();
 

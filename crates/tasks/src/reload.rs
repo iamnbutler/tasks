@@ -843,11 +843,37 @@ pub fn render_status(
             ));
             out.push_str(&format!("binary   {}\n", file.exe.display()));
             out.push_str(&format!("mode     {}\n", status.mode.as_str()));
+            out.push_str(&render_github_hold(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
     }
     out
+}
+
+/// Why the pipeline is idle, when the reason is that GitHub is not answering.
+///
+/// **Silent when there is no hold.** A standing "GitHub ok" line is one a
+/// reader learns to skip, and this one has to land the one time it appears.
+///
+/// It prints two ages, because they answer different questions: how long the
+/// outage has run, and how long ago the last observation was — the gap between
+/// them is the difference between a hold somebody is still refreshing and one
+/// about to expire on its own. And it says what holding *costs*, because the
+/// reader's next question is whether the pipeline is losing work.
+pub fn render_github_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(hold) = &status.github else {
+        return String::new();
+    };
+    format!(
+        "github   not answering for {} ({} failed call(s), last {} ago) — scout and \
+         build dispatch is held; queued work stays queued and nothing is charged an \
+         attempt\n         {}\n",
+        humanize(now - hold.since),
+        hold.failures,
+        humanize(now - hold.last_seen),
+        hold.error
+    )
 }
 
 /// What the VM images are running, and whether that is a problem.
@@ -1004,6 +1030,7 @@ mod tests {
             mode: Mode::Play,
             in_flight,
             images: Vec::new(),
+            github: None,
         }
     }
 
@@ -1042,6 +1069,57 @@ mod tests {
         );
         assert!(out.contains("mode     play"), "{out}");
         assert!(out.contains("in flight  nothing"), "{out}");
+    }
+
+    /// A standing "GitHub ok" line is one a reader learns to skip, so there is
+    /// no line at all until there is something to say.
+    #[test]
+    fn a_healthy_github_says_nothing() {
+        let status = status_with(InFlight::default());
+        assert_eq!(render_github_hold(&status, ts("2026-08-15T13:00:00Z")), "");
+        let whole = render_status(
+            Some(&pidfile_at(4800)),
+            Some(&status),
+            ts("2026-08-15T13:00:00Z"),
+        );
+        assert!(!whole.contains("github"), "{whole}");
+    }
+
+    /// The one time it appears it has to answer the reader's real question —
+    /// why is nothing being dispatched, and is work being lost? — and it has to
+    /// print both ages, since the gap between them is what says whether anybody
+    /// is still refreshing the hold.
+    #[test]
+    fn a_hold_names_what_is_stopped_and_what_it_costs() {
+        use tasks_api::http::GitHubHold;
+
+        let mut status = status_with(InFlight::default());
+        status.github = Some(GitHubHold {
+            since: ts("2026-08-15T12:48:00Z"),
+            last_seen: ts("2026-08-15T12:59:30Z"),
+            failures: 12,
+            error: "rest: list issues: 503 Service Unavailable: Service Unavailable".into(),
+        });
+
+        let line = render_github_hold(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("12m00s"), "the age of the outage: {line}");
+        assert!(line.contains("30s"), "the age of the last look: {line}");
+        assert!(line.contains("12 failed call"), "{line}");
+        assert!(line.contains("dispatch is held"), "{line}");
+        assert!(
+            line.contains("nothing is charged an attempt"),
+            "the reader's next question is whether work is being lost: {line}"
+        );
+        assert!(line.contains("503"), "{line}");
+        // And it is part of the report, not a function nobody calls.
+        assert!(
+            render_status(
+                Some(&pidfile_at(4800)),
+                Some(&status),
+                ts("2026-08-15T13:00:00Z")
+            )
+            .contains("dispatch is held")
+        );
     }
 
     /// Two readings that must not be confused. Nothing polls an image, so an
