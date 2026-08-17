@@ -82,7 +82,7 @@ const DEFAULT_SCOUT_MAX_CONCURRENT: usize = 2;
 const DEFAULT_SCOUT_IMAGE: &str = "agent:v1";
 const DEFAULT_BUILDER_IMAGE: &str = "builder:v1";
 const DEFAULT_VM_POOL_SOCKET: &str = "/tmp/vm-pool.sock";
-/// Builds get the same wall-clock budget as scouts, for the same reason: it
+/// Builds get the same budget as scouts, for the same reason: it
 /// must sit below vm-pool's 7200s reaper so the app deadline fires first.
 const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// Default agent command for orchestrator ticks. `--allowedTools` lets the
@@ -93,7 +93,7 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// `--print --output-format stream-json` (see images/scout/Dockerfile).
 const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
-/// Wall-clock budget for one orchestrator tick.
+/// Budget for one orchestrator tick.
 ///
 /// Fifteen minutes rather than ten because a turn that verifies a composition
 /// may have to pay for one cold build, and Claude Code's own per-command
@@ -118,7 +118,7 @@ const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// Hard cap on how long a steady event trickle can hold a nudge open.
 const NUDGE_MAX_WAIT: Duration = Duration::from_secs(30);
-/// Wall-clock budget for one scout. ~2.5x the observed 23-minute live run, and
+/// Budget for one scout. ~2.5x the observed 23-minute live run, and
 /// deliberately below vm-pool's own `PoolConfig::vm_timeout` (7200s): if the
 /// app deadline sat at or above the pool's reaper, infrastructure would tear
 /// the VM down first and the dispatcher would report a stream error instead of
@@ -230,8 +230,10 @@ pub struct Config {
     pub scout_max_concurrent: usize,
     /// vm-pool image scouts run in (`SCOUT_IMAGE`).
     pub scout_image: String,
-    /// Wall-clock budget for one scout (`SCOUT_TIMEOUT_SECS`). Past it the VM
-    /// is deallocated and the attempt counts as a dispatch failure.
+    /// Budget for one scout (`SCOUT_TIMEOUT_SECS`), measured on both the
+    /// monotonic and the wall clock (see [`crate::deadline`]). Past it the VM
+    /// is deallocated and the attempt counts as a dispatch failure — unless
+    /// the host was asleep for it, which charges nothing.
     pub scout_timeout: Duration,
     /// vm-pool service socket (`VM_POOL_SOCKET`).
     pub vm_pool_socket: PathBuf,
@@ -257,13 +259,16 @@ pub struct Config {
     pub builder_vm_config: VmConfig,
     /// vm-pool image builds run in (`BUILDER_IMAGE`).
     pub builder_image: String,
-    /// Wall-clock budget for one build (`BUILDER_TIMEOUT_SECS`).
+    /// Budget for one build (`BUILDER_TIMEOUT_SECS`), measured on both the
+    /// monotonic and the wall clock — see [`crate::deadline`], and CLAUDE.md's
+    /// *Budgets and a host that sleeps* for why a suspend is not a timeout.
     pub builder_timeout: Duration,
     /// REST endpoint override (`GITHUB_REST_API_URL`) — PR creation only.
     pub github_rest_api_url: Option<String>,
     /// Agent command for orchestrator ticks (`ORCHESTRATOR_CMD`).
     pub orchestrator_cmd: String,
-    /// Wall-clock budget for one orchestrator tick (`ORCHESTRATOR_TIMEOUT_SECS`).
+    /// Budget for one orchestrator tick (`ORCHESTRATOR_TIMEOUT_SECS`), measured
+    /// on both clocks like the two run budgets — see [`crate::deadline`].
     pub orchestrator_timeout: Duration,
     /// Working directory for the orchestrator agent (`ORCHESTRATOR_WORKDIR`).
     /// Default is a neutral dir under the data dir; point it at a dedicated

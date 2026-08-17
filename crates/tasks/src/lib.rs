@@ -8,6 +8,9 @@ pub mod brief;
 pub mod builder;
 pub mod bundles;
 pub mod cancel;
+/// Run budgets measured on both the monotonic and the wall clock, so a
+/// suspended host reads as a suspend and not as a timeout (#929).
+pub mod deadline;
 pub mod env_file;
 pub mod github;
 /// What the VM images are running, observed from the runs inside them (#909).
