@@ -39,7 +39,10 @@ impl TitleBar {
         self
     }
 
-    /// Content centered in the bar.
+    /// Content centered in the bar. Empty since the v3 frame swap (the tab
+    /// strip names the view now); kept as chrome API — the slot is real even
+    /// while nothing occupies it.
+    #[allow(dead_code)]
     pub fn child_center(mut self, child: impl IntoElement) -> Self {
         self.center_children.push(child.into_any_element());
         self

@@ -4,6 +4,7 @@ mod commands;
 mod components;
 mod issue_composer;
 mod menus;
+mod nav;
 mod palette;
 mod projects;
 mod repo_composer;

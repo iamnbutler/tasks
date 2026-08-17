@@ -17,7 +17,7 @@ use gpui::{
     FollowMode, ListAlignment, ListState, MouseButton, SharedString, Stateful, WeakEntity, Window,
     WindowHandle,
 };
-use gpuikit::elements::context_menu::{menu_item, MenuItems};
+use gpuikit::elements::context_menu::{context_menu, menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::elements::kbd::kbd;
@@ -35,10 +35,11 @@ use tasks_client::api::models::{
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, sidebar, task_state_color, title_bar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
+use crate::nav::{MiddleView, NavHistory, TaskTab};
 use crate::palette::{
     GoToAnything, PaletteKind, PaletteState, SelectNextRow, SelectPrevRow, ShowCommandPalette,
 };
@@ -46,7 +47,7 @@ use crate::projects::{self, ProjectFilter};
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
-use crate::state::{is_picked_up, AppState};
+use crate::state::AppState;
 use crate::time;
 
 pub(crate) const FONT: &str = "Menlo";
@@ -63,11 +64,8 @@ actions!(
         NewIssue,
         AddRepo,
         Dismiss,
-        GoToHome,
-        GoToTasks,
-        GoToQueue,
-        GoToActivity,
-        GoToChat,
+        HistoryBack,
+        HistoryForward,
         SetModePlay,
         SetModePause,
         SetModeStop,
@@ -106,105 +104,19 @@ enum ChatRowView {
     Empty,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-pub enum Section {
-    Home,
-    Tasks,
-    Queue,
-    Activity,
-    Chat,
-}
-
-/// Where focus belongs once a section is on screen.
-///
-/// A value rather than a `window.focus` call inside the match, so the rule can
-/// be asserted without a `Window` — the app's tests are pure functions over
-/// view state (a `#[gpui::test]` would need gpui's `test-support` feature,
-/// which the Makefile's stub-`.so` fallback cannot link).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum FocusTarget {
-    /// The workspace root — the section draws no composer of its own, so the
-    /// root is the only element guaranteed to be in the frame.
-    Workspace,
-    /// The chat composer, which only exists while [`Section::Chat`] is drawn.
-    ChatComposer,
-}
-
-impl Section {
-    const ALL: [Section; 5] = [
-        Section::Home,
-        Section::Tasks,
-        Section::Queue,
-        Section::Activity,
-        Section::Chat,
-    ];
-
-    /// The section's name. Rendered exactly once now — in the title bar's
-    /// centre. The nav rows are icons and carry it as an accessible name;
-    /// `render_center` no longer spends a row on it.
-    fn label(self) -> &'static str {
-        match self {
-            Section::Home => "Home",
-            Section::Tasks => "Tasks",
-            Section::Queue => "Queue",
-            Section::Activity => "Activity",
-            Section::Chat => "Chat",
-        }
-    }
-
-    /// The icon a nav row wears in place of its label.
-    fn icon(self) -> gpui::Svg {
-        match self {
-            Section::Home => Icons::home(),
-            Section::Tasks => Icons::list_bullet(),
-            Section::Queue => Icons::layers(),
-            Section::Activity => Icons::activity_log(),
-            Section::Chat => Icons::chat_bubble(),
-        }
-    }
-
-    /// Element id for the nav row. A name rather than the enumeration index:
-    /// these rows have no id'd ancestor, so a bare integer sits at the root
-    /// of the id path, which is exactly the collision class #861 is about.
-    fn nav_id(self) -> &'static str {
-        match self {
-            Section::Home => "nav-home",
-            Section::Tasks => "nav-tasks",
-            Section::Queue => "nav-queue",
-            Section::Activity => "nav-activity",
-            Section::Chat => "nav-chat",
-        }
-    }
-
-    /// Where focus lands when this section becomes the visible one.
-    ///
-    /// Chat gets its composer — arriving ready to type is what the app did
-    /// before, by accident of a startup focus that pointed at the composer
-    /// whether or not it was drawn. Every other section gets the workspace
-    /// root, because a focus handle absent from the frame is treated exactly
-    /// like no focus at all (#902): the dispatch path falls back to the
-    /// *window* root, which carries no key context, and every
-    /// `Workspace`-context binding goes dead.
-    fn focus_target(self) -> FocusTarget {
-        match self {
-            Section::Chat => FocusTarget::ChatComposer,
-            Section::Home | Section::Tasks | Section::Queue | Section::Activity => {
-                FocusTarget::Workspace
-            }
-        }
-    }
-
-    /// The ⌘-digit that reaches this section. Bound in `main`; repeated here
-    /// only to be *announced* — in the row's tooltip and, via
-    /// `aria_keyshortcuts`, to assistive technology.
-    fn shortcut(self) -> &'static str {
-        match self {
-            Section::Home => "⌘1",
-            Section::Tasks => "⌘2",
-            Section::Queue => "⌘3",
-            Section::Activity => "⌘4",
-            Section::Chat => "⌘5",
-        }
+/// Band order for the left rail's task tree — the Queue section's attention
+/// order, flattened into one list without headers. Lower sorts higher.
+/// `None` is a task the tree does not show (backlog and history live behind
+/// All Tasks).
+fn tree_band(state: TaskState) -> Option<u8> {
+    match state {
+        TaskState::InReview => Some(0),
+        TaskState::Scouting => Some(1),
+        TaskState::Building => Some(2),
+        TaskState::AwaitingMerge => Some(3),
+        TaskState::Queued => Some(4),
+        TaskState::ReadyToBuild => Some(5),
+        TaskState::Backlog | TaskState::Done | TaskState::Rejected => None,
     }
 }
 
@@ -221,7 +133,12 @@ pub struct Workspace {
     /// away has to be able to hand it back here, which is also what the
     /// palette needs when it closes.
     pub(crate) focus_handle: FocusHandle,
-    pub(crate) section: Section,
+    /// The middle column's position and history — the whole of "where am I"
+    /// since the v3 frame swap retired sections.
+    pub(crate) nav: NavHistory,
+    /// Which of the selected task's tabs is showing. Reset to Overview on
+    /// every navigation; meaningless while the catalog is up.
+    pub(crate) task_tab: TaskTab,
     pub(crate) left_sidebar: SidebarState,
     pub(crate) right_sidebar: SidebarState,
     /// Which sidebar is currently being drag-resized, if any.
@@ -517,11 +434,12 @@ impl Workspace {
 
         Self {
             focus_handle,
-            section: Section::Home,
+            nav: NavHistory::default(),
+            task_tab: TaskTab::default(),
             left_sidebar: SidebarState::new(true),
-            // The inspector is a reading surface (specs, task bodies) —
-            // default it wide, like the Swift app's 460pt ideal.
-            right_sidebar: SidebarState::new(false).with_width(px(460.)),
+            // The chat pane: on screen by default (the design's always-up
+            // right column), and wide — it is a reading surface.
+            right_sidebar: SidebarState::new(true).with_width(px(460.)),
             resizing: None,
             app_state,
             server_control,
@@ -567,32 +485,50 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Switch sections, and put focus somewhere that is actually drawn.
-    ///
-    /// The focus move is the other half of #902 and is not housekeeping: Chat
-    /// is the one section with a composer worth landing in, and everywhere else
-    /// the composer is not rendered at all. A focus handle that is absent from
-    /// the frame drops the context stack, so leaving Chat without handing focus
-    /// back to the root kills every `Workspace`-context binding until something
-    /// else takes focus.
-    pub(crate) fn go_to_section(
-        &mut self,
-        section: Section,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.section = section;
-        self.place_focus(section.focus_target(), window, cx);
+    /// Point the middle column somewhere. The one write to [`Self::nav`]
+    /// outside the history steps, so selection, drafts and the tab strip stay
+    /// consistent by construction rather than at each call site.
+    pub(crate) fn navigate(&mut self, view: MiddleView, cx: &mut Context<Self>) {
+        if self.nav.navigate(view) {
+            self.settle_after_nav(cx);
+        }
         cx.notify();
     }
 
-    /// Put focus on the named element. The one place `window.focus` is called
-    /// with a choice in it, so "the handle must be in the frame this section
-    /// draws" is checked once rather than at each call site.
-    fn place_focus(&self, target: FocusTarget, window: &mut Window, cx: &mut Context<Self>) {
-        match target {
-            FocusTarget::Workspace => window.focus(&self.focus_handle, cx),
-            FocusTarget::ChatComposer => window.focus(&self.input.focus_handle(cx), cx),
+    /// ⌘[ — step the middle column back.
+    pub(crate) fn history_back(&mut self, cx: &mut Context<Self>) {
+        if self.nav.back() {
+            self.settle_after_nav(cx);
+            cx.notify();
+        }
+    }
+
+    /// ⌘] — step the middle column forward.
+    pub(crate) fn history_forward(&mut self, cx: &mut Context<Self>) {
+        if self.nav.forward() {
+            self.settle_after_nav(cx);
+            cx.notify();
+        }
+    }
+
+    /// What every nav movement implies: the tab strip resets to the landing
+    /// tab, an armed bundle Delete disarms, and — when the selection actually
+    /// changed task — the per-task drafts are cleared, because a review is
+    /// about one spec and a build-now rationale is the only record of why
+    /// *that* task skipped its Scout.
+    fn settle_after_nav(&mut self, cx: &mut Context<Self>) {
+        self.task_tab = TaskTab::Overview;
+        self.bundle_delete_armed = None;
+        let selected = match self.nav.current() {
+            MiddleView::Task(id) => Some(id.clone()),
+            MiddleView::AllTasks => None,
+        };
+        if selected != self.selected_task {
+            self.review_input
+                .update(cx, |input, cx| input.set_content("", cx));
+            self.build_input
+                .update(cx, |input, cx| input.set_content("", cx));
+            self.selected_task = selected;
         }
     }
 
@@ -643,31 +579,23 @@ impl Workspace {
 
     // --- selection (called from section rows) ---
 
+    /// Select a task — which, since the frame swap, *is* navigating the
+    /// middle column to it. Re-selecting the current task is a no-op
+    /// (`NavHistory::navigate` refuses the duplicate), which is also what
+    /// keeps a right-click on the selected row from clearing its drafts.
     pub(crate) fn select_task(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        if self.selected_task.as_ref() != Some(&id) {
-            // Draft feedback is about one spec — don't carry it to another.
-            self.review_input
-                .update(cx, |input, cx| input.set_content("", cx));
-            // Same for the build-now rationale, and more sharply: it is the
-            // only record of why *this* task skipped its Scout.
-            self.build_input
-                .update(cx, |input, cx| input.set_content("", cx));
-        }
-        self.selected_task = Some(id);
-        // Never carry an armed Delete to another task's bundle.
-        self.bundle_delete_armed = None;
-        // `reveal`, not `force_open`: a row click is the content asking to be
-        // seen, and it must not undo a dismissal the user made deliberately.
-        self.right_sidebar.reveal();
-        cx.notify();
+        self.navigate(MiddleView::Task(id), cx);
     }
 
-    /// Send a message into the orchestrator conversation and jump to Chat so
-    /// the reply is visible as it streams in.
+    /// Send a message into the orchestrator conversation. The chat pane is
+    /// always on screen; `reveal` brings it back only if content-hiding put
+    /// it away, without overriding a deliberate ⌘R dismissal… which sending a
+    /// message is the one good reason to override — the reply would otherwise
+    /// stream into a pane the human cannot see.
     pub(crate) fn ask_orchestrator(&mut self, message: String, cx: &mut Context<Self>) {
         self.app_state
             .update(cx, |state, cx| state.send_orchestrator_message(message, cx));
-        self.section = Section::Chat;
+        self.right_sidebar.force_open();
         // Sending re-engages the tail pin even if the user had scrolled up —
         // their own message (and the reply behind it) lands at the bottom.
         self.chat_list.scroll_to_end();
@@ -922,16 +850,14 @@ impl Workspace {
         }
     }
 
-    /// Show the task's spec in the inspector with the review composer focused
-    /// — "Review Spec…" landing where the spec text already is, rather than in
-    /// a modal that would cover the thing being judged.
+    /// Show the task with the review composer focused — "Review Spec…"
+    /// landing where the spec text already is, rather than in a modal that
+    /// would cover the thing being judged. The middle column is always
+    /// visible, so unlike the inspector era there is no panel to force open;
+    /// the form renders on the task's landing tab, which `select_task` just
+    /// reset to.
     fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
         self.select_task(id, cx);
-        // The one selection path that overrides a dismissal, and it has to run
-        // *after* `select_task`, whose `reveal` may have been a no-op: the
-        // composer being focused below means a hidden panel would eat
-        // keystrokes with nothing on screen to explain where they went.
-        self.right_sidebar.force_open();
         window.focus(&self.review_input.focus_handle(cx), cx);
         cx.notify();
     }
@@ -974,18 +900,18 @@ impl Workspace {
     }
 
     pub(crate) fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_task = None;
         self.bundle_delete_armed = None;
-        // `hide`, not `toggle`: escape and the inspector's ✕ mean "clear this",
-        // never "and don't come back". The next row click opens it again.
-        self.right_sidebar.hide();
-        // The panel this just put away may have held the focused element — the
-        // review composer `begin_review` focuses. Hand focus back to the root
-        // rather than to the section's own target: this is a dismissal, so the
-        // caret should not land back in a composer the human just escaped out
-        // of. `on_focus_lost` would catch it a frame later; doing it here means
-        // there is no frame in between with no keyboard.
-        self.place_focus(FocusTarget::Workspace, window, cx);
+        // Escape and the task view's ✕ mean "put this away" — the middle
+        // column returns to the catalog. A real navigation, so ⌘[ can change
+        // your mind about it.
+        self.navigate(MiddleView::AllTasks, cx);
+        // The view this just left may have held the focused element — the
+        // review composer `begin_review` focuses. Hand focus back to the root:
+        // this is a dismissal, so the caret should not land back in a composer
+        // the human just escaped out of. `on_focus_lost` would catch it a
+        // frame later; doing it here means there is no frame in between with
+        // no keyboard.
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1371,10 +1297,24 @@ impl Workspace {
             // The repo the working set belongs to, and the control that
             // changes it.
             .child_left(self.project_switcher.clone())
-            // The section you are looking at, named once. The sidebar's rows
-            // are icons and `render_center` draws no header, so this is the
-            // only place the word appears.
-            .child_center(div().child(self.section.label()))
+            // The middle column's history. Greyed rather than absent at the
+            // ends of the stack, so the affordance has a fixed address.
+            .child_left(
+                Self::title_bar_button("history-back", Icons::arrow_left())
+                    .disabled(!self.nav.can_go_back())
+                    .tooltip(tooltip("Back (⌘[)"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.history_back(cx);
+                    })),
+            )
+            .child_left(
+                Self::title_bar_button("history-forward", Icons::arrow_right())
+                    .disabled(!self.nav.can_go_forward())
+                    .tooltip(tooltip("Forward (⌘])"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.history_forward(cx);
+                    })),
+            )
             .child_right(
                 Self::title_bar_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
@@ -1401,7 +1341,7 @@ impl Workspace {
             .child_right(
                 Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
                     .selected(self.right_sidebar.is_open())
-                    .tooltip(tooltip("Toggle inspector (⌘R)"))
+                    .tooltip(tooltip("Toggle chat (⌘R)"))
                     .on_click(|_event, window, cx| {
                         window.dispatch_action(Box::new(ToggleRightDock), cx);
                     }),
@@ -1409,15 +1349,13 @@ impl Workspace {
     }
 
     fn render_left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (text, text_muted, selected_bg, hover_bg, badge_bg) = (
+        let theme = cx.theme().clone();
+        let (text, text_muted, selected_bg, hover_bg) = (
             theme.fg(),
             theme.fg_muted(),
             theme.surface_tertiary(),
             theme.surface_secondary(),
-            theme.surface_tertiary(),
         );
-        let active = self.section;
 
         // Read before the app-state borrow: a run in flight outranks
         // everything the server could tell us, because it is the reason the
@@ -1431,43 +1369,61 @@ impl Workspace {
                 .map(|run| (run.op, run.started_at))
         };
 
-        let state = self.app_state.read(cx);
-        // The same predicate the Queue section's rows are built from — the
-        // badge counts what that section shows.
-        let queued_work = state
-            .tasks
-            .iter()
-            .filter(|task| is_picked_up(task.state))
-            .count();
-        // A proactive tick is invisible from every section but Chat, so the
-        // Chat row wears the clock. Same slot the Queue count uses.
-        let tick_elapsed = state
-            .orchestrator_tick
-            .as_ref()
-            .map(|tick| time::elapsed(tick.started_at));
-        // A restart in flight outranks both, and is checked first rather than
-        // last: it takes the app's own event stream down, and reporting that
-        // drop as a transport error would be the app blaming the server for
-        // doing what it was asked. A stale build is usually *why* someone hit
-        // restart, so this has to sit above the build warning too.
-        //
-        // The build warning in turn outranks the error: when this app is
-        // older than the server supports, whatever failed underneath is the
-        // symptom and "your app is old" is the cause.
-        let banner = if let Some((op, started_at)) = running_op {
-            Some((
-                format!("{}… {}", op.label(), time::elapsed(started_at)),
-                false,
-            ))
-        } else if let Some(warning) = &state.build_warning {
-            Some((warning.clone(), true))
-        } else if let Some(error) = &state.error {
-            Some((error.clone(), true))
-        } else if state.loaded && !state.connected {
-            Some(("Reconnecting to the tasks server…".to_string(), false))
-        } else {
-            None
+        // Owned projections first — the rows need `cx` for listeners after
+        // the state borrow ends.
+        let (tree, banner) = {
+            let state = self.app_state.read(cx);
+            // The tree is the queue: picked-up work in attention order,
+            // scoped to the window's repo filter. Backlog and history live
+            // behind All Tasks. The sort is stable, so within a band the
+            // server's own order (which is rank order) survives.
+            let mut tree: Vec<(u8, TaskId, String, u64, TaskState)> = state
+                .tasks
+                .iter()
+                .filter(|task| self.project_filter.admits(&task.project_id))
+                .filter_map(|task| {
+                    tree_band(task.state).map(|band| {
+                        (
+                            band,
+                            task.id.clone(),
+                            task.title.clone(),
+                            task.gh_issue_number,
+                            task.state,
+                        )
+                    })
+                })
+                .collect();
+            tree.sort_by_key(|(band, ..)| *band);
+
+            // A restart in flight outranks both, and is checked first rather
+            // than last: it takes the app's own event stream down, and
+            // reporting that drop as a transport error would be the app
+            // blaming the server for doing what it was asked. A stale build
+            // is usually *why* someone hit restart, so this has to sit above
+            // the build warning too.
+            //
+            // The build warning in turn outranks the error: when this app is
+            // older than the server supports, whatever failed underneath is
+            // the symptom and "your app is old" is the cause.
+            let banner = if let Some((op, started_at)) = running_op {
+                Some((
+                    format!("{}… {}", op.label(), time::elapsed(started_at)),
+                    false,
+                ))
+            } else if let Some(warning) = &state.build_warning {
+                Some((warning.clone(), true))
+            } else if let Some(error) = &state.error {
+                Some((error.clone(), true))
+            } else if state.loaded && !state.connected {
+                Some(("Reconnecting to the tasks server…".to_string(), false))
+            } else {
+                None
+            };
+            (tree, banner)
         };
+
+        let all_selected = matches!(self.nav.current(), MiddleView::AllTasks);
+        let selected_task = self.selected_task.clone();
 
         sidebar(SidebarSide::Left, self.left_sidebar.width)
             .on_resize_start({
@@ -1481,66 +1437,154 @@ impl Workspace {
                     }
                 }
             })
-            // The rows are icons: the title bar names the section you are in,
-            // so spelling it again here would be the second of two. What the
-            // word used to do — say which row this is — the tooltip and the
-            // accessible name now do. `role` is not decoration: a node reaches
-            // the a11y tree only with *both* an id and a non-`None` role, so
-            // an `aria_label` on a roleless div is dropped silently.
-            .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
-                Section::ALL.into_iter().map(|section| {
-                    let selected = section == active;
-                    let badge = match section {
-                        Section::Queue if queued_work > 0 => Some(queued_work.to_string()),
-                        Section::Chat => tick_elapsed.clone(),
-                        _ => None,
-                    };
-                    div()
-                        .id(section.nav_id())
-                        .role(gpui::Role::Tab)
-                        .aria_label(section.label())
-                        .aria_keyshortcuts(section.shortcut())
-                        .tooltip(tooltip(format!(
-                            "{} ({})",
-                            section.label(),
-                            section.shortcut()
-                        )))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .mx(px(6.))
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded(px(5.))
-                        .cursor_pointer()
-                        .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
-                        .when(selected, |el| el.bg(selected_bg))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.go_to_section(section, window, cx);
-                        }))
-                        .child(
-                            section
-                                .icon()
-                                .flex_none()
-                                .size(px(15.))
-                                .text_color(if selected { text } else { text_muted }),
-                        )
-                        .child(div().flex_1())
-                        .when_some(badge, |el, badge| {
-                            el.child(
-                                div()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .pt(px(8.))
+                    // The catalog — the one place backlog lives, and where
+                    // queueing happens. A static item above the tree, per the
+                    // v3 design.
+                    .child(
+                        div()
+                            .id("nav-all-tasks")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .mx(px(6.))
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .when(!all_selected, |el| el.hover(move |el| el.bg(hover_bg)))
+                            .when(all_selected, |el| el.bg(selected_bg))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.navigate(MiddleView::AllTasks, cx);
+                            }))
+                            .child(
+                                Icons::list_bullet()
                                     .flex_none()
-                                    .px(px(6.))
-                                    .rounded_full()
-                                    .bg(badge_bg)
-                                    .text_xs()
-                                    .text_color(text_muted)
-                                    .child(badge),
+                                    .size(px(14.))
+                                    .text_color(if all_selected { text } else { text_muted }),
                             )
-                        })
-                }),
-            ))
-            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if all_selected { text } else { text_muted })
+                                    .child("All Tasks"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .pt(px(14.))
+                            .pb(px(4.))
+                            .text_xs()
+                            .text_color(text_muted)
+                            .child("Tasks"),
+                    )
+                    // The tree. Flat rows for now — the drag ranking, state
+                    // glyph vocabulary and Awaiting Feedback section are
+                    // milestone 2; this is the skeleton they hang off.
+                    .child(
+                        div()
+                            .id("task-tree-scroll")
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .map(|el| {
+                                if tree.is_empty() {
+                                    el.child(
+                                        div()
+                                            .px(px(16.))
+                                            .py(px(6.))
+                                            .text_xs()
+                                            .text_color(text_muted)
+                                            .child(
+                                                "Nothing picked up — queue work from All Tasks.",
+                                            ),
+                                    )
+                                } else {
+                                    el.children(tree.into_iter().map(
+                                        |(_band, id, title, number, task_state)| {
+                                            let selected = selected_task.as_ref() == Some(&id);
+                                            let glyph: gpui::AnyElement = match task_state {
+                                                // Work in motion wears a live
+                                                // indicator, the design's ring.
+                                                TaskState::Scouting | TaskState::Building => {
+                                                    loading_indicator()
+                                                        .dash()
+                                                        .xsmall()
+                                                        .color(theme.accent())
+                                                        .into_any_element()
+                                                }
+                                                // Everything else: a dot in the
+                                                // state's colour, upgraded to the
+                                                // full glyph vocabulary in M2.
+                                                state => div()
+                                                    .flex_none()
+                                                    .size(px(7.))
+                                                    .rounded_full()
+                                                    .bg(task_state_color(state))
+                                                    .into_any_element(),
+                                            };
+                                            let row = div()
+                                                .id(SharedString::from(format!("tree-{id}")))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .mx(px(6.))
+                                                .px(px(10.))
+                                                .py(px(4.))
+                                                .rounded(px(5.))
+                                                .cursor_pointer()
+                                                .when(!selected, |el| {
+                                                    el.hover(move |el| el.bg(hover_bg))
+                                                })
+                                                .when(selected, |el| el.bg(selected_bg))
+                                                .on_click(cx.listener({
+                                                    let id = id.clone();
+                                                    move |this, _event, _window, cx| {
+                                                        this.select_task(id.clone(), cx);
+                                                    }
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .overflow_hidden()
+                                                        .truncate()
+                                                        .text_sm()
+                                                        .text_color(text)
+                                                        .child(title),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(text_muted)
+                                                        .child(format!("#{number}")),
+                                                )
+                                                .child(div().flex_none().child(glyph));
+                                            // Right-click offers every verb,
+                                            // greyed to this row's state —
+                                            // same menu as the catalog's rows.
+                                            context_menu(
+                                                SharedString::from(format!("tree-menu-{id}")),
+                                                row,
+                                            )
+                                            .menu(Workspace::row_menu(id, cx))
+                                        },
+                                    ))
+                                }
+                            }),
+                    ),
+            )
             .when_some(banner, |el, (message, is_error)| {
                 el.child(
                     div()
@@ -1559,8 +1603,11 @@ impl Workspace {
             })
     }
 
+    /// The right pane is the orchestrator chat — always on screen (⌘R hides
+    /// it), per the v3 design. The inspector it used to hold moved into the
+    /// middle column's tabs.
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let inspector = self.render_inspector(cx);
+        let chat = self.render_chat(cx).into_any_element();
         sidebar(SidebarSide::Right, self.right_sidebar.width)
             .on_resize_start({
                 let entity = cx.entity().downgrade();
@@ -1573,7 +1620,7 @@ impl Workspace {
                     }
                 }
             })
-            .child(inspector)
+            .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(chat))
     }
 
     /// One chat row. Durable turns and the live tick's trail entries share
@@ -2140,23 +2187,138 @@ impl Workspace {
             );
         }
 
-        // No header row. Chat always worked this way — "the sidebar already
-        // names it" — and now the title bar names every section, so a header
-        // here would be the second rendering of a word that should appear
-        // once. (If the name belongs back in the pane, this block and the
-        // `child_center` in `render_title_bar` are the pair to revert.)
-        //
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
         // never `size_full`: 100% of the pane plus anything above it
-        // overflows the clip and cuts off the bottom (chat's composer).
-        let body = match self.section {
-            Section::Home => self.render_home(cx).into_any_element(),
-            Section::Tasks => self.render_tasks(cx).into_any_element(),
-            Section::Queue => self.render_queue(cx).into_any_element(),
-            Section::Activity => self.render_activity(cx).into_any_element(),
-            Section::Chat => self.render_chat(cx).into_any_element(),
+        // overflows the clip and cuts off the bottom.
+        let body = match self.nav.current().clone() {
+            MiddleView::AllTasks => self.render_tasks(cx).into_any_element(),
+            MiddleView::Task(id) => self.render_task_pane(&id, cx),
         };
         pane.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body))
+    }
+
+    /// A selected task's tab set: the strip, then the active tab's body.
+    fn render_task_pane(&self, id: &TaskId, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        // A task can leave the working set while history still points at it —
+        // a retired row is an honest sentence, not a stale render.
+        if self.app_state.read(cx).task(id).is_none() {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(16.))
+                .text_sm()
+                .text_color(theme.fg_muted())
+                .child("That task is no longer in the working set.")
+                .into_any_element();
+        }
+
+        let body: gpui::AnyElement = match self.task_tab {
+            // The landing tab. For now this is the inspector's content
+            // wholesale — milestone 3 redistributes it across Overview and
+            // Brief and adds the orchestrator-context block.
+            TaskTab::Overview => div()
+                .id("task-overview-scroll")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(self.render_inspector(cx))
+                .into_any_element(),
+            other => self.render_tab_placeholder(other, cx),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.render_tab_bar(cx))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The tab strip, hand-rolled in Zed's idiom: a quiet bar with a bottom
+    /// rule; the active tab reads at full contrast with an accent underline,
+    /// inactive tabs are muted and warm on hover. Stateless over
+    /// [`Self::task_tab`] — the strip is a projection, not an entity.
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_end()
+            .gap(px(2.))
+            .px(px(8.))
+            .border_b_1()
+            .border_color(theme.border_subtle())
+            .children(TaskTab::ALL.into_iter().map(|tab| {
+                let active = tab == self.task_tab;
+                div()
+                    .id(tab.id())
+                    .px(px(10.))
+                    .py(px(6.))
+                    .mb(px(-1.))
+                    .border_b_2()
+                    .border_color(if active {
+                        theme.accent()
+                    } else {
+                        gpui::Hsla::transparent_black()
+                    })
+                    .text_sm()
+                    .text_color(if active { theme.fg() } else { theme.fg_muted() })
+                    .cursor_pointer()
+                    .when(!active, |el| {
+                        let fg = theme.fg();
+                        el.hover(move |el| el.text_color(fg))
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.task_tab = tab;
+                        cx.notify();
+                    }))
+                    .child(tab.label())
+            }))
+    }
+
+    /// What an unbuilt tab says about itself. Honest and specific: these land
+    /// in later milestones of the v3 plan, and a blank pane would read as a
+    /// bug rather than a boundary.
+    fn render_tab_placeholder(&self, tab: TaskTab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let (title, detail) = match tab {
+            TaskTab::Brief => (
+                "Brief",
+                "The spec and its review form land here (milestone 3).",
+            ),
+            TaskTab::AgentFeed => (
+                "Agent Feed",
+                "The live Claude Code stream from this task's VM lands here (milestone 4).",
+            ),
+            TaskTab::Changes => (
+                "Changes",
+                "The build's branch, summary and verification land here (milestone 5).",
+            ),
+            TaskTab::Overview => ("Overview", ""),
+        };
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(6.))
+            .p(px(16.))
+            .child(div().text_sm().text_color(theme.fg()).child(title))
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_center()
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(detail),
+            )
+            .into_any_element()
     }
 }
 
@@ -2250,7 +2412,9 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                if this.selected_task.is_some() || this.right_sidebar.is_open() {
+                // Selection only — escape must not take the chat pane away;
+                // that pane is ⌘R's business.
+                if this.selected_task.is_some() {
                     this.clear_selection(window, cx);
                 }
             }))
@@ -2264,20 +2428,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ApproveSelectedSpec, window, cx| {
                 this.run_on_selection(RowAction::ApproveSpec, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToHome, window, cx| {
-                this.go_to_section(Section::Home, window, cx);
+            .on_action(cx.listener(|this, _: &HistoryBack, _window, cx| {
+                this.history_back(cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
-                this.go_to_section(Section::Tasks, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToQueue, window, cx| {
-                this.go_to_section(Section::Queue, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToActivity, window, cx| {
-                this.go_to_section(Section::Activity, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToChat, window, cx| {
-                this.go_to_section(Section::Chat, window, cx);
+            .on_action(cx.listener(|this, _: &HistoryForward, _window, cx| {
+                this.history_forward(cx);
             }))
             // A view filter over this window's Tasks list, so it is the
             // workspace's to handle and greys out with no workspace focused.
@@ -2365,35 +2520,29 @@ impl Focusable for Workspace {
 mod tests {
     use super::*;
 
-    /// The rule #902 is about, in both directions and over every section:
-    /// focus may only ever name an element the section being switched to
-    /// actually draws. Chat is the one section with a composer, so arriving
-    /// there lands in it — and leaving takes focus back, because
-    /// `window.focus` on a handle that is absent from the frame does not fail
-    /// or warn, it behaves exactly like no focus at all and takes the whole
-    /// key context down with it.
+    /// The left rail's tree is the queue and nothing else: backlog and
+    /// history are behind All Tasks, and the band order is the Queue
+    /// section's attention order, which milestone 2's drag ranking builds on.
     #[test]
-    fn only_chat_focuses_a_composer() {
-        for section in Section::ALL {
-            let expected = match section {
-                Section::Chat => FocusTarget::ChatComposer,
-                _ => FocusTarget::Workspace,
-            };
-            assert_eq!(
-                section.focus_target(),
-                expected,
-                "{} focuses the wrong element",
-                section.label()
-            );
-        }
-    }
+    fn the_tree_shows_picked_up_work_in_attention_order() {
+        let shown: Vec<u8> = [
+            TaskState::InReview,
+            TaskState::Scouting,
+            TaskState::Building,
+            TaskState::AwaitingMerge,
+            TaskState::Queued,
+            TaskState::ReadyToBuild,
+        ]
+        .into_iter()
+        .map(|state| tree_band(state).expect("picked-up work belongs in the tree"))
+        .collect();
+        let mut ordered = shown.clone();
+        ordered.sort_unstable();
+        ordered.dedup();
+        assert_eq!(shown, ordered, "bands must be distinct and in order");
 
-    /// The section a window opens on, spelled out on its own: the startup
-    /// frame draws no composer, so the only handle that can hold focus at rest
-    /// is the root's. Focusing the chat composer here — which is what `new`
-    /// used to do — is the whole of #902.
-    #[test]
-    fn the_section_a_window_opens_on_focuses_the_root() {
-        assert_eq!(Section::Home.focus_target(), FocusTarget::Workspace);
+        for state in [TaskState::Backlog, TaskState::Done, TaskState::Rejected] {
+            assert_eq!(tree_band(state), None, "{state:?} does not belong");
+        }
     }
 }

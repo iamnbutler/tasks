@@ -514,20 +514,17 @@ mod tests {
         }
     }
 
-    /// The sections in sidebar order, then the two palettes — because a
-    /// surface reachable only by knowing its keystroke is one most people
-    /// never find — then the archive filter.
+    /// History first, then the two palettes — because a surface reachable
+    /// only by knowing its keystroke is one most people never find — then the
+    /// archive filter. Sections died with the v3 frame swap.
     #[test]
-    fn view_menu_covers_every_section_in_sidebar_order() {
+    fn view_menu_covers_history_palettes_and_the_archive_filter() {
         let actions: Vec<_> = items("View").into_iter().map(|(_, a)| a).collect();
         assert_eq!(
             actions,
             [
-                "workspace::GoToHome",
-                "workspace::GoToTasks",
-                "workspace::GoToQueue",
-                "workspace::GoToActivity",
-                "workspace::GoToChat",
+                "workspace::HistoryBack",
+                "workspace::HistoryForward",
                 "palette::GoToAnything",
                 "palette::ShowCommandPalette",
                 "workspace::ToggleShowDone",
