@@ -74,7 +74,7 @@ use crate::protocol::TasksProtocol;
 use crate::reattach;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
-use crate::store::{ResumedWork, Store, StoreError, Strike};
+use crate::store::{ReconcileReport, ResumedWork, Store, StoreError, Strike};
 
 pub const DEFAULT_PORT: u16 = 4800;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
@@ -903,7 +903,8 @@ async fn drain_background(
 ///
 /// See [`Store::reconcile_orphaned_work`] for what that means row by row.
 pub async fn reconcile_startup(store: &Store) -> Result<(), StoreError> {
-    reconcile_startup_except(store, &ResumedWork::default()).await
+    reconcile_startup_except(store, &ResumedWork::default()).await?;
+    Ok(())
 }
 
 /// [`reconcile_startup`], minus the rows a reattach already owns.
@@ -914,10 +915,17 @@ pub async fn reconcile_startup(store: &Store) -> Result<(), StoreError> {
 /// destroy exactly the run reattachment exists to save. What is left after the
 /// resume — rows whose VM is gone, or that could not be picked up — is
 /// orphaned in the old sense, and is treated exactly as before.
+///
+/// Returns what it wrote off, so a caller can assert on the *decision* rather
+/// than on the state a reattached row happens to be in afterwards. Those are
+/// not the same claim: `resume_in_flight` spawns the reattach, so on a loaded
+/// machine a session it picked up can already have concluded by the time this
+/// returns, and reading the row back is a race. The report is race-free and the
+/// stronger statement — reconciliation wrote nothing off.
 pub async fn reconcile_startup_except(
     store: &Store,
     resumed: &ResumedWork,
-) -> Result<(), StoreError> {
+) -> Result<ReconcileReport, StoreError> {
     let report = store.reconcile_orphaned_work_except(resumed).await?;
     if !report.is_empty() {
         info!(
@@ -927,7 +935,7 @@ pub async fn reconcile_startup_except(
             "reconciled work orphaned by a previous run"
         );
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Say, once, that an orchestrator turn was cut off mid-flight.

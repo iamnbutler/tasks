@@ -42,8 +42,8 @@ use vm_pool_service::Service;
 
 mod common;
 use common::{
-    gated_agent_path, gated_builder_agent_path, make_fixture_repo, spawn_vm_pool, wait_until,
-    workspace_bin, write_builder_supervisor_wrapper, write_supervisor_wrapper,
+    capture_warnings, gated_agent_path, gated_builder_agent_path, make_fixture_repo, spawn_vm_pool,
+    wait_until, workspace_bin, write_builder_supervisor_wrapper, write_supervisor_wrapper,
 };
 
 type VmPool = Arc<Service<SupervisorRuntime, TasksProtocol>>;
@@ -188,6 +188,10 @@ async fn wait_for_file(path: &Path) {
 /// finishes anyway, under the process that came after it.
 #[tokio::test]
 async fn a_restart_reattaches_to_a_scout_instead_of_orphaning_it() {
+    // First thing: a test process installs no subscriber, so without this a
+    // lost transcript batch reaches the marker assertion below with its own
+    // explanation nowhere to be seen.
+    let warnings = capture_warnings();
     let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let clone_root = tmp.path().join("repos");
@@ -253,30 +257,36 @@ async fn a_restart_reattaches_to_a_scout_instead_of_orphaning_it() {
         resumed.sessions.contains(&session_id),
         "the surviving session must be picked up, not reconciled"
     );
-    run::reconcile_startup_except(&store, &resumed)
+    let report = run::reconcile_startup_except(&store, &resumed)
         .await
         .unwrap();
 
-    // Reconciliation left the resumed row alone…
+    // Reconciliation left the resumed row alone. Asserted on the *report*
+    // rather than by reading the session back as `Running`: `resume_in_flight`
+    // spawns the reattach and everything it needs is already in the pool's
+    // event log, so on a loaded machine the run can conclude before the next
+    // line executes (4 failures in 40 loaded runs, `left: ScoutSucceeded`).
+    // The report is race-free and says the stronger thing — nothing was
+    // written off.
     assert_eq!(
-        store
-            .get_session(&session_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        SessionStatus::Running,
-    );
-    assert_eq!(
-        store.get_task(&task.id).await.unwrap().unwrap().state,
-        TaskState::Scouting,
+        report,
+        Default::default(),
+        "the resumed session must not be reconciled"
     );
 
     // …and the reattach carries the run through to a spec.
+    //
+    // Waited on the *task state*, not on "a spec exists": `finalize_succeeded`
+    // writes the spec first, the queue entry second and the task state last,
+    // so a spec is the earliest of the three watermarks and everything
+    // asserted below it would be racing the rest of the finalize (4 failures
+    // in 300 loaded runs, `left: Scouting, right: InReview`).
     let s = store.clone();
+    let waiting_for = task.id.clone();
     wait_until(Duration::from_secs(120), || {
         let s = s.clone();
-        async move { !s.list_specs().await.unwrap().is_empty() }
+        let id = waiting_for.clone();
+        async move { s.get_task(&id).await.unwrap().unwrap().state == TaskState::InReview }
     })
     .await;
 
@@ -313,7 +323,8 @@ async fn a_restart_reattaches_to_a_scout_instead_of_orphaning_it() {
             .filter(|l| l.contains("picked back up after a server restart"))
             .count(),
         1,
-        "transcript: {transcript:?}"
+        "transcript: {transcript:?}\n\nwarnings logged during this run:\n{}",
+        warnings.seen()
     );
     assert!(
         transcript

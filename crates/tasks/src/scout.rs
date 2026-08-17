@@ -971,7 +971,13 @@ fn spawn_checkpoint_writer(
                 files_touched: Vec::new(),
                 updated_at: Utc::now(),
             };
-            if let Err(e) = store.upsert_scout_notes(&row).await {
+            // Retried because this task is detached and has no caller to
+            // return an error to — and because what it is persisting is the
+            // salvage a cut-short run is judged on, which is the one artefact
+            // `NOTES.md` streaming exists to protect. The retry is a belt;
+            // `store::begin_write` is what removed the unretryable failure.
+            let write = crate::store::retry_on_contention(|| store.upsert_scout_notes(&row)).await;
+            if let Err(e) = write {
                 warn!(session_id = %session_id, error = %e, "persisting a scout checkpoint failed");
             }
         }

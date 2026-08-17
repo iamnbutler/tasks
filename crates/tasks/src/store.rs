@@ -421,7 +421,7 @@ async fn sweep_transcript_credentials(pool: &SqlitePool) -> Result<u64, StoreErr
             return Ok(scrubbed);
         }
         let batch_len = rows.len() as i64;
-        let mut tx = pool.begin().await?;
+        let mut tx = begin_write(pool).await?;
         for (rowid, line) in rows {
             let redacted = crate::redact::redact(&line);
             if redacted != line {
@@ -441,6 +441,29 @@ async fn sweep_transcript_credentials(pool: &SqlitePool) -> Result<u64, StoreErr
     }
 }
 
+/// Open a write transaction that takes the write lock **now**, rather than at
+/// its first `INSERT`.
+///
+/// Every transaction in this module reads before it writes. A bare
+/// `pool.begin()` is a deferred `BEGIN`: it takes its read snapshot at the
+/// first `SELECT` and only asks for the write lock at the first write, and
+/// SQLite refuses a *contended upgrade* **without consulting the busy
+/// handler** — a reader made to wait would deadlock the writer it is waiting
+/// on. So the 5s `busy_timeout` [`Store::open`] sets for exactly this overlap
+/// never applied to the case that matters, and the loser failed instantly with
+/// `SQLITE_BUSY` (5) or `SQLITE_BUSY_SNAPSHOT` (517), rolling its whole batch
+/// back. Measured: two `Store`s on one file appending 100 transcript lines each
+/// lost 82–96 of 200 appends; with `BEGIN IMMEDIATE` they lose none.
+///
+/// `begin_with` execs the statement eagerly and verifies the connection ended
+/// up in a transaction. It rejects a custom statement when already inside one
+/// (SQLite would need a `SAVEPOINT` there) — irrelevant here, nothing nests.
+async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
+    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlx: {0}")]
@@ -455,6 +478,63 @@ pub enum StoreError {
     NotFound(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+}
+
+impl StoreError {
+    /// Whether this is another writer holding the lock, rather than anything
+    /// wrong with the statement.
+    ///
+    /// sqlx reports SQLite's *extended* result code, so this matches the
+    /// primary code in the low byte rather than enumerating spellings —
+    /// `SQLITE_BUSY` (5) covers 5, 261, 517…, and `SQLITE_LOCKED` (6) likewise.
+    pub fn is_contention(&self) -> bool {
+        let Self::Sqlx(sqlx::Error::Database(e)) = self else {
+            return false;
+        };
+        e.code()
+            .and_then(|c| c.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    }
+}
+
+/// Retry a whole write transaction when it loses the lock.
+///
+/// **A belt, not the fix** — [`begin_write`] is the fix, and it removes the
+/// *unretryable* class of failure entirely. A residual `SQLITE_BUSY` is still
+/// possible, because SQLite documents that it may skip the busy handler
+/// whenever waiting could deadlock; this covers that remainder.
+///
+/// Scoped to the two writers with nobody downstream of them — the transcript
+/// writer task and the scout checkpoint writer — because both are detached and
+/// have no caller to return an error to, so a lost write there is simply lost
+/// content. Everything else must keep propagating: a retry in a request path
+/// only makes a visible failure slower.
+///
+/// Safe by construction: what it wraps is a whole transaction, so a rejected
+/// attempt wrote nothing and a retry can neither double a line nor skip a
+/// `seq`.
+pub async fn retry_on_contention<T, F, Fut>(mut write: F) -> Result<T, StoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StoreError>>,
+{
+    const BACKOFF: [Duration; 2] = [Duration::from_millis(50), Duration::from_millis(200)];
+
+    for (attempt, wait) in BACKOFF.iter().enumerate() {
+        match write().await {
+            Err(e) if e.is_contention() => {
+                warn!(
+                    attempt = attempt + 1,
+                    retry_in_ms = wait.as_millis() as u64,
+                    error = %e,
+                    "a write lost the write lock; retrying"
+                );
+                tokio::time::sleep(*wait).await;
+            }
+            other => return other,
+        }
+    }
+    write().await
 }
 
 pub struct Store {
@@ -490,6 +570,16 @@ impl Store {
     /// with `SQLITE_BUSY` ("database is locked") instead of waiting its turn —
     /// seen live the first time a scout streamed transcripts while the app
     /// refreshed.
+    ///
+    /// **That is half the story, and the missing half cost a flaky suite and a
+    /// silently lost salvage.** A busy timeout only helps statements the busy
+    /// handler is actually consulted for, and a *deferred* read→write upgrade
+    /// is not one of them: SQLite refuses a contended upgrade immediately,
+    /// without consulting the handler, because a reader made to wait would
+    /// deadlock the writer it is waiting on. Every write transaction here reads
+    /// before it writes, so every one of them was exposed — which is why they
+    /// all open through [`begin_write`] (`BEGIN IMMEDIATE`) and take the write
+    /// lock up front, where the busy timeout applies.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 
@@ -518,6 +608,11 @@ impl Store {
             actor_token: Uuid::new_v4().to_string().into(),
             migrations_applied,
         })
+    }
+
+    /// Open a write transaction on this store's pool. See [`begin_write`].
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
+        begin_write(&self.pool).await
     }
 
     /// Open an in-memory database (useful for tests).
@@ -746,7 +841,7 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut missing = Vec::new();
         for id in ids {
             let found = sqlx::query("SELECT 1 FROM tasks WHERE id = ?")
@@ -789,7 +884,7 @@ impl Store {
     /// Emits the `TaskStateChanged` event itself so every caller gets the same
     /// audit trail. Returns the updated task.
     pub async fn queue_task(&self, id: &TaskId) -> Result<Task, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let task = self
             .require_task_state(&mut tx, id, TaskState::Backlog)
             .await?;
@@ -822,7 +917,7 @@ impl Store {
     /// rank. Work past `Queued` can't be un-picked — cancel or review it
     /// through the pipeline instead.
     pub async fn dequeue_task(&self, id: &TaskId) -> Result<Task, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let task = self
             .require_task_state(&mut tx, id, TaskState::Queued)
             .await?;
@@ -863,7 +958,7 @@ impl Store {
         &self,
         id: &TaskId,
     ) -> Result<Option<TaskState>, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let task = self
             .get_task_in_tx(&mut tx, id)
             .await?
@@ -893,7 +988,7 @@ impl Store {
     /// dispatch loop picks it up on its next tick; the concurrency cap still
     /// applies — this jumps the queue, it does not bypass it.
     pub async fn push_task_to_front(&self, id: &TaskId) -> Result<Task, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let task = self
             .get_task_in_tx(&mut tx, id)
             .await?
@@ -1087,7 +1182,7 @@ impl Store {
         let task = self.upsert_gh_issue(project_id, issue).await?.into_inner();
 
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let decision_seq = insert_decision(
             &mut tx,
             "task",
@@ -1129,7 +1224,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
 
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let decision_seq = insert_decision(
             &mut tx,
             "task",
@@ -1179,7 +1274,7 @@ impl Store {
     ) -> Result<Vec<TaskId>, StoreError> {
         let open: std::collections::HashSet<u64> = open_issue_numbers.iter().copied().collect();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let rows = sqlx::query(
             "SELECT id, gh_issue_number FROM tasks WHERE project_id = ? AND gh_state = ?",
         )
@@ -1266,7 +1361,7 @@ impl Store {
             )));
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let task = self
             .get_task_in_tx(&mut tx, id)
             .await?
@@ -1584,7 +1679,7 @@ impl Store {
         }
         let (session_id, build_id) = owner_columns(owner);
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let next: i64 = sqlx::query_scalar(match owner {
             TranscriptOwner::Session { .. } => {
@@ -1836,7 +1931,7 @@ impl Store {
     ) -> Result<ReconcileReport, StoreError> {
         let now = Utc::now();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         // The LEFT JOIN is what separates a session that checkpointed from one
         // that went silent. Notes are persisted on arrival precisely so this
         // question survives the restart that orphaned the row.
@@ -2261,7 +2356,7 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut missing = Vec::new();
         for id in ids {
             let found = sqlx::query("SELECT 1 FROM spec_queue WHERE spec_id = ?")
@@ -2348,7 +2443,7 @@ impl Store {
             _ => None,
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         // The ledger row lands in the same transaction as the change it
         // authorizes: events are appended after commit, which is fine for
         // telemetry but would let a crash leave a verdict with no recorded
@@ -2459,7 +2554,7 @@ impl Store {
             created_at: now,
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "INSERT INTO specs (id, session_id, task_id, content, complexity, \
              files_touched, created_at) VALUES (?, NULL, ?, ?, ?, ?, ?)",
@@ -2583,7 +2678,7 @@ impl Store {
             }
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         // One query resolves existence, review status, project, and queue
         // order for the whole batch.
@@ -2729,7 +2824,7 @@ impl Store {
     /// ordering simply skips past it.
     pub async fn claim_next_queued_build(&self) -> Result<Option<Build>, StoreError> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let running = sqlx::query("SELECT 1 FROM builds WHERE status = ? LIMIT 1")
             .bind(BuildStatus::Running.as_str())
@@ -2966,7 +3061,7 @@ impl Store {
         files_touched: &[String],
     ) -> Result<Build, StoreError> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query(
             "UPDATE builds SET status = ?, head_sha = ?, pr_number = ?, summary = ?, \
@@ -3141,7 +3236,7 @@ impl Store {
         strike: Strike,
     ) -> Result<Build, StoreError> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         sqlx::query("UPDATE builds SET status = ?, exit_reason = ?, completed_at = ? WHERE id = ?")
             .bind(status.as_str())
@@ -3320,7 +3415,7 @@ impl Store {
     /// opinion is how audit trails stop being audit trails.
     pub async fn unwind_unmerged_build(&self, id: &BuildId) -> Result<Vec<TaskId>, StoreError> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let built = sqlx::query(
             "SELECT spec_id FROM spec_queue \
@@ -3545,7 +3640,7 @@ impl Store {
         cc_session_id: Option<&str>,
     ) -> Result<OrchestratorMessage, StoreError> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let result = sqlx::query(
             "INSERT INTO orchestrator_messages (role, content, created_at, cc_session_id)              VALUES (?, ?, ?, ?)",
         )
@@ -3962,7 +4057,7 @@ impl Store {
         enforced: bool,
     ) -> Result<i64, StoreError> {
         require_rationale(&decision)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let seq = insert_decision_at(
             &mut tx,
             subject_kind,
@@ -4138,7 +4233,7 @@ impl Store {
                  forward as a summary.)"
             }
         };
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "UPDATE orchestrator_sessions SET ended_at = ?, end_reason = ?              WHERE cc_session_id = ? AND ended_at IS NULL",
         )
@@ -4179,7 +4274,7 @@ impl Store {
         replacing: Option<&str>,
         reason: Option<SessionEndReason>,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("INSERT INTO orchestrator_sessions (cc_session_id, started_at) VALUES (?, ?)")
             .bind(cc_session_id)
             .bind(Utc::now().to_rfc3339())
@@ -5186,6 +5281,154 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    /// Seed a real project → task → session on `store`, since foreign keys are
+    /// on (sqlx sets `PRAGMA foreign_keys=ON`) and a transcript line needs an
+    /// owner that exists.
+    async fn seed_project_task_session(store: &Store) -> SessionId {
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = sample_task(&project.id);
+        store.insert_task(&task).await.unwrap();
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: Some("vm-abc".into()),
+            branch: "scout/42-xyz".into(),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+            directions: None,
+        };
+        store.insert_session(&session).await.unwrap();
+        session.id
+    }
+
+    /// The guard for the root cause of #926.
+    ///
+    /// Two `Store`s on one file is the honest model, not a contrivance: a
+    /// `reload` hand-over really does put two *processes* on one database, and
+    /// the in-memory store is `max_connections(1)`, so no unit test on it could
+    /// ever show this. With a deferred `BEGIN` this fails deterministically —
+    /// 82 of 200 appends rejected, measured — because each transaction reads
+    /// `MAX(seq)` before it writes and SQLite refuses the contended upgrade
+    /// without ever consulting the busy handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_stores_on_one_file_both_get_their_transcript_lines_in() {
+        const APPENDS: usize = 100;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+
+        let first = Store::open(&path).await.unwrap();
+        let session = seed_project_task_session(&first).await;
+        let second = Store::open(&path).await.unwrap();
+
+        async fn append_repeatedly(store: Store, owner: TranscriptOwner, tag: &str) -> usize {
+            let mut rejected = 0;
+            for i in 0..APPENDS {
+                let line = (TranscriptStream::Stdout, format!("{tag} {i}"));
+                if store
+                    .append_transcript_lines(&owner, &[line])
+                    .await
+                    .is_err()
+                {
+                    rejected += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            rejected
+        }
+
+        let owner = TranscriptOwner::session(&session);
+        let (a, b) = tokio::join!(
+            append_repeatedly(first, owner.clone(), "a"),
+            append_repeatedly(second, owner, "b"),
+        );
+
+        assert_eq!(
+            a + b,
+            0,
+            "{} of {} appends were rejected — a write transaction is losing the \
+             lock unretryably, which is what `begin_write` exists to prevent",
+            a + b,
+            APPENDS * 2
+        );
+
+        // And no `seq` went missing: dense 1..=200, so nothing was lost in a
+        // way a reader could not see either.
+        let store = Store::open(&path).await.unwrap();
+        let seqs: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq FROM transcript_lines WHERE session_id = ? ORDER BY seq",
+        )
+        .bind(session.as_str())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(seqs, (1..=(APPENDS as i64 * 2)).collect::<Vec<_>>());
+    }
+
+    /// The classifier, pinned against an error SQLite really produced rather
+    /// than a hand-built one — manufactured with exactly the shape
+    /// [`begin_write`] prevents: a deferred `BEGIN`, a read, someone else's
+    /// commit, then a write (→ `SQLITE_BUSY_SNAPSHOT`, 517).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_contended_write_is_told_apart_from_a_broken_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let store = Store::open(&path).await.unwrap();
+        let session = seed_project_task_session(&store).await;
+        let owner = TranscriptOwner::session(&session);
+
+        let contention = loop {
+            let mut deferred = store.pool.begin().await.unwrap();
+            // Take the read snapshot.
+            let _: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(seq) FROM transcript_lines WHERE session_id = ?")
+                    .bind(session.as_str())
+                    .fetch_one(&mut *deferred)
+                    .await
+                    .unwrap();
+            // Someone else commits underneath it.
+            store
+                .append_transcript_lines(&owner, &[(TranscriptStream::Stdout, "other".into())])
+                .await
+                .unwrap();
+            // Now upgrade to a write against a snapshot that has moved.
+            let upgrade = sqlx::query(
+                "INSERT INTO transcript_lines (session_id, build_id, seq, timestamp, stream, line) \
+                 VALUES (?, NULL, 9999, ?, 'stdout', 'x')",
+            )
+            .bind(session.as_str())
+            .bind(Utc::now())
+            .execute(&mut *deferred)
+            .await;
+            match upgrade {
+                Err(e) => break StoreError::from(e),
+                // It got the lock this time; roll back and try again rather
+                // than leaving a row behind that would collide on the retry.
+                Ok(_) => deferred.rollback().await.unwrap(),
+            }
+        };
+
+        assert!(
+            contention.is_contention(),
+            "SQLite's own contended-upgrade error must classify as contention, got: {contention}"
+        );
+
+        // And the things that are not contention stay not-contention: a
+        // retry must never paper over a broken statement or a missing row.
+        assert!(!StoreError::NotFound("nope".into()).is_contention());
+        let broken = StoreError::from(
+            sqlx::query("SELECT nope FROM tasks")
+                .execute(&store.pool)
+                .await
+                .unwrap_err(),
+        );
+        assert!(!broken.is_contention(), "{broken}");
     }
 
     #[tokio::test]
