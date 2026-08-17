@@ -71,10 +71,16 @@ above the cwd, then the nearest above this binary; the real environment wins):
                          pause). The stored mode is never resumed — only
                          `tasks reload` carries it to the new server
   TASKS_INTAKE_LABEL     ingest only issues carrying this label (default: all)
-  SCOUT_MAX_CONCURRENT   scouts running at once (default 2)
+  SCOUT_MAX_CONCURRENT   scouts running at once (default 2). Each holds a
+                         vm-pool slot, and the serial build lane holds one
+                         more, so the pool must fit SCOUT_MAX_CONCURRENT + 1
+                         with slack — see VM_POOL_MAX_VMS
   SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)
   SCOUT_TIMEOUT_SECS     wall-clock budget per scout (default 3600)
   VM_POOL_SOCKET         vm-pool service socket (default /tmp/vm-pool.sock)
+  VM_POOL_MAX_VMS        VMs `tasks vm-pool` holds at once (default 6). Read
+                         by the pool, not by the server, so changing it means
+                         restarting the pool
   GITHUB_TOKEN           required for polling; also used for repo clones
   GITHUB_API_URL         GraphQL endpoint override
   GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com)
@@ -388,8 +394,9 @@ async fn stop_cmd(args: &[String]) -> Result<()> {
 /// vm-pool-service binary is NoRuntime + ShellProtocol and can't carry our
 /// protocol.
 async fn vm_pool(args: &[String]) -> Result<()> {
+    use tracing::info;
     use vm_pool_manager::{ContainerRuntime, PoolConfig};
-    use vm_pool_service::{Service, ServiceConfig};
+    use vm_pool_service::{MAX_VMS_ENV, Service, ServiceConfig, max_vms_from_env};
 
     // It took no arguments at all, which is why an unrecognized one meant
     // "start the daemon".
@@ -401,10 +408,21 @@ async fn vm_pool(args: &[String]) -> Result<()> {
         .unwrap_or_else(|_| "/tmp/vm-pool.sock".into())
         .into();
     let data_dir = run::data_dir()?;
+    // This is the pool that actually runs scouts and builds, so it has to
+    // honour VM_POOL_MAX_VMS too — it hand-builds its ServiceConfig (it needs
+    // ContainerRuntime + TasksProtocol, which the stock binary cannot carry),
+    // so it cannot inherit `ServiceConfig::from_env`. Resolved before the
+    // socket is bound: an unusable value is an exit, not a daemon of a size
+    // nobody chose.
+    let max_vms = max_vms_from_env()?;
+    info!(max_vms, var = MAX_VMS_ENV, "pool capacity");
     let config = ServiceConfig {
         socket_path,
         snapshot_dir: data_dir.join("snapshots"),
-        pool: PoolConfig::default(),
+        pool: PoolConfig {
+            max_vms,
+            ..PoolConfig::default()
+        },
     };
     let service = Service::<ContainerRuntime, tasks_protocol::TasksProtocol>::with_runtime(
         config,

@@ -1745,23 +1745,42 @@ pub async fn dispatch_loop(
             }
         };
         info!(socket = %config.vm_pool_socket.display(), "connected to vm-pool");
-        report_attach_support(&client).await;
+        report_pool(&client, &config).await;
         sweep_leaked_vms(&store, &mut client).await;
 
         dispatch_connected(&store, &config, &in_flight, client, &mut shutdown).await;
     }
 }
 
-/// Say, on every connect, whether this vm-pool could be reattached to.
+/// Say, on every connect, what this vm-pool can do for this server: whether it
+/// could be reattached to, and whether it is big enough to hold the work this
+/// configuration will ask it for.
 ///
-/// Deliberately not a gate. Dispatch needs nothing newer than the original
-/// command set, and an old daemon runs scouts and builds perfectly well; the
-/// only thing it cannot do is hand work back after a restart. That bill
-/// arrives at the *next* restart, by which point the work it costs is already
-/// in flight — so connect time is the last moment an operator can act on it,
-/// which is the whole reason to say it out loud here.
-async fn report_attach_support(client: &Client<TasksProtocol>) {
-    let support = reattach::attach_support(&client.handle()).await;
+/// Deliberately not a gate, in both halves. Dispatch needs nothing newer than
+/// the original command set, and an old daemon runs scouts and builds
+/// perfectly well; the only thing it cannot do is hand work back after a
+/// restart. That bill arrives at the *next* restart, by which point the work
+/// it costs is already in flight — so connect time is the last moment an
+/// operator can act on it, which is the whole reason to say it out loud here.
+/// Capacity is the same shape of fact: nothing here can resize a pool in
+/// another process, and refusing to dispatch against a small one would turn a
+/// survivable misconfiguration into an outage.
+///
+/// One `status` round trip answers both questions — which is what
+/// [`reattach::support_of`] exists for. A `status` that errors keeps the
+/// attach-support warning and skips the capacity half rather than guessing:
+/// `status` is the oldest command in the protocol, so a pool that will not
+/// answer it will not answer anything better.
+async fn report_pool(client: &Client<TasksProtocol>, config: &Config) {
+    let status = match client.handle().status().await {
+        Ok(status) => status,
+        Err(e) => return report_attach_support(&reattach::AttachSupport::Unknown(e)),
+    };
+    report_attach_support(&reattach::support_of(&status));
+    report_capacity(Capacity::assess(status.total, config.scout_max_concurrent));
+}
+
+fn report_attach_support(support: &reattach::AttachSupport) {
     if support.is_supported() {
         info!(%support, "vm-pool can hand work back across a restart");
     } else {
@@ -1770,6 +1789,81 @@ async fn report_attach_support(client: &Client<TasksProtocol>) {
             "vm-pool cannot hand work back across a restart — a restart from here \
              will write off whatever is in flight"
         );
+    }
+}
+
+/// The slot the serial build lane occupies.
+///
+/// One, and only ever one — builds are strictly serial, so nothing multiplies
+/// it. `buildkit` is deliberately **not** in this sum: it is started by the
+/// container runtime to service an image build, as an ordinary host process
+/// this pool never allocated and does not count. It bills to host memory, not
+/// to a slot.
+const BUILD_LANE_SLOTS: usize = 1;
+
+/// How this server's configuration fits the pool it just connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capacity {
+    /// The pool cannot hold what a full complement of work would need. Some
+    /// dispatch will be refused with `pool exhausted`.
+    Short { needed: usize, total: usize },
+    /// It fits exactly. Dispatches fine today; exhausts on the first leaked VM.
+    NoSlack { needed: usize, total: usize },
+    /// It fits with room over.
+    Slack {
+        needed: usize,
+        total: usize,
+        spare: usize,
+    },
+}
+
+impl Capacity {
+    /// Weigh a pool of `total` slots against what this server may ask of it:
+    /// every scout it will run at once, plus the one serial build lane.
+    fn assess(total: usize, scout_max_concurrent: usize) -> Self {
+        let needed = scout_max_concurrent + BUILD_LANE_SLOTS;
+        match total.checked_sub(needed) {
+            None => Self::Short { needed, total },
+            Some(0) => Self::NoSlack { needed, total },
+            Some(spare) => Self::Slack {
+                needed,
+                total,
+                spare,
+            },
+        }
+    }
+}
+
+/// Log a [`Capacity`], picking the level.
+///
+/// `NoSlack` is a `warn!` rather than an `info!` on purpose: a pool sized
+/// exactly to the steady state dispatches perfectly well right up until one VM
+/// leaks, and then refuses everything. The operator reading this line is the
+/// person who can act on it, so both warnings name the variable *and* the fix
+/// — and the `Short` one names the alternative, since lowering
+/// `SCOUT_MAX_CONCURRENT` is as good an answer as raising the pool.
+fn report_capacity(capacity: Capacity) {
+    match capacity {
+        Capacity::Short { needed, total } => warn!(
+            needed,
+            total,
+            "vm-pool is too small for this server: {needed} slots are needed \
+             ({} scouts + the serial build lane) and it holds {total} — dispatch will \
+             be refused with `pool exhausted`. Raise VM_POOL_MAX_VMS and restart \
+             `tasks vm-pool`, or lower SCOUT_MAX_CONCURRENT",
+            needed - BUILD_LANE_SLOTS,
+        ),
+        Capacity::NoSlack { needed, total } => warn!(
+            needed,
+            total,
+            "vm-pool fits this server exactly ({needed} of {total} slots) — one leaked \
+             VM exhausts it. Raise VM_POOL_MAX_VMS and restart `tasks vm-pool`"
+        ),
+        Capacity::Slack {
+            needed,
+            total,
+            spare,
+        } => info!(needed, total, spare, "vm-pool capacity is sufficient"),
     }
 }
 
@@ -2488,6 +2582,79 @@ mod tests {
 
     use super::*;
     use crate::models::{ProjectId, ProjectStatus};
+
+    #[test]
+    fn the_shipped_defaults_leave_the_pool_slack() {
+        // Asserted against the constants rather than literals, so this moves
+        // when they do instead of quietly becoming a claim about the past.
+        assert_eq!(
+            Capacity::assess(
+                vm_pool_manager::DEFAULT_MAX_VMS,
+                DEFAULT_SCOUT_MAX_CONCURRENT
+            ),
+            Capacity::Slack {
+                needed: DEFAULT_SCOUT_MAX_CONCURRENT + 1,
+                total: vm_pool_manager::DEFAULT_MAX_VMS,
+                spare: vm_pool_manager::DEFAULT_MAX_VMS - DEFAULT_SCOUT_MAX_CONCURRENT - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn buildkit_does_not_occupy_a_slot() {
+        // The sum is scouts + the one serial build lane, and nothing else. A
+        // `buildkit` VM is started by the container runtime as a host process
+        // the pool never allocated, so counting it would size every pool one
+        // too large and make this report wrong in the safe-looking direction.
+        assert_eq!(BUILD_LANE_SLOTS, 1);
+        assert_eq!(
+            Capacity::assess(6, 3),
+            Capacity::Slack {
+                needed: 4,
+                total: 6,
+                spare: 2
+            },
+            "3 scouts + 1 build lane is 4 of 6, not 5 of 6"
+        );
+    }
+
+    #[test]
+    fn a_pool_too_small_is_short_by_what_it_is_missing() {
+        assert_eq!(
+            Capacity::assess(3, 4),
+            Capacity::Short {
+                needed: 5,
+                total: 3
+            }
+        );
+        // The degenerate case: a pool reporting nothing at all is short, not a
+        // subtraction overflow.
+        assert_eq!(
+            Capacity::assess(0, 1),
+            Capacity::Short {
+                needed: 2,
+                total: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_exact_fit_is_reported_as_having_no_slack() {
+        assert_eq!(
+            Capacity::assess(3, 2),
+            Capacity::NoSlack {
+                needed: 3,
+                total: 3
+            }
+        );
+        assert_eq!(
+            Capacity::assess(6, 5),
+            Capacity::NoSlack {
+                needed: 6,
+                total: 6
+            }
+        );
+    }
 
     fn config() -> Config {
         Config {

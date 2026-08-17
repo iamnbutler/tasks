@@ -491,6 +491,40 @@ every restart; and the transition happens *before* `server::bind`, so no
 client — and no `reload` verifying a swap — can observe the previous run's
 mode.
 
+### Pool capacity
+
+There are **two ledgers, and they are not the same one**. The *slot* ledger is
+`VM_POOL_MAX_VMS` (default 6): a slot is a VM the pool allocated, and this
+server asks for `SCOUT_MAX_CONCURRENT` of them for scouts plus exactly **one**
+for the serial build lane — nothing multiplies that one, because builds are
+strictly serial. `buildkit` is **not** on this ledger: the container runtime
+starts it to service `container build`, as an ordinary host process the pool
+never allocated and never counts. The *memory* ledger is the one that bites a
+small machine first, and buildkit is on it: at the default VM shapes, scouts
+(`SCOUT_MAX_CONCURRENT` × `SCOUT_VM_MEMORY_MB`) plus a Builder plus buildkit
+reserve ≈22 GB.
+
+So the recommended ceiling against the default pool is **`SCOUT_MAX_CONCURRENT
+= 3`** — 4 of 6 slots, two spare. 4 scouts is 5 of 6 and 5 is 6 of 6, where a
+single leaked VM (one whose owner died between allocate and deallocate, held
+until the sweep reclaims it) exhausts the pool and every dispatch is refused.
+To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check the memory
+ledger first.
+
+`VM_POOL_MAX_VMS` is read by **`tasks vm-pool`, not by the server** — both
+entry points honour it (`max_vms_from_env` is public and separate from
+`ServiceConfig::from_env` for exactly that reason), but a pool is sized when it
+starts, so changing the variable means restarting the pool and not the server.
+A value that is not a positive integer refuses to start rather than falling
+back: `0` binds the socket, answers `status` cheerfully and fails *every*
+allocate, which is precisely the failure the knob exists to make configurable.
+What the server does is **report** the arithmetic on every vm-pool connect, off
+the `status` round trip the connect path already makes (`run::Capacity`): too
+small, or an exact fit with no slack, is a `warn!` naming the variable and the
+fix. A report and not a gate — nothing here can resize a pool in another
+process, and refusing to dispatch would turn a survivable misconfiguration into
+an outage.
+
 ### Upgrading a running server
 
 `tasks reload` (alias `restart`, `crates/tasks/src/reload.rs`) is the upgrade
@@ -745,7 +779,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_DEFAULT_MODE` | `pause` | the mode **every** boot starts in, overwriting whatever the last process left in the store — `play`, `pause` or `stop`, and an unparseable value refuses to boot rather than being ignored. Only `tasks reload` overrides it, by passing the old server's mode to the new one |
 | `TASKS_ENV_FILES` | `on` | `off` skips `.env` loading entirely — for tests that exec the `tasks` binary, where `env_remove` promotes a `.env` rather than scrubbing it. Anything that is neither `on` nor `off` refuses to boot |
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
-| `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once |
+| `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once. Each holds a vm-pool slot and the serial build lane holds one more, so the pool must fit `SCOUT_MAX_CONCURRENT + 1` — 3 is the recommended ceiling against the default pool of 6, and the server `warn!`s on every connect if the pool it found is short or an exact fit. See *Pool capacity* |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
 | `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
@@ -754,6 +788,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
+| `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |

@@ -74,6 +74,10 @@ Image management:
 
 VM pool management:
 - Allocation/deallocation with limits
+- Capacity (`PoolConfig::max_vms`, default 6, set with `VM_POOL_MAX_VMS`): a
+  slot is a VM this pool allocated, so a VM the container runtime started for
+  its own purposes is not one. Leave slack — allocation at the ceiling is
+  refused, not queued, and a leaked VM holds its slot until the sweep
 - Health monitoring
 - Timeout enforcement
 - Lifecycle state tracking
