@@ -121,6 +121,7 @@ async fn insert_task(store: &Store, project: &Project, state: TaskState) -> Task
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     task
@@ -140,6 +141,7 @@ async fn seed_approved(store: &Store, project: &Project) -> (Task, Spec) {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
@@ -598,6 +600,7 @@ async fn a_cancel_is_refused_when_there_is_nothing_to_stop() {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let (status, body) = api
@@ -686,6 +689,7 @@ async fn cancelling_twice_keeps_the_first_request() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let api = Api::spawn(store.clone()).await;

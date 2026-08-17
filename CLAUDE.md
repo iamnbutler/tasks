@@ -315,6 +315,64 @@ implementation.
   already in hand is never discarded for a cancel that arrived in the same
   poll, so cancelling a run that finishes in the same breath is honest rather
   than destructive.
+- **`directions` tell an agent what to do; `rationale` tells a human why. They
+  are never copied into each other.** A rationale explains a judgment to
+  whoever reads the `decisions` ledger afterwards and reaches no VM ever; put
+  an instruction there and the agent never sees it. `Directions { text, author
+  }` is the other channel: it reaches a Scout or a Builder as its **own
+  labelled section** of the prompt — after the field notes for a Scout, after
+  the specs for a Builder, and immediately before `## Your job` in both — and
+  is persisted against the *run* that carried it. It carries its **author**
+  because the prompt introduces it by name, which is also what lets a Builder
+  see that what it is reading is not a Scout: that is the barrier carve-out,
+  and the argument for it lives in `builder::render_prompt`'s doc comment
+  rather than being re-litigated. The barrier forbids *Scout-run-derived*
+  material, and no path runs from a Scout run to that field. Both sections
+  demand every direction be **accounted for** in the run's own artifact
+  (`SPEC.md`'s `### Notes`, `SUMMARY.md`), declines included, because a
+  direction silently dropped is indistinguishable from one never read — and
+  both say a genuine conflict resolves in the directions' favour *but must be
+  stated*, since the reviewer reads the issue or the spec and cannot see this
+  section. An **undirected prompt grows no heading at all**: an always-present
+  empty `## Directions` is what teaches an agent to skim past the one that
+  matters. Scout directions are **staged on the task and sticky, never
+  consumed** — a VM death or a `needs_revision` return would otherwise leave
+  the retry unaimed with nobody noticing — which is why "absent" cannot mean
+  "clear": a second `POST /scout` with no body must not unaim the run.
+  `parse_directions`' doubled `Option` is that three-way distinction, and
+  over the limit is a **400, not a truncation**, because an instruction cut
+  off halfway is a different instruction. The run's copy is a *copy*: re-aiming
+  a task tomorrow must not rewrite what a run that already happened was told.
+- **The images are rebuilt by hand, and the gap is what has to be visible.** A
+  merge does not rebuild images and should not: nothing inside the pipeline can
+  reach the cross toolchain, the `container` CLI or the checkout a rebuild
+  needs, and a host-exec capability would be far larger than anything in the
+  charter. The failure was never that the rebuild was manual — it was that
+  nobody could see it had not happened, so #888's fix sat on `main` for ten
+  hours while that exact failure killed a scout inside an older image and the
+  old supervisor, having no idea it was old, charged a dispatch strike for it.
+  So both supervisors are stamped by `build-stamp` exactly as the server is
+  (one implementation, which is the only reason the numbers are comparable),
+  each states its identity on the `Started` event of its protocol — the only
+  moment there is to ask, since a VM exists only while a run is inside it — and
+  `crates/tasks/src/images.rs` records it per image and reports it from
+  `/status`, `tasks status`, the Server window and the brief. Three rules hold
+  it together. The field is `#[serde(default)]` because images are upgraded by
+  hand, so the host is routinely newer than the supervisor talking to it —
+  that skew *is* the bug — and **absence is the loudest reading, not the
+  quietest**: `Unstamped`, never `Unknown`, because an image that reports no
+  identity predates reporting one and is staler than any version it could have
+  named. The **verdict is never stored**, only computed at read time against
+  the running server's build, since the server is replaced far more often than
+  the images are. And **nothing observed is not a clean bill of health** — no
+  poll exists, so an empty list means no run has started in an image yet, and
+  every renderer says "none observed yet" rather than "current". There is no
+  `ObligationKind::StaleImage`: obligations go only to the orchestrator, which
+  holds a curl-only token in a VM-less workdir and could never discharge one,
+  and an undischargeable obligation raised every pass is how a signal gets
+  trained out of use. `make images-check` covers the one window observation
+  cannot — right after a rebuild, before anything has run — and `make images`
+  ends by invoking it.
 
 ## Project structure
 
@@ -387,8 +445,19 @@ make status / make stop
 make stop STOP=--when-idle             # ...but wait out in-flight scouts first
 cargo run -p tasks -- add-project owner/repo
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
+make images                            # rebuild the Scout/Builder VM images
+make images-check                      # boot each image, read `--version` back
 make test                              # see Tests below
 ```
+
+`make images` is the whole deployment step for anything inside a VM — a
+supervisor fix reaches nothing until someone runs it on a Mac with
+apple/container and the cross toolchain. `images-check` (which `images` ends by
+invoking) is the only reading available in the window between a rebuild and the
+first run in the new image; everywhere else, the identity is observed from the
+runs themselves. Until the images are rebuilt, `unstamped` / "PREDATES
+STAMPING" in the app and `tasks status` is the correct answer, not a bug —
+it is the feature reporting the state #909 was filed about.
 
 `serve` runs the Diamond 1 loop (`crates/tasks/src/run.rs`): GitHub intake,
 scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates

@@ -99,6 +99,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
 
@@ -112,6 +113,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 
@@ -251,6 +253,23 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
         .expect("the agent phase was stamped when the drain ended");
     assert!(done.started_at.unwrap() <= agent_finished);
     assert!(agent_finished <= done.completed_at.unwrap());
+
+    // The image identity, all the way through the real supervisor binary. See
+    // the Scout counterpart in `tests/scout.rs`: these two tests are the only
+    // place the chain is actually checked, because `Option` plus
+    // `serde(default)` makes a break indistinguishable from "not sent".
+    let images = h.store.image_builds("0.1.0").await.unwrap();
+    let observed = images
+        .iter()
+        .find(|i| i.image == "builder:test")
+        .expect("the builder image was observed");
+    assert_eq!(observed.role, tasks_api::version::ImageRole::Builder);
+    assert!(
+        observed.version.is_some(),
+        "the supervisor stated no build identity"
+    );
+    assert!(observed.commit.is_some());
+    assert_eq!(observed.run_id.as_deref(), Some(done.id.as_str()));
 
     // The branch REALLY landed: the remote repo has it, at the reported tip.
     let branch_ref = format!("refs/heads/{}", done.branch);

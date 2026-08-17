@@ -176,6 +176,10 @@ impl ServerWindow {
             .as_ref()
             .map(in_flight_lines)
             .unwrap_or_else(|| "—".to_string());
+        let images = status
+            .as_ref()
+            .map(images_line)
+            .unwrap_or_else(|| "—".to_string());
         let server_build = match &version {
             Some(version) => format!("{}  ({})", version.version, version.commit),
             // The server answered `/status` but not `/version`: it predates
@@ -193,6 +197,7 @@ impl ServerWindow {
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
+            .child(self.fact("VM images", images, cx))
             .child(self.fact(
                 "App build",
                 format!("{}  ({})", about::VERSION, about::COMMIT),
@@ -677,6 +682,41 @@ fn migrations_line(status: &ServerStatus) -> String {
     }
 }
 
+/// What the scout and builder VM images are running, and whether that is a
+/// problem — the same reading `tasks status` prints.
+///
+/// **"None observed yet" is not "current".** Nothing polls an image; the only
+/// way to learn what is inside one is to run something in it, so a server that
+/// has dispatched nothing since booting knows nothing here. Saying "current"
+/// would be an answer it does not have.
+///
+/// Every stale entry names `make images`, because the rebuild is a host-side
+/// command — there is nothing in this window to click, and a verdict word
+/// alone would tell a reader they have a problem without telling them what to
+/// type.
+fn images_line(status: &ServerStatus) -> String {
+    if status.images.is_empty() {
+        return "none observed yet".to_string();
+    }
+    let mut parts = Vec::new();
+    for image in &status.images {
+        let identity = match &image.version {
+            Some(version) => version.clone(),
+            None => "PREDATES STAMPING".to_string(),
+        };
+        parts.push(format!(
+            "{} {} ({})",
+            image.image,
+            identity,
+            image.freshness.as_str()
+        ));
+    }
+    if status.images.iter().any(|i| i.freshness.needs_rebuild()) {
+        parts.push("run `make images` on the host".to_string());
+    }
+    parts.join(", ")
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -722,6 +762,7 @@ mod tests {
             migrations_applied: Vec::new(),
             mode: Mode::Play,
             in_flight: InFlight::default(),
+            images: Vec::new(),
         }
     }
 
@@ -734,6 +775,35 @@ mod tests {
             description: "charter comment and land".into(),
         }];
         assert_eq!(migrations_line(&status), "0019_charter_comment_and_land");
+    }
+
+    /// The two readings that must not be confused: an unobserved image is not
+    /// a healthy one, and an unstamped one is the state #909 was filed about
+    /// rather than a bug in this line.
+    #[test]
+    fn no_observation_is_not_a_clean_bill_of_health() {
+        use tasks_client::api::version::{ImageFreshness, ImageIdentity, ImageRole};
+
+        let mut status = status();
+        assert_eq!(images_line(&status), "none observed yet");
+        assert!(!images_line(&status).contains("current"));
+
+        status.images = vec![ImageIdentity {
+            image: "agent:v1".into(),
+            role: ImageRole::Scout,
+            version: None,
+            commit: None,
+            observed_at: Utc::now(),
+            run_id: Some("sess_1".into()),
+            freshness: ImageFreshness::Unstamped,
+        }];
+        let line = images_line(&status);
+        assert!(line.contains("PREDATES STAMPING"), "{line}");
+        assert!(line.contains("unstamped"), "{line}");
+        assert!(
+            line.contains("make images"),
+            "a verdict word alone does not say what to type: {line}"
+        );
     }
 
     #[test]

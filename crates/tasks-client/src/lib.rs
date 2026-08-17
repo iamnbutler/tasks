@@ -25,8 +25,8 @@ use tasks_api::events::Event;
 use tasks_api::http::{
     BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
     CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, SendMessage, ServerStatus,
-    SetCharter, SetMode, SetProjectStatus,
+    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
+    ServerStatus, SetCharter, SetMode, SetProjectStatus,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -287,8 +287,20 @@ impl Client {
     }
 
     /// "Scout now": queue at the front; the dispatch loop picks it up.
-    pub fn scout_task_now(&self, id: &TaskId) -> Result<Task> {
-        self.post_empty(&format!("/tasks/{id}/scout"))
+    ///
+    /// `directions` aims the run — what to look at, a constraint the issue
+    /// does not state — and is staged on the task until a Scout takes it.
+    /// `None` leaves whatever is already staged alone; `Some("")` clears it.
+    /// It is not a rationale: this text is the only thing here the agent
+    /// actually reads.
+    pub fn scout_task_now(&self, id: &TaskId, directions: Option<String>) -> Result<Task> {
+        self.post_json(
+            &format!("/tasks/{id}/scout"),
+            &ScoutRequest {
+                directions,
+                ..Default::default()
+            },
+        )
     }
 
     /// File an issue upstream and track it. Lands in the backlog — capturing
@@ -514,10 +526,13 @@ impl Client {
 
     /// 202: queued, not started — builds are serial. Watch `build_started` /
     /// `build_completed` events. `base_branch` defaults to `main`.
+    /// `directions` reaches the Builder's prompt as its own section; it is
+    /// deliberately not the `rationale`, which no VM ever sees.
     pub fn request_build(
         &self,
         spec_ids: Vec<SpecId>,
         base_branch: Option<String>,
+        directions: Option<String>,
     ) -> Result<BuildDetail> {
         self.post_json(
             "/builds",
@@ -525,6 +540,7 @@ impl Client {
                 spec_ids,
                 base_branch,
                 rationale: None,
+                directions,
                 evidence: None,
             },
         )
@@ -580,11 +596,20 @@ impl Client {
     /// to be mandatory enforce that themselves.
     ///
     /// 202, like [`Self::request_build`]: queued, not started.
-    pub fn build_task_now(&self, id: &TaskId, rationale: Option<String>) -> Result<BuildDetail> {
+    /// `directions` is kept out of the spec this authors: the spec is the
+    /// issue body, and an instruction to the agent does not belong in the
+    /// artifact.
+    pub fn build_task_now(
+        &self,
+        id: &TaskId,
+        rationale: Option<String>,
+        directions: Option<String>,
+    ) -> Result<BuildDetail> {
         self.post_json(
             &format!("/tasks/{id}/build-now"),
             &BuildNowRequest {
                 rationale,
+                directions,
                 ..Default::default()
             },
         )

@@ -868,6 +868,7 @@ async fn insert_task_with_gh_state(
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     task
@@ -1261,6 +1262,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&orphan).await.unwrap();
     store.set_mode(Mode::Play).await.unwrap();

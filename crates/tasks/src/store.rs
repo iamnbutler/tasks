@@ -18,14 +18,61 @@ use crate::migrations::MIGRATOR;
 use crate::models::{
     Actor, Briefing, BriefingSection, Build, BuildId, BuildStatus, Capability, CharterEntry,
     CharterLevel, ChatRole, CloseReason, Complexity, Decision, DecisionAction, DecisionInput,
-    GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ReviewedSpec,
-    RunKind, ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec,
-    SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
-    TranscriptLine, TranscriptOwner, TranscriptStream,
+    Directions, GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent,
+    OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId,
+    ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
+    SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
+    Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream,
 };
-use crate::protocol::FailureClass;
+use crate::protocol::{FailureClass, SupervisorBuild};
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
+use tasks_api::version::{ImageFreshness, ImageIdentity, ImageRole};
+
+// --- column lists ---
+//
+// The row mappers below read by *name*, and every SELECT that feeds one spells
+// its columns out — six copies for `tasks`, three for `sessions`, three for
+// `builds`. Adding a column to one of those tables was therefore a hand-edit
+// per query with a *runtime* failure mode: a list that misses a column the
+// mapper reads fails as `ColumnNotFound`, which `resumable_builds` already
+// carries a comment about, because there it is swallowed into "no resumable
+// builds" and looks exactly like a clean restart.
+//
+// So the lists are written once, as `macro_rules!` expanding to a string
+// literal. `concat!("SELECT ", task_columns!(), " FROM …")` stays a
+// `&'static str` — no `format!`, no allocation on the hot path of `get_task` —
+// and adding a column is one edit that every query picks up.
+//
+// **They must be defined above their use sites**: `macro_rules!` resolution is
+// textual, so a macro declared next to the mappers at the bottom of this file
+// would not be in scope for the queries at the top.
+
+/// Every column of `tasks`, in the order [`task_from_row`] expects to find
+/// them. See the note above.
+macro_rules! task_columns {
+    () => {
+        "id, project_id, gh_issue_number, title, body, labels, gh_state, state, priority, \
+         manual_rank, dispatch_attempts, scout_directions, scout_directions_author, \
+         ingested_at, updated_at"
+    };
+}
+
+/// Every column of `sessions`, for [`session_from_row`].
+macro_rules! session_columns {
+    () => {
+        "id, task_id, vm_id, branch, status, started_at, completed_at, exit_reason, \
+         agent_usage, directions, directions_author"
+    };
+}
+
+/// Every column of `builds`, for [`build_from_row`].
+macro_rules! build_columns {
+    () => {
+        "id, project_id, vm_id, branch, base_branch, base_sha, head_sha, pr_number, status, \
+         summary, files_touched, exit_reason, created_at, started_at, agent_finished_at, \
+         completed_at, directions, directions_author"
+    };
+}
 
 /// Builder runs a batch of specs may cost before the batch is retired.
 /// Mirrors `MAX_DISPATCH_ATTEMPTS` for scouts, one diamond along.
@@ -619,11 +666,11 @@ impl Store {
     }
 
     pub async fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE id = ?",
-        )
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM tasks WHERE id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -640,10 +687,12 @@ impl Store {
     /// is the human's statement of what to do next.
     pub async fn list_tasks(&self) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query(&format!(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, \
-             ingested_at",
+            concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM tasks ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, \
+                 ingested_at"
+            ),
             TaskState::ORDER_TERMINAL_LAST_SQL
         ))
         .fetch_all(&self.pool)
@@ -667,10 +716,12 @@ impl Store {
     /// is identical.
     pub async fn list_active_tasks(&self) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query(&format!(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE NOT (gh_state = ? AND state IN (?, ?, ?)) \
-             ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, ingested_at",
+            concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM tasks WHERE NOT (gh_state = ? AND state IN (?, ?, ?)) \
+                 ORDER BY {}, manual_rank IS NULL, manual_rank, priority DESC, ingested_at"
+            ),
             TaskState::ORDER_TERMINAL_LAST_SQL
         ))
         .bind(GhState::Closed.as_str())
@@ -877,6 +928,37 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("task {id}")))
     }
 
+    /// Stage (or clear) the directions the next Scout run on this task will
+    /// carry. `None` clears them.
+    ///
+    /// **Sticky, not consumed.** Nothing clears these at dispatch: a VM death
+    /// or a `needs_revision` return would otherwise hand the retry an unaimed
+    /// run with nobody noticing, and directions that visibly persist are
+    /// easier to argue with than directions that silently vanished. The run's
+    /// own copy lives on its `sessions` row, so re-aiming a task later cannot
+    /// rewrite what an earlier run was told.
+    ///
+    /// `RETURNING` the whole row, so the caller needs no second read — and so
+    /// the returned `Task` cannot disagree with what was just written.
+    pub async fn set_scout_directions(
+        &self,
+        id: &TaskId,
+        directions: Option<&Directions>,
+    ) -> Result<Task, StoreError> {
+        let row = sqlx::query(concat!(
+            "UPDATE tasks SET scout_directions = ?, scout_directions_author = ? \
+             WHERE id = ? RETURNING ",
+            task_columns!()
+        ))
+        .bind(directions.map(|d| d.text.clone()))
+        .bind(directions.map(|d| d.author.as_str().to_string()))
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        task_from_row(row)
+    }
+
     /// Fetch a task inside a transaction and require an exact state, mapping
     /// the mismatch to [`StoreError::Invalid`] (a 400 at the API).
     async fn require_task_state(
@@ -904,11 +986,11 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         id: &TaskId,
     ) -> Result<Option<Task>, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE id = ?",
-        )
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM tasks WHERE id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&mut **tx)
         .await?;
@@ -926,11 +1008,11 @@ impl Store {
         project_id: &ProjectId,
         issue: GhIssue,
     ) -> Result<UpsertOutcome<Task>, StoreError> {
-        let existing = sqlx::query(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE project_id = ? AND gh_issue_number = ?",
-        )
+        let existing = sqlx::query(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM tasks WHERE project_id = ? AND gh_issue_number = ?"
+        ))
         .bind(project_id.as_str())
         .bind(issue.number as i64)
         .fetch_optional(&self.pool)
@@ -979,6 +1061,7 @@ impl Store {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         self.insert_task(&task).await?;
         Ok(UpsertOutcome::Inserted(task))
@@ -1145,12 +1228,12 @@ impl Store {
         &self,
         project_id: &ProjectId,
     ) -> Result<Vec<Task>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, project_id, gh_issue_number, title, body, labels, gh_state, \
-             state, priority, manual_rank, dispatch_attempts, ingested_at, updated_at \
-             FROM tasks WHERE project_id = ? AND gh_state = ? AND state IN (?, ?, ?, ?) \
-             ORDER BY ingested_at",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            task_columns!(),
+            " FROM tasks WHERE project_id = ? AND gh_state = ? AND state IN (?, ?, ?, ?) \
+             ORDER BY ingested_at"
+        ))
         .bind(project_id.as_str())
         .bind(GhState::Closed.as_str())
         .bind(TaskState::Queued.as_str())
@@ -1319,7 +1402,8 @@ impl Store {
     pub async fn insert_session(&self, session: &Session) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO sessions (id, task_id, vm_id, branch, status, started_at, \
-             completed_at, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             completed_at, exit_reason, directions, directions_author) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(session.id.as_str())
         .bind(session.task_id.as_str())
@@ -1329,6 +1413,16 @@ impl Store {
         .bind(session.started_at.to_rfc3339())
         .bind(session.completed_at.map(|t| t.to_rfc3339()))
         .bind(&session.exit_reason)
+        // The run's own record of what it was told, taken as a copy at
+        // dispatch: re-aiming the task tomorrow must not rewrite what a run
+        // that already happened was asked to do.
+        .bind(session.directions.as_ref().map(|d| d.text.clone()))
+        .bind(
+            session
+                .directions
+                .as_ref()
+                .map(|d| d.author.as_str().to_string()),
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1373,10 +1467,11 @@ impl Store {
     }
 
     pub async fn get_session(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
-             exit_reason, agent_usage FROM sessions WHERE id = ?",
-        )
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            session_columns!(),
+            " FROM sessions WHERE id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -1384,10 +1479,11 @@ impl Store {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
-             exit_reason, agent_usage FROM sessions ORDER BY started_at",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            session_columns!(),
+            " FROM sessions ORDER BY started_at"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(session_from_row).collect()
@@ -1952,11 +2048,11 @@ impl Store {
     /// `vm_id IS NULL` is not a candidate: without a VM id there is nothing to
     /// attach to, and the row is an ordinary orphan for reconciliation.
     pub async fn resumable_sessions(&self) -> Result<Vec<Session>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, task_id, vm_id, branch, status, started_at, completed_at, \
-             exit_reason, agent_usage FROM sessions \
-             WHERE status = ? AND vm_id IS NOT NULL ORDER BY started_at",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            session_columns!(),
+            " FROM sessions WHERE status = ? AND vm_id IS NOT NULL ORDER BY started_at"
+        ))
         .bind(SessionStatus::Running.as_str())
         .fetch_all(&self.pool)
         .await?;
@@ -1966,17 +2062,17 @@ impl Store {
     /// Builds a dead process left `running` while still naming a VM. See
     /// [`Store::resumable_sessions`].
     pub async fn resumable_builds(&self) -> Result<Vec<Build>, StoreError> {
-        let rows = sqlx::query(
-            // `agent_finished_at` included like every other build SELECT:
-            // `build_from_row` reads it, so omitting it makes this query fail
-            // at runtime with ColumnNotFound — and the failure is swallowed
-            // into "no resumable builds", which looks exactly like a restart
-            // with nothing in flight.
-            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
-             pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, agent_finished_at, completed_at FROM builds \
-             WHERE status = ? AND vm_id IS NOT NULL ORDER BY created_at, rowid",
-        )
+        let rows = sqlx::query(concat!(
+            // The whole column list, from one place: `build_from_row` reads
+            // every one of them by name, so a list that misses one makes this
+            // query fail at runtime with ColumnNotFound — and *that* failure is
+            // swallowed into "no resumable builds", which looks exactly like a
+            // restart with nothing in flight. `build_columns!` is why that can
+            // no longer drift per query.
+            "SELECT ",
+            build_columns!(),
+            " FROM builds WHERE status = ? AND vm_id IS NOT NULL ORDER BY created_at, rowid"
+        ))
         .bind(BuildStatus::Running.as_str())
         .fetch_all(&self.pool)
         .await?;
@@ -2452,6 +2548,28 @@ impl Store {
         base_branch: &str,
         decision: DecisionInput,
     ) -> Result<Build, StoreError> {
+        self.create_directed_build(spec_ids, base_branch, None, decision)
+            .await
+    }
+
+    /// [`Self::create_build`], plus instructions addressed to the Builder.
+    ///
+    /// A separate entry point rather than a fourth parameter on `create_build`
+    /// because that one has ~70 call sites and two of them are production
+    /// code; making every test say `None` would buy nothing and hide the two
+    /// that matter.
+    ///
+    /// The directions are written in the **same `INSERT`** as the build row.
+    /// A build that briefly existed without them could be claimed by the
+    /// serial build loop in between and dispatch unaimed — silently, since
+    /// there is nothing in an unaimed prompt to notice the absence of.
+    pub async fn create_directed_build(
+        &self,
+        spec_ids: &[SpecId],
+        base_branch: &str,
+        directions: Option<&Directions>,
+        decision: DecisionInput,
+    ) -> Result<Build, StoreError> {
         if spec_ids.is_empty() {
             return Err(StoreError::Invalid(
                 "a build needs at least one spec".into(),
@@ -2545,11 +2663,12 @@ impl Store {
             started_at: None,
             agent_finished_at: None,
             completed_at: None,
+            directions: directions.cloned(),
         };
         let branch = format!("build/{}", build.id);
         sqlx::query(
-            "INSERT INTO builds (id, project_id, branch, base_branch, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO builds (id, project_id, branch, base_branch, status, created_at, \
+             directions, directions_author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(build.id.as_str())
         .bind(build.project_id.as_str())
@@ -2557,6 +2676,8 @@ impl Store {
         .bind(&build.base_branch)
         .bind(build.status.as_str())
         .bind(build.created_at.to_rfc3339())
+        .bind(directions.map(|d| d.text.clone()))
+        .bind(directions.map(|d| d.author.as_str().to_string()))
         .execute(&mut *tx)
         .await?;
         for (position, (spec_id, _, _, _)) in resolved.iter().enumerate() {
@@ -2683,11 +2804,11 @@ impl Store {
     }
 
     pub async fn get_build(&self, id: &BuildId) -> Result<Option<Build>, StoreError> {
-        let row = sqlx::query(
-            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
-             pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, agent_finished_at, completed_at FROM builds WHERE id = ?",
-        )
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            build_columns!(),
+            " FROM builds WHERE id = ?"
+        ))
         .bind(id.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -2696,12 +2817,11 @@ impl Store {
 
     /// Newest first.
     pub async fn list_builds(&self) -> Result<Vec<Build>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, project_id, vm_id, branch, base_branch, base_sha, head_sha, \
-             pr_number, status, summary, files_touched, exit_reason, created_at, \
-             started_at, agent_finished_at, completed_at \
-             FROM builds ORDER BY created_at DESC, rowid DESC",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT ",
+            build_columns!(),
+            " FROM builds ORDER BY created_at DESC, rowid DESC"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(build_from_row).collect()
@@ -4248,6 +4368,97 @@ impl Store {
         })
     }
 
+    // --- VM image identity (#909) ---
+
+    /// Record what an image was running when a run started inside it.
+    ///
+    /// Returns **whether the recorded identity changed**, which is what
+    /// [`crate::images::observe`] uses to decide between a standing report and
+    /// an event: a stale image stays stale, so announcing it per dispatch
+    /// would be exactly the noise a standing `/status` line replaces.
+    ///
+    /// One row per image reference — the question is "what is in there now",
+    /// not a log of every time the same answer was given.
+    pub async fn record_image_build(
+        &self,
+        image: &str,
+        role: ImageRole,
+        build: Option<&SupervisorBuild>,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        let version = build.map(|b| b.version.as_str());
+        let commit = build.map(|b| b.commit.as_str());
+
+        let previous = sqlx::query("SELECT version, commit_sha FROM image_builds WHERE image = ?")
+            .bind(image)
+            .fetch_optional(&self.pool)
+            .await?;
+        let changed = match &previous {
+            Some(row) => {
+                row.try_get::<Option<String>, _>("version")?.as_deref() != version
+                    || row.try_get::<Option<String>, _>("commit_sha")?.as_deref() != commit
+            }
+            // A first sighting is a change: there was no reading before it.
+            None => true,
+        };
+
+        sqlx::query(
+            "INSERT INTO image_builds (image, role, version, commit_sha, observed_at, run_id)              VALUES (?, ?, ?, ?, ?, ?)              ON CONFLICT(image) DO UPDATE SET role = excluded.role,              version = excluded.version, commit_sha = excluded.commit_sha,              observed_at = excluded.observed_at, run_id = excluded.run_id",
+        )
+        .bind(image)
+        .bind(role.as_str())
+        .bind(version)
+        .bind(commit)
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(changed)
+    }
+
+    /// Every image observed so far, judged against `reference_version` — the
+    /// running server's own build.
+    ///
+    /// The verdict is computed here rather than stored: it is a comparison
+    /// against a binary that is replaced far more often than the images are,
+    /// so a persisted answer would be stale the moment the next server booted.
+    ///
+    /// A row whose `role` this binary does not recognize — one a newer binary
+    /// wrote — is **dropped** rather than guessed at: reporting a builder
+    /// image as a scout would be worse than omitting it.
+    ///
+    /// An empty result means nothing has been observed, which is not the same
+    /// as everything being current. Callers say so in words.
+    pub async fn image_builds(
+        &self,
+        reference_version: &str,
+    ) -> Result<Vec<ImageIdentity>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT image, role, version, commit_sha, observed_at, run_id              FROM image_builds ORDER BY role, image",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role_raw: String = row.try_get("role")?;
+            let Some(role) = ImageRole::from_str(&role_raw) else {
+                warn!(role = %role_raw, "dropping an image row with an unrecognized role");
+                continue;
+            };
+            let version: Option<String> = row.try_get("version")?;
+            out.push(ImageIdentity {
+                freshness: ImageFreshness::judge(version.as_deref(), reference_version),
+                image: row.try_get("image")?,
+                role,
+                version,
+                commit: row.try_get("commit_sha")?,
+                observed_at: parse_ts(&row.try_get::<String, _>("observed_at")?, "observed_at")?,
+                run_id: row.try_get("run_id")?,
+            });
+        }
+        Ok(out)
+    }
+
     // --- mode ---
 
     pub async fn get_mode(&self) -> Result<Mode, StoreError> {
@@ -4431,6 +4642,11 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task, StoreError> {
         priority: row.try_get("priority")?,
         manual_rank: row.try_get("manual_rank")?,
         dispatch_attempts: row.try_get::<i64, _>("dispatch_attempts")?.max(0) as u32,
+        scout_directions: Directions::from_columns(
+            row.try_get("scout_directions")?,
+            row.try_get::<Option<String>, _>("scout_directions_author")?
+                .as_deref(),
+        ),
         ingested_at: parse_ts(&row.try_get::<String, _>("ingested_at")?, "ingested_at")?,
         updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
@@ -4456,6 +4672,11 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Session, StoreError>
         usage: row
             .try_get::<Option<String>, _>("agent_usage")?
             .and_then(|raw| serde_json::from_str(&raw).ok()),
+        directions: Directions::from_columns(
+            row.try_get("directions")?,
+            row.try_get::<Option<String>, _>("directions_author")?
+                .as_deref(),
+        ),
     })
 }
 
@@ -4560,6 +4781,11 @@ fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
         started_at: opt_ts("started_at")?,
         agent_finished_at: opt_ts("agent_finished_at")?,
         completed_at: opt_ts("completed_at")?,
+        directions: Directions::from_columns(
+            row.try_get("directions")?,
+            row.try_get::<Option<String>, _>("directions_author")?
+                .as_deref(),
+        ),
     })
 }
 
@@ -4837,6 +5063,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         }
     }
 
@@ -5033,6 +5260,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -5071,6 +5299,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -5580,6 +5809,205 @@ mod tests {
         ));
     }
 
+    /// The poller must never wipe staged scout directions.
+    ///
+    /// It holds by construction — the update branch's `UPDATE` names
+    /// title/body/labels/gh_state only — but the way it *breaks* is a
+    /// one-character mistake: `upsert_gh_issue` builds its result with a
+    /// struct-update literal (`Task { …, ..task }`), where adding
+    /// `scout_directions: None` **overrides** the base rather than filling a
+    /// gap, and the row would then be rewritten empty on every poll. The
+    /// symptom in production is not an error; it is a scout that runs unaimed.
+    #[tokio::test]
+    async fn upsert_gh_issue_never_touches_scout_directions() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let issue = GhIssue {
+            number: 11,
+            title: "First".into(),
+            body: "b".into(),
+            labels: vec![],
+            state: GhState::Open,
+            updated_at: Utc::now(),
+        };
+        let task = store
+            .upsert_gh_issue(&project.id, issue.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        let directions = Directions::new("start from the store, not the API", Actor::Human);
+        store
+            .set_scout_directions(&task.id, Some(&directions))
+            .await
+            .unwrap();
+
+        let repoll = GhIssue {
+            title: "Retitled".into(),
+            body: "edited".into(),
+            labels: vec!["p0".into()],
+            ..issue
+        };
+        let observed = store
+            .upsert_gh_issue(&project.id, repoll)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            observed.scout_directions.as_ref(),
+            Some(&directions),
+            "the value the poller returned was overwritten in memory"
+        );
+        assert_eq!(
+            store
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .scout_directions
+                .as_ref(),
+            Some(&directions),
+            "the poller wrote over the staged directions in the database"
+        );
+    }
+
+    /// Staging is sticky and three-way at the store level: set, re-set,
+    /// cleared — and a run that already happened keeps its own copy.
+    #[tokio::test]
+    async fn scout_directions_stage_and_clear_without_rewriting_a_run() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let task = task_with(&project.id, 3, 0);
+        store.insert_task(&task).await.unwrap();
+
+        let first = Directions::new("look at the poller first", Actor::Human);
+        let staged = store
+            .set_scout_directions(&task.id, Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(staged.scout_directions.as_ref(), Some(&first));
+
+        // A run takes a copy of what is staged *now*.
+        let session = Session {
+            id: SessionId::new(),
+            task_id: task.id.clone(),
+            vm_id: None,
+            branch: format!("scout/{}", task.id),
+            status: SessionStatus::Running,
+            started_at: Utc::now(),
+            completed_at: None,
+            exit_reason: None,
+            usage: None,
+            directions: Some(first.clone()),
+        };
+        store.insert_session(&session).await.unwrap();
+
+        // Re-aim the task, then clear it. Neither touches the run's record.
+        let second = Directions::new("no, start at the dispatcher", Actor::Orchestrator);
+        store
+            .set_scout_directions(&task.id, Some(&second))
+            .await
+            .unwrap();
+        let cleared = store.set_scout_directions(&task.id, None).await.unwrap();
+        assert_eq!(cleared.scout_directions, None);
+        assert_eq!(
+            store
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .scout_directions,
+            None
+        );
+
+        let stored = store.get_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.directions.as_ref(),
+            Some(&first),
+            "the session must keep saying what *that* run was told"
+        );
+    }
+
+    /// The author round-trips, and an author the binary does not recognize
+    /// costs the attribution rather than the instruction.
+    #[tokio::test]
+    async fn a_build_keeps_its_directions_and_an_unknown_author_decays_to_human() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_task, spec) = approved_spec(&store, &project, 41).await;
+
+        let directions = Directions::new("land it behind the feature flag", Actor::Orchestrator);
+        let build = store
+            .create_directed_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                Some(&directions),
+                DecisionInput {
+                    actor: Actor::Orchestrator,
+                    rationale: Some("batching".into()),
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(build.directions.as_ref(), Some(&directions));
+        assert_eq!(
+            store
+                .get_build(&build.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .directions
+                .as_ref(),
+            Some(&directions)
+        );
+
+        sqlx::query("UPDATE builds SET directions_author = 'martian' WHERE id = ?")
+            .bind(build.id.as_str())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let reread = store.get_build(&build.id).await.unwrap().unwrap();
+        let reread = reread.directions.expect("the text must survive");
+        assert_eq!(reread.text, directions.text);
+        assert_eq!(reread.author, Actor::Human);
+    }
+
+    /// `create_build` is the same call with no directions — the ~70 existing
+    /// call sites must keep meaning exactly what they meant.
+    #[tokio::test]
+    async fn an_undirected_build_stores_no_directions() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (_task, spec) = approved_spec(&store, &project, 42).await;
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput {
+                    actor: Actor::Human,
+                    rationale: None,
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(build.directions, None);
+        assert_eq!(
+            store
+                .get_build(&build.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .directions,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn upsert_gh_issue_never_touches_dispatch_attempts() {
         let store = Store::open_in_memory().await.unwrap();
@@ -5653,6 +6081,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&running).await.unwrap();
 
@@ -5778,6 +6207,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&running).await.unwrap();
 
@@ -5825,6 +6255,7 @@ mod tests {
                 completed_at: None,
                 exit_reason: None,
                 usage: None,
+                directions: None,
             };
             store.insert_session(&session).await.unwrap();
             ids.push((task, session));
@@ -5958,6 +6389,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         session.id
@@ -6166,6 +6598,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -7189,6 +7622,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         let second = Spec {
@@ -7279,6 +7713,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -7339,6 +7774,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -7637,6 +8073,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         session.id
@@ -7891,6 +8328,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         assert!(
@@ -8051,6 +8489,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -9153,6 +9592,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 

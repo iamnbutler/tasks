@@ -47,8 +47,8 @@ use tasks_protocol::agent_run::{
 };
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
-    FailureClass, LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent,
-    TasksProtocol,
+    FailureClass, LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, SupervisorBuild,
+    TaskCommand, TaskEvent, TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -60,8 +60,43 @@ use vm_pool_protocol::{VmCommand, VmEvent};
 type TaskVmCommand = VmCommand<TasksProtocol>;
 type TaskVmEvent = VmEvent<TasksProtocol>;
 
+/// This binary's build identity, stamped by `build-stamp` in `build.rs` —
+/// the same crate and the same scheme the server uses, which is what makes
+/// the two numbers comparable at all.
+pub fn identity() -> SupervisorBuild {
+    SupervisorBuild {
+        version: env!("SCOUT_SUPERVISOR_VERSION").to_string(),
+        commit: env!("SCOUT_SUPERVISOR_COMMIT").to_string(),
+    }
+}
+
+/// Answer `--version` and say whether we did.
+///
+/// Called **before** the tracing setup and before stdin is touched, because
+/// `make images-check` runs this by booting the image (`container run --rm
+/// agent:v1 --version`) and reading one line off stdout — the supervisor is
+/// the image's ENTRYPOINT, so argv reaches here.
+///
+/// One line, three whitespace-separated fields (`<name> <version> <commit>`),
+/// so `awk '{print $2}'` is the whole parser. That shape is a contract with
+/// the Makefile: change it and change `images-check` with it.
+fn answered_version() -> bool {
+    if !std::env::args().skip(1).any(|arg| arg == "--version") {
+        return false;
+    }
+    let build = identity();
+    println!("scout-supervisor {} {}", build.version, build.commit);
+    true
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Answered first: before tracing writes anything and before stdin is
+    // touched, so a bare `container run --rm agent:v1 --version` prints one
+    // line and exits rather than falling into the JSON-lines loop.
+    if answered_version() {
+        return Ok(());
+    }
     // Logs go to stderr so they don't collide with the stdout JSON stream.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -230,6 +265,13 @@ async fn run_scout(
         &tx,
         ScoutEvent::Started {
             branch: branch.clone(),
+            // Emitted after clone+branch, which is where `Started` has always
+            // been: a clone failure therefore carries no identity, and
+            // `make images-check` is the answer for "before dispatch".
+            // Moving it earlier would mean a new event variant, which an
+            // *older host* could not decode — the one skew direction that
+            // does not hold.
+            supervisor: Some(identity()),
         },
     )
     .await;

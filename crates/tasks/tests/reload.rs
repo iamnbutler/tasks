@@ -242,6 +242,7 @@ async fn insert_running_session(data_dir: &Path) -> SessionId {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     let session = Session {
@@ -254,6 +255,7 @@ async fn insert_running_session(data_dir: &Path) -> SessionId {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     session.id
