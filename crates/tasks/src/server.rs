@@ -30,14 +30,15 @@ use tracing::{error, info, warn};
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
     CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse,
-    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
-    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage, ServerStatus,
-    SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
+    GitHubHold, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest,
+    ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage,
+    ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
 };
 
 use crate::bundles::RejectedBundles;
 use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
+use crate::github_health::GitHubHealth;
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
     Complexity, Decision, DecisionAction, DecisionInput, Directions, GhState, Mode,
@@ -163,6 +164,11 @@ type ApiResult<T> = Result<T, ApiError>;
 pub struct Services {
     pub github: Option<Arc<GitHubClient>>,
     pub bundles: Option<Arc<RejectedBundles>>,
+    /// The record the poller writes and the two dispatchers read. Absent means
+    /// this router has no dispatchers behind it, which `GET /status` reports as
+    /// no hold — honest, because a router with nothing to dispatch is not
+    /// holding anything back.
+    pub github_health: Option<Arc<GitHubHealth>>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -187,6 +193,12 @@ impl FromRef<AppState> for Option<Arc<GitHubClient>> {
 impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.bundles.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<GitHubHealth>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.github_health.clone()
     }
 }
 
@@ -2446,7 +2458,10 @@ async fn stream_orchestrator(
 /// what is in flight. See [`ServerStatus`]: a 200 here is the claim that
 /// *this* pid opened the database and finished its migrations, which is what
 /// makes it a usable liveness probe for `tasks reload`.
-async fn get_status(State(store): State<Arc<Store>>) -> ApiResult<Json<ServerStatus>> {
+async fn get_status(
+    State(store): State<Arc<Store>>,
+    State(github_health): State<Option<Arc<GitHubHealth>>>,
+) -> ApiResult<Json<ServerStatus>> {
     Ok(Json(ServerStatus {
         pid: std::process::id(),
         started_at: serving_since(),
@@ -2456,6 +2471,18 @@ async fn get_status(State(store): State<Arc<Store>>) -> ApiResult<Json<ServerSta
         // Judged against *this* binary's build, here at read time — see
         // `Store::image_builds`.
         images: store.image_builds(crate::version::VERSION).await?,
+        // Through the same `hold` predicate the two dispatchers use, so
+        // `/status` cannot claim a hold they are not honouring — that is the
+        // whole reason the staleness window is bound at construction rather
+        // than at each read.
+        github: github_health
+            .and_then(|health| health.hold(Utc::now()))
+            .map(|outage| GitHubHold {
+                since: outage.since,
+                last_seen: outage.last,
+                failures: outage.failures,
+                error: outage.error,
+            }),
     }))
 }
 
@@ -3951,6 +3978,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// `/status` is the answer for whoever arrives *after* the edge was
+    /// announced, so it has to report a hold for as long as one lasts — and say
+    /// nothing at all the rest of the time.
+    ///
+    /// It reads through the same `hold` predicate the two dispatchers use, so
+    /// it cannot claim a hold they are not honouring; a released record must
+    /// therefore clear here in the same breath.
+    #[tokio::test]
+    async fn status_reports_a_github_hold_for_as_long_as_it_lasts() {
+        use crate::github::GhError;
+        use crate::github_health::GitHubHealth;
+
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let health = Arc::new(GitHubHealth::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router_with_services(
+            store.clone(),
+            Services {
+                github_health: Some(health.clone()),
+                ..Default::default()
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let status = async || {
+            http.get(format!("{base}/status"))
+                .send()
+                .await
+                .unwrap()
+                .json::<ServerStatus>()
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(status().await.github, None, "quiet with nothing observed");
+
+        let outage: Result<(), GhError> = Err(GhError::Rest {
+            what: "list issues".into(),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Service Unavailable".into(),
+        });
+        health.observe(&outage, Utc::now());
+        health.observe(&outage, Utc::now());
+        let hold = status().await.github.expect("a hold is reported");
+        assert_eq!(hold.failures, 2);
+        assert!(hold.error.contains("503"), "{}", hold.error);
+        assert!(hold.since <= hold.last_seen);
+
+        // Release. Without this half, "held ⇒ reported" passes just as well
+        // when the predicate is stuck on.
+        health.observe(&Ok(()), Utc::now());
+        assert_eq!(status().await.github, None);
+    }
+
+    /// A router with no dispatchers behind it holds nothing back, so it must
+    /// not claim to — an absent service is `None`, not an invented hold.
+    #[tokio::test]
+    async fn status_without_the_health_service_reports_no_hold() {
+        let (store, _project) = store_with_project().await;
+        let base = spawn(store).await;
+        let status: ServerStatus = reqwest::get(format!("{base}/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status.github, None);
     }
 
     /// `/status` answers both halves of "is it up?" in one call: the process

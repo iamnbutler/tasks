@@ -27,28 +27,90 @@ pub enum GhError {
     Http(#[from] reqwest::Error),
     #[error("graphql: {0}")]
     GraphQl(String),
-    #[error("rest: {0}")]
-    Rest(String),
+    /// A REST call GitHub answered with a non-2xx.
+    ///
+    /// A struct variant carrying the status as a [`reqwest::StatusCode`] rather
+    /// than one pre-rendered `String`, because [`GhError::is_unavailable`]
+    /// decides on it — and a decision that greps prose changes meaning the next
+    /// time somebody improves a sentence, which is the same rule
+    /// `FailureClass` follows. The rendered text is deliberately unchanged:
+    /// this message is read by humans in warnings and in failure reasons, so
+    /// only the shape moved.
+    #[error("rest: {what}: {status}: {message}")]
+    Rest {
+        what: String,
+        status: reqwest::StatusCode,
+        message: String,
+    },
     #[error("unexpected response shape: {0}")]
     Shape(String),
 }
 
+impl GhError {
+    /// Whether this failure means **GitHub is not answering** — as opposed to
+    /// answering something we did not like.
+    ///
+    /// Read by [`crate::github_health::GitHubHealth`], which holds scout and
+    /// build dispatch while it is true: a Scout clones and a Builder clones, so
+    /// work dispatched into an outage dies at its first step and is charged a
+    /// strike for it (#939).
+    ///
+    /// Four exclusions are deliberate, and each would make the hold either
+    /// wrong or permanent:
+    ///
+    /// - **429** is a fact about our own usage, it names its own reset, and a
+    ///   clone does not spend the API quota.
+    /// - Any other **4xx** is GitHub answering perfectly well; a 404 on one
+    ///   pull request says nothing about the service.
+    /// - **Decode failures** (`Shape`, a body that would not parse) are our
+    ///   bug, not an outage.
+    /// - **Builder errors** — a malformed request that never left the process
+    ///   — are permanent misconfiguration. A hold on any of these would clear
+    ///   from nowhere.
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            // A response with a status: only 5xx. Without one, the request
+            // never got an answer at all — connect refused, timed out, or died
+            // in flight.
+            Self::Http(e) => match e.status() {
+                Some(status) => status.is_server_error(),
+                None => e.is_connect() || e.is_timeout() || e.is_request(),
+            },
+            Self::Rest { status, .. } => status.is_server_error(),
+            Self::GraphQl(_) | Self::Shape(_) => false,
+        }
+    }
+}
+
+/// Build a [`GhError::Rest`] from a status and GitHub's own response body.
+///
+/// The one place the variant is constructed. GitHub's failure messages are the
+/// useful half of a failed write — "Pull Request is not mergeable", "Resource
+/// not accessible by integration" — and dropping them for the bare status is
+/// what makes a permissions problem look identical to a conflict.
+fn rest_error(
+    what: impl Into<String>,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> GhError {
+    GhError::Rest {
+        what: what.into(),
+        status,
+        message: body
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no message)")
+            .to_string(),
+    }
+}
+
 /// Unwrap a REST response, turning a non-2xx into a [`GhError::Rest`] that
 /// carries GitHub's own `message`.
-///
-/// GitHub's failure messages are the useful half of a failed write — "Pull
-/// Request is not mergeable", "Resource not accessible by integration" — and
-/// dropping them for the bare status is what makes a permissions problem look
-/// identical to a conflict.
 async fn rest_ok(resp: reqwest::Response, what: &str) -> Result<serde_json::Value, GhError> {
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {
-        let msg = body
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("(no message)");
-        return Err(GhError::Rest(format!("{what}: {status}: {msg}")));
+        return Err(rest_error(what, status, &body));
     }
     Ok(body)
 }
@@ -349,13 +411,7 @@ impl GitHubClient {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)");
-            return Err(GhError::Rest(format!(
-                "create pull request: {status}: {msg}"
-            )));
+            return Err(rest_error("create pull request", status, &body));
         }
         body.get("number")
             .and_then(|n| n.as_u64())
@@ -389,11 +445,7 @@ impl GitHubClient {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)");
-            return Err(GhError::Rest(format!("create issue: {status}: {msg}")));
+            return Err(rest_error("create issue", status, &body));
         }
         body.get("number")
             .and_then(|n| n.as_u64())
@@ -431,14 +483,7 @@ impl GitHubClient {
         let status = resp.status();
         if !status.is_success() {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)")
-                .to_string();
-            return Err(GhError::Rest(format!(
-                "close issue {number}: {status}: {msg}"
-            )));
+            return Err(rest_error(format!("close issue {number}"), status, &body));
         }
         Ok(())
     }
@@ -908,13 +953,7 @@ impl GitHubClient {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)");
-            return Err(GhError::Rest(format!(
-                "pull request {number}: {status}: {msg}"
-            )));
+            return Err(rest_error(format!("pull request {number}"), status, &body));
         }
         Ok(PrState {
             state: match body.get("state").and_then(|s| s.as_str()) {
@@ -982,13 +1021,11 @@ impl GitHubClient {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)");
-            return Err(GhError::Rest(format!(
-                "compare {trunk}...{sha}: {status}: {msg}"
-            )));
+            return Err(rest_error(
+                format!("compare {trunk}...{sha}"),
+                status,
+                &body,
+            ));
         }
         let compare_status = body.get("status").and_then(|s| s.as_str());
         debug!(owner, name, trunk, sha, status = compare_status, "compared");
@@ -1024,11 +1061,7 @@ impl GitHubClient {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await?;
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)");
-            return Err(GhError::Rest(format!("contents {path}: {status}: {msg}")));
+            return Err(rest_error(format!("contents {path}"), status, &body));
         }
         // A file rather than a directory answers with an object, not an array.
         let Some(entries) = body.as_array() else {
@@ -1605,6 +1638,94 @@ mod tests {
         let blocked = Landing::Blocked(BLOCKED_REQUIRED).describe();
         assert!(blocked.contains(BLOCKED_REQUIRED), "{blocked}");
         assert!(blocked.contains("would be refused"), "{blocked}");
+    }
+
+    fn rest(status: u16, message: &str) -> GhError {
+        rest_error(
+            "read pull request 7",
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            &json!({ "message": message }),
+        )
+    }
+
+    /// The hold this feeds is only ever set by "GitHub is not answering". A
+    /// 5xx is that; a 4xx is GitHub answering, and holding on one would be a
+    /// hold nothing could clear.
+    #[test]
+    fn only_a_server_error_reads_as_unavailable() {
+        for status in [500, 502, 503, 504] {
+            assert!(rest(status, "unavailable").is_unavailable(), "{status}");
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(!rest(status, "nope").is_unavailable(), "{status}");
+        }
+        // 429 is a fact about our own usage — it names its own reset, and a
+        // clone does not spend the API quota.
+        assert!(!rest(429, "rate limited").is_unavailable());
+        // Our own bug, and GraphQL errors are GitHub answering.
+        assert!(!GhError::Shape("no `data`".into()).is_unavailable());
+        assert!(!GhError::GraphQl("Bad credentials".into()).is_unavailable());
+    }
+
+    /// The variant's shape moved; its rendered text did not. This message is
+    /// read by humans in warnings and in stored failure reasons.
+    #[test]
+    fn the_rest_message_is_byte_identical_to_what_it_always_was() {
+        let err = rest(422, "Pull Request is not mergeable");
+        assert_eq!(
+            err.to_string(),
+            "rest: read pull request 7: 422 Unprocessable Entity: Pull Request is not mergeable"
+        );
+        // A body with no `message` still renders the way it used to.
+        let bare = rest_error(
+            "create issue",
+            reqwest::StatusCode::NOT_FOUND,
+            &json!({ "documentation_url": "..." }),
+        );
+        assert_eq!(
+            bare.to_string(),
+            "rest: create issue: 404 Not Found: (no message)"
+        );
+    }
+
+    /// Empirical, because the classification rests on reqwest carrying the
+    /// status through `error_for_status()` — the GraphQL path's only failure
+    /// mode. If that ever stopped being true, every outage would read as a
+    /// transport error instead, and this is what would notice.
+    #[tokio::test]
+    async fn a_real_503_through_the_graphql_path_reads_as_unavailable() {
+        let app = Router::new().route(
+            "/graphql",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    AxumJson(json!({"message": "Service Unavailable"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = GitHubClient::with_base_url("token", url);
+        let err = client.list_open_issues("own", "repo").await.unwrap_err();
+        assert!(matches!(err, GhError::Http(_)), "{err:?}");
+        assert!(err.is_unavailable(), "{err}");
+    }
+
+    /// The other half of "never got a response": nothing is listening at all,
+    /// which is what a poll during an outage most often looks like.
+    #[tokio::test]
+    async fn a_refused_connection_reads_as_unavailable() {
+        // Bind, read the port, drop the listener: nothing can be listening
+        // there, and the OS answers RST rather than making us wait.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+        drop(listener);
+
+        let client = GitHubClient::with_base_url("token", url);
+        let err = client.list_open_issues("own", "repo").await.unwrap_err();
+        assert!(err.is_unavailable(), "{err}");
     }
 
     /// The field comes off the body `pull_request_state` already fetches — no

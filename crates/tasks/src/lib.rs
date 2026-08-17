@@ -13,6 +13,8 @@ pub mod cancel;
 pub mod deadline;
 pub mod env_file;
 pub mod github;
+/// Whether GitHub is answering, and whether dispatch should wait for it (#939).
+pub mod github_health;
 /// What the VM images are running, observed from the runs inside them (#909).
 pub mod images;
 /// The migration set plus the naming rule that keeps parallel branches from

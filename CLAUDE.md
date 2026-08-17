@@ -289,6 +289,55 @@ implementation.
   retry forever with nothing to stop it. Every waived strike appends a `Note`
   naming the class and the unchanged count, because an attempt that was not
   spent is otherwise indistinguishable from a cap that has been switched off.
+- **A GitHub outage holds dispatch, because that failure is the one in its
+  family that is *preventable*.** A Scout clones and a Builder clones, so work
+  dispatched while GitHub is down dies at its first step — a pre-agent setup
+  failure, which the rule above deliberately keeps charged, so one outage spent
+  a three-spec batch three build attempts of three for something no spec did
+  (#939). **Do not relax the strike rule to fix this**: waiving pre-agent setup
+  failures is the fix that looks equivalent and is not, since a clone against a
+  base branch that is gone fails identically forever and waiving it retries
+  forever with nothing to stop it. The poller already knew and told nobody, so
+  `github_health::GitHubHealth` is an **in-memory** record (never a table — that
+  is a GitHub-owned fact with a timestamp on it, and the vm-pool precondition it
+  mirrors is in-memory too) written from *every* GitHub call a pass makes and
+  read by both dispatchers as a precondition. It cannot be read off `poll_once`'s
+  return value: a failed fetch is logged and skipped so one repo cannot stall
+  intake for the others, so the pass returns `Ok` through an outage that failed
+  every call in it. What counts as an outage is decided **off
+  `GhError::is_unavailable`, structurally** — 5xx, or a request that never got a
+  response — and never off the message text, the same rule `FailureClass`
+  follows; `429` and every other `4xx` are excluded, because they are GitHub
+  *answering* and a hold on one would clear from nowhere. Three rules keep a
+  hold from becoming a silent stall, and each is a way this could go permanently
+  wrong: **absence of evidence never holds** (a tokenless server observes
+  nothing at all and would otherwise never dispatch again), **only a fresh
+  success clears one** (a 404 on one PR is not GitHub coming back), and **a hold
+  nobody is refreshing expires** — generously, at 10 × `TASKS_POLL_INTERVAL`
+  floored at 10 minutes, because during an outage the poller's own requests are
+  the slow kind and a tight window would expire the hold *during* the outage it
+  was set for. The window is bound at construction rather than at each read, so
+  the scout loop, the build lane and `/status` cannot disagree about whether a
+  hold is in force. The mistakes stay asymmetric on purpose: one failed
+  observation is enough, since a false hold costs at most one poll interval of
+  latency and loses nothing, while a false dispatch costs one of three attempts
+  on work that did nothing wrong. Holding is safe here in a way it usually is
+  not — `POST /builds` still records the request, queued work stays queued,
+  nothing is charged, and the batch takes the lane on the tick *after* GitHub
+  answers — which is also why the build lane's check sits in the match guard
+  **ahead of `claim_next_queued_build`**: claiming would flip the build
+  `queued → running` and drag its batch to `building` on every tick of the
+  outage. It is announced once per edge as a `Note` and reported for as long as
+  it lasts on `/status`, `tasks status` and the Server window, so an idle
+  pipeline can always say why it is idle. **No obligation and no orchestrator
+  prompt section** — the orchestrator cannot fix GitHub, and an undischargeable
+  signal raised every pass is how a signal gets trained out of use, the same
+  argument that kept `ObligationKind::StaleImage` from existing. The one
+  remaining gap is deliberate: the record is in memory, so a restart mid-outage
+  can dispatch once, and closing it would mean persisting a GitHub-owned fact or
+  blocking dispatch on a signal that may never arrive. It is narrower than it
+  looks, since a boot takes `TASKS_DEFAULT_MODE` (`pause`) and the path that
+  carries `play` over is `tasks reload`, a deliberate human act.
 - **A build is whichever tip the reconciliation chooses, and the head is read
   out of the bundle — in that order.** `git rev-parse HEAD` and
   `refs/heads/<branch>` are the same commit only while HEAD stays symbolically
@@ -538,7 +587,8 @@ scout dispatch bounded by `SCOUT_MAX_CONCURRENT`, and the HTTP API. Mode gates
 *new* work only — `Pause`/`Stop` never interrupt a scout already in flight.
 Both dependencies degrade rather than crash: no `GITHUB_TOKEN` disables
 polling, an unreachable vm-pool disables dispatch and reconnects periodically,
-and the API stays up either way.
+a GitHub that stops answering *holds* dispatch until it does (see *A GitHub
+outage holds dispatch* below), and the API stays up either way.
 
 **A boot does not resume the mode; it takes `TASKS_DEFAULT_MODE` (default
 `pause`) and overwrites the stored one** (`apply_startup_mode`, before the
@@ -878,7 +928,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | var | default | |
 | --- | --- | --- |
 | `TASKS_SERVER_PORT` | 4800 | HTTP API port (also `--port`) |
-| `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls |
+| `TASKS_POLL_INTERVAL` | 60 | seconds between GitHub polls. It has a second job: the poll is the only thing that observes GitHub's reachability, so a dispatch hold expires after **10 × this**, floored at 10 minutes (`GitHubHealth::stale_after`). Raising it slows how quickly an outage is noticed *and* lengthens how long a hold survives a dead poll loop |
 | `TASKS_DEFAULT_MODE` | `pause` | the mode **every** boot starts in, overwriting whatever the last process left in the store — `play`, `pause` or `stop`, and an unparseable value refuses to boot rather than being ignored. Only `tasks reload` overrides it, by passing the old server's mode to the new one |
 | `TASKS_ENV_FILES` | `on` | `off` skips `.env` loading entirely — for tests that exec the `tasks` binary, where `env_remove` promotes a `.env` rather than scrubbing it. Anything that is neither `on` nor `off` refuses to boot |
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |

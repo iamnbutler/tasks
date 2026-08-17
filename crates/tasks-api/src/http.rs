@@ -403,6 +403,38 @@ pub struct ServerStatus {
     /// "current".
     #[serde(default)]
     pub images: Vec<ImageIdentity>,
+    /// Set for as long as scout and build dispatch is being held because GitHub
+    /// is not answering; `None` the rest of the time, which is almost always.
+    ///
+    /// `#[serde(default)]` for the same reload-skew reason as `images`:
+    /// `reload` reads `/status` off the *older* server before it swaps, so the
+    /// binary decoding this is by construction newer than the one answering.
+    ///
+    /// An absent hold is honest about two different things at once — nothing is
+    /// held, or the answering router has no dispatchers behind it to hold. A
+    /// router with no dispatchers is not holding anything back either way.
+    #[serde(default)]
+    pub github: Option<GitHubHold>,
+}
+
+/// Why the pipeline is idle when GitHub is not answering.
+///
+/// A Scout clones and a Builder clones, so work dispatched into an outage dies
+/// at its first step and is charged an attempt for it. Holding costs nothing:
+/// queued work stays queued, and the next poll that succeeds releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubHold {
+    /// The first failed call in this run — "down since", which later failures
+    /// do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent failed call. The gap between this and now is the
+    /// difference between a hold somebody is still refreshing and one about to
+    /// expire on its own.
+    pub last_seen: DateTime<Utc>,
+    /// How many calls have failed since `since`.
+    pub failures: u32,
+    /// The most recent failure, rendered — prose for a reader.
+    pub error: String,
 }
 
 /// One migration a boot applied.
