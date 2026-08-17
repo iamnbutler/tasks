@@ -16,7 +16,7 @@ use tasks_client::api::http::RejectedBundle;
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
     OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TaskState,
+    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptOwner,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -121,9 +121,29 @@ pub struct AppState {
     /// [`AppState::reorder_queue`].
     pub queue_notice: Option<String>,
 
+    /// The one open transcript tail — the Agent Feed's data. At most one:
+    /// the feed follows what is on screen, and opening the next run retires
+    /// the last (its thread notices the dropped channel on its next line or
+    /// keep-alive and exits, taking the connection with it).
+    pub transcript_feed: Option<TranscriptFeed>,
+    /// Which open_transcript call the running reader belongs to. A reader
+    /// whose generation has moved on stops consuming, which is what closes
+    /// it — there is no handle to a thread blocked in a socket read.
+    transcript_generation: u64,
+
     refreshing: bool,
     /// An event arrived while a refresh was in flight — go again after.
     dirty: bool,
+}
+
+/// A run's transcript as the app holds it: the lines so far, in seq order,
+/// appended live by the tail.
+pub struct TranscriptFeed {
+    pub owner: TranscriptOwner,
+    pub lines: Vec<TranscriptLine>,
+    /// The tail dropped and is reconnecting (the iterator yields its errors
+    /// inline). Shown quietly; backfill makes the gap good on reconnect.
+    pub reconnecting: bool,
 }
 
 /// One full read of every list the UI shows. Fields are per-endpoint options
@@ -294,6 +314,8 @@ impl AppState {
             error: None,
             build_warning: None,
             queue_notice: None,
+            transcript_feed: None,
+            transcript_generation: 0,
             refreshing: false,
             dirty: false,
         }
@@ -493,6 +515,104 @@ impl AppState {
             .ok();
         })
         .detach();
+    }
+
+    /// Open (or keep) the transcript tail for one run — the Agent Feed's
+    /// data path. A no-op when `owner` is already the open feed; otherwise
+    /// the previous reader is retired by generation and a fresh tail starts
+    /// from seq 1, replaying the whole run before going live (the stream's
+    /// own backfill contract).
+    ///
+    /// Same shape as the two standing streams: a blocking iterator on its
+    /// own OS thread, an unbounded channel, applied on the main thread. The
+    /// difference is lifetime — this one follows the screen. Teardown is the
+    /// channel: when the consuming task sees its generation has moved on it
+    /// returns, the receiver drops, and the thread exits on its next send —
+    /// at worst one keep-alive later. One stale thread per switch, briefly,
+    /// never an accumulation.
+    pub fn open_transcript(&mut self, owner: TranscriptOwner, cx: &mut Context<Self>) {
+        if self
+            .transcript_feed
+            .as_ref()
+            .is_some_and(|feed| feed.owner == owner)
+        {
+            return;
+        }
+        self.transcript_generation += 1;
+        let generation = self.transcript_generation;
+        self.transcript_feed = Some(TranscriptFeed {
+            owner: owner.clone(),
+            lines: Vec::new(),
+            reconnecting: false,
+        });
+
+        let (tx, mut rx) = mpsc::unbounded();
+        {
+            let client = self.client.clone();
+            let owner = owner.clone();
+            std::thread::Builder::new()
+                .name("tasks-transcript-tail".into())
+                .spawn(move || {
+                    let tail = match &owner {
+                        TranscriptOwner::Session { session_id } => {
+                            client.stream_transcript(session_id, 1)
+                        }
+                        TranscriptOwner::Build { build_id } => {
+                            client.stream_build_transcript(build_id, 1)
+                        }
+                    };
+                    for item in tail {
+                        if tx.unbounded_send(item).is_err() {
+                            return; // feed closed or replaced
+                        }
+                    }
+                })
+                .expect("spawn transcript-tail thread");
+        }
+        cx.spawn(async move |this, cx| {
+            while let Some(item) = rx.next().await {
+                let alive = this
+                    .update(cx, |state: &mut AppState, cx| {
+                        if state.transcript_generation != generation {
+                            return false; // a newer feed took over — stop consuming
+                        }
+                        if let Some(feed) = state.transcript_feed.as_mut() {
+                            match item {
+                                Ok(line) => {
+                                    feed.reconnecting = false;
+                                    // Reconnect replays from the cursor; an
+                                    // out-of-order or repeated seq would
+                                    // double rows. `since` is exact, so this
+                                    // is belt only.
+                                    if feed.lines.last().is_none_or(|last| last.seq < line.seq) {
+                                        feed.lines.push(line);
+                                    }
+                                }
+                                // The tail reconnects itself; the error is
+                                // worth a quiet "reconnecting…" and nothing
+                                // more, since backfill makes the gap good.
+                                Err(_) => feed.reconnecting = true,
+                            }
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Close the open transcript tail, if any. The reader notices via the
+    /// generation and the thread via the dropped channel.
+    pub fn close_transcript(&mut self) {
+        if self.transcript_feed.is_some() {
+            self.transcript_generation += 1;
+            self.transcript_feed = None;
+        }
     }
 
     /// Full snapshot on the background executor, applied on completion.
@@ -697,7 +817,13 @@ impl AppState {
     /// queue entry, front to back, and it writes `spec_queue.rank`.
     ///
     /// Same bulk-replace semantics, hence the same rule — every entry, not
-    /// just the pending-review ones the Needs you band shows.
+    /// just the pending-review ones the section shows.
+    ///
+    /// Caller-less since the Queue section died in the v3 frame swap; kept
+    /// because Awaiting Feedback's drag-to-rank (the noted fast-follow) is
+    /// this exact call, and the bulk-replace rules encoded here are the
+    /// hard-won part.
+    #[allow(dead_code)]
     pub fn reorder_spec_queue(&mut self, order: Vec<SpecId>, cx: &mut Context<Self>) {
         let rollback = self.spec_queue.clone();
         ranked_first(&mut self.spec_queue, &order, |item| &item.entry.spec_id);

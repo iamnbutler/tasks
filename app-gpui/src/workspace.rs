@@ -14,7 +14,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     actions, div, list, px, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, MouseButton, SharedString, Stateful, WeakEntity, Window,
+    FollowMode, ListAlignment, ListState, MouseButton, SharedString, WeakEntity, Window,
     WindowHandle,
 };
 use gpuikit::elements::context_menu::{menu_item, MenuItems};
@@ -33,24 +33,26 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
     BuildStatus, ChatRole, CloseReason, Mode, ProjectId, ProjectStatus, SessionStatus, SpecId,
-    SpecQueueStatus, TaskId, TaskState,
+    SpecQueueStatus, TaskId, TaskState, TranscriptOwner,
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
+use crate::feed::{self, FeedKey, FeedRowKind};
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
+use crate::nav::{MiddleView, NavHistory, TaskTab};
 use crate::palette::{
     GoToAnything, PaletteKind, PaletteState, SelectNextRow, SelectPrevRow, ShowCommandPalette,
 };
-use crate::projects::{self, ProjectFilter};
+use crate::projects::ProjectFilter;
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
-use crate::state::{is_picked_up, AppState};
+use crate::state::AppState;
 use crate::time;
 
 pub(crate) const FONT: &str = "Menlo";
@@ -58,6 +60,18 @@ pub(crate) const FONT: &str = "Menlo";
 /// Reading-width cap for conversation content — long markdown replies
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
+
+/// The signed-in human, hardcoded until device-flow login exists: the chat
+/// chip's avatar and where clicking it goes. One place on purpose — login
+/// replaces these two constants and nothing else.
+const GITHUB_PROFILE_URL: &str = "https://github.com/iamnbutler";
+const GITHUB_AVATAR_URL: &str = "https://avatars.githubusercontent.com/u/1714999?v=4";
+
+/// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
+/// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
+/// source. Stroke is gruvbox's muted gray, hardcoded because an `img` does
+/// not take the text color — acceptable for a control that ships disabled.
+const MIC_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#928374" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>"##;
 
 actions!(
     workspace,
@@ -67,10 +81,8 @@ actions!(
         NewIssue,
         AddRepo,
         Dismiss,
-        GoToTasks,
-        GoToQueue,
-        GoToActivity,
-        GoToChat,
+        HistoryBack,
+        HistoryForward,
         SetModePlay,
         SetModePause,
         SetModeStop,
@@ -109,103 +121,11 @@ enum ChatRowView {
     Empty,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-pub enum Section {
-    Tasks,
-    Queue,
-    Activity,
-    Chat,
-}
-
-/// Where focus belongs once a section is on screen.
-///
-/// A value rather than a `window.focus` call inside the match, so the rule can
-/// be asserted without a `Window` — the app's tests are pure functions over
-/// view state (a `#[gpui::test]` would need gpui's `test-support` feature,
-/// which the Makefile's stub-`.so` fallback cannot link).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum FocusTarget {
-    /// The workspace root — the section draws no composer of its own, so the
-    /// root is the only element guaranteed to be in the frame.
-    Workspace,
-    /// The chat composer, which only exists while [`Section::Chat`] is drawn.
-    ChatComposer,
-}
-
-impl Section {
-    /// The section a new window opens on. Named rather than spelled out at
-    /// each site: `Workspace::new` and the #902/#914 focus test both read it,
-    /// and two literals are how those two silently drift apart.
-    pub(crate) const DEFAULT: Section = Section::Tasks;
-
-    const ALL: [Section; 4] = [
-        Section::Tasks,
-        Section::Queue,
-        Section::Activity,
-        Section::Chat,
-    ];
-
-    /// The section's name. Rendered exactly once now — in the title bar's
-    /// centre. The nav rows are icons and carry it as an accessible name;
-    /// `render_center` no longer spends a row on it.
-    fn label(self) -> &'static str {
-        match self {
-            Section::Tasks => "Tasks",
-            Section::Queue => "Queue",
-            Section::Activity => "Activity",
-            Section::Chat => "Chat",
-        }
-    }
-
-    /// The icon a nav row wears in place of its label.
-    fn icon(self) -> gpui::Svg {
-        match self {
-            Section::Tasks => Icons::list_bullet(),
-            Section::Queue => Icons::layers(),
-            Section::Activity => Icons::activity_log(),
-            Section::Chat => Icons::chat_bubble(),
-        }
-    }
-
-    /// Element id for the nav row. A name rather than the enumeration index:
-    /// these rows have no id'd ancestor, so a bare integer sits at the root
-    /// of the id path, which is exactly the collision class #861 is about.
-    fn nav_id(self) -> &'static str {
-        match self {
-            Section::Tasks => "nav-tasks",
-            Section::Queue => "nav-queue",
-            Section::Activity => "nav-activity",
-            Section::Chat => "nav-chat",
-        }
-    }
-
-    /// Where focus lands when this section becomes the visible one.
-    ///
-    /// Chat gets its composer — arriving ready to type is what the app did
-    /// before, by accident of a startup focus that pointed at the composer
-    /// whether or not it was drawn. Every other section gets the workspace
-    /// root, because a focus handle absent from the frame is treated exactly
-    /// like no focus at all (#902): the dispatch path falls back to the
-    /// *window* root, which carries no key context, and every
-    /// `Workspace`-context binding goes dead.
-    fn focus_target(self) -> FocusTarget {
-        match self {
-            Section::Chat => FocusTarget::ChatComposer,
-            Section::Tasks | Section::Queue | Section::Activity => FocusTarget::Workspace,
-        }
-    }
-
-    /// The ⌘-digit that reaches this section. Bound in `main`; repeated here
-    /// only to be *announced* — in the row's tooltip and, via
-    /// `aria_keyshortcuts`, to assistive technology.
-    fn shortcut(self) -> &'static str {
-        match self {
-            Section::Tasks => "⌘1",
-            Section::Queue => "⌘2",
-            Section::Activity => "⌘3",
-            Section::Chat => "⌘4",
-        }
-    }
+/// One run the Agent Feed can tail, as the picker offers it.
+struct FeedRun {
+    owner: TranscriptOwner,
+    label: String,
+    live: bool,
 }
 
 pub struct Workspace {
@@ -221,7 +141,12 @@ pub struct Workspace {
     /// away has to be able to hand it back here, which is also what the
     /// palette needs when it closes.
     pub(crate) focus_handle: FocusHandle,
-    pub(crate) section: Section,
+    /// The middle column's position and history — the whole of "where am I"
+    /// since the v3 frame swap retired sections.
+    pub(crate) nav: NavHistory,
+    /// Which of the selected task's tabs is showing. Reset to Overview on
+    /// every navigation; meaningless while the catalog is up.
+    pub(crate) task_tab: TaskTab,
     pub(crate) left_sidebar: SidebarState,
     pub(crate) right_sidebar: SidebarState,
     /// Which sidebar is currently being drag-resized, if any.
@@ -261,12 +186,32 @@ pub struct Workspace {
     /// Issue-draft composer shown in the cmd-n window. Owned here, not by
     /// the window, so a dismissed draft survives to the next cmd-n.
     pub(crate) issue_input: Entity<InputState>,
+    /// The left rail's task composer — the second door into the ⌘N flow.
+    /// Its own draft, not [`Self::issue_input`]'s: the two surfaces can be
+    /// on screen at once, and one `InputState` rendered in two places would
+    /// fight over focus and caret.
+    pub(crate) rail_input: Entity<InputState>,
     /// The cmd-n "new issue" window, if it has been opened. May be stale
     /// (window closed) — probed with `update` before re-fronting.
     issue_window: Option<WindowHandle<IssueComposer>>,
     /// Scroll state for the chat list — tail-following, so the view opens
     /// at the newest message and stays pinned while new ones land.
     chat_list: ListState,
+    /// Scroll state for the Agent Feed list — the same tail-following
+    /// virtualized list the chat uses, over transcript rows.
+    feed_list: ListState,
+    /// The row keys the feed list is synced to.
+    feed_keys: Vec<FeedKey>,
+    /// The parsed rows behind those keys, cached so the row renderer reads
+    /// a slot instead of re-folding the transcript per row.
+    feed_rows: Vec<feed::FeedRow>,
+    /// How many transcript lines the rows were folded from — the cheap "did
+    /// the tail row grow" check that triggers a re-measure without a splice.
+    feed_lines_seen: usize,
+    /// A run the human picked in the feed's run picker, overriding the
+    /// default (the live run, else the newest). Cleared on navigation, and
+    /// ignored once it stops belonging to the selected task.
+    feed_choice: Option<TranscriptOwner>,
     /// The row keys the list is currently synced to — what the next frame's
     /// keys are diffed against.
     chat_keys: Vec<ChatRowKey>,
@@ -300,13 +245,18 @@ pub struct Workspace {
     /// set, per-window and resetting on relaunch, exactly like [`Self::show_done`]
     /// — see [`crate::projects`] for why it is not a query parameter.
     pub(crate) project_filter: ProjectFilter,
-    /// The title bar's repo switcher.
-    ///
-    /// A popover rather than gpuikit's `context_menu` (right-click only) and
-    /// rather than a menu-bar menu: `set_menus` leaks a boxed action per item
-    /// on every rebuild, and the item list here *is* the project list, so a bar
-    /// that rebuilt on every add or archive would leak per repo per change.
-    project_switcher: Entity<PopoverState>,
+    /// The left rail is a two-level drill-down: the repo list up top, one
+    /// repo's tasks below. `true` shows the repo level — entered by the
+    /// header's ‹ chevron, left by choosing a repo.
+    pub(crate) rail_shows_repos: bool,
+    /// The chat chip's avatar, fetched once off the main thread. `None`
+    /// until it lands (or forever, offline) — the chip renders a quiet
+    /// placeholder circle rather than blocking on it.
+    avatar: Option<std::sync::Arc<gpui::Image>>,
+    /// The rail header's ⋮ menu — the chrome that lost its titlebar slot
+    /// (refresh, the Server window). A popover for the same leak reason as
+    /// the switcher.
+    rail_overflow: Entity<PopoverState>,
     /// `owner/repo` draft for the Add Repo window. Owned here, like the issue
     /// draft, so a dismissed one survives to the next open.
     pub(crate) repo_input: Entity<InputState>,
@@ -425,6 +375,20 @@ impl Workspace {
             state.set_placeholder("Describe the issue…", cx);
             state
         });
+        // The rail composer: same flow as ⌘N (the orchestrator titles and
+        // files), its own draft.
+        let rail_input = cx.new(|cx| {
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("Add a task…", cx);
+            state
+        });
+        cx.observe(&rail_input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&rail_input, |this, _, event: &InputStateEvent, cx| {
+            if matches!(event, InputStateEvent::Submit) {
+                this.submit_rail_composer(cx);
+            }
+        })
+        .detach();
         // One line, so cmd-enter and plain enter can mean the same thing —
         // there is no newline to protect.
         let repo_input = cx.new(|cx| {
@@ -433,26 +397,19 @@ impl Workspace {
             state
         });
 
-        // The switcher's rows *are* the project list, so both callbacks read
-        // the workspace back out of a weak handle rather than closing over a
-        // snapshot that would be stale by the first archive.
-        let project_switcher = {
-            let trigger = cx.entity().downgrade();
+        let rail_overflow = {
             let content = cx.entity().downgrade();
             cx.new(|_cx| {
                 PopoverState::new(
-                    popover("project-switcher")
-                        .trigger(move |window, cx| {
-                            Self::render_switcher_trigger(&trigger, window, cx)
-                        })
+                    popover("rail-overflow")
+                        .trigger(Self::render_overflow_trigger)
                         .content(move |window, cx| {
-                            Self::render_switcher_content(&content, window, cx)
+                            Self::render_overflow_content(&content, window, cx)
                         }),
                 )
             })
         };
-        cx.observe(&project_switcher, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe(&rail_overflow, |_, _, cx| cx.notify()).detach();
 
         // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
         // escape is gpuikit's own blur, and the blur is how the palette learns
@@ -515,13 +472,54 @@ impl Workspace {
             });
         }
 
+        // The feed's list mirrors the chat's: top-aligned, tail-following.
+        let feed_list = ListState::new(0, ListAlignment::Top, px(2048.));
+        feed_list.set_follow_mode(FollowMode::Tail);
+
+        // The avatar, once, off the main thread. A miss is a permanent
+        // placeholder, not a retry loop — this is chrome, not data.
+        {
+            let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
+            std::thread::Builder::new()
+                .name("tasks-avatar-fetch".into())
+                .spawn(move || {
+                    let Ok(response) = ureq::get(GITHUB_AVATAR_URL).call() else {
+                        return;
+                    };
+                    let mut bytes = Vec::new();
+                    use std::io::Read as _;
+                    if response.into_reader().read_to_end(&mut bytes).is_err() {
+                        return;
+                    }
+                    // GitHub serves avatars as PNG or JPEG depending on the
+                    // upload; sniff rather than trust the URL.
+                    let format = match bytes.first() {
+                        Some(0xFF) => gpui::ImageFormat::Jpeg,
+                        _ => gpui::ImageFormat::Png,
+                    };
+                    tx.send(gpui::Image::from_bytes(format, bytes)).ok();
+                })
+                .expect("spawn avatar-fetch thread");
+            cx.spawn(async move |this, cx| {
+                if let Ok(image) = rx.await {
+                    this.update(cx, |this: &mut Workspace, cx| {
+                        this.avatar = Some(std::sync::Arc::new(image));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+
         Self {
             focus_handle,
-            section: Section::DEFAULT,
+            nav: NavHistory::default(),
+            task_tab: TaskTab::default(),
             left_sidebar: SidebarState::new(true),
-            // The inspector is a reading surface (specs, task bodies) —
-            // default it wide, like the Swift app's 460pt ideal.
-            right_sidebar: SidebarState::new(false).with_width(px(460.)),
+            // The chat pane: on screen by default (the design's always-up
+            // right column), and wide — it is a reading surface.
+            right_sidebar: SidebarState::new(true).with_width(px(460.)),
             resizing: None,
             app_state,
             server_control,
@@ -532,8 +530,14 @@ impl Workspace {
             review_input,
             build_input,
             issue_input,
+            rail_input,
             issue_window: None,
             chat_list,
+            feed_list,
+            feed_keys: Vec::new(),
+            feed_rows: Vec::new(),
+            feed_lines_seen: 0,
+            feed_choice: None,
             chat_keys: Vec::new(),
             chat_tick_revision: 0,
             expanded_tools: HashSet::new(),
@@ -542,7 +546,9 @@ impl Workspace {
             palette: None,
             palette_input,
             project_filter: ProjectFilter::All,
-            project_switcher,
+            rail_shows_repos: false,
+            avatar: None,
+            rail_overflow,
             repo_input,
             repo_window: None,
             pending_repo_selection: None,
@@ -567,32 +573,52 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Switch sections, and put focus somewhere that is actually drawn.
-    ///
-    /// The focus move is the other half of #902 and is not housekeeping: Chat
-    /// is the one section with a composer worth landing in, and everywhere else
-    /// the composer is not rendered at all. A focus handle that is absent from
-    /// the frame drops the context stack, so leaving Chat without handing focus
-    /// back to the root kills every `Workspace`-context binding until something
-    /// else takes focus.
-    pub(crate) fn go_to_section(
-        &mut self,
-        section: Section,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.section = section;
-        self.place_focus(section.focus_target(), window, cx);
+    /// Point the middle column somewhere. The one write to [`Self::nav`]
+    /// outside the history steps, so selection, drafts and the tab strip stay
+    /// consistent by construction rather than at each call site.
+    pub(crate) fn navigate(&mut self, view: MiddleView, cx: &mut Context<Self>) {
+        if self.nav.navigate(view) {
+            self.settle_after_nav(cx);
+        }
         cx.notify();
     }
 
-    /// Put focus on the named element. The one place `window.focus` is called
-    /// with a choice in it, so "the handle must be in the frame this section
-    /// draws" is checked once rather than at each call site.
-    fn place_focus(&self, target: FocusTarget, window: &mut Window, cx: &mut Context<Self>) {
-        match target {
-            FocusTarget::Workspace => window.focus(&self.focus_handle, cx),
-            FocusTarget::ChatComposer => window.focus(&self.input.focus_handle(cx), cx),
+    /// ⌘[ — step the middle column back.
+    pub(crate) fn history_back(&mut self, cx: &mut Context<Self>) {
+        if self.nav.back() {
+            self.settle_after_nav(cx);
+            cx.notify();
+        }
+    }
+
+    /// ⌘] — step the middle column forward.
+    pub(crate) fn history_forward(&mut self, cx: &mut Context<Self>) {
+        if self.nav.forward() {
+            self.settle_after_nav(cx);
+            cx.notify();
+        }
+    }
+
+    /// What every nav movement implies: the tab strip resets to the landing
+    /// tab, an armed bundle Delete disarms, and — when the selection actually
+    /// changed task — the per-task drafts are cleared, because a review is
+    /// about one spec and a build-now rationale is the only record of why
+    /// *that* task skipped its Scout.
+    fn settle_after_nav(&mut self, cx: &mut Context<Self>) {
+        self.task_tab = TaskTab::Overview;
+        self.bundle_delete_armed = None;
+        // A picked run is about one task's feed — don't carry it to another.
+        self.feed_choice = None;
+        let selected = match self.nav.current() {
+            MiddleView::Task(id) => Some(id.clone()),
+            MiddleView::AllTasks => None,
+        };
+        if selected != self.selected_task {
+            self.review_input
+                .update(cx, |input, cx| input.set_content("", cx));
+            self.build_input
+                .update(cx, |input, cx| input.set_content("", cx));
+            self.selected_task = selected;
         }
     }
 
@@ -643,31 +669,23 @@ impl Workspace {
 
     // --- selection (called from section rows) ---
 
+    /// Select a task — which, since the frame swap, *is* navigating the
+    /// middle column to it. Re-selecting the current task is a no-op
+    /// (`NavHistory::navigate` refuses the duplicate), which is also what
+    /// keeps a right-click on the selected row from clearing its drafts.
     pub(crate) fn select_task(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        if self.selected_task.as_ref() != Some(&id) {
-            // Draft feedback is about one spec — don't carry it to another.
-            self.review_input
-                .update(cx, |input, cx| input.set_content("", cx));
-            // Same for the build-now rationale, and more sharply: it is the
-            // only record of why *this* task skipped its Scout.
-            self.build_input
-                .update(cx, |input, cx| input.set_content("", cx));
-        }
-        self.selected_task = Some(id);
-        // Never carry an armed Delete to another task's bundle.
-        self.bundle_delete_armed = None;
-        // `reveal`, not `force_open`: a row click is the content asking to be
-        // seen, and it must not undo a dismissal the user made deliberately.
-        self.right_sidebar.reveal();
-        cx.notify();
+        self.navigate(MiddleView::Task(id), cx);
     }
 
-    /// Send a message into the orchestrator conversation and jump to Chat so
-    /// the reply is visible as it streams in.
+    /// Send a message into the orchestrator conversation. The chat pane is
+    /// always on screen; `reveal` brings it back only if content-hiding put
+    /// it away, without overriding a deliberate ⌘R dismissal… which sending a
+    /// message is the one good reason to override — the reply would otherwise
+    /// stream into a pane the human cannot see.
     pub(crate) fn ask_orchestrator(&mut self, message: String, cx: &mut Context<Self>) {
         self.app_state
             .update(cx, |state, cx| state.send_orchestrator_message(message, cx));
-        self.section = Section::Chat;
+        self.right_sidebar.force_open();
         // Sending re-engages the tail pin even if the user had scrolled up —
         // their own message (and the reply behind it) lands at the bottom.
         self.chat_list.scroll_to_end();
@@ -922,16 +940,20 @@ impl Workspace {
         }
     }
 
-    /// Show the task's spec in the inspector with the review composer focused
-    /// — "Review Spec…" landing where the spec text already is, rather than in
-    /// a modal that would cover the thing being judged.
-    fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open a task on its Brief tab — the spec is the thing being ruled on,
+    /// so review-shaped entrances (the feedback list, "Review Spec…") land
+    /// beside it rather than on Overview.
+    pub(crate) fn open_brief(&mut self, id: TaskId, cx: &mut Context<Self>) {
         self.select_task(id, cx);
-        // The one selection path that overrides a dismissal, and it has to run
-        // *after* `select_task`, whose `reveal` may have been a no-op: the
-        // composer being focused below means a hidden panel would eat
-        // keystrokes with nothing on screen to explain where they went.
-        self.right_sidebar.force_open();
+        self.task_tab = TaskTab::Brief;
+        cx.notify();
+    }
+
+    /// [`Self::open_brief`] with the review composer focused — "Review
+    /// Spec…" landing where the spec text already is, rather than in a modal
+    /// that would cover the thing being judged.
+    fn begin_review(&mut self, id: TaskId, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_brief(id, cx);
         window.focus(&self.review_input.focus_handle(cx), cx);
         cx.notify();
     }
@@ -974,18 +996,18 @@ impl Workspace {
     }
 
     pub(crate) fn clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_task = None;
         self.bundle_delete_armed = None;
-        // `hide`, not `toggle`: escape and the inspector's ✕ mean "clear this",
-        // never "and don't come back". The next row click opens it again.
-        self.right_sidebar.hide();
-        // The panel this just put away may have held the focused element — the
-        // review composer `begin_review` focuses. Hand focus back to the root
-        // rather than to the section's own target: this is a dismissal, so the
-        // caret should not land back in a composer the human just escaped out
-        // of. `on_focus_lost` would catch it a frame later; doing it here means
-        // there is no frame in between with no keyboard.
-        self.place_focus(FocusTarget::Workspace, window, cx);
+        // Escape and the task view's ✕ mean "put this away" — the middle
+        // column returns to the catalog. A real navigation, so ⌘[ can change
+        // your mind about it.
+        self.navigate(MiddleView::AllTasks, cx);
+        // The view this just left may have held the focused element — the
+        // review composer `begin_review` focuses. Hand focus back to the root:
+        // this is a dismissal, so the caret should not land back in a composer
+        // the human just escaped out of. `on_focus_lost` would catch it a
+        // frame later; doing it here means there is no frame in between with
+        // no keyboard.
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -1089,6 +1111,9 @@ impl Workspace {
     ) {
         self.project_filter = filter;
         self.pending_repo_selection = None;
+        // Choosing a repo is what leaves the repo level — the drill-down's
+        // way back, whichever surface the choice came from.
+        self.rail_shows_repos = false;
         let stale = {
             let state = self.app_state.read(cx);
             self.selected_task
@@ -1108,15 +1133,14 @@ impl Workspace {
     /// archived is the one on screen: you archive a repo while looking at it,
     /// and jumping to All repos in the same click hides the thing you were
     /// about to check.
-    fn set_project_status(&mut self, id: ProjectId, status: ProjectStatus, cx: &mut Context<Self>) {
+    pub(crate) fn set_project_status(
+        &mut self,
+        id: ProjectId,
+        status: ProjectStatus,
+        cx: &mut Context<Self>,
+    ) {
         self.app_state
             .update(cx, |state, cx| state.set_project_status(id, status, cx));
-    }
-
-    fn close_switcher(&mut self, cx: &mut Context<Self>) {
-        self.project_switcher.update(cx, |popover, cx| {
-            popover.close(cx);
-        });
     }
 
     /// Adopt a just-added repo once a snapshot names it. Called from the
@@ -1140,427 +1164,255 @@ impl Workspace {
 
     // Chrome
 
-    /// A title-bar icon button at the design spec's metrics: 14px icon with
-    /// 8px horizontal / 7px vertical padding, so the button fills the bar.
-    fn title_bar_button(
+    /// A pane-header icon button: 14px icon in a slot that fills the row.
+    fn header_button(
         id: &'static str,
         icon: gpui::Svg,
     ) -> gpuikit::elements::icon_button::IconButton {
         icon_button(id, icon)
-            .width(px(30.))
-            .height(px(28.))
+            .width(px(28.))
+            .height(px(24.))
             .icon_size(px(14.))
     }
 
-    /// The switcher's trigger: what the window is looking at, and a chevron
-    /// saying it can be changed.
+    /// The left rail's header — where the window chrome lives in the v3
+    /// design: traffic lights (inset), the ‹ up-level chevron, the repo the
+    /// working set belongs to, then the pipeline controls at the rail's
+    /// right edge. No bar spans the window anymore.
     ///
-    /// Nothing renders before the first snapshot — a placeholder would be a
-    /// claim about a repo we have not read — and with one repo configured it
-    /// is that repo's slug, so a single-repo window reads exactly as it did
-    /// before there was a switcher.
-    fn render_switcher_trigger(
-        workspace: &WeakEntity<Self>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let label = workspace
-            .read_with(cx, |this, cx| {
-                let state = this.app_state.read(cx);
-                projects::switcher_label(&state.projects, &this.project_filter)
-            })
-            .ok()
-            .flatten();
+    /// The rail is a drill-down, not a popover: ‹ goes up to the repo list,
+    /// choosing a repo comes back down. At the repo level the header names
+    /// the level instead — there is nothing above it to go to.
+    pub(crate) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.))
-            .pl(px(6.))
-            .pr(px(4.))
-            .py(px(2.))
-            .rounded(px(4.))
-            .text_sm()
-            .text_color(theme.fg_muted())
-            .when(label.is_some(), |el| {
-                let hover_bg = theme.surface_secondary();
-                el.hover(move |el| el.bg(hover_bg))
-            })
-            .children(label.clone())
-            .when(label.is_some(), |el| {
-                el.child(
-                    Icons::chevron_down()
-                        .size(px(10.))
-                        .text_color(theme.fg_muted()),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// The switcher's rows: All repos, then every project in
-    /// [`projects::switcher_order`], then Add Repo.
-    fn render_switcher_content(
-        workspace: &WeakEntity<Self>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let Ok((rows, filter, several)) = workspace.read_with(cx, |this, cx| {
-            let state = this.app_state.read(cx);
-            let rows: Vec<_> = projects::switcher_order(&state.projects)
-                .into_iter()
-                .map(|project| {
-                    (
-                        project.id.clone(),
-                        project.slug(),
-                        projects::status_note(project.status),
-                        projects::status_actions(project.status),
-                    )
-                })
-                .collect();
-            let several = state.projects.len() > 1;
-            (rows, this.project_filter.clone(), several)
-        }) else {
-            return div().into_any_element();
-        };
-
-        let row_style = |el: Stateful<Div>, selected: bool| {
-            let hover_bg = theme.surface_secondary();
-            el.flex()
-                .flex_col()
-                .gap(px(1.))
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(selected, |el| el.bg(theme.surface_tertiary()))
-                .hover(move |el| el.bg(hover_bg))
-        };
-
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .p(px(4.))
-            .min_w(px(240.))
-            .text_sm()
-            .text_color(theme.fg());
-
-        // Only offered when there is something to be "all" of. With one repo
-        // configured the window is already showing all of it.
-        if several {
-            let selected = filter.selected().is_none();
-            list = list.child(
-                row_style(div().id("switcher-all"), selected)
-                    .on_click({
-                        let workspace = workspace.clone();
-                        move |_event, window, cx| {
-                            workspace
-                                .update(cx, |this, cx| {
-                                    this.select_project(ProjectFilter::All, window, cx);
-                                    this.close_switcher(cx);
-                                })
-                                .ok();
-                        }
-                    })
-                    .child("All repos"),
-            );
-        }
-
-        for (id, slug, note, actions) in rows {
-            let selected = filter.selected() == Some(&id);
-            let mut row = row_style(
-                div().id(SharedString::from(format!("switcher-{id}"))),
-                selected,
-            )
-            .on_click({
-                let workspace = workspace.clone();
-                let id = id.clone();
-                move |_event, window, cx| {
-                    workspace
-                        .update(cx, |this, cx| {
-                            this.select_project(ProjectFilter::One(id.clone()), window, cx);
-                            this.close_switcher(cx);
-                        })
-                        .ok();
-                }
-            })
-            .child(div().truncate().child(slug));
-            // Only a repo that is subtracting something carries a note; the
-            // ordinary case earns no badge.
-            if let Some(note) = note {
-                row = row.child(div().text_xs().text_color(theme.fg_muted()).child(note));
-            }
-            // The status verbs sit under the repo they act on rather than in a
-            // submenu: there are at most two, and a repo's pipeline stopping is
-            // not a thing to bury.
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.))
-                    .pt(px(2.))
-                    .text_xs()
-                    .children(actions.into_iter().map(|action| {
-                        let workspace = workspace.clone();
-                        let id = id.clone();
-                        div()
-                            .id(SharedString::from(format!(
-                                "switcher-{id}-{}",
-                                action.status.as_str()
-                            )))
-                            .text_color(theme.fg_muted())
-                            .cursor_pointer()
-                            .tooltip(tooltip(action.note))
-                            .hover({
-                                let fg = theme.fg();
-                                move |el| el.text_color(fg)
-                            })
-                            .on_click(move |_event, _window, cx| {
-                                workspace
-                                    .update(cx, |this, cx| {
-                                        this.set_project_status(id.clone(), action.status, cx);
-                                        this.close_switcher(cx);
-                                    })
-                                    .ok();
-                            })
-                            .child(action.label)
-                    })),
-            );
-            list = list.child(row);
-        }
-
-        list.child(
-            div()
-                .mt(px(2.))
-                .pt(px(4.))
-                .border_t_1()
-                .border_color(theme.border_subtle())
-                .child(
-                    row_style(div().id("switcher-add-repo"), false)
-                        .on_click({
-                            let workspace = workspace.clone();
-                            move |_event, _window, cx| {
-                                workspace
-                                    .update(cx, |this, cx| {
-                                        this.close_switcher(cx);
-                                        this.open_repo_window(cx);
-                                    })
-                                    .ok();
-                            }
-                        })
-                        .child("Add repo…"),
-                ),
-        )
-        .into_any_element()
-    }
-
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.app_state.read(cx).mode;
 
-        title_bar()
-            .child_left(
-                Self::title_bar_button("toggle-left-sidebar", Icons::panel_left())
-                    .selected(self.left_sidebar.is_open())
-                    .tooltip(tooltip("Toggle sidebar (⌘B)"))
-                    .on_click(|_event, window, cx| {
-                        window.dispatch_action(Box::new(ToggleLeftDock), cx);
-                    }),
-            )
-            // The repo the working set belongs to, and the control that
-            // changes it.
-            .child_left(self.project_switcher.clone())
-            // The section you are looking at, named once. The sidebar's rows
-            // are icons and `render_center` draws no header, so this is the
-            // only place the word appears.
-            .child_center(div().child(self.section.label()))
-            .child_right(
-                Self::title_bar_button("mode-play", Icons::play())
+        let mut header = pane_header("rail-header").traffic_light_inset();
+        if self.rail_shows_repos {
+            header = header.child(
+                div()
+                    .pl(px(4.))
+                    .text_sm()
+                    .text_color(theme.fg_muted())
+                    .child("Repos"),
+            );
+        } else {
+            header = header
+                .child(
+                    Self::header_button("rail-up", Icons::chevron_left())
+                        .tooltip(tooltip("Repos"))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.rail_shows_repos = true;
+                            cx.notify();
+                        })),
+                )
+                // `owner repo`, two-tone per the design. Text, not a
+                // control — changing it is the chevron's job now.
+                .child(self.render_repo_label(cx));
+        }
+        header
+            .child(div().flex_1())
+            .child(
+                Self::header_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
                     .tooltip(tooltip("Play — work moves on its own"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_mode(Mode::Play, cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("mode-pause", Icons::pause())
+            .child(
+                Self::header_button("mode-pause", Icons::pause())
                     .selected(mode == Some(Mode::Pause))
                     .tooltip(tooltip("Pause — no new work starts"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_mode(Mode::Pause, cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("refresh", Icons::reload())
-                    .tooltip(tooltip("Refresh"))
+            // The rest of the chrome, behind ⋮ — the design gives the rail
+            // exactly three controls' worth of width.
+            .child(self.rail_overflow.clone())
+    }
+
+    /// The header's `owner repo` label: owner muted, repo at full contrast,
+    /// the design's two tones. The rules (nothing before the first snapshot,
+    /// one repo named rather than counted, "All repos" as a scope) live in
+    /// [`projects::repo_label`], where they are tested.
+    fn render_repo_label(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let state = self.app_state.read(cx);
+        let label = crate::projects::repo_label(&state.projects, &self.project_filter);
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(2.))
+            .text_sm();
+        match label {
+            Some(label) => {
+                // A scope ("All repos") reads muted throughout; a name gets
+                // the two tones.
+                let scope = label.owner.is_none();
+                row.children(
+                    label
+                        .owner
+                        .map(|owner| div().text_color(theme.fg_muted()).child(owner)),
+                )
+                .child(
+                    div()
+                        .text_color(if scope { theme.fg_muted() } else { theme.fg() })
+                        .child(label.name),
+                )
+                .into_any_element()
+            }
+            None => row.into_any_element(),
+        }
+    }
+
+    /// The ⋮ trigger.
+    fn render_overflow_trigger(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(26.))
+            .h(px(24.))
+            .rounded(px(5.))
+            .hover({
+                let hover_bg = theme.surface_secondary();
+                move |el| el.bg(hover_bg)
+            })
+            .child(
+                Icons::dots_vertical()
+                    .size(px(14.))
+                    .text_color(theme.fg_muted()),
+            )
+            .into_any_element()
+    }
+
+    /// The ⋮ menu: the chrome that lost its titlebar slot. Rows dispatch
+    /// and close.
+    fn render_overflow_content(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let row = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_sm()
+                .text_color(theme.fg())
+                .hover({
+                    let hover_bg = theme.surface_secondary();
+                    move |el| el.bg(hover_bg)
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .min_w(px(180.))
+            .child(row("overflow-refresh", "Refresh").on_click({
+                let workspace = workspace.clone();
+                move |_event, _window, cx| {
+                    workspace
+                        .update(cx, |this, cx| {
+                            this.close_rail_overflow(cx);
+                            this.app_state.update(cx, |state, cx| state.refresh(cx));
+                        })
+                        .ok();
+                }
+            }))
+            .child(row("overflow-server-status", "Server Status…").on_click({
+                let workspace = workspace.clone();
+                move |_event, window, cx| {
+                    workspace
+                        .update(cx, |this, cx| this.close_rail_overflow(cx))
+                        .ok();
+                    window.dispatch_action(Box::new(menus::ShowServerStatus), cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn close_rail_overflow(&mut self, cx: &mut Context<Self>) {
+        self.rail_overflow.update(cx, |popover, cx| {
+            popover.close(cx);
+        });
+    }
+
+    /// The middle column's header: history, then the selected task's tab
+    /// strip, with the chat toggle at the far edge. Takes over the traffic
+    /// light inset and the way back to the rail when the rail is hidden.
+    fn render_middle_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let rail_hidden = !self.left_sidebar.is_open();
+        let show_tabs = match self.nav.current() {
+            MiddleView::Task(id) => self.app_state.read(cx).task(id).is_some(),
+            MiddleView::AllTasks => false,
+        };
+
+        let mut header = pane_header("middle-header");
+        if rail_hidden {
+            header = header.traffic_light_inset().child(
+                Self::header_button("show-left-sidebar", Icons::panel_left())
+                    .tooltip(tooltip("Show sidebar (⌘B)"))
+                    .on_click(|_event, window, cx| {
+                        window.dispatch_action(Box::new(ToggleLeftDock), cx);
+                    }),
+            );
+        }
+        header = header
+            .child(
+                Self::header_button("history-back", Icons::arrow_left())
+                    .disabled(!self.nav.can_go_back())
+                    .tooltip(tooltip("Back (⌘[)"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.app_state.update(cx, |state, cx| state.refresh(cx));
+                        this.history_back(cx);
                     })),
             )
-            .child_right(
-                Self::title_bar_button("toggle-right-sidebar", Icons::panel_right())
-                    .selected(self.right_sidebar.is_open())
-                    .tooltip(tooltip("Toggle inspector (⌘R)"))
-                    .on_click(|_event, window, cx| {
-                        window.dispatch_action(Box::new(ToggleRightDock), cx);
-                    }),
-            )
-    }
-
-    fn render_left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (text, text_muted, selected_bg, hover_bg, badge_bg) = (
-            theme.fg(),
-            theme.fg_muted(),
-            theme.surface_tertiary(),
-            theme.surface_secondary(),
-            theme.surface_tertiary(),
-        );
-        let active = self.section;
-
-        // Read before the app-state borrow: a run in flight outranks
-        // everything the server could tell us, because it is the reason the
-        // server stopped telling us anything.
-        let running_op = {
-            let control = self.server_control.read(cx);
-            control
-                .run
-                .as_ref()
-                .filter(|run| run.is_running())
-                .map(|run| (run.op, run.started_at))
-        };
-
-        let state = self.app_state.read(cx);
-        // The same predicate the Queue section's rows are built from — the
-        // badge counts what that section shows.
-        let queued_work = state
-            .tasks
-            .iter()
-            .filter(|task| is_picked_up(task.state))
-            .count();
-        // A proactive tick is invisible from every section but Chat, so the
-        // Chat row wears the clock. Same slot the Queue count uses.
-        let tick_elapsed = state
-            .orchestrator_tick
-            .as_ref()
-            .map(|tick| time::elapsed(tick.started_at));
-        // A restart in flight outranks both, and is checked first rather than
-        // last: it takes the app's own event stream down, and reporting that
-        // drop as a transport error would be the app blaming the server for
-        // doing what it was asked. A stale build is usually *why* someone hit
-        // restart, so this has to sit above the build warning too.
-        //
-        // The build warning in turn outranks the error: when this app is
-        // older than the server supports, whatever failed underneath is the
-        // symptom and "your app is old" is the cause.
-        let banner = if let Some((op, started_at)) = running_op {
-            Some((
-                format!("{}… {}", op.label(), time::elapsed(started_at)),
-                false,
-            ))
-        } else if let Some(warning) = &state.build_warning {
-            Some((warning.clone(), true))
-        } else if let Some(error) = &state.error {
-            Some((error.clone(), true))
-        } else if state.loaded && !state.connected {
-            Some(("Reconnecting to the tasks server…".to_string(), false))
+            .child(
+                Self::header_button("history-forward", Icons::arrow_right())
+                    .disabled(!self.nav.can_go_forward())
+                    .tooltip(tooltip("Forward (⌘])"))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.history_forward(cx);
+                    })),
+            );
+        if show_tabs {
+            header = header.child(div().w(px(8.))).child(self.render_tab_bar(cx));
         } else {
-            None
-        };
-
-        sidebar(SidebarSide::Left, self.left_sidebar.width)
-            .on_resize_start({
-                let entity = cx.entity().downgrade();
-                move |_event, _window, cx| {
-                    if let Some(workspace) = entity.upgrade() {
-                        workspace.update(cx, |this, cx| {
-                            this.resizing = Some(SidebarSide::Left);
-                            cx.notify();
-                        });
-                    }
-                }
-            })
-            // The rows are icons: the title bar names the section you are in,
-            // so spelling it again here would be the second of two. What the
-            // word used to do — say which row this is — the tooltip and the
-            // accessible name now do. `role` is not decoration: a node reaches
-            // the a11y tree only with *both* an id and a non-`None` role, so
-            // an `aria_label` on a roleless div is dropped silently.
-            .child(div().flex().flex_col().flex_1().pt(px(8.)).children(
-                Section::ALL.into_iter().map(|section| {
-                    let selected = section == active;
-                    let badge = match section {
-                        Section::Queue if queued_work > 0 => Some(queued_work.to_string()),
-                        Section::Chat => tick_elapsed.clone(),
-                        _ => None,
-                    };
-                    div()
-                        .id(section.nav_id())
-                        .role(gpui::Role::Tab)
-                        .aria_label(section.label())
-                        .aria_keyshortcuts(section.shortcut())
-                        .tooltip(tooltip(format!(
-                            "{} ({})",
-                            section.label(),
-                            section.shortcut()
-                        )))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .mx(px(6.))
-                        .px(px(10.))
-                        .py(px(5.))
-                        .rounded(px(5.))
-                        .cursor_pointer()
-                        .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
-                        .when(selected, |el| el.bg(selected_bg))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.go_to_section(section, window, cx);
-                        }))
-                        .child(
-                            section
-                                .icon()
-                                .flex_none()
-                                .size(px(15.))
-                                .text_color(if selected { text } else { text_muted }),
-                        )
-                        .child(div().flex_1())
-                        .when_some(badge, |el, badge| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .rounded_full()
-                                    .bg(badge_bg)
-                                    .text_xs()
-                                    .text_color(text_muted)
-                                    .child(badge),
-                            )
-                        })
+            header = header.child(
+                div()
+                    .pl(px(8.))
+                    .text_sm()
+                    .text_color(theme.fg_muted())
+                    .child("All Tasks"),
+            );
+        }
+        header.child(div().flex_1()).child(
+            Self::header_button("toggle-right-sidebar", Icons::panel_right())
+                .selected(self.right_sidebar.is_open())
+                .tooltip(tooltip("Toggle chat (⌘R)"))
+                .on_click(|_event, window, cx| {
+                    window.dispatch_action(Box::new(ToggleRightDock), cx);
                 }),
-            ))
-            .child(div().flex_1())
-            .when_some(banner, |el, (message, is_error)| {
-                el.child(
-                    div()
-                        .m(px(6.))
-                        .p(px(8.))
-                        .rounded(px(5.))
-                        .bg(cx.theme().surface_secondary())
-                        .text_xs()
-                        .text_color(if is_error {
-                            gpui::hsla(30. / 360., 0.9, 0.6, 1.)
-                        } else {
-                            cx.theme().fg_muted()
-                        })
-                        .child(message),
-                )
-            })
+        )
     }
 
+    /// The right pane is the orchestrator chat — always on screen (⌘R hides
+    /// it), per the v3 design. The inspector it used to hold moved into the
+    /// middle column's tabs.
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let inspector = self.render_inspector(cx);
+        let chat = self.render_chat(cx).into_any_element();
         sidebar(SidebarSide::Right, self.right_sidebar.width)
             .on_resize_start({
                 let entity = cx.entity().downgrade();
@@ -1573,7 +1425,81 @@ impl Workspace {
                     }
                 }
             })
-            .child(inspector)
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(chat)
+                    // Floated last so it paints above the conversation.
+                    .child(self.render_chat_chip(cx)),
+            )
+    }
+
+    /// The chip at the chat's top-right, per the design: the mic (voice mode
+    /// with the orchestrator, later — shipped disabled so the slot exists),
+    /// a divider, and the signed-in human's avatar, which opens their GitHub
+    /// profile until device-flow login gives it more to do.
+    fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let mic = std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            MIC_SVG.to_vec(),
+        ));
+
+        let avatar: gpui::AnyElement = match self.avatar.clone() {
+            Some(image) => gpui::img(image)
+                .size(px(22.))
+                .rounded_full()
+                .into_any_element(),
+            // Offline, or not landed yet: a quiet placeholder, same
+            // footprint, still a working link.
+            None => div()
+                .size(px(22.))
+                .rounded_full()
+                .bg(theme.surface_tertiary())
+                .into_any_element(),
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(10.))
+            .pr(px(8.))
+            .py(px(5.))
+            .rounded_bl(px(14.))
+            .bg(theme.surface_secondary())
+            .child(
+                div()
+                    .id("voice-mode")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.))
+                    .opacity(0.45)
+                    .cursor_not_allowed()
+                    .tooltip(tooltip("Voice mode — coming soon"))
+                    .child(gpui::img(mic).size(px(15.))),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_secondary()))
+            .child(
+                div()
+                    .id("github-profile")
+                    .flex_none()
+                    .cursor_pointer()
+                    .tooltip(tooltip("iamnbutler on GitHub"))
+                    .on_click(|_event, _window, cx| {
+                        cx.open_url(GITHUB_PROFILE_URL);
+                    })
+                    .child(avatar),
+            )
     }
 
     /// One chat row. Durable turns and the live tick's trail entries share
@@ -2121,6 +2047,318 @@ impl Workspace {
             )
     }
 
+    // --- the Agent Feed ---
+
+    /// The run whose transcript the feed should show, given what is on
+    /// screen: the picker's choice while it still belongs to the task,
+    /// else the live run, else the newest scout. `None` closes the tail.
+    fn desired_feed(&self, cx: &App) -> Option<TranscriptOwner> {
+        let MiddleView::Task(task_id) = self.nav.current() else {
+            return None;
+        };
+        if self.task_tab != TaskTab::AgentFeed {
+            return None;
+        }
+        let state = self.app_state.read(cx);
+        let runs = Self::task_runs(state, task_id);
+        if let Some(choice) = &self.feed_choice {
+            if runs.iter().any(|run| &run.owner == choice) {
+                return Some(choice.clone());
+            }
+        }
+        runs.first().map(|run| run.owner.clone())
+    }
+
+    /// The task's runs, newest-worthy first: the live one leads (scout or
+    /// the serial build working this task), then concluded scouts newest
+    /// first.
+    ///
+    /// Historical *builds* are absent deliberately: the wire model carries
+    /// no build→task mapping (a build is a batch of specs), so the only
+    /// build this can honestly attribute is the running one while this task
+    /// is `Building`. A `spec_ids` field on `Build` is the follow-up that
+    /// unlocks the rest.
+    fn task_runs(state: &AppState, task_id: &TaskId) -> Vec<FeedRun> {
+        let mut runs: Vec<FeedRun> = Vec::new();
+        if let Some(task) = state.task(task_id) {
+            if task.state == TaskState::Building {
+                if let Some(build) = state
+                    .builds
+                    .iter()
+                    .find(|build| build.status == BuildStatus::Running)
+                {
+                    runs.push(FeedRun {
+                        owner: TranscriptOwner::build(&build.id),
+                        label: "Build".to_string(),
+                        live: true,
+                    });
+                }
+            }
+        }
+        let mut sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|session| &session.task_id == task_id)
+            .collect();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at));
+        for session in sessions {
+            let live = session.status == SessionStatus::Running;
+            runs.push(FeedRun {
+                owner: TranscriptOwner::session(&session.id),
+                label: format!("Scout · {}", time::relative(session.started_at)),
+                live,
+            });
+        }
+        // Live first, stable within: a running scout outranks history.
+        runs.sort_by_key(|run| !run.live);
+        runs
+    }
+
+    /// Keep the transcript tail and the feed list in line with the screen,
+    /// once per frame — the feed's `sync_chat_list`.
+    fn sync_agent_feed(&mut self, cx: &mut Context<Self>) {
+        let desired = self.desired_feed(cx);
+        self.app_state.update(cx, |state, cx| match &desired {
+            Some(owner) => state.open_transcript(owner.clone(), cx),
+            None => state.close_transcript(),
+        });
+
+        let (rows, lines_len) = {
+            let state = self.app_state.read(cx);
+            match &state.transcript_feed {
+                // Refolded per frame; frames only happen on notify, and a
+                // run's capture is capped at 8 MiB. Incremental folding is
+                // the optimization this signature leaves room for.
+                Some(feed) => (feed::feed_rows(&feed.lines), feed.lines.len()),
+                None => (Vec::new(), 0),
+            }
+        };
+        let keys: Vec<FeedKey> = rows.iter().map(|row| row.key()).collect();
+
+        let prefix = self
+            .feed_keys
+            .iter()
+            .zip(keys.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if prefix < self.feed_keys.len() || prefix < keys.len() {
+            self.feed_list
+                .splice(prefix..self.feed_keys.len(), keys.len() - prefix);
+            // Evict parses of text rows that went away (a feed switch drops
+            // the whole run's worth at once).
+            let mut markdown = self.markdown.borrow_mut();
+            for (seq, kind) in &self.feed_keys[prefix..] {
+                if *kind == 0 {
+                    markdown.remove(format!("feed:{seq}"));
+                }
+            }
+        } else if lines_len != self.feed_lines_seen && !keys.is_empty() {
+            // No structural change but lines arrived: the tail row grew (a
+            // tool group coalescing) — re-measure it in place.
+            let last = keys.len() - 1;
+            self.feed_list.remeasure_items(last..last + 1);
+        }
+        self.feed_keys = keys;
+        self.feed_rows = rows;
+        self.feed_lines_seen = lines_len;
+    }
+
+    /// The Agent Feed tab: the run picker, then the transcript.
+    fn render_agent_feed(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let MiddleView::Task(task_id) = self.nav.current().clone() else {
+            return div().into_any_element();
+        };
+        let (runs, reconnecting, open_owner) = {
+            let state = self.app_state.read(cx);
+            (
+                Self::task_runs(state, &task_id),
+                state
+                    .transcript_feed
+                    .as_ref()
+                    .is_some_and(|feed| feed.reconnecting),
+                state
+                    .transcript_feed
+                    .as_ref()
+                    .map(|feed| feed.owner.clone()),
+            )
+        };
+
+        if runs.is_empty() {
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .p(px(16.))
+                .child(div().text_sm().text_color(theme.fg()).child("No runs yet"))
+                .child(
+                    div()
+                        .max_w(px(420.))
+                        .text_center()
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(
+                            "The feed shows the Claude Code stream from this task's VM \
+                             once a Scout or Builder picks it up.",
+                        ),
+                )
+                .into_any_element();
+        }
+
+        // The picker: one chip per run, the open one lit. Only drawn when
+        // there is a choice to make.
+        let picker = (runs.len() > 1).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .px(px(12.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme.border_subtle())
+                .children(runs.iter().map(|run| {
+                    let active = open_owner.as_ref() == Some(&run.owner);
+                    let owner = run.owner.clone();
+                    let label = if run.live {
+                        format!("{} · live", run.label)
+                    } else {
+                        run.label.clone()
+                    };
+                    div()
+                        .id(SharedString::from(format!("feed-run-{}", run.owner.id())))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .text_xs()
+                        .cursor_pointer()
+                        .map(|el| {
+                            if active {
+                                el.bg(theme.surface_secondary()).text_color(theme.fg())
+                            } else {
+                                el.text_color(theme.fg_muted())
+                            }
+                        })
+                        .when(run.live, |el| el.text_color(theme.accent()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.feed_choice = Some(owner.clone());
+                            cx.notify();
+                        }))
+                        .child(label)
+                }))
+        });
+
+        let feed = list(
+            self.feed_list.clone(),
+            cx.processor(move |this, ix: usize, _window, cx| this.render_feed_row(ix, cx)),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .children(picker)
+            .when(reconnecting, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(12.))
+                        .py(px(2.))
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child("reconnecting to the stream…"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .child(feed.size_full().py(px(8.))),
+            )
+            .into_any_element()
+    }
+
+    /// One feed row. Text is the agent speaking (markdown); tool groups and
+    /// notices are quiet one-liners; raw lines are what they are.
+    fn render_feed_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(row) = self.feed_rows.get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let padded = |body: gpui::AnyElement| {
+            div()
+                .w_full()
+                .px(px(12.))
+                .py(px(3.))
+                .child(div().max_w(px(900.)).w_full().child(body))
+        };
+        match row.kind {
+            FeedRowKind::Text(text) => {
+                let entity =
+                    self.markdown
+                        .borrow_mut()
+                        .entity(format!("feed:{}", row.seq), &text, cx);
+                padded(
+                    div()
+                        .text_sm()
+                        .text_color(theme.fg())
+                        .child(markdown_block(&entity, cx))
+                        .into_any_element(),
+                )
+                .into_any_element()
+            }
+            FeedRowKind::Tools(labels) => {
+                let summary = match labels.len() {
+                    1 => labels[0].clone(),
+                    n => format!(
+                        "{n} tool calls · {}",
+                        labels.last().cloned().unwrap_or_default()
+                    ),
+                };
+                padded(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(6.))
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(div().flex_none().w(px(10.)).child("·"))
+                        .child(div().flex_1().overflow_hidden().truncate().child(summary))
+                        .into_any_element(),
+                )
+                .into_any_element()
+            }
+            FeedRowKind::Notice(text) => padded(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(div().flex_none().child("●").opacity(0.5))
+                    .child(div().flex_1().child(text))
+                    .into_any_element(),
+            )
+            .into_any_element(),
+            FeedRowKind::Raw(text) => padded(
+                div()
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(text)
+                    .into_any_element(),
+            )
+            .into_any_element(),
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let loaded = self.app_state.read(cx).loaded;
@@ -2131,7 +2369,16 @@ impl Workspace {
             .flex_grow(1.)
             .h_full()
             .overflow_hidden()
-            .bg(theme.bg());
+            .bg(theme.bg())
+            // The pane's own top row — history, tabs, the chat toggle — and
+            // the drag region this side of the window keeps.
+            .child(
+                div()
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(theme.border_subtle())
+                    .child(self.render_middle_header(cx)),
+            );
 
         if !loaded {
             return pane.child(
@@ -2143,22 +2390,80 @@ impl Workspace {
             );
         }
 
-        // No header row. Chat always worked this way — "the sidebar already
-        // names it" — and now the title bar names every section, so a header
-        // here would be the second rendering of a word that should appear
-        // once. (If the name belongs back in the pane, this block and the
-        // `child_center` in `render_title_bar` are the pair to revert.)
-        //
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
         // never `size_full`: 100% of the pane plus anything above it
-        // overflows the clip and cuts off the bottom (chat's composer).
-        let body = match self.section {
-            Section::Tasks => self.render_tasks(cx).into_any_element(),
-            Section::Queue => self.render_queue(cx).into_any_element(),
-            Section::Activity => self.render_activity(cx).into_any_element(),
-            Section::Chat => self.render_chat(cx).into_any_element(),
+        // overflows the clip and cuts off the bottom.
+        let body = match self.nav.current().clone() {
+            MiddleView::AllTasks => self.render_tasks(cx).into_any_element(),
+            MiddleView::Task(id) => self.render_task_pane(&id, cx),
         };
         pane.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body))
+    }
+
+    /// A selected task's active tab body. The strip itself lives in the
+    /// middle header.
+    fn render_task_pane(&self, id: &TaskId, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        // A task can leave the working set while history still points at it —
+        // a retired row is an honest sentence, not a stale render.
+        if self.app_state.read(cx).task(id).is_none() {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(16.))
+                .text_sm()
+                .text_color(theme.fg_muted())
+                .child("That task is no longer in the working set.")
+                .into_any_element();
+        }
+
+        match self.task_tab {
+            TaskTab::Overview => self.render_overview(cx),
+            TaskTab::Brief => self.render_brief(cx),
+            TaskTab::AgentFeed => self.render_agent_feed(cx),
+            TaskTab::Changes => self.render_changes(cx),
+        }
+    }
+
+    /// The tab strip, hand-rolled: text labels, the active one lifted on a
+    /// surface chip the way the design draws it, inactive ones muted and
+    /// warm on hover. Stateless over [`Self::task_tab`] — the strip is a
+    /// projection, not an entity.
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .children(TaskTab::ALL.into_iter().map(|tab| {
+                let active = tab == self.task_tab;
+                div()
+                    .id(tab.id())
+                    .px(px(10.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .text_sm()
+                    .map(|el| {
+                        if active {
+                            el.bg(theme.surface_secondary()).text_color(theme.fg())
+                        } else {
+                            el.text_color(theme.fg_muted())
+                        }
+                    })
+                    .cursor_pointer()
+                    .when(!active, |el| {
+                        let fg = theme.fg();
+                        el.hover(move |el| el.text_color(fg))
+                    })
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.task_tab = tab;
+                        cx.notify();
+                    }))
+                    .child(tab.label())
+            }))
     }
 }
 
@@ -2174,6 +2479,7 @@ impl Render for Workspace {
         self.right_sidebar.set_width(right_width, viewport_width);
 
         self.sync_chat_list(cx);
+        self.sync_agent_feed(cx);
         self.sync_palette(cx);
         // Before anything paints: one window can hold several markdown
         // documents and gpuikit can only clear a selection in one it drew this
@@ -2282,7 +2588,9 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                if this.selected_task.is_some() || this.right_sidebar.is_open() {
+                // Selection only — escape must not take the chat pane away;
+                // that pane is ⌘R's business.
+                if this.selected_task.is_some() {
                     this.clear_selection(window, cx);
                 }
             }))
@@ -2296,17 +2604,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ApproveSelectedSpec, window, cx| {
                 this.run_on_selection(RowAction::ApproveSpec, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToTasks, window, cx| {
-                this.go_to_section(Section::Tasks, window, cx);
+            .on_action(cx.listener(|this, _: &HistoryBack, _window, cx| {
+                this.history_back(cx);
             }))
-            .on_action(cx.listener(|this, _: &GoToQueue, window, cx| {
-                this.go_to_section(Section::Queue, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToActivity, window, cx| {
-                this.go_to_section(Section::Activity, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoToChat, window, cx| {
-                this.go_to_section(Section::Chat, window, cx);
+            .on_action(cx.listener(|this, _: &HistoryForward, _window, cx| {
+                this.history_forward(cx);
             }))
             // A view filter over this window's Tasks list, so it is the
             // workspace's to handle and greys out with no workspace focused.
@@ -2360,7 +2662,6 @@ impl Render for Workspace {
             .capture_any_mouse_down(cx.listener(|this, _event, _window, _cx| {
                 this.row_menu_open = false;
             }))
-            .child(self.render_title_bar(cx))
             .child(
                 div()
                     .flex()
@@ -2387,42 +2688,5 @@ impl Render for Workspace {
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The rule #902 is about, in both directions and over every section:
-    /// focus may only ever name an element the section being switched to
-    /// actually draws. Chat is the one section with a composer, so arriving
-    /// there lands in it — and leaving takes focus back, because
-    /// `window.focus` on a handle that is absent from the frame does not fail
-    /// or warn, it behaves exactly like no focus at all and takes the whole
-    /// key context down with it.
-    #[test]
-    fn only_chat_focuses_a_composer() {
-        for section in Section::ALL {
-            let expected = match section {
-                Section::Chat => FocusTarget::ChatComposer,
-                _ => FocusTarget::Workspace,
-            };
-            assert_eq!(
-                section.focus_target(),
-                expected,
-                "{} focuses the wrong element",
-                section.label()
-            );
-        }
-    }
-
-    /// The section a window opens on, spelled out on its own: the startup
-    /// frame draws no composer, so the only handle that can hold focus at rest
-    /// is the root's. Focusing the chat composer here — which is what `new`
-    /// used to do — is the whole of #902.
-    #[test]
-    fn the_section_a_window_opens_on_focuses_the_root() {
-        assert_eq!(Section::DEFAULT.focus_target(), FocusTarget::Workspace);
     }
 }

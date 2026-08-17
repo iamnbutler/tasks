@@ -45,8 +45,7 @@ use tasks_client::api::models::{BuildStatus, TaskId};
 
 use crate::commands::{Command, Facts, Selection, COMMANDS};
 use crate::components::{text_field, title_case};
-use crate::state::is_picked_up;
-use crate::workspace::{Section, Workspace};
+use crate::workspace::Workspace;
 
 actions!(
     palette,
@@ -454,42 +453,15 @@ impl Workspace {
         self.close_palette(window, cx);
         match row.target {
             PaletteTarget::Command(command) => window.dispatch_action((command.action)(), cx),
-            PaletteTarget::Task(id) => self.go_to_task(id, false, window, cx),
-            PaletteTarget::Spec(id) => self.go_to_task(id, true, window, cx),
+            // Selecting *is* navigating since the frame swap: the middle
+            // column shows the task's tabs, spec included, wherever it sits
+            // in the pipeline.
+            PaletteTarget::Task(id) | PaletteTarget::Spec(id) => self.select_task(id, cx),
             PaletteTarget::Build(url) => match url {
                 Some(url) => cx.open_url(&url),
                 None => self.report("that build has no pull request yet", cx),
             },
         }
-    }
-
-    /// Select a task and go to the section it belongs in: Queue once work has
-    /// been picked up, Tasks otherwise. `inspect` forces the inspector open,
-    /// which is what a *spec* row was asking for.
-    fn go_to_task(
-        &mut self,
-        id: TaskId,
-        inspect: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let picked_up = self
-            .app_state
-            .read(cx)
-            .task(&id)
-            .is_some_and(|task| is_picked_up(task.state));
-        self.select_task(id, cx);
-        if inspect {
-            self.right_sidebar.force_open();
-        }
-        self.go_to_section(
-            match picked_up {
-                true => Section::Queue,
-                false => Section::Tasks,
-            },
-            window,
-            cx,
-        );
     }
 
     /// Track the query field, once per frame. Called from `Render::render`

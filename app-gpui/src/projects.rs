@@ -43,24 +43,35 @@ impl ProjectFilter {
     }
 }
 
-/// What the title bar says the window is looking at.
-///
+/// What the rail header says the window is looking at, in the design's two
+/// tones: an owner (muted) when the label names one repo, and the name at
+/// full contrast. "All repos" carries no owner — it is a scope, not a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLabel {
+    pub owner: Option<String>,
+    pub name: String,
+}
+
 /// `None` before the first snapshot — a placeholder would be a claim about a
-/// repo we have not read. With exactly one project configured it is that repo's
-/// slug whatever the filter says, which is what keeps a single-repo window
-/// reading exactly as it did before multi-repo.
-pub fn switcher_label(projects: &[Project], filter: &ProjectFilter) -> Option<String> {
+/// repo we have not read. With exactly one project configured it is that repo
+/// whatever the filter says, which is what keeps a single-repo window reading
+/// exactly as it did before multi-repo.
+pub fn repo_label(projects: &[Project], filter: &ProjectFilter) -> Option<RepoLabel> {
     if projects.is_empty() {
         return None;
     }
+    let named = |project: &Project| RepoLabel {
+        owner: Some(project.repo_owner.clone()),
+        name: project.repo_name.clone(),
+    };
     match filter.selected() {
-        Some(id) => projects
-            .iter()
-            .find(|project| &project.id == id)
-            .map(Project::slug),
+        Some(id) => projects.iter().find(|project| &project.id == id).map(named),
         // One repo is not a choice, so it is named rather than counted.
-        None if projects.len() == 1 => Some(projects[0].slug()),
-        None => Some("All repos".to_string()),
+        None if projects.len() == 1 => Some(named(&projects[0])),
+        None => Some(RepoLabel {
+            owner: None,
+            name: "All repos".to_string(),
+        }),
     }
 }
 
@@ -210,6 +221,27 @@ impl IssueTarget {
     }
 }
 
+/// The message a task-drafting surface hands the orchestrator, with the repo
+/// pinned. One builder for every door into this flow (the ⌘N window, the
+/// rail composer), so they cannot drift into asking the agent two different
+/// things — the orchestrator owns titling and filing, the surface owns the
+/// repo. `None` when the target cannot be filed into; the caller refuses
+/// before anything is sent.
+pub fn issue_prompt(target: &IssueTarget, draft: &str) -> Option<String> {
+    let IssueTarget::Repo { id, slug } = target else {
+        return None;
+    };
+    Some(format!(
+        "Create a new GitHub issue from the draft below, in {slug}. Pass \
+         \"project_id\": \"{id}\" to POST /issues — that is the repository \
+         chosen in the app, not one to re-derive. Write a clear, specific \
+         title, and expand the body with any relevant context you have \
+         (related tasks, recent activity, code areas). File it and reply \
+         with the issue number and link.\n\n\
+         Draft:\n{draft}"
+    ))
+}
+
 /// Resolve the composer's target from the projects and this window's filter.
 ///
 /// The unfiltered single-repo case resolves rather than refusing, and matches
@@ -283,34 +315,43 @@ mod tests {
     /// claim about a repo we have not read.
     #[test]
     fn the_label_says_nothing_before_the_first_snapshot() {
-        assert_eq!(switcher_label(&[], &ProjectFilter::All), None);
+        assert_eq!(repo_label(&[], &ProjectFilter::All), None);
     }
 
-    /// One repo is not a choice — the title bar reads exactly as it did before
-    /// there was a switcher.
+    /// One repo is not a choice — the rail header reads exactly as it did
+    /// before there was a repo level.
     #[test]
     fn one_repo_is_named_rather_than_counted() {
         let projects = [project("tasks", ProjectStatus::Active)];
         assert_eq!(
-            switcher_label(&projects, &ProjectFilter::All).as_deref(),
-            Some("iamnbutler/tasks")
+            repo_label(&projects, &ProjectFilter::All),
+            Some(RepoLabel {
+                owner: Some("iamnbutler".to_string()),
+                name: "tasks".to_string()
+            })
         );
     }
 
     #[test]
-    fn several_repos_unfiltered_read_as_all_repos() {
+    fn several_repos_unfiltered_read_as_all_repos_scope_not_name() {
         let projects = [
             project("tasks", ProjectStatus::Active),
             project("gpuikit", ProjectStatus::Active),
         ];
         assert_eq!(
-            switcher_label(&projects, &ProjectFilter::All).as_deref(),
-            Some("All repos")
+            repo_label(&projects, &ProjectFilter::All),
+            Some(RepoLabel {
+                owner: None,
+                name: "All repos".to_string()
+            })
         );
         let filter = ProjectFilter::One(projects[1].id.clone());
         assert_eq!(
-            switcher_label(&projects, &filter).as_deref(),
-            Some("iamnbutler/gpuikit")
+            repo_label(&projects, &filter),
+            Some(RepoLabel {
+                owner: Some("iamnbutler".to_string()),
+                name: "gpuikit".to_string()
+            })
         );
     }
 

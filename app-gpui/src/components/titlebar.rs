@@ -1,63 +1,61 @@
-//! The window title bar.
+//! Per-pane window chrome.
 //!
-//! Follows Zed's `PlatformTitleBar` (crates/platform_title_bar): the whole
-//! bar is a `WindowControlArea::Drag` region, double-click zooms via
-//! `window.titlebar_double_click()`, and content is inset past the macOS
-//! traffic lights unless the window is fullscreen. Measurements come from
-//! the design spec: 28px fixed height, 1px bottom border.
+//! The v3 design has no full-width title bar: the left rail's header holds
+//! the traffic lights, project switcher and pipeline controls, and the
+//! middle column's header holds history and the tab strip. What survives
+//! from the old bar is the *mechanics*, shared by every pane header —
+//! following Zed's `PlatformTitleBar`: the row is a
+//! `WindowControlArea::Drag` region, double-click zooms via
+//! `window.titlebar_double_click()`, and whichever header sits leftmost in
+//! the window asks for `.traffic_light_inset()` to clear the macOS lights
+//! (dropped automatically in fullscreen, where the lights hide).
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, App, Pixels, Window, WindowControlArea};
-use gpuikit::theme::{ActiveTheme, Themeable};
+use gpui::{div, px, AnyElement, App, ElementId, Pixels, Window, WindowControlArea};
 use smallvec::SmallVec;
 
-pub const TITLE_BAR_HEIGHT: Pixels = px(28.);
+pub const PANE_HEADER_HEIGHT: Pixels = px(28.);
 
 /// Left inset that clears the macOS traffic lights. Per the design spec:
 /// 8px inset + 52px light group + 8px gap before content.
 pub const TRAFFIC_LIGHT_PADDING: Pixels = px(68.);
 
 #[derive(IntoElement)]
-pub struct TitleBar {
-    left_children: SmallVec<[AnyElement; 4]>,
-    center_children: SmallVec<[AnyElement; 2]>,
-    right_children: SmallVec<[AnyElement; 4]>,
+pub struct PaneHeader {
+    id: ElementId,
+    inset: bool,
+    children: SmallVec<[AnyElement; 6]>,
 }
 
-pub fn title_bar() -> TitleBar {
-    TitleBar {
-        left_children: SmallVec::new(),
-        center_children: SmallVec::new(),
-        right_children: SmallVec::new(),
+/// A pane's top row: fixed-height, a window-drag region, double-click to
+/// zoom. Content is the caller's; so is any background or border, since the
+/// header should read as part of its pane, not as a bar laid over it.
+pub fn pane_header(id: impl Into<ElementId>) -> PaneHeader {
+    PaneHeader {
+        id: id.into(),
+        inset: false,
+        children: SmallVec::new(),
     }
 }
 
-impl TitleBar {
-    /// Content placed just right of the traffic lights.
-    pub fn child_left(mut self, child: impl IntoElement) -> Self {
-        self.left_children.push(child.into_any_element());
+impl PaneHeader {
+    /// Clear the macOS traffic lights. For whichever header is leftmost —
+    /// the rail's normally, the middle column's when the rail is hidden.
+    pub fn traffic_light_inset(mut self) -> Self {
+        self.inset = true;
         self
     }
 
-    /// Content centered in the bar.
-    pub fn child_center(mut self, child: impl IntoElement) -> Self {
-        self.center_children.push(child.into_any_element());
-        self
-    }
-
-    /// Content aligned to the right edge.
-    pub fn child_right(mut self, child: impl IntoElement) -> Self {
-        self.right_children.push(child.into_any_element());
+    pub fn child(mut self, child: impl IntoElement) -> Self {
+        self.children.push(child.into_any_element());
         self
     }
 }
 
-impl RenderOnce for TitleBar {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme().clone();
-
+impl RenderOnce for PaneHeader {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         div()
-            .id("title-bar")
+            .id(self.id)
             .window_control_area(WindowControlArea::Drag)
             .on_click(|event, window, _cx| {
                 if event.click_count() == 2 {
@@ -67,44 +65,17 @@ impl RenderOnce for TitleBar {
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
             .w_full()
-            .h(TITLE_BAR_HEIGHT)
+            .h(PANE_HEADER_HEIGHT)
             .flex_none()
-            .bg(theme.surface())
-            .border_b_1()
-            .border_color(theme.border_subtle())
             .map(|this| {
-                if window.is_fullscreen() {
-                    this.pl_2()
-                } else {
+                if self.inset && !window.is_fullscreen() {
                     this.pl(TRAFFIC_LIGHT_PADDING)
+                } else {
+                    this.pl(px(8.))
                 }
             })
             .pr(px(8.))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .children(self.left_children),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.fg_muted())
-                    .children(self.center_children),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .children(self.right_children),
-            )
+            .children(self.children)
     }
 }

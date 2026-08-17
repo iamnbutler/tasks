@@ -83,6 +83,11 @@ impl SidebarState {
     /// Content asking to be seen. Honoured unless the user has dismissed the
     /// panel, in which case it stays out of the way and the panel's contents
     /// change underneath it.
+    ///
+    /// Unused since the v3 frame swap retired the inspector (its callers) —
+    /// kept because it is half of the dismissal model this type exists for,
+    /// and the chat pane will want it the first time content asks to be seen.
+    #[allow(dead_code)]
     pub fn reveal(&mut self) {
         if !self.dismissed {
             self.open = true;
@@ -91,6 +96,9 @@ impl SidebarState {
 
     /// Close the panel because its content went away. Not a statement about
     /// the panel, so it records nothing: the next `reveal` opens it again.
+    ///
+    /// Unused since the v3 frame swap, kept with [`Self::reveal`] as a pair.
+    #[allow(dead_code)]
     pub fn hide(&mut self) {
         self.open = false;
     }

@@ -49,7 +49,7 @@ use crate::menus::{
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
 use crate::workspace::{
-    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToQueue, GoToTasks, NewIssue,
+    AddRepo, ApproveSelectedSpec, Dismiss, HistoryBack, HistoryForward, NewIssue,
     QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock,
     ToggleRightDock, ToggleShowDone,
 };
@@ -305,21 +305,13 @@ pub const COMMANDS: &[Command] = &[
     Command::new("close-window", "Close Window", || Box::new(CloseWindow))
         .key("cmd-w")
         .separated(Slot::File),
-    // --- View: section navigation, in sidebar order ---
-    Command::new("go-to-tasks", "Tasks", || Box::new(GoToTasks))
-        .key("cmd-1")
+    // --- View: middle-column history, browser-style ---
+    Command::new("history-back", "Back", || Box::new(HistoryBack))
+        .key("cmd-[")
         .on_workspace()
         .menu(Slot::View),
-    Command::new("go-to-queue", "Queue", || Box::new(GoToQueue))
-        .key("cmd-2")
-        .on_workspace()
-        .menu(Slot::View),
-    Command::new("go-to-activity", "Activity", || Box::new(GoToActivity))
-        .key("cmd-3")
-        .on_workspace()
-        .menu(Slot::View),
-    Command::new("go-to-chat", "Chat", || Box::new(GoToChat))
-        .key("cmd-5")
+    Command::new("history-forward", "Forward", || Box::new(HistoryForward))
+        .key("cmd-]")
         .on_workspace()
         .menu(Slot::View),
     // The two palettes. In the bar because a surface reachable only by
@@ -619,14 +611,14 @@ mod tests {
         }
     }
 
-    /// The pipeline, the docks, the sections and the selection verbs all act
-    /// on *this window's* state, so they are element-handled and grey out with
-    /// no workspace focused. Minimize/Zoom/Hide/Quit are not a window's
+    /// The pipeline, the docks, the history steps and the selection verbs all
+    /// act on *this window's* state, so they are element-handled and grey out
+    /// with no workspace focused. Minimize/Zoom/Hide/Quit are not a window's
     /// business at all.
     #[test]
     fn what_acts_on_the_workspace_is_handled_by_the_workspace() {
         for id in [
-            "go-to-tasks",
+            "history-back",
             "toggle-left-dock",
             "toggle-right-dock",
             "queue-selected",
@@ -818,8 +810,8 @@ mod tests {
             "Server: Stop Server…"
         );
         assert_eq!(
-            command("go-to-queue").unwrap().palette_label(facts()),
-            "View: Queue"
+            command("history-back").unwrap().palette_label(facts()),
+            "View: Back"
         );
         // …and it renames itself there too, for the same reason it does in
         // the bar.

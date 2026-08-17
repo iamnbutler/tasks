@@ -101,20 +101,13 @@ impl IssueComposer {
         }
         // The refusal the server would make, made before the message is sent
         // rather than after: an ambiguous target reaching the orchestrator is
-        // exactly the guess this window exists to stop asking for.
-        let IssueTarget::Repo { id, slug } = self.target(cx) else {
+        // exactly the guess this window exists to stop asking for. The
+        // message itself is shared with the rail composer — one flow, two
+        // doors.
+        let Some(message) = projects::issue_prompt(&self.target(cx), &draft) else {
             return;
         };
         self.input.update(cx, |input, cx| input.set_content("", cx));
-        let message = format!(
-            "Create a new GitHub issue from the draft below, in {slug}. Pass \
-             \"project_id\": \"{id}\" to POST /issues — that is the repository \
-             chosen in the app, not one to re-derive. Write a clear, specific \
-             title, and expand the body with any relevant context you have \
-             (related tasks, recent activity, code areas). File it and reply \
-             with the issue number and link.\n\n\
-             Draft:\n{draft}"
-        );
         // Route through the workspace so the main window jumps to Chat —
         // that's where the orchestrator's reply lands once this closes.
         if self
