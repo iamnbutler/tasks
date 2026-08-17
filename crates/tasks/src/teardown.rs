@@ -17,8 +17,11 @@
 //!   the whole queue. Deliberate trade.
 //! - **Freeing the VM is vm-pool's job either way.** Walking away leaves
 //!   exactly the state the pool already handles when the server is killed
-//!   mid-call: its health loop reaps VMs the server stops tracking. Nothing
-//!   here needs to retry.
+//!   mid-call: the VM's event stream ends when it dies, and the pool frees its
+//!   slot at that moment — and a whole daemon's worth is stopped by the next
+//!   daemon on its socket, off the ledger this one wrote. Nothing here needs
+//!   to retry. (This used to claim the pool reaped VMs "the server stops
+//!   tracking", which was never a thing the pool could see.)
 
 use std::time::Duration;
 
@@ -71,7 +74,7 @@ pub(crate) async fn deallocate_bounded(
             // the time went.
             let message = format!(
                 "gave up waiting {secs}s for vm-pool to deallocate {vm_id} \
-                 ({owner}); the pool's health loop will reap it"
+                 ({owner}); the pool frees its slot when that VM's event stream ends"
             );
             if let Err(e) = store
                 .append_event(EventPayload::Note {

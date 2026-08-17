@@ -421,6 +421,10 @@ async fn vm_pool(args: &[String]) -> Result<()> {
     let config = ServiceConfig {
         socket_path,
         snapshot_dir: data_dir.join("snapshots"),
+        // The data dir, deliberately not `/tmp`: this is where the VM ledger
+        // lives, and a host that clears `/tmp` on reboot would clear exactly
+        // the record needed after a daemon restart.
+        state_dir: data_dir,
         pool: PoolConfig {
             max_vms,
             ..PoolConfig::default()

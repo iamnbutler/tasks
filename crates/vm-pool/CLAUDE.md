@@ -88,9 +88,16 @@ allocated and does not reconcile against; it costs host memory, not a slot.
 
 **Leave slack.** Allocation at the ceiling is refused, not queued, and a caller
 that reads `pool exhausted` as "this work failed" charges it to the work. A VM
-whose owner died between allocate and deallocate holds its slot until the sweep
-reclaims it, so a pool sized exactly to its steady state is one leak away from
-refusing everything.
+whose owner died between allocate and deallocate holds its slot until that VM's
+own event stream ends — which for an agent VM whose owner died early can be
+most of an hour — so a pool sized exactly to its steady state spends that
+window refusing everything.
+
+`ServiceConfig::state_dir` is where this daemon's own durable state lives —
+today just the VM ledger, one file per socket path. Point it somewhere that
+survives a reboot: a host that clears `/tmp` would clear exactly the record
+needed after a daemon restart. The embedder sets it (`tasks` uses its data
+dir); `Default` derives it the same way `snapshot_dir` is derived.
 
 Three rules the implementation follows, each of which has a way of being
 undone by a later "cleanup":
@@ -166,6 +173,54 @@ whitespace read as unset, which is a different thing from wrong.
   loop, so a daemon wedged *above* its accept still refuses the second start —
   that is the intent, and why the error message leads with "stop the running
   daemon first".
+- **There are two leaks, and they need two mechanisms.** A **slot leak** is a
+  VM that died while this pool still counted it; a **orphan leak** is a VM
+  whose whole daemon went away, since `container run` outlives the process that
+  spawned it. Neither the health loop nor an embedder's own sweep catches
+  either: the health loop only ages VMs out at `vm_timeout` (two hours) and
+  knows nothing about what any client tracks, and an embedder's sweep asks a
+  *store* question about its own concluded work. The slot leak is fixed
+  event-driven, at the instant of death, from a signal `forward_vm_events`
+  already had and was spending on a `debug!` line — the end of a VM's event
+  stream. The orphan leak is fixed by the *next* daemon on that socket, from
+  `VmLedger`: a write-ahead record, keyed by socket path, of the ids this pool
+  started. Both survive being described as "the sweep", which is why the docs
+  that said so were wrong in a way nobody could act on.
+- **The ledger is discharged strictly between `bind_socket` returning and the
+  accept loop starting.** Not during construction, where the safety argument
+  would be circular: a second pool started against a *live* one would stop that
+  pool's in-flight scouts and Builder and then exit on `AlreadyRunning`. After
+  the bind it is a proof rather than an assumption — `bind_socket` admits one
+  live daemon per socket path, the ledger is named for that path, and no
+  command can have been processed because nothing is accepting yet (a client
+  that connected in between is sitting in the kernel's backlog with its
+  `Allocate` unread). `Pool::adopt_ledger` (reads, inert) and
+  `Pool::reclaim_carried_over` (stops) are two calls for the same reason, and
+  the first sits on the impl block *without* the `VmRuntime` bound so the split
+  is in the types and not only in the prose.
+- **Orphan recovery against `ContainerRuntime` is single-shot; an interrupted
+  reclaim is not.** `ContainerRuntime::stop` returns `Ok(())` whether or not
+  `container stop` succeeded — it `warn!`s a spawn error and `debug!`s a
+  non-zero exit — and changing that contract was out of scope. So the honest
+  sentence is "the successor asked the runtime to stop it", never "it is
+  stopped", and that is the sentence used at every site rather than a footnote.
+  An id whose `stop` reports `Err` is kept for the next boot; that branch is
+  implemented and tested, and it is what starts working for free if `stop` ever
+  gets a verdict. What *is* recoverable on every runtime is a reclaim
+  interrupted partway through, and only because `enable` **seeds** the
+  in-memory set with the carried ids — without that, the first `record` or
+  `forget` rewrites the file from an empty set and erases every carried id at
+  once, stopped or not.
+- **A ledger, not `container ls`.** Two independent reasons, either fatal. VM
+  names carry no daemon identity (`vm-<micros>-<counter>`), and pointing a
+  second pool at another `VM_POOL_SOCKET` is a configuration
+  `BindError::AlreadyRunning`'s own message suggests — so a sweep that stopped
+  every unrecognised `vm-*` would tear down a *live peer's* VMs, which is the
+  wrong-takeover `bind_socket` exists to prevent, arriving through a different
+  door. And apple/container is macOS-only, so the parser would be the one
+  load-bearing line of the fix that no Linux agent or CI run could ever
+  execute. The ledger never asks what exists; it remembers what this pool
+  started.
 - Testing: TDD with unit tests + integration tests (supervisor spawn)
 
 ## Development Phases

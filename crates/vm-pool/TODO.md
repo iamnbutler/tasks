@@ -20,6 +20,10 @@ vm-pool is pure infrastructure. It manages VMs, pools, priorities, health, and p
 - [ ] `cargo publish --dry-run` each crate
 - [ ] Publish to crates.io
 
+`ServiceConfig::state_dir` (the VM ledger's home) is a breaking change to
+`vm-pool-service`'s public API — it landed before this publish, which is the
+cheap order. Anything else of that shape should land before it too, not after.
+
 ## Generic protocol ✅
 
 Protocol is now generic over an `AppProtocol` trait. vm-pool handles
