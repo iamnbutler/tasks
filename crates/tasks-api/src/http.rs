@@ -218,9 +218,40 @@ pub struct BuildRequest {
     pub base_branch: Option<String>,
     /// Why this batch, now. Required of the orchestrator — batching and
     /// ordering are judgment calls, so the reasoning is the record.
+    ///
+    /// Read by humans afterwards and **never sent to the Builder**. To tell
+    /// the Builder something, use `directions`.
     #[serde(default)]
     pub rationale: Option<String>,
+    /// Instructions for the Builder itself, carried into its prompt as their
+    /// own section and stored on the build row. Not a second `rationale`:
+    /// see [`crate::models::Directions`].
+    #[serde(default)]
+    pub directions: Option<String>,
     /// What the decider checked, free-form JSON. Stored on the decision.
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Body of `POST /tasks/{id}/queue` and `POST /tasks/{id}/scout`.
+///
+/// Every field is optional and the body itself may be omitted entirely — both
+/// routes took no body at all before `directions` existed, and every caller
+/// that still sends none keeps working.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ScoutRequest {
+    /// Instructions for the Scout that picks this task up, staged on the task
+    /// until one does.
+    ///
+    /// Three-way, and the distinction is the point: **absent** leaves whatever
+    /// is staged alone (posting `/scout` a second time with no body must not
+    /// unaim the run), **empty or whitespace** clears it, and text stages it.
+    #[serde(default)]
+    pub directions: Option<String>,
+    /// Why this task, now. Required of the orchestrator. Lands on the decision
+    /// row and is never shown to the Scout.
+    #[serde(default)]
+    pub rationale: Option<String>,
     #[serde(default)]
     pub evidence: Option<serde_json::Value>,
 }
@@ -253,6 +284,12 @@ pub struct BuildNowRequest {
     /// the one thing that makes an unreviewed build reviewable afterwards.
     #[serde(default)]
     pub rationale: Option<String>,
+    /// Instructions for the Builder, kept strictly out of the spec this
+    /// authors. `content` is the specification; `directions` is what to do
+    /// with it, and conflating them would put an instruction to the agent into
+    /// the artifact a reviewer reads.
+    #[serde(default)]
+    pub directions: Option<String>,
     #[serde(default)]
     pub evidence: Option<serde_json::Value>,
 }

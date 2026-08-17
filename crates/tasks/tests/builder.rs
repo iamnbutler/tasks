@@ -99,6 +99,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
 
@@ -112,6 +113,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 

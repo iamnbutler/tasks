@@ -1007,6 +1007,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     let session = Session {
@@ -1019,6 +1020,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
@@ -1120,6 +1122,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&task).await.unwrap();
         task

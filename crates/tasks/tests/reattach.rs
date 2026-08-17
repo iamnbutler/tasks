@@ -106,6 +106,7 @@ async fn insert_task(store: &Store, project: &Project, state: TaskState) -> Task
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     task
@@ -510,6 +511,7 @@ async fn a_session_whose_vm_is_gone_is_still_written_off() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 
@@ -665,6 +667,7 @@ async fn an_unreachable_vm_pool_falls_back_to_reconciliation() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 
@@ -723,6 +726,7 @@ async fn a_vm_pool_that_predates_attach_falls_back_to_reconciliation() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 
@@ -895,6 +899,7 @@ async fn seed_approved(store: &Store, project: &Project) -> (Task, Spec) {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
 
@@ -908,6 +913,7 @@ async fn seed_approved(store: &Store, project: &Project) -> (Task, Spec) {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 

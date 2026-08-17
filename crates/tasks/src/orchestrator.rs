@@ -1187,9 +1187,22 @@ fn system_prompt(
          http://127.0.0.1:{port}/spec-queue/spec_abc/review \
          -H 'Content-Type: application/json' \
          -d '{{\"status\":\"approved\",\"rationale\":\"why\"}}'\n\n\
+         `directions` is not a second `rationale`, and the two are not \
+         interchangeable. A `rationale` explains your judgment to whoever \
+         reads the decisions ledger afterwards; **no agent ever sees it**. \
+         `directions` is addressed to the Scout or the Builder that will do \
+         the work, reaches it as its own section of that agent's prompt, and \
+         changes what it does. Put an instruction in `rationale` and the agent \
+         never reads it; put an explanation in `directions` and the agent acts \
+         on it. Send both when both apply, and never copy one into the \
+         other.\n\n\
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
-         - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
+         - POST /tasks/{{id}}/queue | /dequeue | /scout \
+           {{\"directions\",\"rationale\"}} — queue membership. The body is \
+           optional; `directions` aims the Scout that picks the task up and \
+           stays staged on the task until one does, so omitting it leaves \
+           whatever is already staged alone and sending \"\" clears it\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /builds/{{id}}/transcript?since=N — the builder agent's own \
            output, line by line. Read this FIRST when a build failed: the \
@@ -1197,8 +1210,9 @@ fn system_prompt(
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
          - POST /spec-queue/{{id}}/review \
            {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
-         - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
-           specs into one Builder run (serial; one at a time)\n\
+         - POST /builds {{\"spec_ids\":[...],\"rationale\",\"directions\"}} — \
+           batch approved specs into one Builder run (serial; one at a \
+           time)\n\
          - POST /sessions/{{id}}/cancel, POST /builds/{{id}}/cancel \
            {{\"rationale\"}} — stop a scout or a build that is already in \
            flight. The rationale is mandatory and lands in the run's \

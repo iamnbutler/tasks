@@ -659,8 +659,12 @@ impl AppState {
         self.run(cx, move |client| client.dequeue_task(&id));
     }
 
+    /// `None` for directions: aiming a run is real UI work (a modal plus
+    /// state plumbing) and no affordance offers it yet. `None` is also the
+    /// safe value — it leaves whatever is already staged on the task alone
+    /// rather than clearing it out from under whoever staged it.
     pub fn scout_task_now(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        self.run(cx, move |client| client.scout_task_now(&id));
+        self.run(cx, move |client| client.scout_task_now(&id, None));
     }
 
     /// Write the task queue's order: `order` is the complete list of picked-up
@@ -733,7 +737,9 @@ impl AppState {
     /// is a request rather than a start; the server answers 202 and the event
     /// stream reports what happens next.
     pub fn build_spec(&mut self, id: SpecId, cx: &mut Context<Self>) {
-        self.run(cx, move |client| client.request_build(vec![id], None));
+        self.run(cx, move |client| {
+            client.request_build(vec![id], None, None)
+        });
     }
 
     /// "Build now": write the task's issue body as its spec, approve it, and
@@ -745,7 +751,7 @@ impl AppState {
     /// 202 and nothing applied locally — the refresh reads the new state back.
     pub fn build_task_now(&mut self, id: TaskId, rationale: String, cx: &mut Context<Self>) {
         self.run(cx, move |client| {
-            client.build_task_now(&id, Some(rationale))
+            client.build_task_now(&id, Some(rationale), None)
         });
     }
 
@@ -1057,6 +1063,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: Utc.timestamp_opt(0, 0).unwrap(),
             updated_at: Utc.timestamp_opt(0, 0).unwrap(),
+            scout_directions: None,
         }
     }
 

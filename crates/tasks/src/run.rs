@@ -2749,6 +2749,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&task).await.unwrap();
         task

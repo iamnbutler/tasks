@@ -165,6 +165,14 @@ pub struct Task {
     /// instead of retrying it forever. Cleared when a scout produces a spec.
     /// Never written by the GitHub poller.
     pub dispatch_attempts: u32,
+    /// Staged instructions for the *next* Scout run on this task — what to
+    /// look at, what not to bother with, a constraint the issue does not
+    /// state. Copied onto the [`Session`] at dispatch and **not cleared**: a
+    /// VM death or a `needs_revision` return would otherwise leave the retry
+    /// unaimed with nobody noticing, and visible persistence beats silent
+    /// loss. Never written by the GitHub poller.
+    #[serde(default)]
+    pub scout_directions: Option<Directions>,
     pub ingested_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -295,6 +303,12 @@ pub struct Session {
     /// never reached a result, or whose record didn't parse.
     #[serde(default)]
     pub usage: Option<SessionUsage>,
+    /// What this run was told, as it was told it — a *copy* of the task's
+    /// staged [`Task::scout_directions`] taken at dispatch, not a reference to
+    /// them. The task can be re-aimed tomorrow; the run's record must keep
+    /// saying what *this* run was asked to do.
+    #[serde(default)]
+    pub directions: Option<Directions>,
 }
 
 /// What one agent run cost. Every field is optional: the shape belongs to
@@ -631,6 +645,12 @@ pub struct Build {
     /// success after the branch was pushed and the PR opened. Always at or
     /// after `agent_finished_at`.
     pub completed_at: Option<DateTime<Utc>>,
+    /// What whoever requested this build told the Builder to do, beyond the
+    /// specs. Written in the same `INSERT` as the row — a build that existed
+    /// without them would dispatch unaimed and silently — and never staged:
+    /// unlike a task, a build is created for one run and never re-aimed.
+    #[serde(default)]
+    pub directions: Option<Directions>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,6 +979,62 @@ impl Actor {
             "orchestrator" => Some(Actor::Orchestrator),
             "system" => Some(Actor::System),
             _ => None,
+        }
+    }
+}
+
+/// An instruction addressed to the agent that will carry out a run, and who
+/// wrote it.
+///
+/// **Deliberately not a `rationale`.** The two have different audiences and
+/// different fates: a rationale explains a judgment to whoever reads the
+/// `decisions` ledger afterwards, and nothing ever shows it to a VM;
+/// directions are written *to* the agent, reach it as their own labelled
+/// prompt section, and change what it does. Put an instruction in a rationale
+/// and the agent never sees it; put an explanation in directions and the agent
+/// acts on it. Neither is ever copied into the other.
+///
+/// The author travels with the text because the Builder has to be able to see
+/// that what it is reading is not a Scout — see the barrier argument on
+/// `builder::render_prompt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Directions {
+    pub text: String,
+    pub author: Actor,
+}
+
+impl Directions {
+    pub fn new(text: impl Into<String>, author: Actor) -> Self {
+        Self {
+            text: text.into(),
+            author,
+        }
+    }
+
+    /// Rebuild from the two nullable columns that persist this.
+    ///
+    /// **The text decides.** An author with no text is nothing at all, and an
+    /// *unrecognized* author decays to [`Actor::Human`] rather than dropping
+    /// the text — losing an instruction an agent was supposed to follow is the
+    /// worse failure, and `Human` is the same default `Actor` takes for
+    /// anything that did not prove otherwise.
+    pub fn from_columns(text: Option<String>, author: Option<&str>) -> Option<Self> {
+        let text = text?;
+        Some(Self {
+            text,
+            author: author.and_then(Actor::from_str).unwrap_or_default(),
+        })
+    }
+
+    /// The clause a prompt introduces the author with. Whole sentences would
+    /// belong to whichever prompt is rendering; this is the subject alone, so
+    /// the Scout's and the Builder's sections can say different things about
+    /// the same author.
+    pub fn author_phrase(&self) -> &'static str {
+        match self.author {
+            Actor::Human => "The human running this pipeline",
+            Actor::Orchestrator => "The orchestrator agent",
+            Actor::System => "The server",
         }
     }
 }

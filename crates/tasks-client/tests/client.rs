@@ -62,6 +62,7 @@ impl TestServer {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         self.runtime
             .block_on(self.store.insert_task(&task))
@@ -140,7 +141,7 @@ fn build_now_returns_a_queued_build_over_a_human_authored_spec() {
 
     let detail = server
         .client
-        .build_task_now(&task.id, Some("the issue body is the spec".into()))
+        .build_task_now(&task.id, Some("the issue body is the spec".into()), None)
         .unwrap();
     assert_eq!(detail.build.status, BuildStatus::Queued);
     assert_eq!(detail.spec_ids.len(), 1);
@@ -269,6 +270,7 @@ fn transcript_tail_replays_then_follows() {
         completed_at: None,
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     server
         .runtime

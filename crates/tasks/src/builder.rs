@@ -34,7 +34,9 @@ use crate::bundles::{self, RejectedBundles};
 use crate::cancel::Bounded;
 use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient};
-use crate::models::{Build, Project, RunKind, Spec, Task, TranscriptOwner, TranscriptStream};
+use crate::models::{
+    Build, Directions, Project, RunKind, Spec, Task, TranscriptOwner, TranscriptStream,
+};
 use crate::protocol::{
     BuildCommand, BuildEvent, FailureClass, TaskCommand, TaskEvent, TasksProtocol,
 };
@@ -249,7 +251,7 @@ impl Builder {
 
         let batch = self.load_batch(build).await?;
         let project = self.project(build).await?;
-        let prompt = render_prompt(&batch);
+        let prompt = render_prompt(&batch, build.directions.as_ref());
 
         let vm_id = self
             .client
@@ -777,28 +779,44 @@ async fn git_stdout(dir: &std::path::Path, args: &[&str]) -> Result<String, Buil
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// The Builder prompt: concatenated spec markdown plus issue title/number.
-/// This function is the information barrier's last mile — it takes `(Spec,
-/// Task)` pairs and emits nothing Scout-code-derived. If anything else ever
-/// needs to reach a Builder, the argument has to be made here, and the answer
-/// should be no.
-fn render_prompt(batch: &[(Spec, Task)]) -> String {
+/// The Builder prompt: concatenated spec markdown, issue title/number, and
+/// whatever the requester directed this run to do.
+///
+/// This function is the information barrier's last mile. The barrier forbids
+/// *Scout-run-derived* material — the throwaway branch, its diff, its files,
+/// anything only the exploration knows — because the spec is the deliverable
+/// and a Builder reading the Scout's code would be reimplementing rather than
+/// implementing.
+///
+/// [`Directions`] are not that, and the argument is worth writing down rather
+/// than re-litigating: they are authored by whoever requested the build, they
+/// are stored on the build row before a VM exists, and no path runs from a
+/// Scout run to that field — `create_directed_build` takes them from the API
+/// caller and nothing else writes them. They also carry their author into the
+/// prompt, so the Builder can see for itself that it is not reading a Scout.
+///
+/// Anything else that ever wants to reach a Builder still has to make its
+/// argument here, and the answer should still be no.
+fn render_prompt(batch: &[(Spec, Task)], directions: Option<&Directions>) -> String {
     let n = batch.len();
     let mut out = format!(
         "You are a Builder in the Double Diamond architecture.\n\n\
-         You are implementing {n} approved spec(s). Each was written by a Scout \
-         that already explored the work by implementing it once in a throwaway \
-         branch you cannot see — the spec is the distilled result. Trust its \
-         pitfalls; verify its claims against the code in front of you.\n\n"
+         You are implementing {n} approved spec(s). Verify a spec's claims \
+         against the code in front of you; where a spec has a Scout behind it, \
+         trust its pitfalls.\n\n"
     );
     for (i, (spec, task)) in batch.iter().enumerate() {
         out.push_str(&format!(
-            "## Spec {idx} of {n}: {title} (#{num})\n\n{content}\n\n",
+            "## Spec {idx} of {n}: {title} (#{num})\n\n{provenance}\n\n{content}\n\n",
             idx = i + 1,
             title = task.title,
             num = task.gh_issue_number,
+            provenance = spec_provenance(spec),
             content = spec.content.trim(),
         ));
+    }
+    if let Some(directions) = directions {
+        out.push_str(&render_directions(directions));
     }
     out.push_str(
         "## Your job\n\n\
@@ -823,6 +841,63 @@ fn render_prompt(batch: &[(Spec, Task)]) -> String {
          6. Do NOT push and do NOT open a PR — the server does both.\n",
     );
     out
+}
+
+/// One sentence under each `## Spec N of M` heading saying what is behind that
+/// spec.
+///
+/// It used to be one sentence in the preamble claiming every spec had been
+/// explored "by implementing it once in a throwaway branch", followed by
+/// "trust its pitfalls" — the strongest trust claim in the prompt. For a
+/// `build-now` spec that is simply false: `Spec::session_id` is `None`, no
+/// Scout ran, and nothing behind it was ever executed. Saying so per spec is
+/// the cheap half of "say plainly what is being skipped", aimed at the agent
+/// rather than at the human.
+fn spec_provenance(spec: &Spec) -> &'static str {
+    match spec.session_id.is_some() {
+        true => {
+            "*A Scout wrote this spec after exploring the work by implementing it once in a \
+             throwaway branch you cannot see, and a reviewer approved it. The spec is the \
+             distilled result — trust its pitfalls.*"
+        }
+        // Deliberately says what is missing rather than hedging: no
+        // exploration, and no independent review either, because the author
+        // and the approver were the same person in the same act.
+        false => {
+            "*A human wrote this spec by hand for an issue that already read as one. No Scout \
+             explored it, nothing in it has been run, and no second reader reviewed it — its \
+             claims about the code are unverified. Check them before relying on them, and if \
+             it is wrong about what is there, say so in `SUMMARY.md`.*"
+        }
+    }
+}
+
+/// Render the `## Directions for this implementation` section.
+///
+/// The Scout's counterpart lives in [`crate::scout`] and says nearly the same
+/// things. Two differences are deliberate: the accounting lands in
+/// `SUMMARY.md` (there is no `SPEC.md` here), and a conflict with a spec
+/// resolves in the direction's favour because a direction is the later word —
+/// written when the build was requested, after the spec was approved.
+fn render_directions(directions: &Directions) -> String {
+    format!(
+        "## Directions for this implementation\n\n\
+         {author} added the following when requesting this build. It is **not** \
+         part of any spec above, and no reviewer has seen it — it is addressed \
+         to you.\n\n\
+         Treat it as a requirement, not a suggestion. The specs are still what \
+         is being implemented; these directions say how to go about it. Where \
+         one genuinely conflicts with a spec, the direction wins — it was \
+         written after the spec was approved, with this build in view — but \
+         **say so in `SUMMARY.md`**, because the reviewer reads the spec and \
+         cannot see this section.\n\n\
+         Account for every direction in `SUMMARY.md` — including any you \
+         decided against, and why. A direction you silently dropped is \
+         indistinguishable from one you never read.\n\n\
+         {text}\n\n",
+        author = directions.author_phrase(),
+        text = directions.text.trim(),
+    )
 }
 
 /// The marker a Builder's `SUMMARY.md` carries its test-run claim under.
@@ -1015,6 +1090,7 @@ mod tests {
                 dispatch_attempts: 0,
                 ingested_at: Utc::now(),
                 updated_at: Utc::now(),
+                scout_directions: None,
             },
         )
     }
@@ -1054,7 +1130,7 @@ mod tests {
             pair(7, "First thing", "## Spec: first\ndo it"),
             pair(9, "Second thing", "## Spec: second\ndo that"),
         ];
-        let prompt = render_prompt(&batch);
+        let prompt = render_prompt(&batch, None);
 
         let first = prompt.find("## Spec 1 of 2: First thing (#7)").unwrap();
         let second = prompt.find("## Spec 2 of 2: Second thing (#9)").unwrap();
@@ -1066,6 +1142,84 @@ mod tests {
         // scout touched, not the issue body (the spec subsumes it).
         assert!(!prompt.contains("secret_scout_file.rs"));
         assert!(!prompt.contains("issue body"));
+
+        // And an undirected build grows **no** `## Directions` heading. An
+        // always-present empty section is how an agent learns to skim past
+        // the one that matters.
+        assert!(!prompt.contains("## Directions"), "{prompt}");
+    }
+
+    #[test]
+    fn directions_sit_after_the_specs_and_name_their_author() {
+        let batch = vec![pair(7, "A thing", "## Spec: first\ndo it")];
+        let directions = Directions::new(
+            "keep the migration reversible",
+            crate::models::Actor::Orchestrator,
+        );
+        let prompt = render_prompt(&batch, Some(&directions));
+
+        let spec = prompt.find("## Spec 1 of 1").unwrap();
+        let section = prompt
+            .find("## Directions for this implementation")
+            .unwrap();
+        let job = prompt.find("## Your job").unwrap();
+        assert!(spec < section && section < job, "{prompt}");
+
+        assert!(prompt.contains("The orchestrator agent"), "{prompt}");
+        assert!(prompt.contains("keep the migration reversible"), "{prompt}");
+        assert!(
+            prompt.contains("a requirement, not a suggestion"),
+            "{prompt}"
+        );
+        // Accounted for where a Builder writes, and conflicts stated rather
+        // than silently resolved.
+        assert!(prompt.contains("SUMMARY.md"), "{prompt}");
+        assert!(prompt.contains("decided against"), "{prompt}");
+
+        let human = render_prompt(
+            &batch,
+            Some(&Directions::new("x", crate::models::Actor::Human)),
+        );
+        assert!(human.contains("The human running this pipeline"), "{human}");
+    }
+
+    /// The prompt used to tell every Builder its specs had been explored "by
+    /// implementing it once in a throwaway branch" and to trust their
+    /// pitfalls. For a `build-now` spec that is the strongest trust claim in
+    /// the prompt made about the artifact with the least behind it.
+    #[test]
+    fn a_hand_authored_spec_is_not_described_as_explored() {
+        let mut hand = pair(7, "A thing", "## Spec: first");
+        hand.0.session_id = None;
+        let prompt = render_prompt(&[hand], None);
+        assert!(
+            prompt.contains("A human wrote this spec by hand"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("No Scout explored it"), "{prompt}");
+        assert!(
+            !prompt.contains("throwaway branch"),
+            "nothing may claim this one was explored: {prompt}"
+        );
+
+        let scouted = render_prompt(&[pair(9, "Another", "## Spec: second")], None);
+        assert!(scouted.contains("throwaway branch"), "{scouted}");
+        assert!(scouted.contains("trust its pitfalls"), "{scouted}");
+    }
+
+    /// Both spec kinds in one batch: the claim is per spec, so a scouted spec
+    /// beside a hand-authored one must not lend it its provenance.
+    #[test]
+    fn provenance_is_per_spec_not_per_prompt() {
+        let mut hand = pair(7, "Hand", "## Spec: hand");
+        hand.0.session_id = None;
+        let prompt = render_prompt(&[hand, pair(9, "Scouted", "## Spec: scouted")], None);
+        let hand_at = prompt.find("## Spec 1 of 2").unwrap();
+        let scouted_at = prompt.find("## Spec 2 of 2").unwrap();
+        let unexplored = prompt.find("A human wrote this spec by hand").unwrap();
+        let explored = prompt.find("throwaway branch").unwrap();
+        assert!(hand_at < unexplored && unexplored < scouted_at, "{prompt}");
+        assert!(scouted_at < explored, "{prompt}");
     }
 
     /// The Builder's own test run is the only evidence this repository can
@@ -1075,7 +1229,7 @@ mod tests {
     /// worse than no line, because the brief reads it back as evidence.
     #[test]
     fn the_prompt_asks_for_the_verification_line_and_for_the_truth() {
-        let prompt = render_prompt(&[pair(7, "A thing", "spec")]);
+        let prompt = render_prompt(&[pair(7, "A thing", "spec")], None);
         assert!(prompt.contains("Verification: PASSED"), "{prompt}");
         assert!(prompt.contains("Verification: FAILED"), "{prompt}");
         assert!(prompt.contains("Verification: NOT RUN"), "{prompt}");

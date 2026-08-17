@@ -80,6 +80,7 @@ async fn seed_task(h: &Harness, issue: u64, state: TaskState) -> Task {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     h.store.insert_task(&task).await.unwrap();
     task
@@ -98,6 +99,7 @@ async fn seed_spec(h: &Harness, issue: u64) -> Spec {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     h.store.insert_session(&session).await.unwrap();
     let spec = Spec {

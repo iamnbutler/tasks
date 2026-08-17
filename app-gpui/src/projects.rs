@@ -275,6 +275,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: Utc.timestamp_opt(0, 0).unwrap(),
             updated_at: Utc.timestamp_opt(0, 0).unwrap(),
+            scout_directions: None,
         }
     }
 
