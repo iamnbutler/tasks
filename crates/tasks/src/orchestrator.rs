@@ -37,6 +37,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::brief::Brief;
+use crate::deadline::{self, Deadline, Expiry};
 use crate::events::{Event, EventPayload};
 use crate::models::{
     Actor, BuildStatus, Capability, CharterEntry, CharterLevel, Obligation, ObligationKind,
@@ -62,6 +63,12 @@ pub enum OrchestratorError {
     },
     #[error("agent timed out after {secs}s")]
     Timeout { secs: u64 },
+    /// The tick's budget ran out because the machine was asleep for it. No
+    /// strike hangs off an orchestrator turn, so this buys no waiver — it buys
+    /// the answer to "why did the orchestrator stop reporting overnight",
+    /// which `agent timed out after 900s` is not.
+    #[error("agent abandoned: {0}")]
+    Suspended(Expiry),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +76,9 @@ pub struct OrchestratorConfig {
     /// The agent command, space-separated (`ORCHESTRATOR_CMD`). Session and
     /// prompt flags are appended per tick. Tests point this at a stub.
     pub command: String,
-    /// Wall-clock budget for one tick (`ORCHESTRATOR_TIMEOUT_SECS`).
+    /// Budget for one tick (`ORCHESTRATOR_TIMEOUT_SECS`), measured on both the
+    /// monotonic and the wall clock — see [`crate::deadline`], and
+    /// [`OrchestratorError::Suspended`] for what a sleeping host reads as.
     pub timeout: Duration,
     /// Working directory for the agent process — somewhere neutral under the
     /// data dir, not a checkout it could edit.
@@ -415,10 +424,21 @@ impl Orchestrator {
             Ok::<_, OrchestratorError>((status, result_text, raw, usage))
         };
 
-        let secs = self.config.timeout.as_secs();
-        let (status, result_text, raw, usage) = tokio::time::timeout(self.config.timeout, read)
-            .await
-            .map_err(|_| OrchestratorError::Timeout { secs })??;
+        // Two clocks, for the reason the dispatchers use them: a lid closed
+        // mid-turn is not a turn that spent 900 seconds thinking.
+        let deadline = Deadline::starting_now(self.config.timeout);
+        let (status, result_text, raw, usage) =
+            deadline::bounded(&deadline, read)
+                .await
+                .map_err(|expiry| {
+                    if expiry.host_slept() {
+                        OrchestratorError::Suspended(expiry)
+                    } else {
+                        OrchestratorError::Timeout {
+                            secs: self.config.timeout.as_secs(),
+                        }
+                    }
+                })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -1458,6 +1478,28 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No strike hangs off a tick, so what a suspend buys here is only the
+    /// sentence — but "the laptop closed its lid" is the answer to "why did the
+    /// orchestrator stop reporting overnight", and `agent timed out after 900s`
+    /// is not. The negative half keeps a real deadline reading as one.
+    #[tokio::test]
+    async fn a_tick_the_host_slept_through_does_not_read_as_a_timeout() {
+        let expiry =
+            Deadline::suspended_for(Duration::from_secs(900), Duration::from_secs(8 * 3600))
+                .expired()
+                .await;
+        assert!(expiry.host_slept(), "{expiry:?}");
+
+        let suspended = OrchestratorError::Suspended(expiry).to_string();
+        assert!(suspended.contains("the host was suspended"), "{suspended}");
+        assert!(!suspended.contains("timed out"), "{suspended}");
+
+        assert_eq!(
+            OrchestratorError::Timeout { secs: 900 }.to_string(),
+            "agent timed out after 900s"
+        );
+    }
 
     #[test]
     fn nudges_are_selective() {

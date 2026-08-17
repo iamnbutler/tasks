@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use chrono::Utc;
@@ -32,6 +32,7 @@ use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::bundles::{self, RejectedBundles};
 use crate::cancel::Bounded;
+use crate::deadline::{Deadline, Expiry};
 use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient};
 use crate::models::{
@@ -68,8 +69,19 @@ pub enum BuilderError {
     Egress(String),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
+    /// Deadline hit with the host awake throughout. `secs` is the *configured*
+    /// budget, never the expiry's: on the reattach path the effective budget is
+    /// the remainder.
     #[error("build timed out after {secs}s")]
     Timeout { secs: u64 },
+    /// The budget ran out because the machine was asleep for most of it, which
+    /// the two clocks in [`crate::deadline`] can tell apart from a run that
+    /// spent its budget. This is #929 itself: a build dispatched at 03:44, a
+    /// lid closed from 04:22, and `build timed out after 3600s` three and a
+    /// half minutes after it opened again — nine hours of the serial lane and
+    /// a build attempt charged to three specs for a run that had 38 minutes.
+    #[error("build abandoned: {0}")]
+    Suspended(Expiry),
     /// Somebody stopped the run on purpose. Carries the whole request: the
     /// actor and the rationale are what make a cancelled build distinguishable
     /// from a failed one when the row is read back, and
@@ -87,8 +99,9 @@ impl BuilderError {
     /// host stopped being able to observe the run at all. Surfacing and
     /// charging are separable — the waive path appends a `Note` naming the
     /// class and the underlying error, so the failure stays exactly as
-    /// visible, and what charging would add is only the strike. `Timeout` is
-    /// charged for the reason a scout's is: the run had the entire budget.
+    /// visible, and what charging would add is only the strike. `Suspended` is
+    /// the third, and the one #929 was filed for. `Timeout` is charged for the
+    /// reason a scout's is: the run had the entire budget *awake*.
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::BuildFailed { class, .. } => *class,
@@ -113,6 +126,11 @@ impl BuilderError {
             // the whole batch, and three of them `blocked` specs that had
             // never failed to build.
             Self::StreamClosed => FailureClass::Transport,
+            // And a suspend is the same argument again, with the measurement
+            // to back it: the two clocks say how much of the budget the run
+            // was actually awake for, and #929 was 38 minutes of an hour. A
+            // strike is charged for a verdict and for nothing else.
+            Self::Suspended(_) => FailureClass::Transport,
             // `Client(_)` stays a verdict deliberately, not by oversight.
             // `Store::finalize_build_unsuccessfully` only charges `if
             // started` (the row has a `vm_id`, set immediately after
@@ -133,7 +151,10 @@ pub struct BuilderConfig {
     /// Image reference to allocate from vm-pool, e.g. `"builder:v1"`.
     pub image: String,
     pub vm_config: VmConfig,
-    /// Wall-clock budget for one build, allocation included.
+    /// Budget for one build (`BUILDER_TIMEOUT_SECS`), allocation included.
+    /// Measured on both the monotonic and the wall clock (see
+    /// [`crate::deadline`]), so a host that slept through it fails with
+    /// [`BuilderError::Suspended`] rather than [`BuilderError::Timeout`].
     pub timeout: Duration,
     /// Where per-build scratch repos live (removed after each build,
     /// success or failure) — and, under `rejected/`, the bundles egress could
@@ -261,7 +282,9 @@ impl Builder {
     /// Everything that can fail on a fresh build. A `?` here lands in
     /// [`Builder::conclude`]'s failure finalization.
     async fn attempt(&self, build: &Build, clone_url: &str) -> Result<Build, BuilderError> {
-        let started = Instant::now();
+        // Anchored on both clocks before anything else, so allocation is inside
+        // the budget and a host that suspends during it is caught too.
+        let deadline = Deadline::starting_now(self.config.timeout);
         // Subscribe before allocating so no event for our VM can be missed.
         let mut events = self.client.subscribe_events();
 
@@ -295,9 +318,8 @@ impl Builder {
             )
             .await?;
 
-        let remaining = self.config.timeout.saturating_sub(started.elapsed());
         let app = AppEvents::live(&mut events, vm_id.clone());
-        self.follow(build, clone_url, &batch, &project, &vm_id, app, remaining)
+        self.follow(build, clone_url, &batch, &project, &vm_id, app, &deadline)
             .await
     }
 
@@ -329,14 +351,15 @@ impl Builder {
             .started_at
             .map(|t| (Utc::now() - t).to_std().unwrap_or_default())
             .unwrap_or_default();
-        let remaining = self
-            .config
-            .timeout
-            .saturating_sub(elapsed)
-            .max(RESUME_MIN_BUDGET);
+        let deadline = Deadline::starting_now(
+            self.config
+                .timeout
+                .saturating_sub(elapsed)
+                .max(RESUME_MIN_BUDGET),
+        );
 
         let app = AppEvents::resumed(&mut events, vm_id.clone(), resume);
-        self.follow(build, clone_url, &batch, &project, &vm_id, app, remaining)
+        self.follow(build, clone_url, &batch, &project, &vm_id, app, &deadline)
             .await
     }
 
@@ -352,7 +375,7 @@ impl Builder {
         project: &Project,
         vm_id: &VmId,
         mut events: AppEvents<'_>,
-        budget: Duration,
+        deadline: &Deadline,
     ) -> Result<Build, BuilderError> {
         let (mut sink, writer) =
             spawn_transcript_writer(self.store.clone(), TranscriptOwner::build(&build.id));
@@ -364,7 +387,7 @@ impl Builder {
             &self.store,
             RunKind::Build,
             build.id.as_str(),
-            budget,
+            deadline,
             self.drain_build_events(&mut events, &build.id, &mut sink),
         )
         .await
@@ -379,16 +402,27 @@ impl Builder {
                 );
                 Err(BuilderError::Cancelled(request))
             }
-            Bounded::TimedOut => {
-                // Said here rather than only in `dispatch`'s failure warn,
-                // which runs *after* teardown: in the incident that was 15:37
-                // to 17:50 of silence between the budget expiring and anyone
-                // being told.
+            // Said here rather than only in `dispatch`'s failure warn, which
+            // runs *after* teardown: in the incident that was 15:37 to 17:50 of
+            // silence between the budget expiring and anyone being told.
+            Bounded::TimedOut(expiry) if expiry.host_slept() => {
+                warn!(
+                    build_id = %build.id,
+                    %vm_id,
+                    slept = %crate::deadline::human(expiry.suspended()),
+                    awake = %crate::deadline::human(expiry.awake),
+                    "the host was suspended while a build was running; tearing the VM down"
+                );
+                Err(BuilderError::Suspended(expiry))
+            }
+            Bounded::TimedOut(_) => {
                 warn!(
                     build_id = %build.id,
                     secs = self.config.timeout.as_secs(),
                     "build budget exhausted; tearing the VM down"
                 );
+                // The *configured* budget, never the expiry's: a resumed build
+                // is bounded by the remainder, and this string is pinned.
                 Err(BuilderError::Timeout {
                     secs: self.config.timeout.as_secs(),
                 })
@@ -1198,6 +1232,45 @@ mod tests {
         assert_eq!(
             Strike::for_class(BuilderError::Timeout { secs: 1 }.failure_class()),
             Strike::Charge,
+        );
+    }
+
+    /// #929 itself: the build that held the serial lane for nine hours because
+    /// the laptop was shut, and charged #909, #917 and #918 an attempt each for
+    /// it. The two clocks measure how much of the budget the run was awake for,
+    /// and 38 minutes of an hour is not a verdict.
+    ///
+    /// The negative half is not optional here either — a test in which nothing
+    /// is charged reads exactly like a cap somebody switched off.
+    #[tokio::test]
+    async fn a_suspended_host_is_transport_and_costs_the_batch_no_attempt() {
+        use crate::store::Strike;
+
+        let expiry =
+            Deadline::suspended_for(Duration::from_secs(3600), Duration::from_secs(8 * 3600))
+                .expired()
+                .await;
+        let suspended = BuilderError::Suspended(expiry);
+
+        assert_eq!(suspended.failure_class(), FailureClass::Transport);
+        assert!(!suspended.failure_class().is_verdict());
+        assert_eq!(Strike::for_class(suspended.failure_class()), Strike::Waive);
+
+        // The waiver has something to log, and it does not read as a deadline
+        // the build was given and spent.
+        let reason = suspended.to_string();
+        assert!(reason.contains("the host was suspended"), "{reason}");
+        assert!(!reason.contains("timed out"), "{reason}");
+
+        // The negative half: a budget spent awake still pays, and still says
+        // the configured number.
+        assert_eq!(
+            Strike::for_class(BuilderError::Timeout { secs: 3600 }.failure_class()),
+            Strike::Charge,
+        );
+        assert_eq!(
+            BuilderError::Timeout { secs: 3600 }.to_string(),
+            "build timed out after 3600s"
         );
     }
 

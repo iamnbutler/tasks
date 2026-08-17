@@ -270,8 +270,10 @@ implementation.
   a second mechanism beside it. Not every class comes off a terminal event,
   though: the failures where there *is* no terminal event are classified by the
   **host**, in those same two functions — `Egress`, because the agent finished
-  and the push is what failed, and `StreamClosed`, because vm-pool going away
-  means the host stopped being able to observe the run at all. vm-pool is a
+  and the push is what failed; `StreamClosed`, because vm-pool going away means
+  the host stopped being able to observe the run at all; and `Suspended`,
+  because a budget the machine slept through was never offered to the run (see
+  *Budgets and a host that sleeps*). vm-pool is a
   separate daemon this document says to restart *ahead* of the server, so the
   second one is routine maintenance rather than a judgement, and it used to
   charge the whole batch. Wire skew runs both ways and only one way is
@@ -280,7 +282,7 @@ implementation.
   because a lost terminal event does not cost a strike — it costs the run its
   outcome and hangs it until the deadline. What stays charged is deliberate and
   is what the negative tests pin: an agent that ran to completion and produced
-  nothing usable, a `Timeout` that had the entire budget, an OOM kill (a memory
+  nothing usable, a `Timeout` that had the entire budget **awake**, an OOM kill (a memory
   limit is a real property of the work in that VM, and #828 exists to make that
   death legible as itself), and every pre-agent setup failure — a clone against
   a base branch that is gone fails identically every time, and waiving it would
@@ -531,6 +533,42 @@ because `ModeChanged` is nudge-worthy and would spend an orchestrator turn on
 every restart; and the transition happens *before* `server::bind`, so no
 client — and no `reload` verifying a swap — can observe the previous run's
 mode.
+
+### Budgets and a host that sleeps
+
+**Every run budget is measured on two clocks, and the gap between them at
+expiry is the suspend.** A `tokio::time::sleep(budget)` is `Instant`-based and
+an `Instant` does not advance while the machine is asleep, so on the laptop this
+pipeline runs on a build dispatched at 03:44 against a lid closed from 04:22 and
+opened at 12:34 fired three and a half minutes later as `build timed out after
+3600s` — true in monotonic terms and wrong in every term a human uses. It held
+the serial build lane for nearly nine hours and charged three specs a build
+attempt each for a closed lid (#929), which the strike rule above forbids: a
+`Timeout` is charged precisely because it "had the entire budget", and this one
+had 38 minutes of it. `crate::deadline::Deadline` anchors on **both** a
+monotonic and a wall-clock reading and expires on whichever runs out first;
+because both anchors are kept, the time the host was not running is a
+**measured fact rather than an inference**, and it gets its own error variant
+(`{Scout,Builder,Orchestrator}Error::Suspended`), its own `exit_reason` sentence
+and `FailureClass::Transport`.
+
+Four things about it are load-bearing. The **monotonic reading is the floor**
+(`wall.elapsed().unwrap_or(awake).max(awake)`) — wall-clock alone would hand the
+deadline to `settimeofday`, where an NTP step could retire a run that had barely
+started or, stepping backwards, postpone one forever, so a clock adjustment can
+only ever degrade to the behaviour that shipped before while a suspend is still
+caught. The deadline **polls** on a 30s tick rather than sleeping the remainder,
+because that is what makes it fire on the *wake* instead of once the leftover
+monotonic budget finally drains; the tick must stay well under any budget anyone
+would configure, since it bounds how long after a wake a doomed run stays parked
+holding the serial lane. `Timeout` keeps reporting the **configured** `secs` and
+not the expiry's, because a resumed run's effective budget is the remainder and
+the integration tests pin specific numbers — and the suspend sentence must never
+contain "timed out", or the distinction goes straight back. And a suspended run
+is **killed at the wake, not extended**: no agent's API connection survives an
+eight-hour suspend, so handing the budget back would only hold the lane longer
+for a run that is already dead. `caffeinate -s` stays the operational answer;
+this makes a sleeping host legible and free, not harmless.
 
 ### Pool capacity
 
@@ -822,11 +860,12 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once. Each holds a vm-pool slot and the serial build lane holds one more, so the pool must fit `SCOUT_MAX_CONCURRENT + 1` — 3 is the recommended ceiling against the default pool of 6, and the server `warn!`s on every connect if the pool it found is short or an exact fit. See *Pool capacity* |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
-| `SCOUT_TIMEOUT_SECS` | 3600 | wall-clock budget per scout; past it the VM is deallocated and the attempt counts as a dispatch failure. Keep below vm-pool's `vm_timeout` (7200) |
+| `SCOUT_TIMEOUT_SECS` | 3600 | budget per scout, measured on both clocks (see *Budgets and a host that sleeps*); past it the VM is deallocated and the attempt counts as a dispatch failure — unless the host was asleep for it, which is `Suspended` and costs nothing. Keep below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
 | `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES` | 2 | times a supervisor re-invokes an agent with `--resume <session_id>` after its API connection dropped mid-response (#845). Only a transport death is retried, and the backoff rises 2s / 15s / 30s. `0` disables it. Read *inside* the VM, so both live in `images/{scout,builder}/Dockerfile` |
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
+| `BUILDER_TIMEOUT_SECS` | 3600 | budget per build, allocation included, measured on both clocks (see *Budgets and a host that sleeps*). Past it the VM is deallocated, the build fails and every spec in the batch is charged a build attempt — unless the host was asleep for it, which is `Suspended` and charges nothing (#929). Same ceiling argument as the scout's: keep it below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |
@@ -835,5 +874,5 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
-| `ORCHESTRATOR_TIMEOUT_SECS` | 900 | wall-clock budget per orchestrator tick. Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
+| `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
 | `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else. Shared and long-lived — the warmth is the value; expect ~7.5 GB and nothing prunes it. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |

@@ -15,7 +15,7 @@
 //! previous process started, which is the whole of what a restart costs now.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use thiserror::Error;
@@ -24,6 +24,7 @@ use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::cancel::Bounded;
+use crate::deadline::{Deadline, Expiry};
 use crate::events::EventPayload;
 use crate::models::{
     Complexity, Directions, ReviewedSpec, RunKind, ScoutNotes, Session, SessionId, SessionStatus,
@@ -72,11 +73,22 @@ pub enum ScoutError {
     Cancelled(CancelRequest),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
-    /// Wall-clock deadline hit. The message lands verbatim in
-    /// `sessions.exit_reason`, so the timeout integration tests match on
+    /// Deadline hit with the host awake throughout. The message lands verbatim
+    /// in `sessions.exit_reason`, so the timeout integration tests match on
     /// `timed out` — including the one where the run was salvaged.
+    ///
+    /// `secs` is the *configured* budget, never the expiry's: on the reattach
+    /// path the effective budget is the remainder, and the integration tests
+    /// pin specific numbers.
     #[error("scout timed out after {secs}s")]
     Timeout { secs: u64 },
+    /// The budget ran out because the machine was asleep for most of it, which
+    /// the two clocks in [`crate::deadline`] can tell apart from a run that
+    /// spent its budget. Nothing here judged the work — the run was never
+    /// given the time — so this is [`FailureClass::Transport`] and costs the
+    /// task no attempt (#929).
+    #[error("scout abandoned: {0}")]
+    Suspended(Expiry),
 }
 
 impl ScoutError {
@@ -85,10 +97,11 @@ impl ScoutError {
     ///
     /// `StreamClosed` is `Transport`: the vm-pool event stream ending is the
     /// daemon going away — a routine maintenance action, not a judgement on
-    /// the work.
+    /// the work. So is `Suspended`, which is the host having been asleep for
+    /// the budget rather than the run having spent it.
     ///
     /// Everything not named here is a [`FailureClass::Verdict`], and two of
-    /// those are deliberate. A `Timeout` had the entire wall-clock budget and
+    /// those are deliberate. A `Timeout` had the entire budget *awake* and
     /// still produced nothing, which is as much of a verdict as an agent that
     /// concluded empty-handed. And a `Store` or `Client` failure that reaches
     /// here is not a disconnect — `crate::run::is_disconnect` answers that
@@ -106,6 +119,11 @@ impl ScoutError {
             // keeps the two answers from disagreeing about the same error.
             // The builder half is the live bug this mirrors.
             Self::StreamClosed => FailureClass::Transport,
+            // #929: a nine-hour suspend that fired the deadline three minutes
+            // after the lid opened, charging three specs an attempt each for a
+            // budget the run was never awake to spend. Classified beside
+            // `Egress` and `StreamClosed` — host-side, and never on the wire.
+            Self::Suspended(_) => FailureClass::Transport,
             Self::Store(_) | Self::Client(_) | Self::Timeout { .. } => FailureClass::Verdict,
         }
     }
@@ -119,9 +137,11 @@ pub struct ScoutConfig {
     pub image: String,
     /// VM configuration passed to vm-pool.
     pub vm_config: VmConfig,
-    /// Wall-clock budget for one dispatch, measured from entry to
-    /// [`Scout::dispatch`] so allocation is charged to it too. On expiry the
-    /// VM is deallocated and the dispatch fails with [`ScoutError::Timeout`].
+    /// Budget for one dispatch, measured from entry to [`Scout::dispatch`] so
+    /// allocation is charged to it too. Measured on both the monotonic and the
+    /// wall clock (see [`crate::deadline`]), so on expiry the VM is
+    /// deallocated and the dispatch fails with [`ScoutError::Timeout`] — or,
+    /// if the host was asleep for it, [`ScoutError::Suspended`].
     pub timeout: Duration,
 }
 
@@ -172,9 +192,11 @@ impl Scout {
     /// `PendingReview`.
     pub async fn dispatch(&self, task: Task, target: &ScoutTarget) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
-        // Stamped before anything else so the deadline covers allocation too,
-        // making it a true wall-clock budget rather than a drain budget.
-        let started = Instant::now();
+        // Anchored before anything else so the deadline covers allocation too,
+        // making it a true run budget rather than a drain budget — and so a
+        // host that suspends *during* allocation is caught, which the
+        // `Instant` arithmetic this replaced could not see.
+        let deadline = Deadline::starting_now(self.config.timeout);
 
         // Subscribe before allocating so no event for our VM can be missed.
         let mut events = self.client.subscribe_events();
@@ -294,9 +316,8 @@ impl Scout {
             return Err(e.into());
         }
 
-        let remaining = self.config.timeout.saturating_sub(started.elapsed());
         let app = AppEvents::live(&mut events, vm_id.clone());
-        self.follow(&session_id, &task, &vm_id, app, remaining, None)
+        self.follow(&session_id, &task, &vm_id, app, &deadline, None)
             .await
     }
 
@@ -352,11 +373,12 @@ impl Scout {
         let elapsed = (Utc::now() - session.started_at)
             .to_std()
             .unwrap_or_default();
-        let remaining = self
-            .config
-            .timeout
-            .saturating_sub(elapsed)
-            .max(RESUME_MIN_BUDGET);
+        let deadline = Deadline::starting_now(
+            self.config
+                .timeout
+                .saturating_sub(elapsed)
+                .max(RESUME_MIN_BUDGET),
+        );
 
         // Rebuilt from the row and the notes table rather than from the
         // replay, because a bounded window is exactly what drops the oldest
@@ -374,7 +396,7 @@ impl Scout {
         };
 
         let app = AppEvents::resumed(&mut events, vm_id.clone(), resume);
-        self.follow(&session_id, &task, &vm_id, app, remaining, Some(state))
+        self.follow(&session_id, &task, &vm_id, app, &deadline, Some(state))
             .await
     }
 
@@ -391,11 +413,11 @@ impl Scout {
         task: &Task,
         vm_id: &VmId,
         mut events: AppEvents<'_>,
-        budget: Duration,
+        deadline: &Deadline,
         resumed: Option<DrainState>,
     ) -> Result<Spec, ScoutError> {
         // Drain events until terminal Completed / Failed, or until the budget
-        // runs out. `saturating_sub` means an already-blown budget fires
+        // runs out on either of its two clocks. An already-blown budget fires
         // immediately instead of wrapping.
         // #849 gave the transcript writer an owner; #856 added the checkpoint
         // writer beside it. Both survive: the sink is owner-addressed, and the
@@ -429,7 +451,7 @@ impl Scout {
             &self.store,
             RunKind::Session,
             session_id.as_str(),
-            budget,
+            deadline,
             drain_scout_events(
                 &self.store,
                 session_id,
@@ -453,10 +475,19 @@ impl Scout {
                 );
                 Err(ScoutError::Cancelled(request))
             }
-            Bounded::TimedOut => {
-                let secs = self.config.timeout.as_secs();
-                self.note_timeout(task, vm_id, secs).await;
-                Err(ScoutError::Timeout { secs })
+            Bounded::TimedOut(expiry) => {
+                self.note_expiry(task, vm_id, &expiry).await;
+                if expiry.host_slept() {
+                    Err(ScoutError::Suspended(expiry))
+                } else {
+                    // The *configured* budget, never `expiry.budget`: on the
+                    // reattach path the effective budget is the remainder, and
+                    // the integration tests pin specific numbers against this
+                    // string.
+                    Err(ScoutError::Timeout {
+                        secs: self.config.timeout.as_secs(),
+                    })
+                }
             }
         };
 
@@ -561,7 +592,10 @@ impl Scout {
                 // The error is returned unchanged either way. `Timeout` in
                 // particular keeps its shape: CLAUDE.md and the timeout
                 // integration tests pin `exit_reason` containing "timed out",
-                // and a salvaged timeout is still a timeout.
+                // and a salvaged timeout is still a timeout. A `Suspended` run
+                // travels the same path and keeps the same salvage — the notes
+                // a scout streamed before the lid closed are the one thing the
+                // suspend did not cost it.
                 match state.checkpoint.take() {
                     Some(notes) => {
                         self.finalize_stopped_early(
@@ -586,21 +620,41 @@ impl Scout {
 
     /// Breadcrumb naming the deadline, written at expiry so the vm id and the
     /// budget land in the entry. Best-effort on purpose: a failed breadcrumb
-    /// must not skip the deallocation that is the whole point of the timeout.
-    async fn note_timeout(&self, task: &Task, vm_id: &VmId, secs: u64) {
-        warn!(task_id = %task.id, %vm_id, timeout_secs = secs, "scout timed out");
+    /// must not skip the deallocation that is the whole point of the deadline.
+    ///
+    /// One function for both sentences — a spent budget and a host that slept
+    /// through one — so the event-log note and the `exit_reason` the caller
+    /// writes cannot come to different conclusions about the same event.
+    async fn note_expiry(&self, task: &Task, vm_id: &VmId, expiry: &Expiry) {
+        let message = if expiry.host_slept() {
+            warn!(
+                task_id = %task.id,
+                %vm_id,
+                slept = %crate::deadline::human(expiry.suspended()),
+                awake = %crate::deadline::human(expiry.awake),
+                "the host was suspended while a scout was running"
+            );
+            format!(
+                "scout for {} abandoned: {expiry}; deallocating {vm_id}",
+                task.id
+            )
+        } else {
+            let secs = self.config.timeout.as_secs();
+            warn!(task_id = %task.id, %vm_id, timeout_secs = secs, "scout timed out");
+            format!(
+                "scout for {} timed out after {secs}s; deallocating {vm_id}",
+                task.id
+            )
+        };
         if let Err(e) = self
             .store
             .append_event(EventPayload::Note {
                 source: crate::run::DISPATCHER.into(),
-                message: format!(
-                    "scout for {} timed out after {secs}s; deallocating {vm_id}",
-                    task.id
-                ),
+                message,
             })
             .await
         {
-            warn!(task_id = %task.id, error = %e, "could not record the timeout note");
+            warn!(task_id = %task.id, error = %e, "could not record the expiry note");
         }
     }
 
@@ -1445,7 +1499,7 @@ mod tests {
         );
 
         // Still charged: a run that concluded with nothing usable, and one
-        // that had the entire wall-clock budget.
+        // that had the entire budget awake.
         assert_eq!(
             Strike::for_class(
                 ScoutError::ScoutFailed {
@@ -1459,6 +1513,42 @@ mod tests {
         assert_eq!(
             Strike::for_class(ScoutError::Timeout { secs: 1 }.failure_class()),
             Strike::Charge,
+        );
+    }
+
+    /// #929, on the scout side. A budget the host slept through is not a budget
+    /// the run spent, and the two clocks are what can tell them apart — so it
+    /// is `Transport` and costs the task nothing.
+    ///
+    /// The negative half is the same one next door: a deadline genuinely spent
+    /// awake still charges, or "nothing was charged" would read as the cap
+    /// having been switched off.
+    #[tokio::test]
+    async fn a_suspended_host_is_transport_and_costs_the_task_no_attempt() {
+        use crate::store::Strike;
+
+        let expiry =
+            Deadline::suspended_for(Duration::from_secs(3600), Duration::from_secs(8 * 3600))
+                .expired()
+                .await;
+        let suspended = ScoutError::Suspended(expiry);
+
+        assert_eq!(suspended.failure_class(), FailureClass::Transport);
+        assert_eq!(Strike::for_class(suspended.failure_class()), Strike::Waive,);
+        // And it must not be mistakable for the thing it replaces: two
+        // integration tests match `exit_reason` on this substring.
+        let reason = suspended.to_string();
+        assert!(!reason.contains("timed out"), "{reason}");
+        assert!(reason.contains("the host was suspended"), "{reason}");
+
+        // The negative half: a budget spent awake is still a verdict.
+        assert_eq!(
+            Strike::for_class(ScoutError::Timeout { secs: 3600 }.failure_class()),
+            Strike::Charge,
+        );
+        assert_eq!(
+            ScoutError::Timeout { secs: 3600 }.to_string(),
+            "scout timed out after 3600s"
         );
     }
 

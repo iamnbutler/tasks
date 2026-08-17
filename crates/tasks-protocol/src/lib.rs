@@ -46,9 +46,12 @@ pub enum FailureClass {
     /// including for every event that predates the field.
     #[default]
     Verdict,
-    /// The agent's connection to the API failed (#845). Transient by nature,
-    /// and below the agent in the VM's network path, so nothing about the work
-    /// is implicated.
+    /// Something below the run failed, rather than the run failing: the agent's
+    /// connection to the API dropping mid-response (#845), a finished branch
+    /// that could not be pushed, a vm-pool restart that took the event stream
+    /// away, or a host that suspended for most of the budget (#929). Nothing
+    /// about the work is implicated in any of them, and the note the waiver
+    /// writes names the specific error beside the class.
     Transport,
     /// Somebody stopped the run on purpose, before it could show whether it
     /// would have worked.
@@ -81,8 +84,8 @@ impl FailureClass {
         match self {
             Self::Verdict => None,
             Self::Transport => Some(
-                "the agent's connection to the API failed, which is an infrastructure \
-                 failure and not a verdict on the work",
+                "the run was interrupted by something underneath it rather than by the \
+                 work, which is an infrastructure failure and not a verdict",
             ),
             Self::Cancelled => Some(
                 "the run was stopped deliberately, before it could show whether it would \

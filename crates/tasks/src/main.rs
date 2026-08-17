@@ -76,7 +76,9 @@ above the cwd, then the nearest above this binary; the real environment wins):
                          more, so the pool must fit SCOUT_MAX_CONCURRENT + 1
                          with slack — see VM_POOL_MAX_VMS
   SCOUT_IMAGE            vm-pool image for scouts (default agent:v1)
-  SCOUT_TIMEOUT_SECS     wall-clock budget per scout (default 3600)
+  SCOUT_TIMEOUT_SECS     budget per scout (default 3600), measured on both
+                         the monotonic and the wall clock, so a host that
+                         slept through it reads as a suspend, not a timeout
   VM_POOL_SOCKET         vm-pool service socket (default /tmp/vm-pool.sock)
   VM_POOL_MAX_VMS        VMs `tasks vm-pool` holds at once (default 6). Read
                          by the pool, not by the server, so changing it means

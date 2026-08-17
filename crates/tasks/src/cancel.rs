@@ -2,10 +2,10 @@
 //!
 //! Both dispatchers spend almost all of a run parked on one `await`: the drain
 //! loop, reading a vm-pool event stream until the supervisor reports a terminal
-//! event. A wall-clock deadline already interrupts that await, by racing it in a
-//! `tokio::time::timeout`. A cancel is the same shape of interruption arriving
-//! from a different direction, so it travels the same way — [`bounded`] is
-//! `timeout` with a third arm.
+//! event. A run's deadline already interrupts that await, by racing it (see
+//! [`crate::deadline`]). A cancel is the same shape of interruption arriving
+//! from a different direction, so it travels the same way — [`bounded`] is that
+//! race with a third arm.
 //!
 //! That is the whole reason cancelling is not just `deallocate`. Destroying the
 //! VM out from under a parked drain does not wake it: the stream it is reading
@@ -31,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
+use crate::deadline::{Deadline, Expiry};
 use crate::events::EventPayload;
 use crate::models::RunKind;
 use crate::store::{CancelRequest, Store};
@@ -55,12 +56,14 @@ pub enum Bounded<T> {
     Completed(T),
     /// Somebody asked for this run to stop.
     Cancelled(CancelRequest),
-    /// The wall-clock budget ran out.
-    TimedOut,
+    /// The budget ran out on one of its two clocks. The [`Expiry`] is what says
+    /// *which*, and therefore whether the caller reports a timeout or a
+    /// suspended host — see [`crate::deadline`].
+    TimedOut(Expiry),
 }
 
 /// Run `work` until it finishes, until someone cancels this run, or until
-/// `budget` expires.
+/// `deadline` expires.
 ///
 /// **`biased`, with the work first.** The three arms are polled in order, so an
 /// outcome already in hand is never discarded for a cancel that happened to
@@ -76,7 +79,7 @@ pub async fn bounded<T>(
     store: &Store,
     kind: RunKind,
     id: &str,
-    budget: Duration,
+    deadline: &Deadline,
     work: impl Future<Output = T>,
 ) -> Bounded<T> {
     tokio::pin!(work);
@@ -84,7 +87,7 @@ pub async fn bounded<T>(
         biased;
         outcome = &mut work => Bounded::Completed(outcome),
         request = observe(store, kind, id) => Bounded::Cancelled(request),
-        _ = tokio::time::sleep(budget) => Bounded::TimedOut,
+        expiry = deadline.expired() => Bounded::TimedOut(expiry),
     }
 }
 
@@ -167,7 +170,7 @@ mod tests {
             &store,
             RunKind::Session,
             "sess_1",
-            Duration::from_secs(30),
+            &Deadline::starting_now(Duration::from_secs(30)),
             async { 7 },
         )
         .await;
@@ -186,7 +189,7 @@ mod tests {
             &store,
             RunKind::Session,
             "sess_1",
-            Duration::from_secs(30),
+            &Deadline::starting_now(Duration::from_secs(30)),
             std::future::pending::<()>(),
         )
         .await;
@@ -223,7 +226,7 @@ mod tests {
             &store,
             RunKind::Build,
             "build_1",
-            Duration::from_secs(30),
+            &Deadline::starting_now(Duration::from_secs(30)),
             std::future::pending::<()>(),
         )
         .await;
@@ -255,11 +258,11 @@ mod tests {
             &store,
             RunKind::Session,
             "build_1",
-            Duration::from_millis(150),
+            &Deadline::starting_now(Duration::from_millis(150)),
             std::future::pending::<()>(),
         )
         .await;
-        assert!(matches!(outcome, Bounded::TimedOut), "{outcome:?}");
+        assert!(matches!(outcome, Bounded::TimedOut(_)), "{outcome:?}");
         assert!(!announces(
             &EventPayload::RunCancelRequested {
                 run_kind: RunKind::Build,
@@ -282,11 +285,34 @@ mod tests {
             &store,
             RunKind::Session,
             "sess_1",
-            Duration::from_millis(100),
+            &Deadline::starting_now(Duration::from_millis(100)),
             std::future::pending::<()>(),
         )
         .await;
-        assert!(matches!(outcome, Bounded::TimedOut), "{outcome:?}");
+        assert!(matches!(outcome, Bounded::TimedOut(_)), "{outcome:?}");
+    }
+
+    /// And a deadline the *host* blew through, rather than the run: the same
+    /// arm fires, but the expiry it carries says the machine was asleep, which
+    /// is what the dispatchers turn into a `Suspended` rather than a `Timeout`.
+    #[tokio::test]
+    async fn a_suspended_host_expires_through_the_same_arm_and_says_so() {
+        let store = store().await;
+        let outcome = bounded(
+            &store,
+            RunKind::Build,
+            "build_1",
+            &Deadline::suspended_for(Duration::from_secs(3600), Duration::from_secs(8 * 3600)),
+            std::future::pending::<()>(),
+        )
+        .await;
+        match outcome {
+            Bounded::TimedOut(expiry) => {
+                assert!(expiry.host_slept(), "{expiry:?}");
+                assert!(!expiry.to_string().contains("timed out"), "{expiry}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The `biased` ordering, from the losing side: a cancel already on record
@@ -302,7 +328,7 @@ mod tests {
             &store,
             RunKind::Session,
             "sess_1",
-            Duration::from_secs(30),
+            &Deadline::starting_now(Duration::from_secs(30)),
             async { "concluded" },
         )
         .await;
