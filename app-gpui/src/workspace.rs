@@ -14,7 +14,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     actions, div, list, px, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, MouseButton, SharedString, Stateful, WeakEntity, Window,
+    FollowMode, ListAlignment, ListState, MouseButton, SharedString, WeakEntity, Window,
     WindowHandle,
 };
 use gpuikit::elements::context_menu::{menu_item, MenuItems};
@@ -44,7 +44,7 @@ use crate::nav::{MiddleView, NavHistory, TaskTab};
 use crate::palette::{
     GoToAnything, PaletteKind, PaletteState, SelectNextRow, SelectPrevRow, ShowCommandPalette,
 };
-use crate::projects::{self, ProjectFilter};
+use crate::projects::ProjectFilter;
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
@@ -56,6 +56,18 @@ pub(crate) const FONT: &str = "Menlo";
 /// Reading-width cap for conversation content — long markdown replies
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
+
+/// The signed-in human, hardcoded until device-flow login exists: the chat
+/// chip's avatar and where clicking it goes. One place on purpose — login
+/// replaces these two constants and nothing else.
+const GITHUB_PROFILE_URL: &str = "https://github.com/iamnbutler";
+const GITHUB_AVATAR_URL: &str = "https://avatars.githubusercontent.com/u/1714999?v=4";
+
+/// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
+/// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
+/// source. Stroke is gruvbox's muted gray, hardcoded because an `img` does
+/// not take the text color — acceptable for a control that ships disabled.
+const MIC_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#928374" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>"##;
 
 actions!(
     workspace,
@@ -229,13 +241,14 @@ pub struct Workspace {
     /// set, per-window and resetting on relaunch, exactly like [`Self::show_done`]
     /// — see [`crate::projects`] for why it is not a query parameter.
     pub(crate) project_filter: ProjectFilter,
-    /// The rail header's repo switcher.
-    ///
-    /// A popover rather than gpuikit's `context_menu` (right-click only) and
-    /// rather than a menu-bar menu: `set_menus` leaks a boxed action per item
-    /// on every rebuild, and the item list here *is* the project list, so a bar
-    /// that rebuilt on every add or archive would leak per repo per change.
-    project_switcher: Entity<PopoverState>,
+    /// The left rail is a two-level drill-down: the repo list up top, one
+    /// repo's tasks below. `true` shows the repo level — entered by the
+    /// header's ‹ chevron, left by choosing a repo.
+    pub(crate) rail_shows_repos: bool,
+    /// The chat chip's avatar, fetched once off the main thread. `None`
+    /// until it lands (or forever, offline) — the chip renders a quiet
+    /// placeholder circle rather than blocking on it.
+    avatar: Option<std::sync::Arc<gpui::Image>>,
     /// The rail header's ⋮ menu — the chrome that lost its titlebar slot
     /// (refresh, the Server window). A popover for the same leak reason as
     /// the switcher.
@@ -380,27 +393,6 @@ impl Workspace {
             state
         });
 
-        // The switcher's rows *are* the project list, so both callbacks read
-        // the workspace back out of a weak handle rather than closing over a
-        // snapshot that would be stale by the first archive.
-        let project_switcher = {
-            let trigger = cx.entity().downgrade();
-            let content = cx.entity().downgrade();
-            cx.new(|_cx| {
-                PopoverState::new(
-                    popover("project-switcher")
-                        .trigger(move |window, cx| {
-                            Self::render_switcher_trigger(&trigger, window, cx)
-                        })
-                        .content(move |window, cx| {
-                            Self::render_switcher_content(&content, window, cx)
-                        }),
-                )
-            })
-        };
-        cx.observe(&project_switcher, |_, _, cx| cx.notify())
-            .detach();
-
         let rail_overflow = {
             let content = cx.entity().downgrade();
             cx.new(|_cx| {
@@ -480,6 +472,42 @@ impl Workspace {
         let feed_list = ListState::new(0, ListAlignment::Top, px(2048.));
         feed_list.set_follow_mode(FollowMode::Tail);
 
+        // The avatar, once, off the main thread. A miss is a permanent
+        // placeholder, not a retry loop — this is chrome, not data.
+        {
+            let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
+            std::thread::Builder::new()
+                .name("tasks-avatar-fetch".into())
+                .spawn(move || {
+                    let Ok(response) = ureq::get(GITHUB_AVATAR_URL).call() else {
+                        return;
+                    };
+                    let mut bytes = Vec::new();
+                    use std::io::Read as _;
+                    if response.into_reader().read_to_end(&mut bytes).is_err() {
+                        return;
+                    }
+                    // GitHub serves avatars as PNG or JPEG depending on the
+                    // upload; sniff rather than trust the URL.
+                    let format = match bytes.first() {
+                        Some(0xFF) => gpui::ImageFormat::Jpeg,
+                        _ => gpui::ImageFormat::Png,
+                    };
+                    tx.send(gpui::Image::from_bytes(format, bytes)).ok();
+                })
+                .expect("spawn avatar-fetch thread");
+            cx.spawn(async move |this, cx| {
+                if let Ok(image) = rx.await {
+                    this.update(cx, |this: &mut Workspace, cx| {
+                        this.avatar = Some(std::sync::Arc::new(image));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
+
         Self {
             focus_handle,
             nav: NavHistory::default(),
@@ -514,7 +542,8 @@ impl Workspace {
             palette: None,
             palette_input,
             project_filter: ProjectFilter::All,
-            project_switcher,
+            rail_shows_repos: false,
+            avatar: None,
             rail_overflow,
             repo_input,
             repo_window: None,
@@ -1078,6 +1107,9 @@ impl Workspace {
     ) {
         self.project_filter = filter;
         self.pending_repo_selection = None;
+        // Choosing a repo is what leaves the repo level — the drill-down's
+        // way back, whichever surface the choice came from.
+        self.rail_shows_repos = false;
         let stale = {
             let state = self.app_state.read(cx);
             self.selected_task
@@ -1097,15 +1129,14 @@ impl Workspace {
     /// archived is the one on screen: you archive a repo while looking at it,
     /// and jumping to All repos in the same click hides the thing you were
     /// about to check.
-    fn set_project_status(&mut self, id: ProjectId, status: ProjectStatus, cx: &mut Context<Self>) {
+    pub(crate) fn set_project_status(
+        &mut self,
+        id: ProjectId,
+        status: ProjectStatus,
+        cx: &mut Context<Self>,
+    ) {
         self.app_state
             .update(cx, |state, cx| state.set_project_status(id, status, cx));
-    }
-
-    fn close_switcher(&mut self, cx: &mut Context<Self>) {
-        self.project_switcher.update(cx, |popover, cx| {
-            popover.close(cx);
-        });
     }
 
     /// Adopt a just-added repo once a snapshot names it. Called from the
@@ -1140,229 +1171,42 @@ impl Workspace {
             .icon_size(px(14.))
     }
 
-    /// The switcher's trigger: what the window is looking at, and a chevron
-    /// saying it can be changed.
-    ///
-    /// Nothing renders before the first snapshot — a placeholder would be a
-    /// claim about a repo we have not read — and with one repo configured it
-    /// is that repo's slug, so a single-repo window reads exactly as it did
-    /// before there was a switcher.
-    fn render_switcher_trigger(
-        workspace: &WeakEntity<Self>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let label = workspace
-            .read_with(cx, |this, cx| {
-                let state = this.app_state.read(cx);
-                projects::switcher_label(&state.projects, &this.project_filter)
-            })
-            .ok()
-            .flatten();
-        let theme = cx.theme().clone();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.))
-            .pl(px(6.))
-            .pr(px(4.))
-            .py(px(2.))
-            .rounded(px(4.))
-            .text_sm()
-            .text_color(theme.fg_muted())
-            .when(label.is_some(), |el| {
-                let hover_bg = theme.surface_secondary();
-                el.hover(move |el| el.bg(hover_bg))
-            })
-            .children(label.clone())
-            .when(label.is_some(), |el| {
-                el.child(
-                    Icons::chevron_down()
-                        .size(px(10.))
-                        .text_color(theme.fg_muted()),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// The switcher's rows: All repos, then every project in
-    /// [`projects::switcher_order`], then Add Repo.
-    fn render_switcher_content(
-        workspace: &WeakEntity<Self>,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let Ok((rows, filter, several)) = workspace.read_with(cx, |this, cx| {
-            let state = this.app_state.read(cx);
-            let rows: Vec<_> = projects::switcher_order(&state.projects)
-                .into_iter()
-                .map(|project| {
-                    (
-                        project.id.clone(),
-                        project.slug(),
-                        projects::status_note(project.status),
-                        projects::status_actions(project.status),
-                    )
-                })
-                .collect();
-            let several = state.projects.len() > 1;
-            (rows, this.project_filter.clone(), several)
-        }) else {
-            return div().into_any_element();
-        };
-
-        let row_style = |el: Stateful<Div>, selected: bool| {
-            let hover_bg = theme.surface_secondary();
-            el.flex()
-                .flex_col()
-                .gap(px(1.))
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(selected, |el| el.bg(theme.surface_tertiary()))
-                .hover(move |el| el.bg(hover_bg))
-        };
-
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .gap(px(1.))
-            .p(px(4.))
-            .min_w(px(240.))
-            .text_sm()
-            .text_color(theme.fg());
-
-        // Only offered when there is something to be "all" of. With one repo
-        // configured the window is already showing all of it.
-        if several {
-            let selected = filter.selected().is_none();
-            list = list.child(
-                row_style(div().id("switcher-all"), selected)
-                    .on_click({
-                        let workspace = workspace.clone();
-                        move |_event, window, cx| {
-                            workspace
-                                .update(cx, |this, cx| {
-                                    this.select_project(ProjectFilter::All, window, cx);
-                                    this.close_switcher(cx);
-                                })
-                                .ok();
-                        }
-                    })
-                    .child("All repos"),
-            );
-        }
-
-        for (id, slug, note, actions) in rows {
-            let selected = filter.selected() == Some(&id);
-            let mut row = row_style(
-                div().id(SharedString::from(format!("switcher-{id}"))),
-                selected,
-            )
-            .on_click({
-                let workspace = workspace.clone();
-                let id = id.clone();
-                move |_event, window, cx| {
-                    workspace
-                        .update(cx, |this, cx| {
-                            this.select_project(ProjectFilter::One(id.clone()), window, cx);
-                            this.close_switcher(cx);
-                        })
-                        .ok();
-                }
-            })
-            .child(div().truncate().child(slug));
-            // Only a repo that is subtracting something carries a note; the
-            // ordinary case earns no badge.
-            if let Some(note) = note {
-                row = row.child(div().text_xs().text_color(theme.fg_muted()).child(note));
-            }
-            // The status verbs sit under the repo they act on rather than in a
-            // submenu: there are at most two, and a repo's pipeline stopping is
-            // not a thing to bury.
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.))
-                    .pt(px(2.))
-                    .text_xs()
-                    .children(actions.into_iter().map(|action| {
-                        let workspace = workspace.clone();
-                        let id = id.clone();
-                        div()
-                            .id(SharedString::from(format!(
-                                "switcher-{id}-{}",
-                                action.status.as_str()
-                            )))
-                            .text_color(theme.fg_muted())
-                            .cursor_pointer()
-                            .tooltip(tooltip(action.note))
-                            .hover({
-                                let fg = theme.fg();
-                                move |el| el.text_color(fg)
-                            })
-                            .on_click(move |_event, _window, cx| {
-                                workspace
-                                    .update(cx, |this, cx| {
-                                        this.set_project_status(id.clone(), action.status, cx);
-                                        this.close_switcher(cx);
-                                    })
-                                    .ok();
-                            })
-                            .child(action.label)
-                    })),
-            );
-            list = list.child(row);
-        }
-
-        list.child(
-            div()
-                .mt(px(2.))
-                .pt(px(4.))
-                .border_t_1()
-                .border_color(theme.border_subtle())
-                .child(
-                    row_style(div().id("switcher-add-repo"), false)
-                        .on_click({
-                            let workspace = workspace.clone();
-                            move |_event, _window, cx| {
-                                workspace
-                                    .update(cx, |this, cx| {
-                                        this.close_switcher(cx);
-                                        this.open_repo_window(cx);
-                                    })
-                                    .ok();
-                            }
-                        })
-                        .child("Add repo…"),
-                ),
-        )
-        .into_any_element()
-    }
-
     /// The left rail's header — where the window chrome lives in the v3
-    /// design: traffic lights (inset), collapse chevron, the project
-    /// switcher, then the pipeline controls at the rail's right edge. No
-    /// bar spans the window anymore.
+    /// design: traffic lights (inset), the ‹ up-level chevron, the repo the
+    /// working set belongs to, then the pipeline controls at the rail's
+    /// right edge. No bar spans the window anymore.
+    ///
+    /// The rail is a drill-down, not a popover: ‹ goes up to the repo list,
+    /// choosing a repo comes back down. At the repo level the header names
+    /// the level instead — there is nothing above it to go to.
     pub(crate) fn render_rail_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let mode = self.app_state.read(cx).mode;
 
-        pane_header("rail-header")
-            .traffic_light_inset()
-            .child(
-                Self::header_button("toggle-left-sidebar", Icons::panel_left())
-                    .tooltip(tooltip("Hide sidebar (⌘B)"))
-                    .on_click(|_event, window, cx| {
-                        window.dispatch_action(Box::new(ToggleLeftDock), cx);
-                    }),
-            )
-            // The repo the working set belongs to, and the control that
-            // changes it.
-            .child(self.project_switcher.clone())
+        let mut header = pane_header("rail-header").traffic_light_inset();
+        if self.rail_shows_repos {
+            header = header.child(
+                div()
+                    .pl(px(4.))
+                    .text_sm()
+                    .text_color(theme.fg_muted())
+                    .child("Repos"),
+            );
+        } else {
+            header = header
+                .child(
+                    Self::header_button("rail-up", Icons::chevron_left())
+                        .tooltip(tooltip("Repos"))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.rail_shows_repos = true;
+                            cx.notify();
+                        })),
+                )
+                // `owner repo`, two-tone per the design. Text, not a
+                // control — changing it is the chevron's job now.
+                .child(self.render_repo_label(cx));
+        }
+        header
             .child(div().flex_1())
             .child(
                 Self::header_button("mode-play", Icons::play())
@@ -1383,6 +1227,42 @@ impl Workspace {
             // The rest of the chrome, behind ⋮ — the design gives the rail
             // exactly three controls' worth of width.
             .child(self.rail_overflow.clone())
+    }
+
+    /// The header's `owner repo` label: owner muted, repo at full contrast,
+    /// the design's two tones. The rules (nothing before the first snapshot,
+    /// one repo named rather than counted, "All repos" as a scope) live in
+    /// [`projects::repo_label`], where they are tested.
+    fn render_repo_label(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let state = self.app_state.read(cx);
+        let label = crate::projects::repo_label(&state.projects, &self.project_filter);
+        let row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(2.))
+            .text_sm();
+        match label {
+            Some(label) => {
+                // A scope ("All repos") reads muted throughout; a name gets
+                // the two tones.
+                let scope = label.owner.is_none();
+                row.children(
+                    label
+                        .owner
+                        .map(|owner| div().text_color(theme.fg_muted()).child(owner)),
+                )
+                .child(
+                    div()
+                        .text_color(if scope { theme.fg_muted() } else { theme.fg() })
+                        .child(label.name),
+                )
+                .into_any_element()
+            }
+            None => row.into_any_element(),
+        }
     }
 
     /// The ⋮ trigger.
@@ -1541,7 +1421,81 @@ impl Workspace {
                     }
                 }
             })
-            .child(div().flex().flex_col().flex_1().min_h(px(0.)).child(chat))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(chat)
+                    // Floated last so it paints above the conversation.
+                    .child(self.render_chat_chip(cx)),
+            )
+    }
+
+    /// The chip at the chat's top-right, per the design: the mic (voice mode
+    /// with the orchestrator, later — shipped disabled so the slot exists),
+    /// a divider, and the signed-in human's avatar, which opens their GitHub
+    /// profile until device-flow login gives it more to do.
+    fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let mic = std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            MIC_SVG.to_vec(),
+        ));
+
+        let avatar: gpui::AnyElement = match self.avatar.clone() {
+            Some(image) => gpui::img(image)
+                .size(px(22.))
+                .rounded_full()
+                .into_any_element(),
+            // Offline, or not landed yet: a quiet placeholder, same
+            // footprint, still a working link.
+            None => div()
+                .size(px(22.))
+                .rounded_full()
+                .bg(theme.surface_tertiary())
+                .into_any_element(),
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .pl(px(10.))
+            .pr(px(8.))
+            .py(px(5.))
+            .rounded_bl(px(14.))
+            .bg(theme.surface_secondary())
+            .child(
+                div()
+                    .id("voice-mode")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.))
+                    .opacity(0.45)
+                    .cursor_not_allowed()
+                    .tooltip(tooltip("Voice mode — coming soon"))
+                    .child(gpui::img(mic).size(px(15.))),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_secondary()))
+            .child(
+                div()
+                    .id("github-profile")
+                    .flex_none()
+                    .cursor_pointer()
+                    .tooltip(tooltip("iamnbutler on GitHub"))
+                    .on_click(|_event, _window, cx| {
+                        cx.open_url(GITHUB_PROFILE_URL);
+                    })
+                    .child(avatar),
+            )
     }
 
     /// One chat row. Durable turns and the live tick's trail entries share

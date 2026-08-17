@@ -25,6 +25,10 @@ chrono = "0.4"
 # parse is defensive (`Value`, not typed), because the shape belongs to
 # Claude Code.
 serde_json = "1"
+# One blocking GET on a background thread: the GitHub avatar. Default
+# features (TLS) deliberately — unlike the workspace's loopback-only ureq,
+# this one leaves the machine.
+ureq = "2"
 
 [dev-dependencies]
 # The Server menu's model reads a pidfile and drives a child process; both

@@ -37,7 +37,7 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{Project, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState};
 
-use crate::components::{move_to, sidebar, sortable, task_state_color, SidebarSide};
+use crate::components::{move_to, sidebar, sortable, task_state_color, Sidebar, SidebarSide};
 use crate::nav::MiddleView;
 use crate::projects::{self, ProjectFilter};
 use crate::state::is_picked_up;
@@ -197,6 +197,11 @@ struct RailDrag {
 
 impl Workspace {
     pub(crate) fn render_left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The rail's upper level: the repo list. Same shell (header, resize,
+        // banner), different body — a drill-down, not a second sidebar.
+        if self.rail_shows_repos {
+            return self.render_repo_level(cx);
+        }
         let theme = cx.theme().clone();
         let (text, text_muted, selected_bg, hover_bg) = (
             theme.fg(),
@@ -447,6 +452,179 @@ impl Workspace {
                 )
             })
             .child(self.render_rail_composer(cx))
+    }
+
+    /// The rail's repo level: every added repo, the All-repos scope, and the
+    /// way to add one — what the switcher popover used to hold, as a level
+    /// of the rail instead. Choosing anything goes back down to its tasks.
+    fn render_repo_level(&self, cx: &mut Context<Self>) -> Sidebar {
+        let theme = cx.theme().clone();
+        let (text, text_muted, selected_bg, hover_bg) = (
+            theme.fg(),
+            theme.fg_muted(),
+            theme.surface_tertiary(),
+            theme.surface_secondary(),
+        );
+
+        // Owned rows first, as everywhere: listeners need `cx` after the
+        // borrow ends.
+        let (rows, several) = {
+            let state = self.app_state.read(cx);
+            let rows: Vec<_> = projects::switcher_order(&state.projects)
+                .into_iter()
+                .map(|project| {
+                    (
+                        project.id.clone(),
+                        project.repo_owner.clone(),
+                        project.repo_name.clone(),
+                        projects::status_note(project.status),
+                        projects::status_actions(project.status),
+                    )
+                })
+                .collect();
+            (rows, state.projects.len() > 1)
+        };
+        let filter = self.project_filter.clone();
+
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .pt(px(4.))
+            .id("repo-level-scroll")
+            .overflow_y_scroll();
+
+        // Only offered when there is something to be "all" of. With one
+        // repo configured the window is already showing all of it.
+        if several {
+            let selected = filter.selected().is_none();
+            list = list.child(
+                div()
+                    .id("repo-all")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .mx(px(6.))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
+                    .when(selected, |el| el.bg(selected_bg))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.select_project(ProjectFilter::All, window, cx);
+                    }))
+                    .child(div().text_sm().text_color(text).child("All repos")),
+            );
+        }
+
+        for (id, owner, name, note, actions) in rows {
+            let selected = filter.selected() == Some(&id);
+            let mut row = div()
+                .id(SharedString::from(format!("repo-{id}")))
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .mx(px(6.))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(!selected, |el| el.hover(move |el| el.bg(hover_bg)))
+                .when(selected, |el| el.bg(selected_bg))
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _event, window, cx| {
+                        this.select_project(ProjectFilter::One(id.clone()), window, cx);
+                    }
+                }))
+                // The header's two tones, in the list too.
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_sm()
+                        .child(div().text_color(text_muted).child(owner))
+                        .child(div().text_color(text).child(name)),
+                );
+            // Only a repo that is subtracting something carries a note; the
+            // ordinary case earns no badge.
+            if let Some(note) = note {
+                row = row.child(div().text_xs().text_color(text_muted).child(note));
+            }
+            // The status verbs sit under the repo they act on: there are at
+            // most two, and a repo's pipeline stopping is not a thing to
+            // bury.
+            if !actions.is_empty() {
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.))
+                        .pt(px(2.))
+                        .text_xs()
+                        .children(actions.into_iter().map(|action| {
+                            let id = id.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "repo-{id}-{}",
+                                    action.status.as_str()
+                                )))
+                                .text_color(text_muted)
+                                .cursor_pointer()
+                                .tooltip(tooltip(action.note))
+                                .hover(move |el| el.text_color(text))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.set_project_status(id.clone(), action.status, cx);
+                                }))
+                                .child(action.label)
+                        })),
+                );
+            }
+            list = list.child(row);
+        }
+
+        sidebar(SidebarSide::Left, self.left_sidebar.width)
+            .on_resize_start({
+                let entity = cx.entity().downgrade();
+                move |_event, _window, cx| {
+                    if let Some(workspace) = entity.upgrade() {
+                        workspace.update(cx, |this, cx| {
+                            this.resizing = Some(SidebarSide::Left);
+                            cx.notify();
+                        });
+                    }
+                }
+            })
+            .child(self.render_rail_header(cx))
+            .child(list)
+            .child(
+                div()
+                    .flex_none()
+                    .m(px(6.))
+                    .pt(px(4.))
+                    .border_t_1()
+                    .border_color(theme.border_subtle())
+                    .child(
+                        div()
+                            .id("repo-add")
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(text_muted)
+                            .hover(move |el| el.bg(hover_bg))
+                            .on_click(|_event, window, cx| {
+                                window.dispatch_action(Box::new(crate::workspace::AddRepo), cx);
+                            })
+                            .child("Add repo…"),
+                    ),
+            )
     }
 
     /// One tree row: title, number, state glyph; a drag source and target
