@@ -63,10 +63,13 @@ pub enum OrchestratorError {
     },
     #[error("agent timed out after {secs}s")]
     Timeout { secs: u64 },
-    /// The tick's budget ran out because the machine was asleep for it. No
-    /// strike hangs off an orchestrator turn, so this buys no waiver — it buys
-    /// the answer to "why did the orchestrator stop reporting overnight",
-    /// which `agent timed out after 900s` is not.
+    /// The tick's budget ran out with enough of it unspent that the machine,
+    /// not the agent, is what consumed it. No strike hangs off an orchestrator
+    /// turn, so this buys no waiver — it buys the answer to "why did the
+    /// orchestrator stop reporting overnight", which `agent timed out after
+    /// 900s` is not. It reads the same [`Expiry::starved_by_suspend`] the two
+    /// dispatchers do, deliberately: two answers to "was this a suspend" is how
+    /// the feed and the ledger start disagreeing about the same night.
     #[error("agent abandoned: {0}")]
     Suspended(Expiry),
 }
@@ -431,7 +434,7 @@ impl Orchestrator {
             deadline::bounded(&deadline, read)
                 .await
                 .map_err(|expiry| {
-                    if expiry.host_slept() {
+                    if expiry.starved_by_suspend() {
                         OrchestratorError::Suspended(expiry)
                     } else {
                         OrchestratorError::Timeout {
@@ -1500,7 +1503,7 @@ mod tests {
             Deadline::suspended_for(Duration::from_secs(900), Duration::from_secs(8 * 3600))
                 .expired()
                 .await;
-        assert!(expiry.host_slept(), "{expiry:?}");
+        assert!(expiry.starved_by_suspend(), "{expiry:?}");
 
         let suspended = OrchestratorError::Suspended(expiry).to_string();
         assert!(suspended.contains("the host was suspended"), "{suspended}");

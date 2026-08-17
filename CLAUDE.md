@@ -282,7 +282,8 @@ implementation.
   because a lost terminal event does not cost a strike — it costs the run its
   outcome and hangs it until the deadline. What stays charged is deliberate and
   is what the negative tests pin: an agent that ran to completion and produced
-  nothing usable, a `Timeout` that had the entire budget **awake**, an OOM kill (a memory
+  nothing usable, a `Timeout` that had all but a small share of the budget
+  **awake** (a nap the run worked through is still a timeout — #944), an OOM kill (a memory
   limit is a real property of the work in that VM, and #828 exists to make that
   death legible as itself), and every pre-agent setup failure — a clone against
   a base branch that is gone fails identically every time, and waiving it would
@@ -626,12 +627,42 @@ because both anchors are kept, the time the host was not running is a
 (`{Scout,Builder,Orchestrator}Error::Suspended`), its own `exit_reason` sentence
 and `FailureClass::Transport`.
 
-Four things about it are load-bearing. The **monotonic reading is the floor**
-(`wall.elapsed().unwrap_or(awake).max(awake)`) — wall-clock alone would hand the
-deadline to `settimeofday`, where an NTP step could retire a run that had barely
-started or, stepping backwards, postpone one forever, so a clock adjustment can
-only ever degrade to the behaviour that shipped before while a suspend is still
-caught. The deadline **polls** on a 30s tick rather than sleeping the remainder,
+**Two thresholds, because "was the host asleep" and "was the run given its
+budget" are different questions.** One constant answering both is #944: the
+deadline fires on `max(wall, awake)`, so a run whose host napped *at all* can
+never reach its budget awake, and a single 61-second nap anywhere inside an hour
+waived the strike for a run that spent 59 of its 60 minutes working.
+`WAKE_KILL_FLOOR` (5 minutes) is **availability** and gates the wall-clock arm of
+the expiry itself — below it the wall arm is disarmed and the run drains its
+monotonic budget as it did before the module existed, which is right because the
+in-VM supervisor already re-invokes an agent whose connection dropped
+(`{SCOUT,BUILDER}_MAX_RESUMES`, the failure a short nap causes) and killing the
+run throws that recovery away. It is cumulative, so three four-minute naps trip
+it, and a run can outlive its wall-clock budget by less than that floor, never
+more. `WAIVED_BUDGET_SHARE` (a quarter) is **accountability**, read as how much
+of the budget went *unspent awake* (`budget − awake`) — a fraction and not a flat
+ten minutes because every budget it reads against is configurable and shorter
+ones (the reattach remainder, floored at 30s) would make a flat floor
+unreachable. `Expiry::starved_by_suspend` is that predicate, and it — not "did
+the host sleep" — is what picks `Suspended` over `Timeout` at all three
+consumers. It needs no second "was that really a suspend" test: an expiry only
+happens with `elapsed >= budget`, so `unspent <= suspended` always, and two
+clocks read microseconds apart leave nothing unspent. The split creates a
+**middle state** with its own sentence: a long nap arriving late is killed at the
+wake *and* charged, because a run that had fifty minutes of its hour and produced
+nothing is a verdict — the same twenty minutes arriving early leaves forty and is
+waived.
+
+Four more things are load-bearing. The **monotonic reading is the floor**
+(`wall.elapsed().unwrap_or(awake).max(awake)`), and the two directions of a clock
+adjustment are **not** symmetric: a step *backwards* is fully neutralised and
+degrades to the monotonic behaviour that shipped before, while a step *forwards*
+is taken by `max()` and adds elapsed time the run never had, so a large enough
+one retires a run early and reports a suspend that never happened. Nothing can
+tell that from a lid, because the measurement *is* the disagreement between the
+clocks; that is accepted rather than solved, and what bounds the bill is
+`WAKE_KILL_FLOOR` — a forward step under it costs nothing at all. The deadline
+**polls** on a 30s tick rather than sleeping the remainder,
 because that is what makes it fire on the *wake* instead of once the leftover
 monotonic budget finally drains; the tick must stay well under any budget anyone
 would configure, since it bounds how long after a wake a doomed run stays parked
@@ -934,12 +965,12 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once. Each holds a vm-pool slot and the serial build lane holds one more, so the pool must fit `SCOUT_MAX_CONCURRENT + 1` — 3 is the recommended ceiling against the default pool of 6, and the server `warn!`s on every connect if the pool it found is short or an exact fit. See *Pool capacity* |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
-| `SCOUT_TIMEOUT_SECS` | 3600 | budget per scout, measured on both clocks (see *Budgets and a host that sleeps*); past it the VM is deallocated and the attempt counts as a dispatch failure — unless the host was asleep for it, which is `Suspended` and costs nothing. Keep below vm-pool's `vm_timeout` (7200) |
+| `SCOUT_TIMEOUT_SECS` | 3600 | budget per scout, measured on both clocks (see *Budgets and a host that sleeps*); past it the VM is deallocated and the attempt counts as a dispatch failure — unless the host was asleep for enough of it (a quarter of the budget left unspent), which is `Suspended` and costs nothing. Keep below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
 | `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES` | 2 | times a supervisor re-invokes an agent with `--resume <session_id>` after its API connection dropped mid-response (#845). Only a transport death is retried, and the backoff rises 2s / 15s / 30s. `0` disables it. Read *inside* the VM, so both live in `images/{scout,builder}/Dockerfile` |
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
-| `BUILDER_TIMEOUT_SECS` | 3600 | budget per build, allocation included, measured on both clocks (see *Budgets and a host that sleeps*). Past it the VM is deallocated, the build fails and every spec in the batch is charged a build attempt — unless the host was asleep for it, which is `Suspended` and charges nothing (#929). Same ceiling argument as the scout's: keep it below vm-pool's `vm_timeout` (7200) |
+| `BUILDER_TIMEOUT_SECS` | 3600 | budget per build, allocation included, measured on both clocks (see *Budgets and a host that sleeps*). Past it the VM is deallocated, the build fails and every spec in the batch is charged a build attempt — unless the host was asleep for enough of it (a quarter of the budget left unspent), which is `Suspended` and charges nothing (#929). Same ceiling argument as the scout's: keep it below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |

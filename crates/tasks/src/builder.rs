@@ -69,14 +69,16 @@ pub enum BuilderError {
     Egress(String),
     #[error("vm-pool event stream closed before completion")]
     StreamClosed,
-    /// Deadline hit with the host awake throughout. `secs` is the *configured*
-    /// budget, never the expiry's: on the reattach path the effective budget is
-    /// the remainder.
+    /// Deadline hit with the run awake for essentially all of it — a host that
+    /// merely napped and a run that still spent its budget land here, which is
+    /// #944. `secs` is the *configured* budget, never the expiry's: on the
+    /// reattach path the effective budget is the remainder.
     #[error("build timed out after {secs}s")]
     Timeout { secs: u64 },
-    /// The budget ran out because the machine was asleep for most of it, which
-    /// the two clocks in [`crate::deadline`] can tell apart from a run that
-    /// spent its budget. This is #929 itself: a build dispatched at 03:44, a
+    /// The budget ran out with enough of it *unspent* that the run was never
+    /// given its time, which the two clocks in [`crate::deadline`] measure and
+    /// [`Expiry::starved_by_suspend`] draws the line on. This is #929 itself: a
+    /// build dispatched at 03:44, a
     /// lid closed from 04:22, and `build timed out after 3600s` three and a
     /// half minutes after it opened again — nine hours of the serial lane and
     /// a build attempt charged to three specs for a run that had 38 minutes.
@@ -101,7 +103,8 @@ impl BuilderError {
     /// class and the underlying error, so the failure stays exactly as
     /// visible, and what charging would add is only the strike. `Suspended` is
     /// the third, and the one #929 was filed for. `Timeout` is charged for the
-    /// reason a scout's is: the run had the entire budget *awake*.
+    /// reason a scout's is: the run had all but a small share of the budget
+    /// *awake*.
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::BuildFailed { class, .. } => *class,
@@ -129,7 +132,9 @@ impl BuilderError {
             // And a suspend is the same argument again, with the measurement
             // to back it: the two clocks say how much of the budget the run
             // was actually awake for, and #929 was 38 minutes of an hour. A
-            // strike is charged for a verdict and for nothing else.
+            // strike is charged for a verdict and for nothing else. What #944
+            // changed is only which expiries reach this arm — the class is
+            // unconditionally `Transport` and always was.
             Self::Suspended(_) => FailureClass::Transport,
             // `Client(_)` stays a verdict deliberately, not by oversight.
             // `Store::finalize_build_unsuccessfully` only charges `if
@@ -153,8 +158,8 @@ pub struct BuilderConfig {
     pub vm_config: VmConfig,
     /// Budget for one build (`BUILDER_TIMEOUT_SECS`), allocation included.
     /// Measured on both the monotonic and the wall clock (see
-    /// [`crate::deadline`]), so a host that slept through it fails with
-    /// [`BuilderError::Suspended`] rather than [`BuilderError::Timeout`].
+    /// [`crate::deadline`]), so a host that slept through enough of it fails
+    /// with [`BuilderError::Suspended`] rather than [`BuilderError::Timeout`].
     pub timeout: Duration,
     /// Where per-build scratch repos live (removed after each build,
     /// success or failure) — and, under `rejected/`, the bundles egress could
@@ -405,7 +410,9 @@ impl Builder {
             // Said here rather than only in `dispatch`'s failure warn, which
             // runs *after* teardown: in the incident that was 15:37 to 17:50 of
             // silence between the budget expiring and anyone being told.
-            Bounded::TimedOut(expiry) if expiry.host_slept() => {
+            // The guarded arm stays first: the unguarded one below it catches
+            // everything else, including the middle state #944 created.
+            Bounded::TimedOut(expiry) if expiry.starved_by_suspend() => {
                 warn!(
                     build_id = %build.id,
                     %vm_id,
@@ -415,10 +422,17 @@ impl Builder {
                 );
                 Err(BuilderError::Suspended(expiry))
             }
-            Bounded::TimedOut(_) => {
+            // Bound rather than `_`: this is the only place the middle state is
+            // visible at all — a run killed at a wake with budget still on the
+            // monotonic clock, charged for the budget it had almost all of.
+            // `Timeout`'s own message is the *configured* number and is pinned,
+            // so it cannot carry the measurement.
+            Bounded::TimedOut(expiry) => {
                 warn!(
                     build_id = %build.id,
                     secs = self.config.timeout.as_secs(),
+                    slept = %crate::deadline::human(expiry.suspended()),
+                    awake = %crate::deadline::human(expiry.awake),
                     "build budget exhausted; tearing the VM down"
                 );
                 // The *configured* budget, never the expiry's: a resumed build
@@ -1425,6 +1439,40 @@ mod tests {
         assert_eq!(
             BuilderError::Timeout { secs: 3600 }.to_string(),
             "build timed out after 3600s"
+        );
+    }
+
+    /// #944, and the boundary from both sides. A build that napped for a minute
+    /// and worked for the other fifty-nine routes to `Timeout` and is charged —
+    /// under the single 60-second floor it was waived, which is a strike quietly
+    /// switched off by a lid that cost the run nothing. And a build that got 45
+    /// minutes of its hour has exactly a quarter of the budget unspent, which is
+    /// the waiver's lower edge and clears it.
+    #[test]
+    fn a_build_that_merely_napped_is_charged_and_the_quarter_is_the_edge() {
+        use crate::store::Strike;
+
+        let napped = Expiry {
+            budget: Duration::from_secs(3600),
+            elapsed: Duration::from_secs(3600 + 61),
+            awake: Duration::from_secs(3600),
+        };
+        assert!(!napped.starved_by_suspend(), "{napped:?}");
+        assert_eq!(
+            Strike::for_class(BuilderError::Timeout { secs: 3600 }.failure_class()),
+            Strike::Charge,
+        );
+
+        let edge = Expiry {
+            budget: Duration::from_secs(3600),
+            elapsed: Duration::from_secs(3600),
+            awake: Duration::from_secs(45 * 60),
+        };
+        assert_eq!(edge.unspent(), Duration::from_secs(15 * 60));
+        assert!(edge.starved_by_suspend(), "{edge:?}");
+        assert_eq!(
+            Strike::for_class(BuilderError::Suspended(edge).failure_class()),
+            Strike::Waive,
         );
     }
 
