@@ -308,7 +308,7 @@ mod tests {
         .await;
         match outcome {
             Bounded::TimedOut(expiry) => {
-                assert!(expiry.host_slept(), "{expiry:?}");
+                assert!(expiry.starved_by_suspend(), "{expiry:?}");
                 assert!(!expiry.to_string().contains("timed out"), "{expiry}");
             }
             other => panic!("{other:?}"),

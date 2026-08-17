@@ -18,15 +18,45 @@
 //! give it its own error, its own `exit_reason` and
 //! [`FailureClass::Transport`](crate::protocol::FailureClass::Transport).
 //!
+//! # The two thresholds, and why they are not one
+//!
+//! An expiry is asked two questions, and they have different answers:
+//!
+//! 1. *Availability* — should this run be abandoned at the wake, or handed the
+//!    monotonic budget it still has? [`WAKE_KILL_FLOOR`] answers that, and it
+//!    gates the wall-clock arm of the expiry itself.
+//! 2. *Accountability* — did the run get enough of its budget to be judged on
+//!    what it produced? [`WAIVED_BUDGET_SHARE`] answers that, via
+//!    [`Expiry::starved_by_suspend`], and it is what picks `Suspended` over
+//!    `Timeout` at the dispatchers.
+//!
+//! One constant answering both is #944. Because the deadline fires on
+//! `max(wall, awake)`, a run whose host napped *at all* can never reach its
+//! budget awake — so a single 61-second nap anywhere inside an hour waived the
+//! strike for a run that spent 59 of its 60 minutes working. "The host slept"
+//! is simply not the question a strike hangs on; "how much of the budget went
+//! unspent" is.
+//!
 //! # Why the monotonic reading is the floor
 //!
 //! [`Expiry::elapsed`] is `max(wall, awake)`, never the wall reading alone.
-//! Wall-clock alone would hand the deadline to `settimeofday`: an NTP step
-//! forwards could retire a run that had barely started, and a step backwards
-//! could postpone one forever. Taking the larger of the two means a clock
-//! adjustment can only ever degrade to the behaviour that shipped before this
-//! module, while a suspend — the only thing that can legitimately make
-//! wall-clock elapsed exceed monotonic elapsed — is still caught.
+//! Wall-clock alone would hand the deadline to `settimeofday`, and the two
+//! directions are *not* symmetric. A step **backwards** is fully neutralised:
+//! `max()` discards it, and the deadline degrades to exactly the monotonic
+//! behaviour that shipped before this module. A step **forwards** is not —
+//! `max()` takes it, so it adds elapsed time the run never had, and a large
+//! enough one retires a run early while reporting a suspend that never
+//! happened.
+//!
+//! Nothing here can tell that apart from a real suspend, because the
+//! measurement *is* the disagreement between the two clocks: a lid and an NTP
+//! step forwards leave the same trace. That is accepted rather than solved —
+//! solving it would mean a third source of truth about time, on a laptop, to
+//! catch a case that is rarer than the one this module exists for. What has
+//! changed since #944 is that the bill is bounded: a forward step smaller than
+//! [`WAKE_KILL_FLOOR`] leaves the wall arm disarmed and costs the run nothing
+//! at all, and one larger than it costs the run its remaining budget but only
+//! waives the strike if the step is also a quarter of that budget or more.
 //!
 //! # What a suspend costs the run
 //!
@@ -56,12 +86,38 @@ use tokio::time::Instant;
 /// configure.
 const WALL_CLOCK_TICK: Duration = Duration::from_secs(30);
 
-/// How far the two clocks must disagree before the gap is called a suspend.
+/// How long the host must have been away before a run that still has monotonic
+/// budget left is abandoned at the wake.
 ///
-/// The direction of the uncertainty is the whole argument: misreading a real
+/// This is an *availability* threshold and it is measured in minutes, because
+/// the pipeline is already built to survive a short absence: the supervisor
+/// inside the VM re-invokes an agent whose API connection dropped mid-response
+/// (`{SCOUT,BUILDER}_MAX_RESUMES`, on a 2s/15s/30s backoff), which is exactly
+/// what a brief nap causes. Killing a run for that throws away work the
+/// pipeline would have recovered by itself. Past a few minutes the resume
+/// ladder is spent, and what is left is a dead run holding the serial lane.
+///
+/// Two properties are worth stating outright. The gap is *cumulative* since the
+/// deadline started, so three four-minute naps trip it even though no single
+/// one does. And because the wall arm is disarmed below it, a run can outlive
+/// its wall-clock budget by **less than this floor, never more**.
+const WAKE_KILL_FLOOR: Duration = Duration::from_secs(5 * 60);
+
+/// The share of the budget that must have gone unspent awake before the strike
+/// is waived.
+///
+/// This is an *accountability* threshold, and unlike [`WAKE_KILL_FLOOR`] it is
+/// a fraction rather than a duration. Every budget it is read against is
+/// configurable — `SCOUT_TIMEOUT_SECS`, `BUILDER_TIMEOUT_SECS`,
+/// `ORCHESTRATOR_TIMEOUT_SECS` (900s today) — and the reattach paths derive
+/// budgets shorter still. Against a 600s budget, "ten minutes unspent" is
+/// satisfiable only by a run that was never awake at all, so a flat floor would
+/// make the waiver quietly unreachable exactly where runs are shortest.
+///
+/// The direction of the uncertainty is unchanged from #929: misreading a real
 /// timeout as a suspend costs one extra attempt, and misreading a suspend as a
-/// timeout is #929.
-const SUSPEND_FLOOR: Duration = Duration::from_secs(60);
+/// timeout charged three specs each for a closed lid.
+const WAIVED_BUDGET_SHARE: f64 = 0.25;
 
 /// A budget anchored on both clocks, expiring on whichever runs out first.
 ///
@@ -96,21 +152,22 @@ impl Deadline {
         self.budget
     }
 
-    /// Resolve when the budget has run out on either clock.
+    /// Resolve when the budget has run out on either armed clock.
     ///
     /// Polls rather than sleeping the whole remainder, because the monotonic
     /// sleep a suspend interrupts would otherwise still have to drain before
-    /// anyone learned the host had been away.
+    /// anyone learned the host had been away. The [`WALL_CLOCK_TICK`] cap is
+    /// also what *arms* the wall arm mid-sleep: a nap that starts during one is
+    /// seen a tick later, never a budget later.
+    ///
+    /// The firing decision itself is [`Expiry::remaining`], so the gate and the
+    /// sleep interval are one expression and cannot drift apart.
     pub async fn expired(&self) -> Expiry {
         loop {
             let reading = self.reading();
-            let remaining = self.budget.saturating_sub(reading.elapsed);
-            if remaining.is_zero() {
+            let Some(remaining) = reading.remaining() else {
                 return reading;
-            }
-            // `elapsed` is already the later of the two clocks, so this is the
-            // smaller of the two remainders — the deadline fires on whichever
-            // budget runs out first, and never early on either.
+            };
             tokio::time::sleep(remaining.min(WALL_CLOCK_TICK)).await;
         }
     }
@@ -138,6 +195,11 @@ impl Deadline {
     /// `scout`/`builder` unit tests, `crates/tasks/tests/` cannot see it, and
     /// making the anchors publicly overridable to buy an integration-level
     /// suspend test is the worse trade.
+    ///
+    /// A `suspended` under [`WAKE_KILL_FLOOR`] leaves the wall arm disarmed, so
+    /// the deadline still takes the full `budget` in real monotonic time before
+    /// it fires. That is what makes the short-nap case expressible as a test at
+    /// all — and why the test that needs it passes a millisecond budget.
     #[cfg(test)]
     pub(crate) fn suspended_for(budget: Duration, suspended: Duration) -> Self {
         Self {
@@ -168,24 +230,84 @@ impl Expiry {
         self.elapsed.saturating_sub(self.awake)
     }
 
-    /// Whether that gap is big enough to call a suspend rather than the two
-    /// clocks being read microseconds apart.
-    pub fn host_slept(&self) -> bool {
-        self.suspended() >= SUSPEND_FLOOR
+    /// How much of the budget the run never got, because the host was not
+    /// running to give it.
+    pub fn unspent(&self) -> Duration {
+        self.budget.saturating_sub(self.awake)
+    }
+
+    /// Whether enough of the budget went unspent for the strike to be waived.
+    ///
+    /// Measured on [`Self::unspent`] and deliberately **never** on
+    /// [`Self::suspended`]. A twenty-minute lid arriving in the last stretch of
+    /// an hour leaves a run that had fifty minutes awake and produced nothing,
+    /// and CLAUDE.md's rule charges that: a strike is for a verdict, and fifty
+    /// minutes of an hour is one. The same twenty minutes arriving early leaves
+    /// a run that had forty, and that is not.
+    ///
+    /// One measurement suffices, and no second "was that really a suspend"
+    /// test belongs here: an expiry only ever happens with `elapsed >= budget`,
+    /// so `unspent = budget − awake <= elapsed − awake = suspended`. Budget lost
+    /// can never exceed the suspend that lost it, which subsumes the job the old
+    /// 60-second floor was doing — two clocks read microseconds apart leave
+    /// nothing unspent.
+    pub fn starved_by_suspend(&self) -> bool {
+        self.unspent() >= self.budget.mul_f64(WAIVED_BUDGET_SHARE)
+    }
+
+    /// Whether this run was abandoned at a wake with budget still on the
+    /// monotonic clock — the middle state the split creates, and the only one
+    /// that is both a suspend and a charge.
+    fn wake_killed(&self) -> bool {
+        !self.unspent().is_zero() && self.suspended() >= WAKE_KILL_FLOOR
+    }
+
+    /// How much longer this budget has to run, or `None` if it has expired.
+    ///
+    /// The monotonic arm is always armed. The wall arm is armed only once the
+    /// host has been away for [`WAKE_KILL_FLOOR`]; below that a run drains its
+    /// monotonic budget exactly as it did before this module existed, which is
+    /// what keeps a nap the in-VM resume ladder would have absorbed from
+    /// costing a run its remaining time.
+    fn remaining(&self) -> Option<Duration> {
+        let awake_left = self.budget.saturating_sub(self.awake);
+        if awake_left.is_zero() {
+            return None;
+        }
+        if self.suspended() >= WAKE_KILL_FLOOR {
+            // `elapsed >= awake`, so this is the smaller of the two remainders
+            // whenever it is armed — the deadline fires on whichever budget
+            // runs out first, and never early on either.
+            let wall_left = self.budget.saturating_sub(self.elapsed);
+            return (!wall_left.is_zero()).then_some(wall_left);
+        }
+        Some(awake_left)
     }
 }
 
 /// The clause an `exit_reason` (or an event-log note) carries.
 ///
-/// Deliberately never contains the words "timed out": two integration tests and
-/// one unit test match that substring for a real deadline, and a suspend
-/// satisfying them would put the whole distinction straight back.
+/// Three sentences, because splitting the thresholds created a third state: a
+/// long nap arriving late kills the run at the wake and still charges it, for a
+/// budget it had almost all of.
+///
+/// No sentence may contain the words "timed out": two integration tests and one
+/// unit test match that substring for a real deadline, and a suspend satisfying
+/// them would put the whole distinction straight back.
 impl fmt::Display for Expiry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host_slept() {
+        if self.starved_by_suspend() {
             write!(
                 f,
                 "the host was suspended for {} of a {} budget; only {} of it ran",
+                human(self.suspended()),
+                human(self.budget),
+                human(self.awake),
+            )
+        } else if self.wake_killed() {
+            write!(
+                f,
+                "the host was suspended for {} of a {} budget, but {} of it ran",
                 human(self.suspended()),
                 human(self.budget),
                 human(self.awake),
@@ -247,8 +369,88 @@ mod tests {
         let expiry = bounded(&deadline, std::future::pending::<()>())
             .await
             .expect_err("the budget should have run out");
-        assert!(!expiry.host_slept(), "{expiry:?}");
-        assert!(expiry.suspended() < SUSPEND_FLOOR, "{expiry:?}");
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
+        assert!(expiry.suspended() < WAKE_KILL_FLOOR, "{expiry:?}");
+    }
+
+    /// #944, and the one test that discriminates: a host that napped for 61
+    /// seconds and then burned every millisecond of its budget awake is a
+    /// timeout, not an excuse. Under the old single 60-second floor this
+    /// panics — the nap alone was the whole predicate.
+    ///
+    /// It is expressible because a suspend under [`WAKE_KILL_FLOOR`] leaves the
+    /// wall arm disarmed, so the deadline still takes the full (millisecond)
+    /// budget in real monotonic time.
+    #[tokio::test]
+    async fn a_short_nap_does_not_excuse_a_budget_that_was_spent_awake() {
+        let deadline = Deadline::suspended_for(Duration::from_millis(50), Duration::from_secs(61));
+        let expiry = deadline.expired().await;
+
+        // It burned the budget awake…
+        assert!(expiry.awake >= Duration::from_millis(50), "{expiry:?}");
+        assert!(expiry.unspent().is_zero(), "{expiry:?}");
+        // …the nap is still measured…
+        assert!(expiry.suspended() >= Duration::from_secs(60), "{expiry:?}");
+        // …it is simply not an excuse.
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
+    }
+
+    /// The middle state: a twenty-minute lid arriving in the last stretch of an
+    /// hour. The run is abandoned at the wake — that is what
+    /// [`WAKE_KILL_FLOOR`] is for — and still charged, because fifty minutes of
+    /// an hour is a verdict.
+    #[test]
+    fn a_late_suspend_kills_the_run_and_still_charges_it() {
+        let expiry = Expiry {
+            budget: Duration::from_secs(3600),
+            elapsed: Duration::from_secs(70 * 60),
+            awake: Duration::from_secs(50 * 60),
+        };
+        assert!(expiry.wake_killed(), "{expiry:?}");
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
+        assert_eq!(
+            expiry.to_string(),
+            "the host was suspended for 20m of a 1h budget, but 50m of it ran"
+        );
+        assert!(!expiry.to_string().contains("timed out"), "{expiry}");
+    }
+
+    /// The *same* twenty minutes, arriving early, and the whole argument for
+    /// measuring lost budget rather than lid time: this run got forty minutes
+    /// of its hour, so it is starved and the strike is waived.
+    #[test]
+    fn the_same_suspend_arriving_early_is_waived() {
+        let expiry = Expiry {
+            budget: Duration::from_secs(3600),
+            elapsed: Duration::from_secs(60 * 60),
+            awake: Duration::from_secs(40 * 60),
+        };
+        assert_eq!(expiry.suspended(), Duration::from_secs(20 * 60));
+        assert!(expiry.starved_by_suspend(), "{expiry:?}");
+        assert_eq!(
+            expiry.to_string(),
+            "the host was suspended for 20m of a 1h budget; only 40m of it ran"
+        );
+    }
+
+    /// The wall arm is armed by the *suspend*, not by the wall clock: two
+    /// readings at the same wall-clock instant, one four minutes of nap and one
+    /// five, and only the second one is over.
+    #[test]
+    fn the_wall_arm_arms_at_the_wake_kill_floor() {
+        let budget = Duration::from_secs(3600);
+        let four = Expiry {
+            budget,
+            elapsed: budget,
+            awake: Duration::from_secs(56 * 60),
+        };
+        let five = Expiry {
+            budget,
+            elapsed: budget,
+            awake: Duration::from_secs(55 * 60),
+        };
+        assert_eq!(four.remaining(), Some(Duration::from_secs(4 * 60)));
+        assert_eq!(five.remaining(), None);
     }
 
     /// The #929 shape: a one-hour budget, a host away for eight of them, and 38
@@ -262,7 +464,7 @@ mod tests {
             Deadline::suspended_for(Duration::from_secs(3600), Duration::from_secs(8 * 3600));
         let expiry = deadline.expired().await;
 
-        assert!(expiry.host_slept(), "{expiry:?}");
+        assert!(expiry.starved_by_suspend(), "{expiry:?}");
         let slept = expiry.suspended();
         assert!(
             slept.abs_diff(Duration::from_secs(8 * 3600)) < Duration::from_secs(5),
@@ -289,8 +491,9 @@ mod tests {
         assert!(!clause.contains("timed out"), "{clause}");
     }
 
-    /// A gap smaller than the floor is the two clocks being read at slightly
-    /// different instants, not a laptop lid.
+    /// The two clocks read at slightly different instants leave nothing
+    /// unspent, which is why the waiver needs no second "was that really a
+    /// suspend" test of its own.
     #[test]
     fn a_gap_under_the_floor_is_not_a_suspend() {
         let expiry = Expiry {
@@ -298,7 +501,8 @@ mod tests {
             elapsed: Duration::from_secs(3600) + Duration::from_millis(4),
             awake: Duration::from_secs(3600),
         };
-        assert!(!expiry.host_slept(), "{expiry:?}");
+        assert!(expiry.unspent().is_zero(), "{expiry:?}");
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
         assert!(!expiry.to_string().contains("suspended"), "{expiry}");
     }
 
@@ -312,7 +516,7 @@ mod tests {
             wall_from: SystemTime::now() + Duration::from_secs(3600),
         };
         let expiry = deadline.expired().await;
-        assert!(!expiry.host_slept(), "{expiry:?}");
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
         assert!(expiry.elapsed >= Duration::from_millis(50), "{expiry:?}");
     }
 
