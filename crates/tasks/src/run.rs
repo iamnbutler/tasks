@@ -93,7 +93,22 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// `--print --output-format stream-json` (see images/scout/Dockerfile).
 const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
-const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 600;
+/// Wall-clock budget for one orchestrator tick.
+///
+/// Fifteen minutes rather than ten because a turn that verifies a composition
+/// may have to pay for one cold build, and Claude Code's own per-command
+/// ceiling has to fit *below* the turn (see
+/// [`orchestrator::command_budget`](crate::orchestrator::command_budget)) — at
+/// 600s against a 600s ceiling a single command could consume the whole turn
+/// and leave nothing to report in. Bounded above by `OBLIGATION_REMINDER`, so
+/// a turn can never outlast the interval at which the pipeline re-states what
+/// it is owed. This is *with* the warm build directory, not instead of it:
+/// alone it would only spend more wall-clock on the same cold build.
+const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 900;
+/// Where the orchestrator builds when it verifies, unless `ORCHESTRATOR_TARGET_DIR`
+/// says otherwise. Shared and long-lived on purpose — the warmth is the whole
+/// value.
+const DEFAULT_ORCHESTRATOR_TARGET_DIR: &str = "verify-target";
 /// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 /// Debounce for pipeline-event nudges: after the first nudge-worthy event,
@@ -255,6 +270,20 @@ pub struct Config {
     /// repo clone to run the orchestrator as a full development agent
     /// (pair with `--dangerously-skip-permissions` in `ORCHESTRATOR_CMD`).
     pub orchestrator_workdir: Option<PathBuf>,
+    /// Build directory for the orchestrator's own verification
+    /// (`ORCHESTRATOR_TARGET_DIR`), set as `CARGO_TARGET_DIR` on the agent
+    /// child and nowhere else.
+    ///
+    /// A `git worktree` gets its own empty `target/`, so verifying that N pull
+    /// requests compose meant a cold workspace debug build — minutes before a
+    /// single test could run, which is why a typecheck was the ceiling on what
+    /// a merge decision could rest on. Shared and long-lived is the point.
+    ///
+    /// Scoped to the one child process rather than living in `<data dir>/.env`,
+    /// which every `tasks` invocation reads: a `CARGO_TARGET_DIR` there would
+    /// be inherited by `tasks reload`'s own build of the server and would
+    /// silently redirect the Makefile's `TEST_BIN_DIR`.
+    pub orchestrator_target_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -310,6 +339,7 @@ impl Config {
                 DEFAULT_ORCHESTRATOR_TIMEOUT_SECS,
             )?),
             orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
+            orchestrator_target_dir: env_string("ORCHESTRATOR_TARGET_DIR").map(PathBuf::from),
         })
     }
 
@@ -320,6 +350,19 @@ impl Config {
         self.orchestrator_workdir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("orchestrator"))
+    }
+
+    /// The build directory the orchestrator verifies in:
+    /// `ORCHESTRATOR_TARGET_DIR`, or `<data dir>/verify-target`.
+    ///
+    /// There is deliberately no `off` value. Every setting here is a path, so a
+    /// sentinel that could also be a directory name is a worse ambiguity than
+    /// the one it resolves; `ORCHESTRATOR_TARGET_DIR=<checkout>/target` restores
+    /// the old behaviour exactly and is the escape hatch.
+    pub fn orchestrator_target_dir(&self) -> PathBuf {
+        self.orchestrator_target_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join(DEFAULT_ORCHESTRATOR_TARGET_DIR))
     }
 
     /// Where the orchestrator's actor credential is written.
@@ -2233,6 +2276,33 @@ fn is_disconnect(error: &ScoutError) -> bool {
 
 // --- orchestrator loop ---
 
+/// The build directory the orchestrator may verify in, or `None` if it cannot.
+///
+/// Resolved and created **once per boot** rather than per turn, and that is
+/// what keeps the prompt honest: the verification section names this directory,
+/// so it can never name one the agent will find missing. `None` whenever the
+/// workdir is not a checkout (there is nothing to build) or the mkdir failed,
+/// and the prompt then grows no verification heading at all.
+async fn verify_target_dir(config: &Config) -> Option<PathBuf> {
+    config.orchestrator_workdir.as_ref()?;
+    let dir = config.orchestrator_target_dir();
+    match tokio::fs::create_dir_all(&dir).await {
+        Ok(()) => {
+            info!(dir = %dir.display(), "orchestrator verification build directory");
+            Some(dir)
+        }
+        Err(e) => {
+            warn!(
+                dir = %dir.display(),
+                error = %e,
+                "could not create the orchestrator's build directory — it will not be \
+                 asked to run tests this boot"
+            );
+            None
+        }
+    }
+}
+
 /// Answer pending orchestrator turns until `shutdown` flips.
 ///
 /// Not mode-gated on purpose: asking the orchestrator "what's the status?"
@@ -2258,6 +2328,7 @@ pub async fn orchestrator_loop(
             timeout: config.orchestrator_timeout,
             workdir,
             workdir_is_checkout: config.orchestrator_workdir.is_some(),
+            target_dir: verify_target_dir(&config).await,
             github_configured: config.github_token.is_some(),
             api_port: config.port,
             curl_config: config.orchestrator_curl_config(),
@@ -2687,6 +2758,7 @@ mod tests {
             orchestrator_cmd: "true".into(),
             orchestrator_timeout: Duration::from_secs(60),
             orchestrator_workdir: None,
+            orchestrator_target_dir: None,
         }
     }
 

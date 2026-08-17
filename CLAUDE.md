@@ -101,6 +101,46 @@ implementation.
   minutes, and it would cost a GitHub read per parked PR per tick rather than
   one per obligation actually surfaced. Mergeability is never cached — that is
   persisting a GitHub-owned fact with a timestamp on it.
+- **The orchestrator can now produce the run it used to only ask for, and what
+  made that possible was a warm build directory, not a bigger budget.** Carve-out
+  (b) above rested on "nothing re-runs its tests for you", and that was true for
+  a reason that had nothing to do with the suite: warm, the whole workspace is
+  ~565 tests in ~21s. It was **compilation**. Verifying that N pull requests
+  compose means checking them out somewhere, a `git worktree` gets its own empty
+  `target/`, and a cold workspace debug build is minutes before a single test
+  runs — so a typecheck was the ceiling on what a merge decision could rest on.
+  Two more things compounded it: a 600s turn against Claude Code's own 600s
+  per-command ceiling (a command could eat the whole turn and leave nothing to
+  report in — the observed "killed before writing output"), and, when the agent
+  avoided the worktree, contention with rust-analyzer for the live checkout's
+  build-directory lock. The fix is three variables on the **child process only**
+  — `CARGO_TARGET_DIR` at a shared long-lived directory
+  (`ORCHESTRATOR_TARGET_DIR`), and both bash timeouts derived as **half** the
+  turn (`command_budget`), half being the statable guarantee: whatever a command
+  spent, at least that much turn is left to report it. Derived and not
+  configured, because a second knob is a second thing to get wrong and the
+  invariant is a *relationship* between two numbers. `<data dir>/.env` is the
+  wrong home for any of it — every `tasks` invocation reads that file, so a
+  `CARGO_TARGET_DIR` there would be inherited by `tasks reload`'s own build of
+  the server and would silently redirect the Makefile's `TEST_BIN_DIR`. **The
+  prompt half is the load-bearing half**: the directory alone would leave the
+  fix inert, since the agent would have somewhere warm to build and a standing
+  instruction saying the run will not happen. `verification_section` and
+  `landing_section` are both generated from one computed `can_verify`
+  (`workdir_is_checkout && target_dir.is_some()`), so they cannot disagree about
+  what this host can do, and the directory is created **once per boot** rather
+  than per turn so the prompt can never name one the agent will find missing.
+  `brief::verification_line` says "no automated check" rather than "nothing
+  downstream" for the same one-source reason: what the *pipeline* does not do
+  and what its *reader* cannot do are different facts. This widens `land_builds`
+  autonomy on purpose — the charter's own principle is that what sends a batch
+  back is unverifiability, and the orchestrator's own run is stronger evidence
+  than the Builder's trailer, a check rather than a claim. Carve-out (c) is
+  untouched and still routes to a human. Verifying a composition stays the
+  orchestrator's own work and does **not** become a Builder-shaped VM run: that
+  would need its own run kind, artifact, charter capability and answer to the
+  Scout/Builder barrier, all to deliver what a worktree plus a warm directory
+  deliver in seconds — revisit only if compositions outgrow a 15-minute turn.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
@@ -454,6 +494,7 @@ cargo run -p tasks -- add-project owner/repo
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
 make images-check                      # boot each image, read `--version` back
+make verify-warm                       # prime the orchestrator's build directory
 make test                              # see Tests below
 ```
 
@@ -794,4 +835,5 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
-| `ORCHESTRATOR_TIMEOUT_SECS` | 600 | wall-clock budget per orchestrator tick |
+| `ORCHESTRATOR_TIMEOUT_SECS` | 900 | wall-clock budget per orchestrator tick. Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
+| `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else. Shared and long-lived — the warmth is the value; expect ~7.5 GB and nothing prunes it. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
