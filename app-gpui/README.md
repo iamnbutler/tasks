@@ -224,3 +224,80 @@ are on `PATH`:
 `TASKS_GPUI_VERSION` / `TASKS_GPUI_COMMIT` explicitly, so an installed build
 is stamped exactly. A bare `cargo run` lets `build.rs` probe git itself,
 which can lag the `-dirty` suffix by a build.
+
+### Optimizing dependencies in dev builds — a local opt-in
+
+`cargo run` from this directory builds gpui and wgpu unoptimized, and a debug
+gpui is slow enough that the app's own frame rate is the thing you notice. The
+usual fix is `opt-level = 2` for dependencies only. It is **not** in
+`Cargo.toml`, deliberately, and this is where to turn it on if you want it.
+
+**Nothing upstream can turn it on for you.** Cargo reads profiles only from
+the root manifest of the build actually being run, and silently ignores a
+profile in a *dependency's* manifest. app-gpui is deliberately not a member of
+the `tasks` workspace, so it is its own root: no profile in the workspace root
+reaches it, and neither does gpuikit's own stanza
+([iamnbutler/gpuikit#140](https://github.com/iamnbutler/gpuikit/pull/140)) —
+gpuikit's changelog will tell you the problem is fixed, and here it is not.
+
+The opt-in, in `app-gpui/.cargo/config.toml` (gitignored, so it stays yours):
+
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+Cargo discovers config from the cwd upward plus `$CARGO_HOME`, so that file
+covers every cargo command run from inside `app-gpui/` — including `make
+app-check` and `make app-test`, which `cd` here first. Putting the same stanza
+in `~/.cargo/config.toml` instead covers every Rust project on the machine,
+the `tasks` workspace included, which is usually not what you want.
+
+Measured on an aarch64 Linux VM, 4 cpus / 6 GB, `CARGO_BUILD_JOBS=2`:
+
+| | default | opt-in |
+| --- | --- | --- |
+| cold `cargo build` | 182s | 644s |
+| rebuild after `touch src/main.rs` | 21–25s | 14–18s |
+| `target/debug/tasks-gpui` | 592 MB | 761 MB |
+| `target/` | 3.8G | 8.3G (both artifact sets) |
+
+Every effect that was measured is a cost. The edit loop does not move — the
+optimized side came in a few seconds faster across three samples each way, and
+six samples on a shared VM do not support claiming a win in either direction.
+The benefit is real but unmeasured, and it accrues to one person running
+`cargo run` on a Mac, while the 3.5× cold build is paid by every fresh clone,
+including every agent VM that touches this crate. Defaulting to the certain
+cost for the unmeasured win is the wrong way round; opting in on your own
+machine is not.
+
+Three things to know before you do:
+
+- **The first build after adding *or* removing the file rebuilds the whole
+  graph** — the profile is part of Cargo's fingerprint. Switching back is
+  cheap (~30s) only while both artifact sets are still in `target/`; a `cargo
+  clean` collects the losing one and the next switch is another full build.
+- **Peak rustc memory rises**, to ~2.6G of 6G free at two jobs. On a small
+  machine, drop `CARGO_BUILD_JOBS` before concluding the build is broken.
+- **`debug = "line-tables-only"` is a separate knob.** It cuts the debug
+  binary hard (761 MB → 279 MB was observed on a scratch build; its link-time
+  effect was never measured cleanly) and would confound the comparison
+  entirely if added at the same time. Its own question, its own issue.
+
+**Measuring the frame-rate side, which is the open question.** It needs a Mac,
+and it needs `cargo run` on both sides — **not `make app` or `make run`**,
+which are `cargo build --release` and cannot see a `[profile.dev]` setting at
+all. A before/after that uses them measures a binary the setting never touched
+and reports "no difference" for entirely the wrong reason, which is the single
+most likely way this gets answered wrongly. Exercise the paths that actually
+push frames: scrolling a long Tasks list, a streaming chat reply, dragging a
+sidebar resize handle. Then record what you saw on
+[#922](https://github.com/iamnbutler/tasks/issues/922) — including "no
+difference", which is the answer that settles it.
+
+For the record, this is an explicit disagreement with gpuikit rather than an
+oversight: gpuikit's stanza buys its `cargo run --example showcase` loop the
+same unmeasured thing, and two crates being consistently unmeasured is not
+better than one being deliberate. If the Mac measurement comes back large,
+committing the stanza is a one-line follow-up made on evidence, and it goes
+where the comment in `Cargo.toml` says it would have gone.
