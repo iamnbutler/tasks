@@ -210,6 +210,27 @@ impl IssueTarget {
     }
 }
 
+/// The message a task-drafting surface hands the orchestrator, with the repo
+/// pinned. One builder for every door into this flow (the ⌘N window, the
+/// rail composer), so they cannot drift into asking the agent two different
+/// things — the orchestrator owns titling and filing, the surface owns the
+/// repo. `None` when the target cannot be filed into; the caller refuses
+/// before anything is sent.
+pub fn issue_prompt(target: &IssueTarget, draft: &str) -> Option<String> {
+    let IssueTarget::Repo { id, slug } = target else {
+        return None;
+    };
+    Some(format!(
+        "Create a new GitHub issue from the draft below, in {slug}. Pass \
+         \"project_id\": \"{id}\" to POST /issues — that is the repository \
+         chosen in the app, not one to re-derive. Write a clear, specific \
+         title, and expand the body with any relevant context you have \
+         (related tasks, recent activity, code areas). File it and reply \
+         with the issue number and link.\n\n\
+         Draft:\n{draft}"
+    ))
+}
+
 /// Resolve the composer's target from the projects and this window's filter.
 ///
 /// The unfiltered single-repo case resolves rather than refusing, and matches

@@ -17,7 +17,7 @@ use gpui::{
     FollowMode, ListAlignment, ListState, MouseButton, SharedString, Stateful, WeakEntity, Window,
     WindowHandle,
 };
-use gpuikit::elements::context_menu::{context_menu, menu_item, MenuItems};
+use gpuikit::elements::context_menu::{menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::input::text_area;
 use gpuikit::elements::kbd::kbd;
@@ -35,7 +35,7 @@ use tasks_client::api::models::{
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, sidebar, task_state_color, title_bar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, sidebar, title_bar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
@@ -104,22 +104,6 @@ enum ChatRowView {
     Empty,
 }
 
-/// Band order for the left rail's task tree — the Queue section's attention
-/// order, flattened into one list without headers. Lower sorts higher.
-/// `None` is a task the tree does not show (backlog and history live behind
-/// All Tasks).
-fn tree_band(state: TaskState) -> Option<u8> {
-    match state {
-        TaskState::InReview => Some(0),
-        TaskState::Scouting => Some(1),
-        TaskState::Building => Some(2),
-        TaskState::AwaitingMerge => Some(3),
-        TaskState::Queued => Some(4),
-        TaskState::ReadyToBuild => Some(5),
-        TaskState::Backlog | TaskState::Done | TaskState::Rejected => None,
-    }
-}
-
 pub struct Workspace {
     /// The root's own focus handle.
     ///
@@ -178,6 +162,11 @@ pub struct Workspace {
     /// Issue-draft composer shown in the cmd-n window. Owned here, not by
     /// the window, so a dismissed draft survives to the next cmd-n.
     pub(crate) issue_input: Entity<InputState>,
+    /// The left rail's task composer — the second door into the ⌘N flow.
+    /// Its own draft, not [`Self::issue_input`]'s: the two surfaces can be
+    /// on screen at once, and one `InputState` rendered in two places would
+    /// fight over focus and caret.
+    pub(crate) rail_input: Entity<InputState>,
     /// The cmd-n "new issue" window, if it has been opened. May be stale
     /// (window closed) — probed with `update` before re-fronting.
     issue_window: Option<WindowHandle<IssueComposer>>,
@@ -342,6 +331,20 @@ impl Workspace {
             state.set_placeholder("Describe the issue…", cx);
             state
         });
+        // The rail composer: same flow as ⌘N (the orchestrator titles and
+        // files), its own draft.
+        let rail_input = cx.new(|cx| {
+            let mut state = InputState::new_multiline(cx).submit_on(SubmitOn::CmdEnter);
+            state.set_placeholder("Add a task…", cx);
+            state
+        });
+        cx.observe(&rail_input, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&rail_input, |this, _, event: &InputStateEvent, cx| {
+            if matches!(event, InputStateEvent::Submit) {
+                this.submit_rail_composer(cx);
+            }
+        })
+        .detach();
         // One line, so cmd-enter and plain enter can mean the same thing —
         // there is no newline to protect.
         let repo_input = cx.new(|cx| {
@@ -450,6 +453,7 @@ impl Workspace {
             review_input,
             build_input,
             issue_input,
+            rail_input,
             issue_window: None,
             chat_list,
             chat_keys: Vec::new(),
@@ -1346,261 +1350,6 @@ impl Workspace {
                         window.dispatch_action(Box::new(ToggleRightDock), cx);
                     }),
             )
-    }
-
-    fn render_left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let (text, text_muted, selected_bg, hover_bg) = (
-            theme.fg(),
-            theme.fg_muted(),
-            theme.surface_tertiary(),
-            theme.surface_secondary(),
-        );
-
-        // Read before the app-state borrow: a run in flight outranks
-        // everything the server could tell us, because it is the reason the
-        // server stopped telling us anything.
-        let running_op = {
-            let control = self.server_control.read(cx);
-            control
-                .run
-                .as_ref()
-                .filter(|run| run.is_running())
-                .map(|run| (run.op, run.started_at))
-        };
-
-        // Owned projections first — the rows need `cx` for listeners after
-        // the state borrow ends.
-        let (tree, banner) = {
-            let state = self.app_state.read(cx);
-            // The tree is the queue: picked-up work in attention order,
-            // scoped to the window's repo filter. Backlog and history live
-            // behind All Tasks. The sort is stable, so within a band the
-            // server's own order (which is rank order) survives.
-            let mut tree: Vec<(u8, TaskId, String, u64, TaskState)> = state
-                .tasks
-                .iter()
-                .filter(|task| self.project_filter.admits(&task.project_id))
-                .filter_map(|task| {
-                    tree_band(task.state).map(|band| {
-                        (
-                            band,
-                            task.id.clone(),
-                            task.title.clone(),
-                            task.gh_issue_number,
-                            task.state,
-                        )
-                    })
-                })
-                .collect();
-            tree.sort_by_key(|(band, ..)| *band);
-
-            // A restart in flight outranks both, and is checked first rather
-            // than last: it takes the app's own event stream down, and
-            // reporting that drop as a transport error would be the app
-            // blaming the server for doing what it was asked. A stale build
-            // is usually *why* someone hit restart, so this has to sit above
-            // the build warning too.
-            //
-            // The build warning in turn outranks the error: when this app is
-            // older than the server supports, whatever failed underneath is
-            // the symptom and "your app is old" is the cause.
-            let banner = if let Some((op, started_at)) = running_op {
-                Some((
-                    format!("{}… {}", op.label(), time::elapsed(started_at)),
-                    false,
-                ))
-            } else if let Some(warning) = &state.build_warning {
-                Some((warning.clone(), true))
-            } else if let Some(error) = &state.error {
-                Some((error.clone(), true))
-            } else if state.loaded && !state.connected {
-                Some(("Reconnecting to the tasks server…".to_string(), false))
-            } else {
-                None
-            };
-            (tree, banner)
-        };
-
-        let all_selected = matches!(self.nav.current(), MiddleView::AllTasks);
-        let selected_task = self.selected_task.clone();
-
-        sidebar(SidebarSide::Left, self.left_sidebar.width)
-            .on_resize_start({
-                let entity = cx.entity().downgrade();
-                move |_event, _window, cx| {
-                    if let Some(workspace) = entity.upgrade() {
-                        workspace.update(cx, |this, cx| {
-                            this.resizing = Some(SidebarSide::Left);
-                            cx.notify();
-                        });
-                    }
-                }
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .pt(px(8.))
-                    // The catalog — the one place backlog lives, and where
-                    // queueing happens. A static item above the tree, per the
-                    // v3 design.
-                    .child(
-                        div()
-                            .id("nav-all-tasks")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.))
-                            .mx(px(6.))
-                            .px(px(10.))
-                            .py(px(5.))
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .when(!all_selected, |el| el.hover(move |el| el.bg(hover_bg)))
-                            .when(all_selected, |el| el.bg(selected_bg))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.navigate(MiddleView::AllTasks, cx);
-                            }))
-                            .child(
-                                Icons::list_bullet()
-                                    .flex_none()
-                                    .size(px(14.))
-                                    .text_color(if all_selected { text } else { text_muted }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if all_selected { text } else { text_muted })
-                                    .child("All Tasks"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px(px(16.))
-                            .pt(px(14.))
-                            .pb(px(4.))
-                            .text_xs()
-                            .text_color(text_muted)
-                            .child("Tasks"),
-                    )
-                    // The tree. Flat rows for now — the drag ranking, state
-                    // glyph vocabulary and Awaiting Feedback section are
-                    // milestone 2; this is the skeleton they hang off.
-                    .child(
-                        div()
-                            .id("task-tree-scroll")
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .map(|el| {
-                                if tree.is_empty() {
-                                    el.child(
-                                        div()
-                                            .px(px(16.))
-                                            .py(px(6.))
-                                            .text_xs()
-                                            .text_color(text_muted)
-                                            .child(
-                                                "Nothing picked up — queue work from All Tasks.",
-                                            ),
-                                    )
-                                } else {
-                                    el.children(tree.into_iter().map(
-                                        |(_band, id, title, number, task_state)| {
-                                            let selected = selected_task.as_ref() == Some(&id);
-                                            let glyph: gpui::AnyElement = match task_state {
-                                                // Work in motion wears a live
-                                                // indicator, the design's ring.
-                                                TaskState::Scouting | TaskState::Building => {
-                                                    loading_indicator()
-                                                        .dash()
-                                                        .xsmall()
-                                                        .color(theme.accent())
-                                                        .into_any_element()
-                                                }
-                                                // Everything else: a dot in the
-                                                // state's colour, upgraded to the
-                                                // full glyph vocabulary in M2.
-                                                state => div()
-                                                    .flex_none()
-                                                    .size(px(7.))
-                                                    .rounded_full()
-                                                    .bg(task_state_color(state))
-                                                    .into_any_element(),
-                                            };
-                                            let row = div()
-                                                .id(SharedString::from(format!("tree-{id}")))
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(6.))
-                                                .mx(px(6.))
-                                                .px(px(10.))
-                                                .py(px(4.))
-                                                .rounded(px(5.))
-                                                .cursor_pointer()
-                                                .when(!selected, |el| {
-                                                    el.hover(move |el| el.bg(hover_bg))
-                                                })
-                                                .when(selected, |el| el.bg(selected_bg))
-                                                .on_click(cx.listener({
-                                                    let id = id.clone();
-                                                    move |this, _event, _window, cx| {
-                                                        this.select_task(id.clone(), cx);
-                                                    }
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .overflow_hidden()
-                                                        .truncate()
-                                                        .text_sm()
-                                                        .text_color(text)
-                                                        .child(title),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_xs()
-                                                        .text_color(text_muted)
-                                                        .child(format!("#{number}")),
-                                                )
-                                                .child(div().flex_none().child(glyph));
-                                            // Right-click offers every verb,
-                                            // greyed to this row's state —
-                                            // same menu as the catalog's rows.
-                                            context_menu(
-                                                SharedString::from(format!("tree-menu-{id}")),
-                                                row,
-                                            )
-                                            .menu(Workspace::row_menu(id, cx))
-                                        },
-                                    ))
-                                }
-                            }),
-                    ),
-            )
-            .when_some(banner, |el, (message, is_error)| {
-                el.child(
-                    div()
-                        .m(px(6.))
-                        .p(px(8.))
-                        .rounded(px(5.))
-                        .bg(cx.theme().surface_secondary())
-                        .text_xs()
-                        .text_color(if is_error {
-                            gpui::hsla(30. / 360., 0.9, 0.6, 1.)
-                        } else {
-                            cx.theme().fg_muted()
-                        })
-                        .child(message),
-                )
-            })
     }
 
     /// The right pane is the orchestrator chat — always on screen (⌘R hides
@@ -2513,36 +2262,5 @@ impl Render for Workspace {
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The left rail's tree is the queue and nothing else: backlog and
-    /// history are behind All Tasks, and the band order is the Queue
-    /// section's attention order, which milestone 2's drag ranking builds on.
-    #[test]
-    fn the_tree_shows_picked_up_work_in_attention_order() {
-        let shown: Vec<u8> = [
-            TaskState::InReview,
-            TaskState::Scouting,
-            TaskState::Building,
-            TaskState::AwaitingMerge,
-            TaskState::Queued,
-            TaskState::ReadyToBuild,
-        ]
-        .into_iter()
-        .map(|state| tree_band(state).expect("picked-up work belongs in the tree"))
-        .collect();
-        let mut ordered = shown.clone();
-        ordered.sort_unstable();
-        ordered.dedup();
-        assert_eq!(shown, ordered, "bands must be distinct and in order");
-
-        for state in [TaskState::Backlog, TaskState::Done, TaskState::Rejected] {
-            assert_eq!(tree_band(state), None, "{state:?} does not belong");
-        }
     }
 }

@@ -7,6 +7,7 @@ mod menus;
 mod nav;
 mod palette;
 mod projects;
+mod rail;
 mod repo_composer;
 mod row_menu;
 mod sections;
