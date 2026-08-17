@@ -21,13 +21,16 @@ tasks-client = { path = "../crates/tasks-client" }
 # from the SSE thread, StreamExt::next on the foreground executor.
 futures = "0.3"
 chrono = "0.4"
+# The Agent Feed parses raw Claude Code stream-json transcript lines; every
+# parse is defensive (`Value`, not typed), because the shape belongs to
+# Claude Code.
+serde_json = "1"
 
 [dev-dependencies]
 # The Server menu's model reads a pidfile and drives a child process; both
 # are tested against real files and a real process, per the workspace's
 # no-mocks convention.
 tempfile = "3"
-serde_json = "1"
 
 [build-dependencies]
 # The version stamp About shows, shared with the server and tasks-client so

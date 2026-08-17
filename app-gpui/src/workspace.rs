@@ -29,7 +29,7 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
 use tasks_client::api::models::{
     BuildStatus, ChatRole, CloseReason, Mode, ProjectId, ProjectStatus, SessionStatus, SpecId,
-    SpecQueueStatus, TaskId, TaskState,
+    SpecQueueStatus, TaskId, TaskState, TranscriptOwner,
 };
 
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
@@ -37,6 +37,7 @@ use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
     markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
+use crate::feed::{self, FeedKey, FeedRowKind};
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
 use crate::nav::{MiddleView, NavHistory, TaskTab};
@@ -102,6 +103,13 @@ enum ChatRowView {
         labels: Vec<String>,
     },
     Empty,
+}
+
+/// One run the Agent Feed can tail, as the picker offers it.
+struct FeedRun {
+    owner: TranscriptOwner,
+    label: String,
+    live: bool,
 }
 
 pub struct Workspace {
@@ -173,6 +181,21 @@ pub struct Workspace {
     /// Scroll state for the chat list — tail-following, so the view opens
     /// at the newest message and stays pinned while new ones land.
     chat_list: ListState,
+    /// Scroll state for the Agent Feed list — the same tail-following
+    /// virtualized list the chat uses, over transcript rows.
+    feed_list: ListState,
+    /// The row keys the feed list is synced to.
+    feed_keys: Vec<FeedKey>,
+    /// The parsed rows behind those keys, cached so the row renderer reads
+    /// a slot instead of re-folding the transcript per row.
+    feed_rows: Vec<feed::FeedRow>,
+    /// How many transcript lines the rows were folded from — the cheap "did
+    /// the tail row grow" check that triggers a re-measure without a splice.
+    feed_lines_seen: usize,
+    /// A run the human picked in the feed's run picker, overriding the
+    /// default (the live run, else the newest). Cleared on navigation, and
+    /// ignored once it stops belonging to the selected task.
+    feed_choice: Option<TranscriptOwner>,
     /// The row keys the list is currently synced to — what the next frame's
     /// keys are diffed against.
     chat_keys: Vec<ChatRowKey>,
@@ -453,6 +476,10 @@ impl Workspace {
             });
         }
 
+        // The feed's list mirrors the chat's: top-aligned, tail-following.
+        let feed_list = ListState::new(0, ListAlignment::Top, px(2048.));
+        feed_list.set_follow_mode(FollowMode::Tail);
+
         Self {
             focus_handle,
             nav: NavHistory::default(),
@@ -474,6 +501,11 @@ impl Workspace {
             rail_input,
             issue_window: None,
             chat_list,
+            feed_list,
+            feed_keys: Vec::new(),
+            feed_rows: Vec::new(),
+            feed_lines_seen: 0,
+            feed_choice: None,
             chat_keys: Vec::new(),
             chat_tick_revision: 0,
             expanded_tools: HashSet::new(),
@@ -542,6 +574,8 @@ impl Workspace {
     fn settle_after_nav(&mut self, cx: &mut Context<Self>) {
         self.task_tab = TaskTab::Overview;
         self.bundle_delete_armed = None;
+        // A picked run is about one task's feed — don't carry it to another.
+        self.feed_choice = None;
         let selected = match self.nav.current() {
             MiddleView::Task(id) => Some(id.clone()),
             MiddleView::AllTasks => None,
@@ -2052,6 +2086,318 @@ impl Workspace {
             )
     }
 
+    // --- the Agent Feed ---
+
+    /// The run whose transcript the feed should show, given what is on
+    /// screen: the picker's choice while it still belongs to the task,
+    /// else the live run, else the newest scout. `None` closes the tail.
+    fn desired_feed(&self, cx: &App) -> Option<TranscriptOwner> {
+        let MiddleView::Task(task_id) = self.nav.current() else {
+            return None;
+        };
+        if self.task_tab != TaskTab::AgentFeed {
+            return None;
+        }
+        let state = self.app_state.read(cx);
+        let runs = Self::task_runs(state, task_id);
+        if let Some(choice) = &self.feed_choice {
+            if runs.iter().any(|run| &run.owner == choice) {
+                return Some(choice.clone());
+            }
+        }
+        runs.first().map(|run| run.owner.clone())
+    }
+
+    /// The task's runs, newest-worthy first: the live one leads (scout or
+    /// the serial build working this task), then concluded scouts newest
+    /// first.
+    ///
+    /// Historical *builds* are absent deliberately: the wire model carries
+    /// no build→task mapping (a build is a batch of specs), so the only
+    /// build this can honestly attribute is the running one while this task
+    /// is `Building`. A `spec_ids` field on `Build` is the follow-up that
+    /// unlocks the rest.
+    fn task_runs(state: &AppState, task_id: &TaskId) -> Vec<FeedRun> {
+        let mut runs: Vec<FeedRun> = Vec::new();
+        if let Some(task) = state.task(task_id) {
+            if task.state == TaskState::Building {
+                if let Some(build) = state
+                    .builds
+                    .iter()
+                    .find(|build| build.status == BuildStatus::Running)
+                {
+                    runs.push(FeedRun {
+                        owner: TranscriptOwner::build(&build.id),
+                        label: "Build".to_string(),
+                        live: true,
+                    });
+                }
+            }
+        }
+        let mut sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|session| &session.task_id == task_id)
+            .collect();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at));
+        for session in sessions {
+            let live = session.status == SessionStatus::Running;
+            runs.push(FeedRun {
+                owner: TranscriptOwner::session(&session.id),
+                label: format!("Scout · {}", time::relative(session.started_at)),
+                live,
+            });
+        }
+        // Live first, stable within: a running scout outranks history.
+        runs.sort_by_key(|run| !run.live);
+        runs
+    }
+
+    /// Keep the transcript tail and the feed list in line with the screen,
+    /// once per frame — the feed's `sync_chat_list`.
+    fn sync_agent_feed(&mut self, cx: &mut Context<Self>) {
+        let desired = self.desired_feed(cx);
+        self.app_state.update(cx, |state, cx| match &desired {
+            Some(owner) => state.open_transcript(owner.clone(), cx),
+            None => state.close_transcript(),
+        });
+
+        let (rows, lines_len) = {
+            let state = self.app_state.read(cx);
+            match &state.transcript_feed {
+                // Refolded per frame; frames only happen on notify, and a
+                // run's capture is capped at 8 MiB. Incremental folding is
+                // the optimization this signature leaves room for.
+                Some(feed) => (feed::feed_rows(&feed.lines), feed.lines.len()),
+                None => (Vec::new(), 0),
+            }
+        };
+        let keys: Vec<FeedKey> = rows.iter().map(|row| row.key()).collect();
+
+        let prefix = self
+            .feed_keys
+            .iter()
+            .zip(keys.iter())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if prefix < self.feed_keys.len() || prefix < keys.len() {
+            self.feed_list
+                .splice(prefix..self.feed_keys.len(), keys.len() - prefix);
+            // Evict parses of text rows that went away (a feed switch drops
+            // the whole run's worth at once).
+            let mut markdown = self.markdown.borrow_mut();
+            for (seq, kind) in &self.feed_keys[prefix..] {
+                if *kind == 0 {
+                    markdown.remove(format!("feed:{seq}"));
+                }
+            }
+        } else if lines_len != self.feed_lines_seen && !keys.is_empty() {
+            // No structural change but lines arrived: the tail row grew (a
+            // tool group coalescing) — re-measure it in place.
+            let last = keys.len() - 1;
+            self.feed_list.remeasure_items(last..last + 1);
+        }
+        self.feed_keys = keys;
+        self.feed_rows = rows;
+        self.feed_lines_seen = lines_len;
+    }
+
+    /// The Agent Feed tab: the run picker, then the transcript.
+    fn render_agent_feed(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let MiddleView::Task(task_id) = self.nav.current().clone() else {
+            return div().into_any_element();
+        };
+        let (runs, reconnecting, open_owner) = {
+            let state = self.app_state.read(cx);
+            (
+                Self::task_runs(state, &task_id),
+                state
+                    .transcript_feed
+                    .as_ref()
+                    .is_some_and(|feed| feed.reconnecting),
+                state
+                    .transcript_feed
+                    .as_ref()
+                    .map(|feed| feed.owner.clone()),
+            )
+        };
+
+        if runs.is_empty() {
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .p(px(16.))
+                .child(div().text_sm().text_color(theme.fg()).child("No runs yet"))
+                .child(
+                    div()
+                        .max_w(px(420.))
+                        .text_center()
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(
+                            "The feed shows the Claude Code stream from this task's VM \
+                             once a Scout or Builder picks it up.",
+                        ),
+                )
+                .into_any_element();
+        }
+
+        // The picker: one chip per run, the open one lit. Only drawn when
+        // there is a choice to make.
+        let picker = (runs.len() > 1).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .px(px(12.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme.border_subtle())
+                .children(runs.iter().map(|run| {
+                    let active = open_owner.as_ref() == Some(&run.owner);
+                    let owner = run.owner.clone();
+                    let label = if run.live {
+                        format!("{} · live", run.label)
+                    } else {
+                        run.label.clone()
+                    };
+                    div()
+                        .id(SharedString::from(format!("feed-run-{}", run.owner.id())))
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .text_xs()
+                        .cursor_pointer()
+                        .map(|el| {
+                            if active {
+                                el.bg(theme.surface_secondary()).text_color(theme.fg())
+                            } else {
+                                el.text_color(theme.fg_muted())
+                            }
+                        })
+                        .when(run.live, |el| el.text_color(theme.accent()))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            this.feed_choice = Some(owner.clone());
+                            cx.notify();
+                        }))
+                        .child(label)
+                }))
+        });
+
+        let feed = list(
+            self.feed_list.clone(),
+            cx.processor(move |this, ix: usize, _window, cx| this.render_feed_row(ix, cx)),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .children(picker)
+            .when(reconnecting, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(12.))
+                        .py(px(2.))
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child("reconnecting to the stream…"),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .child(feed.size_full().py(px(8.))),
+            )
+            .into_any_element()
+    }
+
+    /// One feed row. Text is the agent speaking (markdown); tool groups and
+    /// notices are quiet one-liners; raw lines are what they are.
+    fn render_feed_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(row) = self.feed_rows.get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let padded = |body: gpui::AnyElement| {
+            div()
+                .w_full()
+                .px(px(12.))
+                .py(px(3.))
+                .child(div().max_w(px(900.)).w_full().child(body))
+        };
+        match row.kind {
+            FeedRowKind::Text(text) => {
+                let entity =
+                    self.markdown
+                        .borrow_mut()
+                        .entity(format!("feed:{}", row.seq), &text, cx);
+                padded(
+                    div()
+                        .text_sm()
+                        .text_color(theme.fg())
+                        .child(markdown_block(&entity, cx))
+                        .into_any_element(),
+                )
+                .into_any_element()
+            }
+            FeedRowKind::Tools(labels) => {
+                let summary = match labels.len() {
+                    1 => labels[0].clone(),
+                    n => format!(
+                        "{n} tool calls · {}",
+                        labels.last().cloned().unwrap_or_default()
+                    ),
+                };
+                padded(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(6.))
+                        .text_xs()
+                        .text_color(theme.fg_muted())
+                        .child(div().flex_none().w(px(10.)).child("·"))
+                        .child(div().flex_1().overflow_hidden().truncate().child(summary))
+                        .into_any_element(),
+                )
+                .into_any_element()
+            }
+            FeedRowKind::Notice(text) => padded(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(div().flex_none().child("●").opacity(0.5))
+                    .child(div().flex_1().child(text))
+                    .into_any_element(),
+            )
+            .into_any_element(),
+            FeedRowKind::Raw(text) => padded(
+                div()
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(text)
+                    .into_any_element(),
+            )
+            .into_any_element(),
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let loaded = self.app_state.read(cx).loaded;
@@ -2115,6 +2461,7 @@ impl Workspace {
         match self.task_tab {
             TaskTab::Overview => self.render_overview(cx),
             TaskTab::Brief => self.render_brief(cx),
+            TaskTab::AgentFeed => self.render_agent_feed(cx),
             other => self.render_tab_placeholder(other, cx),
         }
     }
@@ -2164,15 +2511,13 @@ impl Workspace {
     fn render_tab_placeholder(&self, tab: TaskTab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let (title, detail) = match tab {
-            TaskTab::AgentFeed => (
-                "Agent Feed",
-                "The live Claude Code stream from this task's VM lands here (milestone 4).",
-            ),
             TaskTab::Changes => (
                 "Changes",
                 "The build's branch, summary and verification land here (milestone 5).",
             ),
-            TaskTab::Overview | TaskTab::Brief => unreachable!("these tabs render content"),
+            TaskTab::Overview | TaskTab::Brief | TaskTab::AgentFeed => {
+                unreachable!("these tabs render content")
+            }
         };
         div()
             .flex_1()
@@ -2207,6 +2552,7 @@ impl Render for Workspace {
         self.right_sidebar.set_width(right_width, viewport_width);
 
         self.sync_chat_list(cx);
+        self.sync_agent_feed(cx);
         self.sync_palette(cx);
         // The first frame that can know a just-added repo's id: this client
         // applies snapshots, not responses.
