@@ -15,7 +15,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use gpui::prelude::*;
-use gpui::{div, App, Entity, FontWeight, SharedString};
+use gpui::{div, App, ElementId, Entity, EntityId, FontWeight, SharedString};
 use gpuikit::markdown::{Markdown, MarkdownElement, MarkdownStyle, TextStyle};
 use gpuikit::theme::{ActiveTheme, Themeable};
 
@@ -135,22 +135,47 @@ impl Update {
     }
 }
 
+/// The id of the wrapper every one of a document's elements hangs under.
+///
+/// gpui hashes an element's *whole* id path into an accessibility node id and
+/// refuses duplicates, so this is what makes gpuikit's per-render text-run ids
+/// unique across a frame that draws more than one document. Keyed on the
+/// entity because [`MarkdownCache`] hands out one stable entity per key, so
+/// the id is unique per document *and* stable across frames — assistive
+/// technology reads a changed node id as a different element.
+///
+/// Deliberately the same shape as gpuikit's own `element_id::for_entity`,
+/// which is where upstream landed in gpuikit #145, and exactly what
+/// `.id(("markdown", entity_id))` already produced: gpui's
+/// `From<(&'static str, EntityId)> for ElementId` (`window.rs:6533`) is this
+/// same expression. Naming it is what makes it testable.
+fn block_element_id(entity_id: EntityId) -> ElementId {
+    ElementId::NamedInteger("markdown".into(), entity_id.as_u64())
+}
+
 /// A markdown element styled for this app's reading surfaces.
 ///
-/// The wrapper `div` exists for its id, not its box: gpuikit mints text-run
-/// ids (`md-run-1`, `md-run-2`, …) from a counter it restarts on every
-/// render, so two documents on one screen emit the same ids and collide in
-/// whatever gpui keys off the id path — which is how three markdown documents
-/// on one screen tripped the a11y tree's uniqueness assert (#861, back when
-/// Home rendered three briefings at once). Giving each document a
-/// distinct id ancestor makes the app immune regardless of what upstream does
-/// with that counter next. Keyed on `entity_id()` because [`MarkdownCache`]
-/// already hands out one stable entity per key, so the id is unique per
-/// document *and* stable across frames — which is what gpui wants in order to
-/// treat a node as the same node frame to frame.
+/// The wrapper `div` exists for its id, not its box, and the id is not
+/// redundant with anything upstream does. gpuikit mints text-run ids
+/// (`md-run-1`, `md-run-2`, …) from a counter it restarts on every render, so
+/// run ids are unique only *within* one document; [`block_element_id`] is what
+/// makes them unique across a frame, at any gpuikit version — including the
+/// next one.
+///
+/// The history is the argument for keeping it. Two markdown documents on one
+/// screen collided in the a11y tree's uniqueness assert (#861, back when Home
+/// rendered three briefings at once) and this wrapper is the fix that shipped
+/// (#882). gpuikit 0.7.0 still minted colliding ids afterwards and was merely
+/// *inert*, because its text runs reported no a11y role and gpui builds a node
+/// only for an element that has one. gpuikit #133 — an ancestor of the rev
+/// this app pins — scoped the run ids under a per-document element and gave
+/// those runs their roles back, which is precisely the re-arming #882
+/// predicted, and was safe only because the same commit did both. Deleting
+/// this wrapper on the grounds that upstream now scopes its own ids bets the
+/// crash on that ordering holding forever.
 pub fn markdown_block(entity: &Entity<Markdown>, cx: &App) -> impl IntoElement {
     div()
-        .id(("markdown", entity.entity_id()))
+        .id(block_element_id(entity.entity_id()))
         .w_full()
         .child(MarkdownElement::new(entity.clone()).style(style(cx)))
 }
@@ -250,6 +275,42 @@ mod tests {
         assert_eq!(
             Update::between("task:41", "briefing"),
             Update::Replace("briefing".into())
+        );
+    }
+
+    /// The property the whole a11y defence rests on: two documents drawn in
+    /// one frame hang under two different ids, so the run ids underneath them
+    /// cannot collide however upstream numbers them.
+    #[test]
+    fn two_documents_get_two_ids() {
+        assert_ne!(
+            block_element_id(EntityId::from(1u64)),
+            block_element_id(EntityId::from(2u64))
+        );
+    }
+
+    /// The other half: stable frame to frame. A node whose id changed is a
+    /// different element as far as assistive technology is concerned, so a
+    /// per-frame counter here would be its own bug.
+    #[test]
+    fn one_document_keeps_its_id_across_frames() {
+        let entity = EntityId::from(7u64);
+        assert_eq!(block_element_id(entity), block_element_id(entity));
+    }
+
+    /// A name *qualified by the entity*, not a bare name — a bare `"markdown"`
+    /// would collide for exactly the documents this exists to separate.
+    ///
+    /// Asserted against `as_u64()` rather than the literal `9`: `EntityId` is
+    /// a slotmap key and packs a version into the high half, so
+    /// `EntityId::from(9u64).as_u64()` is not 9. Pinning the literal would pin
+    /// slotmap's packing, which is not the property under test.
+    #[test]
+    fn the_id_is_a_name_qualified_by_the_entity() {
+        let entity = EntityId::from(9u64);
+        assert_eq!(
+            block_element_id(entity),
+            ElementId::NamedInteger("markdown".into(), entity.as_u64())
         );
     }
 

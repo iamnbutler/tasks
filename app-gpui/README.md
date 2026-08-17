@@ -157,6 +157,16 @@ Two consequences worth knowing:
   what makes that a decision rather than an accident. Going all the way back is
   `gpuikit = "0.7"` plus swapping the `Update::Append` arm in `MarkdownCache`
   for a `set_source`.
+- **…but going back to 0.7 costs more than streaming**, and the price is not
+  visible from the line being changed. The pinned rev is newer than 0.7.0 in
+  ways unrelated to `append`: gpuikit #133 scoped markdown's text runs under a
+  per-document element id, and #145 audited element ids crate-wide. 0.7.0
+  predates both, so a revert hands back the unscoped `md-run-N` ids the a11y
+  tree's uniqueness assert crashed on (#861) plus gpuikit's own unscoped
+  popover, context-menu, toast and dialog ids. This app's own defence — the
+  wrapper id in `components/markdown.rs` — covers the markdown half at any
+  gpuikit version, which is exactly why it must **not** be deleted as redundant
+  with #133. 0.8 will be the first published version carrying the fix.
 
 The end state is `gpuikit = { version = "0.8", features = ["stitch"] }` the day
 upstream cuts a release — worth asking for, alongside the stale `rust-version`.
