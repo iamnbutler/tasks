@@ -424,6 +424,7 @@ impl Scout {
             drain_scout_events(
                 &self.store,
                 session_id,
+                &self.config.image,
                 &mut events,
                 &mut sink,
                 &mut checkpoints,
@@ -1018,6 +1019,9 @@ fn is_terminal(event: &TaskEvent) -> bool {
 async fn drain_scout_events(
     store: &Store,
     session_id: &SessionId,
+    // The image reference this run was allocated from. The `Started` event
+    // says what is *inside* it; only the host knows what it asked for.
+    image: &str,
     events: &mut AppEvents<'_>,
     sink: &mut TranscriptSink,
     checkpoints: &mut CheckpointSink,
@@ -1028,7 +1032,22 @@ async fn drain_scout_events(
 
         match event {
             TaskEvent::Scout(app) => match app {
-                ScoutEvent::Started { branch: b } => {
+                ScoutEvent::Started {
+                    branch: b,
+                    supervisor,
+                } => {
+                    // What the image is running, from the only moment there is
+                    // to ask it: the VM exists only while this run is inside
+                    // it. `None` is the loudest answer, not the quietest — see
+                    // `ImageFreshness::Unstamped`.
+                    crate::images::observe(
+                        store,
+                        image,
+                        tasks_api::version::ImageRole::Scout,
+                        supervisor.as_ref(),
+                        session_id.as_str(),
+                    )
+                    .await;
                     state.branch = Some(b.clone());
                     // Persisted here rather than at finalize: a bounded replay
                     // window drops the *oldest* events, and `Started` is the

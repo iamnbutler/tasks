@@ -9,9 +9,16 @@
 //! ship from one tree, so the value here is the diagnosis, and a refusal on
 //! every route would turn one legible sentence back into the wall of failed
 //! requests this exists to replace.
+//!
+//! The wire enums here carry an inherent `from_str -> Option` rather than
+//! implementing `std::str::FromStr`, for the reason stated at the top of
+//! [`crate::models`]: callers want an Option to turn into a typed error, not a
+//! `FromStr::Err`.
+#![allow(clippy::should_implement_trait)]
 
 use std::cmp::Ordering;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Body of `GET /version`. Three flat strings, so `curl … | jq -r .version`
@@ -51,6 +58,129 @@ impl VersionInfo {
             None => Support::Unknown,
         }
     }
+}
+
+/// Which supervisor a VM image carries, and therefore which half of the
+/// pipeline it serves.
+///
+/// [`Self::from_str`] returns `None` for anything it does not know rather than
+/// guessing: a row written by a newer binary is dropped from a report, because
+/// showing a builder image as a scout would be worse than omitting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageRole {
+    Scout,
+    Builder,
+}
+
+impl ImageRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageRole::Scout => "scout",
+            ImageRole::Builder => "builder",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "scout" => Some(ImageRole::Scout),
+            "builder" => Some(ImageRole::Builder),
+            _ => None,
+        }
+    }
+}
+
+/// What a running server thinks of the image a run started in.
+///
+/// Judged at *read* time and deliberately never stored: this is a comparison
+/// against the server's own build, and the server is replaced far more often
+/// than the images are, so a stored verdict would be stale the moment the next
+/// binary booted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFreshness {
+    /// At or above the server's build. Nothing to do.
+    Current,
+    /// Older than the running server: it is missing whatever has been fixed
+    /// since, and nothing inside the pipeline will rebuild it.
+    Behind,
+    /// Newer than the running server. Deliberately **not** a rebuild request:
+    /// rebuilding an image that is already newer changes nothing, and the
+    /// thing to move is the server.
+    Ahead,
+    /// The image reported no identity at all — it was built before there was
+    /// one to send.
+    ///
+    /// Deliberately not [`Self::Unknown`]. Absence here is the *loudest*
+    /// reading available: an unstamped image is strictly staler than any
+    /// version a supervisor could report, because reporting one is itself the
+    /// newer behaviour.
+    Unstamped,
+    /// One of the two versions does not parse — a build with no git in reach.
+    /// Not `Behind`, for the same reason [`Support::Unknown`] is not
+    /// [`Support::TooOld`]: a warning that fires on merely unidentifiable
+    /// builds gets trained out of use.
+    Unknown,
+}
+
+impl ImageFreshness {
+    /// Judge an image's reported version against the running server's.
+    ///
+    /// `None` — no version reported — is [`Self::Unstamped`], which is the
+    /// whole reason this takes an `Option` rather than being called only when
+    /// there is something to compare.
+    pub fn judge(image_version: Option<&str>, server_version: &str) -> Self {
+        let Some(image_version) = image_version else {
+            return ImageFreshness::Unstamped;
+        };
+        match compare(image_version, server_version) {
+            Some(Ordering::Less) => ImageFreshness::Behind,
+            Some(Ordering::Equal) => ImageFreshness::Current,
+            Some(Ordering::Greater) => ImageFreshness::Ahead,
+            None => ImageFreshness::Unknown,
+        }
+    }
+
+    /// Whether `make images` is the answer.
+    ///
+    /// `Ahead` is not — see the variant. `Unknown` is not either: it is an
+    /// unidentifiable build, not a stale one, and asking for a rebuild that
+    /// would produce the same unidentifiable answer teaches a reader to ignore
+    /// the line.
+    pub fn needs_rebuild(&self) -> bool {
+        matches!(self, ImageFreshness::Behind | ImageFreshness::Unstamped)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageFreshness::Current => "current",
+            ImageFreshness::Behind => "behind",
+            ImageFreshness::Ahead => "ahead",
+            ImageFreshness::Unstamped => "unstamped",
+            ImageFreshness::Unknown => "unknown",
+        }
+    }
+}
+
+/// One VM image, as last observed by a run that started inside it, with the
+/// verdict computed against the reporting server's own build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageIdentity {
+    /// The image reference the host allocates from, e.g. `agent:v1`.
+    pub image: String,
+    pub role: ImageRole,
+    /// `None` means the supervisor sent no identity — see
+    /// [`ImageFreshness::Unstamped`].
+    pub version: Option<String>,
+    pub commit: Option<String>,
+    /// When a run last started in this image. The freshness of the *answer*,
+    /// which matters because nothing polls an image — it is only ever observed
+    /// by work running inside it.
+    pub observed_at: DateTime<Utc>,
+    /// The scout session or build that reported it, so the reading can be
+    /// traced back to a transcript.
+    pub run_id: Option<String>,
+    pub freshness: ImageFreshness,
 }
 
 /// Order two `0.1.<n>` build versions, or `None` if either doesn't parse.
@@ -134,6 +264,66 @@ mod tests {
         assert_eq!(compare("0.1.0", ""), None);
         assert_eq!(compare("0.1.x", "0.1.0"), None);
         assert_eq!(compare("-dirty", "0.1.0"), None);
+    }
+
+    #[test]
+    fn an_unstamped_image_is_the_loudest_reading_not_the_quietest() {
+        // Absence means "built before there was an identity to send", which is
+        // strictly staler than any version a supervisor could report.
+        assert_eq!(
+            ImageFreshness::judge(None, "0.1.163"),
+            ImageFreshness::Unstamped
+        );
+        assert!(ImageFreshness::Unstamped.needs_rebuild());
+        assert_ne!(
+            ImageFreshness::judge(None, "0.1.163"),
+            ImageFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn freshness_is_judged_against_the_running_server() {
+        assert_eq!(
+            ImageFreshness::judge(Some("0.1.163"), "0.1.163"),
+            ImageFreshness::Current
+        );
+        assert_eq!(
+            ImageFreshness::judge(Some("0.1.100"), "0.1.163"),
+            ImageFreshness::Behind
+        );
+        assert_eq!(
+            ImageFreshness::judge(Some("0.1.200"), "0.1.163"),
+            ImageFreshness::Ahead
+        );
+        assert_eq!(
+            ImageFreshness::judge(Some("nonsense"), "0.1.163"),
+            ImageFreshness::Unknown
+        );
+        // A dirty stamp compares as the commit it was built from, like
+        // everywhere else in this module.
+        assert_eq!(
+            ImageFreshness::judge(Some("0.1.163-dirty"), "0.1.163"),
+            ImageFreshness::Current
+        );
+    }
+
+    /// Only two verdicts ask for `make images`. Rebuilding an image that is
+    /// already newer changes nothing, and an unidentifiable build would come
+    /// back just as unidentifiable.
+    #[test]
+    fn only_behind_and_unstamped_ask_for_a_rebuild() {
+        assert!(ImageFreshness::Behind.needs_rebuild());
+        assert!(ImageFreshness::Unstamped.needs_rebuild());
+        assert!(!ImageFreshness::Current.needs_rebuild());
+        assert!(!ImageFreshness::Ahead.needs_rebuild());
+        assert!(!ImageFreshness::Unknown.needs_rebuild());
+    }
+
+    #[test]
+    fn an_unrecognized_role_is_dropped_rather_than_guessed() {
+        assert_eq!(ImageRole::from_str("scout"), Some(ImageRole::Scout));
+        assert_eq!(ImageRole::from_str("builder"), Some(ImageRole::Builder));
+        assert_eq!(ImageRole::from_str("orchestrator"), None);
     }
 
     #[test]

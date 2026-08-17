@@ -21,5 +21,8 @@ vm-pool-protocol.workspace = true
 tasks-protocol.workspace = true
 uuid.workspace = true
 
+[build-dependencies]
+build-stamp.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

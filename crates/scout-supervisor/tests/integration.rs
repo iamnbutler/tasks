@@ -181,9 +181,17 @@ async fn start_scout_completes_with_spec() {
     while completion.is_none() {
         match sup.recv().await {
             VmEvent::App {
-                payload: TaskEvent::Scout(ScoutEvent::Started { branch }),
+                payload: TaskEvent::Scout(ScoutEvent::Started { branch, supervisor }),
             } => {
                 assert!(branch.starts_with("scout/task_42-"));
+                // The whole point of stamping: the *real* binary reports its
+                // own identity here, and only a test that runs the real binary
+                // can catch it going missing. Everywhere else `Option` plus
+                // `serde(default)` is by design indistinguishable from "not
+                // sent".
+                let build = supervisor.expect("the supervisor states its build identity");
+                assert!(!build.version.is_empty());
+                assert!(!build.commit.is_empty());
                 saw_started = true;
             }
             VmEvent::App {

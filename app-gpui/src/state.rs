@@ -737,9 +737,7 @@ impl AppState {
     /// is a request rather than a start; the server answers 202 and the event
     /// stream reports what happens next.
     pub fn build_spec(&mut self, id: SpecId, cx: &mut Context<Self>) {
-        self.run(cx, move |client| {
-            client.request_build(vec![id], None, None)
-        });
+        self.run(cx, move |client| client.request_build(vec![id], None, None));
     }
 
     /// "Build now": write the task's issue body as its spec, approve it, and

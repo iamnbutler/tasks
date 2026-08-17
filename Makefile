@@ -27,6 +27,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 
 .PHONY: check-toolchain scout-supervisor-linux builder-supervisor-linux \
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
+        images-check \
         check-nextest test-bins test test-ci test-cargo app run \
         app-check app-stubs app-test \
         server serve restart status stop migration
@@ -38,13 +39,22 @@ RELOAD ?=
 STOP ?=
 TASKS_BIN := $(CARGO_TARGET_DIR)/debug/tasks
 
-# Version identity stamped into the app (shown in About Tasks): version is
-# 0.1.<commit count>, build is the short SHA, "-dirty" when uncommitted
-# changes were present. Answers "is what I'm running fresh?" at a glance.
-# app-gpui/build.rs computes the same two values on its own for a bare
-# `cargo run`; passing them here is what makes an installed bundle exact.
-APP_VERSION := 0.1.$(shell git rev-list --count HEAD)
-APP_COMMIT := $(shell git rev-parse --short HEAD)$(shell git diff --quiet 2>/dev/null || echo "-dirty")
+# The build identity stamped into every artifact this Makefile installs:
+# version is 0.1.<commit count>, commit is the short SHA, "-dirty" when
+# uncommitted changes were present. Answers "is what I'm running fresh?" at a
+# glance, and — since the server, the app and both supervisors compute it the
+# same way — makes those numbers comparable to each other.
+#
+# Each build.rs computes the same two values on its own for a bare
+# `cargo build`; passing them explicitly is what makes an *installed* artifact
+# exact, and it is what lets `images-check` compare an image against the same
+# expression that built it.
+BUILD_VERSION := 0.1.$(shell git rev-list --count HEAD)
+BUILD_COMMIT := $(shell git rev-parse --short HEAD)$(shell git diff --quiet 2>/dev/null || echo "-dirty")
+# Aliases, so `make app` reads the way it always did. One pair of values, not
+# two that could drift.
+APP_VERSION := $(BUILD_VERSION)
+APP_COMMIT := $(BUILD_COMMIT)
 
 # Build the mac app and install it to ~/Applications, replacing any existing
 # copy. app-gpui is not a workspace member and has its own target/ directory,
@@ -220,11 +230,17 @@ check-toolchain:
 	@rustup target list --installed | grep -q $(LINUX_TARGET) || { echo "missing rust target: rustup target add $(LINUX_TARGET)"; exit 1; }
 	@which container >/dev/null || { echo "missing apple/container CLI"; exit 1; }
 
+# Both supervisors are stamped explicitly, for the same reason `make app` is:
+# an installed artifact should carry the identity of the tree that produced it,
+# not of whatever the build container could see — and `images-check` compares
+# what the image reports against these exact values.
 scout-supervisor-linux: check-toolchain
-	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p scout-supervisor
+	$(CROSS_ENV) SCOUT_SUPERVISOR_VERSION=$(BUILD_VERSION) SCOUT_SUPERVISOR_COMMIT=$(BUILD_COMMIT) \
+		cargo build --release --target $(LINUX_TARGET) -p scout-supervisor
 
 builder-supervisor-linux: check-toolchain
-	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p builder-supervisor
+	$(CROSS_ENV) BUILDER_SUPERVISOR_VERSION=$(BUILD_VERSION) BUILDER_SUPERVISOR_COMMIT=$(BUILD_COMMIT) \
+		cargo build --release --target $(LINUX_TARGET) -p builder-supervisor
 
 vm-supervisor-linux: check-toolchain
 	$(CROSS_ENV) cargo build --release --target $(LINUX_TARGET) -p vm-pool-supervisor
@@ -250,3 +266,45 @@ image-builder: image-agent builder-supervisor-linux
 	rm -f images/builder/builder-supervisor
 
 images: image-scout image-builder
+	@$(MAKE) images-check
+
+# Boot each image and read `--version` out of it.
+#
+# This covers the one window the run-time observation cannot: right after a
+# rebuild, before anything has run. Nothing polls an image — a VM exists only
+# while a run is inside it — so until a scout or a build starts, the server has
+# no reading at all.
+#
+# A recipe line of `images` rather than a third prerequisite: `make -j` gives
+# prerequisites no ordering, and a check that can race the build it verifies is
+# worse than no check.
+#
+# The probe is deliberately not wrapped in `timeout(1)` — macOS ships none, and
+# it does not need one: `container run` without `-i` hands the supervisor a
+# closed stdin, so a pre-stamping supervisor falls through argv into its
+# JSON-lines loop, reads EOF, and exits. The shape check below then reports
+# that as "too old to report a version", which is the honest answer.
+images-check:
+	@which container >/dev/null || { echo "missing apple/container CLI"; exit 1; }
+	@case "$(BUILD_COMMIT)" in *-dirty) \
+		echo "warning: this tree is dirty ($(BUILD_COMMIT)); an image built from it stamps"; \
+		echo "         the same -dirty string and compares equal while naming a commit it"; \
+		echo "         may not contain. The comparison below is not exact.";; \
+	esac
+	@stale=0; \
+	for pair in "agent:v1 scout-supervisor" "builder:v1 builder-supervisor"; do \
+		set -- $$pair; image="$$1"; name="$$2"; \
+		out="$$(container run --rm "$$image" --version 2>/dev/null | head -n 1)"; \
+		set -- $$out; \
+		if [ "$$1" != "$$name" ] || [ -z "$$3" ]; then \
+			echo "$$image  too old to report a version (predates supervisor stamping) — run make images"; \
+			stale=1; continue; \
+		fi; \
+		if [ "$$2" = "$(BUILD_VERSION)" ] && [ "$$3" = "$(BUILD_COMMIT)" ]; then \
+			echo "$$image  $$2 ($$3)  current"; \
+		else \
+			echo "$$image  $$2 ($$3)  stale — this tree is $(BUILD_VERSION) ($(BUILD_COMMIT)) — run make images"; \
+			stale=1; \
+		fi; \
+	done; \
+	exit $$stale

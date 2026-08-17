@@ -24,8 +24,9 @@ use crate::models::{
     SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
     Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream,
 };
-use crate::protocol::FailureClass;
+use crate::protocol::{FailureClass, SupervisorBuild};
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
+use tasks_api::version::{ImageFreshness, ImageIdentity, ImageRole};
 
 // --- column lists ---
 //
@@ -4365,6 +4366,97 @@ impl Store {
             builds,
             orchestrator,
         })
+    }
+
+    // --- VM image identity (#909) ---
+
+    /// Record what an image was running when a run started inside it.
+    ///
+    /// Returns **whether the recorded identity changed**, which is what
+    /// [`crate::images::observe`] uses to decide between a standing report and
+    /// an event: a stale image stays stale, so announcing it per dispatch
+    /// would be exactly the noise a standing `/status` line replaces.
+    ///
+    /// One row per image reference — the question is "what is in there now",
+    /// not a log of every time the same answer was given.
+    pub async fn record_image_build(
+        &self,
+        image: &str,
+        role: ImageRole,
+        build: Option<&SupervisorBuild>,
+        run_id: &str,
+    ) -> Result<bool, StoreError> {
+        let version = build.map(|b| b.version.as_str());
+        let commit = build.map(|b| b.commit.as_str());
+
+        let previous = sqlx::query("SELECT version, commit_sha FROM image_builds WHERE image = ?")
+            .bind(image)
+            .fetch_optional(&self.pool)
+            .await?;
+        let changed = match &previous {
+            Some(row) => {
+                row.try_get::<Option<String>, _>("version")?.as_deref() != version
+                    || row.try_get::<Option<String>, _>("commit_sha")?.as_deref() != commit
+            }
+            // A first sighting is a change: there was no reading before it.
+            None => true,
+        };
+
+        sqlx::query(
+            "INSERT INTO image_builds (image, role, version, commit_sha, observed_at, run_id)              VALUES (?, ?, ?, ?, ?, ?)              ON CONFLICT(image) DO UPDATE SET role = excluded.role,              version = excluded.version, commit_sha = excluded.commit_sha,              observed_at = excluded.observed_at, run_id = excluded.run_id",
+        )
+        .bind(image)
+        .bind(role.as_str())
+        .bind(version)
+        .bind(commit)
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(changed)
+    }
+
+    /// Every image observed so far, judged against `reference_version` — the
+    /// running server's own build.
+    ///
+    /// The verdict is computed here rather than stored: it is a comparison
+    /// against a binary that is replaced far more often than the images are,
+    /// so a persisted answer would be stale the moment the next server booted.
+    ///
+    /// A row whose `role` this binary does not recognize — one a newer binary
+    /// wrote — is **dropped** rather than guessed at: reporting a builder
+    /// image as a scout would be worse than omitting it.
+    ///
+    /// An empty result means nothing has been observed, which is not the same
+    /// as everything being current. Callers say so in words.
+    pub async fn image_builds(
+        &self,
+        reference_version: &str,
+    ) -> Result<Vec<ImageIdentity>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT image, role, version, commit_sha, observed_at, run_id              FROM image_builds ORDER BY role, image",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role_raw: String = row.try_get("role")?;
+            let Some(role) = ImageRole::from_str(&role_raw) else {
+                warn!(role = %role_raw, "dropping an image row with an unrecognized role");
+                continue;
+            };
+            let version: Option<String> = row.try_get("version")?;
+            out.push(ImageIdentity {
+                freshness: ImageFreshness::judge(version.as_deref(), reference_version),
+                image: row.try_get("image")?,
+                role,
+                version,
+                commit: row.try_get("commit_sha")?,
+                observed_at: parse_ts(&row.try_get::<String, _>("observed_at")?, "observed_at")?,
+                run_id: row.try_get("run_id")?,
+            });
+        }
+        Ok(out)
     }
 
     // --- mode ---

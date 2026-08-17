@@ -494,8 +494,19 @@ impl Builder {
             let (_origin, event) = events.next().await.ok_or(BuilderError::StreamClosed)?;
             match event {
                 TaskEvent::Build(app) => match app {
-                    BuildEvent::Started { base_sha } => {
+                    BuildEvent::Started {
+                        base_sha,
+                        supervisor,
+                    } => {
                         self.store.set_build_base_sha(build_id, &base_sha).await?;
+                        crate::images::observe(
+                            &self.store,
+                            &self.config.image,
+                            tasks_api::version::ImageRole::Builder,
+                            supervisor.as_ref(),
+                            build_id.as_str(),
+                        )
+                        .await;
                     }
                     BuildEvent::Progress { stream, line } => {
                         // Two sinks, two scrubs. The log is redacted here; the

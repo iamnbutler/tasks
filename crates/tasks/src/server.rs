@@ -2465,6 +2465,9 @@ async fn get_status(State(store): State<Arc<Store>>) -> ApiResult<Json<ServerSta
         migrations_applied: store.migrations_applied().to_vec(),
         mode: store.get_mode().await?,
         in_flight: store.in_flight().await?,
+        // Judged against *this* binary's build, here at read time — see
+        // `Store::image_builds`.
+        images: store.image_builds(crate::version::VERSION).await?,
     }))
 }
 

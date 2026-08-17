@@ -843,8 +843,45 @@ pub fn render_status(
             ));
             out.push_str(&format!("binary   {}\n", file.exe.display()));
             out.push_str(&format!("mode     {}\n", status.mode.as_str()));
+            out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
+    }
+    out
+}
+
+/// What the VM images are running, and whether that is a problem.
+///
+/// **No observation is not a clean bill of health**, so an empty list says
+/// "none observed yet" rather than "current": nothing polls an image, so the
+/// only way to learn what is in one is to run something inside it.
+///
+/// Every stale line names `make images`. A verdict word alone tells a reader
+/// they have a problem and not what to type — and the rebuild is a host-side
+/// command by design, so there is nothing here to click.
+pub fn render_images(status: &ServerStatus) -> String {
+    if status.images.is_empty() {
+        return "images   none observed yet (an image is only read from a run inside it)\n"
+            .to_string();
+    }
+    let mut out = String::from("images\n");
+    for image in &status.images {
+        let identity = match (&image.version, &image.commit) {
+            (Some(version), Some(commit)) => format!("{version} ({commit})"),
+            (Some(version), None) => version.clone(),
+            _ => "PREDATES STAMPING".to_string(),
+        };
+        let advice = match image.freshness.needs_rebuild() {
+            true => "  — run `make images`",
+            false => "",
+        };
+        out.push_str(&format!(
+            "  {}  {}  {}{}\n",
+            image.image,
+            identity,
+            image.freshness.as_str(),
+            advice
+        ));
     }
     out
 }
@@ -966,6 +1003,7 @@ mod tests {
             migrations_applied: Vec::new(),
             mode: Mode::Play,
             in_flight,
+            images: Vec::new(),
         }
     }
 
@@ -1004,6 +1042,54 @@ mod tests {
         );
         assert!(out.contains("mode     play"), "{out}");
         assert!(out.contains("in flight  nothing"), "{out}");
+    }
+
+    /// Two readings that must not be confused. Nothing polls an image, so an
+    /// empty list means no run has started in one — reporting that as
+    /// "current" would be an answer this server does not have. And every stale
+    /// line has to name `make images`: the rebuild is a host-side command, so
+    /// a verdict word alone tells a reader they have a problem without telling
+    /// them what to type.
+    #[test]
+    fn no_observation_is_not_a_clean_bill_of_health() {
+        use tasks_api::version::{ImageFreshness, ImageIdentity, ImageRole};
+
+        let mut status = status_with(InFlight::default());
+        let empty = render_images(&status);
+        assert!(empty.contains("none observed yet"), "{empty}");
+        assert!(!empty.contains("current"), "{empty}");
+
+        status.images = vec![
+            ImageIdentity {
+                image: "agent:v1".into(),
+                role: ImageRole::Scout,
+                version: None,
+                commit: None,
+                observed_at: Utc::now(),
+                run_id: Some("sess_1".into()),
+                freshness: ImageFreshness::Unstamped,
+            },
+            ImageIdentity {
+                image: "builder:v1".into(),
+                role: ImageRole::Builder,
+                version: Some("0.1.163".into()),
+                commit: Some("abc1234".into()),
+                observed_at: Utc::now(),
+                run_id: Some("build_1".into()),
+                freshness: ImageFreshness::Current,
+            },
+        ];
+        let rendered = render_images(&status);
+        assert!(rendered.contains("PREDATES STAMPING"), "{rendered}");
+        assert!(rendered.contains("unstamped"), "{rendered}");
+        assert!(rendered.contains("0.1.163 (abc1234)"), "{rendered}");
+
+        // Exactly one line asks for a rebuild — the stale one.
+        assert_eq!(
+            rendered.matches("make images").count(),
+            1,
+            "only the stale image asks: {rendered}"
+        );
     }
 
     #[test]

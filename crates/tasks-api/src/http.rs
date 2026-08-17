@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::models::{BriefingSection, Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
+use crate::version::ImageIdentity;
 
 /// Body of `POST /projects`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -381,6 +382,21 @@ pub struct ServerStatus {
     pub migrations_applied: Vec<AppliedMigration>,
     pub mode: Mode,
     pub in_flight: InFlight,
+    /// What the VM images are running, as last observed by a run that started
+    /// inside one, judged against *this* server's build.
+    ///
+    /// `#[serde(default)]` is **required, not decorative**: `reload`'s
+    /// `fetch_status` reads `/status` off the *old*, still-running server
+    /// before it swaps, so the binary decoding this is by construction newer
+    /// than the one answering it. A required field would make every upgrade
+    /// past this commit fail at exactly the step whose job is to verify the
+    /// upgrade.
+    ///
+    /// An empty list means nothing has been observed — which is **not** a
+    /// clean bill of health, and every renderer says so rather than printing
+    /// "current".
+    #[serde(default)]
+    pub images: Vec<ImageIdentity>,
 }
 
 /// One migration a boot applied.
