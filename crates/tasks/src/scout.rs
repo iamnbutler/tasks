@@ -1307,6 +1307,9 @@ fn render_previous_attempt(prior: &ReviewedSpec) -> String {
          resubmit the previous spec unchanged, and do not repeat the shortcomings \
          it identifies. Explore the current code yourself — the previous spec may \
          itself be out of date.\n\n\
+         Account for every item of it in `SPEC.md`'s `### Notes` — including any \
+         you decided against, and why. An item you silently dropped is \
+         indistinguishable from one you never read.\n\n\
          ### Reviewer feedback\n\n\
          {feedback}\n\n\
          ### Previous spec\n\n\
@@ -1555,6 +1558,16 @@ mod tests {
 
         // Order matters: issue → verdict → feedback → prior spec → instructions.
         assert!(attempt < verdict && verdict < feedback && feedback < spec && spec < job);
+
+        // The section already called the feedback a requirement; it had
+        // nowhere for a *refusal* to land, which is the symmetric silent drop
+        // #935 closed on the Builder side.
+        assert!(
+            prompt.contains("a requirement, not a suggestion"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("`SPEC.md`'s `### Notes`"), "{prompt}");
+        assert!(prompt.contains("decided against"), "{prompt}");
     }
 
     #[test]

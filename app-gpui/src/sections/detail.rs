@@ -331,9 +331,17 @@ impl Workspace {
                 cx.listener({
                     let id = spec_id.clone();
                     move |this, _: &ClickEvent, _window, cx| {
+                        // Carries the review draft if there is one: an
+                        // approval's feedback reaches the Builder as a
+                        // required section of its prompt, so this is how a
+                        // human approves *with* changes rather than sending a
+                        // whole spec back for one of them. Not gated on
+                        // `has_text` — approve is the one exit that does not
+                        // need text.
+                        let feedback = this.take_review_draft(cx);
                         let id = id.clone();
                         this.app_state.update(cx, |state, cx| {
-                            state.review_spec(id, SpecQueueStatus::Approved, None, cx)
+                            state.review_spec(id, SpecQueueStatus::Approved, feedback, cx)
                         });
                     }
                 }),

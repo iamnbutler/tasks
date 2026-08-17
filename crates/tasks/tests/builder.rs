@@ -37,9 +37,10 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    api_death_builder_agent_path, gated_builder_agent_path, history_rewriting_builder_agent_path,
-    make_fixture_repo, silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path,
-    wait_until, workspace_bin, write_builder_supervisor_wrapper_with_env,
+    api_death_builder_agent_path, echo_prompt_builder_agent_path, gated_builder_agent_path,
+    history_rewriting_builder_agent_path, make_fixture_repo, silent_builder_agent_path,
+    spawn_vm_pool, stub_builder_agent_path, wait_until, workspace_bin,
+    write_builder_supervisor_wrapper_with_env,
 };
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -670,6 +671,84 @@ async fn a_history_rewriting_build_lands_its_branch() {
     assert_eq!(
         h.store.get_build(&build.id).await.unwrap().unwrap().status,
         BuildStatus::Succeeded
+    );
+}
+
+/// #935, end to end: the feedback a spec was **approved with** reaches the
+/// agent inside the VM.
+///
+/// The unit tests in `builder.rs` pin what `render_prompt` writes; only this
+/// one pins that the dispatcher goes and *reads that feedback out of the
+/// store*, which is the half that was missing — the prompt was assembled from
+/// `specs` and `tasks`, and the column lives on `spec_queue`.
+///
+/// The seam is `SUMMARY.md`: the fixture agent echoes its whole prompt into
+/// it, and the summary comes back on the build row, so what the agent was told
+/// is assertable from out here without entering the VM.
+#[tokio::test]
+async fn the_review_feedback_a_spec_was_approved_with_reaches_the_builder_agent() {
+    let h = harness(echo_prompt_builder_agent_path().to_str().unwrap()).await;
+    let (_, reviewed) = seed_approved(&h.store, &h.project, 935, "Carry the feedback").await;
+    let (_, silent) = seed_approved(&h.store, &h.project, 936, "Approved saying nothing").await;
+
+    // The real reviewer path, both channels at once: `feedback` is addressed
+    // to the agent, `rationale` to the ledger.
+    h.store
+        .review_spec(
+            &reviewed.id,
+            SpecQueueStatus::Approved,
+            Some(
+                "Name the constant REVIEW_FEEDBACK_HEADING, and say why in the module docs.".into(),
+            ),
+            DecisionInput {
+                actor: tasks::models::Actor::Human,
+                rationale: Some(
+                    "approving with one required change rather than sending it back".into(),
+                ),
+                evidence: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    h.store
+        .create_build(
+            &[reviewed.id.clone(), silent.id.clone()],
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+    let done = h.builder.dispatch(claimed, &h.repo_url).await.unwrap();
+    assert_eq!(done.status, BuildStatus::Succeeded);
+
+    let prompt = done.summary.clone().expect("the agent echoed its prompt");
+    assert!(
+        prompt.contains("## Review feedback on these specs"),
+        "the section never reached the VM:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Name the constant REVIEW_FEEDBACK_HEADING"),
+        "the feedback text never reached the VM:\n{prompt}"
+    );
+    // Attributed to the spec it was written about, and to that one only.
+    assert!(
+        prompt.contains("### On spec 1 of 2: Carry the feedback (#935)"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("### On spec 2 of 2"),
+        "a spec approved with nothing grew a subsection:\n{prompt}"
+    );
+    // And the accounting it demands is the one the brief reads back.
+    assert!(prompt.contains("## Review feedback` heading"), "{prompt}");
+
+    // And the other half of the same rule: `review_spec` took a rationale too,
+    // and a decision record addressed to the ledger reaches no VM ever.
+    assert!(
+        !prompt.contains("rather than sending it back"),
+        "the rationale reached a VM:\n{prompt}"
     );
 }
 

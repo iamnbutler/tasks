@@ -2402,6 +2402,19 @@ impl Store {
     /// Task side effects: approved → `ReadyToBuild`, rejected → `Rejected`,
     /// needs revision → back to `Queued` so it re-scouts without losing its
     /// place as picked-up work.
+    ///
+    /// `feedback` is agent-facing and reaches one on **either** verdict: a
+    /// re-scout quotes it under `## Previous attempt`, and a Builder gets it
+    /// as its own `## Review feedback on these specs` section
+    /// ([`crate::builder`] reads this column at prompt time). Approving *with*
+    /// feedback is therefore a real verdict, not a contradiction. `rationale`
+    /// is the opposite channel and must never be copied into it — it explains
+    /// the judgment to whoever reads the `decisions` ledger and reaches no VM
+    /// ever.
+    ///
+    /// It is bound unconditionally, so a later approval that says nothing
+    /// clears a `needs_revision`'s text rather than leaving stale items
+    /// attached to a spec that has since been rewritten.
     pub async fn review_spec(
         &self,
         spec_id: &SpecId,
