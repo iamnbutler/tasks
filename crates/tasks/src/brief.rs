@@ -307,6 +307,48 @@ impl<'a> Brief<'a> {
                 ));
             }
         }
+
+        lines.extend(self.stale_image_facts().await?);
+        Ok(lines)
+    }
+
+    /// What the VM images are running, when that changes how a failure should
+    /// be read.
+    ///
+    /// A **fact, not an obligation**, and deliberately so: obligations are
+    /// surfaced only to the orchestrator, which holds a curl-only token in a
+    /// VM-less workdir and can neither cross-compile a supervisor nor reach
+    /// the `container` CLI. An obligation it can never discharge is raised on
+    /// every pass forever, which is how a signal gets trained out of use.
+    ///
+    /// Worded around the judgment the orchestrator actually makes, rather than
+    /// around the rebuild it cannot perform: a run that failed inside a stale
+    /// image has not told you anything about its task. That is the reading
+    /// #884 got wrong.
+    ///
+    /// Silent when every image is current, and silent when none has been
+    /// observed — an unobserved image is not a fact about anything yet, and
+    /// the standing `/status` line is where "nothing observed" belongs.
+    async fn stale_image_facts(&self) -> Result<Vec<String>, StoreError> {
+        let mut lines = Vec::new();
+        for image in self.store.image_builds(crate::version::VERSION).await? {
+            if !image.freshness.needs_rebuild() {
+                continue;
+            }
+            let running = match &image.version {
+                Some(version) => format!("is running supervisor {version}"),
+                None => "predates supervisor stamping".to_string(),
+            };
+            lines.push(format!(
+                "the {} VM image ({}) {}, while this server is {} — a run that failed inside \
+                 it may have died of a bug already fixed here, which is not a verdict on its \
+                 task. Only a human at the host can rebuild it (`make images`)",
+                image.role.as_str(),
+                image.image,
+                running,
+                crate::version::VERSION,
+            ));
+        }
         Ok(lines)
     }
 
@@ -740,6 +782,13 @@ impl<'a> Brief<'a> {
 /// workflows and no required checks, so there is no second opinion anywhere in
 /// the loop. Saying so on the line is the difference between evidence and the
 /// appearance of evidence.
+///
+/// It says "no automated check" rather than "nothing downstream", and the
+/// narrowing is necessary: on a host where the orchestrator has a warm build
+/// directory, the *reader* of this brief can go and make a run, even though the
+/// *pipeline* still will not make one for it. Leaving a sentence here that says
+/// the run will not happen, beside a landing section that says go and make one,
+/// is two sources of truth about the same fact.
 fn verification_line(summary: Option<&str>) -> String {
     match verification_report(summary) {
         VerificationReport::Passed(detail) => format!(
@@ -749,13 +798,13 @@ fn verification_line(summary: Option<&str>) -> String {
         ),
         VerificationReport::Failed(detail) => format!(
             "the build reported its own tests FAILED ({}) — its claim, not an \
-             independent run, and nothing downstream re-runs them, so no passing \
+             independent run, and no automated check re-runs them, so no passing \
              run backs this batch",
             or_unspecified(&detail),
         ),
         VerificationReport::NotRun(detail) => format!(
             "the build reported that it did NOT RUN the tests ({}) — so no run at \
-             all backs this batch, and nothing downstream will make one",
+             all backs this batch, and no automated check will make one",
             or_unspecified(&detail),
         ),
         VerificationReport::Unreported => {
@@ -1228,6 +1277,63 @@ mod tests {
             silent,
             verification_line(None),
             "a build from before the line reads the same"
+        );
+    }
+
+    /// A stale image is a **fact**, not an obligation — the orchestrator holds
+    /// a curl-only token in a VM-less workdir and can never discharge one — so
+    /// it rides the pipeline brief, worded around the judgment it *can* make:
+    /// a run that failed inside a stale image has not told you anything about
+    /// its task. That is the reading #884 got wrong.
+    #[tokio::test]
+    async fn a_stale_image_is_a_pipeline_fact_and_a_current_one_is_silent() {
+        use crate::protocol::SupervisorBuild;
+        use tasks_api::version::ImageRole;
+
+        let store = Store::open_in_memory().await.unwrap();
+        let brief = Brief::new(&store, None, "main");
+
+        // Nothing observed: silent here. "None observed yet" belongs on the
+        // standing /status line, not in a brief that claims to report facts.
+        assert!(brief.stale_image_facts().await.unwrap().is_empty());
+
+        // An image at this very build is current, and also silent.
+        store
+            .record_image_build(
+                "agent:v1",
+                ImageRole::Scout,
+                Some(&SupervisorBuild {
+                    version: crate::version::VERSION.into(),
+                    commit: "abc1234".into(),
+                }),
+                "sess_1",
+            )
+            .await
+            .unwrap();
+        assert!(brief.stale_image_facts().await.unwrap().is_empty());
+
+        // One that predates stamping is not.
+        store
+            .record_image_build("builder:v1", ImageRole::Builder, None, "build_1")
+            .await
+            .unwrap();
+        let facts = brief.stale_image_facts().await.unwrap();
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(facts[0].contains("builder:v1"), "{}", facts[0]);
+        assert!(
+            facts[0].contains("predates supervisor stamping"),
+            "{}",
+            facts[0]
+        );
+        assert!(
+            facts[0].contains("not a verdict on its task"),
+            "the judgment the orchestrator actually makes: {}",
+            facts[0]
+        );
+        assert!(
+            facts[0].contains("Only a human at the host can rebuild it"),
+            "and it must not read as something the orchestrator could do: {}",
+            facts[0]
         );
     }
 

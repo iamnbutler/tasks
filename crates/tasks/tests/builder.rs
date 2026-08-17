@@ -37,9 +37,9 @@ use vm_pool_protocol::VmConfig;
 
 mod common;
 use common::{
-    api_death_builder_agent_path, history_rewriting_builder_agent_path, make_fixture_repo,
-    silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path, workspace_bin,
-    write_builder_supervisor_wrapper_with_env,
+    api_death_builder_agent_path, gated_builder_agent_path, history_rewriting_builder_agent_path,
+    make_fixture_repo, silent_builder_agent_path, spawn_vm_pool, stub_builder_agent_path,
+    wait_until, workspace_bin, write_builder_supervisor_wrapper_with_env,
 };
 
 async fn run_git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -99,6 +99,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
 
@@ -112,6 +113,7 @@ async fn seed_approved(store: &Store, project: &Project, issue: u64, title: &str
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
 
@@ -149,7 +151,11 @@ struct Harness {
     /// bundles egress could not push.
     scratch_root: std::path::PathBuf,
     seen_prs: Arc<Mutex<Vec<Value>>>,
-    _tmp: tempfile::TempDir,
+    /// The real vm-pool socket. A test that wants to stand something between
+    /// the client and the service connects its own listener to this.
+    pool_socket: std::path::PathBuf,
+    github: Arc<GitHubClient>,
+    tmp: tempfile::TempDir,
 }
 
 async fn harness(agent_cmd: &str) -> Harness {
@@ -159,6 +165,18 @@ async fn harness(agent_cmd: &str) -> Harness {
 /// [`harness`], plus environment the builder-supervisor reads *inside* the VM
 /// (`BUILDER_MAX_RESUMES` has no other seam from out here).
 async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> Harness {
+    harness_with_env_and_vms(agent_cmd, supervisor_env, 1).await
+}
+
+/// [`harness_with_env`] with room for more than one VM. A test that cuts the
+/// connection needs it: a `deallocate` cannot travel down a socket that is
+/// gone, so every such round strands a VM in the pool (a real vm-pool restart
+/// collects these on the next connect; nothing in a test can).
+async fn harness_with_env_and_vms(
+    agent_cmd: &str,
+    supervisor_env: &[(&str, &str)],
+    max_vms: usize,
+) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let supervisor_bin = workspace_bin("builder-supervisor").await;
     let wrapper = write_builder_supervisor_wrapper_with_env(
@@ -169,7 +187,7 @@ async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> H
         supervisor_env,
     )
     .await;
-    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, max_vms).await;
     let client = Client::<TasksProtocol>::connect(&socket).await.unwrap();
 
     let store = Arc::new(Store::open_in_memory().await.unwrap());
@@ -190,6 +208,7 @@ async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> H
         GitHubClient::with_base_url("token", "http://unused.invalid/graphql")
             .with_rest_base_url(rest_url),
     );
+    let github_for_harness = github.clone();
 
     let scratch_root = tmp.path().join("scratch");
     let builder = Builder::new(
@@ -212,7 +231,9 @@ async fn harness_with_env(agent_cmd: &str, supervisor_env: &[(&str, &str)]) -> H
         repo,
         scratch_root,
         seen_prs,
-        _tmp: tmp,
+        pool_socket: socket,
+        github: github_for_harness,
+        tmp,
     }
 }
 
@@ -251,6 +272,23 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
         .expect("the agent phase was stamped when the drain ended");
     assert!(done.started_at.unwrap() <= agent_finished);
     assert!(agent_finished <= done.completed_at.unwrap());
+
+    // The image identity, all the way through the real supervisor binary. See
+    // the Scout counterpart in `tests/scout.rs`: these two tests are the only
+    // place the chain is actually checked, because `Option` plus
+    // `serde(default)` makes a break indistinguishable from "not sent".
+    let images = h.store.image_builds("0.1.0").await.unwrap();
+    let observed = images
+        .iter()
+        .find(|i| i.image == "builder:test")
+        .expect("the builder image was observed");
+    assert_eq!(observed.role, tasks_api::version::ImageRole::Builder);
+    assert!(
+        observed.version.is_some(),
+        "the supervisor stated no build identity"
+    );
+    assert!(observed.commit.is_some());
+    assert_eq!(observed.run_id.as_deref(), Some(done.id.as_str()));
 
     // The branch REALLY landed: the remote repo has it, at the reported tip.
     let branch_ref = format!("refs/heads/{}", done.branch);
@@ -763,4 +801,219 @@ async fn a_rejected_egress_preserves_the_commits_and_the_command_recovers_them()
         h.store.get_task(&task.id).await.unwrap().unwrap().state,
         TaskState::ReadyToBuild
     );
+}
+
+/// A Unix-socket relay the test owns, standing between the Builder's vm-pool
+/// client and the real service.
+///
+/// vm-pool's `Service` has no shutdown API and the test service runs
+/// in-process, so "kill the daemon" is not directly expressible — hence this.
+/// Cutting it makes the client see genuine EOF, so `StreamClosed` is raised by
+/// the code under test rather than constructed by the test. Killing the *VM*
+/// instead would be a different failure: what a vm-pool restart does to this
+/// server is end the connection, and that is the only thing that raises
+/// `StreamClosed`.
+struct PoolLink {
+    path: std::path::PathBuf,
+    pumps: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl PoolLink {
+    async fn open(path: std::path::PathBuf, upstream: std::path::PathBuf) -> Self {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let pumps: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let registry = pumps.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((down, _)) = listener.accept().await {
+                let Ok(up) = UnixStream::connect(&upstream).await else {
+                    return;
+                };
+                let (mut down_read, mut down_write) = down.into_split();
+                let (mut up_read, mut up_write) = up.into_split();
+                let to_pool = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut down_read, &mut up_write).await;
+                });
+                let to_client = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut up_read, &mut down_write).await;
+                });
+                registry.lock().unwrap().extend([to_pool, to_client]);
+            }
+        });
+        pumps.lock().unwrap().push(accept);
+        Self { path, pumps }
+    }
+
+    /// Drop both halves of every pumped connection, and the accept loop with
+    /// them. Aborting the tasks drops the sockets they own, which is what puts
+    /// the EOF on the client's side.
+    fn cut(&self) {
+        for pump in self.pumps.lock().unwrap().drain(..) {
+            pump.abort();
+        }
+    }
+}
+
+impl Drop for PoolLink {
+    fn drop(&mut self) {
+        self.cut();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// vm-pool is a separate long-lived daemon, upgraded separately and — per
+/// CLAUDE.md — restarted *ahead* of this server, so a restart routinely
+/// catches a build in flight. `BuilderError::StreamClosed` was classified
+/// `Verdict`, four lines below the comment explaining why `Egress` is
+/// `Transport`, and `Builder::conclude` reads `failure_class()` straight into
+/// `Strike::for_class` — so every such restart charged the whole batch, and
+/// three of them `blocked` specs that had never failed to build.
+///
+/// Four rounds, one past `MAX_BUILD_ATTEMPTS`, so the assertion is "the cap
+/// was never reached" rather than "the cap has not been reached yet".
+#[tokio::test]
+async fn a_vm_pool_that_goes_away_mid_build_costs_the_batch_no_attempt() {
+    // The gate is released at the end so nothing is left sleeping; while it is
+    // held, the agent is provably still running, which is what puts a live
+    // build behind the cut.
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gate = gate_dir.path().join("build-gate");
+    let agent_cmd = format!(
+        "{} {}",
+        gated_builder_agent_path().display(),
+        gate.display()
+    );
+    // Every round strands a VM: a `deallocate` cannot travel down a socket
+    // that is gone.
+    let h = harness_with_env_and_vms(&agent_cmd, &[], 8).await;
+    let (task, spec) = seed_approved(&h.store, &h.project, 7, "The daemon, not the spec").await;
+
+    let started = gate_dir.path().join("build-gate.started");
+    for round in 1..=4u32 {
+        // The previous round's agent is stranded but still holding its
+        // marker; without clearing it the wait below returns instantly and
+        // the cut lands on a build that has not allocated yet.
+        let _ = std::fs::remove_file(&started);
+
+        let link = PoolLink::open(
+            h.tmp.path().join(format!("relay-{round}.sock")),
+            h.pool_socket.clone(),
+        )
+        .await;
+        let client = Client::<TasksProtocol>::connect(&link.path).await.unwrap();
+        let builder = Builder::new(
+            h.store.clone(),
+            client.handle(),
+            h.github.clone(),
+            BuilderConfig {
+                image: "builder:test".into(),
+                vm_config: VmConfig::default(),
+                timeout: Duration::from_secs(60),
+                scratch_root: h.scratch_root.clone(),
+            },
+        );
+
+        h.store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("round {round} could not be queued: {e}"));
+        let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
+        let build_id = claimed.id.clone();
+
+        let repo_url = h.repo_url.clone();
+        let dispatch = tokio::spawn(async move { builder.dispatch(claimed, &repo_url).await });
+
+        // Wait until the agent is provably running, then cut the connection
+        // out from under a live build.
+        wait_until(Duration::from_secs(30), || {
+            let started = started.clone();
+            async move { started.exists() }
+        })
+        .await;
+        link.cut();
+
+        let err = dispatch.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, tasks::builder::BuilderError::StreamClosed),
+            "round {round} raised something else: {err:?}"
+        );
+
+        // The build got as far as owning a VM, so the store's own
+        // never-started waiver (`finalize_build_unsuccessfully` charges only
+        // `if started`) is not what is passing this test.
+        let build = h.store.get_build(&build_id).await.unwrap().unwrap();
+        assert!(
+            build.vm_id.is_some(),
+            "round {round}: the build never started, so nothing was waived"
+        );
+
+        assert_eq!(
+            h.store
+                .get_spec_queue_entry(&spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SpecQueueStatus::Approved,
+            "round {round}: the spec must stay buildable"
+        );
+        assert_eq!(
+            h.store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::ReadyToBuild,
+            "round {round}"
+        );
+        // Cleaned up here rather than at end of scope, so the next round's
+        // socket path is the only one anything can reach.
+        drop(link);
+    }
+
+    // `SpecQueueEntry` does not expose `build_attempts`, so the counter is
+    // read the way a human would — off the obligation the spec is still
+    // raising.
+    let obligations = h
+        .store
+        .open_obligations(chrono::Duration::seconds(-1))
+        .await
+        .unwrap();
+    let dispatch = obligations
+        .iter()
+        .find(|o| o.subject_id == spec.id.to_string())
+        .unwrap_or_else(|| panic!("the spec should still be owed a build: {obligations:?}"));
+    assert!(
+        dispatch.summary.contains("4 earlier build(s) failed"),
+        "{}",
+        dispatch.summary
+    );
+    assert!(
+        dispatch.summary.contains("0 of 3 attempts are charged"),
+        "four transport deaths must charge nothing: {}",
+        dispatch.summary
+    );
+
+    // And the waivers are legible on the log, or an unspent attempt is
+    // indistinguishable from a cap somebody switched off.
+    let waivers = h
+        .store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| match &e.payload {
+            tasks::events::EventPayload::Note { source, message } => {
+                source == "dispatcher"
+                    && message.contains("failed as transport")
+                    && message.contains("keep their build attempts")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(waivers, 4, "one waiver note per round");
+
+    // Release the gate so no agent is left sleeping in a stranded VM.
+    let _ = std::fs::write(&gate, "");
 }

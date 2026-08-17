@@ -11,7 +11,22 @@ gpui = { package = "gpui-unofficial", version = "=1.14.2" }
 # runtime_shaders: compile Metal shaders at runtime so builds don't need the
 # Xcode Metal toolchain.
 gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.14.2", features = ["font-kit", "runtime_shaders"] }
-gpuikit = "0.7"
+# A git rev, and the only one in this graph — see README ▸ Dependencies.
+# `Markdown::append` (which keeps a selection across a streaming delta) and the
+# `stitch` feature (which closes syntax a half-streamed document leaves open)
+# landed in gpuikit #134 and are in no published release; `main`'s own version
+# is still 0.7.0, so there is nothing to bump to. A `rev`, never a `branch`, so
+# the build stays reproducible.
+#
+# `editor` is on for its **syntect bridge**, not the editor widget: it is what
+# `markdown::init_code_highlighting` is gated behind, and without it fenced
+# code blocks render as plain monospace. It pulls syntect + onig, which is the
+# one real cost — see `components/markdown.rs` for what streaming a fence
+# through that highlighter measures at.
+#
+# The clean end state is
+# `gpuikit = { version = "0.8", features = ["stitch", "editor"] }`.
+gpuikit = { git = "https://github.com/iamnbutler/gpuikit", rev = "b28732f290f8bd8ca7ffcc56a40d00a852ac978a", features = ["stitch", "editor"] }
 smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.
@@ -40,3 +55,18 @@ tempfile = "3"
 # The version stamp About shows, shared with the server and tasks-client so
 # the three numbers are comparable at all.
 build-stamp = { path = "../crates/build-stamp" }
+
+# There is deliberately no `[profile.dev.package."*"] opt-level = 2` here, and
+# gpuikit having one of its own (iamnbutler/gpuikit#140) is not a reason to add
+# it: Cargo reads profiles from the root manifest of the build being run and
+# ignores a dependency's, so nothing upstream can propagate one here anyway.
+#
+# It was measured rather than argued about. A cold build goes 182s → 644s, the
+# debug binary 592 MB → 761 MB, and the edit loop does not move; the benefit is
+# smoother frames, which can only be seen on a Mac and has never been measured.
+# Every fresh clone — every agent VM that touches this crate — would pay the
+# certain cost for the unmeasured win, so the setting is documented as a
+# `.cargo/config.toml` opt-in instead, which Cargo honours identically.
+#
+# See README ▸ Running ▸ "Optimizing dependencies in dev builds", including how
+# to measure the frame-rate side and where to record the answer (#922).

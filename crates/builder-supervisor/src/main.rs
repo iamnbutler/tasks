@@ -49,8 +49,8 @@ use tasks_protocol::agent_run::{
 };
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
-    BuildCommand, BuildEvent, FailureClass, LogStream, MAX_BUNDLE_BASE64_BYTES, TaskCommand,
-    TaskEvent, TasksProtocol,
+    BuildCommand, BuildEvent, FailureClass, LogStream, MAX_BUNDLE_BASE64_BYTES, SupervisorBuild,
+    TaskCommand, TaskEvent, TasksProtocol,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -62,8 +62,41 @@ use vm_pool_protocol::{VmCommand, VmEvent};
 type TaskVmCommand = VmCommand<TasksProtocol>;
 type TaskVmEvent = VmEvent<TasksProtocol>;
 
+/// This binary's build identity, stamped by `build-stamp` in `build.rs` —
+/// the same crate and the same scheme the server uses, which is what makes
+/// the two numbers comparable at all.
+pub fn identity() -> SupervisorBuild {
+    SupervisorBuild {
+        version: env!("BUILDER_SUPERVISOR_VERSION").to_string(),
+        commit: env!("BUILDER_SUPERVISOR_COMMIT").to_string(),
+    }
+}
+
+/// Answer `--version` and say whether we did.
+///
+/// Called **before** the tracing setup and before stdin is touched, because
+/// `make images-check` runs this by booting the image (`container run --rm
+/// agent:v1 --version`) and reading one line off stdout — the supervisor is
+/// the image's ENTRYPOINT, so argv reaches here.
+///
+/// One line, three whitespace-separated fields (`<name> <version> <commit>`),
+/// so `awk '{print $2}'` is the whole parser. That shape is a contract with
+/// the Makefile: change it and change `images-check` with it.
+fn answered_version() -> bool {
+    if !std::env::args().skip(1).any(|arg| arg == "--version") {
+        return false;
+    }
+    let build = identity();
+    println!("builder-supervisor {} {}", build.version, build.commit);
+    true
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // See scout-supervisor: answered before tracing and before stdin.
+    if answered_version() {
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
@@ -250,6 +283,7 @@ async fn run_build(
         &tx,
         BuildEvent::Started {
             base_sha: base_sha.clone(),
+            supervisor: Some(identity()),
         },
     )
     .await;

@@ -63,6 +63,7 @@ async fn seed_spec(
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     seed_spec_for_task(store, &task.id, files, status).await
@@ -86,6 +87,7 @@ async fn seed_spec_for_task(
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let spec = Spec {

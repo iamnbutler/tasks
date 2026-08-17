@@ -26,8 +26,8 @@ use vm_pool_protocol::{VmConfig, VmId};
 use crate::cancel::Bounded;
 use crate::events::EventPayload;
 use crate::models::{
-    Complexity, ReviewedSpec, RunKind, ScoutNotes, Session, SessionId, SessionStatus, SessionUsage,
-    Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
+    Complexity, Directions, ReviewedSpec, RunKind, ScoutNotes, Session, SessionId, SessionStatus,
+    SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskState, TranscriptOwner,
     TranscriptStream,
 };
 use crate::protocol::{
@@ -83,6 +83,10 @@ impl ScoutError {
     /// Whether this failure judged the work — the one decision point this
     /// dispatcher has, read by [`crate::run::record_outcome`].
     ///
+    /// `StreamClosed` is `Transport`: the vm-pool event stream ending is the
+    /// daemon going away — a routine maintenance action, not a judgement on
+    /// the work.
+    ///
     /// Everything not named here is a [`FailureClass::Verdict`], and two of
     /// those are deliberate. A `Timeout` had the entire wall-clock budget and
     /// still produced nothing, which is as much of a verdict as an agent that
@@ -95,9 +99,14 @@ impl ScoutError {
             Self::ScoutFailed { class, .. } | Self::StoppedEarly { class, .. } => *class,
             Self::NotResumable(_) => FailureClass::Orphaned,
             Self::Cancelled(_) => FailureClass::Cancelled,
-            Self::Store(_) | Self::Client(_) | Self::StreamClosed | Self::Timeout { .. } => {
-                FailureClass::Verdict
-            }
+            // `crate::run::is_disconnect` reaches this error first on the
+            // dispatch path and already spares it its attempt, so nothing
+            // here changes what a scout is charged today. It is what makes
+            // the classification honest for every *other* reader — and what
+            // keeps the two answers from disagreeing about the same error.
+            // The builder half is the live bug this mirrors.
+            Self::StreamClosed => FailureClass::Transport,
+            Self::Store(_) | Self::Client(_) | Self::Timeout { .. } => FailureClass::Verdict,
         }
     }
 }
@@ -208,7 +217,24 @@ impl Scout {
                 "carrying field notes from an interrupted attempt"
             );
         }
-        let prompt = render_prompt(&task, prior.as_ref(), salvage.as_ref());
+        // Directions arrive on the `Task` this was handed, exactly as `prior`
+        // and `salvage` are fetched above — so no signature changes and the
+        // dispatch loop needs no edit. They are deliberately *not* cleared
+        // here: see `Store::set_scout_directions`.
+        if let Some(directions) = &task.scout_directions {
+            info!(
+                task_id = %task.id,
+                author = directions.author.as_str(),
+                bytes = directions.text.len(),
+                "this run is directed"
+            );
+        }
+        let prompt = render_prompt(
+            &task,
+            prior.as_ref(),
+            salvage.as_ref(),
+            task.scout_directions.as_ref(),
+        );
 
         // Allocate
         let vm_id = self
@@ -237,6 +263,9 @@ impl Scout {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            // A *copy*, not a reference: the task can be re-aimed tomorrow,
+            // and this row has to keep saying what this run was told.
+            directions: task.scout_directions.clone(),
         };
         self.store.insert_session(&session_row).await?;
         self.store
@@ -404,6 +433,7 @@ impl Scout {
             drain_scout_events(
                 &self.store,
                 session_id,
+                &self.config.image,
                 &mut events,
                 &mut sink,
                 &mut checkpoints,
@@ -941,7 +971,13 @@ fn spawn_checkpoint_writer(
                 files_touched: Vec::new(),
                 updated_at: Utc::now(),
             };
-            if let Err(e) = store.upsert_scout_notes(&row).await {
+            // Retried because this task is detached and has no caller to
+            // return an error to — and because what it is persisting is the
+            // salvage a cut-short run is judged on, which is the one artefact
+            // `NOTES.md` streaming exists to protect. The retry is a belt;
+            // `store::begin_write` is what removed the unretryable failure.
+            let write = crate::store::retry_on_contention(|| store.upsert_scout_notes(&row)).await;
+            if let Err(e) = write {
                 warn!(session_id = %session_id, error = %e, "persisting a scout checkpoint failed");
             }
         }
@@ -998,6 +1034,9 @@ fn is_terminal(event: &TaskEvent) -> bool {
 async fn drain_scout_events(
     store: &Store,
     session_id: &SessionId,
+    // The image reference this run was allocated from. The `Started` event
+    // says what is *inside* it; only the host knows what it asked for.
+    image: &str,
     events: &mut AppEvents<'_>,
     sink: &mut TranscriptSink,
     checkpoints: &mut CheckpointSink,
@@ -1008,7 +1047,22 @@ async fn drain_scout_events(
 
         match event {
             TaskEvent::Scout(app) => match app {
-                ScoutEvent::Started { branch: b } => {
+                ScoutEvent::Started {
+                    branch: b,
+                    supervisor,
+                } => {
+                    // What the image is running, from the only moment there is
+                    // to ask it: the VM exists only while this run is inside
+                    // it. `None` is the loudest answer, not the quietest — see
+                    // `ImageFreshness::Unstamped`.
+                    crate::images::observe(
+                        store,
+                        image,
+                        tasks_api::version::ImageRole::Scout,
+                        supervisor.as_ref(),
+                        session_id.as_str(),
+                    )
+                    .await;
                     state.branch = Some(b.clone());
                     // Persisted here rather than at finalize: a bounded replay
                     // window drops the *oldest* events, and `Started` is the
@@ -1087,15 +1141,23 @@ fn render_prompt(
     task: &Task,
     prior: Option<&ReviewedSpec>,
     salvage: Option<&ScoutNotes>,
+    directions: Option<&Directions>,
 ) -> String {
     let previous = prior.map(render_previous_attempt).unwrap_or_default();
     let field_notes = salvage.map(render_field_notes).unwrap_or_default();
+    // Last before the instructions, so the model reads issue → what went wrong
+    // last time → unverified leads → what it has additionally been told → what
+    // to do. Nothing is emitted at all when there are no directions: an
+    // always-present empty heading is exactly what teaches an agent to skim
+    // past the one that matters.
+    let directions = directions.map(render_directions).unwrap_or_default();
     format!(
         "You are a Scout in the Double Diamond architecture.\n\n\
          ## Issue: {title} (#{num})\n\n\
          {body}\n\n\
          {previous}\
          {field_notes}\
+         {directions}\
          ## Your job\n\n\
          1. Implement a working solution in the cloned repo (cwd).\n\
          2. Keep `NOTES.md` in the repo root up to date as you go: findings, \
@@ -1131,6 +1193,33 @@ fn render_prompt(
         body = task.body,
         previous = previous,
         field_notes = field_notes,
+        directions = directions,
+    )
+}
+
+/// Render the `## Directions for this exploration` section.
+///
+/// Framed as the opposite of the field notes above it: those are explicitly
+/// unverified leads, these are an instruction from a named author that the
+/// run is expected to follow. Getting the two voices the same way round is
+/// most of the value of having two sections.
+fn render_directions(directions: &Directions) -> String {
+    let text = trim_prompt_text("directions", directions.text.trim());
+    format!(
+        "## Directions for this exploration\n\n\
+         {author} added the following when sending this task to a Scout. It is \
+         **not** part of the issue, and no reviewer has seen it — it is \
+         addressed to you.\n\n\
+         Treat it as a requirement, not a suggestion. The issue above is still \
+         what is being solved; these directions say how to go about it. If one \
+         of them genuinely conflicts with the issue, resolve it in the \
+         directions' favour **and say so in `SPEC.md`**, because the reviewer \
+         reads the issue and cannot see this section.\n\n\
+         Account for every direction in `SPEC.md`'s `### Notes` — including \
+         any you decided against, and why. A direction you silently dropped is \
+         indistinguishable from one you never read.\n\n\
+         {text}\n\n",
+        author = directions.author_phrase(),
     )
 }
 
@@ -1155,7 +1244,7 @@ fn render_field_notes(salvage: &ScoutNotes) -> String {
         .map(str::trim)
         .filter(|r| !r.is_empty())
         .unwrap_or("the run was cut short before it could say why");
-    let notes = trim_prompt_notes(salvage.notes.trim());
+    let notes = trim_prompt_text("field notes", salvage.notes.trim());
     let fence = fence_for(&notes);
     format!(
         "## Field notes from an interrupted attempt\n\n\
@@ -1172,9 +1261,18 @@ fn render_field_notes(salvage: &ScoutNotes) -> String {
     )
 }
 
-/// Cut salvaged notes to [`MAX_PROMPT_NOTES_BYTES`] on a char boundary,
+/// Cut quoted prompt text to [`MAX_PROMPT_NOTES_BYTES`] on a char boundary,
 /// keeping the head and saying so.
-fn trim_prompt_notes(notes: &str) -> String {
+///
+/// `what` names the section in the marker, because more than one thing is
+/// quoted into this prompt now and a truncation notice that says "field notes"
+/// under a `## Directions` heading is worse than no notice: it sends the
+/// reader looking for a section that was never cut.
+///
+/// Directions use this as a backstop only — the API refuses an oversized set
+/// with a 400 rather than silently shortening one, so anything arriving here
+/// predates that check or came in some other way.
+fn trim_prompt_text(what: &str, notes: &str) -> String {
     if notes.len() <= MAX_PROMPT_NOTES_BYTES {
         return notes.to_string();
     }
@@ -1184,7 +1282,7 @@ fn trim_prompt_notes(notes: &str) -> String {
     }
     let dropped = notes.len() - cut;
     format!(
-        "{}\n\n…[tasks: field notes truncated here, {dropped} bytes dropped]",
+        "{}\n\n…[tasks: {what} truncated here, {dropped} bytes dropped]",
         &notes[..cut]
     )
 }
@@ -1286,6 +1384,7 @@ fn infer_complexity(files_touched: &[String]) -> Complexity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Actor;
 
     fn task_fixture() -> Task {
         Task {
@@ -1302,6 +1401,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: Utc::now(),
             updated_at: Utc::now(),
+            scout_directions: None,
         }
     }
 
@@ -1321,12 +1421,118 @@ mod tests {
         }
     }
 
+    /// The scout half of the `StreamClosed` move. A scout is already spared
+    /// its attempt by a *different* guard — `crate::run::is_disconnect`
+    /// returns before `failure_class` is consulted — so this pins the
+    /// classification rather than a behaviour change, which is exactly the
+    /// point: two answers about the same error must not disagree.
+    ///
+    /// The negative half is kept for the reason it is kept next door: an
+    /// assertion that nothing was charged reads identically to the cap being
+    /// switched off unless something in the same test still gets charged.
+    #[test]
+    fn a_closed_event_stream_is_transport_and_costs_the_task_no_attempt() {
+        use crate::store::Strike;
+
+        assert_eq!(
+            ScoutError::StreamClosed.failure_class(),
+            FailureClass::Transport,
+        );
+        assert!(!ScoutError::StreamClosed.failure_class().is_verdict());
+        assert_eq!(
+            Strike::for_class(ScoutError::StreamClosed.failure_class()),
+            Strike::Waive,
+        );
+
+        // Still charged: a run that concluded with nothing usable, and one
+        // that had the entire wall-clock budget.
+        assert_eq!(
+            Strike::for_class(
+                ScoutError::ScoutFailed {
+                    reason: "SPEC.md not found".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+        assert_eq!(
+            Strike::for_class(ScoutError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
+        );
+    }
+
     #[test]
     fn a_fresh_prompt_has_no_previous_attempt_section() {
-        let prompt = render_prompt(&task_fixture(), None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None);
         assert!(!prompt.contains("Previous attempt"));
         // The body must still run straight into the instructions.
         assert!(prompt.contains("The issue body.\n\n## Your job"));
+        // No empty heading either: a `## Directions` that is always there is
+        // exactly what teaches an agent to skim past the one that matters.
+        assert!(!prompt.contains("## Directions"), "{prompt}");
+    }
+
+    #[test]
+    fn directions_sit_last_before_the_job_and_name_their_author() {
+        let directions = Directions::new("start from the poller, not the API", Actor::Human);
+        let notes = salvaged("half an idea", Some("the VM went away"));
+        let prompt = render_prompt(&task_fixture(), None, Some(&notes), Some(&directions));
+
+        let field = prompt.find("## Field notes from an interrupted").unwrap();
+        let section = prompt.find("## Directions for this exploration").unwrap();
+        let job = prompt.find("## Your job").unwrap();
+        assert!(field < section && section < job, "{prompt}");
+
+        assert!(
+            prompt.contains("The human running this pipeline"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("start from the poller, not the API"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("a requirement, not a suggestion"),
+            "{prompt}"
+        );
+        // Accounted for where a Scout writes, declines included.
+        assert!(prompt.contains("### Notes"), "{prompt}");
+        assert!(prompt.contains("decided against"), "{prompt}");
+
+        let orchestrated = render_prompt(
+            &task_fixture(),
+            None,
+            None,
+            Some(&Directions::new("x", Actor::Orchestrator)),
+        );
+        assert!(
+            orchestrated.contains("The orchestrator agent"),
+            "{orchestrated}"
+        );
+    }
+
+    /// Directions and field notes are the two quoted sections, and they are
+    /// framed as opposites on purpose: notes are unverified leads, directions
+    /// are an instruction to follow. A directions-only prompt must carry none
+    /// of the salvage's hedging voice.
+    #[test]
+    fn directions_are_not_framed_as_unverified_salvage() {
+        let prompt = render_prompt(
+            &task_fixture(),
+            None,
+            None,
+            Some(&Directions::new("do the thing", Actor::Human)),
+        );
+        assert!(
+            !prompt.contains("Nothing below has been verified"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("Field notes"), "{prompt}");
+        assert!(
+            prompt.contains("no reviewer has seen it"),
+            "it is still not a reviewed artifact, and says so in its own words: {prompt}"
+        );
     }
 
     #[test]
@@ -1335,7 +1541,7 @@ mod tests {
             "## Spec: old\n\nSection 3 is thin.",
             Some("Flesh out section 3."),
         );
-        let prompt = render_prompt(&task_fixture(), Some(&prior), None);
+        let prompt = render_prompt(&task_fixture(), Some(&prior), None, None);
 
         let attempt = prompt.find("## Previous attempt").expect("section present");
         let verdict = prompt.find("needs_revision").expect("verdict present");
@@ -1354,7 +1560,12 @@ mod tests {
     #[test]
     fn missing_or_blank_feedback_still_renders() {
         for empty in [None, Some(""), Some("   ")] {
-            let prompt = render_prompt(&task_fixture(), Some(&reviewed("spec body", empty)), None);
+            let prompt = render_prompt(
+                &task_fixture(),
+                Some(&reviewed("spec body", empty)),
+                None,
+                None,
+            );
             assert!(prompt.contains("## Previous attempt"));
             assert!(prompt.contains("no written feedback"));
         }
@@ -1365,7 +1576,12 @@ mod tests {
         // A spec containing its own ```rust block would break out of a plain
         // ``` wrapper and merge its headings into the prompt's structure.
         let nested = "## Spec\n\n```rust\nfn x() {}\n```\n";
-        let prompt = render_prompt(&task_fixture(), Some(&reviewed(nested, Some("f"))), None);
+        let prompt = render_prompt(
+            &task_fixture(),
+            Some(&reviewed(nested, Some("f"))),
+            None,
+            None,
+        );
         assert!(prompt.contains("````markdown"));
         assert_eq!(fence_for("no fences"), "```");
         assert_eq!(fence_for("a ``` b"), "````");
@@ -1388,7 +1604,7 @@ mod tests {
     /// skeleton spec is what reaches a reviewer looking finished.
     #[test]
     fn the_prompt_asks_for_notes_and_forbids_a_placeholder_spec() {
-        let prompt = render_prompt(&task_fixture(), None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None);
         assert!(prompt.contains("Keep `NOTES.md`"));
         assert!(prompt.contains("`SPEC.md` is not a checkpoint"));
         assert!(prompt.contains("A half-written spec is worse than no spec"));
@@ -1402,7 +1618,7 @@ mod tests {
             "# Notes\n\nThe parser lives in src/parse.rs.",
             Some("scout timed out after 3600s"),
         );
-        let prompt = render_prompt(&task_fixture(), None, Some(&notes));
+        let prompt = render_prompt(&task_fixture(), None, Some(&notes), None);
 
         let section = prompt
             .find("## Field notes from an interrupted attempt")
@@ -1418,7 +1634,7 @@ mod tests {
 
         // A checkpoint salvaged mid-run has no reason yet; the section still
         // renders rather than printing "None".
-        let no_reason = render_prompt(&task_fixture(), None, Some(&salvaged("x", None)));
+        let no_reason = render_prompt(&task_fixture(), None, Some(&salvaged("x", None)), None);
         assert!(no_reason.contains("cut short before it could say why"));
         assert!(!no_reason.contains("None)"));
     }
@@ -1429,7 +1645,7 @@ mod tests {
     #[test]
     fn quoted_notes_survive_their_own_fences() {
         let notes = salvaged("```rust\nfn x() {}\n```", None);
-        let prompt = render_prompt(&task_fixture(), None, Some(&notes));
+        let prompt = render_prompt(&task_fixture(), None, Some(&notes), None);
         assert!(prompt.contains("````markdown"));
     }
 
@@ -1438,13 +1654,16 @@ mod tests {
     #[test]
     fn prompt_notes_are_trimmed_head_first() {
         let short = "still short";
-        assert_eq!(trim_prompt_notes(short), short);
+        assert_eq!(trim_prompt_text("field notes", short), short);
 
         let long = format!("HEAD{}TAIL", "é".repeat(MAX_PROMPT_NOTES_BYTES));
-        let out = trim_prompt_notes(&long);
+        let out = trim_prompt_text("field notes", &long);
         assert!(out.starts_with("HEAD"), "the head is what survives");
         assert!(!out.contains("TAIL"));
         assert!(out.contains("field notes truncated"));
+        // The marker names the section it cut, so a truncation notice under a
+        // `## Directions` heading cannot say "field notes".
+        assert!(trim_prompt_text("directions", &long).contains("directions truncated"));
         assert!(out.len() < MAX_PROMPT_NOTES_BYTES + 128);
         const { assert!(MAX_PROMPT_NOTES_BYTES < crate::protocol::MAX_NOTES_BYTES) };
     }
@@ -1455,7 +1674,7 @@ mod tests {
     fn a_prompt_can_carry_both_a_review_and_field_notes() {
         let prior = reviewed("## Spec: old", Some("Say more."));
         let notes = salvaged("a later, interrupted look", None);
-        let prompt = render_prompt(&task_fixture(), Some(&prior), Some(&notes));
+        let prompt = render_prompt(&task_fixture(), Some(&prior), Some(&notes), None);
 
         let previous = prompt.find("## Previous attempt").unwrap();
         let field = prompt.find("## Field notes").unwrap();

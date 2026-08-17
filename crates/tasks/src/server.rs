@@ -28,23 +28,22 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    AbandonPullRequest, BriefingStatus, BuildDetail, BuildNowRequest, BuildRequest, CancelAck,
-    CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest,
-    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
+    AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
+    CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse,
+    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
+    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage, ServerStatus,
+    SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
 };
 
-use crate::briefing::{self, Briefings};
 use crate::bundles::RejectedBundles;
 use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
-    Complexity, Decision, DecisionAction, DecisionInput, GhState, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind, ScoutNotes, Session,
-    SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId,
-    TranscriptLine, TranscriptOwner,
+    Complexity, Decision, DecisionAction, DecisionInput, Directions, GhState, Mode,
+    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind,
+    ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
+    Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
@@ -156,14 +155,12 @@ type ApiResult<T> = Result<T, ApiError>;
 ///
 /// Each is optional so `router(store)` (tests, embedded uses) keeps working,
 /// and each absence has a defined answer rather than a pretended one: without
-/// the briefing service `GET /briefings` serves stored copies and never
-/// regenerates, without a GitHub client the endpoints that write upstream
-/// answer 503, and without a bundle service `GET /bundles` answers 503 — never
-/// `[]`, because "nothing was preserved" is the one wrong answer to give about
-/// a directory nobody looked in.
+/// a GitHub client the endpoints that write upstream answer 503, and without
+/// a bundle service `GET /bundles` answers 503 — never `[]`, because "nothing
+/// was preserved" is the one wrong answer to give about a directory nobody
+/// looked in.
 #[derive(Clone, Default)]
 pub struct Services {
-    pub briefings: Option<Arc<Briefings>>,
     pub github: Option<Arc<GitHubClient>>,
     pub bundles: Option<Arc<RejectedBundles>>,
 }
@@ -178,12 +175,6 @@ pub struct AppState {
 impl FromRef<AppState> for Arc<Store> {
     fn from_ref(state: &AppState) -> Self {
         state.store.clone()
-    }
-}
-
-impl FromRef<AppState> for Option<Arc<Briefings>> {
-    fn from_ref(state: &AppState) -> Self {
-        state.services.briefings.clone()
     }
 }
 
@@ -205,11 +196,10 @@ pub fn router(store: Arc<Store>) -> Router {
     router_with_services(store, Services::default())
 }
 
-/// Build the full API router. `serve` passes the briefing service so
-/// `GET /briefings` can kick stale-while-revalidate regenerations, the GitHub
-/// client so issue writes can go through the server rather than through an
-/// agent's own credential, and the bundle service so a preserved
-/// implementation can be found without an `ls` on the server host.
+/// Build the full API router. `serve` passes the GitHub client so issue
+/// writes can go through the server rather than through an agent's own
+/// credential, and the bundle service so a preserved implementation can be
+/// found without an `ls` on the server host.
 pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
     Router::new()
         // First on purpose: no state, no store, no auth — the one route that
@@ -283,7 +273,6 @@ pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
-        .route("/briefings", get(list_briefings))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
         .with_state(AppState { store, services })
@@ -565,14 +554,56 @@ async fn get_task(
         .ok_or_else(|| ApiError::NotFound(format!("task {id}")))
 }
 
+/// Largest set of directions any endpoint accepts.
+///
+/// Generous — this is a paragraph or two of instruction, not a document — and
+/// it exists to bound what lands in an agent's context window rather than to
+/// bound a column.
+const MAX_DIRECTIONS_BYTES: usize = 16 * 1024;
+
+/// Read a `directions` field off a request body.
+///
+/// The doubled `Option` is the whole point, and the three cases are three
+/// different intentions:
+///
+/// - `None` — the field was absent. **Leave whatever is staged alone.** A
+///   second `POST /scout` with no body must not silently unaim the run, which
+///   is why "absent" cannot be spelled the same way as "clear".
+/// - `Some(None)` — present but empty or whitespace. Clear it.
+/// - `Some(Some(d))` — these directions, attributed to `actor`.
+///
+/// Over [`MAX_DIRECTIONS_BYTES`] is a **400, not a truncation**: an
+/// instruction cut off halfway is a different instruction, and one the caller
+/// would have no way to know they gave.
+fn parse_directions(raw: Option<&str>, actor: Actor) -> ApiResult<Option<Option<Directions>>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(None));
+    }
+    if trimmed.len() > MAX_DIRECTIONS_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "directions are {} bytes, over the {MAX_DIRECTIONS_BYTES}-byte limit. They are \
+             refused rather than shortened: an instruction cut off halfway is a different \
+             instruction. If this much needs saying, it belongs in the issue or the spec, \
+             which are reviewed",
+            trimmed.len()
+        )));
+    }
+    Ok(Some(Some(Directions::new(trimmed, actor))))
+}
+
 /// Pick a backlog task up into the scout queue (appended at the end).
 async fn queue_task(
     State(store): State<Arc<Store>>,
     Path(task_id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<ScoutRequest>>,
 ) -> ApiResult<Response> {
     let id = TaskId::from_raw(task_id);
-    queue_under_charter(&store, &headers, &id, false).await
+    queue_under_charter(&store, &headers, &id, false, body).await
 }
 
 /// Return a queued (not yet running) task to the backlog.
@@ -589,9 +620,10 @@ async fn scout_task_now(
     State(store): State<Arc<Store>>,
     Path(task_id): Path<String>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<ScoutRequest>>,
 ) -> ApiResult<Response> {
     let id = TaskId::from_raw(task_id);
-    queue_under_charter(&store, &headers, &id, true).await
+    queue_under_charter(&store, &headers, &id, true, body).await
 }
 
 /// Queue a task, or record that the orchestrator would have.
@@ -606,8 +638,16 @@ async fn queue_under_charter(
     headers: &axum::http::HeaderMap,
     id: &TaskId,
     front: bool,
+    body: Option<Json<ScoutRequest>>,
 ) -> ApiResult<Response> {
+    // Both routes took no body at all before `directions` existed, and every
+    // caller that still sends none has to keep working — `Option<Json<T>>` is
+    // the extractor for that, already proven here by `build_task_now`.
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     let actor = actor_of(store, headers)?;
+    // Parsed before anything is written, so an oversized set 400s having
+    // staged nothing *and* queued nothing.
+    let directions = parse_directions(body.directions.as_deref(), actor)?;
     let authority = authorize(
         store,
         actor,
@@ -616,6 +656,10 @@ async fn queue_under_charter(
     )
     .await?;
     if authority == Authority::Shadow {
+        // Deliberately no staging on this path. Nothing was queued, so
+        // directions written here would sit waiting to steer whoever queues
+        // the task next — which is not what the caller asked for and not what
+        // a shadow row means.
         let seq = store
             .record_decision(
                 "task",
@@ -623,13 +667,18 @@ async fn queue_under_charter(
                 DecisionAction::QueueTask,
                 DecisionInput {
                     actor,
-                    rationale: Some("queued in shadow".into()),
-                    evidence: None,
+                    rationale: body.rationale.or_else(|| Some("queued in shadow".into())),
+                    evidence: body.evidence,
                 },
                 false,
             )
             .await?;
         return Ok(shadowed(seq, "the task was not queued"));
+    }
+    // Staged *before* the queueing: in the other order the dispatch loop can
+    // claim the task in between and start a run the directions never reached.
+    if let Some(directions) = &directions {
+        store.set_scout_directions(id, directions.as_ref()).await?;
     }
     let task = if front {
         store.push_task_to_front(id).await?
@@ -644,8 +693,14 @@ async fn queue_under_charter(
                 DecisionAction::QueueTask,
                 DecisionInput {
                     actor,
-                    rationale: Some(if front { "scout now" } else { "queued" }.into()),
-                    evidence: None,
+                    // The caller's own words when it gave any. `directions` is
+                    // never copied in here and `rationale` never reaches the
+                    // Scout: one is read by humans afterwards, the other is
+                    // read by the agent.
+                    rationale: body
+                        .rationale
+                        .or_else(|| Some(if front { "scout now" } else { "queued" }.into())),
+                    evidence: body.evidence,
                 },
                 true,
             )
@@ -1979,6 +2034,9 @@ async fn request_build(
 ) -> ApiResult<Response> {
     let base_branch = body.base_branch.as_deref().unwrap_or("main");
     let actor = actor_of(&store, &headers)?;
+    // A build has no staging step — it is created for one run — so "absent"
+    // and "cleared" are the same answer here and the outer Option flattens.
+    let directions = parse_directions(body.directions.as_deref(), actor)?.flatten();
     let decision = DecisionInput {
         actor,
         rationale: body.rationale,
@@ -2011,7 +2069,7 @@ async fn request_build(
         return Ok(shadowed(seq, "no Builder run was queued"));
     }
     let build = store
-        .create_build(&body.spec_ids, base_branch, decision)
+        .create_directed_build(&body.spec_ids, base_branch, directions.as_ref(), decision)
         .await?;
     let spec_ids = store.build_spec_ids(&build.id).await?;
     Ok((StatusCode::ACCEPTED, Json(BuildDetail { build, spec_ids })).into_response())
@@ -2078,6 +2136,11 @@ async fn build_task_now(
         )));
     }
 
+    // Strictly beside `content`, never inside it: the spec is the artifact a
+    // reviewer would read, and an instruction addressed to the agent does not
+    // belong in it.
+    let directions = parse_directions(body.directions.as_deref(), actor)?.flatten();
+
     let decision = DecisionInput {
         actor,
         rationale: body.rationale,
@@ -2087,9 +2150,10 @@ async fn build_task_now(
         .author_spec(&id, &content, complexity, decision.clone())
         .await?;
     let build = store
-        .create_build(
+        .create_directed_build(
             std::slice::from_ref(&spec.id),
             body.base_branch.as_deref().unwrap_or("main"),
+            directions.as_ref(),
             decision,
         )
         .await?;
@@ -2389,6 +2453,9 @@ async fn get_status(State(store): State<Arc<Store>>) -> ApiResult<Json<ServerSta
         migrations_applied: store.migrations_applied().to_vec(),
         mode: store.get_mode().await?,
         in_flight: store.in_flight().await?,
+        // Judged against *this* binary's build, here at read time — see
+        // `Store::image_builds`.
+        images: store.image_builds(crate::version::VERSION).await?,
     }))
 }
 
@@ -2572,25 +2639,6 @@ fn to_sse(line: &TranscriptLine) -> Option<Result<SseEvent, Infallible>> {
     }
 }
 
-// --- briefings ---
-
-/// All three Home briefing slots, stale-while-revalidate: whatever is stored
-/// returns immediately, and stale sections kick a single-flight background
-/// regeneration when a briefing service is attached (the production server).
-/// Completion arrives as a `briefing_updated` event — refetch on it. Without
-/// a service (tests, embedded routers) this only ever serves stored copies.
-async fn list_briefings(
-    State(store): State<Arc<Store>>,
-    State(briefings): State<Option<Arc<Briefings>>>,
-) -> ApiResult<Json<Vec<BriefingStatus>>> {
-    match briefings {
-        Some(service) => Ok(Json(service.get_all().await?)),
-        None => Ok(Json(
-            briefing::snapshot(&store, briefing::DEFAULT_TTL).await?,
-        )),
-    }
-}
-
 // --- events ---
 
 #[derive(Debug, Deserialize)]
@@ -2690,6 +2738,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&task).await.unwrap();
         task
@@ -2708,6 +2757,7 @@ mod tests {
             completed_at: Some(Utc::now()),
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         let spec = Spec {
@@ -3416,6 +3466,204 @@ mod tests {
         assert_eq!(resp.status(), 404);
     }
 
+    // --- directions (#917) ---
+
+    /// Staging is three-way, and "absent" is the case that has to be right:
+    /// a second `POST /scout` with no body must not unaim a run somebody
+    /// already aimed.
+    #[tokio::test]
+    async fn scout_directions_omit_keeps_and_empty_clears() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 7, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        // No body at all — the shape every caller used before this existed.
+        let resp = http
+            .post(format!("{base}/tasks/{}/queue", task.id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "an empty POST still queues the task");
+        let queued: Task = resp.json().await.unwrap();
+        assert_eq!(queued.state, TaskState::Queued);
+        assert_eq!(queued.scout_directions, None);
+
+        let aimed: Task = http
+            .post(format!("{base}/tasks/{}/scout", task.id))
+            .json(&json!({"directions": "  start from the poller  "}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let staged = aimed.scout_directions.expect("staged");
+        assert_eq!(staged.text, "start from the poller", "trimmed, not raw");
+        assert_eq!(staged.author, Actor::Human);
+
+        // Absent leaves it alone.
+        let again: Task = http
+            .post(format!("{base}/tasks/{}/scout", task.id))
+            .json(&json!({"rationale": "bumping it"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            again.scout_directions.as_ref().map(|d| d.text.as_str()),
+            Some("start from the poller"),
+            "omitting the field must not unaim the run"
+        );
+
+        // Empty clears it.
+        let cleared: Task = http
+            .post(format!("{base}/tasks/{}/scout", task.id))
+            .json(&json!({"directions": "   "}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared.scout_directions, None);
+        assert_eq!(
+            store
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .scout_directions,
+            None
+        );
+    }
+
+    /// Over the limit is a refusal, and it costs the request everything: no
+    /// staging, and no queueing either. Truncating instead would hand a Scout
+    /// half an instruction the caller has no way to know was cut.
+    #[tokio::test]
+    async fn oversized_directions_400_and_stage_nothing_and_queue_nothing() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 7, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let huge = "x".repeat(MAX_DIRECTIONS_BYTES + 1);
+        let resp = http
+            .post(format!("{base}/tasks/{}/queue", task.id))
+            .json(&json!({"directions": huge}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let after = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(after.scout_directions, None, "nothing was staged");
+        assert_eq!(
+            after.state,
+            TaskState::Backlog,
+            "and the task was not queued either"
+        );
+    }
+
+    /// The two fields are not interchangeable, in either direction. A
+    /// `rationale` on `POST /builds` explains the batch to a later reader and
+    /// must never reach the VM.
+    #[tokio::test]
+    async fn a_rationale_on_a_build_never_becomes_directions() {
+        let (store, project) = store_with_project().await;
+        let (_task, spec) = insert_spec(&store, &project, 7).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Human,
+                    rationale: None,
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let detail: BuildDetail = http
+            .post(format!("{base}/builds"))
+            .json(&json!({
+                "spec_ids": [spec.id.as_str()],
+                "rationale": "this is the only approved spec",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.build.directions, None,
+            "a rationale is not an instruction to the agent"
+        );
+
+        let decisions = store
+            .decisions(Some(("build", detail.build.id.as_str())), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            decisions[0].rationale.as_deref(),
+            Some("this is the only approved spec")
+        );
+    }
+
+    /// And the reverse: directions reach the build row, attributed, without
+    /// touching the rationale.
+    #[tokio::test]
+    async fn build_directions_are_stored_with_their_author() {
+        let (store, project) = store_with_project().await;
+        let (_task, spec) = insert_spec(&store, &project, 7).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput {
+                    actor: Actor::Human,
+                    rationale: None,
+                    evidence: None,
+                },
+            )
+            .await
+            .unwrap();
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let detail: BuildDetail = http
+            .post(format!("{base}/builds"))
+            .json(&json!({
+                "spec_ids": [spec.id.as_str()],
+                "rationale": "why",
+                "directions": "keep the migration reversible",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let directions = detail.build.directions.expect("stored on the row");
+        assert_eq!(directions.text, "keep the migration reversible");
+        assert_eq!(directions.author, Actor::Human);
+
+        let decisions = store
+            .decisions(Some(("build", detail.build.id.as_str())), 10)
+            .await
+            .unwrap();
+        assert_eq!(decisions[0].rationale.as_deref(), Some("why"));
+    }
+
     // --- build now (#869) ---
 
     /// The whole path in one call: the issue body becomes the spec, the spec
@@ -3504,6 +3752,43 @@ mod tests {
             "a supplied content replaces the body, it does not append to it"
         );
         assert_eq!(spec.complexity, Complexity::Medium);
+    }
+
+    /// `content` is the specification; `directions` is what to do with it.
+    /// Merging the two would put an instruction addressed to the agent inside
+    /// the artifact a reviewer would read — and here that artifact is the only
+    /// thing standing in for a review at all.
+    #[tokio::test]
+    async fn build_now_keeps_directions_out_of_the_spec_it_authors() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 9, 0).await;
+        let base = spawn(store.clone()).await;
+        let http = reqwest::Client::new();
+
+        let detail: BuildDetail = http
+            .post(format!("{base}/tasks/{}/build-now", task.id))
+            .json(&json!({
+                "content": "## Spec\nRename the flag.",
+                "rationale": "the issue says it all",
+                "directions": "do not touch the migration",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let spec = store.get_spec(&detail.spec_ids[0]).await.unwrap().unwrap();
+        assert_eq!(spec.content, "## Spec\nRename the flag.");
+        assert!(
+            !spec.content.contains("do not touch the migration"),
+            "directions must not leak into the spec: {}",
+            spec.content
+        );
+        let directions = detail.build.directions.expect("on the build row instead");
+        assert_eq!(directions.text, "do not touch the migration");
+        assert_eq!(directions.author, Actor::Human);
     }
 
     /// Human-only, and *not* charter-gated: every capability that could
@@ -3606,6 +3891,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&task).await.unwrap();
         let base = spawn(store.clone()).await;
@@ -3704,6 +3990,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
 
@@ -3788,55 +4075,6 @@ mod tests {
                 to: Mode::Play
             }
         );
-    }
-
-    /// The `/briefings` wire shape: always all three sections, snake_case
-    /// keys, RFC3339 timestamps, and — without a briefing service attached —
-    /// stored copies only, never a regeneration.
-    #[tokio::test]
-    async fn briefings_serve_all_three_sections_from_storage() {
-        use crate::models::{Briefing, BriefingSection};
-
-        let store = Arc::new(Store::open_in_memory().await.unwrap());
-        store
-            .upsert_briefing(&Briefing {
-                section: BriefingSection::Changes,
-                content: "PR [#7](https://github.com/a/b/pull/7) is stale.".into(),
-                generated_at: Utc::now(),
-                event_high_water: 3,
-            })
-            .await
-            .unwrap();
-        let base = spawn(store.clone()).await;
-
-        let body: Vec<Value> = reqwest::get(format!("{base}/briefings"))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(body.len(), 3);
-        let sections: Vec<&str> = body
-            .iter()
-            .map(|b| b["section"].as_str().unwrap())
-            .collect();
-        assert_eq!(sections, vec!["state_of_project", "changes", "issues"]);
-
-        let changes = &body[1];
-        assert_eq!(
-            changes["content"].as_str().unwrap(),
-            "PR [#7](https://github.com/a/b/pull/7) is stale."
-        );
-        assert_eq!(changes["stale"], Value::Bool(false));
-        assert_eq!(changes["regenerating"], Value::Bool(false));
-        assert!(changes["generated_at"].as_str().unwrap().contains('T'));
-
-        let never_generated = &body[0];
-        assert_eq!(never_generated["content"], Value::Null);
-        assert_eq!(never_generated["stale"], Value::Bool(true));
-
-        // No service attached: nothing regenerated behind the read.
-        assert_eq!(store.list_briefings().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4038,6 +4276,7 @@ mod tests {
             completed_at: None,
             exit_reason: None,
             usage: None,
+            directions: None,
         };
         store.insert_session(&session).await.unwrap();
         session.id
@@ -4448,6 +4687,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&retired).await.unwrap();
         let base = spawn(store).await;

@@ -14,6 +14,68 @@ use vm_pool_service::{Service, ServiceConfig};
 
 use tasks_protocol::TasksProtocol;
 
+/// Warnings and errors this test process has logged, once a test asks for
+/// them. See [`capture_warnings`].
+static WARNINGS: LazyLock<Warnings> = LazyLock::new(|| {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let sink = buffer.clone();
+    // `try_init`, because under plain `cargo test` several tests share one
+    // process and only the first of them gets to install a subscriber. A
+    // failure here is fine: the buffer stays empty and `seen()` says so.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || BufferWriter(sink.clone()))
+        .with_ansi(false)
+        .try_init();
+    Warnings { buffer }
+});
+
+struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufferWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A handle on what the code under test warned about.
+#[derive(Clone)]
+pub struct Warnings {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Warnings {
+    /// Everything logged at WARN or above so far, for a failure message.
+    ///
+    /// `"(none)"` rather than an empty string when nothing was logged, because
+    /// that is itself informative: it rules the log out as the explanation
+    /// instead of leaving a blank where an answer should be.
+    pub fn seen(&self) -> String {
+        let buffer = self.buffer.lock().unwrap();
+        let text = String::from_utf8_lossy(&buffer);
+        if text.trim().is_empty() {
+            "(none)".into()
+        } else {
+            text.into_owned()
+        }
+    }
+}
+
+/// Start collecting this process's warnings, so a failing assertion can print
+/// what the code under test said about itself.
+///
+/// A test process installs no subscriber by default, which is how a lost
+/// transcript batch — logged, and explained, at ERROR — reached a failing
+/// assertion with no explanation attached, and got read as a bug in the code
+/// under test rather than in the store's locking.
+pub fn capture_warnings() -> Warnings {
+    WARNINGS.clone()
+}
+
 /// Binaries this suite has already located, keyed by package name. The cell
 /// is what makes concurrent callers for the same binary wait on one build
 /// instead of racing several.
@@ -193,9 +255,7 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         orchestrator_cmd: "true".into(),
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
-        briefing_cmd: "true".into(),
-        briefing_ttl: Duration::from_secs(900),
-        briefing_timeout: Duration::from_secs(60),
+        orchestrator_target_dir: None,
     }
 }
 

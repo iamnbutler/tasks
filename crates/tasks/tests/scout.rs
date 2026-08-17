@@ -55,6 +55,7 @@ async fn insert_project_and_task(store: &Store, title: &str, body: &str) -> (Pro
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     (project, task)
@@ -136,6 +137,25 @@ async fn scout_dispatch_end_to_end_produces_spec() {
         .unwrap();
     assert_eq!(session.status, SessionStatus::ScoutSucceeded);
     assert!(session.branch.starts_with("scout/"));
+
+    // The image identity, all the way through: the *real* supervisor binary
+    // stamped itself, reported it on `Started`, and the host recorded it. This
+    // and its Builder counterpart are the only places the whole chain is
+    // actually checked — everywhere else `Option` plus `serde(default)` is by
+    // design indistinguishable from "the field was never sent", so a break
+    // would pass silently.
+    let images = store.image_builds("0.1.0").await.unwrap();
+    let observed = images
+        .iter()
+        .find(|i| i.image == "agent:v1")
+        .expect("the scout image was observed");
+    assert_eq!(observed.role, tasks_api::version::ImageRole::Scout);
+    assert!(
+        observed.version.is_some(),
+        "the supervisor stated no build identity"
+    );
+    assert!(observed.commit.is_some());
+    assert_eq!(observed.run_id.as_deref(), Some(session.id.as_str()));
 
     // Sanity: event log captured the transitions
     let events = store.all_events().await.unwrap();

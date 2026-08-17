@@ -55,6 +55,7 @@ fn orchestrator(store: Arc<Store>, stub: &Path, tmp: &Path) -> Orchestrator {
             timeout: Duration::from_secs(30),
             workdir: tmp.join("orch-workdir"),
             workdir_is_checkout: false,
+            target_dir: None,
             github_configured: true,
             api_port: 4800,
             curl_config: tmp.join("orchestrator-curl.conf"),
@@ -593,6 +594,7 @@ async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expan
             timeout: Duration::from_secs(30),
             workdir: workdir.clone(),
             workdir_is_checkout: false,
+            target_dir: None,
             github_configured: true,
             api_port: port,
             curl_config: curl_config.clone(),
@@ -1007,6 +1009,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     let session = Session {
@@ -1019,6 +1022,7 @@ async fn seed_pending_spec(store: &Store) -> Spec {
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
@@ -1120,6 +1124,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
             dispatch_attempts: 0,
             ingested_at: now,
             updated_at: now,
+            scout_directions: None,
         };
         store.insert_task(&task).await.unwrap();
         task
@@ -1365,4 +1370,104 @@ async fn messages_flow_over_http() {
         .await
         .unwrap();
     assert!(after.is_empty());
+}
+
+/// The scope test: what the agent child's environment actually is.
+///
+/// A unit test on the prompt can only say what the agent is *told*; this runs a
+/// real child and reads its environment back. Both directions matter, and the
+/// `None` half is the one a careless implementation gets wrong: with no target
+/// directory the child must see exactly what the parent had — neither cleared
+/// nor invented — because `CARGO_TARGET_DIR` set where nothing asked for it
+/// would silently redirect whatever else runs under this server.
+#[tokio::test]
+async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env_log = tmp.path().join("env.log");
+    let stub = tmp.path().join("env-dumping-agent.sh");
+    tokio::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nenv > {log}\ncat > /dev/null\necho done\n",
+            log = common::shell_escape(&env_log.display().to_string()),
+        ),
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&stub).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&stub, p).await.unwrap();
+    }
+
+    let target_dir = tmp.path().join("verify-target");
+    let base = OrchestratorConfig {
+        command: stub.display().to_string(),
+        timeout: Duration::from_secs(900),
+        workdir: tmp.path().join("orch-workdir"),
+        workdir_is_checkout: true,
+        target_dir: Some(target_dir.clone()),
+        github_configured: true,
+        api_port: 4800,
+        curl_config: tmp.path().join("orchestrator-curl.conf"),
+    };
+
+    let read_env = |path: std::path::PathBuf| async move {
+        tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                l.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    store
+        .append_orchestrator_message(ChatRole::User, "hello")
+        .await
+        .unwrap();
+    Orchestrator::new(store.clone(), base.clone())
+        .tick()
+        .await
+        .unwrap();
+
+    let env = read_env(env_log.clone()).await;
+    assert_eq!(
+        env.get("CARGO_TARGET_DIR").map(String::as_str),
+        Some(target_dir.display().to_string().as_str())
+    );
+    // Half the turn, in milliseconds, on both — Claude Code computes its
+    // ceiling as max(BASH_MAX_TIMEOUT_MS, effective default), so setting only
+    // the max would leave un-annotated commands at its 120s default.
+    assert_eq!(env.get("BASH_DEFAULT_TIMEOUT_MS").unwrap(), "450000");
+    assert_eq!(env.get("BASH_MAX_TIMEOUT_MS").unwrap(), "450000");
+
+    // And with no directory configured, the variable is not invented.
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    store
+        .append_orchestrator_message(ChatRole::User, "hello")
+        .await
+        .unwrap();
+    Orchestrator::new(
+        store,
+        OrchestratorConfig {
+            target_dir: None,
+            ..base
+        },
+    )
+    .tick()
+    .await
+    .unwrap();
+
+    let env = read_env(env_log).await;
+    assert_eq!(
+        env.get("CARGO_TARGET_DIR").cloned(),
+        std::env::var("CARGO_TARGET_DIR").ok(),
+        "with no target dir the child must see exactly what the parent had"
+    );
 }

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::models::{TranscriptOwner, TranscriptStream};
 use crate::protocol::LogStream;
@@ -57,6 +57,16 @@ pub struct TranscriptSink {
     dropped: u64,
     /// Total dropped, for the summary line on the way out.
     pub dropped_total: u64,
+    /// Lines the store *refused*, shared with the writer task.
+    ///
+    /// Distinct from [`Self::dropped_total`], and the distinction is the point.
+    /// A drop is deliberate backpressure this sink announces in the transcript
+    /// itself, at the place it happened. A rejection is content that was
+    /// accepted, queued and then lost to a failed transaction — and it leaves
+    /// no hole a reader could see, because `seq` is assigned at persist time.
+    /// Silence about it is how a lock bug got read as a bug in the code under
+    /// test.
+    rejected: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TranscriptSink {
@@ -142,11 +152,26 @@ pub fn spawn_transcript_writer(
     owner: TranscriptOwner,
 ) -> (TranscriptSink, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(TRANSCRIPT_QUEUE_CAPACITY);
+    let rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = Arc::clone(&rejected);
     let handle = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(TRANSCRIPT_BATCH);
         while rx.recv_many(&mut batch, TRANSCRIPT_BATCH).await > 0 {
-            if let Err(e) = store.append_transcript_lines(&owner, &batch).await {
-                warn!(owner = %owner, error = %e, "persisting transcript lines failed");
+            // Retried because this task is detached: there is no caller to
+            // return the error to, so an unretried loss is simply content
+            // gone. The retry is a belt — `store::begin_write` is what removed
+            // the unretryable class of failure.
+            let write =
+                crate::store::retry_on_contention(|| store.append_transcript_lines(&owner, &batch))
+                    .await;
+            if let Err(e) = write {
+                counter.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    owner = %owner,
+                    lines = batch.len(),
+                    error = %e,
+                    "persisting transcript lines failed; the batch is lost"
+                );
             }
             batch.clear();
         }
@@ -158,6 +183,7 @@ pub fn spawn_transcript_writer(
             capped: false,
             dropped: 0,
             dropped_total: 0,
+            rejected,
         },
         handle,
     )
@@ -178,9 +204,20 @@ pub async fn flush(sink: TranscriptSink, writer: tokio::task::JoinHandle<()>, ow
             "transcript lines dropped under queue pressure"
         );
     }
+    // Cloned before the sink is dropped and read after the writer is joined —
+    // the last batch is rejected inside `writer.await`, so reading it any
+    // earlier would report a stale zero.
+    let rejected = Arc::clone(&sink.rejected);
     drop(sink);
     if let Err(e) = writer.await {
         warn!(owner, error = %e, "transcript writer task failed");
+    }
+    let rejected = rejected.load(std::sync::atomic::Ordering::Relaxed);
+    if rejected > 0 {
+        error!(
+            owner,
+            rejected, "transcript lines were accepted and then lost by the store"
+        );
     }
 }
 
@@ -236,6 +273,7 @@ mod tests {
             capped: false,
             dropped: 0,
             dropped_total: 0,
+            rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let line = "x".repeat(MAX_TRANSCRIPT_LINE_BYTES);

@@ -12,7 +12,7 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::Context;
 use tasks_client::api::events::Event;
-use tasks_client::api::http::{BriefingStatus, RejectedBundle};
+use tasks_client::api::http::RejectedBundle;
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
     OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
@@ -79,7 +79,6 @@ pub struct AppState {
     pub bundles: Vec<RejectedBundle>,
     /// Newest [`ACTIVITY_LIMIT`] events, newest first.
     pub activity: Vec<Event>,
-    pub briefings: Vec<BriefingStatus>,
     pub orchestrator_messages: Vec<OrchestratorMessage>,
     /// The tick in flight, if one is showing.
     pub orchestrator_tick: Option<OrchestratorTick>,
@@ -159,7 +158,6 @@ struct Snapshot {
     builds: Option<Vec<Build>>,
     bundles: Option<Vec<RejectedBundle>>,
     activity: Option<Vec<Event>>,
-    briefings: Option<Vec<BriefingStatus>>,
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
     mode: Option<Mode>,
     /// The first failure, if any read failed.
@@ -207,7 +205,6 @@ impl Snapshot {
                 events
             }),
         );
-        take(&mut snapshot.briefings, &mut error, client.briefings());
         take(
             &mut snapshot.orchestrator_messages,
             &mut error,
@@ -306,7 +303,6 @@ impl AppState {
             builds: Vec::new(),
             bundles: Vec::new(),
             activity: Vec::new(),
-            briefings: Vec::new(),
             orchestrator_messages: Vec::new(),
             orchestrator_tick: None,
             chat: ChatLog::new(),
@@ -651,7 +647,7 @@ impl AppState {
                 $(if let Some(value) = snapshot.$field { self.$field = value; })+
             };
         }
-        merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity, briefings);
+        merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity);
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
         // The opening window is the same code path — an empty list has no
@@ -779,8 +775,12 @@ impl AppState {
         self.run(cx, move |client| client.dequeue_task(&id));
     }
 
+    /// `None` for directions: aiming a run is real UI work (a modal plus
+    /// state plumbing) and no affordance offers it yet. `None` is also the
+    /// safe value — it leaves whatever is already staged on the task alone
+    /// rather than clearing it out from under whoever staged it.
     pub fn scout_task_now(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        self.run(cx, move |client| client.scout_task_now(&id));
+        self.run(cx, move |client| client.scout_task_now(&id, None));
     }
 
     /// Write the task queue's order: `order` is the complete list of picked-up
@@ -859,7 +859,7 @@ impl AppState {
     /// is a request rather than a start; the server answers 202 and the event
     /// stream reports what happens next.
     pub fn build_spec(&mut self, id: SpecId, cx: &mut Context<Self>) {
-        self.run(cx, move |client| client.request_build(vec![id], None));
+        self.run(cx, move |client| client.request_build(vec![id], None, None));
     }
 
     /// "Build now": write the task's issue body as its spec, approve it, and
@@ -871,7 +871,7 @@ impl AppState {
     /// 202 and nothing applied locally — the refresh reads the new state back.
     pub fn build_task_now(&mut self, id: TaskId, rationale: String, cx: &mut Context<Self>) {
         self.run(cx, move |client| {
-            client.build_task_now(&id, Some(rationale))
+            client.build_task_now(&id, Some(rationale), None)
         });
     }
 
@@ -1183,6 +1183,7 @@ mod tests {
             dispatch_attempts: 0,
             ingested_at: Utc.timestamp_opt(0, 0).unwrap(),
             updated_at: Utc.timestamp_opt(0, 0).unwrap(),
+            scout_directions: None,
         }
     }
 

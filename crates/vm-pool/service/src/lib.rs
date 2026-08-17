@@ -6,12 +6,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use vm_pool_manager::{
-    EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState, SnapshotStore,
-    VmRuntime,
+    DEFAULT_MAX_VMS, EventLog, EventPayload, ImageRef, NoRuntime, Pool, PoolConfig, ServiceState,
+    SnapshotStore, VmRuntime,
 };
 use vm_pool_protocol::{
     AppProtocol, NullProtocol, Request, Response, ServiceCommand, ServiceEvent,
@@ -51,6 +53,188 @@ impl Default for ServiceConfig {
             pool: PoolConfig::default(),
         }
     }
+}
+
+impl ServiceConfig {
+    /// [`Default`], with [`PoolConfig::max_vms`] taken from [`MAX_VMS_ENV`].
+    ///
+    /// Deliberately *not* what `default()` does. `default()` is what tests and
+    /// embedders build a config with, and one that reads the ambient
+    /// environment lets whoever's shell happens to be running the suite decide
+    /// what it asserts.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            pool: PoolConfig {
+                max_vms: max_vms_from_env()?,
+                ..PoolConfig::default()
+            },
+            ..Self::default()
+        })
+    }
+}
+
+/// The environment variable that sizes the pool.
+pub const MAX_VMS_ENV: &str = "VM_POOL_MAX_VMS";
+
+/// Why a configuration value could not be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(
+        "{MAX_VMS_ENV} must be a positive integer (the number of VMs this pool may hold \
+         at once); got {value:?}"
+    )]
+    MaxVms { value: String },
+}
+
+/// Resolve [`PoolConfig::max_vms`] from [`MAX_VMS_ENV`].
+///
+/// Public and separate from [`ServiceConfig::from_env`] on purpose: the service
+/// has two entry points — the stock `vm-pool` binary, and any embedder that
+/// hand-builds a `ServiceConfig` because it needs a runtime or an app protocol
+/// this crate's `main` cannot name — and a knob only one of them honours is
+/// worse than no knob at all, because it is documented and ignored.
+///
+/// Unset, empty or whitespace reads as "not configured" and yields
+/// [`DEFAULT_MAX_VMS`]. Anything else that is not a positive integer is an
+/// error rather than a fallback: `0` binds the socket and answers `status`
+/// cheerfully while failing *every* allocate, and a typo silently running a
+/// capacity nobody chose is the failure this knob exists to end.
+pub fn max_vms_from_env() -> Result<usize, ConfigError> {
+    max_vms_from(std::env::var(MAX_VMS_ENV).ok())
+}
+
+/// The pure half of [`max_vms_from_env`], so tests never touch the process
+/// environment (`set_var` is `unsafe` in edition 2024 and races every other
+/// thread in the test binary).
+fn max_vms_from(value: Option<String>) -> Result<usize, ConfigError> {
+    let Some(raw) = value else {
+        return Ok(DEFAULT_MAX_VMS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_MAX_VMS);
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(ConfigError::MaxVms { value: raw }),
+    }
+}
+
+/// How long [`bind_socket`]'s probe waits for a connect to be answered before
+/// it treats the path as occupied. The answer comes out of the kernel's listen
+/// backlog, not from the daemon's accept loop, so this is generous for a live
+/// socket and only ever bites on something pathological — which is exactly the
+/// case that must not be taken over.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why a socket path could not be bound.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    /// Something answered a connect on the path. It has an owner, and this
+    /// process is not it.
+    #[error(
+        "another vm-pool is already listening on {0} — refusing to start a second one. \
+         Stop the running daemon first (its VMs are still its own), or point this one \
+         at a different VM_POOL_SOCKET"
+    )]
+    AlreadyRunning(PathBuf),
+    /// Something is at the path that is not a socket. The old code would have
+    /// deleted it.
+    #[error("{0} exists and is not a socket — refusing to remove it")]
+    NotASocket(PathBuf),
+    #[error("could not remove the stale socket at {path}")]
+    Unlink {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not bind {path}")]
+    Bind {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Whether something is listening on `path` right now.
+///
+/// **Every unreadable answer counts as occupied.** Only `ECONNREFUSED` (a
+/// socket file whose daemon is gone) and `ENOENT` (nothing there at all) are
+/// "free"; a third-kind io error, or a connect that does not return inside
+/// [`PROBE_TIMEOUT`], reads as occupied and says why. The asymmetry is the
+/// whole design: a wrong refusal costs one error message and one restart, a
+/// wrong takeover costs the running daemon every VM it holds and every run
+/// those VMs are carrying.
+async fn probe(path: &Path) -> bool {
+    match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            false
+        }
+        Ok(Err(e)) => {
+            warn!(
+                "could not tell whether {} has an owner ({e}); treating it as occupied",
+                path.display()
+            );
+            true
+        }
+        Err(_) => {
+            warn!(
+                "connect to {} did not answer within {PROBE_TIMEOUT:?}; treating it as occupied",
+                path.display()
+            );
+            true
+        }
+    }
+}
+
+/// Bind the service's Unix socket, refusing to displace a live daemon.
+///
+/// The decision order is `symlink_metadata` → is-it-a-socket → probe → unlink
+/// → bind. `symlink_metadata` rather than `metadata`, so a dangling symlink at
+/// the path is not followed into a stat error and mistaken for something else.
+///
+/// This exists because the previous code unconditionally `remove_file`d the
+/// path and then bound it, which silently displaced a running pool: the first
+/// daemon went on listening on an unlinked inode — healthy, `pgrep`-able,
+/// resolvable by `lsof` (which reads by path, and the path had been recreated
+/// underneath it) and unreachable forever — while the server reconnected to
+/// the path, found the *new* pool, and handed it the queued work. Neither std
+/// nor tokio unlinks a listener's path on drop, which is what makes the stale
+/// case real as well as testable: bind, drop, and the file is still there.
+///
+/// `pub` on purpose — it is the unit under test, and any future vm-pool entry
+/// point should call it rather than re-deriving the rule.
+pub async fn bind_socket(path: &Path) -> Result<UnixListener, BindError> {
+    // `symlink_metadata`: a dangling symlink is a thing that exists, and
+    // following it would report NotFound for a path that is not free.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            return Err(BindError::NotASocket(path.to_path_buf()));
+        }
+        if probe(path).await {
+            return Err(BindError::AlreadyRunning(path.to_path_buf()));
+        }
+        warn!(
+            "removing stale socket {} (nothing is listening on it)",
+            path.display()
+        );
+        std::fs::remove_file(path).map_err(|source| BindError::Unlink {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+
+    UnixListener::bind(path).map_err(|source| BindError::Bind {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Shared state for all connection handlers.
@@ -102,16 +286,15 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         let socket_path = &self.config.socket_path;
 
-        // Clean up old socket
-        let _ = std::fs::remove_file(socket_path);
-
+        // The `Starting` append stays *ahead* of the bind, so a refusal is
+        // still preceded by the state it was refused in.
         self.events
             .append(EventPayload::Service {
                 state: ServiceState::Starting,
             })
             .await;
 
-        let listener = UnixListener::bind(socket_path)?;
+        let listener = bind_socket(socket_path).await?;
         info!("listening on {}", socket_path.display());
 
         self.events
@@ -377,6 +560,41 @@ mod tests {
     use super::*;
     use vm_pool_protocol::{ShellCommand, ShellProtocol, VmConfig, VmId};
 
+    #[test]
+    fn an_unset_or_blank_pool_size_is_the_default() {
+        assert_eq!(max_vms_from(None).unwrap(), DEFAULT_MAX_VMS);
+        assert_eq!(max_vms_from(Some(String::new())).unwrap(), DEFAULT_MAX_VMS);
+        assert_eq!(max_vms_from(Some("  ".into())).unwrap(), DEFAULT_MAX_VMS);
+    }
+
+    #[test]
+    fn a_positive_integer_sizes_the_pool() {
+        for (raw, expected) in [("1", 1), ("6", 6), ("12", 12), (" 9 ", 9)] {
+            assert_eq!(max_vms_from(Some(raw.into())).unwrap(), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_a_positive_integer_refuses_to_start() {
+        // `0` is the one that matters: it binds, answers `status`, and then
+        // fails every allocate — silently reproducing the exhaustion this knob
+        // exists to make configurable.
+        for raw in ["0", "-1", "six", "3.5", "1_000", "6 vms"] {
+            assert!(
+                max_vms_from(Some(raw.into())).is_err(),
+                "{raw:?} should be refused, not clamped or defaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_variable_and_the_value() {
+        let message = max_vms_from(Some("six".into())).unwrap_err().to_string();
+        assert!(message.contains(MAX_VMS_ENV), "{message}");
+        assert!(message.contains("six"), "{message}");
+        assert!(message.contains("positive integer"), "{message}");
+    }
+
     async fn test_service() -> Arc<Service<NoRuntime, ShellProtocol>> {
         let dir = tempfile::tempdir().unwrap();
         let config = ServiceConfig {
@@ -393,6 +611,94 @@ mod tests {
         Service::<NoRuntime, ShellProtocol>::new(config)
             .await
             .unwrap()
+    }
+
+    /// The incident, as a test: a second daemon must not take the path from a
+    /// live one. And the assertion that matters is the second half — the
+    /// incumbent is still *reachable through the path* afterwards, which is
+    /// precisely what the old unlink-then-bind destroyed while leaving the
+    /// first process alive and looking healthy.
+    #[tokio::test]
+    async fn a_live_socket_is_refused_and_its_owner_stays_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let incumbent = bind_socket(&path).await.expect("a free path binds");
+
+        let err = bind_socket(&path)
+            .await
+            .expect_err("a live socket has an owner");
+        assert!(matches!(err, BindError::AlreadyRunning(ref p) if *p == path));
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains("Stop the running daemon first"),
+            "the reader does not yet know a first daemon exists: {message}"
+        );
+
+        // Still the incumbent's, and still answering on the path. No
+        // `accept()` here on purpose: the kernel answers out of the listen
+        // backlog, which is the same thing `probe` relies on.
+        UnixStream::connect(&path)
+            .await
+            .expect("the first listener still owns the path");
+        drop(incumbent);
+    }
+
+    /// The recovery that used to need a human with `rm`. Neither std nor tokio
+    /// unlinks a listener's path on drop, so the file is asserted to survive
+    /// the drop first — without that half the test could pass vacuously on a
+    /// path that was simply free.
+    #[tokio::test]
+    async fn a_stale_socket_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        drop(bind_socket(&path).await.unwrap());
+        assert!(path.exists(), "the socket file outlives its listener");
+
+        let listener = bind_socket(&path).await.expect("a dead socket is stale");
+        UnixStream::connect(&path)
+            .await
+            .expect("the reclaimed path answers");
+        drop(listener);
+    }
+
+    /// The unconditional `remove_file` would have deleted a regular file a
+    /// human put at the path. Its contents are checked afterwards, because
+    /// "the call failed" and "the call failed without eating the file" are
+    /// different claims.
+    #[tokio::test]
+    async fn a_regular_file_at_the_path_is_refused_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, "someone's notes").unwrap();
+
+        let err = bind_socket(&path).await.expect_err("that is not a socket");
+        assert!(matches!(err, BindError::NotASocket(ref p) if *p == path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone's notes");
+    }
+
+    /// The refusal reaches `run()` rather than being swallowed inside it —
+    /// the entry point both `vm-pool-service`'s `main` and `tasks vm-pool`
+    /// go through.
+    #[tokio::test]
+    async fn run_surfaces_a_refused_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taken.sock");
+        let _incumbent = bind_socket(&path).await.unwrap();
+
+        let config = ServiceConfig {
+            socket_path: path.clone(),
+            snapshot_dir: dir.path().join("snapshots"),
+            pool: PoolConfig::default(),
+        };
+        let svc = Service::<NoRuntime, ShellProtocol>::new(config)
+            .await
+            .unwrap();
+        let err = svc.run().await.expect_err("the socket is occupied");
+        assert!(
+            err.to_string().contains("refusing to start a second one"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

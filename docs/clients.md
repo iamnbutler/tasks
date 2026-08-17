@@ -259,21 +259,6 @@ than filing into the wrong repo. Name it explicitly in a multi-repo client.
   `pr_number` is an identifier, not a state: the PR's mergeability/CI/open
   state is GitHub's — link out (`https://github.com/{owner}/{repo}/pull/N`),
   don't expect it here.
-- `GET /briefings` — the three Home briefing slots, always all three, in
-  display order: `[{section, content, generated_at, stale, regenerating,
-  error}]` with `section` one of `state_of_project` | `changes` | `issues`.
-  `content` is LLM-written markdown prose (null until first generation);
-  render it with the generated_at age visible — the prose is a **cache with
-  a date**, and prose without its date reads as current. **Reading is the
-  demand signal**: the server returns stored copies immediately and kicks a
-  single-flight background regeneration for stale sections
-  (stale-while-revalidate, TTL `BRIEFING_TTL_SECS`, default 900s); a
-  completed regeneration appends a `briefing_updated` event — refetch on it.
-  `regenerating` means a run is in flight ("refreshing…"); `error` carries
-  the last failed attempt while the previous good copy keeps serving
-  ("couldn't refresh"). Don't poll on a timer — the SSE loop's
-  refetch-on-event plus fetching when the surface is visible is the whole
-  contract.
 - `GET /events?since=&limit=` — catch-up (default limit 100);
   `GET /events/stream` — SSE, each `data:` line is one Event JSON.
 

@@ -183,12 +183,41 @@ pub enum ScoutCommand {
     },
 }
 
+/// Which build of a supervisor binary is inside a VM, as it reports itself.
+///
+/// A VM exists only while a run is inside it, so the `Started` event is the
+/// only moment there is to ask. The two fields are `build-stamp`'s, computed
+/// the same way the server's own are — which is the whole reason the two
+/// numbers can be compared at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorBuild {
+    /// `0.1.<commit count>`, or the crate version with no git in reach.
+    pub version: String,
+    /// Short SHA, `-dirty` for an uncommitted tree, or `unknown`.
+    pub commit: String,
+}
+
 /// Events a Scout VM streams back to the tasks server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScoutEvent {
     /// Supervisor has received `Start` and is setting up (clone, branch).
-    Started { branch: String },
+    ///
+    /// `supervisor` is **`#[serde(default)]` and that is load-bearing**, not
+    /// decorative. Images are rebuilt by hand, so the host is routinely newer
+    /// than the supervisor talking to it — that skew *is* #909. A `Started`
+    /// from an image built before this field existed carries no `supervisor`
+    /// key and must still decode.
+    ///
+    /// `None` is therefore the **loudest** reading, not the quietest: it means
+    /// "built before there was an identity to send", which is strictly staler
+    /// than any version a supervisor could report. See
+    /// `tasks_api::version::ImageFreshness::Unstamped`.
+    Started {
+        branch: String,
+        #[serde(default)]
+        supervisor: Option<SupervisorBuild>,
+    },
     /// A stdout/stderr line from the agent process. Best-effort — may be
     /// dropped under load. Useful for breadcrumbs / live log tailing.
     Progress { stream: LogStream, line: String },
@@ -279,7 +308,14 @@ pub enum BuildCommand {
 pub enum BuildEvent {
     /// Supervisor cloned and branched; `base_sha` is the commit the branch
     /// grew from (and the thin bundle's prerequisite).
-    Started { base_sha: String },
+    ///
+    /// `supervisor` carries the image's build identity, under the same skew
+    /// rule as [`ScoutEvent::Started`] — read that one.
+    Started {
+        base_sha: String,
+        #[serde(default)]
+        supervisor: Option<SupervisorBuild>,
+    },
     /// A stdout/stderr line from the agent process. Best-effort.
     Progress { stream: LogStream, line: String },
     /// Agent process finished; the sweep commit (if any) hasn't happened yet.
@@ -531,12 +567,54 @@ mod tests {
         assert_eq!(back, cmd);
     }
 
+    /// The skew this field has to survive is the one it exists to report:
+    /// images are rebuilt by hand, so a `Started` from an image built before
+    /// this field existed reaches a newer host and **must decode**. Without
+    /// `serde(default)` that is not a failing test, it is a broken pipeline.
+    #[test]
+    fn a_started_from_a_pre_stamping_image_still_decodes() {
+        let scout: ScoutEvent =
+            serde_json::from_str(r#"{"kind":"started","branch":"scout/42-uuid"}"#).unwrap();
+        assert_eq!(
+            scout,
+            ScoutEvent::Started {
+                branch: "scout/42-uuid".into(),
+                supervisor: None,
+            }
+        );
+
+        let build: BuildEvent =
+            serde_json::from_str(r#"{"kind":"started","base_sha":"abc123"}"#).unwrap();
+        assert_eq!(
+            build,
+            BuildEvent::Started {
+                base_sha: "abc123".into(),
+                supervisor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_stamped_started_round_trips() {
+        let evt = TaskEvent::Build(BuildEvent::Started {
+            base_sha: "abc123".into(),
+            supervisor: Some(SupervisorBuild {
+                version: "0.1.163".into(),
+                commit: "def5678".into(),
+            }),
+        });
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"version\":\"0.1.163\""), "{json}");
+        assert_eq!(serde_json::from_str::<TaskEvent>(&json).unwrap(), evt);
+    }
+
     #[test]
     fn service_event_composes() {
         let evt: ServiceEvent<TasksProtocol> = ServiceEvent::VmApp {
             vm_id: VmId::new("vm-abc"),
             event: TaskEvent::Scout(ScoutEvent::Started {
                 branch: "scout/42-uuid".into(),
+                supervisor: None,
             }),
             seq: 3,
         };

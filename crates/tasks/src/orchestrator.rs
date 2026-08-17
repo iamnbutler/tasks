@@ -87,6 +87,18 @@ pub struct OrchestratorConfig {
     /// prompt was lying to it. Anything the prompt claims about the
     /// environment has to be derived from the environment.
     pub workdir_is_checkout: bool,
+    /// Shared, long-lived build directory for the agent's own verification
+    /// (`CARGO_TARGET_DIR` on the child), or `None` when it cannot verify.
+    ///
+    /// `land_builds` shipped `live` while the only evidence a merge decision
+    /// could rest on was a typecheck and the Builder's own claim. The suite was
+    /// never the problem — warm, the whole workspace is ~565 tests in ~21s — it
+    /// was *compilation*: a `git worktree` gets its own empty `target/`, so
+    /// checking that N pull requests compose meant a cold build first.
+    ///
+    /// Resolved once per boot by the caller, so the prompt cannot name a
+    /// directory the agent will find missing.
+    pub target_dir: Option<PathBuf>,
     /// Whether the server booted with a GitHub credential.
     ///
     /// Same principle as [`Self::workdir_is_checkout`], applied to the other
@@ -205,13 +217,7 @@ impl Orchestrator {
         // through the prompt. A human flipping a capability takes effect on
         // the next turn, without restarting anything.
         let charter = self.store.charter().await?;
-        let system = system_prompt(
-            self.config.api_port,
-            &charter,
-            &self.config.curl_config,
-            self.config.workdir_is_checkout,
-            self.config.github_configured,
-        );
+        let system = system_prompt(&self.config, &charter);
         match self.store.orchestrator_cc_session().await? {
             None => self.start_session(&system, prompt, None).await,
             Some(session) => match self
@@ -325,12 +331,31 @@ impl Orchestrator {
             // `TASKS_ACTOR_TOKEN`, and inheriting one would revive the shell
             // expansion that a static allowlist cannot run.
             .env_remove("TASKS_ACTOR_TOKEN")
+            // A command may not outlast the turn that has to report on it.
+            // Both are set explicitly: Claude Code computes its ceiling as
+            // max(BASH_MAX_TIMEOUT_MS, effective default), so setting only the
+            // max would leave un-annotated commands — the majority of them — at
+            // the 120s default.
+            .env(
+                "BASH_DEFAULT_TIMEOUT_MS",
+                command_budget(self.config.timeout).as_millis().to_string(),
+            )
+            .env(
+                "BASH_MAX_TIMEOUT_MS",
+                command_budget(self.config.timeout).as_millis().to_string(),
+            )
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Only when there is one — `None` must leave the child's environment
+        // exactly as this process had it, neither cleared nor invented.
+        if let Some(target_dir) = &self.config.target_dir {
+            cmd.env("CARGO_TARGET_DIR", target_dir);
+        }
 
         let mut child = cmd.spawn().map_err(OrchestratorError::Spawn)?;
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -1028,13 +1053,42 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 /// work — see [`crate::github::Landing`].
 ///
 /// A missing row reads as `Off`, the safe direction `authority_section` takes.
-fn landing_section(charter: &[CharterEntry]) -> &'static str {
+///
+/// `can_verify` splits the `Live` arm because carve-out (b) used to assert
+/// "nothing re-runs its tests for you" — true when the agent had nowhere warm
+/// to build, and false on a host where it does. Leaving it in place beside a
+/// [`verification_section`] that hands over a build directory would be the fix
+/// going inert: the agent would have somewhere to run the suite and a standing
+/// instruction saying the run will not happen. Both are computed from the same
+/// `can_verify` for exactly that reason.
+///
+/// It widens `land_builds` autonomy, deliberately: the charter's own principle
+/// is that what sends a batch back to a human is unverifiability, not risk, and
+/// the orchestrator's own run is *stronger* evidence than the Builder's trailer
+/// — a check rather than a claim. (c) is untouched, and handing over stays
+/// available whenever a run genuinely could not be produced.
+fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
     let level = charter
         .iter()
         .find(|e| e.capability == Capability::LandBuilds)
         .map(|e| e.level)
         .unwrap_or(CharterLevel::Off);
     match level {
+        CharterLevel::Live if can_verify => {
+            "Landing it is YOURS, and waiting is not the default: merge it this \
+             turn with POST /pull-requests/{number}/merge, and say that you did. \
+             The brief above has already asked the three questions that could \
+             stop you, and they are the whole list: (a) GitHub would refuse the \
+             merge — say which reason and stop; (b) no passing run backs it AND \
+             you could not make one — but you can: check the pull request out \
+             and run the suite yourself before you consider handing it over, \
+             since your own run is stronger evidence than the build's claim \
+             about itself, and hand it to the human only when a run genuinely \
+             could not be produced; (c) nothing runnable here could have checked \
+             it — the app-gpui rendering case. Say which of the three it is \
+             rather than defaulting to caution, and if it is none of them, merge \
+             it."
+        }
         CharterLevel::Live => {
             "Landing it is YOURS, and waiting is not the default: merge it this \
              turn with POST /pull-requests/{number}/merge, and say that you did. \
@@ -1067,6 +1121,64 @@ fn landing_section(charter: &[CharterEntry]) -> &'static str {
     }
 }
 
+/// Floor under [`command_budget`], so a very short turn still allows a command
+/// long enough to be worth running.
+const MIN_COMMAND_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long one command may run inside a turn of `turn`.
+///
+/// Half, and the half is the statable guarantee: whatever a command spent, at
+/// least that much turn is left to report it in. The failure this comes from
+/// was a 600s turn against Claude Code's own 600s per-command ceiling, where a
+/// single command could consume the entire turn and leave nothing to report
+/// with — observed as an agent "killed before writing output".
+///
+/// Derived rather than configured. A second knob is a second thing to get
+/// wrong, and the invariant that matters is a relationship between the two
+/// numbers, not either number alone. The floor never exceeds the turn itself.
+pub fn command_budget(turn: Duration) -> Duration {
+    (turn / 2).max(MIN_COMMAND_BUDGET.min(turn))
+}
+
+/// How the agent verifies a change, or empty when it cannot.
+///
+/// Empty rather than a heading saying "you cannot build here" — same shape as
+/// [`degradation_section`], and for the standing reason that an always-present
+/// section is what teaches an agent to skim past the one that matters.
+///
+/// Everything it claims about the environment is read off the environment: the
+/// directory is the one the caller created this boot, and both budgets are the
+/// ones actually set on the child.
+fn verification_section(target_dir: Option<&Path>, turn: Duration) -> String {
+    let Some(dir) = target_dir else {
+        return String::new();
+    };
+    let dir = dir.display();
+    let command_secs = command_budget(turn).as_secs();
+    let turn_secs = turn.as_secs();
+    format!(
+        "You can run this repository's tests, and a merge decision should rest \
+         on that rather than on a typecheck. CARGO_TARGET_DIR is already set \
+         for you to {dir} — a shared, long-lived build directory that stays \
+         warm between turns. Do not override it, do not `cargo clean` it, and \
+         do not delete it: its warmth is the whole reason the suite is \
+         affordable here, and a cold workspace build is minutes before a single \
+         test runs. It follows you into a `git worktree`, so checking out one \
+         or more pull requests somewhere and building there costs you no extra \
+         compilation.\n\n\
+         Budgets: one command may run for {command_secs}s and the whole turn \
+         for {turn_secs}s. Backgrounding a command buys you nothing — the child \
+         dies with the turn. If a genuinely cold first build does not finish \
+         inside one turn, that is expected rather than a failure: say where you \
+         got to, and the next turn continues against a directory that is now \
+         warm.\n\n\
+         `make test` is the suite (cargo-nextest, plus doctests, which nextest \
+         does not run). If a tool it needs is missing, NAME what was missing \
+         and what you ran instead — silently falling back to a plain `cargo \
+         test` reports a weaker check as though it were the same one.\n\n"
+    )
+}
+
 /// What this boot cannot do regardless of what the charter permits, or empty
 /// when nothing is degraded.
 ///
@@ -1088,18 +1200,23 @@ fn degradation_section(github_configured: bool) -> String {
         .to_string()
 }
 
-fn system_prompt(
-    port: u16,
-    charter: &[CharterEntry],
-    curl_config: &Path,
-    workdir_is_checkout: bool,
-    github_configured: bool,
-) -> String {
+/// Assemble the standing system prompt.
+///
+/// Takes the whole [`OrchestratorConfig`] rather than five positional
+/// parameters (it would now be seven), and computes `can_verify` **once** so
+/// the verification section and the landing section cannot disagree about what
+/// this host can do: a warm build directory the agent is never told to use, or
+/// an instruction to run the suite with nowhere to build it, are the same
+/// two-sources-of-truth failure in opposite directions.
+fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> String {
+    let port = config.api_port;
+    let can_verify = config.workdir_is_checkout && config.target_dir.is_some();
     let authority = authority_section(charter);
-    let landing = landing_section(charter);
-    let workdir = workdir_section(workdir_is_checkout);
-    let degradation = degradation_section(github_configured);
-    let curl_config = curl_config.display();
+    let landing = landing_section(charter, can_verify);
+    let workdir = workdir_section(config.workdir_is_checkout);
+    let verification = verification_section(config.target_dir.as_deref(), config.timeout);
+    let degradation = degradation_section(config.github_configured);
+    let curl_config = config.curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
          that turns GitHub issues into specs (via Scout agents) and approved \
@@ -1165,6 +1282,7 @@ fn system_prompt(
          {authority}\n\n\
          {degradation}\
          {workdir}\n\n\
+         {verification}\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
          state and the activity log honest.\n\n\
@@ -1187,9 +1305,22 @@ fn system_prompt(
          http://127.0.0.1:{port}/spec-queue/spec_abc/review \
          -H 'Content-Type: application/json' \
          -d '{{\"status\":\"approved\",\"rationale\":\"why\"}}'\n\n\
+         `directions` is not a second `rationale`, and the two are not \
+         interchangeable. A `rationale` explains your judgment to whoever \
+         reads the decisions ledger afterwards; **no agent ever sees it**. \
+         `directions` is addressed to the Scout or the Builder that will do \
+         the work, reaches it as its own section of that agent's prompt, and \
+         changes what it does. Put an instruction in `rationale` and the agent \
+         never reads it; put an explanation in `directions` and the agent acts \
+         on it. Send both when both apply, and never copy one into the \
+         other.\n\n\
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
-         - POST /tasks/{{id}}/queue | /dequeue | /scout — queue membership\n\
+         - POST /tasks/{{id}}/queue | /dequeue | /scout \
+           {{\"directions\",\"rationale\"}} — queue membership. The body is \
+           optional; `directions` aims the Scout that picks the task up and \
+           stays staged on the task until one does, so omitting it leaves \
+           whatever is already staged alone and sending \"\" clears it\n\
          - GET /sessions, GET /sessions/{{id}}/transcript?since=N — scout runs\n\
          - GET /builds/{{id}}/transcript?since=N — the builder agent's own \
            output, line by line. Read this FIRST when a build failed: the \
@@ -1197,8 +1328,9 @@ fn system_prompt(
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
          - POST /spec-queue/{{id}}/review \
            {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
-         - POST /builds {{\"spec_ids\":[...],\"rationale\"}} — batch approved \
-           specs into one Builder run (serial; one at a time)\n\
+         - POST /builds {{\"spec_ids\":[...],\"rationale\",\"directions\"}} — \
+           batch approved specs into one Builder run (serial; one at a \
+           time)\n\
          - POST /sessions/{{id}}/cancel, POST /builds/{{id}}/cancel \
            {{\"rationale\"}} — stop a scout or a build that is already in \
            flight. The rationale is mandatory and lands in the run's \
@@ -1436,21 +1568,30 @@ mod tests {
         assert!(!nudge_worthy(&EventPayload::QueueReordered {
             task_ids: vec![]
         }));
-        // Briefings are generated ABOUT pipeline activity — nudging on them
-        // would be a feedback loop (nudge → tick → activity → briefing →
-        // nudge). Load-bearing exclusion, not an oversight.
-        assert!(!nudge_worthy(&EventPayload::BriefingUpdated {
-            section: crate::models::BriefingSection::Changes,
-        }));
+    }
+
+    /// A config for the prompt tests: a checkout, a token, and no build
+    /// directory unless a test asks for one.
+    fn prompt_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            command: "true".into(),
+            timeout: Duration::from_secs(900),
+            workdir: PathBuf::from("/repo"),
+            workdir_is_checkout: true,
+            target_dir: None,
+            github_configured: true,
+            api_port: 4800,
+            curl_config: PathBuf::from("/data/orchestrator-curl.conf"),
+        }
     }
 
     fn prompt(port: u16, charter: &[CharterEntry]) -> String {
         system_prompt(
-            port,
+            &OrchestratorConfig {
+                api_port: port,
+                ..prompt_config()
+            },
             charter,
-            Path::new("/data/orchestrator-curl.conf"),
-            true,
-            true,
         )
     }
 
@@ -1469,11 +1610,12 @@ mod tests {
         assert!(degraded.contains("GITHUB_TOKEN"), "{degraded}");
 
         let p = system_prompt(
-            4800,
+            &OrchestratorConfig {
+                workdir_is_checkout: false,
+                github_configured: false,
+                ..prompt_config()
+            },
             &[],
-            Path::new("/data/orchestrator-curl.conf"),
-            false,
-            false,
         );
         assert!(p.contains("without a GitHub credential"), "{p}");
         let healthy = prompt(4800, &[]);
@@ -1686,22 +1828,126 @@ mod tests {
         // An absent row is `off` — `Store::charter_entry` reads a missing row
         // that way, so the prompt has to as well or the two disagree.
         assert_eq!(
-            landing_section(&[]),
-            landing_section(&charter(CharterLevel::Off))
+            landing_section(&[], false),
+            landing_section(&charter(CharterLevel::Off), false)
         );
 
         // All three name the three carve-outs, so the standard a batch is
         // judged against does not change with who applies it.
         for section in [
-            landing_section(&charter(CharterLevel::Live)),
-            landing_section(&charter(CharterLevel::Shadow)),
-            landing_section(&charter(CharterLevel::Off)),
+            landing_section(&charter(CharterLevel::Live), false),
+            landing_section(&charter(CharterLevel::Shadow), false),
+            landing_section(&charter(CharterLevel::Off), false),
         ] {
             assert!(section.contains("three"), "{section}");
             assert!(
                 section.contains("app-gpui") || section.contains("runnable here"),
                 "{section}"
             );
+        }
+    }
+
+    /// Same rule as the workdir and degradation sections: anything the prompt
+    /// claims about the environment is read off the environment, and an
+    /// environment that cannot do the thing grows no heading about it.
+    #[test]
+    fn verification_is_described_only_where_it_is_possible() {
+        assert_eq!(verification_section(None, Duration::from_secs(900)), "");
+
+        let section = verification_section(
+            Some(Path::new("/state/verify-target")),
+            Duration::from_secs(900),
+        );
+        assert!(section.contains("/state/verify-target"), "{section}");
+        assert!(section.contains("CARGO_TARGET_DIR"), "{section}");
+        // The three ways an agent could destroy the warmth it was given.
+        assert!(section.contains("do not `cargo clean` it"), "{section}");
+        assert!(section.contains("Do not override it"), "{section}");
+        assert!(section.contains("do not delete it"), "{section}");
+        // Both budgets, and the fact that backgrounding does not dodge them.
+        assert!(section.contains("450s"), "{section}");
+        assert!(section.contains("900s"), "{section}");
+        assert!(section.contains("dies with the turn"), "{section}");
+        // A missing tool must be named, not silently downgraded.
+        assert!(section.contains("NAME what was missing"), "{section}");
+
+        // And it reaches the assembled prompt only with a directory.
+        let without = prompt(4800, &[]);
+        assert!(!without.contains("CARGO_TARGET_DIR"), "{without}");
+        let with = system_prompt(
+            &OrchestratorConfig {
+                target_dir: Some(PathBuf::from("/state/verify-target")),
+                ..prompt_config()
+            },
+            &[],
+        );
+        assert!(with.contains("CARGO_TARGET_DIR"), "{with}");
+    }
+
+    /// The observed failure was an agent "killed before writing output": a
+    /// 600s turn against Claude Code's own 600s per-command ceiling, where one
+    /// command could eat the whole turn and leave nothing to report in.
+    #[test]
+    fn a_command_can_never_outlast_the_turn_that_reports_on_it() {
+        for turn_secs in [1, 30, 60, 120, 600, 900, 3600] {
+            let turn = Duration::from_secs(turn_secs);
+            assert!(
+                command_budget(turn) <= turn,
+                "a {turn_secs}s turn allowed a longer command"
+            );
+        }
+        // Half is the guarantee: whatever the command spent, at least that
+        // much turn remains to report it.
+        assert_eq!(
+            command_budget(Duration::from_secs(900)),
+            Duration::from_secs(450)
+        );
+        // …with a floor, so a short turn still allows a usable command.
+        assert_eq!(
+            command_budget(Duration::from_secs(90)),
+            MIN_COMMAND_BUDGET,
+            "the floor applies below 2x the minimum"
+        );
+    }
+
+    /// Adding the build directory without changing this section would leave the
+    /// whole fix inert: somewhere warm to build, beside a standing instruction
+    /// saying nothing re-runs the tests for you.
+    #[test]
+    fn a_host_that_can_run_the_suite_is_told_to_run_it_before_handing_over() {
+        let charter = |level| {
+            vec![CharterEntry {
+                capability: crate::models::Capability::LandBuilds,
+                level,
+                daily_limit: None,
+                updated_at: chrono::Utc::now(),
+            }]
+        };
+        let live = charter(CharterLevel::Live);
+
+        let cannot = landing_section(&live, false);
+        assert!(
+            cannot.contains("nothing re-runs its tests for you"),
+            "{cannot}"
+        );
+
+        let can = landing_section(&live, true);
+        assert!(
+            !can.contains("nothing re-runs its tests for you"),
+            "the claim is false on a host that can verify: {can}"
+        );
+        assert!(can.contains("check the pull request out"), "{can}");
+        assert!(can.contains("run the suite yourself"), "{can}");
+        // The other two carve-outs are untouched, and handing over stays
+        // available when a run genuinely could not be produced.
+        assert!(can.contains("GitHub would refuse the merge"), "{can}");
+        assert!(can.contains("app-gpui"), "{can}");
+        assert!(can.contains("could not be produced"), "{can}");
+
+        // Shadow and Off do not vary with it.
+        for level in [CharterLevel::Shadow, CharterLevel::Off] {
+            let c = charter(level);
+            assert_eq!(landing_section(&c, true), landing_section(&c, false));
         }
     }
 

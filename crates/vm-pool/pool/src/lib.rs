@@ -300,9 +300,29 @@ impl<P: AppProtocol> VmRuntime<P> for SupervisorRuntime {
     }
 }
 
+/// How many VMs a pool holds at once when nothing says otherwise.
+///
+/// A *slot* is a VM **this pool allocated** — the entries in its own map, the
+/// thing [`Pool::allocate`] counts against [`PoolConfig::max_vms`] and
+/// [`vm_pool_protocol::PoolStatus::total`] reports. Nothing else consumes one.
+/// In particular a `buildkit` VM does not: it is started by the container
+/// runtime to service an image build, as an ordinary host process, and this
+/// pool neither allocates it nor reconciles against what the runtime is
+/// running. It costs host memory, not a slot.
+pub const DEFAULT_MAX_VMS: usize = 6;
+
 /// Configuration for the VM pool.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
+    /// Ceiling on simultaneously allocated VMs; [`Pool::allocate`] fails with
+    /// `pool exhausted` at it.
+    ///
+    /// Leave slack above what the workload steadily needs. Exhaustion is not a
+    /// queue — an allocate that arrives at the ceiling is refused, and a caller
+    /// that reads the refusal as "this work failed" charges it to the work. A
+    /// leaked VM (one whose owner died between allocate and deallocate) holds
+    /// its slot until the sweep reclaims it, so a pool sized exactly to the
+    /// steady state is one leak from refusing everything.
     pub max_vms: usize,
     pub health_check_interval: u64,
     pub vm_timeout: u64,
@@ -311,7 +331,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_vms: 6,
+            max_vms: DEFAULT_MAX_VMS,
             health_check_interval: 30,
             vm_timeout: 7200,
         }

@@ -52,7 +52,7 @@
 use std::fmt;
 
 use tracing::info;
-use vm_pool_client::{ClientError, ClientHandle, EventStream};
+use vm_pool_client::{ClientError, ClientHandle, EventStream, PoolStatus};
 use vm_pool_protocol::{ATTACH_PROTOCOL_VERSION, ServiceEvent, VmId};
 
 use crate::protocol::{TaskEvent, TasksProtocol};
@@ -120,11 +120,21 @@ impl fmt::Display for AttachSupport {
 /// from. See [`vm_pool_protocol::PROTOCOL_VERSION`].
 pub async fn attach_support(client: &ClientHandle<TasksProtocol>) -> AttachSupport {
     match client.status().await {
-        Ok(status) if status.speaks(ATTACH_PROTOCOL_VERSION) => {
-            AttachSupport::Yes(status.protocol_version)
-        }
-        Ok(status) => AttachSupport::TooOld(status.protocol_version),
+        Ok(status) => support_of(&status),
         Err(e) => AttachSupport::Unknown(e),
+    }
+}
+
+/// The classification half of [`attach_support`], over a [`PoolStatus`] the
+/// caller already has.
+///
+/// Split out so a caller with more than one question about the pool can answer
+/// them all from one `status` reply rather than making a round trip each.
+pub fn support_of(status: &PoolStatus) -> AttachSupport {
+    if status.speaks(ATTACH_PROTOCOL_VERSION) {
+        AttachSupport::Yes(status.protocol_version)
+    } else {
+        AttachSupport::TooOld(status.protocol_version)
     }
 }
 

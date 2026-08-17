@@ -47,6 +47,7 @@ async fn insert_project_and_task(store: &Store) -> (Project, Task) {
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
     (project, task)

@@ -45,6 +45,14 @@ fn main() {
 
     app.run(|cx: &mut App| {
         gpuikit::theme::init(cx);
+
+        // Syntax highlighting for fenced code blocks. Unlike the four calls
+        // below it — whose ordering comments are load-bearing — this one is
+        // order-independent: it only writes a global, and every read of that
+        // global is behind a `try_global`. It sits here because startup is
+        // where a process-global belongs, not because it has to.
+        components::init_code_highlighting(cx);
+
         bind_input_keys(cx, None);
 
         // **After `bind_input_keys`, and this is not stylistic.** The

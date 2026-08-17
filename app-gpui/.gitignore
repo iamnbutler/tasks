@@ -1,1 +1,6 @@
 /target
+# The dev-profile opt-in documented in README ▸ Running is deliberately a
+# local choice, so the file that carries it must never show up in
+# `git status` — otherwise the first `git add -A` commits the thing the
+# measurement says not to commit.
+/.cargo/

@@ -193,6 +193,7 @@ async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec,
         dispatch_attempts: 0,
         ingested_at: now,
         updated_at: now,
+        scout_directions: None,
     };
     store.insert_task(&task).await.unwrap();
 
@@ -206,6 +207,7 @@ async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec,
         completed_at: Some(now),
         exit_reason: None,
         usage: None,
+        directions: None,
     };
     store.insert_session(&session).await.unwrap();
     let spec = Spec {
