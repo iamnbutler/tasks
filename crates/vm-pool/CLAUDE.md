@@ -88,9 +88,75 @@ allocated and does not reconcile against; it costs host memory, not a slot.
 
 **Leave slack.** Allocation at the ceiling is refused, not queued, and a caller
 that reads `pool exhausted` as "this work failed" charges it to the work. A VM
-whose owner died between allocate and deallocate holds its slot until the sweep
-reclaims it, so a pool sized exactly to its steady state is one leak away from
-refusing everything.
+whose owner died between allocate and deallocate holds its slot until someone
+hands it back, so a pool sized exactly to its steady state refuses everything
+for as long as one leak lasts. How long that is depends on which half died —
+see *Leaks* below.
+
+## Leaks
+
+Two of them, and they are different failures with different mechanisms. Neither
+subsumes the other.
+
+A **slot leak** is a VM the pool still counts and no longer has. It is
+reclaimed **event-driven, at the instant of death**: the end of a VM's event
+stream is an exact statement that the VM is gone — the transport closed, or the
+runtime dropped its sender — so `forward_vm_events` hands the slot back there.
+That signal was already arriving and was being spent on a `debug!` line while
+the pool went on counting the VM until `vm_timeout` (7200s) aged it out two
+hours later. Three consequences worth not undoing:
+
+- **An ordinary `deallocate` ends the stream too** — it drops the command
+  sender, which ends the bridge — so the reclamation path runs on *every*
+  teardown, and finding nothing in the map is the common case and means the
+  teardown was deliberate. Only a VM still counted at that point died on its
+  own.
+- **`deallocate` is idempotent for a VM the pool reclaimed itself**, via a
+  `reclaimed` set whose entry the first `deallocate` consumes. Do not
+  "simplify" that into returning `Ok` for anything unknown: `VmNotFound` means
+  "this pool never started that VM", and widening it would let a client stop a
+  container by guessing a name. The reclaimed VM still runs the *whole*
+  teardown rather than returning early, because a closed transport says the
+  **host** side is gone and a supervisor that died inside a container that is
+  still running looks identical from here.
+- **The order in `allocate` is load-bearing.** The forwarder is spawned
+  *after* `vms.insert`, under the same held write lock. Spawned before, a VM
+  that dies instantly finds no entry to reclaim and then has a dead one
+  inserted on top of it — a slot leaked for the pool's whole lifetime.
+
+An **orphan leak** is a VM whose whole daemon went away. Nothing in this
+process can see it: `Pool::deallocate` answers `VmNotFound` for an id its map
+never had, *before* it ever reaches `runtime.stop`, so a restarted pool cannot
+be asked to clean up its predecessor's VMs. `VmLedger` (`pool/src/ledger.rs`)
+is the fix — a written record of what this pool started, at
+`<state_dir>/vms-<socket>.json`, recorded **write-ahead** (before
+`runtime.start`, since recording afterwards loses exactly the VM whose daemon
+died between the spawn and the write) and forgotten after the VM is stopped.
+`Service::with_runtime` opens it and discharges the carry-over **before
+`run()` binds the socket**, so the pool never advertises capacity its
+predecessor's VMs still consume.
+
+Read `ledger.rs`'s module docs before changing any of it; the short version is
+that it is a *record of what this pool started*, never an *inventory of the
+host*. A `container ls` sweep would stop a live peer pool's VMs (ids carry no
+daemon identity, and a second pool on another socket is a configuration this
+project suggests in `BindError::AlreadyRunning`'s own message) and could never
+be executed by a test on Linux. The ledger's safety is a proof rather than a
+heuristic: `bind_socket` admits one live daemon per socket path and the file is
+named for that path, so everything in it at boot belongs to a daemon that is
+gone. Hence also: the socket must reach the *file name* (the directory is
+shared between pools on a host), and a slot reclaimed on a dead transport
+deliberately does **not** forget its ledger entry, because the container may
+well still be running — over-stopping is idempotent, under-stopping is the bug.
+
+`ServiceConfig::state_dir` is `None`-able and `VmLedger::disabled()` is a fully
+working ledger that persists nothing, so an embedder with nowhere to write gets
+exactly the behaviour it had before. No method on the ledger returns an error:
+refusing to boot over an unwritable file would trade a recoverable leak for an
+outage. What this does *not* cover, and cannot from Linux, is the
+`container stop` at the end of the orphan path — that call is inherited
+unchanged from `deallocate`, which is the reason not to have written a new
+`container ls` parser beside it.
 
 Three rules the implementation follows, each of which has a way of being
 undone by a later "cleanup":

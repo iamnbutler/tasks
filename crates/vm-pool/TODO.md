@@ -17,6 +17,9 @@ vm-pool is pure infrastructure. It manages VMs, pools, priorities, health, and p
 - [ ] Add `homepage`, `keywords`, `categories` to workspace Cargo.toml
 - [ ] Add `repository.workspace = true` to all crate Cargo.tomls
 - [ ] Version: `0.1.0-alpha.1`
+- [ ] Land any breaking `ServiceConfig` changes *before* publishing —
+      `state_dir` was added as a public field, which breaks literal
+      construction for embedders
 - [ ] `cargo publish --dry-run` each crate
 - [ ] Publish to crates.io
 
@@ -78,7 +81,13 @@ The `ContainerRuntime` is implemented but untested with a real container image.
 - [ ] Build a container image with the supervisor baked in as entrypoint
 - [ ] Test `ContainerRuntime` end-to-end: start container, send commands, receive events, stop
 - [ ] Add DNS config to `VmConfig`
-- [ ] Orphan detection: on startup, check for stale containers via `container list`
+- [x] Orphan detection: on startup, stop the VMs a previous daemon on this
+      socket left running. Done with `VmLedger` — a written record of what this
+      pool started — and explicitly **not** with `container list`: ids carry no
+      daemon identity, so an inventory sweep would stop a live peer pool's VMs,
+      and a macOS-only parser could never be run by a test. See
+      `pool/src/ledger.rs`. What is still uncovered is the `container stop` at
+      the end of that path, inherited unchanged from `deallocate`
 
 ## Snapshots
 

@@ -1863,7 +1863,8 @@ enum Capacity {
     /// The pool cannot hold what a full complement of work would need. Some
     /// dispatch will be refused with `pool exhausted`.
     Short { needed: usize, total: usize },
-    /// It fits exactly. Dispatches fine today; exhausts on the first leaked VM.
+    /// It fits exactly. Dispatches fine today; refuses everything for as long
+    /// as one leaked VM is held.
     NoSlack { needed: usize, total: usize },
     /// It fits with room over.
     Slack {
@@ -1894,8 +1895,13 @@ impl Capacity {
 ///
 /// `NoSlack` is a `warn!` rather than an `info!` on purpose: a pool sized
 /// exactly to the steady state dispatches perfectly well right up until one VM
-/// leaks, and then refuses everything. The operator reading this line is the
-/// person who can act on it, so both warnings name the variable *and* the fix
+/// leaks, and then refuses everything until that VM is handed back. That is a
+/// *window*, not a ratchet — vm-pool frees the slot as soon as the VM's event
+/// stream ends, and `vm_timeout` (two hours) bounds the case where it is the
+/// owner rather than the VM that died — but a window that lasts hours and
+/// refuses every dispatch inside it is still a warning. The operator reading
+/// this line is the person who can act on it, so both warnings name the
+/// variable *and* the fix
 /// — and the `Short` one names the alternative, since lowering
 /// `SCOUT_MAX_CONCURRENT` is as good an answer as raising the pool.
 fn report_capacity(capacity: Capacity) {
@@ -1913,7 +1919,8 @@ fn report_capacity(capacity: Capacity) {
             needed,
             total,
             "vm-pool fits this server exactly ({needed} of {total} slots) — one leaked \
-             VM exhausts it. Raise VM_POOL_MAX_VMS and restart `tasks vm-pool`"
+             VM exhausts it until the pool hands that slot back. Raise VM_POOL_MAX_VMS \
+             and restart `tasks vm-pool`"
         ),
         Capacity::Slack {
             needed,
@@ -1932,6 +1939,14 @@ fn report_capacity(capacity: Capacity) {
 ///
 /// Best-effort by construction. A failure here must not stop dispatch, since
 /// the whole point is to get slots back so dispatch can proceed.
+///
+/// **This is a store question, and it is not the only sweep.** It asks what
+/// *this database* still points at for work that has already concluded, so it
+/// can only ever name VMs some row remembers — it never asks the runtime
+/// anything, and a VM whose whole pool went away is invisible to it (the
+/// deallocate lands on a daemon that never had the id). That leak is
+/// vm-pool's own to close, from `VmLedger`, at the next daemon's boot. Neither
+/// sweep subsumes the other; keep both.
 async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
     let leaked = match store.leaked_vm_ids().await {
         Ok(leaked) if leaked.is_empty() => return,
@@ -1948,8 +1963,12 @@ async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
     // Bounded like every other teardown: this loop is sequential and sits on
     // the dispatch loop's connect path, so one unanswered deallocate would
     // stall *all* dispatch — and it runs precisely when the pool is already
-    // in trouble. A failure or an expiry is logged; the row is cleared either
-    // way, so the next sweep retries whatever did not land.
+    // in trouble. A failure or an expiry is logged, and the row is cleared
+    // either way, which means this sweep does **not** retry — deliberately.
+    // The commonest failure here is a pool that no longer has the id at all
+    // (it was restarted), where every retry from now to the end of time would
+    // get the same `VM not found`; that VM is the ledger's to stop, not this
+    // loop's to nag about.
     let handle = client.handle();
     for vm_id in leaked {
         let id = VmId::new(vm_id.clone());

@@ -585,10 +585,17 @@ reserve ≈22 GB.
 
 So the recommended ceiling against the default pool is **`SCOUT_MAX_CONCURRENT
 = 3`** — 4 of 6 slots, two spare. 4 scouts is 5 of 6 and 5 is 6 of 6, where a
-single leaked VM (one whose owner died between allocate and deallocate, held
-until the sweep reclaims it) exhausts the pool and every dispatch is refused.
-To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check the memory
-ledger first.
+single leaked VM exhausts the pool and every dispatch is refused for as long as
+that slot is held. **How long that is depends on which half died**, and the two
+are not the same leak. If the *VM* died, vm-pool frees the slot at the instant
+its event stream ends — that stream ending is an exact statement that the VM is
+gone, and it used to be spent on a `debug!` line while the pool went on
+counting the VM for the full `vm_timeout` (two hours). If the VM is still
+running and its *owner* is what died, nothing can tell that from a healthy run,
+so the slot is held until someone deallocates it (`run::sweep_leaked_vms` on
+the next vm-pool connect, for work this database knows concluded) or
+`vm_timeout` ages it out. To go higher, raise `VM_POOL_MAX_VMS`, restart the
+*pool*, and check the memory ledger first.
 
 `VM_POOL_MAX_VMS` is read by **`tasks vm-pool`, not by the server** — both
 entry points honour it (`max_vms_from_env` is public and separate from
@@ -740,11 +747,30 @@ gated: `reattach::attach_support` asks `status` once per boot and reads the
 too old, unanswerable, or unreachable — `ResumedWork` membership is a promise
 to conclude the row, so a claim made against a pool that cannot decode `attach`
 would fail the run rather than lose the stream. The remaining cost is the
-one-time restart itself: whatever vm-pool is holding is lost once (the event
-log is in memory), and the leaked VMs are collected by the sweep on the next
-connect. `dispatch_loop` logs the skew on every connect, because the bill
-otherwise only arrives at the next restart, by which point the work it costs is
-already in flight.
+one-time restart itself: whatever vm-pool is holding is lost once — the event
+log is in memory — but **not the VMs**, which the next daemon on that socket
+stops at boot. That is `VmLedger` (`crates/vm-pool/pool/src/ledger.rs`), and it
+is a *written record*, never an inventory: `allocate` writes the id to
+`<state dir>/vms-<socket>.json` **before** the VM exists and `deallocate`
+strikes it off after the VM is stopped, so the file is a superset of what is
+running rather than a subset — over-stopping is idempotent, under-stopping is
+the leak. The obvious alternative, `container ls` and stop whatever this pool
+does not recognise, is rejected for two independent reasons: a VM name carries
+no daemon identity (`vm-<micros>-<counter>`) while a second pool on another
+`VM_POOL_SOCKET` is a configuration `BindError::AlreadyRunning` explicitly
+suggests, so the sweep would tear down a *live* peer's VMs — the wrong-takeover
+`bind_socket` exists to prevent, arriving through a different door — and
+apple/container is macOS-only, so the one load-bearing line of the fix could
+never be run by a test, by CI, or by an agent here. The ledger's safety is a
+proof instead of a heuristic: `bind_socket` admits one live daemon per socket
+path and the file is *named* for that path, so everything in it at boot belongs
+to a daemon that is gone. It is discharged in `Service::with_runtime`, before
+the socket is bound, so the pool never advertises capacity its predecessor's
+VMs still consume; a VM nobody ever deallocates keeps its entry until that next
+boot, which is the behaviour and not a leak, since the entry is exactly what
+the successor needs. `dispatch_loop` logs the skew on every connect, because
+the bill otherwise only arrives at the next restart, by which point the work it
+costs is already in flight.
 
 ### Tests
 
@@ -867,7 +893,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `BUILDER_TIMEOUT_SECS` | 3600 | budget per build, allocation included, measured on both clocks (see *Budgets and a host that sleeps*). Past it the VM is deallocated, the build fails and every spec in the batch is charged a build attempt — unless the host was asleep for it, which is `Suspended` and charges nothing (#929). Same ceiling argument as the scout's: keep it below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
-| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
+| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed, and so are its VMs: the path also names the daemon's `VmLedger` (`<data dir>/vm-pool/vms-…json`), which the next daemon on that socket reads at boot and stops whatever is in it |
 | `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |

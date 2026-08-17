@@ -77,10 +77,17 @@ VM pool management:
 - Capacity (`PoolConfig::max_vms`, default 6, set with `VM_POOL_MAX_VMS`): a
   slot is a VM this pool allocated, so a VM the container runtime started for
   its own purposes is not one. Leave slack — allocation at the ceiling is
-  refused, not queued, and a leaked VM holds its slot until the sweep
+  refused, not queued, and a leaked VM holds its slot until something hands it
+  back: immediately if the VM itself died (the end of its event stream is what
+  frees the slot), otherwise at its owner's `deallocate` or at `vm_timeout`
 - Health monitoring
 - Timeout enforcement
 - Lifecycle state tracking
+- Orphan recovery (`VmLedger`): the ids this pool started, written to
+  `<state_dir>/vms-<socket>.json` before each VM exists and struck off after it
+  is stopped, so the next daemon on the same socket stops what a crash left
+  running. A record of what this pool started, never an inventory of the host —
+  see `ledger.rs` for why that distinction is the whole safety argument
 
 ### Snapshot (`crates/snapshot`)
 

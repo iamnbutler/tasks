@@ -17,8 +17,16 @@
 //!   the whole queue. Deliberate trade.
 //! - **Freeing the VM is vm-pool's job either way.** Walking away leaves
 //!   exactly the state the pool already handles when the server is killed
-//!   mid-call: its health loop reaps VMs the server stops tracking. Nothing
-//!   here needs to retry.
+//!   mid-call, and the pool has three ways out of it: the VM's event stream
+//!   ends and the slot is reclaimed on the spot; `vm_timeout` (7200s) ages out
+//!   a VM that is still running with nobody talking to it; and if the pool
+//!   itself dies, its ledger hands the VM to the next daemon on that socket.
+//!   Note what none of those is: the health loop knows nothing about what
+//!   *this server* tracks, so a VM abandoned here and still running is the
+//!   pool's for up to two hours. Retrying is still not this function's job —
+//!   [`crate::run::sweep_leaked_vms`] asks that question again on every
+//!   vm-pool connect, off the store rather than off a retry loop that would be
+//!   holding the queue.
 
 use std::time::Duration;
 
