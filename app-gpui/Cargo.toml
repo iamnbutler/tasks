@@ -16,9 +16,17 @@ gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.14.2"
 # `stitch` feature (which closes syntax a half-streamed document leaves open)
 # landed in gpuikit #134 and are in no published release; `main`'s own version
 # is still 0.7.0, so there is nothing to bump to. A `rev`, never a `branch`, so
-# the build stays reproducible. The clean end state is
-# `gpuikit = { version = "0.8", features = ["stitch"] }`.
-gpuikit = { git = "https://github.com/iamnbutler/gpuikit", rev = "b28732f290f8bd8ca7ffcc56a40d00a852ac978a", features = ["stitch"] }
+# the build stays reproducible.
+#
+# `editor` is on for its **syntect bridge**, not the editor widget: it is what
+# `markdown::init_code_highlighting` is gated behind, and without it fenced
+# code blocks render as plain monospace. It pulls syntect + onig, which is the
+# one real cost — see `components/markdown.rs` for what streaming a fence
+# through that highlighter measures at.
+#
+# The clean end state is
+# `gpuikit = { version = "0.8", features = ["stitch", "editor"] }`.
+gpuikit = { git = "https://github.com/iamnbutler/gpuikit", rev = "b28732f290f8bd8ca7ffcc56a40d00a852ac978a", features = ["stitch", "editor"] }
 smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.

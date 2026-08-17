@@ -24,6 +24,10 @@ use gpuikit::elements::kbd::kbd;
 use gpuikit::elements::loading_indicator::loading_indicator;
 use gpuikit::elements::popover::{popover, PopoverState};
 use gpuikit::elements::tooltip::tooltip;
+// Aliased: a bare `Copy` next to a derive list is a trap for the next reader.
+// This is gpuikit's *action*, and handling it rather than defining one of our
+// own is the whole copy design — see the handler in `render`.
+use gpuikit::input::bindings::Copy as InputCopy;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::DefaultIcons as Icons;
@@ -2171,6 +2175,10 @@ impl Render for Workspace {
 
         self.sync_chat_list(cx);
         self.sync_palette(cx);
+        // Before anything paints: one window can hold several markdown
+        // documents and gpuikit can only clear a selection in one it drew this
+        // frame, so deciding which selection is live is this view's job.
+        self.markdown_cache().sync_selection(cx);
         // The first frame that can know a just-added repo's id: this client
         // applies snapshots, not responses.
         self.settle_pending_repo(window, cx);
@@ -2209,6 +2217,32 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &NewIssue, _window, cx| {
                 this.open_issue_window(cx);
+            }))
+            // ⌘C over a markdown selection, and it is gpuikit's own action
+            // rather than one of ours on purpose: **⌘C never reaches this
+            // app's keymap on macOS.** The Edit menu's Copy is a
+            // `MenuItem::os_action` (`menus::edit_menu`), so AppKit answers
+            // the key equivalent from the menu bar and dispatches
+            // `input::Copy` directly — a `CopyMarkdownSelection` of our own
+            // bound to `cmd-c` would be shadowed by it and fire on no platform
+            // at all. Handling what the menu already sends gets Edit ▸ Copy
+            // working on a selected paragraph for free.
+            //
+            // On the *root*, so it is the fallback: gpui walks the focus path
+            // inward-out, so a focused `Input` (chat composer, palette) takes
+            // it first through its own handler and still copies from the
+            // composer. The residual is upstream's — `InputState::copy` does
+            // not `cx.propagate()` when its own selection is empty, so a
+            // markdown selection made while the composer holds focus cannot be
+            // copied until you click the text you are selecting.
+            .on_action(cx.listener(|this, _: &InputCopy, _window, cx| {
+                let selected = this.markdown_cache().selected_text(cx);
+                match selected {
+                    Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                    // Nothing of ours to copy, so this keystroke was never
+                    // ours: let it carry on to whatever else is listening.
+                    None => cx.propagate(),
+                }
             }))
             .on_action(cx.listener(|this, _: &AddRepo, _window, cx| {
                 this.open_repo_window(cx);

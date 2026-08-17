@@ -21,12 +21,59 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 
 use crate::workspace::FONT;
 
+/// Turn on syntax highlighting for fenced code blocks, process-wide.
+///
+/// A thin forward to gpuikit, so the app's one dependency on the `editor`
+/// feature sits with the rest of its markdown wiring rather than in `main`.
+/// Call it once at startup; it only writes a global, and every read of that
+/// global is behind a `try_global`, so it is order-independent and every step
+/// below it degrades to plain monospace rather than failing: no feature, no
+/// init, no info string on the fence, an info string syntect has no grammar
+/// for, or a block over 256 KiB.
+///
+/// No theme call is needed. `CodeHighlightTheme::FollowApp` is the default and
+/// picks a dark or light syntect theme from the lightness of the surface each
+/// block is painted on, so a theme change is followed with nothing observing
+/// it.
+///
+/// **Highlighting a *streaming* fence is expensive**, and it was measured
+/// rather than guessed. gpuikit's highlight cache keys on the whole block
+/// text, so a fence arriving through `Markdown::append` misses on every delta
+/// and pays a full syntect pass over the block-so-far — and `state.rs`
+/// notifies on every delta, so that is per rendered frame. Release build,
+/// aarch64: a 20-line fence costs 3.4 ms settled and 25 ms streamed; 100 lines
+/// 8.4 ms and 457 ms; 400 lines 15.2 ms settled and 5.32 s streamed, whose
+/// worst delta is ~16.3 ms — the whole 60 fps budget. One long streamed fence
+/// also deposits hundreds of prefix entries and clears the 256-entry cache
+/// wholesale, evicting the settled spec and task blocks with it.
+///
+/// It ships anyway, and there is no app-side lever to ship instead:
+/// highlighting is a process-global on/off and the per-block decision lives
+/// inside gpuikit's `code_block`. The reading surfaces are static and win
+/// outright; chat degrades only while a fence is actively streaming. The cheap
+/// upstream fix is to skip highlighting a fence `stitch` had to close —
+/// `close_open_syntax` returns `Cow::Owned` exactly when the source was
+/// incomplete, which is precisely the streaming case.
+pub fn init_code_highlighting(cx: &mut App) {
+    gpuikit::markdown::init_code_highlighting(cx);
+}
+
 /// Parsed-markdown entities keyed by a caller-chosen stable string
 /// (`"chat:{seq}"`, `"spec:{id}"`, …). Sources are re-parsed only when the
 /// text behind a key actually changes.
 #[derive(Default)]
 pub struct MarkdownCache {
     entries: HashMap<SharedString, Entity<Markdown>>,
+    /// The key of the document whose selection ⌘C copies, if any.
+    ///
+    /// gpuikit's selection is per-document and its clear-on-press-outside
+    /// handler is registered *during paint*, so a document that stopped being
+    /// drawn is never told to let go: select a task body, switch section,
+    /// select a briefing line, and two documents hold a selection at once with
+    /// nothing upstream able to arbitrate — nothing upstream knows the two
+    /// share a window. This field is the arbitration, maintained by
+    /// [`MarkdownCache::sync_selection`].
+    active_selection: Option<SharedString>,
 }
 
 impl MarkdownCache {
@@ -77,8 +124,81 @@ impl MarkdownCache {
     /// a chat reset must not throw away spec parses. Without it the cache
     /// grows by one orphaned parse per turn, forever.
     pub fn remove(&mut self, key: impl Into<SharedString>) {
-        self.entries.remove(&key.into());
+        let key = key.into();
+        self.entries.remove(&key);
+        // A retired key can never be resolved back to an entity, so leaving it
+        // named here would make `selected_text` answer `None` forever rather
+        // than falling through to whatever the user selects next.
+        if self.active_selection.as_ref() == Some(&key) {
+            self.active_selection = None;
+        }
     }
+
+    /// Decide which document's selection is live this frame, and drop every
+    /// other one. Call once per frame, before anything renders.
+    ///
+    /// Idempotent by construction: clearing a selection is persistent, so a
+    /// displaced document is absent from `selected` on the next pass and
+    /// nothing notifies again. That matters — the `cx.notify()` below is what
+    /// repaints away the stale highlight, and a clear that kept re-firing
+    /// would schedule a render on every frame forever.
+    pub fn sync_selection(&mut self, cx: &mut App) {
+        let selected: Vec<SharedString> = self
+            .entries
+            .iter()
+            .filter(|(_, entity)| !entity.read(cx).selection().is_empty())
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let active = resolve_active(&selected, self.active_selection.as_ref());
+
+        for key in &selected {
+            if Some(key) == active.as_ref() {
+                continue;
+            }
+            let Some(entity) = self.entries.get(key).cloned() else {
+                continue;
+            };
+            entity.update(cx, |markdown, cx| {
+                markdown.selection().clear();
+                cx.notify();
+            });
+        }
+
+        self.active_selection = active;
+    }
+
+    /// What ⌘C should copy: the text selected in the active document.
+    ///
+    /// Reads only the active key rather than scanning, which is the whole
+    /// point of [`MarkdownCache::sync_selection`] — a scan over a `HashMap`
+    /// would copy whichever stale selection iteration happened to yield first.
+    ///
+    /// `None` for a selected document that is off screen, because upstream
+    /// reconstructs the text from a registry it rebuilds each paint. That is
+    /// the honest answer rather than something to route around: the user
+    /// cannot see the highlight either.
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        let key = self.active_selection.as_ref()?;
+        self.entries.get(key)?.read(cx).selected_text()
+    }
+}
+
+/// Which of the documents holding a selection this frame owns it.
+///
+/// A key that is selected now and was not active is the drag the user just
+/// made — there is one pointer, so at most one newcomer per frame — and it
+/// wins. Otherwise the incumbent keeps it, and everything else in `selected`
+/// is a stale selection in a document that stopped being painted.
+fn resolve_active(
+    selected: &[SharedString],
+    active: Option<&SharedString>,
+) -> Option<SharedString> {
+    selected
+        .iter()
+        .find(|key| Some(*key) != active)
+        .or_else(|| selected.first())
+        .cloned()
 }
 
 /// How the text behind a cached key changed since the last frame.
@@ -275,6 +395,56 @@ mod tests {
         assert_eq!(
             Update::between("task:41", "briefing"),
             Update::Replace("briefing".into())
+        );
+    }
+
+    fn key(name: &str) -> SharedString {
+        SharedString::from(name.to_string())
+    }
+
+    #[test]
+    fn nothing_selected_owns_nothing() {
+        assert_eq!(resolve_active(&[], None), None);
+        assert_eq!(resolve_active(&[], Some(&key("task:1"))), None);
+    }
+
+    #[test]
+    fn the_only_selection_is_the_active_one() {
+        assert_eq!(resolve_active(&[key("task:1")], None), Some(key("task:1")));
+    }
+
+    /// The drag the user just made wins. One pointer means at most one key can
+    /// have gone from unselected to selected since the last frame, so "the one
+    /// that is not the incumbent" identifies it exactly.
+    #[test]
+    fn a_newly_selected_document_takes_it_from_the_incumbent() {
+        assert_eq!(
+            resolve_active(&[key("task:1"), key("brief:queue")], Some(&key("task:1"))),
+            Some(key("brief:queue"))
+        );
+    }
+
+    /// The settled frame, and the reason `sync_selection` is idempotent: with
+    /// only the incumbent selected there is no newcomer, so it keeps the
+    /// selection and nothing is displaced — hence nothing to clear and nothing
+    /// to notify.
+    #[test]
+    fn a_settled_frame_leaves_the_active_document_alone() {
+        let active = key("task:1");
+        assert_eq!(
+            resolve_active(std::slice::from_ref(&active), Some(&active)),
+            Some(active)
+        );
+    }
+
+    /// The incumbent's own document cleared its selection (a click landed
+    /// outside it) while another still holds one: the survivor takes over
+    /// rather than leaving ⌘C pointed at an empty document.
+    #[test]
+    fn a_survivor_takes_over_from_an_incumbent_that_let_go() {
+        assert_eq!(
+            resolve_active(&[key("spec:7")], Some(&key("task:1"))),
+            Some(key("spec:7"))
         );
     }
 

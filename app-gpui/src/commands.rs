@@ -49,9 +49,9 @@ use crate::menus::{
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
 use crate::workspace::{
-    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToQueue, GoToTasks,
-    NewIssue, QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop,
-    ToggleLeftDock, ToggleRightDock, ToggleShowDone,
+    AddRepo, ApproveSelectedSpec, Dismiss, GoToActivity, GoToChat, GoToQueue, GoToTasks, NewIssue,
+    QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock,
+    ToggleRightDock, ToggleShowDone,
 };
 
 /// The keymap context the workspace root sets on itself. A binding in this
