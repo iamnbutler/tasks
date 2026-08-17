@@ -371,7 +371,7 @@ impl Builder {
         &self,
         build: &Build,
         clone_url: &str,
-        batch: &[(Spec, Task)],
+        batch: &[BatchItem],
         project: &Project,
         vm_id: &VmId,
         mut events: AppEvents<'_>,
@@ -501,8 +501,15 @@ impl Builder {
             .ok_or_else(|| StoreError::NotFound(format!("project {}", build.project_id)).into())
     }
 
-    /// Load the batch's `(Spec, Task)` pairs in position order.
-    async fn load_batch(&self, build: &Build) -> Result<Vec<(Spec, Task)>, BuilderError> {
+    /// Load the batch's [`BatchItem`]s in position order.
+    ///
+    /// The queue entry is read here, at *prompt* time, rather than snapshotted
+    /// onto the build row when the batch was created: a batch that
+    /// [`crate::run::watch_merges`] unwound back to `ready_to_build` and that
+    /// somebody rebuilt has to carry the same requirements the first attempt
+    /// was given. A spec with no queue entry is not an error — it reads
+    /// exactly as an approval that said nothing.
+    async fn load_batch(&self, build: &Build) -> Result<Vec<BatchItem>, BuilderError> {
         let mut batch = Vec::new();
         for spec_id in self.store.build_spec_ids(&build.id).await? {
             let spec = self
@@ -515,7 +522,12 @@ impl Builder {
                 .get_task(&spec.task_id)
                 .await?
                 .ok_or_else(|| StoreError::NotFound(format!("task {}", spec.task_id)))?;
-            batch.push((spec, task));
+            let review_feedback = self
+                .store
+                .get_spec_queue_entry(&spec_id)
+                .await?
+                .and_then(|entry| entry.feedback);
+            batch.push(BatchItem::new(spec, task, review_feedback));
         }
         if batch.is_empty() {
             return Err(BuilderError::BuildFailed {
@@ -794,6 +806,43 @@ fn is_terminal(event: &TaskEvent) -> bool {
     )
 }
 
+/// One spec in a build's batch, with everything about it that reaches the
+/// prompt: the spec itself, the issue it was written for, and the feedback the
+/// reviewer approved it with.
+///
+/// A struct rather than the `(Spec, Task)` tuple it replaces because the third
+/// field is the one that is easy to lose — it was lost by construction until
+/// #935, since the build prompt was assembled from `specs` and `tasks` and
+/// feedback lives on `spec_queue`.
+struct BatchItem {
+    spec: Spec,
+    task: Task,
+    /// What the reviewer required when they approved this spec, or `None` when
+    /// they said nothing. Blank text is `None` — see [`BatchItem::new`].
+    review_feedback: Option<String>,
+}
+
+impl BatchItem {
+    /// The **single** place blank feedback becomes `None`.
+    ///
+    /// `Store::review_spec` binds `feedback` unconditionally, so an approval
+    /// that says nothing writes `NULL` — but an empty string can reach the
+    /// column by other routes, and an always-present empty `## Review feedback`
+    /// section is exactly how an agent learns to skim past the one that
+    /// matters. Deciding it once here means [`render_review_feedback`] can
+    /// trust the field rather than re-deriving the rule beside it.
+    fn new(spec: Spec, task: Task, review_feedback: Option<String>) -> Self {
+        let review_feedback = review_feedback
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        Self {
+            spec,
+            task,
+            review_feedback,
+        }
+    }
+}
+
 struct BuildOutcome {
     #[allow(dead_code)] // verified VM-side; kept for symmetry / debugging
     base_sha: String,
@@ -856,9 +905,14 @@ async fn git_stdout(dir: &std::path::Path, args: &[&str]) -> Result<String, Buil
 /// caller and nothing else writes them. They also carry their author into the
 /// prompt, so the Builder can see for itself that it is not reading a Scout.
 ///
+/// Review feedback is not that either, and for the same shape of reason: it is
+/// what the *reviewer* required of the spec when they approved it. It is
+/// written about the spec, by whoever ruled on it, and no path runs from a
+/// Scout run to `spec_queue.feedback`.
+///
 /// Anything else that ever wants to reach a Builder still has to make its
 /// argument here, and the answer should still be no.
-fn render_prompt(batch: &[(Spec, Task)], directions: Option<&Directions>) -> String {
+fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String {
     let n = batch.len();
     let mut out = format!(
         "You are a Builder in the Double Diamond architecture.\n\n\
@@ -866,16 +920,21 @@ fn render_prompt(batch: &[(Spec, Task)], directions: Option<&Directions>) -> Str
          against the code in front of you; where a spec has a Scout behind it, \
          trust its pitfalls.\n\n"
     );
-    for (i, (spec, task)) in batch.iter().enumerate() {
+    for (i, item) in batch.iter().enumerate() {
         out.push_str(&format!(
             "## Spec {idx} of {n}: {title} (#{num})\n\n{provenance}\n\n{content}\n\n",
             idx = i + 1,
-            title = task.title,
-            num = task.gh_issue_number,
-            provenance = spec_provenance(spec),
-            content = spec.content.trim(),
+            title = item.task.title,
+            num = item.task.gh_issue_number,
+            provenance = spec_provenance(&item.spec),
+            content = item.spec.content.trim(),
         ));
     }
+    // After the specs and before the directions — the order the three channels
+    // were written in (the spec, then the review that approved it, then the
+    // directions for this particular build), which is also why directions stay
+    // last as the later word.
+    out.push_str(&render_review_feedback(batch));
     if let Some(directions) = directions {
         out.push_str(&render_directions(directions));
     }
@@ -931,6 +990,89 @@ fn spec_provenance(spec: &Spec) -> &'static str {
              it is wrong about what is there, say so in `SUMMARY.md`.*"
         }
     }
+}
+
+/// Render the `## Review feedback on these specs` section.
+///
+/// Emits **nothing at all** when no spec in the batch was approved with any —
+/// the same rule that keeps an undirected build from growing an empty
+/// `## Directions`, and for the same reason: an always-present empty section is
+/// how an agent learns to skim past the one that matters.
+///
+/// Attributed per spec, because a batch is exactly where that stops being
+/// obvious: unattributed feedback in a batch of three is a guess about which
+/// spec it belongs to.
+fn render_review_feedback(batch: &[BatchItem]) -> String {
+    let n = batch.len();
+    let reviewed: Vec<(usize, &BatchItem)> = batch
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.review_feedback.is_some())
+        .collect();
+    if reviewed.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "## Review feedback on these specs\n\n\
+         A reviewer read the spec(s) above and approved them **with** the \
+         following. It is part of what was approved: the spec says what to \
+         build, this says what the reviewer required of it. It is not part of \
+         any spec text, so nothing above repeats it.\n\n\
+         Treat every item as a requirement, not a suggestion. Where one \
+         genuinely conflicts with the spec it was written about, the feedback \
+         wins — it is the later word, written by the person who approved that \
+         spec — but **say so in `SUMMARY.md`**.\n\n\
+         Account for every item in `SUMMARY.md` under a `## Review feedback` \
+         heading: one line per item saying you did it, or that you decided \
+         against it and why. Declines are fine and are expected to be written \
+         down; an item you silently dropped is indistinguishable from one you \
+         never read, and the reviewer reads the spec rather than this \
+         section.\n\n",
+    );
+    for (i, item) in reviewed {
+        out.push_str(&format!(
+            "### On spec {idx} of {n}: {title} (#{num})\n\n{feedback}\n\n",
+            idx = i + 1,
+            title = item.task.title,
+            num = item.task.gh_issue_number,
+            feedback = item.review_feedback.as_deref().unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// The heading a Builder's `SUMMARY.md` accounts for its review feedback under.
+///
+/// A heading rather than a [`VERIFICATION_PREFIX`]-style trailer because there
+/// is one line per item and the item count is the reviewer's, not ours.
+pub const REVIEW_FEEDBACK_HEADING: &str = "Review feedback";
+
+/// Whether a `SUMMARY.md` has a [`REVIEW_FEEDBACK_HEADING`] section at all.
+///
+/// A **presence check, and nothing more**: it cannot tell a real accounting
+/// from a bare heading, so it is reported as the build's own claim exactly like
+/// [`verification_report`] is. Lenient about the shapes agents write — `##`,
+/// `**…**`, `- …:` — for the same reason that parser is.
+///
+/// What it must not do is read the words appearing inside an ordinary sentence
+/// ("Review feedback was helpful") as an accounting, which is what the
+/// next-non-space-character rule is for: a heading is followed by nothing, by
+/// emphasis, or by punctuation, never by more prose.
+pub fn summary_accounts_for_review_feedback(summary: Option<&str>) -> bool {
+    let Some(summary) = summary else {
+        return false;
+    };
+    summary.lines().any(|line| {
+        let line = line.trim().trim_start_matches(['-', '*', '#', ' ']).trim();
+        let Some(rest) = strip_prefix_ci(line, REVIEW_FEEDBACK_HEADING) else {
+            return false;
+        };
+        rest.trim_start()
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric())
+    })
 }
 
 /// Render the `## Directions for this implementation` section.
@@ -1041,14 +1183,14 @@ fn strip_prefix_ci<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
 /// PR title + body. Body prefers the agent's SUMMARY.md; falls back to the
 /// spec titles. Says `Implements #N`, not `Closes #N`: closing an issue is
 /// GitHub state that isn't ours to write.
-fn pr_text(batch: &[(Spec, Task)], outcome: &BuildOutcome) -> (String, String) {
+fn pr_text(batch: &[BatchItem], outcome: &BuildOutcome) -> (String, String) {
     let title = match batch {
-        [(_, task)] => task.title.clone(),
+        [item] => item.task.title.clone(),
         _ => format!(
             "Build: {}",
             batch
                 .iter()
-                .map(|(_, t)| format!("#{}", t.gh_issue_number))
+                .map(|item| format!("#{}", item.task.gh_issue_number))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1058,13 +1200,13 @@ fn pr_text(batch: &[(Spec, Task)], outcome: &BuildOutcome) -> (String, String) {
         Some(s) => neutralize_closing_keywords(s),
         None => batch
             .iter()
-            .map(|(_, t)| format!("- {} (#{})", t.title, t.gh_issue_number))
+            .map(|item| format!("- {} (#{})", item.task.title, item.task.gh_issue_number))
             .collect::<Vec<_>>()
             .join("\n"),
     };
     body.push_str("\n\n");
-    for (_, task) in batch {
-        body.push_str(&format!("Implements #{}\n", task.gh_issue_number));
+    for item in batch {
+        body.push_str(&format!("Implements #{}\n", item.task.gh_issue_number));
     }
     (title, body)
 }
@@ -1124,6 +1266,18 @@ mod tests {
     use super::*;
     use crate::models::{Complexity, GhState, ProjectId, SessionId, SpecId, TaskId, TaskState};
     use chrono::Utc;
+
+    /// A batch item with no review feedback. Goes through [`BatchItem::new`]
+    /// deliberately, so the blank-is-absent rule is exercised by every test
+    /// rather than re-stated in the helper.
+    fn item(n: u64, title: &str, content: &str) -> BatchItem {
+        reviewed(n, title, content, None)
+    }
+
+    fn reviewed(n: u64, title: &str, content: &str, feedback: Option<&str>) -> BatchItem {
+        let (spec, task) = pair(n, title, content);
+        BatchItem::new(spec, task, feedback.map(str::to_string))
+    }
 
     fn pair(n: u64, title: &str, content: &str) -> (Spec, Task) {
         let task_id = TaskId::new();
@@ -1277,8 +1431,8 @@ mod tests {
     #[test]
     fn the_prompt_is_specs_and_issue_identity_only() {
         let batch = vec![
-            pair(7, "First thing", "## Spec: first\ndo it"),
-            pair(9, "Second thing", "## Spec: second\ndo that"),
+            item(7, "First thing", "## Spec: first\ndo it"),
+            item(9, "Second thing", "## Spec: second\ndo that"),
         ];
         let prompt = render_prompt(&batch, None);
 
@@ -1301,7 +1455,7 @@ mod tests {
 
     #[test]
     fn directions_sit_after_the_specs_and_name_their_author() {
-        let batch = vec![pair(7, "A thing", "## Spec: first\ndo it")];
+        let batch = vec![item(7, "A thing", "## Spec: first\ndo it")];
         let directions = Directions::new(
             "keep the migration reversible",
             crate::models::Actor::Orchestrator,
@@ -1339,8 +1493,8 @@ mod tests {
     /// the prompt made about the artifact with the least behind it.
     #[test]
     fn a_hand_authored_spec_is_not_described_as_explored() {
-        let mut hand = pair(7, "A thing", "## Spec: first");
-        hand.0.session_id = None;
+        let mut hand = item(7, "A thing", "## Spec: first");
+        hand.spec.session_id = None;
         let prompt = render_prompt(&[hand], None);
         assert!(
             prompt.contains("A human wrote this spec by hand"),
@@ -1352,7 +1506,7 @@ mod tests {
             "nothing may claim this one was explored: {prompt}"
         );
 
-        let scouted = render_prompt(&[pair(9, "Another", "## Spec: second")], None);
+        let scouted = render_prompt(&[item(9, "Another", "## Spec: second")], None);
         assert!(scouted.contains("throwaway branch"), "{scouted}");
         assert!(scouted.contains("trust its pitfalls"), "{scouted}");
     }
@@ -1361,15 +1515,104 @@ mod tests {
     /// beside a hand-authored one must not lend it its provenance.
     #[test]
     fn provenance_is_per_spec_not_per_prompt() {
-        let mut hand = pair(7, "Hand", "## Spec: hand");
-        hand.0.session_id = None;
-        let prompt = render_prompt(&[hand, pair(9, "Scouted", "## Spec: scouted")], None);
+        let mut hand = item(7, "Hand", "## Spec: hand");
+        hand.spec.session_id = None;
+        let prompt = render_prompt(&[hand, item(9, "Scouted", "## Spec: scouted")], None);
         let hand_at = prompt.find("## Spec 1 of 2").unwrap();
         let scouted_at = prompt.find("## Spec 2 of 2").unwrap();
         let unexplored = prompt.find("A human wrote this spec by hand").unwrap();
         let explored = prompt.find("throwaway branch").unwrap();
         assert!(hand_at < unexplored && unexplored < scouted_at, "{prompt}");
         assert!(scouted_at < explored, "{prompt}");
+    }
+
+    /// #935: an approved spec's review feedback reached the Builder in no form
+    /// at all — it lives on `spec_queue.feedback`, and the prompt was built
+    /// from `specs` and `tasks`. Every required item that was not *also* spec
+    /// content was dropped by construction.
+    ///
+    /// Attribution is the half a batch makes load-bearing: unattributed
+    /// feedback in a batch of two is a guess about which spec it belongs to.
+    #[test]
+    fn review_feedback_sits_between_the_specs_and_the_directions_attributed_per_spec() {
+        let batch = vec![
+            reviewed(
+                7,
+                "First thing",
+                "## Spec: first\ndo it",
+                Some("name the constant, and say why in the module docs"),
+            ),
+            item(9, "Second thing", "## Spec: second\ndo that"),
+        ];
+        let directions = Directions::new("keep it one commit", crate::models::Actor::Human);
+        let prompt = render_prompt(&batch, Some(&directions));
+
+        let spec_two = prompt.find("## Spec 2 of 2: Second thing (#9)").unwrap();
+        let section = prompt.find("## Review feedback on these specs").unwrap();
+        let dirs = prompt
+            .find("## Directions for this implementation")
+            .unwrap();
+        let job = prompt.find("## Your job").unwrap();
+        assert!(spec_two < section, "after the specs: {prompt}");
+        assert!(
+            section < dirs && dirs < job,
+            "before the directions: {prompt}"
+        );
+
+        // Attributed to the spec it was written about — and *only* to it. A
+        // subsection for a spec that has none is the future refactor this
+        // negative assertion exists to catch.
+        assert!(
+            prompt.contains("### On spec 1 of 2: First thing (#7)"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("### On spec 2 of 2"), "{prompt}");
+        assert!(prompt.contains("name the constant"), "{prompt}");
+
+        // Required, declinable, and accounted for where the reviewer will read
+        // it back.
+        assert!(
+            prompt.contains("a requirement, not a suggestion"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("## Review feedback` heading"), "{prompt}");
+        assert!(prompt.contains("decided against it and why"), "{prompt}");
+    }
+
+    /// The same rule that keeps an undirected build from growing an empty
+    /// `## Directions`: a batch nobody left feedback on grows no heading at
+    /// all, and blank text counts as nobody.
+    #[test]
+    fn a_batch_approved_without_feedback_grows_no_review_section() {
+        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
+        assert!(!prompt.contains("Review feedback"), "{prompt}");
+
+        let blank = render_prompt(&[reviewed(7, "A thing", "spec", Some("   \n  "))], None);
+        assert!(!blank.contains("Review feedback"), "{blank}");
+    }
+
+    /// A presence check, and it has to fail towards "no accounting on record":
+    /// the words appearing inside an ordinary sentence must not read as one,
+    /// exactly as prose about passing is not the verification trailer.
+    #[test]
+    fn the_review_feedback_accounting_survives_the_shapes_agents_write() {
+        let accounts = |s: &str| summary_accounts_for_review_feedback(Some(s));
+
+        assert!(accounts(
+            "Did the thing.\n\n## Review feedback\n\n- Renamed it."
+        ));
+        assert!(accounts("### review feedback"));
+        assert!(accounts("**Review feedback**\n\n- Declined: out of scope."));
+        assert!(accounts("- Review feedback: all three items done"));
+        assert!(accounts("## Review feedback (2 items)"));
+
+        assert!(!summary_accounts_for_review_feedback(None));
+        assert!(!accounts("Just prose about the change."));
+        assert!(
+            !accounts("Review feedback was helpful and I followed it."),
+            "the words in a sentence are not an accounting"
+        );
+        assert!(!accounts("## Reviewer notes"));
     }
 
     /// The Builder's own test run is the only evidence this repository can
@@ -1379,7 +1622,7 @@ mod tests {
     /// worse than no line, because the brief reads it back as evidence.
     #[test]
     fn the_prompt_asks_for_the_verification_line_and_for_the_truth() {
-        let prompt = render_prompt(&[pair(7, "A thing", "spec")], None);
+        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
         assert!(prompt.contains("Verification: PASSED"), "{prompt}");
         assert!(prompt.contains("Verification: FAILED"), "{prompt}");
         assert!(prompt.contains("Verification: NOT RUN"), "{prompt}");
@@ -1457,7 +1700,7 @@ mod tests {
 
     #[test]
     fn pr_text_prefers_the_summary_and_never_says_closes() {
-        let batch = vec![pair(7, "First thing", "spec"), pair(9, "Second", "spec")];
+        let batch = vec![item(7, "First thing", "spec"), item(9, "Second", "spec")];
         let outcome = BuildOutcome {
             base_sha: "a".into(),
             head_sha: "b".into(),
@@ -1472,7 +1715,7 @@ mod tests {
         assert!(body.contains("Implements #9"));
         assert!(!body.contains("Closes"));
 
-        let single = vec![pair(7, "First thing", "spec")];
+        let single = vec![item(7, "First thing", "spec")];
         let no_summary = BuildOutcome {
             summary: None,
             ..outcome
@@ -1510,7 +1753,7 @@ mod tests {
         // A `#` not followed by digits is not an issue reference.
         assert_eq!(neutralize_closing_keywords("fixes #abc"), "fixes #abc");
 
-        let batch = vec![pair(763, "Golden fixtures", "spec")];
+        let batch = vec![item(763, "Golden fixtures", "spec")];
         let outcome = BuildOutcome {
             base_sha: "a".into(),
             head_sha: "b".into(),

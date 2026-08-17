@@ -27,11 +27,13 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::builder::{VerificationReport, verification_report};
+use crate::builder::{
+    VerificationReport, summary_accounts_for_review_feedback, verification_report,
+};
 use crate::github::GitHubClient;
 use crate::models::{
-    Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueStatus, Task, TaskId,
-    TaskState,
+    Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
+    Task, TaskId, TaskState,
 };
 use crate::store::{Store, StoreError};
 
@@ -96,7 +98,10 @@ pub struct Brief<'a> {
 /// them together keeps the fact functions pure and testable.
 struct World {
     specs: Vec<Spec>,
-    queue: HashMap<SpecId, SpecQueueStatus>,
+    /// The whole queue entry, not just its status: a stranded build's brief
+    /// needs to know whether the batch carried review feedback, and that lives
+    /// on the same row.
+    queue: HashMap<SpecId, SpecQueueEntry>,
     tasks: HashMap<TaskId, Task>,
     projects: HashMap<ProjectId, Project>,
     builds: Vec<Build>,
@@ -184,6 +189,11 @@ impl<'a> Brief<'a> {
     /// runnable here could have checked. All three are facts — who acts on
     /// them is stated once, in the generated `land_batch` section of the
     /// orchestrator's prompt, and nowhere else.
+    ///
+    /// A fourth appears only when this batch's specs were approved *with*
+    /// review feedback: whether the build accounted for it. See
+    /// [`review_feedback_line`] — it is a fact and not a fourth landing
+    /// carve-out, and says so in its own wording.
     pub async fn for_stranded_build(&self, build_id: &BuildId) -> Result<Vec<String>, StoreError> {
         let Some(build) = self.store.get_build(build_id).await? else {
             return Ok(vec![format!(
@@ -232,6 +242,7 @@ impl<'a> Brief<'a> {
             lines.push(format!("still awaiting merge: {}", waiting.join(", ")));
         }
         lines.push(verification_line(build.summary.as_deref()));
+        lines.extend(review_feedback_line(&build, world));
         lines.push(verification_surface(&build.files_touched));
         lines.extend(self.landing_facts(&build, world).await);
         Ok(lines)
@@ -276,8 +287,8 @@ impl<'a> Brief<'a> {
         let approved = world
             .queue
             .iter()
-            .filter(|(spec_id, status)| {
-                **status == SpecQueueStatus::Approved && !carried.contains(spec_id)
+            .filter(|(spec_id, entry)| {
+                entry.status == SpecQueueStatus::Approved && !carried.contains(spec_id)
             })
             .count();
         if approved > 0 {
@@ -538,7 +549,7 @@ impl<'a> Brief<'a> {
             .list_spec_queue()
             .await?
             .into_iter()
-            .map(|item| (item.entry.spec_id, item.entry.status))
+            .map(|item| (item.entry.spec_id.clone(), item.entry))
             .collect();
         let tasks = self
             .store
@@ -816,6 +827,57 @@ fn verification_line(summary: Option<&str>) -> String {
     }
 }
 
+/// Whether a build that was *given* review feedback said anything about it.
+///
+/// Silent when no spec in the batch carried any — there is nothing to have
+/// accounted for, and a standing line saying so is a line that gets skimmed.
+/// Blank feedback counts as none, the same rule `BatchItem::new` applies on the
+/// way into the prompt: a build cannot account for an empty section it was
+/// never shown.
+///
+/// Like [`verification_line`], what it reports is the build's **own claim** —
+/// [`summary_accounts_for_review_feedback`] is a presence check and cannot tell
+/// a real accounting from a bare heading. And it is a *fact*, never a veto:
+/// `orchestrator::landing_section` names exactly three carve-outs, all about
+/// whether a change can be verified, and a brief fact that reads like a fourth
+/// would be a second source of truth about who decides.
+fn review_feedback_line(build: &Build, world: &World) -> Option<String> {
+    let carried = world
+        .build_specs
+        .get(build_key(build))
+        .into_iter()
+        .flatten()
+        .filter_map(|spec_id| world.queue.get(spec_id))
+        .any(|entry| {
+            entry
+                .feedback
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        });
+    if !carried {
+        return None;
+    }
+    Some(
+        match summary_accounts_for_review_feedback(build.summary.as_deref()) {
+            true => {
+                "this batch's specs were approved WITH review feedback, and the build's summary \
+             has a `Review feedback` section — that is the build's own claim to have \
+             accounted for each item, not a check that it did. Read it against the feedback \
+             itself (`GET /spec-queue` for these specs)"
+                    .to_string()
+            }
+            false => {
+                "this batch's specs were approved WITH review feedback, and the build's summary \
+             has no `Review feedback` section, so whether those items landed is unknown \
+             rather than known-skipped. Read the feedback (`GET /spec-queue` for these \
+             specs) against the diff and say what you find on the PR — on its own this is \
+             not a reason to refuse the merge"
+                    .to_string()
+            }
+        },
+    )
+}
+
 /// How much of this batch nothing runnable here could have checked.
 ///
 /// A count rather than a verdict. `app-gpui` compiles and unit-tests on a Linux
@@ -875,7 +937,7 @@ fn spec_overlap(spec: &Spec, world: &World) -> Vec<String> {
             continue;
         }
         let status = match world.queue.get(&other.id) {
-            Some(status) => *status,
+            Some(entry) => entry.status,
             None => continue,
         };
         if !matches!(
@@ -1031,7 +1093,7 @@ fn sequence_clash_in_flight(spec: &Spec, world: &World) -> Vec<String> {
             continue;
         }
         let live = matches!(
-            world.queue.get(&other.id),
+            world.queue.get(&other.id).map(|entry| entry.status),
             Some(SpecQueueStatus::PendingReview) | Some(SpecQueueStatus::Approved)
         );
         if !live {
@@ -1278,6 +1340,91 @@ mod tests {
             verification_line(None),
             "a build from before the line reads the same"
         );
+    }
+
+    /// #935's other half: the prompt now carries the feedback, and this is the
+    /// only thing downstream that says whether it was answered. Silent when the
+    /// batch was approved with nothing, because a standing line saying "no
+    /// feedback to account for" is a line that gets skimmed.
+    #[test]
+    fn the_review_feedback_line_reports_the_claim_and_is_silent_without_feedback() {
+        let build = a_build();
+        let spec_id = SpecId::new();
+
+        let world = |feedback: Option<&str>| a_world(&build, &spec_id, feedback);
+
+        // Nothing was required of this batch, so there is nothing to report —
+        // and blank text in the column reads the same, since the prompt does
+        // not render an empty section for it either.
+        assert_eq!(review_feedback_line(&build, &world(None)), None);
+        assert_eq!(review_feedback_line(&build, &world(Some("  \n "))), None);
+
+        let carried = world(Some("name the constant"));
+
+        let mut answered = build.clone();
+        answered.summary = Some("Did it.\n\n## Review feedback\n\n- Renamed it.".into());
+        let line = review_feedback_line(&answered, &carried).expect("a line");
+        assert!(line.contains("has a `Review feedback` section"), "{line}");
+        assert!(
+            line.contains("the build's own claim"),
+            "a presence check is never described as a check: {line}"
+        );
+        assert!(line.contains("GET /spec-queue"), "{line}");
+
+        let mut silent = build.clone();
+        silent.summary = Some("Did it.".into());
+        let line = review_feedback_line(&silent, &carried).expect("a line");
+        assert!(line.contains("no `Review feedback` section"), "{line}");
+        assert!(line.contains("unknown rather than known-skipped"), "{line}");
+        assert!(
+            line.ends_with("on its own this is not a reason to refuse the merge"),
+            "a fact must not read as a fourth landing carve-out: {line}"
+        );
+    }
+
+    fn a_build() -> Build {
+        Build {
+            id: crate::models::BuildId::new(),
+            project_id: ProjectId::new(),
+            vm_id: None,
+            branch: "build/x".into(),
+            base_branch: "main".into(),
+            base_sha: None,
+            head_sha: None,
+            pr_number: Some(4),
+            status: BuildStatus::Succeeded,
+            summary: None,
+            files_touched: vec![],
+            exit_reason: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            agent_finished_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            directions: None,
+        }
+    }
+
+    /// The smallest world [`review_feedback_line`] reads: one build carrying
+    /// one spec, whose queue entry holds `feedback`.
+    fn a_world(build: &Build, spec_id: &SpecId, feedback: Option<&str>) -> World {
+        World {
+            specs: Vec::new(),
+            queue: HashMap::from([(
+                spec_id.clone(),
+                SpecQueueEntry {
+                    spec_id: spec_id.clone(),
+                    status: SpecQueueStatus::Approved,
+                    rank: None,
+                    approved_at: None,
+                    feedback: feedback.map(str::to_string),
+                    blocking_dependencies: vec![],
+                },
+            )]),
+            tasks: HashMap::new(),
+            projects: HashMap::new(),
+            builds: Vec::new(),
+            build_specs: HashMap::from([(build_key(build).to_string(), vec![spec_id.clone()])]),
+        }
     }
 
     /// A stale image is a **fact**, not an obligation — the orchestrator holds

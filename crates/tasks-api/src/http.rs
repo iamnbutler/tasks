@@ -195,7 +195,13 @@ pub struct ReorderSpecQueue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub status: String,
-    /// Sent onward to a scout on `needs_revision` — what to change.
+    /// Addressed to whichever agent picks the work up next, and it reaches one
+    /// on **either** verdict: on `needs_revision` the re-scout is asked to
+    /// account for it in `SPEC.md`'s `### Notes`, and on `approved` the Builder
+    /// gets it as its own `## Review feedback on these specs` section and is
+    /// asked to account for it in `SUMMARY.md`. So an approval may carry
+    /// required changes — this is how a reviewer approves *with* them rather
+    /// than sending the whole spec back.
     #[serde(default)]
     pub feedback: Option<String>,
     /// Why this verdict was rendered. Distinct from `feedback`: that is

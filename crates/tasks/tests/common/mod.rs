@@ -299,6 +299,16 @@ pub fn echo_prompt_agent_path() -> PathBuf {
         .join("echo-prompt-agent.sh")
 }
 
+/// [`echo_prompt_agent_path`] for builds: copies its whole stdin prompt into
+/// `SUMMARY.md`, which comes back on the build row — the only seam from
+/// outside the VM for asserting what the Builder was told.
+pub fn echo_prompt_builder_agent_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("echo-prompt-builder-agent.sh")
+}
+
 /// A stand-in scout agent that blocks until the test creates a gate file, so
 /// a run is provably still in flight when the test kills the server.
 pub fn gated_agent_path() -> PathBuf {

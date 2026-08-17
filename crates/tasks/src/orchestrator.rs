@@ -1334,6 +1334,14 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          never reads it; put an explanation in `directions` and the agent acts \
          on it. Send both when both apply, and never copy one into the \
          other.\n\n\
+         A review's `feedback` is the third channel and belongs with \
+         `directions` rather than with `rationale`: it is addressed to whoever \
+         picks the spec up next. On `needs_revision` the re-scout is asked to \
+         account for it in `SPEC.md`; on `approved` the Builder receives it as \
+         its own section of its prompt and is asked to account for each item \
+         in `SUMMARY.md`. So you can approve a spec *with* required changes \
+         rather than sending the whole thing back for one of them — put those \
+         changes in `feedback`, not in `rationale`, which no agent reads.\n\n\
          Endpoints:\n\
          - GET /tasks (working set; ?all=true for history), GET /tasks/{{id}}\n\
          - POST /tasks/{{id}}/queue | /dequeue | /scout \
@@ -1347,7 +1355,10 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            build row says it failed, the transcript says why\n\
          - GET /specs/{{id}}, GET /spec-queue — specs and their review state\n\
          - POST /spec-queue/{{id}}/review \
-           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}}\n\
+           {{\"status\":\"approved|needs_revision|rejected\",\"feedback\",\"rationale\"}} \
+           — `feedback` reaches the agent that picks the spec up next, on an \
+           approval as well as on a `needs_revision`, so approving with \
+           required changes in it is a real verdict rather than a hedge\n\
          - POST /builds {{\"spec_ids\":[...],\"rationale\",\"directions\"}} — \
            batch approved specs into one Builder run (serial; one at a \
            time)\n\

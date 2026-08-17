@@ -392,6 +392,30 @@ implementation.
   over the limit is a **400, not a truncation**, because an instruction cut
   off halfway is a different instruction. The run's copy is a *copy*: re-aiming
   a task tomorrow must not rewrite what a run that already happened was told.
+- **A review's `feedback` is agent-facing on *both* verdicts, so an approval
+  can carry required changes.** It is the third channel beside `directions` and
+  `rationale`, and it belongs with the first: on `needs_revision` the re-scout
+  quotes it under `## Previous attempt`, and on `approved` the Builder receives
+  it as its own `## Review feedback on these specs` section — attributed per
+  spec, because a batch is exactly where unattributed feedback becomes a guess
+  about which spec it belongs to. Until #935 the approved half reached nothing
+  at all: feedback lives on `spec_queue.feedback`, the build prompt was
+  assembled from `specs` and `tasks`, and `Spec` has no such column, so every
+  required item that was not *also* spec content was dropped by construction —
+  which is why the dropped ones were uniformly documentation, naming and
+  framing. `Builder::load_batch` reads the queue entry at **prompt time**, not
+  when the batch was created, so a batch a `watch_merges` unwind sent back to
+  `ready_to_build` is rebuilt under the same requirements. The section demands
+  each item be accounted for in `SUMMARY.md` under a `## Review feedback`
+  heading, declines included — and since the summary *is* the PR body, that
+  accounting is in front of the reviewer without anything being fetched.
+  `summary_accounts_for_review_feedback` is a **presence check** and is
+  reported as the build's own claim, exactly like `Verification:`; it is a
+  brief fact and **not a fourth `landing_section` carve-out**, since those three
+  are about whether a change can be *verified* and a fact that reads like a veto
+  is a second source of truth about who decides. `rationale` must never follow
+  this path — `review_spec` takes both, and a decision record addressed to the
+  ledger has no business in a VM.
 - **The images are rebuilt by hand, and the gap is what has to be visible.** A
   merge does not rebuild images and should not: nothing inside the pipeline can
   reach the cross toolchain, the `container` CLI or the checkout a rebuild
