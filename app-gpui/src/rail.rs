@@ -219,10 +219,11 @@ impl Workspace {
 
         // Owned projections first — the rows need `cx` for listeners after
         // the state borrow ends.
-        let (tree, feedback, banner) = {
+        let (tree, feedback, banner, queue_notice) = {
             let state = self.app_state.read(cx);
             let tree = tree_rows(&state.tasks, &self.project_filter);
             let feedback = feedback_rows(&state.tasks, &state.spec_queue, &state.projects);
+            let queue_notice = state.queue_notice.clone();
 
             // A restart in flight outranks both, and is checked first rather
             // than last: it takes the app's own event stream down, and
@@ -248,7 +249,7 @@ impl Workspace {
             } else {
                 None
             };
-            (tree, feedback, banner)
+            (tree, feedback, banner, queue_notice)
         };
 
         let all_selected = matches!(self.nav.current(), MiddleView::AllTasks);
@@ -349,6 +350,21 @@ impl Workspace {
                                     .child(Icons::plus().size(px(12.)).text_color(text_muted)),
                             ),
                     )
+                    // A correction the server made to the last drag, where
+                    // the drag happened. Not the banner: the POST succeeded,
+                    // and this is about the order, not the connection.
+                    .children(queue_notice.map(|notice| {
+                        div()
+                            .mx(px(6.))
+                            .mb(px(4.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(5.))
+                            .bg(theme.surface_secondary())
+                            .text_xs()
+                            .text_color(theme.fg())
+                            .child(notice)
+                    }))
                     // The tree — the queue itself, drag to rank.
                     .child(
                         div()

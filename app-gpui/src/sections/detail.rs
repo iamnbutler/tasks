@@ -124,7 +124,7 @@ impl Workspace {
 
     /// The scrolling column every tab body lives in: padded, reading-width
     /// capped, keyed so two tabs' scroll positions stay separate.
-    fn tab_pane(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn tab_pane(id: &'static str) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
             .flex()
@@ -676,7 +676,11 @@ impl Workspace {
     ///
     /// Delete arms on the first click and fires on the second. There is no
     /// undo and no second copy — [`Workspace::bundle_delete_armed`].
-    fn render_bundle(&self, bundle: RejectedBundle, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_bundle(
+        &self,
+        bundle: RejectedBundle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let armed = self.bundle_delete_armed.as_ref() == Some(&bundle.build_id);
         let build_id: BuildId = bundle.build_id.clone();

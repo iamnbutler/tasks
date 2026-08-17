@@ -817,7 +817,13 @@ impl AppState {
     /// queue entry, front to back, and it writes `spec_queue.rank`.
     ///
     /// Same bulk-replace semantics, hence the same rule — every entry, not
-    /// just the pending-review ones the Needs you band shows.
+    /// just the pending-review ones the section shows.
+    ///
+    /// Caller-less since the Queue section died in the v3 frame swap; kept
+    /// because Awaiting Feedback's drag-to-rank (the noted fast-follow) is
+    /// this exact call, and the bulk-replace rules encoded here are the
+    /// hard-won part.
+    #[allow(dead_code)]
     pub fn reorder_spec_queue(&mut self, order: Vec<SpecId>, cx: &mut Context<Self>) {
         let rollback = self.spec_queue.clone();
         ranked_first(&mut self.spec_queue, &order, |item| &item.entry.spec_id);

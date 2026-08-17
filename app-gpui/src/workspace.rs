@@ -2462,7 +2462,7 @@ impl Workspace {
             TaskTab::Overview => self.render_overview(cx),
             TaskTab::Brief => self.render_brief(cx),
             TaskTab::AgentFeed => self.render_agent_feed(cx),
-            other => self.render_tab_placeholder(other, cx),
+            TaskTab::Changes => self.render_changes(cx),
         }
     }
 
@@ -2503,40 +2503,6 @@ impl Workspace {
                     }))
                     .child(tab.label())
             }))
-    }
-
-    /// What an unbuilt tab says about itself. Honest and specific: these land
-    /// in later milestones of the v3 plan, and a blank pane would read as a
-    /// bug rather than a boundary.
-    fn render_tab_placeholder(&self, tab: TaskTab, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let (title, detail) = match tab {
-            TaskTab::Changes => (
-                "Changes",
-                "The build's branch, summary and verification land here (milestone 5).",
-            ),
-            TaskTab::Overview | TaskTab::Brief | TaskTab::AgentFeed => {
-                unreachable!("these tabs render content")
-            }
-        };
-        div()
-            .flex_1()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(6.))
-            .p(px(16.))
-            .child(div().text_sm().text_color(theme.fg()).child(title))
-            .child(
-                div()
-                    .max_w(px(420.))
-                    .text_center()
-                    .text_xs()
-                    .text_color(theme.fg_muted())
-                    .child(detail),
-            )
-            .into_any_element()
     }
 }
 
