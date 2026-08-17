@@ -29,6 +29,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         vm-supervisor-linux image-base image-agent image-scout image-builder images \
         images-check \
         check-nextest test-bins test test-ci test-cargo app run \
+        check-darwin app-build app-stop app-install \
         app-check app-stubs app-test \
         server serve restart status stop migration verify-warm
 
@@ -56,15 +57,79 @@ BUILD_COMMIT := $(shell git rev-parse --short HEAD)$(shell git diff --quiet 2>/d
 APP_VERSION := $(BUILD_VERSION)
 APP_COMMIT := $(BUILD_COMMIT)
 
-# Build the mac app and install it to ~/Applications, replacing any existing
-# copy. app-gpui is not a workspace member and has its own target/ directory,
-# so the binary comes from there, not the root target/. There is no Xcode
-# project any more, so the bundle is assembled by hand around it.
-app:
-	@[ "$$(uname -s)" = "Darwin" ] || { echo "make app builds a macOS .app bundle; this is $$(uname -s)"; exit 1; }
+# Where the installed bundle lives. One source for a path that used to be
+# written out twice — once by the installer, once by the launcher — which is
+# how they could drift.
+#
+# `$$HOME` rather than `$(HOME)`, so the *shell* expands it inside the recipe —
+# which is exactly what the two hand-written copies did, making this a rename
+# rather than a change in behaviour.
+#
+# It is not, on its own, a guard against an unset HOME: `$$HOME` and `$(HOME)`
+# both expand to the empty string there, and `"$HOME/Applications/Tasks.app"`
+# then reads `/Applications/Tasks.app` — someone else's install, aimed at by an
+# `rm -rf`. Measured, not assumed. The guard in `app-install` is what closes it.
+APP_BUNDLE := $$HOME/Applications/Tasks.app
+
+# The macOS guard, named once. It used to sit in the recipe that both built
+# and installed; those are separate targets now, so copying it would be two
+# places to keep in step.
+check-darwin:
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "the app targets build a macOS .app bundle; this is $$(uname -s)"; exit 1; }
+
+# Build the mac app. app-gpui is not a workspace member and has its own
+# target/ directory, so the binary comes from there, not the root target/.
+app-build: check-darwin
 	cd app-gpui && TASKS_GPUI_VERSION=$(APP_VERSION) TASKS_GPUI_COMMIT=$(APP_COMMIT) \
 		cargo build --release
-	@bundle="$$HOME/Applications/Tasks.app"; \
+
+# Quit a running Tasks and *wait for it to be gone*.
+#
+# The waiting is the point. `pkill` returns as soon as the signal is delivered,
+# not when the process has exited, so a bare `pkill; open` asks LaunchServices
+# to activate an instance that is on its way out — which is the -600
+# (procNotFound) that made `make run` fail on its first invocation and succeed
+# on its second (#928).
+#
+# Bounded at 2s and it *falls through with a warning* rather than escalating to
+# SIGKILL: SIGKILLing a window somebody is looking at is not this target's call,
+# and a target that can hang is worse than one that can be wrong. It exits 0 in
+# every case, including the warning — `exit 0` from inside the loop is what
+# skips the warning, so there is no flag variable to get out of step.
+#
+# The kill and the wait use the same predicate (`-x Tasks`) deliberately: a
+# wait watching a different process than the signal went to would report
+# success for the wrong reason.
+#
+# No check-darwin. Quitting a process that isn't running is a no-op everywhere,
+# and this is the one app target with nothing macOS-shaped in it.
+app-stop:
+	@pkill -x Tasks 2>/dev/null || true
+	@for i in $$(seq 1 20); do \
+		pgrep -x Tasks >/dev/null 2>&1 || exit 0; \
+		sleep 0.1; \
+	done; \
+	echo "warning: Tasks still running after 2s; continuing (it may need to be quit by hand)"
+
+# Assemble the bundle around the built binary and install it to ~/Applications,
+# replacing any existing copy. There is no Xcode project any more, so this is
+# done by hand.
+#
+# It warns rather than quitting a live app: `make app` is "build and install",
+# not "restart my app", and killing the user's app from a build target is a
+# surprise. `make run` is the target that stops it, and does so *before* this
+# one runs.
+#
+# The HOME check is ahead of the `rm -rf`, not decorative: with HOME unset the
+# path collapses to `/Applications/Tasks.app` and this recipe deletes whatever
+# is there. Refusing costs a Mac user nothing — HOME is always set in a login
+# shell — and it is the only line here that can destroy something.
+app-install: check-darwin
+	@[ -n "$$HOME" ] || { echo "HOME is unset; refusing to install to $(APP_BUNDLE)"; exit 1; }
+	@pgrep -x Tasks >/dev/null 2>&1 && \
+		echo "note: Tasks is running; it will keep running from the deleted bundle until you quit it (make run stops it first)" \
+		|| true
+	@bundle="$(APP_BUNDLE)"; \
 	rm -rf "$$bundle"; \
 	mkdir -p "$$bundle/Contents/MacOS" "$$bundle/Contents/Resources"; \
 	cp app-gpui/target/release/tasks-gpui "$$bundle/Contents/MacOS/Tasks"; \
@@ -72,10 +137,40 @@ app:
 		app-gpui/Info.plist.in > "$$bundle/Contents/Info.plist"; \
 	echo "installed $$bundle ($(APP_VERSION), $(APP_COMMIT))"
 
-# Build, install, and (re)launch.
-run: app
-	@pkill -x Tasks 2>/dev/null || true
-	open ~/Applications/Tasks.app
+# Build and install, exactly as `make app` always did.
+#
+# Sub-makes rather than prerequisites, here and in `run` below: `make -j` gives
+# prerequisites no ordering at all, and every property of these targets is an
+# ordering. Same call the `images-check` comment further down makes, for the
+# same reason.
+app:
+	@$(MAKE) --no-print-directory app-build
+	@$(MAKE) --no-print-directory app-install
+
+# Build, stop, install, launch — in that order, and each step is where it is
+# for a reason:
+#
+#   app-build    first, so a compile error costs you nothing: the app you have
+#                running keeps running, exactly as a failed `make restart`
+#                leaves the server you have serving.
+#   app-stop     before the install, because app-install deletes the bundle and
+#                a live process running out of a deleted bundle is what made
+#                `open` fail with -600.
+#   app-install  now safe: nothing is running out of the bundle it replaces.
+#   open         the relaunch, retried once. Not `|| true` — `make run`
+#                reporting success while nothing launched would be a worse bug
+#                than the one this fixes. With the wait above in place the
+#                retry should be dead code; it costs a line, and being wrong
+#                about that costs a red build for a cosmetic race.
+run:
+	@$(MAKE) --no-print-directory app-build
+	@$(MAKE) --no-print-directory app-stop
+	@$(MAKE) --no-print-directory app-install
+	@open "$(APP_BUNDLE)" || { \
+		echo "launch failed; retrying once"; \
+		sleep 1; \
+		open "$(APP_BUNDLE)"; \
+	}
 
 # Typecheck and test the GUI on a machine with no display and no Mac — which
 # is every agent VM, and used to mean every app-gpui change was written

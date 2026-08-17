@@ -201,11 +201,31 @@ cargo update -p <crate>-gpui-unofficial --precise 1.14.2
 
 ```sh
 cargo run          # from this directory
-make app           # from the repo root: install ~/Applications/Tasks.app
-make run           # …and (re)launch it
+make app           # from the repo root: build + install ~/Applications/Tasks.app
+make app-stop      # quit a running Tasks, and wait for it to be gone
+make run           # build, stop, install, (re)launch
 cargo test         # from this directory — app-gpui is not a workspace member,
                    # so `cargo test --workspace` at the root skips it
 ```
+
+`make run` is four steps in a fixed order — `app-build`, `app-stop`,
+`app-install`, `open` — and each is where it is for a reason. The **build comes
+first** so that a compile error costs you nothing: the copy you already have
+running keeps running, the same property `make restart` gives the server. The
+**stop comes before the install**, because installing deletes the bundle and
+recreates it, and a live process running out of a deleted bundle is what made
+`open` fail with `_LSOpenURLsWithCompletionHandler() failed with error -600`
+(`procNotFound`) on the first invocation and succeed on the second. `app-stop`
+does not just signal — `pkill` returns when the signal is delivered, not when
+the process has exited, so it then **waits** (up to 2s) for `pgrep -x Tasks` to
+come back empty; past the bound it warns and continues rather than escalating
+to `SIGKILL`, so it can never hang the build and never kills a window you are
+looking at. The **launch retries once** and then fails honestly, rather than
+being swallowed with `|| true`: `make run` reporting success while nothing
+launched would be worse than the bug it fixes.
+
+`make app` itself only warns when Tasks is running — it is "build and install",
+not "restart my app", and quitting your app from a build target is a surprise.
 
 On Linux the build needs five packages — `pkg-config libfontconfig-dev
 libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev` — which the Scout and
