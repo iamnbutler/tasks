@@ -2402,13 +2402,13 @@ dependencies = [
 [[package]]
 name = "gpuikit"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f460fb9848730b70c8476baa61651da1f99dc7406cc193c74b6224b602594fc"
+source = "git+https://github.com/iamnbutler/gpuikit?rev=b28732f290f8bd8ca7ffcc56a40d00a852ac978a#b28732f290f8bd8ca7ffcc56a40d00a852ac978a"
 dependencies = [
  "anyhow",
  "gpui-platform-gpui-unofficial",
  "gpui-unofficial",
  "log",
+ "mdstitch",
  "pulldown-cmark",
  "rust-embed",
  "serde",
@@ -3202,6 +3202,12 @@ dependencies = [
  "cfg-if",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "mdstitch"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c85a8c4350811e8f4b00621aa211b1eb9b5035591826f885faf0bc1c6f1f7bc"
 
 [[package]]
 name = "media-gpui-unofficial"
@@ -4233,9 +4239,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.12.2"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
 dependencies = [
  "bitflags 2.13.1",
  "memchr",

@@ -2,9 +2,10 @@
 
 The gpui port of the Tasks app (`tasks/app`, the Swift client). Built on
 [gpui-unofficial](https://github.com/iamnbutler/gpui-unofficial) 1.14.2 and
-[gpuikit](https://github.com/iamnbutler/gpuikit) 0.7, talking to the tasks
-server through the workspace's own crates: `tasks-api` (shared wire types)
-and `tasks-client` (typed blocking client + reconnecting SSE streams).
+[gpuikit](https://github.com/iamnbutler/gpuikit) 0.7 (pinned to a git rev — see
+Dependencies), talking to the tasks server through the workspace's own crates:
+`tasks-api` (shared wire types) and `tasks-client` (typed blocking client +
+reconnecting SSE streams).
 
 ## Architecture
 
@@ -129,8 +130,36 @@ SVG assets are served by `Application::with_assets(gpuikit::assets())`.
 
 ## Dependencies
 
-Everything comes from crates.io — there is no git dependency, and
-`grep git+ Cargo.lock` returning nothing is the check that keeps it that way.
+Everything comes from crates.io **except gpuikit**, which is pinned to a git
+rev. `grep git+ Cargo.lock` should return exactly one line, naming gpuikit and
+nothing else; a second one is a regression.
+
+That is a deliberate exception to what this section used to promise, and it is
+temporary. The chat's streaming markdown needs two things that exist only on
+gpuikit `main` (added together in
+[#134](https://github.com/iamnbutler/gpuikit/pull/134), commit `dde1e9c`):
+`Markdown::append`, which keeps a selection across a delta where `set_source`
+drops it, and the `stitch` feature, which closes the inline syntax a
+half-streamed document leaves open. `main`'s own `Cargo.toml` still reads
+`version = "0.7.0"` — the version already on crates.io — so there is no release
+to depend on and no version to ask for. A `rev`, not a `branch`, so the build
+stays reproducible.
+
+Two consequences worth knowing:
+
+- **The effective MSRV rises to 1.95**, via `stitch`'s `mdstitch` dependency.
+  gpuikit's own `rust-version = "1.75"` is stale either way (it uses async
+  closures and needs 1.85). Accepted: this crate has no MSRV policy of its own
+  and nothing else in the repo builds it.
+- **The revert is one line.** Dropping `features = ["stitch"]` gives up only
+  the flicker fix and nothing else; `components/markdown.rs` is unaffected
+  either way, and its `partial_markdown_preprocessing_is_compiled_in` test is
+  what makes that a decision rather than an accident. Going all the way back is
+  `gpuikit = "0.7"` plus swapping the `Update::Append` arm in `MarkdownCache`
+  for a `set_source`.
+
+The end state is `gpuikit = { version = "0.8", features = ["stitch"] }` the day
+upstream cuts a release — worth asking for, alongside the stale `rust-version`.
 
 **`gpui` and `gpui_platform` are pinned exactly (`=1.14.2`), not with a
 caret.** gpuikit asks for `^1.14.2`, so an exact pin unifies with it rather

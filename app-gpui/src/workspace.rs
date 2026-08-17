@@ -1646,9 +1646,12 @@ impl Workspace {
     /// so it reads at full contrast; anything a tool call has closed off is
     /// working narration, and is muted.
     ///
-    /// Partial markdown is safe here: gpuikit parses with `pulldown-cmark`,
-    /// which closes open constructs at end-of-input, so an unterminated fence
-    /// renders as the best reading of what has arrived.
+    /// Partial markdown is safe here, and this is the one key that streams:
+    /// `pulldown-cmark` closes open *blocks* at end-of-input, and gpuikit's
+    /// `stitch` feature closes the open *inline* syntax it does not, so a
+    /// half-written `**bold` reads as bold rather than flashing its asterisks
+    /// for one delta. The text grows by pure suffix, which is what has
+    /// [`MarkdownCache`] append rather than replace — see its `Update`.
     fn render_trail_text(
         &self,
         key: String,

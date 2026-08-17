@@ -11,7 +11,14 @@ gpui = { package = "gpui-unofficial", version = "=1.14.2" }
 # runtime_shaders: compile Metal shaders at runtime so builds don't need the
 # Xcode Metal toolchain.
 gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.14.2", features = ["font-kit", "runtime_shaders"] }
-gpuikit = "0.7"
+# A git rev, and the only one in this graph — see README ▸ Dependencies.
+# `Markdown::append` (which keeps a selection across a streaming delta) and the
+# `stitch` feature (which closes syntax a half-streamed document leaves open)
+# landed in gpuikit #134 and are in no published release; `main`'s own version
+# is still 0.7.0, so there is nothing to bump to. A `rev`, never a `branch`, so
+# the build stays reproducible. The clean end state is
+# `gpuikit = { version = "0.8", features = ["stitch"] }`.
+gpuikit = { git = "https://github.com/iamnbutler/gpuikit", rev = "b28732f290f8bd8ca7ffcc56a40d00a852ac978a", features = ["stitch"] }
 smallvec = "1"
 # The server's wire types (models, events, request/response bodies) — the
 # whole point of living in this repo. Path dep so type changes are atomic.
