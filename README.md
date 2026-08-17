@@ -1,0 +1,95 @@
+# Tasks
+
+An autonomous software pipeline with a human in the loop. Tasks turns a
+GitHub issue tracker into shipped pull requests by orchestrating headless
+[Claude Code](https://claude.com/claude-code) agents — and keeps a human in
+the position of *reviewer*, not operator.
+
+## The idea
+
+Most agent tooling makes you drive: prompt, watch, approve, repeat. Tasks
+inverts that. Work moves on its own — issues are ingested, explored, specced,
+built, merged, and closed — while every judgment call lands in an append-only
+decisions ledger you can audit and reverse. Oversight happens after the fact,
+where it's cheap, instead of as pre-approval gates, where it's the bottleneck.
+
+The architecture is a double diamond:
+
+```
+GitHub issues ──▶ backlog ──▶ queue ──▶ SCOUT ──▶ spec ──▶ review ──▶ BUILDER ──▶ PR ──▶ merged ──▶ done
+                                     (parallel)          (human or            (serial)
+                                                        orchestrator)
+```
+
+- **Scouts** run in parallel, each in its own ephemeral VM. A Scout explores
+  the codebase and writes a **spec** — a text document saying what to build
+  and how. The spec is the deliverable; the Scout's code is thrown away.
+- Specs land in a **review queue**. A human (or the orchestrator, when
+  granted) approves, requests revision, or rejects.
+- **Builders** run serially, one at a time. A Builder gets approved specs —
+  never Scout code, the information barrier is deliberate — implements them
+  on a fresh branch, and opens a PR with its own test verdict.
+- A merge watcher confirms the work actually reached trunk (not just that
+  GitHub said `merged`), then closes the issue. `done` always means
+  *shipped*.
+
+Sitting beside the pipeline is the **orchestrator**: a Claude Code agent that
+wakes on a tick, reads a brief of everything owed a decision, and acts —
+queueing tasks, reviewing specs, dispatching and landing builds, commenting
+upstream. What it *may* do is governed by a nine-capability **charter**
+(each `off` / `shadow` / `live`, human-writable only), enforced server-side
+and regenerated into its prompt every turn. The charter is a kill switch,
+not a promotion ladder: everything ships live, and the ledger is the safety
+mechanism.
+
+GitHub stays at the edges. Issues in, PRs out, nothing GitHub owns is ever
+cached — mergeability, CI, open/closed are queried at decision time.
+
+## The pieces
+
+| | |
+| --- | --- |
+| `crates/tasks` | the server: SQLite store, GitHub polling, dispatchers, HTTP API + SSE, orchestrator loop |
+| `crates/tasks-api` | wire types shared by server and clients |
+| `crates/tasks-protocol` | Scout/Builder command protocol |
+| `crates/scout-supervisor` | PID 1 inside agent VMs: clone, run the agent, stream results back |
+| `crates/vm-pool` | vendored VM infrastructure (apple/container); app-agnostic, independently publishable |
+| `images/` | the Scout/Builder container images |
+| `app-gpui` | native Mac app: three-pane workspace — task queue rail, tabbed task view (overview, brief, live agent feed, changes), always-on orchestrator chat |
+
+## Running it
+
+Requires macOS with [apple/container](https://github.com/apple/container),
+Rust (edition 2024), and a `GITHUB_TOKEN`.
+
+```sh
+make images                            # build the Scout/Builder VM images (once, and after supervisor changes)
+tasks vm-pool &                        # the VM pool, a separate long-lived daemon
+make serve                             # the server, in this terminal
+cargo run -p tasks -- add-project owner/repo
+```
+
+The server boots **paused**: intake and the API run, nothing dispatches.
+Flip to `play` (from the app, or `POST /mode`) and the pipeline starts
+pulling queued work. Bulk intake never auto-dispatches — adding a repo with
+10,000 issues creates 10,000 backlog rows and zero VM runs; only explicitly
+queued tasks reach a Scout.
+
+Day to day:
+
+```sh
+make restart      # upgrade a running server in place (drain, swap, verify)
+make status
+make test         # ~565 tests, real processes and real SQLite, no mocks
+```
+
+The app (`app-gpui`, built separately — `cd app-gpui && cargo run`) is where
+the loop closes: watch a Scout's live Claude Code stream, read its spec,
+approve it, and talk to the orchestrator about why it did what it did.
+
+## Reading further
+
+- `CLAUDE.md` — the load-bearing design rules, with the reasoning attached
+- `docs/plans/` — implementation plans, including the v2 architecture and
+  the v3 UI spec
+- `crates/vm-pool/CLAUDE.md` — vm-pool's own conventions
