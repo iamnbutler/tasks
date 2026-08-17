@@ -711,9 +711,10 @@ entry loses to, so *removing* a variable from a child's environment is exactly
 what promotes the file that defines it — and `.env` is gitignored, so a
 maintainer with `TASKS_DEFAULT_MODE=play` in one fails a restart suite on their
 machine and nowhere else. `TASKS_ENV_FILES=off` is the switch for that:
-`crates/tasks/tests/reload.rs` is the only file that execs the binary (so it is
-the whole blast radius), and any future one needs the same three settings. The
-test that pins it carries a **control** — it first boots with the switch removed
+`crates/tasks/tests/reload.rs` and `crates/tasks/tests/cli.rs` are the only
+files that exec the binary (so they are the whole blast radius), and any future
+one needs the same settings. The
+test that pins it carries a **control** — it first boots with the switch off
 and asserts the `.env` really does decide the mode, then boots with it and
 asserts it does not. Without that half the assertion is vacuous. A value that is
 neither `on` nor `off` (including one that is not UTF-8) refuses to start rather
@@ -745,7 +746,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
-| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket |
+| `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `GITHUB_TOKEN` | — | required for polling; also used for clones |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
