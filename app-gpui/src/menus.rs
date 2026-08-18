@@ -390,6 +390,7 @@ mod tests {
                 "workspace::SetModePlay",
                 "workspace::SetModePause",
                 "workspace::SetModeStop",
+                "workspace::KillAllContainers",
                 "tasks::RevealServeLog",
                 "tasks::OpenDataDirectory",
             ]

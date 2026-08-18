@@ -339,6 +339,18 @@ pub struct CancelAck {
     pub note: String,
 }
 
+/// The answer to `POST /runs/cancel-all`: one [`CancelAck`] per run that was
+/// asked to stop, and a one-line summary.
+///
+/// An empty `runs` with a note is a real answer, not a failure — either
+/// nothing was running, or the capability is shadowed and the decisions were
+/// recorded without being applied. The note says which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAllResponse {
+    pub runs: Vec<CancelAck>,
+    pub note: String,
+}
+
 /// A build with its batch, in position order — the shape of
 /// `GET /builds/{id}` and the `POST /builds` acknowledgement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -415,6 +427,26 @@ pub struct ServerStatus {
     /// router with no dispatchers is not holding anything back either way.
     #[serde(default)]
     pub github: Option<GitHubHold>,
+    /// Set while an upgrade is half-applied — a newer server binary on disk
+    /// awaiting `make restart`, or a VM image observed running a build older
+    /// than this server's, awaiting `make images`. While set (and enforced),
+    /// no new scout or build starts; in-flight work runs to completion and
+    /// queued work stays queued. `#[serde(default)]` for the same reload-skew
+    /// reason as the fields above.
+    #[serde(default)]
+    pub update: Option<UpdatePending>,
+}
+
+/// Why new containers are waiting: an upgrade is half-applied.
+///
+/// Each reason names its own discharge (`make restart` / `make images`),
+/// because the reader's next question is always "what do I run".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePending {
+    pub reasons: Vec<String>,
+    /// Whether the hold is binding dispatch, or merely being reported
+    /// (`TASKS_UPDATE_HOLD=off`).
+    pub enforced: bool,
 }
 
 /// Why the pipeline is idle when GitHub is not answering.

@@ -844,6 +844,7 @@ pub fn render_status(
             out.push_str(&format!("binary   {}\n", file.exe.display()));
             out.push_str(&format!("mode     {}\n", status.mode.as_str()));
             out.push_str(&render_github_hold(status, now));
+            out.push_str(&render_update_pending(status));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -874,6 +875,27 @@ pub fn render_github_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
         humanize(now - hold.last_seen),
         hold.error
     )
+}
+
+/// Why the pipeline is idle, when the reason is a half-applied upgrade.
+///
+/// Silent with nothing pending, for the same reason as the GitHub line. Each
+/// reason already names its own discharge (`make restart` / `make images`),
+/// so this renders them verbatim rather than summarizing them into a verdict
+/// the reader then has to translate back into a command.
+pub fn render_update_pending(status: &ServerStatus) -> String {
+    let Some(update) = &status.update else {
+        return String::new();
+    };
+    let effect = match update.enforced {
+        true => "new scouts and builds wait until it is applied",
+        false => "reported only — TASKS_UPDATE_HOLD=off",
+    };
+    let mut out = format!("update   pending ({effect})\n");
+    for reason in &update.reasons {
+        out.push_str(&format!("         {reason}\n"));
+    }
+    out
 }
 
 /// What the VM images are running, and whether that is a problem.
@@ -1031,6 +1053,7 @@ mod tests {
             in_flight,
             images: Vec::new(),
             github: None,
+            update: None,
         }
     }
 

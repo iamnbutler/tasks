@@ -28,11 +28,12 @@ use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 use tasks_api::http::{
-    AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest,
-    CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject, EditIssueRequest, ErrorResponse,
-    GitHubHold, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest,
-    ReorderQueue, ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage,
-    ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
+    AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
+    CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
+    EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
+    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
+    ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
+    SetProjectStatus, ShadowAck,
 };
 
 use crate::bundles::RejectedBundles;
@@ -169,6 +170,9 @@ pub struct Services {
     /// no hold — honest, because a router with nothing to dispatch is not
     /// holding anything back.
     pub github_health: Option<Arc<GitHubHealth>>,
+    /// The update watch the two dispatchers consult. Absent for the same
+    /// reason as `github_health`: a router with no dispatchers holds nothing.
+    pub updates: Option<Arc<crate::updates::UpdateWatch>>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -199,6 +203,12 @@ impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
 impl FromRef<AppState> for Option<Arc<GitHubHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.github_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.updates.clone()
     }
 }
 
@@ -258,6 +268,7 @@ pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
         .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
         .route("/builds/{build_id}/cancel", post(cancel_build))
+        .route("/runs/cancel-all", post(cancel_all_runs))
         .route(
             "/builds/{build_id}/bundle",
             get(get_build_bundle).delete(delete_build_bundle),
@@ -1759,7 +1770,8 @@ async fn cancel_run(
             .await?;
     }
 
-    let (concluded, status) = settle(store, kind, id).await?;
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
+    let (concluded, status) = settle(store, kind, id, deadline).await?;
     let note = match concluded {
         true => format!("the {} stopped: it is now {status}", kind.noun()),
         // Deliberately not "teardown is underway": the other way to be here is
@@ -1782,13 +1794,153 @@ async fn cancel_run(
     .into_response())
 }
 
-/// Poll the run for up to [`CANCEL_SETTLE`], and report where it got to.
+/// `POST /runs/cancel-all` — stop everything that currently holds a VM.
+///
+/// "All" is precisely the set with a container: `running` sessions and
+/// `running` builds, read from the same query `/status` reports in-flight
+/// work from. A `queued` build deliberately survives — it holds no VM, it is
+/// durable intent, and killing containers must not quietly rewrite the queue.
+/// (Pause the mode first if the point is that nothing further starts.)
+///
+/// Semantically this is N single cancels and it is authorized and recorded as
+/// exactly that: one capability check, then one ledger row and one durable
+/// cancellation request per run, through the same writes `cancel_run` makes —
+/// so each run's `exit_reason` names the actor and rationale individually,
+/// and the audit trail does not have a special bulk shape to learn.
+async fn cancel_all_runs(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let actor = actor_of(&store, &headers)?;
+
+    let in_flight = store.in_flight().await?;
+    let targets: Vec<(RunKind, String)> = in_flight
+        .scouts
+        .iter()
+        .map(|item| (RunKind::Session, item.id.clone()))
+        .chain(
+            in_flight
+                .builds
+                .iter()
+                .map(|item| (RunKind::Build, item.id.clone())),
+        )
+        .collect();
+    if targets.is_empty() {
+        return Ok(Json(CancelAllResponse {
+            runs: Vec::new(),
+            note: "nothing is running — no containers to kill".to_string(),
+        })
+        .into_response());
+    }
+
+    let shadowed = authorize(
+        &store,
+        actor,
+        Capability::CancelRuns,
+        DecisionAction::CancelRun,
+    )
+    .await?
+        == Authority::Shadow;
+
+    let mut issued: Vec<(RunKind, String, i64)> = Vec::with_capacity(targets.len());
+    for (kind, id) in &targets {
+        let decision = DecisionInput {
+            actor,
+            rationale: body.rationale.clone(),
+            evidence: body.evidence.clone(),
+        };
+        let decision_seq = store
+            .record_decision(
+                kind.as_str(),
+                id,
+                DecisionAction::CancelRun,
+                decision,
+                !shadowed,
+            )
+            .await?;
+        if shadowed {
+            continue;
+        }
+        store
+            .request_cancel(
+                *kind,
+                id,
+                actor,
+                body.rationale.as_deref(),
+                Some(decision_seq),
+            )
+            .await?;
+        store
+            .append_event(EventPayload::RunCancelRequested {
+                run_kind: *kind,
+                run_id: id.clone(),
+                actor,
+                decision_seq: Some(decision_seq),
+            })
+            .await?;
+        info!(%kind, run_id = id.as_str(), actor = actor.as_str(), "cancel requested (cancel-all)");
+        issued.push((*kind, id.clone(), decision_seq));
+    }
+
+    if shadowed {
+        return Ok(Json(CancelAllResponse {
+            runs: Vec::new(),
+            note: format!(
+                "shadowed: {} run(s) would have been cancelled; the decisions are recorded \
+                 and nothing was applied",
+                targets.len()
+            ),
+        })
+        .into_response());
+    }
+
+    // One settle window over the whole set: the drains tear down
+    // concurrently, so the first run's wait overlaps the rest.
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
+    let mut runs = Vec::with_capacity(issued.len());
+    for (kind, id, decision_seq) in issued {
+        let (concluded, status) = settle(&store, kind, &id, deadline).await?;
+        let note = match concluded {
+            true => format!("the {} stopped: it is now {status}", kind.noun()),
+            false => format!(
+                "the cancel is recorded and the {} is still {status}; whoever is \
+                 following the run concludes it",
+                kind.noun()
+            ),
+        };
+        runs.push(CancelAck {
+            run_kind: kind,
+            run_id: id,
+            concluded,
+            status,
+            decision_seq,
+            note,
+        });
+    }
+    let concluded = runs.iter().filter(|ack| ack.concluded).count();
+    let note = format!(
+        "{} run(s) asked to stop; {concluded} concluded before this answered",
+        runs.len()
+    );
+    Ok(Json(CancelAllResponse { runs, note }).into_response())
+}
+
+/// Poll the run until `deadline`, and report where it got to.
 ///
 /// Polling rather than waiting on the event stream because the run may be
 /// concluded by a *different* process (one that reattached to it), whose
-/// terminal write this server only sees in the database.
-async fn settle(store: &Store, kind: RunKind, id: &str) -> ApiResult<(bool, String)> {
-    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
+/// terminal write this server only sees in the database. The deadline is the
+/// caller's so that a bulk cancel can settle its whole set inside one
+/// [`CANCEL_SETTLE`] window — the teardowns run concurrently, so waiting a
+/// fresh window per run would charge serially for work that isn't.
+async fn settle(
+    store: &Store,
+    kind: RunKind,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> ApiResult<(bool, String)> {
     loop {
         let (concluded, status) = match kind {
             RunKind::Session => {
@@ -2461,7 +2613,14 @@ async fn stream_orchestrator(
 async fn get_status(
     State(store): State<Arc<Store>>,
     State(github_health): State<Option<Arc<GitHubHealth>>>,
+    State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
 ) -> ApiResult<Json<ServerStatus>> {
+    // Through the same watch the dispatchers consult, so `/status` cannot
+    // claim a hold they are not honouring.
+    let update = match updates {
+        Some(watch) => watch.pending(&store).await,
+        None => None,
+    };
     Ok(Json(ServerStatus {
         pid: std::process::id(),
         started_at: serving_since(),
@@ -2483,6 +2642,7 @@ async fn get_status(
                 failures: outage.failures,
                 error: outage.error,
             }),
+        update,
     }))
 }
 

@@ -518,6 +518,31 @@ implementation.
   trained out of use. `make images-check` covers the one window observation
   cannot — right after a rebuild, before anything has run — and `make images`
   ends by invoking it.
+- **While an update is pending, new containers wait — observing a gap and
+  walking into it must not be the same behaviour.** An upgrade is three acts
+  (`cargo build`, `make images`, `tasks reload`) and the gaps between them are
+  where work dispatches into the stale half. `crate::updates::UpdateWatch`
+  holds *new* dispatch — the scout top-up and the build claim, the only two
+  places a container starts — when either of the two skews observable from
+  inside the process is present: a server binary at `current_exe` with an
+  mtime after boot (discharge: `make restart`), or an image identity observed
+  **since this process booted** whose `ImageFreshness::needs_rebuild()` holds
+  against this server's stamp (discharge: `make images`, then `make restart`).
+  Both halves of "observed" are load-bearing, and both are the no-wedge rule:
+  **absence of evidence never holds** — the run that would observe a rebuilt
+  image is the run the hold would prevent, so "none observed yet" dispatches —
+  and a *pre-boot* observation is stale data, not evidence, because every
+  image reads `behind` the moment a newer server starts, the record only moves
+  when a run moves it, and a rebuild does not touch it; holding on it would be
+  a gate only the gate itself keeps closed. The bounded cost is that after an
+  upgrade one run may start in a genuinely stale image — it reports the fact
+  and closes the gate behind itself. In-flight
+  work runs on, queued work stays queued, nothing is charged an attempt; the
+  transition is announced once by the watch and `/status`/`tasks status`
+  carry the standing answer with each reason naming its own discharge.
+  `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate; anything else
+  non-`on` refuses to boot. The hold sits beside `github_hold` at the same two
+  gates, ahead of the claim, for the same claim-then-refuse reason.
 
 ## Project structure
 
@@ -1033,3 +1058,4 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
 | `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else. Shared and long-lived — the warmth is the value; expect ~7.5 GB and nothing prunes it. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
+| `TASKS_UPDATE_HOLD` | `on` | whether new scouts and builds wait while an update is pending — a newer server binary on disk awaiting `make restart`, or a VM image observed running a build older than this server's awaiting `make images`. `off` keeps the `/status` report and drops the gate; anything else refuses to boot |

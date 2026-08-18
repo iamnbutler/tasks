@@ -791,3 +791,118 @@ async fn three_cancelled_builds_do_not_block_a_spec() {
         "one strike out of three is not blocked"
     );
 }
+
+/// `POST /runs/cancel-all` is N single cancels over exactly the set that
+/// holds a VM: every `running` session and `running` build gets its own
+/// decision row and durable request, and a `queued` build — durable intent,
+/// no container — survives untouched.
+#[tokio::test]
+async fn cancel_all_stops_the_running_set_and_leaves_the_queue_alone() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let api = Api::spawn(store.clone()).await;
+
+    // Nothing running: a real answer, not an error, and nothing recorded.
+    let (status, body) = api.cancel("/runs/cancel-all", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["runs"].as_array().unwrap().len(), 0, "{body}");
+    assert!(
+        body["note"]
+            .as_str()
+            .unwrap()
+            .contains("nothing is running"),
+        "{body}"
+    );
+
+    // One running scout, one claimed (running) build, one queued build — the
+    // queued one on a second project only because a task's issue number is
+    // unique per project. The scout session rides the seeded task: `in_flight`
+    // selects on the session row's own status, so the task needs no second
+    // state to make the session count.
+    let project = insert_project(&store).await;
+    let (task_a, spec_a) = seed_approved(&store, &project).await;
+    let session = Session {
+        id: SessionId::new(),
+        task_id: task_a.id.clone(),
+        vm_id: Some("vm-scout".into()),
+        branch: "scout/x".into(),
+        status: SessionStatus::Running,
+        started_at: Utc::now(),
+        completed_at: None,
+        exit_reason: None,
+        usage: None,
+        directions: None,
+    };
+    store.insert_session(&session).await.unwrap();
+
+    let running_build = store
+        .create_build(
+            std::slice::from_ref(&spec_a.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store.claim_next_queued_build().await.unwrap().unwrap();
+
+    let project_b = Project {
+        id: ProjectId::new(),
+        repo_owner: "test".into(),
+        repo_name: "other-repo".into(),
+        added_at: Utc::now(),
+        status: ProjectStatus::Active,
+    };
+    store.insert_project(&project_b).await.unwrap();
+    let (_task_b, spec_b) = seed_approved(&store, &project_b).await;
+    let queued_build = store
+        .create_build(
+            std::slice::from_ref(&spec_b.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = api
+        .cancel(
+            "/runs/cancel-all",
+            json!({ "rationale": "clearing the deck" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "the queued build is not a run: {body}");
+
+    // Each run got the full single-cancel treatment: a ledger row and a
+    // durable request carrying the shared rationale.
+    for (kind, id) in [
+        (RunKind::Session, session.id.as_str().to_string()),
+        (RunKind::Build, running_build.id.as_str().to_string()),
+    ] {
+        let request = store
+            .pending_cancel(kind, &id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no cancel request for {kind} {id}"));
+        assert_eq!(request.rationale.as_deref(), Some("clearing the deck"));
+        assert!(
+            !store
+                .decisions(Some((kind.as_str(), &id)), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no decision row for {kind} {id}"
+        );
+    }
+
+    // The queued build holds no container and must survive exactly as it was.
+    let untouched = store.get_build(&queued_build.id).await.unwrap().unwrap();
+    assert_eq!(untouched.status, BuildStatus::Queued);
+    assert!(
+        store
+            .pending_cancel(RunKind::Build, queued_build.id.as_str())
+            .await
+            .unwrap()
+            .is_none(),
+        "a queued build gets no cancel request from cancel-all"
+    );
+}

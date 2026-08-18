@@ -23,8 +23,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelRunRequest, CaptureIssue,
-    CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
+    BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse, CancelRunRequest,
+    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
     ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
     ServerStatus, SetCharter, SetMode, SetProjectStatus,
 };
@@ -452,6 +452,21 @@ impl Client {
     pub fn cancel_session(&self, id: &SessionId, rationale: Option<String>) -> Result<CancelAck> {
         self.post_json(
             &format!("/sessions/{id}/cancel"),
+            &CancelRunRequest {
+                rationale,
+                evidence: None,
+            },
+        )
+    }
+
+    /// Cancel everything that currently holds a VM — every `running` session
+    /// and `running` build — through the same per-run writes as the two
+    /// single cancels, so each run's `exit_reason` carries the rationale
+    /// individually. Queued builds survive: they hold no container, and
+    /// killing containers must not rewrite the queue.
+    pub fn cancel_all_runs(&self, rationale: Option<String>) -> Result<CancelAllResponse> {
+        self.post_json(
+            "/runs/cancel-all",
             &CancelRunRequest {
                 rationale,
                 evidence: None,
