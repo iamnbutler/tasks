@@ -79,8 +79,10 @@ ENV PATH="/home/agent/.cargo/bin:${PATH}"
 ENV CARGO_BUILD_JOBS=1
 
 # Headless agent invocation. The prompt arrives on stdin; SPEC.md is the
-# artifact. Credentials (ANTHROPIC_API_KEY) are injected per-VM, never baked
-# into the image.
+# artifact. Credentials are injected per-VM, never baked into the image — and
+# since #971 what is injected is a run lease, not a key: ANTHROPIC_API_KEY
+# holds a short-lived token and ANTHROPIC_BASE_URL points at the host's
+# credential broker, which swaps it for the real key per request.
 # stream-json turns stdout into typed JSON-lines (assistant messages, thinking,
 # tool calls with inputs, tool results, and a final result record with usage and
 # cost) which the server persists as the session transcript. --verbose is

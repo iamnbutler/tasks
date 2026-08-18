@@ -320,7 +320,7 @@ impl Orchestrator {
         // stale file is useless. An agent that cannot identify itself must
         // not run at all — an unattributed write is recorded as the human's,
         // which is the charter going silently unenforced.
-        write_curl_config(&self.config.curl_config, self.store.actor_token())
+        write_curl_config(&self.config.curl_config, self.store.actor_token().expose())
             .await
             .map_err(|source| OrchestratorError::ActorConfig {
                 path: self.config.curl_config.display().to_string(),

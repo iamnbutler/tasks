@@ -357,9 +357,21 @@ impl Landing {
     }
 }
 
+/// Where the client's bearer token comes from at request time.
+///
+/// `Live` reads **through** [`crate::secrets::Secrets`] on every request, so
+/// `tasks secrets set github-token` rotates a running server's API calls
+/// with nothing restarted — including the `Arc<GitHubClient>`s the server
+/// and the Builder hold for their whole lifetime. `Fixed` is the test path
+/// and any caller that already resolved a token.
+enum TokenSource {
+    Fixed(crate::redact::Secret),
+    Live(crate::secrets::Secrets),
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
-    token: String,
+    token: TokenSource,
     base_url: String,
     rest_base_url: String,
 }
@@ -370,15 +382,46 @@ impl GitHubClient {
     }
 
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::with_source(
+            TokenSource::Fixed(crate::redact::Secret::new(token.into())),
+            base_url,
+        )
+    }
+
+    /// A client whose token is read live from the sealed store (with its env
+    /// fallback) at every request. `api_url` overrides the GraphQL endpoint.
+    pub fn from_secrets(secrets: crate::secrets::Secrets, api_url: Option<&str>) -> Self {
+        Self::with_source(
+            TokenSource::Live(secrets),
+            api_url
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+        )
+    }
+
+    fn with_source(token: TokenSource, base_url: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent("tasks/0.1")
             .build()
             .expect("reqwest client");
         Self {
             http,
-            token: token.into(),
+            token,
             base_url: base_url.into(),
             rest_base_url: DEFAULT_REST_BASE_URL.into(),
+        }
+    }
+
+    /// The bearer token as of *now*. An empty value (a live source whose
+    /// token was removed mid-flight) authenticates as nothing and fails
+    /// upstream exactly as an expired token would — the caller's error
+    /// handling is already shaped for that.
+    fn token(&self) -> crate::redact::Secret {
+        match &self.token {
+            TokenSource::Fixed(secret) => secret.clone(),
+            TokenSource::Live(secrets) => secrets
+                .github_token()
+                .unwrap_or_else(|| crate::redact::Secret::new("")),
         }
     }
 
@@ -409,7 +452,7 @@ impl GitHubClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({
                 "title": title,
@@ -444,7 +487,7 @@ impl GitHubClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({
                 "title": title,
@@ -485,7 +528,7 @@ impl GitHubClient {
         let resp = self
             .http
             .patch(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({
                 "state": "closed",
@@ -515,7 +558,7 @@ impl GitHubClient {
         let resp = self
             .http
             .patch(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({ "state": "open" }))
             .send()
@@ -548,7 +591,7 @@ impl GitHubClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({ "body": body }))
             .send()
@@ -570,7 +613,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -615,7 +658,7 @@ impl GitHubClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({
                 "body": body,
@@ -650,7 +693,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -697,7 +740,7 @@ impl GitHubClient {
         let resp = self
             .http
             .patch(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::Value::Object(payload))
             .send()
@@ -726,7 +769,7 @@ impl GitHubClient {
         let resp = self
             .http
             .put(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({ "labels": labels }))
             .send()
@@ -752,7 +795,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -794,7 +837,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -847,7 +890,7 @@ impl GitHubClient {
             .http
             .get(&url)
             .query(&[("q", query.as_str()), ("per_page", "20")])
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -899,7 +942,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -939,7 +982,7 @@ impl GitHubClient {
         let resp = self
             .http
             .put(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&payload)
             .send()
@@ -967,7 +1010,7 @@ impl GitHubClient {
         let resp = self
             .http
             .patch(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({ "state": "closed" }))
             .send()
@@ -1024,7 +1067,7 @@ impl GitHubClient {
             let resp: serde_json::Value = self
                 .http
                 .post(&self.base_url)
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token().expose())
                 .header("Accept", "application/json")
                 .json(&body)
                 .send()
@@ -1098,7 +1141,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -1166,7 +1209,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -1203,7 +1246,7 @@ impl GitHubClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/vnd.github+json")
             .send()
             .await?;
@@ -1264,7 +1307,7 @@ impl GitHubClient {
         let resp = self
             .http
             .post(&self.base_url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token().expose())
             .header("Accept", "application/json")
             .json(&req_body)
             .send()

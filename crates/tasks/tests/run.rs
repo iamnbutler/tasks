@@ -206,7 +206,7 @@ async fn a_failing_poll_holds_dispatch_announces_once_and_releases_on_recovery()
     store.set_mode(Mode::Play).await.unwrap();
 
     let mut config = test_config(Path::new("/nonexistent"), Path::new("/nonexistent"), 1);
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
     config.github_api_url = Some(github_url);
     config.poll_interval = Duration::from_millis(50);
 
@@ -347,7 +347,7 @@ async fn a_github_hold_never_claims_a_build() {
     // An unconfigured lane disables itself, and this test would then pass for
     // the wrong reason. The budget is short because the release half really
     // dispatches, and `build_loop` awaits a build inline.
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
     config.builder_timeout = Duration::from_secs(10);
 
     let health = Arc::new(GitHubHealth::default());
@@ -963,7 +963,7 @@ async fn poll_loop_honours_the_configured_intake_label() {
     store.set_mode(Mode::Play).await.unwrap();
 
     let mut config = test_config(Path::new("/nonexistent"), Path::new("/nonexistent"), 1);
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
     config.github_api_url = Some(github_url);
     config.poll_interval = Duration::from_millis(50);
     config.intake = IntakeFilter::from_label(Some("tasks".into()));
@@ -1005,7 +1005,7 @@ async fn poll_loop_skips_polling_while_stopped() {
     store.set_mode(Mode::Stop).await.unwrap();
 
     let mut config = test_config(Path::new("/nonexistent"), Path::new("/nonexistent"), 1);
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
     config.github_api_url = Some(github_url);
     config.poll_interval = Duration::from_millis(50);
 
@@ -1087,7 +1087,14 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         scout_image: "agent:v1".into(),
         scout_timeout: Duration::from_secs(300),
         vm_pool_socket: vm_pool_socket.to_path_buf(),
-        github_token: None,
+        secrets: tasks::secrets::Secrets::for_tests(None, None),
+        broker: tasks::broker::BrokerConfig {
+            port: 4801,
+            bind: "127.0.0.1".into(),
+            advertise_host: "127.0.0.1".into(),
+            anthropic_upstream: "http://127.0.0.1:9".into(),
+            git_upstream: "https://github.com".into(),
+        },
         github_api_url: None,
         intake: IntakeFilter::All,
         clone_url_base: format!("file://{}", clone_root.display()),

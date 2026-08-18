@@ -49,6 +49,10 @@ sqlx = { version = "0.8", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    # The broker streams request and response bodies through unbuffered
+    # (`wrap_stream` / `bytes_stream`) — an Anthropic SSE response must not
+    # be collected before it is forwarded.
+    "stream",
 ] }
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -60,6 +64,16 @@ base64 = "0.22"
 ureq = { version = "2", default-features = false, features = ["json"] }
 
 dirs = "6"
+
+# Credential custody (docs/plans/2026-08-18-credential-custody.md): the sealed
+# secret store is ChaCha20-Poly1305 under an HKDF-derived key, lease tokens
+# are random bytes stored as SHA-256 hashes, and every raw value in memory is
+# zeroized on drop. RustCrypto crates, pure Rust.
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+rand = "0.8"
 
 # vm-pool (vendored infrastructure — these crates must never depend on
 # tasks crates; app vocabulary enters only through the AppProtocol generic)

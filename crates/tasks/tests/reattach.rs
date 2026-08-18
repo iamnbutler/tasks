@@ -59,7 +59,14 @@ fn test_config(vm_pool_socket: &Path, data_dir: &Path, clone_root: &Path) -> Con
         scout_image: "agent:v1".into(),
         scout_timeout: Duration::from_secs(300),
         vm_pool_socket: vm_pool_socket.to_path_buf(),
-        github_token: None,
+        secrets: tasks::secrets::Secrets::for_tests(None, None),
+        broker: tasks::broker::BrokerConfig {
+            port: 4801,
+            bind: "127.0.0.1".into(),
+            advertise_host: "127.0.0.1".into(),
+            anthropic_upstream: "http://127.0.0.1:9".into(),
+            git_upstream: "https://github.com".into(),
+        },
         github_api_url: None,
         intake: IntakeFilter::All,
         clone_url_base: format!("file://{}", clone_root.display()),
@@ -223,10 +230,14 @@ async fn a_restart_reattaches_to_a_scout_instead_of_orphaning_it() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: format!("file://{}", clone_root.join("test/repo.git").display()),
+        source: tasks::broker::CloneSource::Direct(format!(
+            "file://{}",
+            clone_root.join("test/repo.git").display()
+        )),
         base_branch: "main".into(),
     };
     let task_for_dispatch = task.clone();
@@ -390,7 +401,7 @@ async fn a_restart_reattaches_to_a_build_and_still_lands_the_branch() {
 
     let db = tmp.path().join("tasks.db");
     let mut config = test_config(&socket, tmp.path(), &clone_root);
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
     config.github_api_url = Some("http://unused.invalid/graphql".into());
     config.github_rest_api_url = Some(rest_url);
 
@@ -420,12 +431,17 @@ async fn a_restart_reattaches_to_a_build_and_still_lands_the_branch() {
             image: "builder:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
             scratch_root: tmp.path().join("scratch"),
         },
     );
     let repo_url = format!("file://{}", clone_root.join("test/repo.git").display());
     let url = repo_url.clone();
-    let dispatch = tokio::spawn(async move { builder.dispatch(claimed, &url).await });
+    let dispatch = tokio::spawn(async move {
+        builder
+            .dispatch(claimed, &tasks::broker::CloneSource::Direct(url))
+            .await
+    });
 
     wait_for_file(&gate.with_file_name("build-gate.started")).await;
     let vm_id = VmId::new(
@@ -577,7 +593,7 @@ async fn a_build_whose_vm_is_gone_fails_without_wedging_the_queue() {
         .unwrap();
     let (_pool, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
     let mut config = test_config(&socket, tmp.path(), &tmp.path().join("repos"));
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
 
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let project = insert_project(&store).await;
@@ -719,7 +735,7 @@ async fn a_vm_pool_that_predates_attach_falls_back_to_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     let (socket, commands) = spawn_pre_attach_vm_pool(tmp.path()).await;
     let mut config = test_config(&socket, tmp.path(), &tmp.path().join("repos"));
-    config.github_token = Some("token".into());
+    config.secrets = tasks::secrets::Secrets::for_tests(Some("token"), None);
 
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let project = insert_project(&store).await;

@@ -35,6 +35,10 @@ usage:
                                 dispatch until `tasks resume`
   tasks resume                  release that hold: dispatch plays again
   tasks add-project <owner/repo>  track a GitHub repository
+  tasks secrets <subcommand>    custody of the upstream credentials: seal
+                                ANTHROPIC_API_KEY / GITHUB_TOKEN under the
+                                data dir so no raw key lives in .env, the
+                                environment, or a VM (see `tasks secrets -h`)
   tasks vm-pool                 run the vm-pool service specialized for
                                 scouts (ContainerRuntime + TasksProtocol)
                                 on VM_POOL_SOCKET
@@ -102,9 +106,17 @@ above the cwd, then the nearest above this binary; the real environment wins):
   VM_POOL_MAX_VMS        VMs `tasks vm-pool` holds at once (default 6). Read
                          by the pool, not by the server, so changing it means
                          restarting the pool
-  GITHUB_TOKEN           required for polling; also used for repo clones
+  GITHUB_TOKEN           fallback for `tasks secrets set github-token`; needed
+                         for polling and clones. Prefer the sealed store —
+                         a raw token in .env is what #971 rotated away from
   GITHUB_API_URL         GraphQL endpoint override
-  GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com)
+  GITHUB_CLONE_URL_BASE  clone URL prefix (default https://github.com); also
+                         where the credential broker forwards git traffic
+  TASKS_BROKER_PORT      credential broker port (default 4801) — where VMs
+                         redeem their run leases; see `tasks secrets -h`
+  TASKS_BROKER_ADVERTISE broker address as VMs see it (default 192.168.64.1,
+                         apple/container's bridge gateway)
+  TASKS_SECRETS_KEY_FILE unseal-key file overriding the Keychain (Linux/tests)
 ";
 
 // Per-subcommand usage. The top-level `USAGE` answers "what commands are
@@ -220,6 +232,33 @@ are never dispatched until something queues them explicitly.
 Removal is archive, never delete: POST /projects/{id}/status.
 ";
 
+const SECRETS_USAGE: &str = "\
+usage: tasks secrets <init|set|status|rm> [args]
+
+Custody of the two upstream credentials (docs/plans/2026-08-18-credential-custody.md):
+raw keys live ChaCha20-Poly1305-sealed under <data dir>/secrets/, the unseal
+key lives in the macOS Keychain (or a file), and what VMs receive at dispatch
+is a short-lived, repo-bound lease the in-process broker redeems per request.
+Neither artifact alone — data dir or Keychain — decrypts anything.
+
+  tasks secrets init [--key-file PATH]
+        create the store: generate the unseal key into the Keychain (service
+        tasks-v2-secrets) or into --key-file (mandatory off macOS). Refuses
+        to overwrite an existing store.
+  tasks secrets set <anthropic-api-key|github-token>
+        seal a value, read from STDIN (never argv — argv is readable in
+        `ps`). Pipe it, or paste and press ctrl-D. A running server picks
+        the change up on its next read: rotation needs no restart.
+  tasks secrets status
+        what is sealed and when it was set — names and timestamps, never
+        values. Works without the unseal key.
+  tasks secrets rm <name>
+        remove one entry; the environment fallback (if any) applies again.
+
+The environment variables keep working as fallbacks, warned at startup: the
+sealed store is where production keys should live.
+";
+
 const VM_POOL_USAGE: &str = "\
 usage: tasks vm-pool
 
@@ -267,6 +306,7 @@ fn usage_for(command: &str) -> &'static str {
         "drain" => DRAIN_USAGE,
         "resume" => RESUME_USAGE,
         "add-project" => ADD_PROJECT_USAGE,
+        "secrets" => SECRETS_USAGE,
         "vm-pool" => VM_POOL_USAGE,
         _ => USAGE,
     }
@@ -322,6 +362,7 @@ async fn dispatch() -> Result<()> {
         Some("drain") => drain_cmd(&args[1..]).await,
         Some("resume") => resume_cmd(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
+        Some("secrets") => secrets_cmd(&args[1..]),
         Some("vm-pool") => vm_pool(&args[1..]).await,
         Some("-h") | Some("--help") | Some("help") | None => {
             print!("{USAGE}");
@@ -639,4 +680,118 @@ async fn add_project(args: &[String]) -> Result<()> {
 
 async fn open_store() -> Result<Store> {
     Ok(run::open_store(&run::data_dir()?).await?)
+}
+
+/// `tasks secrets <init|set|status|rm>` — the sealed store's CLI. Synchronous
+/// on purpose: everything here is local file and Keychain work, and none of
+/// it should ever touch the server, the store, or the network.
+fn secrets_cmd(args: &[String]) -> Result<()> {
+    use tasks::secrets::{self, SecretName};
+
+    let data_dir = run::data_dir()?;
+    match args.first().map(String::as_str) {
+        Some("init") => {
+            let mut key_file = None;
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--key-file" => {
+                        key_file = Some(PathBuf::from(
+                            rest.next().context("--key-file requires a path")?,
+                        ));
+                    }
+                    other => bail!("unexpected argument: {other}\n\n{SECRETS_USAGE}"),
+                }
+            }
+            let path = secrets::init(&data_dir, key_file.as_deref())?;
+            println!("sealed store created at {}", path.display());
+            match key_file {
+                Some(kf) => println!("unseal key written to {} (0600)", kf.display()),
+                None => println!("unseal key stored in the Keychain (service tasks-v2-secrets)"),
+            }
+            println!("next: tasks secrets set anthropic-api-key");
+            println!("      tasks secrets set github-token");
+            Ok(())
+        }
+        Some("set") => {
+            let name = parse_secret_name(args.get(1))?;
+            if let Some(extra) = args.get(2) {
+                bail!("unexpected argument: {extra}\n\n{SECRETS_USAGE}");
+            }
+            // STDIN, never argv: argv is readable in `ps` for as long as the
+            // process runs, and shells keep history.
+            use std::io::{IsTerminal, Read};
+            if std::io::stdin().is_terminal() {
+                eprintln!("paste the value for `{name}`, then press ctrl-D:");
+            }
+            let mut value = String::new();
+            std::io::stdin().read_to_string(&mut value)?;
+            let value = value.trim();
+            if value.is_empty() {
+                bail!("empty value; nothing sealed");
+            }
+            secrets::set(&data_dir, name, value)?;
+            println!(
+                "sealed `{name}` ({} chars); a running server picks this up on its next read",
+                value.len()
+            );
+            Ok(())
+        }
+        Some("status") => {
+            if let Some(extra) = args.get(1) {
+                bail!("unexpected argument: {extra}\n\n{SECRETS_USAGE}");
+            }
+            let status = secrets::status(&data_dir)?;
+            println!("store:      {}", status.path.display());
+            println!("unseal key: {}", status.key_source);
+            if status.entries.is_empty() {
+                println!("entries:    none — `tasks secrets set <name>`");
+            } else {
+                for entry in &status.entries {
+                    println!(
+                        "entries:    {} (set {})",
+                        entry.name,
+                        entry.set_at.format("%Y-%m-%d %H:%M UTC")
+                    );
+                }
+            }
+            for name in SecretName::ALL {
+                if std::env::var(name.env_var()).is_ok_and(|v| !v.is_empty()) {
+                    println!(
+                        "note:       {} is also set in the environment ({})",
+                        name.env_var(),
+                        if status.entries.iter().any(|e| e.name == name) {
+                            "the sealed value wins"
+                        } else {
+                            "currently the live value — seal it to retire the raw copy"
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("rm") => {
+            let name = parse_secret_name(args.get(1))?;
+            if let Some(extra) = args.get(2) {
+                bail!("unexpected argument: {extra}\n\n{SECRETS_USAGE}");
+            }
+            if tasks::secrets::remove(&data_dir, name)? {
+                println!("removed `{name}`");
+            } else {
+                println!("`{name}` was not set");
+            }
+            Ok(())
+        }
+        Some(other) => bail!("unknown secrets subcommand: {other}\n\n{SECRETS_USAGE}"),
+        None => {
+            print!("{SECRETS_USAGE}");
+            Ok(())
+        }
+    }
+}
+
+fn parse_secret_name(arg: Option<&String>) -> Result<tasks::secrets::SecretName> {
+    let raw = arg.context("which secret? (anthropic-api-key | github-token)")?;
+    tasks::secrets::SecretName::parse(raw)
+        .with_context(|| format!("unknown secret name `{raw}` (anthropic-api-key | github-token)"))
 }

@@ -82,7 +82,7 @@ impl Api {
             .post(format!("{}{path}", self.base))
             .header(
                 "X-Tasks-Actor",
-                format!("orchestrator {}", self.store.actor_token()),
+                format!("orchestrator {}", self.store.actor_token().expose()),
             )
             .json(&body)
             .send()
@@ -209,10 +209,11 @@ async fn a_cancelled_scout_concludes_and_returns_its_task_to_the_backlog() {
             // Far beyond the test's own patience: if this passes by timing out
             // it is not passing.
             timeout: Duration::from_secs(600),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: format!("file://{}", repo.display()),
+        source: tasks::broker::CloneSource::Direct(format!("file://{}", repo.display())),
         base_branch: "main".into(),
     };
     let dispatched = task.clone();
@@ -342,10 +343,11 @@ async fn a_cancelled_scout_keeps_its_salvage_and_stamps_the_reason() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(600),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: format!("file://{}", repo.display()),
+        source: tasks::broker::CloneSource::Direct(format!("file://{}", repo.display())),
         base_branch: "main".into(),
     };
     let dispatched = task.clone();
@@ -451,11 +453,16 @@ async fn a_cancelled_build_returns_its_specs_without_a_strike() {
             image: "builder:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(600),
+            leases: None,
             scratch_root: tmp.path().join("scratch"),
         },
     );
     let url = format!("file://{}", clone_root.join("test/repo.git").display());
-    let dispatch = tokio::spawn(async move { builder.dispatch(claimed, &url).await });
+    let dispatch = tokio::spawn(async move {
+        builder
+            .dispatch(claimed, &tasks::broker::CloneSource::Direct(url))
+            .await
+    });
 
     wait_for_file(&gate.with_file_name("build-gate.started")).await;
     let vm_id = VmId::new(

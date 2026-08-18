@@ -83,13 +83,14 @@ async fn a_scout_run_produces_a_queryable_transcript_and_usage() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let spec = scout
         .dispatch(
             task.clone(),
             &ScoutTarget {
-                repo_clone_url: repo_url,
+                source: tasks::broker::CloneSource::Direct(repo_url),
                 base_branch: "main".into(),
             },
         )
@@ -197,13 +198,14 @@ async fn the_transcript_is_complete_before_the_session_completes() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let spec = scout
         .dispatch(
             task.clone(),
             &ScoutTarget {
-                repo_clone_url: repo_url,
+                source: tasks::broker::CloneSource::Direct(repo_url),
                 base_branch: "main".into(),
             },
         )
@@ -271,13 +273,14 @@ async fn a_credential_echoed_by_the_agent_never_reaches_the_transcript() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let spec = scout
         .dispatch(
             task.clone(),
             &ScoutTarget {
-                repo_clone_url: repo_url,
+                source: tasks::broker::CloneSource::Direct(repo_url),
                 base_branch: "main".into(),
             },
         )

@@ -73,7 +73,6 @@ use crate::models::{
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::reattach;
-use crate::redact::Secret;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
 use crate::store::{ReconcileReport, ResumedWork, Store, StoreError, Strike};
@@ -128,6 +127,22 @@ const NUDGE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// means raising the pool's `vm_timeout` too.
 const DEFAULT_SCOUT_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_CLONE_URL_BASE: &str = "https://github.com";
+/// The credential broker's port (`TASKS_BROKER_PORT`). Beside the API's 4800,
+/// but a separate listener on purpose: the API stays loopback-only, and this
+/// one is reachable from the VM subnet.
+const DEFAULT_BROKER_PORT: u16 = 4801;
+/// The broker's bind address (`TASKS_BROKER_BIND`). All interfaces, because
+/// the address a VM reaches the host at (`bridge100`'s gateway) does not
+/// exist until the first container starts, so binding it directly would be a
+/// boot-order dependency on the container runtime. Every route demands a
+/// live lease, so what the wide bind exposes is a 401.
+const DEFAULT_BROKER_BIND: &str = "0.0.0.0";
+/// The broker's address as VMs see it (`TASKS_BROKER_ADVERTISE`):
+/// apple/container's vmnet gateway.
+const DEFAULT_BROKER_ADVERTISE: &str = "192.168.64.1";
+/// Where the broker forwards Anthropic traffic
+/// (`TASKS_BROKER_ANTHROPIC_UPSTREAM`) — overridden only by tests.
+const DEFAULT_ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 
 /// The mode every boot starts in when `TASKS_DEFAULT_MODE` says nothing.
 ///
@@ -216,6 +231,12 @@ pub enum ConfigError {
     },
     #[error("HOME environment variable not set")]
     NoHome,
+    /// A sealed secret store that exists but cannot be opened. A hard startup
+    /// error on purpose: the operator who sealed their keys has said the
+    /// environment is not the source of truth, and a server that silently
+    /// booted without them would come up healthy and wrong.
+    #[error(transparent)]
+    Secrets(#[from] crate::secrets::SecretsError),
 }
 
 /// Everything `serve` reads from the environment, resolved once at startup.
@@ -242,14 +263,20 @@ pub struct Config {
     pub scout_timeout: Duration,
     /// vm-pool service socket (`VM_POOL_SOCKET`).
     pub vm_pool_socket: PathBuf,
-    /// `GITHUB_TOKEN`. Absent disables polling and leaves clone URLs anonymous.
+    /// Custody of the two upstream credentials (#971): the sealed store under
+    /// the data dir, with the process environment as the boot-captured
+    /// fallback. No GitHub token configured disables polling and leaves
+    /// clones anonymous, exactly as an unset `GITHUB_TOKEN` used to.
     ///
-    /// A [`Secret`] rather than a `String` so that this struct's derived
-    /// `Debug` cannot print it: the token ends up inside every clone URL a VM
-    /// is handed, which is the sibling leak to #923 on the other side of the
-    /// wire. Nothing logs a `Config` today — this closes the hazard, not an
-    /// incident.
-    pub github_token: Option<Secret>,
+    /// A handle rather than values, so rotation through `tasks secrets set`
+    /// reaches a running server — and so this struct's derived `Debug` has
+    /// nothing to print. Raw keys leave it only at the two credential
+    /// boundaries: [`crate::github::GitHubClient`] and [`crate::broker`].
+    pub secrets: crate::secrets::Secrets,
+    /// The credential broker's listener and advertised address
+    /// (`TASKS_BROKER_*`) — where VMs redeem their leases. See
+    /// [`crate::broker`].
+    pub broker: crate::broker::BrokerConfig,
     /// GraphQL endpoint override (`GITHUB_API_URL`) — GitHub Enterprise, tests.
     pub github_api_url: Option<String>,
     /// Which fetched issues intake accepts (`TASKS_INTAKE_LABEL`). Unset means
@@ -308,11 +335,15 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        // Resolved once and shared by both roles: the apiKeyHelper path shells
-        // out to a script, and it should not run twice per startup.
-        let credentials = agent_credentials_env();
+        let data_dir = data_dir()?;
+        // Opened once: this is what shells out to the Keychain (or the
+        // apiKeyHelper fallback), and a sealed store that exists but cannot
+        // be opened is a startup error here, before anything binds.
+        let secrets = crate::secrets::Secrets::open(&data_dir)?;
+        let clone_url_base =
+            env_string("GITHUB_CLONE_URL_BASE").unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into());
         Ok(Self {
-            data_dir: data_dir()?,
+            data_dir,
             port: parse_env("TASKS_SERVER_PORT", "a port number", DEFAULT_PORT)?,
             poll_interval: Duration::from_secs(parse_env(
                 "TASKS_POLL_INTERVAL",
@@ -335,14 +366,22 @@ impl Config {
             vm_pool_socket: env_string("VM_POOL_SOCKET")
                 .unwrap_or_else(|| DEFAULT_VM_POOL_SOCKET.into())
                 .into(),
-            github_token: env_string("GITHUB_TOKEN").map(Secret::new),
+            broker: crate::broker::BrokerConfig {
+                port: parse_env("TASKS_BROKER_PORT", "a port number", DEFAULT_BROKER_PORT)?,
+                bind: env_string("TASKS_BROKER_BIND").unwrap_or_else(|| DEFAULT_BROKER_BIND.into()),
+                advertise_host: env_string("TASKS_BROKER_ADVERTISE")
+                    .unwrap_or_else(|| DEFAULT_BROKER_ADVERTISE.into()),
+                anthropic_upstream: env_string("TASKS_BROKER_ANTHROPIC_UPSTREAM")
+                    .unwrap_or_else(|| DEFAULT_ANTHROPIC_UPSTREAM.into()),
+                git_upstream: clone_url_base.clone(),
+            },
+            secrets,
             github_api_url: env_string("GITHUB_API_URL"),
             intake: IntakeFilter::from_label(env_string("TASKS_INTAKE_LABEL")),
-            clone_url_base: env_string("GITHUB_CLONE_URL_BASE")
-                .unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into()),
+            clone_url_base,
             scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
-            vm_config: agent_vm_config(SCOUT_VM, &credentials)?,
-            builder_vm_config: agent_vm_config(BUILDER_VM, &credentials)?,
+            vm_config: agent_vm_config(SCOUT_VM)?,
+            builder_vm_config: agent_vm_config(BUILDER_VM)?,
             builder_image: env_string("BUILDER_IMAGE")
                 .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.into()),
             builder_timeout: Duration::from_secs(parse_env(
@@ -402,12 +441,34 @@ impl Config {
         self.data_dir.join("orchestrator-curl.conf")
     }
 
+    /// Whether GitHub is configured *now* — the sealed store is live, so this
+    /// can change while the process runs.
+    pub fn github_configured(&self) -> bool {
+        self.secrets.github_configured()
+    }
+
+    /// The lease issuer every dispatcher mints through — one construction,
+    /// so the advertised address in a VM's env and the broker actually
+    /// listening cannot disagree.
+    fn lease_issuer(&self, store: &Arc<Store>) -> crate::broker::LeaseIssuer {
+        crate::broker::LeaseIssuer::new(
+            store.clone(),
+            self.broker.advertise_host.clone(),
+            self.broker.port,
+        )
+    }
+
+    /// A GitHub client reading its token **through** [`Config::secrets`], so
+    /// `tasks secrets set github-token` rotates every holder of this client
+    /// with nothing restarted. `None` when no token is configured at the time
+    /// of the call — whether the credential exists at all is still decided
+    /// where the client is built, once, at boot.
     fn github_client(&self) -> Option<GitHubClient> {
-        let token = self.github_token.as_ref()?.expose();
-        let client = match &self.github_api_url {
-            Some(url) => GitHubClient::with_base_url(token, url),
-            None => GitHubClient::new(token),
-        };
+        if !self.secrets.github_configured() {
+            return None;
+        }
+        let client =
+            GitHubClient::from_secrets(self.secrets.clone(), self.github_api_url.as_deref());
         Some(match &self.github_rest_api_url {
             Some(url) => client.with_rest_base_url(url),
             None => client,
@@ -475,16 +536,19 @@ fn build_jobs(cpus: u32, memory_mb: u32) -> u32 {
     (for_jobs / BUILD_JOB_MEMORY_MB).clamp(1, cpus.max(1))
 }
 
-/// Build one role's VM shape: cpus, memory, and the environment its agent
-/// runs with (credentials plus the derived `CARGO_BUILD_JOBS`).
+/// Build one role's VM shape: cpus, memory, and the derived
+/// `CARGO_BUILD_JOBS`.
+///
+/// **No credentials.** The shape is resolved once at startup; what a run
+/// authenticates with is minted per dispatch — a lease from
+/// [`crate::broker::LeaseIssuer`], appended to this env at allocation — so
+/// nothing long-lived ever rides `container run`'s argv or a VM's
+/// environment (#971).
 ///
 /// The images pin `CARGO_BUILD_JOBS=1` as a floor for hand-started
 /// containers; this env entry overrides it, so the server's arithmetic always
 /// wins for a VM the server allocated.
-fn agent_vm_config(
-    role: VmRole,
-    credentials: &[(String, String)],
-) -> Result<VmConfig, ConfigError> {
+fn agent_vm_config(role: VmRole) -> Result<VmConfig, ConfigError> {
     let cpus: u32 = parse_env(role.cpus_var, "a positive integer", role.default_cpus)?.max(1);
     let memory_mb: u32 = parse_env(role.memory_var, "a size in MB", role.default_memory_mb)?;
     let jobs: u32 = parse_env(
@@ -494,48 +558,12 @@ fn agent_vm_config(
     )?
     .max(1);
 
-    let mut env = credentials.to_vec();
-    env.push(("CARGO_BUILD_JOBS".into(), jobs.to_string()));
     Ok(VmConfig {
         cpus: Some(cpus),
         memory_mb: Some(memory_mb),
-        env,
+        env: vec![("CARGO_BUILD_JOBS".into(), jobs.to_string())],
         ..VmConfig::default()
     })
-}
-
-/// Credentials for the agent inside a Scout or Builder VM, resolved host-side
-/// once at startup: `ANTHROPIC_API_KEY` from the environment, else the output
-/// of the host's Claude Code `apiKeyHelper` script
-/// (`~/.claude/anthropic_key.sh`) when one exists. Injected per-VM via
-/// `VmConfig.env`, never baked into images. Empty means agents will fail auth
-/// — warned at startup.
-fn agent_credentials_env() -> Vec<(String, String)> {
-    if let Some(key) = env_string("ANTHROPIC_API_KEY") {
-        return vec![("ANTHROPIC_API_KEY".into(), key)];
-    }
-    let helper = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".claude/anthropic_key.sh"));
-    if let Some(helper) = helper.filter(|p| p.exists()) {
-        match std::process::Command::new(&helper).output() {
-            Ok(out) if out.status.success() => {
-                let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !key.is_empty() {
-                    tracing::info!("agent credentials: host apiKeyHelper");
-                    return vec![("ANTHROPIC_API_KEY".into(), key)];
-                }
-            }
-            Ok(out) => {
-                tracing::warn!(status = %out.status, "apiKeyHelper failed");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not run apiKeyHelper");
-            }
-        }
-    }
-    tracing::warn!("no agent credentials found — scouts and builds will fail agent auth");
-    Vec::new()
 }
 
 fn parse_env<T: std::str::FromStr>(
@@ -762,6 +790,18 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let store = Arc::new(open_store(&config.data_dir).await?);
 
+    // Leases nothing could ever redeem again are noise; a day of history is
+    // kept for reading a recent run's tail. Best-effort — a failed prune
+    // costs rows, not correctness, since every read re-checks expiry.
+    match store
+        .prune_leases(chrono::Utc::now() - chrono::Duration::days(1))
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(pruned = n, "removed long-expired credential leases"),
+        Err(e) => warn!(error = %e, "could not prune expired leases"),
+    }
+
     // Before the listener binds: the mode this process runs in is decided by
     // configuration, not by what the last one left behind, and nobody should
     // ever be able to read the previous run's mode off this server.
@@ -770,6 +810,11 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // The port is taken here so a clash is a startup error, before any work is
     // resumed — but the listener is not dropped until this function returns.
     let listener = server::bind(config.port).await?;
+    // The broker binds before any work is resumed, for a sharper reason than
+    // the API's: the VMs a reattach picks back up are already pointed at this
+    // port, and their supervisors are mid-retry against it. Serving starts
+    // once the shutdown channel exists; the accept backlog holds the gap.
+    let broker_listener = crate::broker::bind(&config.broker).await?;
 
     let in_flight = InFlight::default();
     let resumed = resume_in_flight(&store, &config, &in_flight).await;
@@ -835,6 +880,16 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         OBLIGATION_TICK,
         shutdown_rx.clone(),
     ));
+    let broker = {
+        let state =
+            crate::broker::BrokerState::new(store.clone(), config.secrets.clone(), &config.broker);
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::broker::serve(broker_listener, state, shutdown).await {
+                warn!(error = %e, "credential broker exited with an error");
+            }
+        })
+    };
     // The API's own GitHub client: issue writes go through the server, so
     // without a token those routes answer 503 rather than falling back to an
     // agent's credential.
@@ -847,7 +902,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         server::Services {
             github: config.github_client().map(Arc::new),
             bundles: Some(Arc::new(RejectedBundles::under(
-                builder_config(&config).scratch_root,
+                builder_config(&config, None).scratch_root,
             ))),
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
@@ -875,6 +930,10 @@ pub async fn run(config: Config) -> Result<(), RunError> {
                         ("poll", poll),
                         ("nudge", nudge),
                         ("obligations", obligations),
+                        // Bounded by its own CONNECTION_GRACE (2s), well
+                        // inside this deadline; severing a proxied stream is
+                        // safe — the in-VM supervisors resume from it.
+                        ("broker", broker),
                     ],
                 )
                 .await
@@ -1156,7 +1215,11 @@ pub async fn resume_in_flight(
                 continue;
             }
         };
-        let scout = Scout::new(store.clone(), client.handle(), scout_config(config));
+        let scout = Scout::new(
+            store.clone(),
+            client.handle(),
+            scout_config(config, Some(config.lease_issuer(store))),
+        );
         resumed.sessions.insert(session.id.clone());
         resumed.tasks.insert(task.id.clone());
 
@@ -1175,7 +1238,7 @@ pub async fn resume_in_flight(
     let github = config.github_client().map(Arc::new);
     for build in builds {
         let Some(github) = github.clone() else {
-            warn!(build_id = %build.id, "no GITHUB_TOKEN; a resumed build could not push or open a PR");
+            warn!(build_id = %build.id, "no GitHub token configured; a resumed build could not push or open a PR");
             continue;
         };
         let project = match store.get_project(&build.project_id).await {
@@ -1189,12 +1252,12 @@ pub async fn resume_in_flight(
                 continue;
             }
         };
-        let url = clone_url(config, &project);
+        let source = clone_source(config, &project);
         let builder = Builder::new(
             store.clone(),
             client.handle(),
             github,
-            builder_config(config),
+            builder_config(config, Some(config.lease_issuer(store))),
         );
         resumed.builds.insert(build.id.clone());
         for task_id in build_task_ids(store, &build.id).await {
@@ -1205,7 +1268,7 @@ pub async fn resume_in_flight(
         tokio::spawn(async move {
             let _held = counter;
             let build_id = build.id.clone();
-            match builder.reattach(build, &url).await {
+            match builder.reattach(build, &source).await {
                 Ok(done) => {
                     info!(build_id = %done.id, pr = ?done.pr_number, "resumed build succeeded")
                 }
@@ -1336,7 +1399,10 @@ pub async fn poll_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
-        warn!("GITHUB_TOKEN not set — GitHub polling disabled");
+        warn!(
+            "no GitHub token configured (`tasks secrets set github-token`, or GITHUB_TOKEN) — \
+             GitHub polling disabled"
+        );
         return;
     };
     // Said once, at startup: a typo in TASKS_INTAKE_LABEL ingests nothing, and
@@ -1346,7 +1412,7 @@ pub async fn poll_loop(
         None => info!("intake accepts every open issue (TASKS_INTAKE_LABEL unset)"),
     }
 
-    let bundles = RejectedBundles::under(builder_config(&config).scratch_root);
+    let bundles = RejectedBundles::under(builder_config(&config, None).scratch_root);
 
     loop {
         match store.get_mode().await {
@@ -1988,21 +2054,25 @@ async fn watch_merges(
 /// How a Scout VM is booted, in one place: the dispatch loop and
 /// [`resume_in_flight`] must agree on it, and a resumed run's deadline is
 /// measured against the same budget.
-fn scout_config(config: &Config) -> ScoutConfig {
+fn scout_config(config: &Config, leases: Option<crate::broker::LeaseIssuer>) -> ScoutConfig {
     ScoutConfig {
         image: config.scout_image.clone(),
         vm_config: config.vm_config.clone(),
         timeout: config.scout_timeout,
+        leases,
     }
 }
 
-/// How a Builder VM is booted. See [`scout_config`].
-fn builder_config(config: &Config) -> BuilderConfig {
+/// How a Builder VM is booted. See [`scout_config`]. `leases` is `None` only
+/// for callers that read the config without dispatching (the bundles service
+/// wants `scratch_root` and nothing else).
+fn builder_config(config: &Config, leases: Option<crate::broker::LeaseIssuer>) -> BuilderConfig {
     BuilderConfig {
         image: config.builder_image.clone(),
         vm_config: config.builder_vm_config.clone(),
         timeout: config.builder_timeout,
         scratch_root: config.data_dir.join("build-scratch"),
+        leases,
     }
 }
 
@@ -2257,7 +2327,7 @@ async fn dispatch_connected(
     let scout = Arc::new(Scout::new(
         store.clone(),
         client.handle(),
-        scout_config(config),
+        scout_config(config, Some(config.lease_issuer(store))),
     ));
 
     let mut in_flight: JoinSet<(TaskId, Result<Spec, ScoutError>)> = JoinSet::new();
@@ -2351,7 +2421,7 @@ async fn top_up(
         }
 
         let target = ScoutTarget {
-            repo_clone_url: clone_url(config, &project),
+            source: clone_source(config, &project),
             base_branch: config.scout_base_branch.clone(),
         };
         let task_id = task.id.clone();
@@ -2679,7 +2749,7 @@ pub async fn orchestrator_loop(
             workdir,
             workdir_is_checkout: config.orchestrator_workdir.is_some(),
             target_dir: verify_target_dir(&config).await,
-            github_configured: config.github_token.is_some(),
+            github_configured: config.github_configured(),
             api_port: config.port,
             curl_config: config.orchestrator_curl_config(),
         },
@@ -2890,7 +2960,7 @@ pub async fn build_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
-        warn!("no GITHUB_TOKEN; builds disabled (a build must push and open a PR)");
+        warn!("no GitHub token configured — builds disabled (a build must push and open a PR)");
         return;
     };
     let github = Arc::new(github);
@@ -2919,7 +2989,7 @@ pub async fn build_loop(
             store.clone(),
             client.handle(),
             github.clone(),
-            builder_config(&config),
+            builder_config(&config, Some(config.lease_issuer(&store))),
         );
 
         loop {
@@ -2966,9 +3036,9 @@ pub async fn build_loop(
                                     continue;
                                 }
                             };
-                            let url = clone_url(&config, &project);
+                            let source = clone_source(&config, &project);
                             // Inline await = serial by construction.
-                            match builder.dispatch(build, &url).await {
+                            match builder.dispatch(build, &source).await {
                                 Ok(done) => {
                                     info!(build_id = %done.id, pr = ?done.pr_number, "build succeeded");
                                 }
@@ -3001,29 +3071,21 @@ pub async fn build_loop(
     }
 }
 
-/// Where a scout clones from. Derived per project; the token, when set, rides
-/// along as basic auth so private repos clone without a credential helper.
-fn clone_url(config: &Config, project: &Project) -> String {
-    clone_url_for(
-        &config.clone_url_base,
-        config.github_token.as_ref().map(Secret::expose),
-        project,
-    )
-}
-
-/// The credentialed clone URL for a project — shared by the scout and builder
-/// paths so both sides of the diamond clone (and the builder pushes) the same
-/// way. Non-https bases take no credentials; they'd be meaningless.
-pub(crate) fn clone_url_for(base: &str, token: Option<&str>, project: &Project) -> String {
-    let url = format!(
-        "{}/{}/{}.git",
-        base.trim_end_matches('/'),
-        project.repo_owner,
-        project.repo_name
-    );
-    match (token, url.strip_prefix("https://")) {
-        (Some(token), Some(rest)) => format!("https://x-access-token:{token}@{rest}"),
-        _ => url,
+/// Where a run for `project` clones from. An http(s) base leases through the
+/// broker; anything else (a `file://` mirror) is structurally unproxyable by
+/// a git smart-HTTP passthrough and clones direct — see
+/// [`crate::broker::CloneSource`].
+fn clone_source(config: &Config, project: &Project) -> crate::broker::CloneSource {
+    let base = config.clone_url_base.trim_end_matches('/');
+    if base.starts_with("https://") || base.starts_with("http://") {
+        crate::broker::CloneSource::Leased {
+            repo: format!("{}/{}", project.repo_owner, project.repo_name),
+        }
+    } else {
+        crate::broker::CloneSource::Direct(format!(
+            "{}/{}/{}.git",
+            base, project.repo_owner, project.repo_name
+        ))
     }
 }
 
@@ -3108,34 +3170,6 @@ mod tests {
         );
     }
 
-    fn config() -> Config {
-        Config {
-            data_dir: PathBuf::from("/tmp"),
-            port: 0,
-            poll_interval: Duration::from_secs(60),
-            startup_mode: DEFAULT_STARTUP_MODE,
-            scout_max_concurrent: 1,
-            scout_image: DEFAULT_SCOUT_IMAGE.into(),
-            scout_timeout: Duration::from_secs(DEFAULT_SCOUT_TIMEOUT_SECS),
-            vm_pool_socket: PathBuf::from(DEFAULT_VM_POOL_SOCKET),
-            github_token: None,
-            github_api_url: None,
-            intake: IntakeFilter::All,
-            clone_url_base: DEFAULT_CLONE_URL_BASE.into(),
-            scout_base_branch: "main".into(),
-            vm_config: VmConfig::default(),
-            builder_vm_config: VmConfig::default(),
-            builder_image: DEFAULT_BUILDER_IMAGE.into(),
-            builder_timeout: Duration::from_secs(DEFAULT_BUILDER_TIMEOUT_SECS),
-            github_rest_api_url: None,
-            orchestrator_cmd: "true".into(),
-            orchestrator_timeout: Duration::from_secs(60),
-            orchestrator_workdir: None,
-            orchestrator_target_dir: None,
-            update_hold: true,
-        }
-    }
-
     fn project() -> Project {
         Project {
             id: ProjectId::new(),
@@ -3176,37 +3210,6 @@ mod tests {
         // vm-pool's own default shape, and anything smaller, still builds.
         assert_eq!(build_jobs(2, 2048), 1);
         assert_eq!(build_jobs(1, 65536), 1);
-    }
-
-    #[test]
-    fn clone_url_is_anonymous_without_a_token() {
-        assert_eq!(
-            clone_url(&config(), &project()),
-            "https://github.com/iamnbutler/tasks.git"
-        );
-    }
-
-    #[test]
-    fn clone_url_carries_the_token_as_basic_auth() {
-        let mut config = config();
-        config.github_token = Some("ghp_secret".into());
-        assert_eq!(
-            clone_url(&config, &project()),
-            "https://x-access-token:ghp_secret@github.com/iamnbutler/tasks.git"
-        );
-    }
-
-    /// A non-https base (a local clone in tests, a git:// mirror) takes no
-    /// credentials — they'd be meaningless in the URL.
-    #[test]
-    fn clone_url_leaves_non_https_bases_alone() {
-        let mut config = config();
-        config.github_token = Some("ghp_secret".into());
-        config.clone_url_base = "file:///srv/repos/".into();
-        assert_eq!(
-            clone_url(&config, &project()),
-            "file:///srv/repos/iamnbutler/tasks.git"
-        );
     }
 
     /// Unset is the whole point of the change: a machine that comes back on

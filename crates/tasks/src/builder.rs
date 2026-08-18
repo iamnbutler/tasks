@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
+use crate::broker::{CloneSource, LeaseIssuer, SubjectKind};
 use crate::bundles::{self, RejectedBundles};
 use crate::cancel::Bounded;
 use crate::deadline::{Deadline, Expiry};
@@ -168,6 +169,11 @@ pub struct BuilderConfig {
     /// never landed, and [`crate::run::reclaim_bundles`] is the only thing
     /// that empties it.
     pub scratch_root: PathBuf,
+    /// Mints per-build run leases and per-landing push leases when the
+    /// build's source is [`CloneSource::Leased`]. `None` only where there is
+    /// no broker at all — the integration tests, which build from `file://`
+    /// repos.
+    pub leases: Option<LeaseIssuer>,
 }
 
 pub struct Builder {
@@ -194,9 +200,13 @@ impl Builder {
 
     /// Run a claimed (`running`) build to a terminal state. Finalizes the
     /// build row on every path and returns the finished build.
-    pub async fn dispatch(&self, build: Build, clone_url: &str) -> Result<Build, BuilderError> {
+    pub async fn dispatch(
+        &self,
+        build: Build,
+        source: &CloneSource,
+    ) -> Result<Build, BuilderError> {
         info!(build_id = %build.id, branch = %build.branch, "build dispatch starting");
-        self.conclude(&build, self.attempt(&build, clone_url).await)
+        self.conclude(&build, self.attempt(&build, source).await)
             .await
     }
 
@@ -206,9 +216,13 @@ impl Builder {
     /// resumed. [`Store::reconcile_orphaned_work_except`] skips rows handed to
     /// a reattach, and a `running` build nobody concludes wedges the serial
     /// queue forever, which is strictly worse than an orphaned session.
-    pub async fn reattach(&self, build: Build, clone_url: &str) -> Result<Build, BuilderError> {
+    pub async fn reattach(
+        &self,
+        build: Build,
+        source: &CloneSource,
+    ) -> Result<Build, BuilderError> {
         info!(build_id = %build.id, branch = %build.branch, "reattaching to a build");
-        self.conclude(&build, self.resume(&build, clone_url).await)
+        self.conclude(&build, self.resume(&build, source).await)
             .await
     }
 
@@ -219,6 +233,17 @@ impl Builder {
         build: &Build,
         outcome: Result<Build, BuilderError>,
     ) -> Result<Build, BuilderError> {
+        // Every terminal path passes through here, so the build's credit ends
+        // here too — the run lease and any landing lease alike. Tightening on
+        // top of expiry; see `LeaseIssuer::revoke_best_effort`.
+        if let Some(leases) = &self.config.leases {
+            leases
+                .revoke_best_effort(SubjectKind::Build, build.id.as_str())
+                .await;
+            leases
+                .revoke_best_effort(SubjectKind::Land, build.id.as_str())
+                .await;
+        }
         match outcome {
             Ok(done) => Ok(done),
             // A deliberate stop by an accountable actor, so it is `cancelled`
@@ -286,7 +311,7 @@ impl Builder {
 
     /// Everything that can fail on a fresh build. A `?` here lands in
     /// [`Builder::conclude`]'s failure finalization.
-    async fn attempt(&self, build: &Build, clone_url: &str) -> Result<Build, BuilderError> {
+    async fn attempt(&self, build: &Build, source: &CloneSource) -> Result<Build, BuilderError> {
         // Anchored on both clocks before anything else, so allocation is inside
         // the budget and a host that suspends during it is caught too.
         let deadline = Deadline::starting_now(self.config.timeout);
@@ -297,10 +322,42 @@ impl Builder {
         let project = self.project(build).await?;
         let prompt = render_prompt(&batch, build.directions.as_ref());
 
-        let vm_id = self
-            .client
-            .allocate(&self.config.image, self.config.vm_config.clone())
-            .await?;
+        // What this build authenticates with: a lease minted against this
+        // build id, read-only, repo-bound, expiring at the budget plus slack
+        // (see `crate::broker`). The push credential is never in the VM in
+        // any form — the landing mints its own lease host-side.
+        let (vm_clone_url, credentials_env) = match (source, &self.config.leases) {
+            (CloneSource::Leased { repo }, Some(leases)) => {
+                let grant = leases
+                    .grant_agent(
+                        SubjectKind::Build,
+                        build.id.as_str(),
+                        repo,
+                        self.config.timeout,
+                    )
+                    .await?;
+                (grant.clone_url, grant.env)
+            }
+            // The broker cannot front a non-HTTP repo, but this run's API
+            // credit still goes through it rather than riding raw.
+            (CloneSource::Direct(url), Some(leases)) => (
+                url.clone(),
+                leases
+                    .grant_anthropic_env(SubjectKind::Build, build.id.as_str(), self.config.timeout)
+                    .await?,
+            ),
+            (CloneSource::Direct(url), None) => (url.clone(), Vec::new()),
+            (CloneSource::Leased { .. }, None) => {
+                return Err(BuilderError::BuildFailed {
+                    reason: "leased dispatch with no lease issuer wired".into(),
+                    class: FailureClass::Verdict,
+                });
+            }
+        };
+        let mut vm_config = self.config.vm_config.clone();
+        vm_config.env.extend(credentials_env);
+
+        let vm_id = self.client.allocate(&self.config.image, vm_config).await?;
         info!(
             %vm_id,
             build_id = %build.id,
@@ -315,7 +372,7 @@ impl Builder {
                 &vm_id,
                 TaskCommand::Build(BuildCommand::Start {
                     build_id: build.id.to_string(),
-                    repo_clone_url: clone_url.to_string(),
+                    repo_clone_url: vm_clone_url,
                     base_branch: build.base_branch.clone(),
                     branch: build.branch.clone(),
                     prompt,
@@ -324,12 +381,12 @@ impl Builder {
             .await?;
 
         let app = AppEvents::live(&mut events, vm_id.clone());
-        self.follow(build, clone_url, &batch, &project, &vm_id, app, &deadline)
+        self.follow(build, source, &batch, &project, &vm_id, app, &deadline)
             .await
     }
 
     /// Everything that can fail on a resumed build.
-    async fn resume(&self, build: &Build, clone_url: &str) -> Result<Build, BuilderError> {
+    async fn resume(&self, build: &Build, source: &CloneSource) -> Result<Build, BuilderError> {
         let Some(vm_id) = build.vm_id.clone().map(VmId::new) else {
             return Err(BuilderError::NotResumable("the build records no VM".into()));
         };
@@ -356,15 +413,32 @@ impl Builder {
             .started_at
             .map(|t| (Utc::now() - t).to_std().unwrap_or_default())
             .unwrap_or_default();
-        let deadline = Deadline::starting_now(
-            self.config
-                .timeout
-                .saturating_sub(elapsed)
-                .max(RESUME_MIN_BUDGET),
-        );
+        let remaining = self
+            .config
+            .timeout
+            .saturating_sub(elapsed)
+            .max(RESUME_MIN_BUDGET);
+        let deadline = Deadline::starting_now(remaining);
+
+        // The VM still holds the lease it was dispatched with — the only one
+        // it will ever have — and a long outage may have expired it. Re-arm
+        // it for the resumed budget; best-effort, because an unextendable
+        // lease only means the agent 401s and the run concludes the way it
+        // was already going to.
+        if let Some(leases) = &self.config.leases {
+            let until = Utc::now()
+                + chrono::Duration::from_std(remaining + crate::broker::LEASE_SLACK)
+                    .unwrap_or_default();
+            if let Err(e) = leases
+                .extend(SubjectKind::Build, build.id.as_str(), until)
+                .await
+            {
+                warn!(build_id = %build.id, error = %e, "could not extend the build's lease");
+            }
+        }
 
         let app = AppEvents::resumed(&mut events, vm_id.clone(), resume);
-        self.follow(build, clone_url, &batch, &project, &vm_id, app, &deadline)
+        self.follow(build, source, &batch, &project, &vm_id, app, &deadline)
             .await
     }
 
@@ -375,7 +449,7 @@ impl Builder {
     async fn follow(
         &self,
         build: &Build,
-        clone_url: &str,
+        source: &CloneSource,
         batch: &[BatchItem],
         project: &Project,
         vm_id: &VmId,
@@ -481,7 +555,7 @@ impl Builder {
         let outcome = result?;
 
         // Egress: unbundle, verify, push — then the PR.
-        self.land_branch(build, clone_url, &outcome).await?;
+        self.land_branch(build, source, &outcome).await?;
         let (title, body) = pr_text(batch, &outcome);
         let pr_number = self
             .github
@@ -643,10 +717,10 @@ impl Builder {
     async fn land_branch(
         &self,
         build: &Build,
-        clone_url: &str,
+        source: &CloneSource,
         outcome: &BuildOutcome,
     ) -> Result<(), BuilderError> {
-        match self.land_and_sweep(build, clone_url, outcome).await {
+        match self.land_and_sweep(build, source, outcome).await {
             // The variant is unwrapped and re-wrapped, so the reason reads
             // `branch egress: …` once rather than twice.
             Err(BuilderError::Egress(why)) => Err(self.preserve_bundle(build, outcome, &why).await),
@@ -657,9 +731,27 @@ impl Builder {
     async fn land_and_sweep(
         &self,
         build: &Build,
-        clone_url: &str,
+        source: &CloneSource,
         outcome: &BuildOutcome,
     ) -> Result<(), BuilderError> {
+        // The push window. For a leased build this is the only form the
+        // write credential ever takes: a ~10-minute `git-read`+`git-write`
+        // lease on a loopback URL, minted here, revoked at `conclude`. The
+        // PAT itself stays inside the broker's upstream call — even host-side
+        // `git` argv never carries it. Failures are `Egress`, which is the
+        // path that preserves the bundle.
+        let clone_url = match (source, &self.config.leases) {
+            (CloneSource::Direct(url), _) => url.clone(),
+            (CloneSource::Leased { repo }, Some(leases)) => leases
+                .grant_land(build.id.as_str(), repo)
+                .await
+                .map_err(|e| BuilderError::Egress(format!("landing lease: {e}")))?,
+            (CloneSource::Leased { .. }, None) => {
+                return Err(BuilderError::Egress(
+                    "leased landing with no lease issuer wired".into(),
+                ));
+            }
+        };
         let scratch = self
             .config
             .scratch_root
@@ -668,7 +760,7 @@ impl Builder {
             .await
             .map_err(|e| BuilderError::Egress(format!("scratch dir: {e}")))?;
 
-        let result = self.land_in(&scratch, build, clone_url, outcome).await;
+        let result = self.land_in(&scratch, build, &clone_url, outcome).await;
         if let Err(e) = tokio::fs::remove_dir_all(&scratch).await {
             warn!(scratch = %scratch.display(), error = %e, "could not remove scratch repo");
         }
@@ -1268,11 +1360,6 @@ fn neutralize_closing_keywords(text: &str) -> String {
         prev = word.chars().last();
     }
     out
-}
-
-/// The clone URL a Builder VM uses — same construction as scouts.
-pub fn project_clone_url(base: &str, token: Option<&str>, project: &Project) -> String {
-    crate::run::clone_url_for(base, token, project)
 }
 
 #[cfg(test)]
