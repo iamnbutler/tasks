@@ -108,15 +108,125 @@ formatted environment.
 - **No image rebuild.** Everything rides per-VM env and URLs the server
   already injects. Existing images work unchanged.
 
-## Rotation runbook (the actual #971 remediation, after this deploys)
+## Deployment and rotation runbook (the actual #971 remediation)
 
-1. `make restart` onto this change. `tasks secrets init`, then rotate both
-   keys at their providers, then `tasks secrets set anthropic-api-key` and
-   `tasks secrets set github-token` (paste, ctrl-D).
-2. Delete both keys from every `.env` and shell profile.
-3. Restart vm-pool (per #971, ahead of the server) and `make images` for the
-   supervisor halves of #970 — unrelated to this change but part of the same
-   runbook.
+Written to be run top to bottom by a human at the machine. Steps 1–4 are
+reversible and change no credential; step 5 is the irreversible half, and it
+is deliberately last, so the mechanism is proven before the keys it protects
+are replaced.
+
+Two facts decide the ordering. The sealed store **outranks** the environment
+fallback (`Secrets::get` reads the cache first), so sealing a key takes effect
+immediately and *before* anything is deleted from `.env` — which means the old
+value stays in place as a fallback the whole way through, and every step below
+can be abandoned without losing the ability to serve. And a sealed store that
+exists but cannot be opened **refuses to boot**, so the failure mode of a
+locked login Keychain is a server that will not start, not one that quietly
+falls back.
+
+### 1. Deploy the code (no credential moves yet)
+
+    make drain          # quiesce; new scouts and the build lane hold
+    make restart
+    make resume
+
+`make restart` alone is enough if nothing is in flight. Two things to check
+before you start:
+
+- **Port 4801 must be free** — `lsof -nP -iTCP:4801 -sTCP:LISTEN`. The broker
+  binds it at boot and a clash is a startup error by design. Override with
+  `TASKS_BROKER_PORT` if something else owns it.
+- **No image rebuild is needed.** The lease rides in `ANTHROPIC_API_KEY` and a
+  clone URL, both of which the server already injects. `make images` is only
+  on this list for the *unrelated* supervisor half of #970, at step 6.
+
+Confirm it came up: `tasks status`, and `credential broker listening` in
+`serve.log` with the advertised address beside it.
+
+### 2. Create the sealed store
+
+    tasks secrets init
+
+Writes `<data dir>/secrets/sealed.json` (0600) and generates the unseal key
+into the login Keychain (service `tasks-v2-secrets`). Neither artifact alone
+decrypts anything, which is the whole property — so **back them up
+separately, or not at all**. On a host where the login Keychain is locked
+non-interactively (a headless or launchd-started server), use
+`tasks secrets init --key-file PATH` instead and set `TASKS_SECRETS_KEY_FILE`;
+`tasks secrets status` will name the override rather than the Keychain, which
+is how you confirm it took.
+
+### 3. Seal the keys you already have
+
+Deliberately the ones currently in `.env` — this step proves the mechanism
+end to end while the values are still ones you can afford to lose:
+
+    printf %s "$ANTHROPIC_API_KEY" | tasks secrets set anthropic-api-key
+    printf %s "$GITHUB_TOKEN"      | tasks secrets set github-token
+
+Values come from **stdin, never argv** (argv is readable in `ps`). Pasting
+interactively and pressing ctrl-D works too. A running server picks the change
+up on its next read — rotation needs no restart — so verify with:
+
+    tasks secrets status     # names and timestamps, never values
+
+### 4. Prove the broker path before trusting it
+
+Nothing here is destructive; all of it is reversible by `tasks secrets rm`.
+
+1. **The keys are sealed, not stored.** `grep -r "$GITHUB_TOKEN"
+   ~/.local/state/tasks-v2/secrets/` must find nothing.
+2. **One scout, one real repo.** Queue a task and watch `serve.log` for
+   `minted an agent lease` naming the session and repo. The run proves two
+   distinct things at once: the clone succeeded (git went through
+   `/git/owner/repo`) and the agent authenticated (Claude Code reached
+   `/anthropic`). `RUST_LOG=tasks::broker=debug` turns on the per-request
+   `git passthrough` / `anthropic passthrough` lines if you want to watch it
+   happen.
+3. **The VM holds no key.** In the run's transcript, `ANTHROPIC_API_KEY` is a
+   `tl-` token, not an `sk-ant-` one, and it stops working minutes after the
+   run ends.
+4. **One build, through the landing push.** This is the only step that
+   exercises the `land` lease — the agent lease deliberately cannot push, so a
+   green scout says nothing about whether landing works.
+
+If the Anthropic key is missing or unsealed, the broker answers `502` naming
+the fix rather than failing obscurely; if GitHub's is, clones fall back to
+anonymous and private repos `401` upstream.
+
+### 5. Rotate (the irreversible half)
+
+Only once step 4 is green:
+
+1. Issue new credentials at both providers.
+2. `tasks secrets set anthropic-api-key` and `tasks secrets set github-token`
+   with the new values. The running server picks them up on its next read.
+3. Confirm a fresh scout still works.
+4. **Revoke the old credentials at the providers.** Until this happens the
+   exposure #971 was filed about is unchanged — the keys are already in logs,
+   consoles and archives, and nothing here can reach those. Sealing stops new
+   writes; only revocation closes what is already out.
+5. Delete both keys from every `.env`, shell profile and shell history.
+   `<data dir>/.env` is easy to miss and is read by *every* `tasks`
+   invocation. What confirms it is the `loaded .env` line each `tasks`
+   command logs at startup, which **names the variables that file defined** —
+   neither key should appear in it. The "raw `GITHUB_TOKEN` in the
+   environment" warning does *not* answer this question: it is suppressed
+   once the name is sealed, so it goes quiet at step 3 whether or not the
+   `.env` entry is still there.
+
+### 6. The rest of #971, unrelated to this change
+
+Restart vm-pool (ahead of the server, per the pool's own upgrade rule) and run
+`make images` for the supervisor halves of #970. Both are host acts, so they
+go inside a `make drain` / `make resume` pair.
+
+### Rollback
+
+At any point before step 5: `tasks secrets rm <name>` (or delete
+`<data dir>/secrets/`) and the environment fallbacks serve again on the next
+read. After step 5 the old keys are revoked and there is nothing to roll back
+to — which is why step 4 comes first.
 
 ## Env vars added
 
