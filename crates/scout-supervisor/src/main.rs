@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 use tasks_protocol::agent_run::{
     AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, max_resumes_from_env,
 };
+use tasks_protocol::redact::redact;
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
     FailureClass, LogStream, MAX_NOTES_BYTES, ScoutCommand, ScoutEvent, SupervisorBuild,
@@ -143,7 +144,12 @@ async fn main() -> Result<()> {
         let command: TaskVmCommand = match serde_json::from_str(line.trim()) {
             Ok(c) => c,
             Err(e) => {
-                warn!("invalid command line ({e}): {}", line.trim());
+                // Redacted: the line we could not decode is a `Start`
+                // carrying `repo_clone_url`, which holds `GITHUB_TOKEN` as
+                // basic auth — and this process's stderr is inherited up
+                // through `container run` into vm-pool's own log. The host it
+                // names stays readable, which is the diagnostic half.
+                warn!("invalid command line ({e}): {}", redact(line.trim()));
                 continue;
             }
         };
@@ -654,19 +660,51 @@ fn make_workdir(task_id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Clone the repo, with the clone's own stderr **captured** rather than
+/// inherited.
+///
+/// `url` carries `GITHUB_TOKEN` as basic auth, and this process's stderr is
+/// inherited up through `container run` into vm-pool's log. Measured on the
+/// git in the Scout image, `git clone` does strip the userinfo from its own
+/// `fatal: unable to access '…'` — but that is git's guarantee, not ours, and
+/// it does *not* hold for `remote:` lines, which are echoed verbatim from the
+/// server. So the stderr is captured, redacted, and a tail of it put in the
+/// error, which the host then stores as the failure reason.
 async fn git_clone(url: &str, branch: &str, into: &Path) -> Result<()> {
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(["clone", "--branch", branch, "--depth", "50", url, "."])
         .current_dir(into)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .await
         .context("spawn git clone")?;
-    if !status.success() {
-        anyhow::bail!("git clone exited with {status}");
+    if !output.status.success() {
+        anyhow::bail!(
+            "git clone exited with {}{}",
+            output.status,
+            stderr_tail(&output.stderr)
+        );
     }
     Ok(())
+}
+
+/// How many trailing stderr lines a failed git command reports. Enough for the
+/// `fatal:` and the line above it; not enough to push a whole server-side
+/// message into `sessions.exit_reason`.
+const STDERR_TAIL_LINES: usize = 5;
+
+/// The last few lines of a captured stderr, redacted, ready to append to an
+/// error. Empty stderr contributes nothing rather than a dangling `: `.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(STDERR_TAIL_LINES)..].join("; ");
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", redact(&tail))
+    }
 }
 
 async fn git_checkout_new_branch(workdir: &Path, branch: &str) -> Result<()> {

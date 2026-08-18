@@ -10,6 +10,10 @@ use std::fmt::Debug;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+pub mod redact;
+
+use redact::is_secret_name;
+
 /// What this build speaks, reported on [`ServiceEvent::PoolStatus`].
 ///
 /// | revision | added |
@@ -235,7 +239,14 @@ impl fmt::Display for Priority {
 }
 
 /// Configuration for a VM.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written rather than derived, and that is the load-bearing
+/// part: `env` is *where a credential enters the system* — for an agent VM it
+/// carries the API key — so a derived `Debug` on this type is the leak of #923
+/// one `tracing` field away, in a type every caller holds. `Serialize` is
+/// untouched: redaction is a property of formatting, never of the data, and
+/// the VM still has to be started with the real value.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VmConfig {
     /// CPU cores (default: 2).
     #[serde(default)]
@@ -249,6 +260,37 @@ pub struct VmConfig {
     /// Environment variables to set.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+}
+
+impl fmt::Debug for VmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VmConfig")
+            .field("cpus", &self.cpus)
+            .field("memory_mb", &self.memory_mb)
+            .field("priority", &self.priority)
+            .field("env", &MaskedEnv(&self.env))
+            .finish()
+    }
+}
+
+/// An environment rendered exactly as `Vec<(String, String)>` renders itself,
+/// except that a secret-named value is masked. The *name* is always kept:
+/// "did the key get through at all" is what such a line is read for.
+struct MaskedEnv<'a>(&'a [(String, String)]);
+
+impl fmt::Debug for MaskedEnv<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, value)| {
+                let value = if is_secret_name(name) {
+                    redact::REDACTED
+                } else {
+                    value.as_str()
+                };
+                (name.as_str(), value)
+            }))
+            .finish()
+    }
 }
 
 /// Commands sent from Tasks to vm-pool service.

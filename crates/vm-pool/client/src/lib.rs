@@ -70,6 +70,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
+use vm_pool_protocol::redact::Scrubbed;
 use vm_pool_protocol::{
     AppProtocol, LogLine, NullProtocol, ReplayedEvent, Request, Response, ServiceCommand,
     ServiceEvent, VmConfig, VmId,
@@ -307,7 +308,10 @@ impl<P: AppProtocol> ClientHandle<P> {
             return Err(ClientError::Closed);
         }
 
-        debug!("sending: {}", json);
+        // `Allocate` carries the VM's environment and `Send` carries the
+        // credentialed clone URL, so this line is a serialized secret unless
+        // something scrubs it (#923).
+        debug!("sending: {}", Scrubbed(&json));
         if self.conn.cmd_tx.send(json).await.is_err() {
             lock(&self.conn.pending).remove(&id);
             return Err(ClientError::Closed);

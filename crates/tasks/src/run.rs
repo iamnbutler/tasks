@@ -73,6 +73,7 @@ use crate::models::{
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
 use crate::reattach;
+use crate::redact::Secret;
 use crate::scout::{Scout, ScoutConfig, ScoutError, ScoutTarget};
 use crate::server;
 use crate::store::{ReconcileReport, ResumedWork, Store, StoreError, Strike};
@@ -242,7 +243,13 @@ pub struct Config {
     /// vm-pool service socket (`VM_POOL_SOCKET`).
     pub vm_pool_socket: PathBuf,
     /// `GITHUB_TOKEN`. Absent disables polling and leaves clone URLs anonymous.
-    pub github_token: Option<String>,
+    ///
+    /// A [`Secret`] rather than a `String` so that this struct's derived
+    /// `Debug` cannot print it: the token ends up inside every clone URL a VM
+    /// is handed, which is the sibling leak to #923 on the other side of the
+    /// wire. Nothing logs a `Config` today — this closes the hazard, not an
+    /// incident.
+    pub github_token: Option<Secret>,
     /// GraphQL endpoint override (`GITHUB_API_URL`) — GitHub Enterprise, tests.
     pub github_api_url: Option<String>,
     /// Which fetched issues intake accepts (`TASKS_INTAKE_LABEL`). Unset means
@@ -328,7 +335,7 @@ impl Config {
             vm_pool_socket: env_string("VM_POOL_SOCKET")
                 .unwrap_or_else(|| DEFAULT_VM_POOL_SOCKET.into())
                 .into(),
-            github_token: env_string("GITHUB_TOKEN"),
+            github_token: env_string("GITHUB_TOKEN").map(Secret::new),
             github_api_url: env_string("GITHUB_API_URL"),
             intake: IntakeFilter::from_label(env_string("TASKS_INTAKE_LABEL")),
             clone_url_base: env_string("GITHUB_CLONE_URL_BASE")
@@ -396,7 +403,7 @@ impl Config {
     }
 
     fn github_client(&self) -> Option<GitHubClient> {
-        let token = self.github_token.as_ref()?;
+        let token = self.github_token.as_ref()?.expose();
         let client = match &self.github_api_url {
             Some(url) => GitHubClient::with_base_url(token, url),
             None => GitHubClient::new(token),
@@ -2851,7 +2858,7 @@ pub async fn build_loop(
 fn clone_url(config: &Config, project: &Project) -> String {
     clone_url_for(
         &config.clone_url_base,
-        config.github_token.as_deref(),
+        config.github_token.as_ref().map(Secret::expose),
         project,
     )
 }
