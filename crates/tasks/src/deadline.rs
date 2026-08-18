@@ -99,8 +99,41 @@ const WALL_CLOCK_TICK: Duration = Duration::from_secs(30);
 ///
 /// Two properties are worth stating outright. The gap is *cumulative* since the
 /// deadline started, so three four-minute naps trip it even though no single
-/// one does. And because the wall arm is disarmed below it, a run can outlive
-/// its wall-clock budget by **less than this floor, never more**.
+/// one does.
+///
+/// And what this floor bounds is a run's **awake execution past the point wall
+/// elapsed reached the budget** — never wall-clock elapsed itself. The sentence
+/// that stood here until #955 claimed the latter: *because the wall arm is
+/// disarmed below it, a run can outlive its wall-clock budget by less than this
+/// floor, never more*. Its reason was sound about the regime it names — while
+/// the arm is disarmed the whole suspend is under this floor, so the wall-clock
+/// overshoot is under it too — and the claim is simply generalised past that
+/// regime. What the clause silently excludes is the case that breaks it: a
+/// single nap at or past this floor *arms* the arm, and that nap is itself the
+/// overshoot.
+///
+/// The two halves separately, then. **Wall-clock elapsed has no bound, and
+/// costs nothing.** [`Expiry::remaining`] answers `None` as soon as `awake`
+/// reaches the budget, whatever the suspend is, so a lid closed for three hours
+/// during a disarmed run's last tick fires three hours past the wall-clock
+/// budget — and nothing caps that, because nothing caps a suspend. It is free:
+/// the run was not running for any of it, and the serial lane is released at
+/// the wake either way. **Awake execution is bounded, by the monotonic arm, and
+/// strictly under this floor.** Write `s` for the suspend accumulated when wall
+/// elapsed first reaches the budget, at which point `awake = budget − s` by
+/// definition. Neither branch of [`Expiry::remaining`] ever answers with more
+/// than the monotonic remainder (the armed branch returns `budget − elapsed`,
+/// and `elapsed >= awake`), and [`Deadline::expired`] sleeps
+/// `remaining.min(WALL_CLOCK_TICK)` — so `awake` never passes `budget`, leaving
+/// at most `s` of awake execution to be spent past that point. Disarmed there,
+/// `s` is under this floor by definition. Armed there, the arm's own
+/// `wall_left` is already zero, so the next poll fires — at most one
+/// [`WALL_CLOCK_TICK`] of awake later, and a tick is *less* than this floor
+/// rather than something to add to it.
+///
+/// So the tick is not a term in this bound at all. The question it does answer
+/// is its own: how long after a wake a doomed run stays parked holding the
+/// serial lane.
 const WAKE_KILL_FLOOR: Duration = Duration::from_secs(5 * 60);
 
 /// The share of the budget that must have gone unspent awake before the strike
@@ -269,6 +302,21 @@ impl Expiry {
     /// monotonic budget exactly as it did before this module existed, which is
     /// what keeps a nap the in-VM resume ladder would have absorbed from
     /// costing a run its remaining time.
+    ///
+    /// Neither arm ever answers with more than the monotonic remainder — the
+    /// armed branch returns `budget − elapsed`, and `elapsed >= awake` — so
+    /// with [`Deadline::expired`] sleeping `remaining.min(WALL_CLOCK_TICK)`,
+    /// `awake` can never pass `budget`. That is the invariant the bound in
+    /// [`WAKE_KILL_FLOOR`]'s docs rests on, and it is the reason the bound is
+    /// on awake execution rather than on the wall clock.
+    ///
+    /// The monotonic arm answering first — `awake_left` is computed and can
+    /// return `None` *before* the floor is consulted — is deliberate, and it is
+    /// why the wall-clock overshoot has no bound at all. Reordering the two
+    /// checks would buy none: past the wall-clock budget the armed branch's own
+    /// `wall_left` is zero and answers `None` identically. The cause is that
+    /// the sleep is monotonic and a suspend has no cap, so there is no bound to
+    /// be found by rearranging this function.
     fn remaining(&self) -> Option<Duration> {
         let awake_left = self.budget.saturating_sub(self.awake);
         if awake_left.is_zero() {
@@ -451,6 +499,83 @@ mod tests {
         };
         assert_eq!(four.remaining(), Some(Duration::from_secs(4 * 60)));
         assert_eq!(five.remaining(), None);
+    }
+
+    /// The half of [`WAKE_KILL_FLOOR`]'s claim that is true, and the one the
+    /// sentence #955 replaced was reaching for: awake execution past the point
+    /// wall elapsed reached the budget is bounded, and bounded *strictly under*
+    /// the floor — not by the floor plus a [`WALL_CLOCK_TICK`], which
+    /// double-counts.
+    ///
+    /// A reading a second under the floor of nap, a tick of budget left, and
+    /// wall elapsed already past the budget: the arm is still disarmed, so the
+    /// run is still handed its last tick, and that tick is bounded by the
+    /// suspend that bought it.
+    #[test]
+    fn awake_execution_past_the_wall_budget_stays_under_the_floor() {
+        let budget = Duration::from_secs(3600);
+        let awake = budget - WALL_CLOCK_TICK;
+        let nap = WAKE_KILL_FLOOR - Duration::from_secs(1);
+        let disarmed = Expiry {
+            budget,
+            elapsed: awake + nap,
+            awake,
+        };
+        assert!(disarmed.elapsed > budget, "{disarmed:?}");
+        let left = disarmed
+            .remaining()
+            .expect("still disarmed, so still armed only on awake");
+        assert_eq!(left, WALL_CLOCK_TICK);
+        assert!(left <= disarmed.suspended(), "{disarmed:?}");
+        assert!(disarmed.suspended() < WAKE_KILL_FLOOR, "{disarmed:?}");
+
+        // One more second of nap arms the wall arm, and arming only ever
+        // shortens the window: `wall_left` is already zero, so it is over.
+        let armed = Expiry {
+            elapsed: disarmed.elapsed + Duration::from_secs(1),
+            ..disarmed
+        };
+        assert_eq!(armed.suspended(), WAKE_KILL_FLOOR);
+        assert_eq!(armed.remaining(), None);
+
+        // And armed *before* the wall budget runs out, the arm still answers
+        // with no more than the monotonic remainder — the invariant the whole
+        // bound rests on.
+        let early = Expiry {
+            budget,
+            elapsed: Duration::from_secs(50 * 60),
+            awake: Duration::from_secs(50 * 60) - Duration::from_secs(400),
+        };
+        assert!(early.suspended() >= WAKE_KILL_FLOOR, "{early:?}");
+        let wall_left = early.remaining().expect("the wall budget has not run out");
+        let awake_left = early.budget - early.awake;
+        assert!(wall_left <= awake_left, "{wall_left:?} vs {awake_left:?}");
+    }
+
+    /// The other half, and the one the old sentence got backwards: the
+    /// *wall-clock* overshoot at the firing poll has no bound whatsoever,
+    /// because nothing caps a suspend.
+    ///
+    /// A one-hour budget spent entirely awake, with the lid closed for three
+    /// hours during the last tick of it. The deadline is over — and it reads as
+    /// a plain timeout, which is the point: the overshoot is free, and #944 is
+    /// working. `unspent()` is zero because the run had every second of its
+    /// budget, so neither suspend sentence applies even though `suspended()` is
+    /// three hours. That pairing looks like a bug and is not, so it is pinned
+    /// rather than left to be discovered and "fixed".
+    #[test]
+    fn the_wall_clock_overshoot_at_the_firing_poll_is_unbounded() {
+        let expiry = Expiry {
+            budget: Duration::from_secs(3600),
+            elapsed: Duration::from_secs(4 * 3600),
+            awake: Duration::from_secs(3600),
+        };
+        assert_eq!(expiry.remaining(), None);
+        assert_eq!(expiry.suspended(), Duration::from_secs(3 * 3600));
+        assert!(expiry.unspent().is_zero(), "{expiry:?}");
+        assert!(!expiry.starved_by_suspend(), "{expiry:?}");
+        assert!(!expiry.wake_killed(), "{expiry:?}");
+        assert_eq!(expiry.to_string(), "the 1h budget ran out awake");
     }
 
     /// The #929 shape: a one-hour budget, a host away for eight of them, and 38
