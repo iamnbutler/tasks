@@ -71,6 +71,28 @@ independently testable and publishable, so it does not read the host
 project's equivalent (`TASKS_TEST_BIN_DIR`). A bare `cargo test` with nothing
 exported still works — it just builds once.
 
+**A supervisor-backed test waits for its events, never for a span of time.**
+The tests that assert over the event log used to `sleep` a fixed 200–500ms and
+assert whatever had arrived. What they were waiting for is a chain of process
+forks — `run_supervisor` awaits each `Execute` before reading the next line,
+and each one forks `sh` — so the sleep was a claim about how fast a loaded
+machine forks. Under `cargo nextest` against a freshly linked supervisor those
+forks were measured at 75–162ms apiece, which is how four commands overran a
+500ms sleep, and why these failed in parallel and passed alone. `await_vm_events`
+is the replacement: subscribe to the log *before* the first snapshot (so no
+append can fall between the two, which is what makes it a wait and not a poll),
+then wake on each event until the caller's predicate holds. Its 30s ceiling is
+a stall detector and not a schedule — nothing is expected to spend any of it —
+and it stays because a wait that ended only on success would hang a real
+regression instead of reporting it; on expiry the caller's own assertion still
+prints, which is why the messages are unchanged. It is duplicated between the
+pool's test module and `tests/integration.rs` on the `RecordingRuntime`
+grounds: `vm-pool-test-support` is a dev-dependency of the pool crate, and a
+shared home would need a dev-dependency cycle to reach `EventLog`. Where a fact
+is already synchronous, assert it with **no** wait at all — `deallocate`
+appends `Stopping` and `Stopped` before it returns, so sleeping there only
+widens the window for something else to land in a sequence asserted whole.
+
 Note the package/binary names differ: package `vm-pool-supervisor` declares
 `[[bin]] name = "supervisor"`, so the file cargo writes is `supervisor`. The
 helper checks the bin name first and the package name second, so pointing the
@@ -203,6 +225,27 @@ whitespace read as unset, which is a different thing from wrong.
   what it means only if the lock error maps onto `AlreadyRunning`; and
   `vm-pool-service` has no `libc`/`rustix`/`fs2` dependency today, while
   vm-pool stays independently publishable.
+- **A teardown drains a VM's events; it does not truncate them.** The bridge
+  task between the pool and a VM's transport used to answer a closed command
+  channel — which is exactly how an ordinary `deallocate` stops a VM, by
+  dropping the entry holding the sender — by sending `Shutdown` and breaking
+  out of its loop. Everything the VM had produced that the task had not yet
+  forwarded went on the floor, *including events already parsed and sitting in
+  the transport's queue*, because `select!` picks at random among ready
+  branches and the close can win against an `Output` that arrived before it.
+  Sending one command and deallocating delivered **nothing** — no app events,
+  not even the `Shutdown` the VM answered with — while the supervisor's own log
+  showed it had run the command and exited cleanly. It cost the child that
+  clean exit too: `close` drops the event receiver, which ends `read_events`,
+  which drops the read end of the pipe, so a supervisor still writing its last
+  event died of `Broken pipe` rather than returning on the `Shutdown` it had
+  just been handed. The fix costs no lifetime at all, which is the argument for
+  it: `close` already awaits the child, so the task already outlived the
+  teardown by exactly this window and merely spent it deaf — a VM that ignores
+  `Shutdown` hangs the task no longer than it always did. `bridge` is **one
+  function** and not a copy per runtime, because `ContainerRuntime` and
+  `SupervisorRuntime` had spawned byte-identical loops and this had to be found
+  twice before it could be fixed once.
 - **There are two leaks, and they need two mechanisms.** A **slot leak** is a
   VM that died while this pool still counted it; a **orphan leak** is a VM
   whose whole daemon went away, since `container run` outlives the process that

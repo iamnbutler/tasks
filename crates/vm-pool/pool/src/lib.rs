@@ -119,6 +119,75 @@ pub trait VmRuntime<P: AppProtocol = NullProtocol>: Send + Sync + 'static {
     fn stop(&self, vm_id: &VmId) -> impl Future<Output = Result<(), PoolError>> + Send;
 }
 
+/// Pump one VM's commands in and its events out, for as long as the VM lives.
+///
+/// One function rather than a copy per runtime: [`ContainerRuntime`] and
+/// [`SupervisorRuntime`] spawned byte-identical loops, and the truncation
+/// below had to be found and fixed in both before it was fixed at all.
+///
+/// **A teardown drains the VM's events; it does not truncate them.** When
+/// `cmd_rx` closes — which is how an ordinary [`Pool::deallocate`] stops a VM,
+/// by dropping the entry that holds the sender — this asks the VM to
+/// `Shutdown` and then keeps forwarding until the VM's own stream ends.
+/// Breaking out of the loop there is what it used to do, and it discarded
+/// every event the VM had produced that this task had not yet forwarded,
+/// including ones already parsed and sitting in the transport's queue:
+/// `select!` picks at random among ready branches, so an `Output` that had
+/// already arrived could still lose to the close. Sending a command and
+/// deallocating delivered nothing at all — no app events, not even the
+/// `Shutdown` the VM answered with — while the supervisor's own log showed it
+/// had run the command and exited cleanly.
+///
+/// It also cost the child a clean exit. `close` drops the event receiver,
+/// which ends `read_events`, which drops the read end of the pipe; a
+/// supervisor still writing its last event met EPIPE and died of `Broken pipe`
+/// instead of returning on the `Shutdown` it had just been handed.
+///
+/// Draining buys all of that for no lifetime at all: `close` already awaits
+/// the child, so this task already outlived the teardown by exactly this
+/// window. It only spent it deaf. A VM that ignores `Shutdown` therefore hangs
+/// this task no longer than it always did — the wait moved, it did not appear.
+async fn bridge<P: AppProtocol>(
+    mut transport: VmTransport<P>,
+    mut cmd_rx: mpsc::Receiver<VmCommand<P>>,
+    evt_tx: mpsc::Sender<VmEvent<P>>,
+) {
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(command) => {
+                        if let Err(e) = transport.send(&command).await {
+                            error!("failed to send command: {}", e);
+                            break;
+                        }
+                    }
+                    None => {
+                        let _ = transport.send(&VmCommand::<P>::Shutdown).await;
+                        while let Some(evt) = transport.recv().await {
+                            if evt_tx.send(evt).await.is_err() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            event = transport.recv() => {
+                match event {
+                    Some(evt) => {
+                        if evt_tx.send(evt).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    let _ = transport.close().await;
+}
+
 /// Real container runtime using apple/container CLI.
 ///
 /// Starts VMs with `container run -i` and communicates via the
@@ -192,46 +261,10 @@ impl<P: AppProtocol> VmRuntime<P> for ContainerRuntime {
         }
 
         // Set up command forwarding channels
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(64);
 
-        // Bridge task: forward commands to transport, events from transport
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(command) => {
-                                if let Err(e) = transport.send(&command).await {
-                                    error!("failed to send command: {}", e);
-                                    break;
-                                }
-                            }
-                            None => {
-                                // Command channel closed — shut down
-                                let _ = transport.send(&VmCommand::<P>::Shutdown).await;
-                                break;
-                            }
-                        }
-                    }
-                    event = transport.recv() => {
-                        match event {
-                            Some(evt) => {
-                                if evt_tx.send(evt).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => {
-                                // Transport closed
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            // Ensure cleanup
-            let _ = transport.close().await;
-        });
+        tokio::spawn(bridge(transport, cmd_rx, evt_tx));
 
         self.transports.write().await.insert(vm_id.clone(), ());
 
@@ -310,40 +343,10 @@ impl<P: AppProtocol> VmRuntime<P> for SupervisorRuntime {
             )));
         }
 
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VmCommand<P>>(64);
         let (evt_tx, evt_rx) = mpsc::channel::<VmEvent<P>>(64);
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(command) => {
-                                if let Err(e) = transport.send(&command).await {
-                                    error!("failed to send command: {}", e);
-                                    break;
-                                }
-                            }
-                            None => {
-                                let _ = transport.send(&VmCommand::<P>::Shutdown).await;
-                                break;
-                            }
-                        }
-                    }
-                    event = transport.recv() => {
-                        match event {
-                            Some(evt) => {
-                                if evt_tx.send(evt).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-            let _ = transport.close().await;
-        });
+        tokio::spawn(bridge(transport, cmd_rx, evt_tx));
 
         info!(%vm_id, path = %self.supervisor_path.display(), "supervisor started");
 
@@ -953,8 +956,79 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
     use vm_pool_protocol::{ShellCommand, ShellEvent, ShellProtocol};
     use vm_pool_test_support::supervisor_binary;
+
+    /// How long [`await_vm_events`] waits before reporting what it has.
+    ///
+    /// A stall detector, not a schedule — nothing here is expected to spend
+    /// any of it. See [`await_vm_events`].
+    const AWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Wait until this VM's events satisfy `done`, then return them.
+    ///
+    /// The supervisor-backed tests used to `sleep` a fixed span and assert
+    /// over whatever had arrived. What they were waiting for is a chain of
+    /// process forks — `run_supervisor` awaits each `Execute` before reading
+    /// the next line, and each one forks `sh` — so the sleep was a claim about
+    /// how fast a loaded machine forks. Under `cargo nextest` against a
+    /// freshly linked binary those forks were observed at 75–162ms apiece,
+    /// which is how four commands overran a 500ms sleep and how these tests
+    /// came to fail in parallel and pass alone.
+    ///
+    /// Subscribing *before* the first snapshot is what makes this a wait and
+    /// not a poll: no append can fall between the two, so the loop sleeps
+    /// until an event arrives and wakes on the one that satisfies it.
+    ///
+    /// The ceiling stays because a wait that ended *only* on success would
+    /// hang a genuine regression instead of reporting it. On expiry this
+    /// returns what the log holds and leaves the caller's own assertion to say
+    /// what was missing — the same message a fixed sleep gave, minus the
+    /// false alarms.
+    ///
+    /// Duplicated in `tests/integration.rs` rather than shared through
+    /// `vm-pool-test-support`, on the same grounds as [`RecordingRuntime`]:
+    /// that crate is a dev-dependency of this one, and a shared home would
+    /// need a dev-dependency cycle to reach `EventLog`.
+    async fn await_vm_events<F>(
+        events: &EventLog<ShellProtocol>,
+        vm_id: &VmId,
+        mut done: F,
+    ) -> Vec<Event<ShellProtocol>>
+    where
+        F: FnMut(&[Event<ShellProtocol>]) -> bool,
+    {
+        let mut rx = events.subscribe();
+        let deadline = tokio::time::Instant::now() + AWAIT_TIMEOUT;
+        loop {
+            let snapshot = events.for_vm(vm_id).await;
+            if done(&snapshot) {
+                return snapshot;
+            }
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(_)) => {}
+                // Lagged only means this loop missed a wakeup; the log is the
+                // source of truth and is re-read at the top regardless.
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                // Nothing more is coming, or the ceiling was reached.
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    return events.for_vm(vm_id).await;
+                }
+            }
+        }
+    }
+
+    /// The application events among a VM's log entries, oldest first.
+    fn app_events(events: &[Event<ShellProtocol>]) -> Vec<ShellEvent> {
+        events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::VmApp { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     /// A value that cannot authenticate anywhere. The bug this fixes is a
     /// credential written to a log; no test here may reproduce one, so the
@@ -1372,30 +1446,93 @@ mod tests {
         .await
         .unwrap();
 
-        // Wait for events to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let vm_events = events.for_vm(&vm_id).await;
-        let app_events: Vec<_> = vm_events
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::VmApp { event, .. } => Some(event.clone()),
-                _ => None,
+        let carries_the_marker = |evts: &[Event<ShellProtocol>]| {
+            app_events(evts).iter().any(|e| {
+                matches!(
+                    e,
+                    ShellEvent::Output { data, .. } if data.contains("pool-test")
+                )
             })
-            .collect();
+        };
+        let vm_events = await_vm_events(&events, &vm_id, carries_the_marker).await;
+        let app_events = app_events(&vm_events);
 
-        let has_output = app_events.iter().any(|e| {
-            matches!(
-                e,
-                ShellEvent::Output { data, .. } if data.contains("pool-test")
-            )
-        });
         assert!(
-            has_output,
+            carries_the_marker(&vm_events),
             "expected ShellEvent::Output with pool-test, got: {app_events:?}"
         );
 
         pool.deallocate(&vm_id).await.unwrap();
+    }
+
+    /// The drain in [`bridge`], with no timing assumption anywhere in it.
+    ///
+    /// The command is sent and the VM deallocated in the same breath, so
+    /// nothing has had a chance to arrive when the teardown begins — which is
+    /// the whole point. The transport is a pipe, so the supervisor reads
+    /// `Execute` before the `Shutdown` written after it; it answers both in
+    /// order, and the drain forwards until its stdout reaches EOF. `Shutdown`
+    /// is therefore the last event of the run, and waiting for it is a wait
+    /// for the stream to have ended rather than for a span of time to pass.
+    ///
+    /// Before the drain this found an empty log: `deallocate` drops the
+    /// command sender, and the bridge answered that by discarding every event
+    /// the VM had produced — including the ones it had already parsed.
+    #[tokio::test]
+    async fn a_deallocate_delivers_the_events_it_used_to_discard() {
+        let events = EventLog::<ShellProtocol>::new();
+        let pool: Arc<Pool<SupervisorRuntime, ShellProtocol>> = Pool::with_runtime(
+            PoolConfig {
+                max_vms: 1,
+                health_check_interval: 300,
+                vm_timeout: 7200,
+            },
+            events.clone(),
+            SupervisorRuntime::new(supervisor_binary()),
+        );
+
+        let vm_id = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+
+        pool.send_to_vm(
+            &vm_id,
+            ShellCommand::Execute {
+                command: "echo tail-marker".into(),
+            },
+        )
+        .await
+        .unwrap();
+        pool.deallocate(&vm_id).await.unwrap();
+
+        let vm_events = await_vm_events(&events, &vm_id, |evts| {
+            evts.iter().any(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::VmInfra {
+                        event: InfraEvent::Shutdown,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+        let app_events = app_events(&vm_events);
+
+        assert!(
+            app_events.iter().any(|e| matches!(
+                e,
+                ShellEvent::Output { data, .. } if data.contains("tail-marker")
+            )),
+            "the output the VM produced during teardown never reached the log: {app_events:?}"
+        );
+        assert!(
+            app_events
+                .iter()
+                .any(|e| matches!(e, ShellEvent::CommandCompleted { exit_code: 0 })),
+            "the command's completion never reached the log: {app_events:?}"
+        );
     }
 
     // --- Slot reclamation: a VM that dies while the pool still counts it ---
