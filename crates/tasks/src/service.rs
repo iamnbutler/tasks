@@ -90,6 +90,9 @@ fn io_err(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> ServiceE
 /// cannot disagree about which service they are talking about.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServicePaths {
+    /// The `$HOME` everything below hangs off — kept because the plist's
+    /// `PATH` needs it too (per-user tool dirs, [`plist_contents`]).
+    pub home: PathBuf,
     /// `~/.tasks/bin/tasks` — the binary's stable home.
     pub bin: PathBuf,
     /// `~/Library/LaunchAgents/<LABEL>.plist`.
@@ -108,6 +111,7 @@ impl ServicePaths {
     /// The layout rule, testable without an environment.
     pub fn under(home: &Path) -> Self {
         Self {
+            home: home.to_path_buf(),
             bin: home.join(HOME_DIR).join("bin").join("tasks"),
             plist: home
                 .join("Library/LaunchAgents")
@@ -197,8 +201,14 @@ fn xml_unescape(raw: &str) -> String {
 /// The `PATH` is launchd's minimal one plus the usual toolchain locations,
 /// for the same reason the app prepends them: the server shells out (`git`
 /// for landings), and launchd's `PATH` finds tools for exactly the people
-/// who did not need the help.
+/// who did not need the help. The per-user dirs lead it because they are
+/// where the tools this server actually spawns live: `~/.local/bin` is the
+/// `claude` native installer's home — under launchd the orchestrator's
+/// `spawn agent: No such file or directory` was exactly this entry missing —
+/// and `~/.cargo/bin` is what an orchestrator pointed at a checkout builds
+/// with.
 pub fn plist_contents(
+    home: &Path,
     bin: &Path,
     data_dir: &Path,
     log: &Path,
@@ -211,6 +221,10 @@ pub fn plist_contents(
         ),
         None => String::new(),
     };
+    let path_env = format!(
+        "{home}/.local/bin:{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        home = home.display()
+    );
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -236,7 +250,7 @@ pub fn plist_contents(
 		<key>TASKS_DATA_DIR</key>
 		<string>{data_dir}</string>
 		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>{mode_entry}
+		<string>{path_env}</string>{mode_entry}
 	</dict>
 </dict>
 </plist>
@@ -245,6 +259,7 @@ pub fn plist_contents(
         bin = xml_escape(&bin.display().to_string()),
         log = xml_escape(&log.display().to_string()),
         data_dir = xml_escape(&data_dir.display().to_string()),
+        path_env = xml_escape(&path_env),
     )
 }
 
@@ -312,7 +327,7 @@ pub fn write_plist(
     let log = tasks_api::paths::serve_log(data_dir);
     std::fs::write(
         &paths.plist,
-        plist_contents(&paths.bin, data_dir, &log, default_mode),
+        plist_contents(&paths.home, &paths.bin, data_dir, &log, default_mode),
     )
     .map_err(io_err(format!("writing {}", paths.plist.display())))
 }
@@ -369,10 +384,28 @@ pub async fn loaded() -> Result<bool, ServiceError> {
 /// Load the plist. `bootout` first, ignoring its failure: a job that is
 /// already loaded holds the *old* plist, and bootstrap refuses a loaded
 /// label, so the sequence is what makes `install` idempotent.
+///
+/// The bootstrap itself retries, because `bootout` returning is not the job
+/// being gone: launchd tears it down asynchronously, and a bootstrap that
+/// lands inside the teardown fails with exit 5 ("Input/output error") — which
+/// is exactly how the very first real `service install` on a machine with a
+/// running service failed. The retry is bounded and only for failure, so a
+/// genuinely broken plist still surfaces its error, just a few seconds later.
 pub async fn bootstrap(paths: &ServicePaths) -> Result<(), ServiceError> {
     let domain = gui_domain().await?;
     let _ = launchctl("bootout", &[&format!("{domain}/{LABEL}")]).await;
-    launchctl("bootstrap", &[&domain, &paths.plist.display().to_string()]).await
+    let plist = paths.plist.display().to_string();
+    let mut last = Err(ServiceError::Other("bootstrap never attempted".into()));
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        last = launchctl("bootstrap", &[&domain, &plist]).await;
+        if last.is_ok() {
+            return last;
+        }
+    }
+    last
 }
 
 /// Unload the job — the only stop that sticks, given `KeepAlive`.
@@ -582,6 +615,7 @@ mod tests {
     #[test]
     fn the_plist_carries_the_contract() {
         let contents = plist_contents(
+            Path::new("/Users/nb"),
             Path::new("/Users/nb/.tasks/bin/tasks"),
             Path::new("/Users/nb/.local/state/tasks-v2"),
             Path::new("/Users/nb/.local/state/tasks-v2/serve.log"),
@@ -595,6 +629,13 @@ mod tests {
         assert!(contents.contains("<key>KeepAlive</key>\n\t<true/>"));
         assert!(contents.contains("<key>RunAtLoad</key>\n\t<true/>"));
         assert!(contents.contains("<key>TASKS_DATA_DIR</key>"));
+        // The per-user tool dirs lead the PATH: `~/.local/bin` is where the
+        // `claude` native installer puts the binary the orchestrator spawns,
+        // and under launchd there is no shell profile to find it with.
+        assert!(
+            contents
+                .contains("<string>/Users/nb/.local/bin:/Users/nb/.cargo/bin:/opt/homebrew/bin")
+        );
         // No operator choice, no pin: a crash restart boots the server's own
         // quiet default.
         assert!(!contents.contains("TASKS_DEFAULT_MODE"));
@@ -603,6 +644,7 @@ mod tests {
     #[test]
     fn a_chosen_default_mode_is_pinned_and_only_then() {
         let contents = plist_contents(
+            Path::new("/t"),
             Path::new("/t/tasks"),
             Path::new("/t/data"),
             Path::new("/t/data/serve.log"),
@@ -620,6 +662,7 @@ mod tests {
     fn the_pinned_data_dir_roundtrips_and_gates_delegation() {
         let data_dir = Path::new("/Users/a&b/.local/state/tasks-v2");
         let contents = plist_contents(
+            Path::new("/t"),
             Path::new("/t/tasks"),
             data_dir,
             Path::new("/t/serve.log"),
@@ -639,12 +682,15 @@ mod tests {
     #[test]
     fn paths_are_xml_escaped() {
         let contents = plist_contents(
+            Path::new("/Users/a&b"),
             Path::new("/Users/a&b/.tasks/bin/tasks"),
             Path::new("/Users/a&b/data"),
             Path::new("/Users/a&b/data/serve.log"),
             None,
         );
         assert!(contents.contains("/Users/a&amp;b/.tasks/bin/tasks"));
+        // The PATH interpolates $HOME too, so it escapes with everything else.
+        assert!(contents.contains("/Users/a&amp;b/.local/bin"));
         assert!(!contents.contains("a&b"));
     }
 
