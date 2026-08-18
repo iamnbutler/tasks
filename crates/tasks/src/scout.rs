@@ -131,6 +131,26 @@ impl ScoutError {
             // Unconditionally `Transport`, then and now; #944 changed only
             // which expiries are allowed to reach it.
             Self::Suspended(_) => FailureClass::Transport,
+            // A refusal from vm-pool, classified off the structural `kind`
+            // rather than the message it came with — one statement, shared
+            // with the builder, in `FailureClass::for_service_error`. In
+            // practice this is `Capacity`: a pool with every slot allocated
+            // right now, which the next dispatch of this same task finds free.
+            //
+            // **The waiver and #967's hold are one story, and this arm alone
+            // is not safe.** Waiving is only right because a full pool clears
+            // by itself, and "clears" means something retries. The retry is
+            // `crate::pool_health`, which holds new dispatch while
+            // `status.available` is 0 and releases it when a slot frees; the
+            // unwind beside it is what puts a refused task back in `Queued` to
+            // be retried at all. Without the hold, `DISPATCH_TICK` is 500ms
+            // and a waived strike is an uncounted 2Hz retry against a
+            // permanently full pool — which is precisely the retry-forever
+            // loop that keeps `Image` charged. Do not delete the hold and keep
+            // this arm.
+            Self::Client(ClientError::Service { kind, .. }) => {
+                FailureClass::for_service_error(*kind)
+            }
             Self::Store(_) | Self::Client(_) | Self::Timeout { .. } => FailureClass::Verdict,
         }
     }
@@ -172,6 +192,13 @@ pub struct ScoutTarget {
     pub base_branch: String,
 }
 
+/// What [`Scout::start`] hands to the drain: the run exists, and these are the
+/// two handles it is followed by.
+struct Started {
+    session_id: SessionId,
+    vm_id: VmId,
+}
+
 pub struct Scout {
     store: Arc<Store>,
     client: ClientHandle<TasksProtocol>,
@@ -197,6 +224,15 @@ impl Scout {
     /// On success, returns the persisted [`Spec`]. Task state is advanced to
     /// `InReview` and a spec-queue entry is created with status
     /// `PendingReview`.
+    ///
+    /// The two halves are `Scout::start` — everything from the `Scouting`
+    /// transition through the session row — and `Scout::follow`. The split
+    /// is what gives every *pre-session* failure one place to undo the
+    /// `Scouting` claim (see `Scout::unwind_unstarted`), which is the shape
+    /// `Builder::conclude` already had and the shape #967 needed: an allocate
+    /// refusal returns before any session row exists, so `finalize_failed` —
+    /// the only path back to `Queued` — never runs, and `run::next_dispatchable`
+    /// could not see the task again until the next boot.
     pub async fn dispatch(&self, task: Task, target: &ScoutTarget) -> Result<Spec, ScoutError> {
         info!(task_id = %task.id, "scout dispatch starting");
         // Anchored before anything else so the deadline covers allocation too,
@@ -208,6 +244,82 @@ impl Scout {
         // Subscribe before allocating so no event for our VM can be missed.
         let mut events = self.client.subscribe_events();
 
+        let started = match self.start(&task, target).await {
+            Ok(started) => started,
+            Err(e) => {
+                // One place, for every way starting can fail. Best-effort and
+                // last, so it cannot replace the error the caller is about to
+                // report.
+                self.unwind_unstarted(&task).await;
+                return Err(e);
+            }
+        };
+
+        let app = AppEvents::live(&mut events, started.vm_id.clone());
+        self.follow(
+            &started.session_id,
+            &task,
+            &started.vm_id,
+            app,
+            &deadline,
+            None,
+        )
+        .await
+    }
+
+    /// Return a task this dispatch claimed but never started to `Queued`.
+    ///
+    /// Three details are deliberate. It **reads the state back** and only
+    /// undoes an actual `Scouting`, because the failure may *be* the
+    /// transition — this way it can only ever undo its own change. It is
+    /// **best-effort**: this path is already failing, and a bookkeeping error
+    /// must not replace the error the caller is about to report. And it writes
+    /// **no `Note`** — `run::record_outcome` already appends one per failed
+    /// dispatch, and a second would double every line on a 500ms loop.
+    ///
+    /// The hold in [`crate::pool_health`] makes this rare rather than
+    /// unnecessary: a slot can go between the probe and the allocation, and
+    /// `PROBE_INTERVAL` is five seconds wide. This is what makes losing that
+    /// race cost a tick instead of a restart.
+    async fn unwind_unstarted(&self, task: &Task) {
+        let claimed = match self.store.get_task(&task.id).await {
+            Ok(Some(current)) => current.state == TaskState::Scouting,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "could not read back a task to unwind it");
+                return;
+            }
+        };
+        if !claimed {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .update_task_state(&task.id, TaskState::Queued)
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "could not return a task to the queue");
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .append_event(EventPayload::TaskStateChanged {
+                task_id: task.id.clone(),
+                from: TaskState::Scouting,
+                to: TaskState::Queued,
+            })
+            .await
+        {
+            warn!(task_id = %task.id, error = %e, "could not log a task returning to the queue");
+        }
+        info!(task_id = %task.id, "a scout that never started returned its task to the queue");
+    }
+
+    /// Everything from the `Scouting` claim through the session row and the
+    /// `Start` command. A failure anywhere in here has left no session to
+    /// conclude, which is exactly what makes [`Scout::unwind_unstarted`] the
+    /// right and only cleanup.
+    async fn start(&self, task: &Task, target: &ScoutTarget) -> Result<Started, ScoutError> {
         // Advance task state to Scouting and log the transition.
         self.store
             .update_task_state(&task.id, TaskState::Scouting)
@@ -259,7 +371,7 @@ impl Scout {
             );
         }
         let prompt = render_prompt(
-            &task,
+            task,
             prior.as_ref(),
             salvage.as_ref(),
             task.scout_directions.as_ref(),
@@ -281,6 +393,56 @@ impl Scout {
             "allocated scout VM"
         );
 
+        if let Err(e) = self.register(task, &session_id, &vm_id).await {
+            // The one window in which a leaked slot is invisible to all three
+            // reclamations: the pool holds a VM, and no row anywhere names it.
+            // So hand it straight back rather than leaving it for a sweep that
+            // has nothing to sweep from.
+            crate::teardown::deallocate_bounded(
+                &self.client,
+                &self.store,
+                &vm_id,
+                &format!("unregistered scout for task {}", task.id),
+                crate::teardown::DEALLOCATE_TIMEOUT,
+            )
+            .await;
+            return Err(e);
+        }
+
+        // Send Start
+        if let Err(e) = self
+            .client
+            .send_to_vm(
+                &vm_id,
+                TaskCommand::Scout(ScoutCommand::Start {
+                    task_id: task.id.to_string(),
+                    repo_clone_url: target.repo_clone_url.clone(),
+                    base_branch: target.base_branch.clone(),
+                    prompt,
+                }),
+            )
+            .await
+        {
+            // Past `register` there *is* a session to conclude, so this keeps
+            // concluding it — `finalize_failed` returns the task to `Queued`
+            // itself, and `unwind_unstarted` reads the state back and finds
+            // nothing of its own to undo.
+            self.finalize_failed(&session_id, task, Some(&vm_id), format!("send: {e}"))
+                .await?;
+            return Err(e.into());
+        }
+
+        Ok(Started { session_id, vm_id })
+    }
+
+    /// Persist the session row and announce it. Split out so [`Scout::start`]
+    /// has one fallible expression to hang the VM hand-back on.
+    async fn register(
+        &self,
+        task: &Task,
+        session_id: &SessionId,
+        vm_id: &VmId,
+    ) -> Result<(), ScoutError> {
         // Persist initial session (branch filled in once Scout emits Started).
         let session_row = Session {
             id: session_id.clone(),
@@ -303,29 +465,7 @@ impl Scout {
                 task_id: task.id.clone(),
             })
             .await?;
-
-        // Send Start
-        if let Err(e) = self
-            .client
-            .send_to_vm(
-                &vm_id,
-                TaskCommand::Scout(ScoutCommand::Start {
-                    task_id: task.id.to_string(),
-                    repo_clone_url: target.repo_clone_url.clone(),
-                    base_branch: target.base_branch.clone(),
-                    prompt,
-                }),
-            )
-            .await
-        {
-            self.finalize_failed(&session_id, &task, Some(&vm_id), format!("send: {e}"))
-                .await?;
-            return Err(e.into());
-        }
-
-        let app = AppEvents::live(&mut events, vm_id.clone());
-        self.follow(&session_id, &task, &vm_id, app, &deadline, None)
-            .await
+        Ok(())
     }
 
     /// Pick up a scout a previous process left running.
@@ -1546,6 +1686,87 @@ mod tests {
             Strike::for_class(ScoutError::Timeout { secs: 1 }.failure_class()),
             Strike::Charge,
         );
+    }
+
+    /// A refusal by a service the client can still talk to.
+    fn refused(kind: crate::protocol::ServiceErrorKind, message: &str) -> ScoutError {
+        ScoutError::Client(ClientError::Service {
+            message: message.into(),
+            kind,
+        })
+    }
+
+    /// #930. A pool with every slot allocated right now is a fact about the
+    /// *moment*, and the identical dispatch succeeds once one frees — so it
+    /// judged nothing and costs the task no attempt. Three full pools used to
+    /// reject a task nothing had looked at.
+    ///
+    /// The negative half is in the same test, and it is the whole line this
+    /// change draws: a refusal that does **not** clear by itself still
+    /// charges. An image reference that does not resolve refuses identically
+    /// forever, and `Unspecified` — which is every refusal from a vm-pool
+    /// older than the field — must charge too, or an old daemon silently
+    /// waives every permanent misconfiguration it has.
+    #[test]
+    fn a_full_pool_is_transport_while_every_other_refusal_still_charges() {
+        use crate::protocol::ServiceErrorKind;
+        use crate::store::Strike;
+
+        let full = refused(ServiceErrorKind::Capacity, "pool exhausted: 0 available");
+        assert_eq!(full.failure_class(), FailureClass::Transport);
+        assert_eq!(Strike::for_class(full.failure_class()), Strike::Waive);
+
+        for kind in [
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            let error = refused(kind, "allocate failed");
+            assert_eq!(
+                error.failure_class(),
+                FailureClass::Verdict,
+                "{kind} must not be waived"
+            );
+            assert_eq!(Strike::for_class(error.failure_class()), Strike::Charge);
+        }
+
+        // And an ordinary empty-handed run is charged exactly as it was.
+        assert_eq!(
+            Strike::for_class(
+                ScoutError::ScoutFailed {
+                    reason: "SPEC.md not found".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+    }
+
+    /// The refusal has to reach the class check at all. `record_outcome`
+    /// consults `is_disconnect` first, so a refusal folded in there would be
+    /// waived for the wrong reason *and* would throw away a working socket.
+    #[test]
+    fn a_refusal_is_not_a_disconnect() {
+        use crate::protocol::ServiceErrorKind;
+
+        assert!(!crate::run::is_disconnect(&refused(
+            ServiceErrorKind::Capacity,
+            "pool exhausted"
+        )));
+        assert!(!crate::run::is_disconnect(&refused(
+            ServiceErrorKind::Image,
+            "no such image"
+        )));
+        assert!(crate::run::is_disconnect(&ScoutError::Client(
+            ClientError::Closed
+        )));
+        assert!(crate::run::is_disconnect(&ScoutError::StreamClosed));
     }
 
     /// #929, on the scout side. A budget the host slept through is not a budget

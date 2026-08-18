@@ -844,6 +844,7 @@ pub fn render_status(
             out.push_str(&format!("binary   {}\n", file.exe.display()));
             out.push_str(&format!("mode     {}\n", status.mode.as_str()));
             out.push_str(&render_github_hold(status, now));
+            out.push_str(&render_pool_hold(status, now));
             out.push_str(&render_update_pending(status));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
@@ -874,6 +875,28 @@ pub fn render_github_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
         hold.failures,
         humanize(now - hold.last_seen),
         hold.error
+    )
+}
+
+/// Why the pipeline is idle, when the reason is that vm-pool has no free slot.
+///
+/// Silent with no hold, for the same reason as the GitHub line. It prints
+/// **`0 of N`** rather than "full", because `0 of 0` is a `VM_POOL_MAX_VMS`
+/// that can never dispatch and `0 of 6` is work (or a leaked VM) holding every
+/// slot — different problems with different fixes, and a reader cannot tell
+/// them apart from the word "full".
+pub fn render_pool_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(hold) = &status.pool else {
+        return String::new();
+    };
+    format!(
+        "vm-pool  0 of {} slots available for {} ({} observation(s), last {} ago) — \
+         scout and build dispatch is held; queued work stays queued and nothing is \
+         charged an attempt\n",
+        hold.total,
+        humanize(now - hold.since),
+        hold.observations,
+        humanize(now - hold.last_seen),
     )
 }
 
@@ -1053,6 +1076,7 @@ mod tests {
             in_flight,
             images: Vec::new(),
             github: None,
+            pool: None,
             update: None,
         }
     }
@@ -1106,6 +1130,47 @@ mod tests {
             ts("2026-08-15T13:00:00Z"),
         );
         assert!(!whole.contains("github"), "{whole}");
+    }
+
+    /// The third hold reports like the other two: nothing at all while there
+    /// is nothing to say, and when there is, `0 of N` rather than "full" —
+    /// `0 of 0` is a pool that can never dispatch and `0 of 6` is one holding
+    /// every slot, and those want different fixes.
+    #[test]
+    fn a_pool_with_no_slot_names_the_ceiling_it_is_against() {
+        use tasks_api::http::PoolHold;
+
+        let mut status = status_with(InFlight::default());
+        assert_eq!(render_pool_hold(&status, ts("2026-08-15T13:00:00Z")), "");
+        assert!(
+            !render_status(
+                Some(&pidfile_at(4800)),
+                Some(&status),
+                ts("2026-08-15T13:00:00Z")
+            )
+            .contains("vm-pool"),
+        );
+
+        status.pool = Some(PoolHold {
+            since: ts("2026-08-15T12:50:00Z"),
+            last_seen: ts("2026-08-15T12:59:55Z"),
+            observations: 120,
+            total: 6,
+        });
+        let line = render_pool_hold(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("0 of 6 slots"), "{line}");
+        assert!(!line.contains("full"), "{line}");
+        assert!(line.contains("dispatch is held"), "{line}");
+        assert!(
+            line.contains("nothing is charged an attempt"),
+            "the reader's next question is whether work is being lost: {line}"
+        );
+        assert!(line.contains("120 observation"), "{line}");
+
+        // `VM_POOL_MAX_VMS=0` — a permanent hold, and the number is what says
+        // which problem it is.
+        status.pool.as_mut().unwrap().total = 0;
+        assert!(render_pool_hold(&status, ts("2026-08-15T13:00:00Z")).contains("0 of 0 slots"),);
     }
 
     /// The one time it appears it has to answer the reader's real question —

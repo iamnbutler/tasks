@@ -435,6 +435,39 @@ pub struct ServerStatus {
     /// reason as the fields above.
     #[serde(default)]
     pub update: Option<UpdatePending>,
+    /// Set for as long as scout and build dispatch is being held because
+    /// vm-pool has no free slot; `None` the rest of the time.
+    ///
+    /// `#[serde(default)]` for the same reload-skew reason as `images` and
+    /// `github`: `reload` reads `/status` off the *older* server before it
+    /// swaps, so the binary decoding this is by construction newer than the
+    /// one answering.
+    #[serde(default)]
+    pub pool: Option<PoolHold>,
+}
+
+/// Why the pipeline is idle when vm-pool has no slot to give.
+///
+/// A refused allocation used to cost a task a dispatch attempt *and* strand it
+/// in `Scouting` until the next boot (#967). Holding costs neither: queued
+/// work stays queued, and the next probe that finds a slot releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolHold {
+    /// The first observation with no slot free — "full since", which later
+    /// ones do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent such observation. The gap between this and now is the
+    /// difference between a hold the gates are still refreshing and one about
+    /// to expire on its own.
+    pub last_seen: DateTime<Utc>,
+    /// How many observations since `since` found no slot.
+    pub observations: u32,
+    /// `VM_POOL_MAX_VMS` as the pool last reported it. Carried because
+    /// **`0 of 0` and `0 of 6` are different problems**: the first is a pool
+    /// that can never dispatch, the second is work or a leak holding every
+    /// slot. Every renderer prints `0 of N` rather than "full" for exactly
+    /// that reason.
+    pub total: usize,
 }
 
 /// Why new containers are waiting: an upgrade is half-applied.

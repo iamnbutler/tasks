@@ -271,6 +271,191 @@ async fn scout_dispatch_failure_resets_task_to_new() {
     );
 }
 
+/// #930 and #967 together, end to end and with no mocks: a real pool with its
+/// only slot already taken, a real `pool exhausted` over a real socket.
+///
+/// Three things are asserted about the refusal, and each is a different half
+/// of this batch. It is `FailureClass::Transport` and `Strike::Waive` (#930 —
+/// the strike ledger), the task is back in `Queued` rather than stranded in
+/// `Scouting` (#967 — the pipeline), and nothing was persisted for a run that
+/// never happened: no session row, no spec, no queue entry.
+///
+/// **This calls `Scout::dispatch` directly, past the gate, deliberately.**
+/// #967's `pool_health` hold lives in `run::top_up` and the build lane, not in
+/// the dispatcher, so once a probe has seen an exhausted pool the production
+/// path stops *making* this allocation at all. What is exercised here is the
+/// race the hold leaves open — a slot going between the probe and the
+/// allocation, `PROBE_INTERVAL` being five seconds wide — which is precisely
+/// the case the classification and the unwind exist for.
+///
+/// Then the negative half over the same socket: free the slot and the *same
+/// task*, from the state the refusal left it in, scouts to a spec. That is
+/// what makes the waiver meaningful — and, since #967, `Queued` is a state the
+/// production dispatcher can pick up again, so the sentence is about the
+/// pipeline and not only about this test's own call.
+#[tokio::test]
+async fn a_scout_refused_a_vm_is_not_charged_and_keeps_its_place_in_the_queue() {
+    use tasks::protocol::FailureClass;
+    use tasks::scout::ScoutError;
+    use tasks::store::Strike;
+    use vm_pool_protocol::VmConfig as PoolVmConfig;
+
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+
+    let agent = stub_agent_path();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        agent.to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+    // One slot, and the test takes it.
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+    let squatter = client
+        .handle()
+        .allocate("agent:v1", PoolVmConfig::default())
+        .await
+        .expect("the only slot");
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) =
+        insert_project_and_task(&store, "Refused a VM", "The pool was full.").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: repo_url,
+        base_branch: "main".into(),
+    };
+
+    let refused = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("the pool has no slot to give");
+    assert!(
+        matches!(&refused, ScoutError::Client(_)),
+        "expected a refusal from vm-pool, got {refused:?}"
+    );
+    assert_eq!(
+        refused.failure_class(),
+        FailureClass::Transport,
+        "a full pool is a fact about the moment, not a verdict on the work: {refused}"
+    );
+    assert_eq!(Strike::for_class(refused.failure_class()), Strike::Waive);
+
+    // Nothing was persisted for a run that never started.
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "a refusal returns before any session row exists"
+    );
+    assert!(store.list_specs().await.unwrap().is_empty());
+    assert!(store.list_spec_queue().await.unwrap().is_empty());
+
+    // #967: back in the queue, not stranded in `Scouting`.
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::Queued,
+        "a task that never started must not be left claimed"
+    );
+
+    // The negative half, over the same socket: free the slot and the same task
+    // scouts fine.
+    client.handle().deallocate(&squatter).await.unwrap();
+    let spec = scout
+        .dispatch(store.get_task(&task.id).await.unwrap().unwrap(), &target)
+        .await
+        .expect("with a slot free, the identical dispatch succeeds");
+    assert!(!spec.content.is_empty());
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0,
+        "and it never cost an attempt along the way"
+    );
+}
+
+/// #967's unwind on its own, against a pool that can never allocate
+/// (`max_vms: 0` binds the socket and answers `status` while failing every
+/// allocate). Direct, because this is the branch the gate cannot cover: a slot
+/// can go between the probe and the allocation.
+#[tokio::test]
+async fn a_dispatch_that_never_started_returns_its_task_to_the_queue() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper =
+        write_supervisor_wrapper(tmp.path(), &supervisor_bin, "true", &workdir_root).await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 0).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "No slots ever", "body").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+        },
+    );
+    let target = ScoutTarget {
+        repo_clone_url: format!("file://{}", repo.display()),
+        base_branch: "main".into(),
+    };
+
+    assert!(scout.dispatch(task.clone(), &target).await.is_err());
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::Queued,
+    );
+
+    // The unwind undoes its *own* change and nothing else — a second refusal
+    // against a task already back in the queue is a no-op, not a second
+    // transition event.
+    assert!(
+        scout
+            .dispatch(store.get_task(&task.id).await.unwrap().unwrap(), &target)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::Queued,
+    );
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0,
+        "the dispatcher charges attempts, not the dispatch"
+    );
+}
+
 /// #760: a task re-dispatched after `needs_revision` must receive the
 /// reviewer's feedback and the spec it referred to.
 ///

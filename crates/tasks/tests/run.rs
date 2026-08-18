@@ -16,6 +16,7 @@ use axum::routing::post;
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::watch;
+use vm_pool_client::Client;
 use vm_pool_manager::SupervisorRuntime;
 use vm_pool_protocol::VmConfig;
 use vm_pool_service::Service;
@@ -30,6 +31,7 @@ use tasks::models::{
     ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
     SpecQueueStatus, Task, TaskId, TaskState,
 };
+use tasks::pool_health::PoolHealth;
 use tasks::run::{self, Config, GitHubWatch, InFlight};
 use tasks::store::Store;
 use tasks::updates::UpdateWatch;
@@ -44,6 +46,12 @@ use common::{
 /// predates the process running it, and a fresh store has observed no images.
 fn test_update_watch() -> Arc<UpdateWatch> {
     Arc::new(UpdateWatch::at_boot(true))
+}
+
+/// A fresh vm-pool capacity record. It has observed nothing, so it holds
+/// nothing — the loop's own first probe is what fills it in.
+fn test_pool_health() -> Arc<PoolHealth> {
+    Arc::new(PoolHealth::new())
 }
 
 // --- GitHub poll loop ---
@@ -290,6 +298,7 @@ async fn a_github_hold_starts_no_scout_and_charges_nothing() {
         InFlight::default(),
         health.clone(),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -360,6 +369,7 @@ async fn a_github_hold_never_claims_a_build() {
         InFlight::default(),
         health.clone(),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -390,6 +400,281 @@ async fn a_github_hold_never_claims_a_build() {
         .await
         .expect("build loop exits on shutdown")
         .unwrap();
+}
+
+/// #967, the scout half. A pool with no free slot must **hold** dispatch, not
+/// dispatch into a refusal.
+///
+/// Disabling this gate alone (leaving the unwind) is what makes the point:
+/// `DISPATCH_TICK` is 500ms, so the loop burns all three `dispatch_attempts` in
+/// under two seconds and rejects a healthy task — `Rejected` where this asserts
+/// `Queued`. With #930 in force it does not reject, and instead produces an
+/// unbounded stream of waiver `Note`s into the feed and the orchestrator's
+/// input, which is the same failure one level up.
+///
+/// The release half is not optional: "held ⇒ nothing dispatched" passes just as
+/// well when the dispatch loop is broken. So the test hands the slot back and
+/// waits for the work to actually go out. Both halves over one real pool, no
+/// mocks.
+#[tokio::test]
+async fn a_full_pool_starts_no_scout_and_charges_nothing() {
+    let (_tmp, store, config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "waits for a slot").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    // Take the pool's only slot, from outside the loop under test.
+    let squatter_client: Client<TasksProtocol> =
+        Client::connect(&config.vm_pool_socket).await.unwrap();
+    let squatter = squatter_client
+        .handle()
+        .allocate("agent:v1", VmConfig::default())
+        .await
+        .expect("the only slot");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        test_update_watch(),
+        test_pool_health(),
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "a held dispatcher starts nothing"
+    );
+    let held = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(
+        held.state,
+        TaskState::Queued,
+        "and never claims a task it cannot start"
+    );
+    assert_eq!(
+        held.dispatch_attempts, 0,
+        "holding costs the task no attempt — that is the whole point"
+    );
+
+    // The hold is announced once, and it says what it costs.
+    let notes = dispatcher_notes(&store).await;
+    assert_eq!(notes.len(), 1, "one edge, one note: {notes:?}");
+    assert!(notes[0].contains("no free slot"), "{}", notes[0]);
+    assert!(
+        notes[0].contains("nothing is charged an attempt"),
+        "{}",
+        notes[0]
+    );
+
+    // Release: the same task, from the same state, scouts to a spec.
+    squatter_client
+        .handle()
+        .deallocate(&squatter)
+        .await
+        .unwrap();
+    let s = store.clone();
+    wait_until(Duration::from_secs(60), || {
+        let s = s.clone();
+        async move { s.list_specs().await.unwrap().len() == 1 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0,
+        "and it never cost an attempt along the way"
+    );
+}
+
+/// #967, the build half. The hold sits in the match guard **ahead of the
+/// claim**, for the same reason the GitHub one does: claiming flips the build
+/// `queued → running` and drags its batch's tasks to `building`, so a
+/// claim-then-refuse would do that on every tick of a full pool.
+///
+/// Disabling this gate alone gives `Failed` where this asserts `Queued`.
+#[tokio::test]
+async fn a_full_pool_never_claims_a_build() {
+    let (_tmp, store, mut config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let (task, build) = queued_build(&store, &project).await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    // An unconfigured lane disables itself, and this test would then pass for
+    // the wrong reason.
+    config.github_token = Some("token".into());
+    config.builder_timeout = Duration::from_secs(10);
+
+    let squatter_client: Client<TasksProtocol> =
+        Client::connect(&config.vm_pool_socket).await.unwrap();
+    let squatter = squatter_client
+        .handle()
+        .allocate("agent:v1", VmConfig::default())
+        .await
+        .expect("the only slot");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::build_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        test_update_watch(),
+        test_pool_health(),
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        store.get_build(&build.id).await.unwrap().unwrap().status,
+        BuildStatus::Queued,
+        "a held lane never claims"
+    );
+    assert_eq!(
+        store.get_task(&task.id).await.unwrap().unwrap().state,
+        TaskState::ReadyToBuild,
+        "and never drags its batch's tasks to `building`"
+    );
+
+    squatter_client
+        .handle()
+        .deallocate(&squatter)
+        .await
+        .unwrap();
+    let s = store.clone();
+    let id = build.id.clone();
+    wait_until(Duration::from_secs(30), || {
+        let s = s.clone();
+        let id = id.clone();
+        async move { s.get_build(&id).await.unwrap().unwrap().status != BuildStatus::Queued }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("build loop exits on shutdown")
+        .unwrap();
+}
+
+/// Two loops racing across one edge write **one** `Note`, not two — the probe
+/// claim is what admits exactly one of them to the `observe` that returns the
+/// transition. Announcing off the `hold` predicate instead would write one per
+/// tick from each loop, which is the event-log flood this change exists to
+/// prevent, one level up.
+#[tokio::test]
+async fn two_loops_across_one_edge_announce_the_hold_once() {
+    let (_tmp, store, mut config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let _ = insert_task(&store, &project, 1, "waits for a slot").await;
+    let (_task, build) = queued_build(&store, &project).await;
+    store.set_mode(Mode::Play).await.unwrap();
+    config.github_token = Some("token".into());
+    config.builder_timeout = Duration::from_secs(10);
+
+    let squatter_client: Client<TasksProtocol> =
+        Client::connect(&config.vm_pool_socket).await.unwrap();
+    let squatter = squatter_client
+        .handle()
+        .allocate("agent:v1", VmConfig::default())
+        .await
+        .expect("the only slot");
+
+    // One shared record, exactly as `run()` builds it.
+    let pool = test_pool_health();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let scouts = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config.clone(),
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        test_update_watch(),
+        pool.clone(),
+        shutdown_rx.clone(),
+    ));
+    let builds = tokio::spawn(run::build_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        test_update_watch(),
+        pool.clone(),
+        shutdown_rx,
+    ));
+
+    // Several probe intervals' worth of ticks from both loops.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let held = dispatcher_notes(&store).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "two loops, one edge, one note — got {held:?}"
+    );
+    assert!(held[0].contains("no free slot"), "{}", held[0]);
+
+    // And the same across the *other* edge.
+    squatter_client
+        .handle()
+        .deallocate(&squatter)
+        .await
+        .unwrap();
+    let s = store.clone();
+    wait_until(Duration::from_secs(30), || {
+        let s = s.clone();
+        async move { dispatcher_notes(&s).await.len() >= 2 }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let both = dispatcher_notes(&store).await;
+    assert_eq!(both.len(), 2, "the release is one edge too: {both:?}");
+    assert!(both[1].contains("freed a slot"), "{}", both[1]);
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(60), scouts).await;
+    let _ = tokio::time::timeout(Duration::from_secs(60), builds).await;
+
+    // Both loops woke to the same freed slot and one of them lost the race —
+    // the probe-to-allocate window #967 leaves open, and the one place #930's
+    // waiver still applies to a live dispatch. It is *not* asserted here: this
+    // harness hands the build lane a scout supervisor, so a build that takes
+    // the slot fails as an ordinary verdict and the two outcomes would be
+    // indistinguishable. The refusal's classification is pinned end to end in
+    // `tests/scout.rs`, against a real `pool exhausted` over a real socket.
+    let _ = store.get_build(&build.id).await;
+}
+
+/// The `Note`s the capacity hold wrote — its two edges and nothing else. Note
+/// the filter is the transition wording rather than "vm-pool": #930's waiver
+/// notes name vm-pool too, and counting those as edges would be counting the
+/// wrong thing.
+async fn dispatcher_notes(store: &Store) -> Vec<String> {
+    store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EventPayload::Note { message, .. }
+                if message.contains("no free slot") || message.contains("freed a slot") =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One approved spec, by the path a real one takes, with a build queued behind
@@ -1055,6 +1340,7 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1250,6 +1536,7 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1308,6 +1595,7 @@ async fn pause_blocks_new_dispatches() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1395,6 +1683,7 @@ async fn an_agent_that_concluded_with_nothing_still_burns_its_three() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1478,6 +1767,7 @@ async fn an_infrastructure_death_never_rejects_the_task() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1560,6 +1850,7 @@ async fn a_restart_resumes_the_persisted_attempt_count() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1632,6 +1923,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1682,6 +1974,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         test_update_watch(),
+        test_pool_health(),
         shutdown_rx,
     ));
 
@@ -1809,6 +2102,7 @@ async fn an_update_hold_starts_no_scout_and_observing_the_rebuilt_image_releases
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
         updates,
+        test_pool_health(),
         shutdown_rx,
     ));
 

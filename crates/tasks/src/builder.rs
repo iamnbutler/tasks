@@ -136,13 +136,27 @@ impl BuilderError {
             // changed is only which expiries reach this arm — the class is
             // unconditionally `Transport` and always was.
             Self::Suspended(_) => FailureClass::Transport,
-            // `Client(_)` stays a verdict deliberately, not by oversight.
-            // `Store::finalize_build_unsuccessfully` only charges `if
-            // started` (the row has a `vm_id`, set immediately after
-            // `allocate`), so this arm can only bite after a VM exists —
-            // whether that is really transport is a separate question with
-            // its own argument to make, and widening it silently here would
-            // decide it for the scout too.
+            // A refusal *by* vm-pool, as opposed to a broken connection to
+            // it, is classified off the structural `kind` through the same
+            // `FailureClass::for_service_error` the scout uses. That question
+            // — what one refusal means — used to have two answers here, and
+            // the comment that stood in this place deferred it. It is
+            // **behaviour-neutral for a build**: `Capacity` can only come from
+            // `allocate`, and `Store::finalize_build_unsuccessfully` charges
+            // only `if started`, which a build that failed at `allocate` is
+            // not. It is written anyway because the disagreement is the
+            // hazard: two dispatchers giving different answers about one
+            // refusal is how the next bug of this shape gets written, and the
+            // `if started` guard is a coincidence of where the failure lands
+            // rather than a decision anybody made about refusals.
+            Self::Client(ClientError::Service { kind, .. }) => {
+                FailureClass::for_service_error(*kind)
+            }
+            // Every other `Client(_)` — a closed or unbuildable connection —
+            // stays a verdict deliberately, not by oversight. Whether *that*
+            // is really transport is a separate question with its own argument
+            // to make, and widening it silently here would decide it for the
+            // scout too.
             Self::Store(_) | Self::Client(_) | Self::GitHub(_) | Self::Timeout { .. } => {
                 FailureClass::Verdict
             }
@@ -1399,6 +1413,77 @@ mod tests {
         );
         assert_eq!(
             Strike::for_class(BuilderError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
+        );
+    }
+
+    /// The other half of #930: a build and a scout must give the *same* answer
+    /// about one refusal from vm-pool.
+    ///
+    /// For a build this is behaviour-neutral today —
+    /// `Store::finalize_build_unsuccessfully` charges only `if started`, and a
+    /// build refused at `allocate` never started — so what is pinned here is
+    /// the agreement, not a change. The agreement is the point: the `if
+    /// started` guard is a coincidence of where the failure lands, and two
+    /// dispatchers disagreeing about one refusal is how the next bug of this
+    /// shape gets written.
+    ///
+    /// The negative half is the same line the scout's test draws: every kind
+    /// that does not clear by itself still charges, `Unspecified` included.
+    #[test]
+    fn a_full_pool_is_classified_the_same_for_a_build_as_for_a_scout() {
+        use crate::protocol::ServiceErrorKind;
+        use crate::scout::ScoutError;
+        use crate::store::Strike;
+
+        let refused = |kind| ClientError::Service {
+            message: "allocate failed".into(),
+            kind,
+        };
+
+        for kind in [
+            ServiceErrorKind::Capacity,
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            let build = BuilderError::Client(refused(kind)).failure_class();
+            let scout = ScoutError::Client(refused(kind)).failure_class();
+            assert_eq!(build, scout, "the two dispatchers disagree about {kind}");
+        }
+
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::Client(refused(ServiceErrorKind::Capacity)).failure_class()
+            ),
+            Strike::Waive,
+        );
+        for kind in [
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Unspecified,
+        ] {
+            assert_eq!(
+                Strike::for_class(BuilderError::Client(refused(kind)).failure_class()),
+                Strike::Charge,
+                "{kind} must not be waived"
+            );
+        }
+
+        // And an ordinary empty-handed build still pays.
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::BuildFailed {
+                    reason: "agent produced no commits".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
             Strike::Charge,
         );
     }

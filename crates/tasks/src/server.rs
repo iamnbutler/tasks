@@ -31,9 +31,9 @@ use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
     EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
-    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, ShadowAck,
+    PoolHold, RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
+    ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter,
+    SetLabelsRequest, SetMode, SetProjectStatus, ShadowAck,
 };
 
 use crate::bundles::RejectedBundles;
@@ -174,6 +174,10 @@ pub struct Services {
     /// The update watch the two dispatchers consult. Absent for the same
     /// reason as `github_health`: a router with no dispatchers holds nothing.
     pub updates: Option<Arc<crate::updates::UpdateWatch>>,
+    /// The vm-pool capacity record the two gates write and read. Absent for
+    /// the same reason again — and read here through the same `hold` predicate
+    /// they use, so `/status` cannot claim a hold they are not honouring.
+    pub pool_health: Option<Arc<crate::pool_health::PoolHealth>>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -210,6 +214,12 @@ impl FromRef<AppState> for Option<Arc<GitHubHealth>> {
 impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.updates.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.pool_health.clone()
     }
 }
 
@@ -2641,6 +2651,7 @@ async fn get_status(
     State(store): State<Arc<Store>>,
     State(github_health): State<Option<Arc<GitHubHealth>>>,
     State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
+    State(pool_health): State<Option<Arc<crate::pool_health::PoolHealth>>>,
 ) -> ApiResult<Json<ServerStatus>> {
     // Through the same watch the dispatchers consult, so `/status` cannot
     // claim a hold they are not honouring.
@@ -2670,6 +2681,16 @@ async fn get_status(
                 error: outage.error,
             }),
         update,
+        // Through the same `hold` predicate the two gates use, for the same
+        // reason as `github` above.
+        pool: pool_health
+            .and_then(|health| health.hold(Utc::now()))
+            .map(|exhaustion| PoolHold {
+                since: exhaustion.since,
+                last_seen: exhaustion.last,
+                observations: exhaustion.observations,
+                total: exhaustion.total,
+            }),
     }))
 }
 

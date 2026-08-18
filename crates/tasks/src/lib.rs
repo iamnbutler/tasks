@@ -22,6 +22,7 @@ pub mod images;
 mod migrations;
 pub mod orchestrator;
 pub mod pidfile;
+pub mod pool_health;
 pub mod reattach;
 pub mod redact;
 pub mod reload;

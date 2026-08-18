@@ -374,7 +374,34 @@ implementation.
   *Budgets and a host that sleeps*). vm-pool is a
   separate daemon this document says to restart *ahead* of the server, so the
   second one is routine maintenance rather than a judgement, and it used to
-  charge the whole batch. Wire skew runs both ways and only one way is
+  charge the whole batch. A fourth is a refusal *by* vm-pool rather than a
+  broken connection to it, and it is the one place the rule reaches through
+  the wire into another crate: `pool exhausted` and `no such image` differ only
+  as prose, and "read the class off a field, never off the reason text" left
+  nothing to read — so `ServiceEvent::Error` gained a structural
+  `ServiceErrorKind` (protocol revision 2, `#[serde(default)]`, unknown values
+  decaying rather than failing the decode, since an undecodable error response
+  is never delivered and turns a refusal into a hang), and
+  `FailureClass::for_service_error` states the reading once for both
+  dispatchers. `Capacity` is `Transport` — a full pool is a property of the
+  *moment* and the next dispatch of the same task succeeds — and everything
+  else including `Image` and **`Unspecified`** stays a `Verdict`, because a
+  reference that does not resolve refuses identically forever and waiving that
+  is the retry-forever loop the cap exists to stop. The match is exhaustive
+  rather than `_ => Transport`, so a kind added tomorrow cannot widen a waiver
+  without somebody deciding it here. `Unspecified` is the **routine** case, not
+  the exotic one: an older pool states no kind, so the waiver is inert until
+  someone restarts the daemon — which the server now says out loud on every
+  connect (`run::report_error_kinds`) rather than leaving it to be found in a
+  rejected task. That report is not a gate, and
+  `ERROR_KIND_PROTOCOL_VERSION` must not become one: an old daemon runs scouts
+  and builds perfectly well, and the reason `attach` *is* gated does not
+  generalise — an old peer rejects an unknown **command** at decode time, while
+  an absent **field** is rescued by `serde(default)`. The builder arm is
+  provably behaviour-neutral (`finalize_build_unsuccessfully` charges only `if
+  started`, and a build refused at `allocate` never started) and is written
+  anyway, because two dispatchers disagreeing about one refusal is how the next
+  bug of this shape gets written. Wire skew runs both ways and only one way is
   obvious: `#[serde(default)]` covers an older supervisor omitting the field,
   while a hand-written `Deserialize` decays an *unknown* class to `Verdict`,
   because a lost terminal event does not cost a strike — it costs the run its
@@ -619,6 +646,53 @@ implementation.
   `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate; anything else
   non-`on` refuses to boot. The hold sits beside `github_hold` at the same two
   gates, ahead of the claim, for the same claim-then-refuse reason.
+- **A full pool holds dispatch, and a refusal that slips through is classified
+  rather than charged. Those are two mechanisms on purpose, and they must not
+  read each other.** `Scout::dispatch` moved a task to `Scouting` *before* it
+  allocated and the refusal returned before any session row existed, so
+  `finalize_failed` — the only path back to `Queued` — never ran and
+  `next_dispatchable`, which reads only `Queued`, could not see the task again
+  until the next boot's reconciliation. A momentarily full pool therefore cost
+  a task a restart (#967), while the same refusal charged it one of three
+  dispatch attempts and three of them rejected work nothing had judged (#930).
+  Both halves of #967 are needed and neither works alone: `Scout::start` is the
+  boundary, so one `match` in `dispatch` undoes the `Scouting` claim on **every**
+  pre-session failure (`unwind_unstarted` — it reads the state back and only
+  ever undoes its own change, is best-effort so a bookkeeping error cannot
+  replace the error being reported, and writes no `Note` because
+  `run::record_outcome` already appends one); and `pool_health::PoolHealth` is
+  the third dispatch hold beside `github_hold` and `UpdateWatch`, at the same
+  two gates, because `DISPATCH_TICK` is 500ms and a bare requeue against a pool
+  that stays full is a 2Hz retry — which under #930's waiver is an unbounded
+  stream of `Note`s into the feed and the orchestrator's input, and without it
+  burns three attempts in two seconds. **The hold is therefore mandatory rather
+  than preferable**: the waiver's whole justification is that a full pool
+  "clears by itself", and clearing means something retries; the hold is that
+  something, and it is also what bounds the retry, which is the backstop the
+  waiver removed. The hold's evidence is a `status` round trip and **never a
+  classified refusal** — `status.available` is `max_vms - allocated`, the exact
+  quantity `Pool::allocate` checks — for two independent reasons: reading a
+  refusal would close a circle (the natural clearing signal is a successful
+  allocation, and the hold is what prevents one), and `available` is ungated on
+  the pool running right now while #930's `kind` needs a **vm-pool restart** to
+  appear at all, since vm-pool is a separate daemon a server restart does not
+  restart. That last point is why the window between #930 merging and the next
+  pool restart is one where the hold is the only thing standing between a full
+  pool and burned attempts, and why the gate makes the unwind *rare* rather
+  than unnecessary — `PROBE_INTERVAL` is 5s wide, so a slot can go between the
+  probe and the allocation, and that race is exactly where the waiver applies
+  to a scout. `probe_due` **claims** the slot, which does two jobs: the scout
+  loop and the build lane make one round trip between them, and exactly one of
+  two racing loops reaches the `observe` that returns the `Transition` — so the
+  announcement is driven by that transition and never by the `hold` predicate,
+  which two loops reading every tick would turn into a `Note` per tick.
+  An unreadable `status` touches nothing (it is evidence of neither a full pool
+  nor a free one; the loops answer a dead socket by reconnecting), nothing can
+  deadlock on the hold (what releases it is a VM handed back by work already in
+  flight, which the gate does not touch), and `available == 0 && total == 0` —
+  a `VM_POOL_MAX_VMS=0` that binds and answers `status` while failing every
+  allocate — reads as a permanent hold, correctly, which is why `total` rides
+  the report and every renderer prints `0 of N` rather than "full".
 
 ## Project structure
 
@@ -831,8 +905,8 @@ reserve ≈22 GB.
 So the recommended ceiling against the default pool is **`SCOUT_MAX_CONCURRENT
 = 3`** — 4 of 6 slots, two spare. 4 scouts is 5 of 6 and 5 is 6 of 6, where a
 single leaked VM (one whose owner died between allocate and deallocate, held
-until its own event stream ends) exhausts the pool and every dispatch is
-refused. To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check
+until its own event stream ends) exhausts the pool and every dispatch **waits**
+(see *A full pool holds dispatch* below — it used to be refused, and charged). To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check
 the memory ledger first.
 
 **Two leaks eat slots, and they need two mechanisms — neither of which is the
@@ -854,13 +928,26 @@ data dir, deliberately not `/tmp`, which a reboot may clear) keyed by socket
 path. The ledger is read and discharged strictly **between the bind and the
 accept loop** — never at construction, where a second pool started against a
 live one would kill that pool's in-flight scouts and Builder and then exit on
-`AlreadyRunning`. Two limits are stated rather than implied. Against
-`ContainerRuntime`, whose `stop` returns `Ok(())` whether or not the container
-died, orphan recovery is **single-shot**: the true sentence is "the successor
-asked the runtime to stop it", not "it is stopped". What *is* recoverable on
-every runtime is an **interrupted** reclaim, because the ledger seeds its
-in-memory set at read time and persists the remainder after each stop — so a
-daemon that dies partway through hands the rest to the next one.
+`AlreadyRunning`. Three limits are stated rather than implied, and one of them
+was narrowed rather than removed. A **refusal is retried across boots**, which
+it was not: `VmRuntime::stop` now answers a verdict — `Ok(())` is the claim
+that the VM is not running, `PoolError::StopFailed` is "could not confirm" —
+and both `deallocate` and `reclaim_carried_over` forget an id only on the
+first, so a container that will not stop is asked again by the next daemon
+instead of being dropped from the only record of its existence (#950; the old
+`stop` `warn!`ed a spawn failure, `debug!`ed a non-zero exit and returned `Ok`
+regardless, which made `Err` unreachable in production). A **reported success
+is still the CLI's word**: `ContainerRuntime` trusts exit 0 rather than
+verifying the container died, so on that path "the successor asked the runtime
+to stop it" remains the honest verb. And what *is* recoverable on every runtime
+is an **interrupted** reclaim, because the ledger seeds its in-memory set at
+read time and persists the remainder after each stop — so a daemon that dies
+partway through hands the rest to the next one. The cost of the retry is one
+`container stop` per stuck id per boot, forever, reported as **one summary
+line** naming the count and the distinct unrecognised texts rather than one
+line per id — the safety argument for a needle list guessed on Linux is that
+being wrong is benign *and loud*, and one line per id stops being loud at
+exactly the scale where the list being too narrow matters.
 
 `VM_POOL_MAX_VMS` is read by **`tasks vm-pool`, not by the server** — both
 entry points honour it (`max_vms_from_env` is public and separate from

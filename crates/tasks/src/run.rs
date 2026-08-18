@@ -57,7 +57,7 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
-use vm_pool_client::{Client, ClientError};
+use vm_pool_client::{Client, ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
 use crate::brief::Brief;
@@ -792,6 +792,10 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // At boot, so the binary probe's reference instant is the build that
     // actually booted — constructed later it would hide a build in between.
     let updates = Arc::new(crate::updates::UpdateWatch::at_boot(config.update_hold));
+    // The third hold. One record, written by whichever of the two gates claims
+    // the probe and read by both plus `/status`, so they cannot disagree about
+    // whether a hold is in force.
+    let pool = Arc::new(crate::pool_health::PoolHealth::new());
 
     let poll = tokio::spawn(poll_loop(
         store.clone(),
@@ -805,6 +809,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         in_flight.clone(),
         health.clone(),
         updates.clone(),
+        pool.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
@@ -813,6 +818,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         in_flight.clone(),
         health.clone(),
         updates.clone(),
+        pool.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -851,6 +857,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             ))),
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
+            pool_health: Some(pool.clone()),
         },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`
@@ -1935,6 +1942,7 @@ pub async fn dispatch_loop(
     in_flight: InFlight,
     health: Arc<GitHubHealth>,
     updates: Arc<crate::updates::UpdateWatch>,
+    pool: Arc<crate::pool_health::PoolHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -1966,6 +1974,7 @@ pub async fn dispatch_loop(
             &in_flight,
             &health,
             &updates,
+            &pool,
             client,
             &mut shutdown,
         )
@@ -1998,7 +2007,37 @@ async fn report_pool(client: &Client<TasksProtocol>, config: &Config) {
         Err(e) => return report_attach_support(&reattach::AttachSupport::Unknown(e)),
     };
     report_attach_support(&reattach::support_of(&status));
+    report_error_kinds(&status);
     report_capacity(Capacity::assess(status.total, config.scout_max_concurrent));
+}
+
+/// Say, on every connect, whether this pool can state *why* it refused.
+///
+/// A refusal from a pool that predates
+/// [`ERROR_KIND_PROTOCOL_VERSION`](vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION)
+/// carries no `kind`, reads as `Unspecified` and is therefore **charged** —
+/// which is the right default (an old daemon must never silently waive a
+/// permanent misconfiguration) and also means the #930 waiver is inert until
+/// somebody restarts the pool. vm-pool is a separate daemon that a server
+/// restart does not restart, so that is the routine state after this server is
+/// upgraded, not an exotic one.
+///
+/// A report and not a gate, for the same reason as the two lines beside it: an
+/// old daemon runs scouts and builds perfectly well, and refusing to dispatch
+/// because its *error vocabulary* is old would turn a rare miscount into an
+/// outage. Without this line an operator's only signal is a task rejected for
+/// a pool that was merely busy — which is the bug.
+fn report_error_kinds(status: &vm_pool_client::PoolStatus) {
+    if status.speaks(vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION) {
+        return;
+    }
+    warn!(
+        speaks = status.protocol_version,
+        needs = vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION,
+        "vm-pool cannot say why it refuses an allocation — a full pool is \
+         indistinguishable from a missing image here, so a refusal is charged as \
+         a verdict. Restart `tasks vm-pool` to pick the newer protocol up"
+    );
 }
 
 fn report_attach_support(support: &reattach::AttachSupport) {
@@ -2154,12 +2193,14 @@ async fn sweep_leaked_vms(store: &Store, client: &mut Client<TasksProtocol>) {
 /// The dispatch loop for as long as one vm-pool connection lives. Returns when
 /// shutdown is requested or the connection is lost (after draining whatever is
 /// still in flight).
+#[expect(clippy::too_many_arguments, reason = "the dispatch loop's working set")]
 async fn dispatch_connected(
     store: &Arc<Store>,
     config: &Config,
     resumed: &InFlight,
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
+    pool: &crate::pool_health::PoolHealth,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -2168,6 +2209,9 @@ async fn dispatch_connected(
         client.handle(),
         scout_config(config),
     ));
+    // Hoisted out of the loop rather than cloned per tick: the probe below
+    // runs on every pass, and the handle is the only thing it needs.
+    let handle = client.handle();
 
     let mut in_flight: JoinSet<(TaskId, Result<Spec, ScoutError>)> = JoinSet::new();
     let mut in_flight_ids: HashSet<TaskId> = HashSet::new();
@@ -2182,6 +2226,8 @@ async fn dispatch_connected(
                 resumed,
                 health,
                 updates,
+                pool,
+                &handle,
                 &scout,
                 &mut in_flight,
                 &mut in_flight_ids,
@@ -2227,6 +2273,8 @@ async fn top_up(
     resumed: &InFlight,
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
+    pool: &crate::pool_health::PoolHealth,
+    handle: &ClientHandle<TasksProtocol>,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
@@ -2235,6 +2283,13 @@ async fn top_up(
     // that decides. A held dispatcher must not walk the whole task table every
     // `DISPATCH_TICK` to reach the same answer.
     if dispatch_held(store, health, updates).await? {
+        return Ok(());
+    }
+
+    // The pool hold sits after the other three because it costs a round trip
+    // (rate-limited to one per `PROBE_INTERVAL`, claimed, and shared with the
+    // build lane) where they cost a store read and a stat.
+    if pool_hold(pool, handle, store).await {
         return Ok(());
     }
 
@@ -2326,6 +2381,78 @@ async fn dispatch_held(
     }
 
     Ok(false)
+}
+
+/// Whether new work must wait for a vm-pool slot — probing first if a probe is
+/// due.
+///
+/// The third hold, beside the GitHub one and the update one, and it is
+/// deliberately **not** inside [`dispatch_held`]: that function is asked twice
+/// per pass by design (once for cost, once per dispatch for freshness), and
+/// this one costs a round trip. [`PoolHealth::probe_due`] is what bounds
+/// that — it claims the slot, so the scout loop and the build lane make one
+/// round trip between them per interval rather than two.
+///
+/// The claim is also what makes the announcement land once. Only the caller
+/// that claimed gets to `observe`, so only it sees the `Transition` across an
+/// edge; announcing off the `hold` predicate instead would write a `Note` per
+/// tick from each of two loops, which is the event-log flood this whole change
+/// exists to prevent, one level up.
+async fn pool_hold(
+    pool: &crate::pool_health::PoolHealth,
+    handle: &ClientHandle<TasksProtocol>,
+    store: &Store,
+) -> bool {
+    let now = chrono::Utc::now();
+    if pool.probe_due(now) {
+        let status = handle.status().await;
+        let transition = pool.observe(&status, now);
+        announce_pool(store, transition).await;
+    }
+    pool.hold(chrono::Utc::now()).is_some()
+}
+
+/// Say once, on each edge, that the pipeline is waiting for a slot — and once
+/// when it stops.
+///
+/// A hold that nothing reported is an idle pipeline with no explanation, which
+/// is the failure the GitHub hold's own rule exists to prevent. Announced from
+/// the `Transition` and never from the predicate, for the reason in
+/// [`pool_hold`].
+async fn announce_pool(store: &Store, transition: crate::pool_health::Transition) {
+    use crate::pool_health::Transition;
+
+    let message = match transition {
+        Transition::Unchanged => return,
+        Transition::Exhausted(exhaustion) => {
+            warn!(
+                total = exhaustion.total,
+                "vm-pool has no free slot — scout and build dispatch is held"
+            );
+            exhaustion.describe()
+        }
+        Transition::Freed(exhaustion) => {
+            info!(
+                total = exhaustion.total,
+                observations = exhaustion.observations,
+                "vm-pool freed a slot; dispatch resumes"
+            );
+            format!(
+                "vm-pool freed a slot after {} observation(s) with none available; \
+                 scout and build dispatch resumes",
+                exhaustion.observations
+            )
+        }
+    };
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: DISPATCHER.into(),
+            message,
+        })
+        .await
+    {
+        warn!(error = %e, "could not record the vm-pool capacity transition");
+    }
 }
 
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
@@ -2478,10 +2605,18 @@ async fn record_outcome(
 
 /// Retire a task that has burned through [`MAX_DISPATCH_ATTEMPTS`].
 ///
-/// [`Scout::dispatch`]'s failure path has already put the task back to `New` by
-/// the time we get here, which is why this runs last and wins: a task left
-/// `New` at the cap would be picked up again by the next process, which is
-/// exactly the retry-forever loop the persisted count exists to stop.
+/// [`Scout::dispatch`] has already put the task back to **`Queued`** by the
+/// time we get here — `finalize_failed` once a session exists, and
+/// `Scout::unwind_unstarted` for every failure before one does. (The comment
+/// that stood here said `New`, which no path writes, and it predated the
+/// second of those two: until #967 an allocate refusal returned before any
+/// session row existed, so *nothing* put the task back and it sat in
+/// `Scouting` — invisible to `next_dispatchable`, which reads only `Queued` —
+/// until the next boot's reconciliation.)
+///
+/// That is why this runs last and wins: a task left `Queued` at the cap would
+/// be picked up again by the next process, which is exactly the retry-forever
+/// loop the persisted count exists to stop.
 async fn reject_exhausted(
     store: &Store,
     task_id: &TaskId,
@@ -2525,7 +2660,15 @@ async fn reject_exhausted(
 /// Connect(_))` is a disconnect and is still classified a verdict, so folding
 /// either into the other would start charging it — see the `Client(_)` comment
 /// on `BuilderError::failure_class` for why that is a separate argument.
-fn is_disconnect(error: &ScoutError) -> bool {
+///
+/// A **refusal is deliberately not a disconnect**, and that omission is
+/// load-bearing in both directions. vm-pool answered — the socket is fine, and
+/// rebuilding a working connection over a condition that clears by itself
+/// would throw away the very socket that is about to say yes. And because
+/// [`record_outcome`] consults this predicate *first*, a refusal caught here
+/// would never reach the class check at all, so `Client(Service { .. })` has to
+/// fall through for `FailureClass::for_service_error` to get to decide it.
+pub(crate) fn is_disconnect(error: &ScoutError) -> bool {
     matches!(
         error,
         ScoutError::StreamClosed
@@ -2796,6 +2939,7 @@ pub async fn build_loop(
     in_flight: InFlight,
     health: Arc<GitHubHealth>,
     updates: Arc<crate::updates::UpdateWatch>,
+    pool: Arc<crate::pool_health::PoolHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
@@ -2830,12 +2974,18 @@ pub async fn build_loop(
             github.clone(),
             builder_config(&config),
         );
+        // Hoisted out of the loop rather than cloned per tick.
+        let handle = client.handle();
 
         loop {
             // Computed ahead of the guard only because a match guard cannot
             // await; it is the same hold-before-claim rule as the GitHub one
-            // below.
+            // below. The pool probe runs here too, which means a *paused*
+            // server still probes every `PROBE_INTERVAL` — `update_hold`
+            // already has that shape, and the cost is one local unix round
+            // trip shared with the scout loop.
             let update_hold = updates.hold(&store).await;
+            let pool_hold = pool_hold(&pool, &handle, &store).await;
             match store.get_mode().await {
                 // A build this process inherited is `running` in the store, so
                 // `claim_next_queued_build` already refuses to start another.
@@ -2848,16 +2998,19 @@ pub async fn build_loop(
                 // its batch's tasks to `building`, so a claim-then-refuse would
                 // flip that state on every tick of the outage.
                 //
-                // These are the same three questions [`dispatch_held`] asks for
-                // scouts, and the duplication is deliberate: this lane claims at
-                // most one build per pass, so it already re-reads them for every
-                // container it starts and never had `top_up`'s stale-snapshot bug
-                // (#948) — while sharing the function would mean restructuring
-                // this match guard around an `await`. A fourth reason to hold
-                // new work belongs in both places: add it to `dispatch_held` and
-                // here.
+                // These are the same questions the scout side asks — the
+                // first three through [`dispatch_held`] and the fourth through
+                // [`pool_hold`] — and the duplication is deliberate: this lane
+                // claims at most one build per pass, so it already re-reads
+                // them for every container it starts and never had `top_up`'s
+                // stale-snapshot bug (#948), while sharing the function would
+                // mean restructuring this match guard around an `await`. A
+                // fifth reason to hold new work belongs in both places.
                 Ok(Mode::Play)
-                    if in_flight.builds() == 0 && !github_hold(&health) && !update_hold =>
+                    if in_flight.builds() == 0
+                        && !github_hold(&health)
+                        && !update_hold
+                        && !pool_hold =>
                 {
                     match store.claim_next_queued_build().await {
                         Ok(Some(build)) => {
@@ -3313,6 +3466,74 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+        let after = store.get_task(&doomed.id).await.unwrap().unwrap();
+        assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
+        assert_eq!(after.state, TaskState::Rejected);
+    }
+
+    /// #930 through the real `record_outcome`, one round past
+    /// `MAX_DISPATCH_ATTEMPTS`: a pool that is merely busy must never reject a
+    /// task, however many times it is busy.
+    ///
+    /// It pins the other half too — `ConnectionLost(false)`. A refusal is not
+    /// a disconnect: vm-pool answered, and rebuilding a working connection
+    /// over a condition that clears by itself would throw away the socket that
+    /// is about to say yes.
+    ///
+    /// The negative half is in the same test: three `Image` refusals do reject
+    /// the task, or "attempts stayed 0" would read identically to the cap
+    /// having been switched off.
+    #[tokio::test]
+    async fn a_full_pool_costs_the_task_no_dispatch_attempt() {
+        use crate::protocol::ServiceErrorKind;
+
+        let store = Store::open_in_memory().await.unwrap();
+        let project = project();
+        store.insert_project(&project).await.unwrap();
+        let task = seed_task(&store, &project, 1, TaskState::Queued).await;
+
+        let refused = |kind| {
+            ScoutError::Client(vm_pool_client::ClientError::Service {
+                message: "allocate failed: pool exhausted: 0 available, 1 requested".into(),
+                kind,
+            })
+        };
+
+        for round in 1..=MAX_DISPATCH_ATTEMPTS + 1 {
+            let ConnectionLost(lost) =
+                record_outcome(&store, &task.id, Err(refused(ServiceErrorKind::Capacity)))
+                    .await
+                    .unwrap();
+            assert!(
+                !lost,
+                "round {round}: vm-pool answered, so the socket is fine"
+            );
+
+            let after = store.get_task(&task.id).await.unwrap().unwrap();
+            assert_eq!(after.dispatch_attempts, 0, "round {round} charged a strike");
+            assert_ne!(after.state, TaskState::Rejected, "round {round}");
+        }
+
+        // The waiver names its class, or an unspent attempt is
+        // indistinguishable from a cap somebody switched off.
+        let notes = store.recent_events(200).await.unwrap();
+        assert!(
+            notes.iter().any(|event| matches!(
+                &event.payload,
+                EventPayload::Note { message, .. }
+                    if message.contains("transport") && message.contains("keeps its 0 attempt")
+            )),
+            "the waiver has to say what it waived: {notes:#?}"
+        );
+
+        // The negative half. A refusal that does *not* clear by itself — an
+        // image reference that will not resolve — still rejects at the cap.
+        let doomed = seed_task(&store, &project, 2, TaskState::Queued).await;
+        for _ in 0..MAX_DISPATCH_ATTEMPTS {
+            record_outcome(&store, &doomed.id, Err(refused(ServiceErrorKind::Image)))
+                .await
+                .unwrap();
         }
         let after = store.get_task(&doomed.id).await.unwrap().unwrap();
         assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
