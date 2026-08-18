@@ -193,6 +193,10 @@ impl ServerWindow {
             .as_ref()
             .and_then(github_hold_line)
             .map(|line| self.fact("GitHub", line, cx));
+        let update = status
+            .as_ref()
+            .and_then(update_pending_line)
+            .map(|line| self.fact("Update", line, cx));
 
         div()
             .flex()
@@ -201,6 +205,7 @@ impl ServerWindow {
             .child(self.fact("Server", serving, cx))
             .child(self.fact("Pipeline", mode, cx))
             .children(github)
+            .children(update)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -735,6 +740,17 @@ fn images_line(status: &ServerStatus) -> String {
 /// observation was are different facts, and the gap between them is the
 /// difference between a hold somebody is still refreshing and one about to
 /// expire on its own.
+/// Why new work is waiting, when the reason is a half-applied upgrade. Same
+/// contract as [`github_hold_line`]: `None` renders no row at all.
+fn update_pending_line(status: &ServerStatus) -> Option<String> {
+    let update = status.update.as_ref()?;
+    let effect = match update.enforced {
+        true => "new scouts and builds wait",
+        false => "reported only — TASKS_UPDATE_HOLD=off",
+    };
+    Some(format!("pending ({effect}): {}", update.reasons.join("; ")))
+}
+
 fn github_hold_line(status: &ServerStatus) -> Option<String> {
     let hold = status.github.as_ref()?;
     Some(format!(
@@ -795,6 +811,7 @@ mod tests {
             in_flight: InFlight::default(),
             images: Vec::new(),
             github: None,
+            update: None,
         }
     }
 

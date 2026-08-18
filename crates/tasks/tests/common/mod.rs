@@ -256,6 +256,7 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
+        update_hold: true,
     }
 }
 

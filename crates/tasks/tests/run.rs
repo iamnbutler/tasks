@@ -32,12 +32,19 @@ use tasks::models::{
 };
 use tasks::run::{self, Config, GitHubWatch, InFlight};
 use tasks::store::Store;
+use tasks::updates::UpdateWatch;
 
 mod common;
 use common::{
     api_death_agent_path, make_fixture_repo, spawn_vm_pool, stub_agent_path, wait_until,
     workspace_bin, write_supervisor_wrapper_with_env,
 };
+
+/// An enforcing update watch with nothing pending: the test binary's mtime
+/// predates the process running it, and a fresh store has observed no images.
+fn test_update_watch() -> Arc<UpdateWatch> {
+    Arc::new(UpdateWatch::at_boot(true))
+}
 
 // --- GitHub poll loop ---
 
@@ -282,6 +289,7 @@ async fn a_github_hold_starts_no_scout_and_charges_nothing() {
         config,
         InFlight::default(),
         health.clone(),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -351,6 +359,7 @@ async fn a_github_hold_never_claims_a_build() {
         config,
         InFlight::default(),
         health.clone(),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1045,6 +1054,7 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1091,6 +1101,7 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
+        update_hold: true,
     }
 }
 
@@ -1238,6 +1249,7 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1295,6 +1307,7 @@ async fn pause_blocks_new_dispatches() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1382,6 +1395,7 @@ async fn an_agent_that_concluded_with_nothing_still_burns_its_three() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1464,6 +1478,7 @@ async fn an_infrastructure_death_never_rejects_the_task() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1545,6 +1560,7 @@ async fn a_restart_resumes_the_persisted_attempt_count() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1616,6 +1632,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1665,6 +1682,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
         config,
         InFlight::default(),
         Arc::new(GitHubHealth::default()),
+        test_update_watch(),
         shutdown_rx,
     ));
 
@@ -1745,4 +1763,98 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
         async move { service.pool.list().await.is_empty() }
     })
     .await;
+}
+
+/// The update hold, at the same gate: a stale image observed in the record
+/// stops new scouts exactly as a GitHub outage does — nothing dispatched,
+/// nothing moved, no attempt charged — and observing the rebuilt image
+/// releases it without a restart.
+///
+/// The release half is not optional here either, and it is also the
+/// no-wedge rule in action: the watch holds on *observed* staleness only, so
+/// recording the current identity (what the first run in a rebuilt image
+/// does) must reopen the gate by itself.
+#[tokio::test]
+async fn an_update_hold_starts_no_scout_and_observing_the_rebuilt_image_releases_it() {
+    use tasks_protocol::SupervisorBuild;
+
+    let (_tmp, store, config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "waits for the upgrade").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    // The watch boots first: only an observation made under this server can
+    // hold — one from before its boot is stale data about images that may
+    // have been rebuilt since.
+    let updates = test_update_watch();
+
+    // A run reports an image older than this binary: the upgrade is
+    // half-applied, and the observation is fresh.
+    store
+        .record_image_build(
+            "agent:v1",
+            tasks_api::version::ImageRole::Scout,
+            Some(&SupervisorBuild {
+                version: "0.1.1".into(),
+                commit: "0000000".into(),
+            }),
+            "sess_before",
+        )
+        .await
+        .unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        updates,
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "a held dispatcher starts nothing"
+    );
+    let held = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(held.state, TaskState::Queued, "and moves nothing");
+    assert_eq!(held.dispatch_attempts, 0, "holding charges nothing");
+
+    // The rebuilt image is observed — the write the first run in it makes —
+    // and dispatch resumes with no restart in between.
+    store
+        .record_image_build(
+            "agent:v1",
+            tasks_api::version::ImageRole::Scout,
+            Some(&SupervisorBuild {
+                version: tasks::version::VERSION.into(),
+                commit: "0000000".into(),
+            }),
+            "sess_after",
+        )
+        .await
+        .unwrap();
+    let s = store.clone();
+    wait_until(Duration::from_secs(60), || {
+        let s = s.clone();
+        async move { s.list_specs().await.unwrap().len() == 1 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0
+    );
 }

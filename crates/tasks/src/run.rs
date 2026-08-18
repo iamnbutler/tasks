@@ -293,6 +293,10 @@ pub struct Config {
     /// be inherited by `tasks reload`'s own build of the server and would
     /// silently redirect the Makefile's `TEST_BIN_DIR`.
     pub orchestrator_target_dir: Option<PathBuf>,
+    /// Whether the update watch gates new dispatch (`TASKS_UPDATE_HOLD`,
+    /// default on). Off, what is pending is still reported in `/status`; only
+    /// the dispatchers stop listening. See [`crate::updates`].
+    pub update_hold: bool,
 }
 
 impl Config {
@@ -349,6 +353,14 @@ impl Config {
             )?),
             orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
             orchestrator_target_dir: env_string("ORCHESTRATOR_TARGET_DIR").map(PathBuf::from),
+            update_hold: {
+                let raw = env_string("TASKS_UPDATE_HOLD");
+                crate::updates::parse_enabled(raw.as_deref()).map_err(|_| ConfigError::Invalid {
+                    var: "TASKS_UPDATE_HOLD",
+                    expected: "`on` or `off`",
+                    value: raw.unwrap_or_default(),
+                })?
+            },
         })
     }
 
@@ -770,6 +782,9 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // `/status` — the staleness window is bound here, from the poll interval,
     // so the three of them cannot disagree about whether a hold is in force.
     let health = Arc::new(GitHubHealth::new(config.poll_interval));
+    // At boot, so the binary probe's reference instant is the build that
+    // actually booted — constructed later it would hide a build in between.
+    let updates = Arc::new(crate::updates::UpdateWatch::at_boot(config.update_hold));
 
     let poll = tokio::spawn(poll_loop(
         store.clone(),
@@ -782,6 +797,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.clone(),
         in_flight.clone(),
         health.clone(),
+        updates.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
@@ -789,6 +805,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.clone(),
         in_flight.clone(),
         health.clone(),
+        updates.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -826,6 +843,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
                 builder_config(&config).scratch_root,
             ))),
             github_health: Some(health.clone()),
+            updates: Some(updates.clone()),
         },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`
@@ -1909,6 +1927,7 @@ pub async fn dispatch_loop(
     config: Config,
     in_flight: InFlight,
     health: Arc<GitHubHealth>,
+    updates: Arc<crate::updates::UpdateWatch>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -1934,7 +1953,16 @@ pub async fn dispatch_loop(
         report_pool(&client, &config).await;
         sweep_leaked_vms(&store, &mut client).await;
 
-        dispatch_connected(&store, &config, &in_flight, &health, client, &mut shutdown).await;
+        dispatch_connected(
+            &store,
+            &config,
+            &in_flight,
+            &health,
+            &updates,
+            client,
+            &mut shutdown,
+        )
+        .await;
     }
 }
 
@@ -2124,6 +2152,7 @@ async fn dispatch_connected(
     config: &Config,
     resumed: &InFlight,
     health: &GitHubHealth,
+    updates: &crate::updates::UpdateWatch,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -2145,6 +2174,7 @@ async fn dispatch_connected(
                 config,
                 resumed,
                 health,
+                updates,
                 &scout,
                 &mut in_flight,
                 &mut in_flight_ids,
@@ -2183,11 +2213,13 @@ async fn dispatch_connected(
 
 /// Start scouts until we are at the concurrency limit or run out of eligible
 /// tasks.
+#[expect(clippy::too_many_arguments, reason = "the dispatch loop's working set")]
 async fn top_up(
     store: &Arc<Store>,
     config: &Config,
     resumed: &InFlight,
     health: &GitHubHealth,
+    updates: &crate::updates::UpdateWatch,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
@@ -2200,6 +2232,14 @@ async fn top_up(
     // the world, not about any one task, and skipping held work to find
     // something else to dispatch would just pick a different victim.
     if github_hold(health) {
+        return Ok(());
+    }
+
+    // Same shape for a half-applied upgrade: a new scout would run in the
+    // stale half of it. Silent here for the same reason as the GitHub hold —
+    // the transition is announced by the watch itself, once, and `/status`
+    // answers for whoever asks later.
+    if updates.hold(store).await {
         return Ok(());
     }
 
@@ -2700,6 +2740,7 @@ pub async fn build_loop(
     config: Config,
     in_flight: InFlight,
     health: Arc<GitHubHealth>,
+    updates: Arc<crate::updates::UpdateWatch>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
@@ -2736,18 +2777,24 @@ pub async fn build_loop(
         );
 
         loop {
+            // Computed ahead of the guard only because a match guard cannot
+            // await; it is the same hold-before-claim rule as the GitHub one
+            // below.
+            let update_hold = updates.hold(&store).await;
             match store.get_mode().await {
                 // A build this process inherited is `running` in the store, so
                 // `claim_next_queued_build` already refuses to start another.
                 // The counter says the same thing in the loop's own terms,
                 // where it can be read without a round trip.
                 //
-                // The hold is in the guard, **ahead of the claim**, for the
+                // The holds are in the guard, **ahead of the claim**, for the
                 // same reason the project-status check lives inside the claim's
                 // transaction: claiming moves the build to `running` and drags
                 // its batch's tasks to `building`, so a claim-then-refuse would
                 // flip that state on every tick of the outage.
-                Ok(Mode::Play) if in_flight.builds() == 0 && !github_hold(&health) => {
+                Ok(Mode::Play)
+                    if in_flight.builds() == 0 && !github_hold(&health) && !update_hold =>
+                {
                     match store.claim_next_queued_build().await {
                         Ok(Some(build)) => {
                             let project = match store.get_project(&build.project_id).await {
@@ -2930,6 +2977,7 @@ mod tests {
             orchestrator_timeout: Duration::from_secs(60),
             orchestrator_workdir: None,
             orchestrator_target_dir: None,
+            update_hold: true,
         }
     }
 

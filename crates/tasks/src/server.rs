@@ -170,6 +170,9 @@ pub struct Services {
     /// no hold — honest, because a router with nothing to dispatch is not
     /// holding anything back.
     pub github_health: Option<Arc<GitHubHealth>>,
+    /// The update watch the two dispatchers consult. Absent for the same
+    /// reason as `github_health`: a router with no dispatchers holds nothing.
+    pub updates: Option<Arc<crate::updates::UpdateWatch>>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -200,6 +203,12 @@ impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
 impl FromRef<AppState> for Option<Arc<GitHubHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.github_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.updates.clone()
     }
 }
 
@@ -2604,7 +2613,14 @@ async fn stream_orchestrator(
 async fn get_status(
     State(store): State<Arc<Store>>,
     State(github_health): State<Option<Arc<GitHubHealth>>>,
+    State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
 ) -> ApiResult<Json<ServerStatus>> {
+    // Through the same watch the dispatchers consult, so `/status` cannot
+    // claim a hold they are not honouring.
+    let update = match updates {
+        Some(watch) => watch.pending(&store).await,
+        None => None,
+    };
     Ok(Json(ServerStatus {
         pid: std::process::id(),
         started_at: serving_since(),
@@ -2626,6 +2642,7 @@ async fn get_status(
                 failures: outage.failures,
                 error: outage.error,
             }),
+        update,
     }))
 }
 

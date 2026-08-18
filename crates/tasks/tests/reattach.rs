@@ -73,6 +73,7 @@ fn test_config(vm_pool_socket: &Path, data_dir: &Path, clone_root: &Path) -> Con
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
+        update_hold: true,
     }
 }
 
