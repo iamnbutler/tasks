@@ -216,6 +216,15 @@ async fn probe(path: &Path) -> bool {
 /// nor tokio unlinks a listener's path on drop, which is what makes the stale
 /// case real as well as testable: bind, drop, and the file is still there.
 ///
+/// That failure is closed against an incumbent that was **already
+/// listening**, and only against that. The probe answers for the instant it
+/// ran, and nothing holds that answer through the unlink and the bind after
+/// it, so two starts racing against the same stale path still interleave and
+/// still leave one of them on an unlinked inode. Read this as "refuses to
+/// displace a live daemon", never as "safe against a concurrent start"; the
+/// interleaving is spelled out at the unlink below, and the fix it would take
+/// is written down in `crates/vm-pool/CLAUDE.md`.
+///
 /// `pub` on purpose — it is the unit under test, and any future vm-pool entry
 /// point should call it rather than re-deriving the rule.
 pub async fn bind_socket(path: &Path) -> Result<UnixListener, BindError> {
@@ -229,6 +238,18 @@ pub async fn bind_socket(path: &Path) -> Result<UnixListener, BindError> {
         if probe(path).await {
             return Err(BindError::AlreadyRunning(path.to_path_buf()));
         }
+        // The probe's answer goes stale right here. Between it and the
+        // `bind` below, a second start can observe the same dead socket: A
+        // unlinks and binds, then B — already past its own probe — unlinks
+        // A's now-live socket and binds over it, leaving A listening on an
+        // unlinked inode. That is the displaced-daemon failure this function
+        // exists to prevent, reassembled out of two processes that each did
+        // the right thing. Narrowing the window is not a fix, because no
+        // ordering of unlink and bind is atomic against another process;
+        // closing it takes a lock held across both, taken ahead of the probe
+        // (the shape is in `crates/vm-pool/CLAUDE.md`). It is named rather
+        // than fixed: it needs two starts within the same few milliseconds
+        // against a socket nobody owns, which no documented workflow does.
         warn!(
             "removing stale socket {} (nothing is listening on it)",
             path.display()
