@@ -49,9 +49,9 @@ use crate::menus::{
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
 use crate::workspace::{
-    AddRepo, ApproveSelectedSpec, Dismiss, HistoryBack, HistoryForward, NewIssue,
-    QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop, ToggleLeftDock,
-    ToggleRightDock, ToggleShowDone,
+    AddRepo, ApproveSelectedSpec, Dismiss, HistoryBack, HistoryForward, KillAllContainers,
+    NewIssue, QueueSelectedTask, ScoutSelectedTask, SetModePause, SetModePlay, SetModeStop,
+    ToggleLeftDock, ToggleRightDock, ToggleShowDone,
 };
 
 /// The keymap context the workspace root sets on itself. A binding in this
@@ -417,6 +417,16 @@ pub const COMMANDS: &[Command] = &[
         .on_workspace()
         .menu(Slot::Server)
         .checked(|facts| facts.menu.mode == Some(Mode::Stop)),
+    // In the pipeline group, not the process group: it acts on running work
+    // over HTTP (the same durable cancel rows the row menu writes, one per
+    // run), never on VMs directly. Queued builds survive it — pause first if
+    // the point is that nothing further starts.
+    Command::new("kill-all-containers", "Kill All Containers", || {
+        Box::new(KillAllContainers)
+    })
+    .on_workspace()
+    .menu(Slot::Server)
+    .refusal(running_server_refusal),
     Command::new("reveal-serve-log", "Reveal serve.log", || {
         Box::new(RevealServeLog)
     })

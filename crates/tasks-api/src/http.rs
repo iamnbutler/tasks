@@ -339,6 +339,18 @@ pub struct CancelAck {
     pub note: String,
 }
 
+/// The answer to `POST /runs/cancel-all`: one [`CancelAck`] per run that was
+/// asked to stop, and a one-line summary.
+///
+/// An empty `runs` with a note is a real answer, not a failure — either
+/// nothing was running, or the capability is shadowed and the decisions were
+/// recorded without being applied. The note says which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelAllResponse {
+    pub runs: Vec<CancelAck>,
+    pub note: String,
+}
+
 /// A build with its batch, in position order — the shape of
 /// `GET /builds/{id}` and the `POST /builds` acknowledgement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

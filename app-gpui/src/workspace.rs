@@ -87,6 +87,7 @@ actions!(
         SetModePlay,
         SetModePause,
         SetModeStop,
+        KillAllContainers,
         ToggleShowDone,
         // The Task menu's three verbs. They act on the selected row, so they
         // are element-handled like the dock toggles: with no workspace
@@ -2895,6 +2896,10 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SetModeStop, _window, cx| {
                 this.set_mode(Mode::Stop, cx);
+            }))
+            .on_action(cx.listener(|this, _: &KillAllContainers, _window, cx| {
+                this.app_state
+                    .update(cx, |state, cx| state.cancel_all_runs(cx));
             }))
             // Drag-resize tracking: the handle only starts the drag; from
             // then on the pointer outruns it, so movement is tracked here at

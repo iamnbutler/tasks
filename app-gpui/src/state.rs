@@ -946,6 +946,20 @@ impl AppState {
         self.report("nothing is running for that task", cx);
     }
 
+    /// Cancel every running scout and build in one call — the Server menu's
+    /// "Kill All Containers". No rationale, on the same principle as
+    /// [`Self::cancel_run`]: this client speaks for the human. The server's
+    /// summary lands in the banner, because "3 asked, 2 concluded" is an
+    /// answer about the write that the refresh's snapshot cannot carry.
+    pub fn cancel_all_runs(&mut self, cx: &mut Context<Self>) {
+        self.run_settling(
+            cx,
+            |client| client.cancel_all_runs(None),
+            |state, response, cx| state.report(response.note, cx),
+            |_, _| {},
+        );
+    }
+
     /// Put a message in the sidebar banner without a server round trip — how
     /// a refused keystroke says why instead of doing nothing. Cleared by the
     /// next successful refresh, like any other banner text.
