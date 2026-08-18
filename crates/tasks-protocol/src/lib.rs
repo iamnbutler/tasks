@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use vm_pool_protocol::AppProtocol;
 
 pub mod agent_run;
+pub mod redact;
 pub mod vm_memory;
 
 /// Whether a terminal failure is a verdict on the *work*, or something that

@@ -47,6 +47,7 @@ use base64::Engine as _;
 use tasks_protocol::agent_run::{
     AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, max_resumes_from_env,
 };
+use tasks_protocol::redact::redact;
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
     BuildCommand, BuildEvent, FailureClass, LogStream, MAX_BUNDLE_BASE64_BYTES, SupervisorBuild,
@@ -137,7 +138,12 @@ async fn main() -> Result<()> {
         let command: TaskVmCommand = match serde_json::from_str(line.trim()) {
             Ok(c) => c,
             Err(e) => {
-                warn!("invalid command line ({e}): {}", line.trim());
+                // Redacted: the line we could not decode is a `Start`
+                // carrying `repo_clone_url`, which holds `GITHUB_TOKEN` as
+                // basic auth — and this process's stderr is inherited up
+                // through `container run` into vm-pool's own log. The host it
+                // names stays readable, which is the diagnostic half.
+                warn!("invalid command line ({e}): {}", redact(line.trim()));
                 continue;
             }
         };
@@ -828,9 +834,9 @@ async fn git(workdir: &Path, args: &[&str]) -> Result<()> {
     if !output.status.success() {
         anyhow::bail!(
             "git {} exited with {}: {}",
-            args.join(" "),
+            redact(&args.join(" ")),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact(String::from_utf8_lossy(&output.stderr).trim())
         );
     }
     Ok(())
@@ -846,9 +852,9 @@ async fn git_stdout(workdir: &Path, args: &[&str]) -> Result<String> {
     if !output.status.success() {
         anyhow::bail!(
             "git {} exited with {}: {}",
-            args.join(" "),
+            redact(&args.join(" ")),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            redact(String::from_utf8_lossy(&output.stderr).trim())
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

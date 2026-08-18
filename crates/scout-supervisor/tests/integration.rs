@@ -12,7 +12,7 @@ use std::time::Duration;
 use tasks_protocol::{
     BuildCommand, FailureClass, ScoutCommand, ScoutEvent, TaskCommand, TaskEvent, TasksProtocol,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use vm_pool_protocol::{VmCommand, VmEvent};
@@ -76,6 +76,9 @@ struct SupervisorProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    /// Present only for the tests that assert on what the supervisor *logged*.
+    /// Everything else inherits, so a failing test still prints its diagnostics.
+    stderr: Option<tokio::process::ChildStderr>,
 }
 
 impl SupervisorProc {
@@ -89,10 +92,32 @@ impl SupervisorProc {
         workdir_root: &Path,
         extra_env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_inner(binary, agent_cmd, workdir_root, extra_env, false).await
+    }
+
+    /// Like [`Self::spawn`], but with the supervisor's stderr captured so a
+    /// test can assert on what it logged. A supervisor's stderr is inherited
+    /// up through `container run` into vm-pool's own log, so "what reached
+    /// stderr" is exactly the question a credential-leak test has to ask.
+    async fn spawn_capturing_stderr(binary: &Path, agent_cmd: &str, workdir_root: &Path) -> Self {
+        Self::spawn_inner(binary, agent_cmd, workdir_root, &[], true).await
+    }
+
+    async fn spawn_inner(
+        binary: &Path,
+        agent_cmd: &str,
+        workdir_root: &Path,
+        extra_env: &[(&str, &str)],
+        capture_stderr: bool,
+    ) -> Self {
         let mut cmd = Command::new(binary);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .env("SCOUT_AGENT_CMD", agent_cmd)
             .env("SCOUT_WORKDIR_ROOT", workdir_root)
             // 1s instead of the 30s default so a test can watch NOTES.md
@@ -106,10 +131,12 @@ impl SupervisorProc {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let stdout_lines = BufReader::new(stdout).lines();
+        let stderr = child.stderr.take();
         Self {
             child,
             stdin,
             stdout_lines,
+            stderr,
         }
     }
 
@@ -133,7 +160,26 @@ impl SupervisorProc {
         drop(self.stdin);
         let _ = self.child.wait().await;
     }
+
+    /// Shut the supervisor down and return everything it wrote to stderr.
+    /// Only valid after [`Self::spawn_capturing_stderr`].
+    async fn close_and_read_stderr(mut self) -> String {
+        let mut stderr = self.stderr.take().expect("stderr was not captured");
+        drop(self.stdin);
+        let mut log = String::new();
+        timeout(Duration::from_secs(30), stderr.read_to_string(&mut log))
+            .await
+            .expect("stderr read timeout")
+            .expect("stderr read");
+        let _ = self.child.wait().await;
+        log
+    }
 }
+
+/// A value that cannot authenticate anywhere. The bug under test is a
+/// credential written to a log, so nothing in this file may carry a real one:
+/// every leak is named by its call site and its field.
+const FAKE_TOKEN: &str = "not-a-real-credential-0000";
 
 #[tokio::test]
 async fn ping_pong_and_shutdown() {
@@ -788,4 +834,98 @@ async fn notes_are_checkpointed_while_the_agent_is_still_running() {
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;
+}
+
+/// A clone that fails must not spill the credentialed clone URL — neither
+/// into the `Failed` reason (which the host stores as `sessions.exit_reason`)
+/// nor into anything the supervisor logs (whose stderr is inherited up through
+/// `container run` into vm-pool's log).
+///
+/// The URL carries `GITHUB_TOKEN` as basic auth. Git happens to strip userinfo
+/// from its own `fatal:` line, but that is git's guarantee and it does not
+/// hold for `remote:` lines echoed from the server — so the supervisor
+/// captures the clone's stderr rather than inheriting it, and redacts what it
+/// reports.
+#[tokio::test]
+async fn a_failing_clone_leaks_no_credential() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut sup = SupervisorProc::spawn_capturing_stderr(&binary, "true", tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    // Port 1 on loopback: refused immediately, no DNS, no network needed.
+    let url = format!("https://x-access-token:{FAKE_TOKEN}@127.0.0.1:1/o/r.git");
+    sup.send(VmCommand::App {
+        payload: TaskCommand::Scout(ScoutCommand::Start {
+            task_id: "task_leak".into(),
+            repo_clone_url: url,
+            base_branch: "main".into(),
+            prompt: "n/a".into(),
+        }),
+    })
+    .await;
+
+    match sup.recv().await {
+        VmEvent::App {
+            payload: TaskEvent::Scout(ScoutEvent::Failed { reason, class }),
+        } => {
+            assert!(reason.contains("clone"), "reason: {reason}");
+            assert!(
+                !reason.contains(FAKE_TOKEN),
+                "the failure reason carried the credential"
+            );
+            assert_eq!(class, FailureClass::Verdict);
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    let log = sup.close_and_read_stderr().await;
+    assert!(
+        !log.contains(FAKE_TOKEN),
+        "the supervisor logged the credential"
+    );
+}
+
+/// A command line the supervisor cannot decode is logged — and that line is a
+/// `Start` carrying the credentialed clone URL. This leak is entirely ours:
+/// we format the line, so nothing upstream sanitizes it for us.
+///
+/// The host it names stays readable, because that is the whole diagnostic
+/// value of the message; only the credential goes.
+#[tokio::test]
+async fn an_undecodable_command_line_is_logged_without_its_credential() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut sup = SupervisorProc::spawn_capturing_stderr(&binary, "true", tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+
+    // Valid JSON, but not a command this supervisor can decode — and it
+    // carries a credentialed clone URL, exactly as a real `Start` would.
+    let bad = format!(
+        r#"{{"type":"app","payload":{{"role":"scout","kind":"no_such_kind","repo_clone_url":"https://x-access-token:{FAKE_TOKEN}@github.example.com/o/r.git"}}}}"#
+    );
+    sup.stdin.write_all(bad.as_bytes()).await.unwrap();
+    sup.stdin.write_all(b"\n").await.unwrap();
+    sup.stdin.flush().await.unwrap();
+
+    // The supervisor logs and keeps reading: a Ping still answers, which is
+    // also how we know the warning has been written by the time we read it.
+    sup.send(VmCommand::Ping).await;
+    assert!(matches!(sup.recv().await, VmEvent::Pong));
+
+    sup.send(VmCommand::Shutdown).await;
+    let log = sup.close_and_read_stderr().await;
+
+    assert!(
+        log.contains("invalid command line"),
+        "expected the warning, got: {log}"
+    );
+    assert!(!log.contains(FAKE_TOKEN), "the log carried the credential");
+    assert!(
+        log.contains("github.example.com"),
+        "the host must stay readable: {log}"
+    );
 }
