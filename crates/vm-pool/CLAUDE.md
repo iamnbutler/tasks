@@ -228,19 +228,48 @@ whitespace read as unset, which is a different thing from wrong.
   `Pool::reclaim_carried_over` (stops) are two calls for the same reason, and
   the first sits on the impl block *without* the `VmRuntime` bound so the split
   is in the types and not only in the prose.
-- **Orphan recovery against `ContainerRuntime` is single-shot; an interrupted
-  reclaim is not.** `ContainerRuntime::stop` returns `Ok(())` whether or not
-  `container stop` succeeded — it `warn!`s a spawn error and `debug!`s a
-  non-zero exit — and changing that contract was out of scope. So the honest
-  sentence is "the successor asked the runtime to stop it", never "it is
-  stopped", and that is the sentence used at every site rather than a footnote.
-  An id whose `stop` reports `Err` is kept for the next boot; that branch is
-  implemented and tested, and it is what starts working for free if `stop` ever
-  gets a verdict. What *is* recoverable on every runtime is a reclaim
-  interrupted partway through, and only because `enable` **seeds** the
-  in-memory set with the carried ids — without that, the first `record` or
-  `forget` rewrites the file from an empty set and erases every carried id at
-  once, stopped or not.
+- **`VmRuntime::stop` answers a verdict, and the ledger keys on it.**
+  `Ok(())` is a claim about the world — that VM is not running, which a VM that
+  was already gone satisfies — and `PoolError::StopFailed` is "could not
+  confirm". Both callers forget an id only on the first, so a refusal is asked
+  again by the *next* daemon on this socket and orphan recovery survives a
+  container that will not stop. It used to be single-shot, because
+  `ContainerRuntime::stop` `warn!`ed a spawn failure, `debug!`ed a non-zero
+  exit and returned `Ok` regardless, which made `Err` unreachable in production
+  and dropped every id after one attempt (#950). The contract is portable and
+  lives on the *trait*: any future runtime gets retry-across-boots by returning
+  an error it already knows about, and `NoRuntime`/`SupervisorRuntime` are
+  single-shot by nature rather than by defect, since their stops genuinely
+  cannot fail. What is **not** portable is deciding, from what a CLI printed,
+  whether the container was already gone: that is `ALREADY_GONE` /
+  `NOT_AN_ANSWER` / `reads_as_already_gone`, specific to apple/container's
+  wording, confined to two free functions and two `const`s, pure and fully
+  unit-tested, and it never crosses the trait. A reported success is still the
+  CLI's word — exit 0 is trusted, not verified — so "the successor asked the
+  runtime to stop it" stays the honest verb on the success path. What *is*
+  recoverable on every runtime is a reclaim interrupted partway through, and
+  only because `enable` **seeds** the in-memory set with the carried ids —
+  without that, the first `record` or `forget` rewrites the file from an empty
+  set and erases every carried id at once, stopped or not.
+- **A failed `stop` does not fail a `deallocate`.** Freeing the slot and
+  forgetting the id are different questions: the slot is this pool's own
+  accounting and is free either way, while the ledger entry is a claim about a
+  container that may still be running. So `deallocate` keeps returning
+  `Ok(())` and `warn!`s — a teardown error propagated to a caller that can do
+  nothing about it helps nobody — and what the verdict changes is only whether
+  `ledger.forget` runs. That half is the one easy to miss: before #950 the
+  forget was unconditional, so an ordinary teardown whose stop failed dropped
+  the id just as the reclaim did.
+- **Classifying "already gone" as a failure is the loop forget-on-success
+  exists to avoid.** `container run --rm` means the container is usually gone
+  by the time a deallocate lands, so an `ALREADY_GONE` list that misses the
+  real wording keeps an id on *every* teardown, and the file grows without
+  bound. Unknown therefore resolves to failure (a wrong failure costs one CLI
+  call and one log line per boot and announces itself; a wrong success is the
+  silent leak), the unrecognised text is logged verbatim naming the constant to
+  extend, and `reclaim_carried_over` reports **one summary line** with the
+  count and the distinct texts rather than one line per id — otherwise "loud"
+  stops being true at exactly the scale where it matters.
 - **A ledger, not `container ls`.** Two independent reasons, either fatal. VM
   names carry no daemon identity (`vm-<micros>-<counter>`), and pointing a
   second pool at another `VM_POOL_SOCKET` is a configuration

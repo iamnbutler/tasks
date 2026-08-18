@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
-use vm_pool_protocol::VmId;
+use vm_pool_protocol::{ServiceErrorKind, VmId};
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -23,6 +23,26 @@ pub enum SnapshotError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl SnapshotError {
+    /// Which of vm-pool's own conditions this is, for the wire.
+    ///
+    /// **All `Other`, deliberately.** The tempting arm is
+    /// `NotFound => NoSuchVm`, and it would be a lie: a missing *snapshot* is
+    /// not a missing VM, and a caller that read `NoSuchVm` here would conclude
+    /// something about a VM that is very likely still running. Beside the enum
+    /// for the same reason as [`crate::PoolError::kind`] — a new variant has
+    /// to answer rather than inherit.
+    pub fn kind(&self) -> ServiceErrorKind {
+        match self {
+            Self::NotFound(_)
+            | Self::SaveFailed(_)
+            | Self::RestoreFailed(_)
+            | Self::Io(_)
+            | Self::Json(_) => ServiceErrorKind::Other,
+        }
+    }
 }
 
 /// Snapshot metadata.

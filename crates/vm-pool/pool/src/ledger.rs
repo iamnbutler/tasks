@@ -21,23 +21,31 @@
 //!    peer's* VMs — the wrong-takeover that `bind_socket` exists to prevent,
 //!    arriving through a different door.
 //! 2. **apple/container is macOS-only**, so the parser would be the one
-//!    load-bearing line of this fix that no Scout, Builder or CI run could
+//!    load-bearing line of this fix that no test or CI run on Linux could
 //!    ever execute.
 //!
 //! The ledger never asks what exists. It remembers what this pool started.
 //!
-//! # The one thing it does not promise
+//! # What forgetting an id costs, and what earns it
 //!
-//! Recovery is only ever as strong as the runtime's `stop`, and
-//! [`crate::ContainerRuntime::stop`] returns `Ok(())` whether or not the
-//! container died — it `warn!`s a spawn error and `debug!`s a non-zero exit.
-//! So on the runtime that runs in production, orphan recovery is
-//! **single-shot**: an id whose stop returned `Ok` is forgotten after one
-//! attempt and is not carried again. The true sentence is "the successor asked
-//! the runtime to stop it", not "it is stopped", and that is the sentence used
-//! everywhere this is described. Do not write the stronger one back; the way
-//! to earn it is to give `stop` a verdict, at which point the `Err` branch
-//! already implemented here starts retrying at the next boot for free.
+//! Recovery is only ever as strong as the runtime's `stop`, so `stop` answers
+//! a **verdict**: `Ok(())` is the claim that the VM is not running, and
+//! [`crate::PoolError::StopFailed`] is "could not confirm". An id is forgotten
+//! only on the first, by both callers — [`crate::Pool::deallocate`] and
+//! [`crate::Pool::reclaim_carried_over`]. That is what forgetting costs: it is
+//! the deletion of the only record that a container exists, so it has to be
+//! earned by an answer rather than by an attempt.
+//!
+//! An id that is not forgotten is asked again by the *next* daemon on this
+//! socket, and the one after that. A container that never stops is therefore
+//! kept forever — the behaviour, not a leak, since the alternative is dropping
+//! the record — and costs one `container stop` per boot plus one warning
+//! naming it, which is also how anyone finds out.
+//!
+//! A reported success is still the runtime's word. `ContainerRuntime` trusts
+//! `container stop`'s exit 0 rather than verifying the container died, so on
+//! that path "the successor asked the runtime to stop it" is the honest verb.
+//! What is new is that a **refusal** is retried across boots.
 //!
 //! What *is* recoverable on every runtime is an **interrupted** reclaim, and
 //! only because [`VmLedger::enable`] **seeds** the in-memory set with the

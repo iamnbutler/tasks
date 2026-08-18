@@ -18,6 +18,11 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use vm_pool_protocol::AppProtocol;
 
+/// Re-exported because [`FailureClass::for_service_error`] takes one: a
+/// caller of that function needs the type, and reaching past this crate for
+/// it would make every such caller depend on vm-pool's protocol directly.
+pub use vm_pool_protocol::ServiceErrorKind;
+
 pub mod agent_run;
 pub mod redact;
 pub mod vm_memory;
@@ -96,6 +101,54 @@ impl FailureClass {
                 "the run could not be picked up after a server restart, which is the \
                  restart's fault and not the work's",
             ),
+        }
+    }
+
+    /// What a refusal from vm-pool costs the work it was refused for.
+    ///
+    /// **One statement, read by both dispatchers**, so a scout and a build
+    /// cannot disagree about the same refusal. It reads the structural
+    /// [`ServiceErrorKind`] and never the message: `pool exhausted` and
+    /// `no such image` differ only as prose, which is the rule this whole
+    /// enum already follows.
+    ///
+    /// The line is **whether the condition clears by itself**, not whether the
+    /// failure happened before the agent ran:
+    ///
+    /// - [`ServiceErrorKind::Capacity`] is a property of the *moment*. Every
+    ///   slot is allocated right now; the identical dispatch succeeds once one
+    ///   frees, so nothing about the work has been judged and it must not cost
+    ///   an attempt (#930: three full pools rejected a task nothing had
+    ///   looked at).
+    /// - Everything else is a [`FailureClass::Verdict`], including
+    ///   [`ServiceErrorKind::Unspecified`]. An image reference that does not
+    ///   resolve refuses identically forever, and waiving it is the
+    ///   retry-forever loop the attempt cap exists to stop. `Unspecified` is
+    ///   the routine skew case — vm-pool is a separate daemon upgraded
+    ///   separately, so an older one states no kind — and charging it means an
+    ///   old daemon is loud rather than silently waiving every permanent
+    ///   misconfiguration it has.
+    ///
+    /// The match is **exhaustive and explicit** rather than `_ => Transport`:
+    /// a kind added to vm-pool tomorrow cannot widen a waiver without somebody
+    /// deciding it here.
+    pub fn for_service_error(kind: ServiceErrorKind) -> Self {
+        match kind {
+            // The only thing that clears by itself.
+            ServiceErrorKind::Capacity => Self::Transport,
+            // `ServiceErrorKind::Transport` is **not** `FailureClass::Transport`,
+            // and this arm is not a typo. That one names vm-pool's stdio link
+            // to one VM; this enum's names "nothing here judged the work". A
+            // pipe to a supervisor that will not carry a command is a VM that
+            // cannot run the work, and it does not clear on its own.
+            ServiceErrorKind::Transport
+            | ServiceErrorKind::Unspecified
+            | ServiceErrorKind::NoSuchVm
+            | ServiceErrorKind::NotReady
+            | ServiceErrorKind::Image
+            | ServiceErrorKind::Runtime
+            | ServiceErrorKind::BadRequest
+            | ServiceErrorKind::Other => Self::Verdict,
         }
     }
 

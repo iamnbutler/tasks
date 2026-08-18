@@ -73,7 +73,7 @@ use tracing::{debug, warn};
 use vm_pool_protocol::redact::Scrubbed;
 use vm_pool_protocol::{
     AppProtocol, LogLine, NullProtocol, ReplayedEvent, Request, Response, ServiceCommand,
-    ServiceEvent, VmConfig, VmId,
+    ServiceErrorKind, ServiceEvent, VmConfig, VmId,
 };
 
 /// How many pushed events a subscriber may fall behind before the oldest are
@@ -88,8 +88,19 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
     #[error("connection closed")]
     Closed,
-    #[error("service error: {0}")]
-    Service(String),
+    /// The service answered, and the answer was a refusal.
+    ///
+    /// `kind` is which of *its own* conditions it hit — see
+    /// [`ServiceErrorKind`]. It is carried so a caller can decide on a field
+    /// rather than on `message`, which is prose and changes meaning the next
+    /// time somebody improves a sentence. A service predating
+    /// [`vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION`] states no kind, and
+    /// that reads as [`ServiceErrorKind::Unspecified`].
+    #[error("service error: {message}")]
+    Service {
+        message: String,
+        kind: ServiceErrorKind,
+    },
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
 }
@@ -325,7 +336,7 @@ impl<P: AppProtocol> ClientHandle<P> {
     /// Convert a ServiceEvent::Error into a ClientError, or return the event.
     fn check_error(event: ServiceEvent<P>) -> Result<ServiceEvent<P>, ClientError> {
         match event {
-            ServiceEvent::Error { message } => Err(ClientError::Service(message)),
+            ServiceEvent::Error { message, kind } => Err(ClientError::Service { message, kind }),
             other => Ok(other),
         }
     }
@@ -683,7 +694,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use vm_pool_manager::{EventPayload, NoRuntime, PoolConfig};
-    use vm_pool_protocol::{OutputStream, ShellEvent, ShellProtocol};
+    use vm_pool_protocol::{OutputStream, ServiceErrorKind, ShellEvent, ShellProtocol};
     use vm_pool_service::{Service, ServiceConfig};
 
     type TestClient = Client<ShellProtocol>;
@@ -846,7 +857,15 @@ mod tests {
             .await
             .unwrap();
         let result = client.allocate("agent:v1", VmConfig::default()).await;
-        assert!(matches!(result, Err(ClientError::Service(_))));
+        // Over a real socket, off a real refusal: the kind survives the wire,
+        // which is the whole point of putting it there.
+        match result {
+            Err(ClientError::Service { message, kind }) => {
+                assert!(message.contains("exhausted"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::Capacity, "got: {message}");
+            }
+            other => panic!("expected a service refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
