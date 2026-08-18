@@ -27,13 +27,14 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
+use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
     EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
     RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
     ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, ShadowAck,
+    SetProjectStatus, SettleDecisionRequest, ShadowAck,
 };
 
 use crate::bundles::RejectedBundles;
@@ -42,7 +43,7 @@ use crate::github::{GhIssue, GitHubClient};
 use crate::github_health::GitHubHealth;
 use crate::models::{
     Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
-    Complexity, Decision, DecisionAction, DecisionInput, Directions, GhState, Mode,
+    Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions, GhState, Mode,
     OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind,
     ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
     Task, TaskId, TranscriptLine, TranscriptOwner,
@@ -270,6 +271,8 @@ pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
         .route("/spec-queue/{spec_id}/review", post(review_spec))
         .route("/builds", get(list_builds).post(request_build))
         .route("/decisions", get(list_decisions))
+        .route("/decisions/{seq}/reconcile", get(reconcile_decision))
+        .route("/decisions/{seq}/settle", post(settle_decision))
         .route("/charter", get(get_charter))
         .route("/charter/{capability}", post(set_charter))
         .route("/builds/{build_id}", get(get_build))
@@ -816,20 +819,37 @@ async fn capture_issue(
         return Ok(shadowed(seq, "no issue was filed"));
     }
 
-    let number = github
-        .create_issue(
-            &project.repo_owner,
-            &project.repo_name,
-            &body.title,
-            &issue_body(&body.body, actor, body.provenance.as_deref()),
-            &body.labels,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("filing the issue failed: {e}")))?;
+    let rendered = issue_body(&body.body, actor, body.provenance.as_deref());
+    // The subject is the title, not a task: no issue number and no task exists
+    // yet, and the intent has to be on record *before* the call that would
+    // create one. That is what the shadow branch above already does.
+    let (seq, number) = ledgered(
+        &store,
+        "capture",
+        &body.title,
+        DecisionAction::CaptureWork,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "title": body.title,
+            "labels": body.labels,
+        }),
+        "filing the issue failed",
+        || {
+            github.create_issue(
+                &project.repo_owner,
+                &project.repo_name,
+                &body.title,
+                &rendered,
+                &body.labels,
+            )
+        },
+    )
+    .await?;
 
-    // The issue exists upstream now, so a failure past this point loses
-    // tracking, not work — the poller picks the issue up on its next pass
-    // either way.
+    // The issue exists upstream now and the ledger says so, so a failure past
+    // this point loses tracking, not attribution — and the poller picks the
+    // issue up on its next pass either way.
     let task = store
         .capture_issue(
             &project.id,
@@ -841,7 +861,8 @@ async fn capture_issue(
                 state: GhState::Open,
                 updated_at: Utc::now(),
             },
-            decision,
+            actor,
+            seq,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
@@ -904,17 +925,30 @@ async fn close_task(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("project {}", task.project_id)))?;
 
-    github
-        .close_issue(
-            &project.repo_owner,
-            &project.repo_name,
-            task.gh_issue_number,
-            reason,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("closing the issue failed: {e}")))?;
+    let (seq, ()) = ledgered(
+        &store,
+        "task",
+        id.as_str(),
+        DecisionAction::RetireWork,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "issue": task.gh_issue_number,
+            "reason": reason.as_str(),
+        }),
+        "closing the issue failed",
+        || {
+            github.close_issue(
+                &project.repo_owner,
+                &project.repo_name,
+                task.gh_issue_number,
+                reason,
+            )
+        },
+    )
+    .await?;
 
-    store.record_issue_closed(&id, reason, decision).await?;
+    store.record_issue_closed(&id, reason, actor, seq).await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -973,24 +1007,26 @@ async fn reopen_task(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("project {}", task.project_id)))?;
 
-    github
-        .reopen_issue(
-            &project.repo_owner,
-            &project.repo_name,
-            task.gh_issue_number,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("reopening the issue failed: {e}")))?;
-
-    store
-        .record_decision(
-            "task",
-            id.as_str(),
-            DecisionAction::ReopenWork,
-            decision,
-            true,
-        )
-        .await?;
+    ledgered(
+        &store,
+        "task",
+        id.as_str(),
+        DecisionAction::ReopenWork,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "issue": task.gh_issue_number,
+        }),
+        "reopening the issue failed",
+        || {
+            github.reopen_issue(
+                &project.repo_owner,
+                &project.repo_name,
+                task.gh_issue_number,
+            )
+        },
+    )
+    .await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -1045,25 +1081,22 @@ async fn comment_on_work(
         return Ok(shadowed(seq, "nothing was posted"));
     }
 
-    let comment_id = github
-        .create_issue_comment(
-            &project.repo_owner,
-            &project.repo_name,
-            number,
-            &attributed(&body.body, actor),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("commenting failed: {e}")))?;
-
-    let seq = store
-        .record_decision(
-            "gh",
-            &number.to_string(),
-            DecisionAction::CommentOnWork,
-            decision,
-            true,
-        )
-        .await?;
+    let text = attributed(&body.body, actor);
+    let (seq, comment_id) = ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::CommentOnWork,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "body": text,
+        }),
+        "commenting failed",
+        || github.create_issue_comment(&project.repo_owner, &project.repo_name, number, &text),
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "comment_id": comment_id, "decision_seq": seq })),
@@ -1131,26 +1164,29 @@ async fn merge_pull_request(
         return Ok(shadowed(seq, "the pull request is still open"));
     }
 
-    let sha = github
-        .merge_pull_request(
-            &project.repo_owner,
-            &project.repo_name,
-            number,
-            method,
-            body.commit_title.as_deref(),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("merging failed: {e}")))?;
-
-    let seq = store
-        .record_decision(
-            "gh",
-            &number.to_string(),
-            DecisionAction::MergeBuild,
-            decision,
-            true,
-        )
-        .await?;
+    let (seq, sha) = ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::MergeBuild,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "method": method,
+        }),
+        "merging failed",
+        || {
+            github.merge_pull_request(
+                &project.repo_owner,
+                &project.repo_name,
+                number,
+                method,
+                body.commit_title.as_deref(),
+            )
+        },
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "merged_sha": sha, "decision_seq": seq })).into_response())
 }
 
@@ -1208,20 +1244,20 @@ async fn abandon_pull_request(
         return Ok(shadowed(seq, "the pull request is still open"));
     }
 
-    github
-        .close_pull_request(&project.repo_owner, &project.repo_name, number)
-        .await
-        .map_err(|e| ApiError::Internal(format!("closing the pull request failed: {e}")))?;
-
-    store
-        .record_decision(
-            "gh",
-            &number.to_string(),
-            DecisionAction::AbandonBuild,
-            decision,
-            true,
-        )
-        .await?;
+    ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::AbandonBuild,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+        }),
+        "closing the pull request failed",
+        || github.close_pull_request(&project.repo_owner, &project.repo_name, number),
+    )
+    .await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -1274,27 +1310,33 @@ async fn create_review_comment(
         return Ok(shadowed(seq, "nothing was posted"));
     }
 
-    let comment_id = github
-        .create_review_comment(
-            &project.repo_owner,
-            &project.repo_name,
-            number,
-            &body.path,
-            body.line,
-            &attributed(&body.body, actor),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("review comment failed: {e}")))?;
-
-    let seq = store
-        .record_decision(
-            "gh",
-            &subject,
-            DecisionAction::ReviewComment,
-            decision,
-            true,
-        )
-        .await?;
+    let text = attributed(&body.body, actor);
+    let (seq, comment_id) = ledgered(
+        &store,
+        "gh",
+        &subject,
+        DecisionAction::ReviewComment,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "path": body.path,
+            "line": body.line,
+            "body": text,
+        }),
+        "review comment failed",
+        || {
+            github.create_review_comment(
+                &project.repo_owner,
+                &project.repo_name,
+                number,
+                &body.path,
+                body.line,
+                &text,
+            )
+        },
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "comment_id": comment_id, "decision_seq": seq })),
@@ -1367,39 +1409,47 @@ async fn edit_issue(
         return Ok(shadowed(seq, "the issue is unchanged"));
     }
 
-    // Read before write, so the ledger keeps what is about to be overwritten.
+    // Read before the **intent**, not merely before the write: `evidence` is
+    // the immutable half of a ledger row, so anything belonging there has to
+    // be known when the row is written. A read is not an effect, so running it
+    // first costs nothing and there is nothing to attribute if it fails.
     let (old_title, old_body) = github
         .issue_body(&project.repo_owner, &project.repo_name, number)
         .await
         .map_err(|e| ApiError::Internal(format!("reading the issue failed: {e}")))?;
 
-    github
-        .update_issue(
-            &project.repo_owner,
-            &project.repo_name,
-            number,
-            body.title.as_deref(),
-            body.body.as_deref(),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("editing the issue failed: {e}")))?;
-
     let evidence = serde_json::json!({
         "replaced": { "title": old_title, "body": old_body },
         "caller_evidence": decision.evidence,
     });
-    let seq = store
-        .record_decision(
-            "gh",
-            &number.to_string(),
-            DecisionAction::EditIssue,
-            DecisionInput {
-                evidence: Some(evidence),
-                ..decision
-            },
-            true,
-        )
-        .await?;
+    let decision = DecisionInput {
+        evidence: Some(evidence),
+        ..decision
+    };
+    let (seq, ()) = ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::EditIssue,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "title": body.title,
+            "body": body.body,
+        }),
+        "editing the issue failed",
+        || {
+            github.update_issue(
+                &project.repo_owner,
+                &project.repo_name,
+                number,
+                body.title.as_deref(),
+                body.body.as_deref(),
+            )
+        },
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "decision_seq": seq })).into_response())
 }
 
@@ -1444,25 +1494,28 @@ async fn set_issue_labels(
         return Ok(shadowed(seq, "the labels are unchanged"));
     }
 
-    github
-        .set_issue_labels(
-            &project.repo_owner,
-            &project.repo_name,
-            number,
-            &body.labels,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("setting labels failed: {e}")))?;
-
-    store
-        .record_decision(
-            "gh",
-            &number.to_string(),
-            DecisionAction::LabelIssue,
-            decision,
-            true,
-        )
-        .await?;
+    ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::LabelIssue,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "labels": body.labels,
+        }),
+        "setting labels failed",
+        || {
+            github.set_issue_labels(
+                &project.repo_owner,
+                &project.repo_name,
+                number,
+                &body.labels,
+            )
+        },
+    )
+    .await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -1523,6 +1576,126 @@ fn attributed(body: &str, actor: Actor) -> String {
 /// success response for a call that did nothing is how a shadow evaluation
 /// quietly becomes a lie. Only the orchestrator can ever see this — a human
 /// is never shadowed — so no typed client has to handle it.
+/// Run an effect that lands in somebody else's system, with its intent
+/// already on record — and settle the record against what actually happened.
+///
+/// #957 closed the half of the attribution gap that can be *refused*: every
+/// gated handler applies `require_rationale` inside [`authorize`], before it
+/// touches GitHub, so a 4xx is a genuine no-op. This closes the half that
+/// cannot be. Ten sites ran the effect and *then* the `record_decision`
+/// explaining it, so a SQLite error, a panic or a SIGKILL in between left a
+/// real artifact upstream that nothing in the ledger accounts for (#964).
+///
+/// Recording first stays refused: a row claiming an effect a failed call never
+/// had makes every row suspect, where a missing row leaves one artifact
+/// unexplained. The window is *represented* instead — `pending` before,
+/// `applied` or `annulled` after.
+///
+/// **Taking the effect as a closure is the point.** A handler nobody has
+/// written yet cannot reach GitHub without its intent already being on record,
+/// which is the same property that made `authorize` the right home for the
+/// rationale check. It runs *after* `authorize`, never instead of it: a
+/// refusal must still cost nothing, including a ledger row.
+///
+/// Three outcomes, decided **structurally off [`GhError::is_unavailable`] and
+/// never off message text** — the same predicate `github_health` turns on:
+///
+/// - returned → `applied`, with what it produced in `outcome`;
+/// - refused with an *answer* (4xx, 429, a shape we could not read) →
+///   `annulled`, because GitHub said no and nothing reached the world;
+/// - **never answered** (5xx, or no response at all) → **stays pending**,
+///   because we do not know, and saying so is the whole point.
+///
+/// A settle that itself fails is logged and **not** propagated. The effect
+/// happened; a 500 here sends a well-behaved caller into the retry that files
+/// a second issue, which is the #957 failure. What it leaves behind is a
+/// durable, attributed, unconfirmed row — the outcome this function exists to
+/// guarantee — and `ObligationKind::ReconcileDecision` chases it.
+#[allow(clippy::too_many_arguments)]
+async fn ledgered<T, F, Fut>(
+    store: &Store,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    intent: serde_json::Value,
+    failed: &str,
+    effect: F,
+) -> ApiResult<(i64, T)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::github::GhError>>,
+    T: serde::Serialize,
+{
+    let seq = store
+        .record_intent(subject_kind, subject_id, action, decision, Some(&intent))
+        .await?;
+    match effect().await {
+        Ok(value) => {
+            // Not `?`: a hidden serialization error here would leave a
+            // settled effect unsettled, for a case that cannot occur — every
+            // `T` is a number, a string or `()`.
+            let produced = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
+            settled(
+                store,
+                seq,
+                crate::models::DecisionState::Applied,
+                serde_json::json!({ "result": produced }),
+            )
+            .await;
+            Ok((seq, value))
+        }
+        Err(e) if e.is_unavailable() => {
+            // GitHub never answered. The write may have landed. Leaving the
+            // row pending is the only honest description, and the note is
+            // what the reconciliation reads.
+            if let Err(store_err) = store
+                .note_decision_outcome(seq, &serde_json::json!({ "unanswered": e.to_string() }))
+                .await
+            {
+                error!(seq, error = %store_err, "recording an unanswered effect failed");
+            }
+            warn!(
+                seq,
+                error = %e,
+                "GitHub never answered; decision {seq} stays pending until it is reconciled"
+            );
+            Err(ApiError::Unavailable(format!(
+                "{failed}: {e} — decision {seq} is recorded as pending; \
+                 GET /decisions/{seq}/reconcile once GitHub is answering again"
+            )))
+        }
+        Err(e) => {
+            settled(
+                store,
+                seq,
+                crate::models::DecisionState::Annulled,
+                serde_json::json!({ "refused": e.to_string() }),
+            )
+            .await;
+            Err(ApiError::Internal(format!("{failed}: {e}")))
+        }
+    }
+}
+
+/// Settle a row, loudly on failure and never fatally. See [`ledgered`].
+async fn settled(
+    store: &Store,
+    seq: i64,
+    state: crate::models::DecisionState,
+    outcome: serde_json::Value,
+) {
+    if let Err(e) = store.settle_decision(seq, state, Some(&outcome)).await {
+        error!(
+            seq,
+            state = state.as_str(),
+            error = %e,
+            "the effect happened and settling its ledger row did not — the row stays \
+             pending and ReconcileDecision will chase it"
+        );
+    }
+}
+
 fn shadowed(decision_seq: i64, effect: &str) -> Response {
     (
         StatusCode::ACCEPTED,
@@ -2143,6 +2316,14 @@ async fn list_decisions(
         (None, Some(id)) => Some(("build", id)),
         (None, None) => None,
     };
+    if q.pending.unwrap_or(false) {
+        if subject.is_some() {
+            return Err(ApiError::BadRequest(
+                "pass a subject or ?pending=true, not both".into(),
+            ));
+        }
+        return Ok(Json(store.pending_decisions().await?));
+    }
     Ok(Json(
         store.decisions(subject, q.limit.unwrap_or(100)).await?,
     ))
@@ -2153,6 +2334,331 @@ struct DecisionQuery {
     spec: Option<String>,
     build: Option<String>,
     limit: Option<i64>,
+    /// Every row whose effect nobody confirmed, oldest first. The working set
+    /// for `ObligationKind::ReconcileDecision`.
+    pending: Option<bool>,
+}
+
+/// Ask GitHub — with **this server's** credential — whether a pending
+/// decision's artifact exists.
+///
+/// This is what makes `ObligationKind::ReconcileDecision` dischargeable, and
+/// it is the reason the obligation exists at all. `GET /decisions?pending=true`
+/// says a row is pending; it cannot say whether the artifact is upstream, and
+/// the default `ORCHESTRATOR_CMD` is `--allowedTools Bash(curl:*)` with no
+/// `GITHUB_TOKEN` of its own — so leaving the lookup to the recipient leaves
+/// it a choice between guessing and doing nothing. A guess writes `applied` or
+/// `annulled` into an append-only ledger on no evidence, which is worse than
+/// the missing row this whole mechanism exists to prevent, and it is worse in
+/// the specific way #964 warns about: a row claiming an effect makes every row
+/// suspect. It also does not stop at the ledger — an orchestrator that cannot
+/// tell whether its capture landed has one obvious move, which is to file it
+/// again, and that is #957's second-issue failure one level up.
+///
+/// A read, so it settles nothing itself: it returns what it found, and
+/// `POST /decisions/{seq}/settle` writes the answer down. `unknown` is a real
+/// and common verdict — the row stays pending, which is the same honest
+/// description it had before.
+async fn reconcile_decision(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(seq): Path<i64>,
+) -> ApiResult<Json<DecisionReconciliation>> {
+    let decision = store
+        .decision(seq)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("decision {seq}")))?;
+    if decision.state != DecisionState::Pending {
+        return Err(ApiError::BadRequest(format!(
+            "decision {seq} is {} — there is no open window to reconcile",
+            decision.state.as_str()
+        )));
+    }
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable(
+            "no GITHUB_TOKEN: this server cannot look the artifact up, and nothing else              should guess on its behalf"
+                .into(),
+        )
+    })?;
+    let intent = decision
+        .outcome
+        .as_ref()
+        .and_then(|o| o.get("intent"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let repo = intent.get("repo").and_then(|r| r.as_str()).unwrap_or("");
+    let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+    if owner.is_empty() || name.is_empty() {
+        return Ok(Json(DecisionReconciliation {
+            seq,
+            action: decision.action.as_str().to_string(),
+            verdict: "unknown".into(),
+            found: serde_json::Value::Null,
+            note: "the intent does not name a repository, so there is nowhere to look —                    settle this one by hand or leave it pending"
+                .into(),
+        }));
+    }
+    let number = intent
+        .get("number")
+        .or_else(|| intent.get("issue"))
+        .and_then(|n| n.as_u64());
+
+    let looked_up = look_up_artifact(&github, &decision, &intent, owner, name, number).await;
+    let (verdict, found, note) = match looked_up {
+        Ok(answer) => answer,
+        // A failed lookup is `unknown` and never `annulled`: "we could not
+        // ask" and "it did not happen" are the two answers that must never be
+        // confused here.
+        Err(e) => (
+            "unknown",
+            serde_json::json!({ "lookup_failed": e.to_string() }),
+            format!("asking GitHub failed ({e}); the row stays pending"),
+        ),
+    };
+    Ok(Json(DecisionReconciliation {
+        seq,
+        action: decision.action.as_str().to_string(),
+        verdict: verdict.to_string(),
+        found,
+        note,
+    }))
+}
+
+/// The per-action lookup behind [`reconcile_decision`]: what artifact this
+/// action would have produced, and is it there.
+///
+/// Exhaustive on [`DecisionAction`], so a new action has to say how it is
+/// reconciled — or say that it has no upstream artifact, which is the honest
+/// answer for every store-only decision and is why they never go pending.
+async fn look_up_artifact(
+    github: &GitHubClient,
+    decision: &Decision,
+    intent: &serde_json::Value,
+    owner: &str,
+    name: &str,
+    number: Option<u64>,
+) -> Result<(&'static str, serde_json::Value, String), crate::github::GhError> {
+    let text = |key: &str| {
+        intent
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Ok(match decision.action {
+        DecisionAction::CaptureWork => {
+            let title = text("title");
+            let numbers = github.find_issues_by_title(owner, name, &title).await?;
+            if numbers.is_empty() {
+                (
+                    "annulled",
+                    serde_json::json!({ "matching_issues": [] }),
+                    format!("no issue in {owner}/{name} carries the title that was filed"),
+                )
+            } else {
+                (
+                    "applied",
+                    serde_json::json!({ "matching_issues": numbers }),
+                    format!("the issue exists upstream as #{}", numbers[0]),
+                )
+            }
+        }
+        DecisionAction::RetireWork | DecisionAction::ReopenWork => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let facts = github.issue_facts(owner, name, number).await?;
+            let want = if decision.action == DecisionAction::RetireWork {
+                GhState::Closed
+            } else {
+                GhState::Open
+            };
+            let verdict = if facts.state == want { "applied" } else { "annulled" };
+            (
+                verdict,
+                serde_json::json!({ "issue": number, "state": facts.state.as_str() }),
+                format!("#{number} is {} upstream", facts.state.as_str()),
+            )
+        }
+        DecisionAction::EditIssue => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let facts = github.issue_facts(owner, name, number).await?;
+            // Only the fields the edit actually asked to change are compared:
+            // an edit that set only the body says nothing about the title.
+            let title_ok = intent
+                .get("title")
+                .and_then(|t| t.as_str())
+                .is_none_or(|t| t == facts.title);
+            let body_ok = intent
+                .get("body")
+                .and_then(|b| b.as_str())
+                .is_none_or(|b| b == facts.body);
+            let verdict = if title_ok && body_ok { "applied" } else { "annulled" };
+            (
+                verdict,
+                serde_json::json!({ "issue": number, "title": facts.title, "body": facts.body }),
+                format!("#{number}'s current text {} what the edit asked for",
+                        if title_ok && body_ok { "is" } else { "is not" }),
+            )
+        }
+        DecisionAction::LabelIssue => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let facts = github.issue_facts(owner, name, number).await?;
+            let wanted: Vec<String> = intent
+                .get("labels")
+                .and_then(|l| l.as_array())
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut have = facts.labels.clone();
+            let mut want = wanted.clone();
+            have.sort();
+            want.sort();
+            let verdict = if have == want { "applied" } else { "annulled" };
+            (
+                verdict,
+                serde_json::json!({ "issue": number, "labels": facts.labels }),
+                format!("#{number} carries {} labels", facts.labels.len()),
+            )
+        }
+        DecisionAction::CommentOnWork | DecisionAction::ReviewComment => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let wanted = text("body");
+            let bodies = if decision.action == DecisionAction::CommentOnWork {
+                github.list_issue_comments(owner, name, number).await?
+            } else {
+                github.list_review_comments(owner, name, number).await?
+            };
+            let posted = bodies.iter().any(|b| b.trim() == wanted.trim());
+            (
+                if posted { "applied" } else { "annulled" },
+                serde_json::json!({ "number": number, "comments": bodies.len(), "found": posted }),
+                format!(
+                    "the comment {} among the {} on #{number}",
+                    if posted { "is" } else { "is not" },
+                    bodies.len()
+                ),
+            )
+        }
+        DecisionAction::MergeBuild | DecisionAction::AbandonBuild => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let pr = github.pull_request_state(owner, name, number).await?;
+            let done = if decision.action == DecisionAction::MergeBuild {
+                pr.merged
+            } else {
+                pr.state == GhState::Closed && !pr.merged
+            };
+            (
+                if done { "applied" } else { "annulled" },
+                serde_json::json!({
+                    "number": number,
+                    "state": pr.state.as_str(),
+                    "merged": pr.merged,
+                }),
+                format!(
+                    "PR #{number} is {} and merged = {}",
+                    pr.state.as_str(),
+                    pr.merged
+                ),
+            )
+        }
+        // No upstream artifact: these commit in the same transaction as the
+        // state they authorize, so they are never written pending and nothing
+        // should be here asking about one.
+        DecisionAction::Approve
+        | DecisionAction::NeedsRevision
+        | DecisionAction::Reject
+        | DecisionAction::RequestBuild
+        | DecisionAction::AuthorSpec
+        | DecisionAction::QueueTask
+        | DecisionAction::CancelRun
+        | DecisionAction::SettleDecision => (
+            "unknown",
+            serde_json::Value::Null,
+            "this action never reaches another system, so it has no artifact to find —              a pending row here is a bug, not a window"
+                .into(),
+        ),
+    })
+}
+
+fn unaddressed() -> (&'static str, serde_json::Value, String) {
+    (
+        "unknown",
+        serde_json::Value::Null,
+        "the intent names no issue or pull request number, so there is nowhere to look".into(),
+    )
+}
+
+/// Write down what became of a pending decision.
+///
+/// **Never charter-gated, deliberately.** The obvious design borrows the
+/// settled row's authority via [`DecisionAction::capability`], and it has a
+/// failure the charter's own purpose creates: `shadow`/`off` exist for
+/// *demotion*, and demotion is most likely exactly when something has gone
+/// wrong, which is when pending rows exist. Demote `capture_work` with a
+/// capture pending and the recipient would be raised an obligation every
+/// thirty minutes that the server refuses forever.
+///
+/// So: settling is not the action. The effect already happened, and refusing
+/// to record it does not un-file the issue — it only keeps the ledger wrong.
+/// Recording an outcome exercises no authority over anything outside this
+/// database, which is why a demoted capability does not gate it. The
+/// capability the settled row came from is still reported, on the row and in
+/// the brief, so a reader can see that the thing being settled is one the
+/// charter has since switched off.
+///
+/// What is still required is a rationale from the orchestrator, on the
+/// ordinary rule: an unexplained autonomous row is unreviewable, and this one
+/// is a claim about the world.
+async fn settle_decision(
+    State(store): State<Arc<Store>>,
+    Path(seq): Path<i64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SettleDecisionRequest>,
+) -> ApiResult<Response> {
+    let state = DecisionState::from_str(&body.state).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown state: {} (applied or annulled)",
+            body.state
+        ))
+    })?;
+    if !state.is_terminal() {
+        return Err(ApiError::BadRequest(
+            "a decision settles to applied or annulled; pending is where it already is".into(),
+        ));
+    }
+    let actor = actor_of(&store, &headers)?;
+    let existing = store
+        .decision(seq)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("decision {seq}")))?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let settle_seq = store
+        .reconcile_decision(seq, state, body.outcome.as_ref(), &decision)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "settled": seq,
+        "state": state.as_str(),
+        "action": existing.action.as_str(),
+        "capability": existing.action.capability().map(|c| c.as_str()),
+        "decision_seq": settle_seq,
+    }))
+    .into_response())
 }
 
 async fn reorder_spec_queue(

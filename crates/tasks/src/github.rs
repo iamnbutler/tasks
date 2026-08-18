@@ -115,6 +115,17 @@ async fn rest_ok(resp: reqwest::Response, what: &str) -> Result<serde_json::Valu
     Ok(body)
 }
 
+/// What an issue looks like right now, for a reconciliation reading back an
+/// effect it never saw the answer to. Never persisted — every field here is
+/// GitHub's and is read at decision time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueFacts {
+    pub state: GhState,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+}
+
 /// Normalized GitHub issue, ready for upsert into tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhIssue {
@@ -442,11 +453,13 @@ impl GitHubClient {
             }))
             .send()
             .await?;
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await?;
-        if !status.is_success() {
-            return Err(rest_error("create issue", status, &body));
-        }
+        // Through `rest_ok`, like every other write here — and it was the one
+        // that was not. Parsing the body *before* checking the status turns a
+        // 5xx whose body is not JSON (a proxy's error page) into
+        // `GhError::Http(decode error)`, which carries no status, so
+        // `is_unavailable()` reads it as GitHub *answering* — and the intent
+        // ledger would annul a decision whose issue may well have been filed.
+        let body = rest_ok(resp, "create issue").await?;
         body.get("number")
             .and_then(|n| n.as_u64())
             .ok_or_else(|| GhError::Shape("issue response missing `number`".into()))
@@ -758,6 +771,145 @@ impl GitHubClient {
                         .to_string(),
                 ))
             })
+            .collect())
+    }
+
+    /// Everything about an issue that a reconciliation reads back: its state,
+    /// its current text, and its labels.
+    ///
+    /// One GET serving four actions (`retire_work`, `reopen_work`,
+    /// `edit_issue`, `label_issue`), because they all ask the same resource a
+    /// different question and four methods would be four chances for two of
+    /// them to disagree about what a 404 means.
+    pub async fn issue_facts(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<IssueFacts, GhError> {
+        let url = format!(
+            "{}/repos/{owner}/{name}/issues/{number}",
+            self.rest_base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("read issue {number}")).await?;
+        Ok(IssueFacts {
+            state: match body.get("state").and_then(|s| s.as_str()) {
+                Some("closed") => GhState::Closed,
+                _ => GhState::Open,
+            },
+            title: body
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            body: body
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            labels: body
+                .get("labels")
+                .and_then(|l| l.as_array())
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|l| Some(l.get("name")?.as_str()?.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Issue numbers in this repository whose title matches `title` exactly,
+    /// open or closed.
+    ///
+    /// The reconciliation for a `capture_work` whose call never answered: the
+    /// only handle we have on an issue we may or may not have filed is the
+    /// title we sent. Search is eventually consistent, so a just-filed issue
+    /// may not appear — which is fine here and only here, because this is read
+    /// after a grace period rather than in the moment.
+    pub async fn find_issues_by_title(
+        &self,
+        owner: &str,
+        name: &str,
+        title: &str,
+    ) -> Result<Vec<u64>, GhError> {
+        let query = format!("repo:{owner}/{name} in:title type:issue \"{title}\"");
+        let url = format!("{}/search/issues", self.rest_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("q", query.as_str()), ("per_page", "20")])
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, "search issues by title").await?;
+        let items = body
+            .get("items")
+            .and_then(|i| i.as_array())
+            .ok_or_else(|| GhError::Shape("search response missing `items`".into()))?;
+        Ok(items
+            .iter()
+            .filter(|item| item.get("title").and_then(|t| t.as_str()) == Some(title))
+            .filter_map(|item| item.get("number").and_then(|n| n.as_u64()))
+            .collect())
+    }
+
+    /// Comment bodies on an issue or a pull request thread, newest page last.
+    ///
+    /// The reconciliation for `comment_on_work`: the artifact is a comment,
+    /// and the only way to know whether ours landed is to read them.
+    pub async fn list_issue_comments(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<Vec<String>, GhError> {
+        self.comment_bodies(&format!(
+            "{}/repos/{owner}/{name}/issues/{number}/comments?per_page=100",
+            self.rest_base_url
+        ))
+        .await
+    }
+
+    /// Review-comment bodies on a pull request's diff — the same question as
+    /// [`Self::list_issue_comments`], on the other resource.
+    pub async fn list_review_comments(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<Vec<String>, GhError> {
+        self.comment_bodies(&format!(
+            "{}/repos/{owner}/{name}/pulls/{number}/comments?per_page=100",
+            self.rest_base_url
+        ))
+        .await
+    }
+
+    async fn comment_bodies(&self, url: &str) -> Result<Vec<String>, GhError> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?;
+        let body = rest_ok(resp, "list comments").await?;
+        let arr = body
+            .as_array()
+            .ok_or_else(|| GhError::Shape("comments response is not an array".into()))?;
+        Ok(arr
+            .iter()
+            .filter_map(|c| Some(c.get("body")?.as_str()?.to_string()))
             .collect())
     }
 
@@ -1326,6 +1478,45 @@ mod tests {
                 "nodes": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
             }
         })
+    }
+
+    /// `create_issue` was the one write not going through [`rest_ok`]: it
+    /// parsed the body *before* checking the status, so a 5xx whose body is
+    /// not JSON — a proxy's error page — became `GhError::Http(decode error)`,
+    /// which carries no status. [`GhError::is_unavailable`] then read it as
+    /// GitHub *answering*, and the intent ledger would have **annulled** a
+    /// decision whose issue may well have been filed.
+    ///
+    /// Found only because the all-routes guard in `tests/custodial.rs` drove
+    /// every route through a failing GitHub; a route-by-route test would have
+    /// missed it.
+    #[tokio::test]
+    async fn a_five_hundred_with_an_unparseable_body_reads_as_an_outage() {
+        let app = Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                "<html><body>502 Bad Gateway</body></html>",
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = GitHubClient::with_base_url("token", "http://unused.invalid/graphql")
+            .with_rest_base_url(base);
+        let err = client
+            .create_issue("own", "repo", "a title", "a body", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GhError::Rest { status, .. } if status.is_server_error()),
+            "the status is what decides, not the body: {err}"
+        );
+        assert!(
+            err.is_unavailable(),
+            "GitHub did not answer, and a decision about this issue must stay pending"
+        );
     }
 
     #[tokio::test]

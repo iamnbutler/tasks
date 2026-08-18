@@ -931,6 +931,26 @@ pub enum ObligationKind {
     /// the honest unit; anything constructing a `SpecId` from `subject_id`
     /// must branch on the kind first.
     LandBatch,
+    /// A decision recorded its intent, reached for somebody else's system, and
+    /// never learned what happened — so a real artifact may exist upstream
+    /// that the ledger does not account for.
+    ///
+    /// **Its `subject_id` is a decision `seq`** — the third subject type,
+    /// after spec ids and build ids. Anything constructing a `SpecId` from
+    /// `subject_id` must branch on the kind first; a `SpecId::from_raw("417")`
+    /// is not a type error, it just heads a section with a spec that has never
+    /// existed.
+    ///
+    /// It passes the test [`ObligationKind::StaleImage`] would have failed —
+    /// it is dischargeable by its recipient — and only because the *server*
+    /// holds the lookup: `GET /decisions/{seq}/reconcile` asks GitHub, with
+    /// the server's own token, whether the artifact exists, and
+    /// `POST /decisions/{seq}/settle` writes the answer down. An orchestrator
+    /// holding a curl-only token and no `GITHUB_TOKEN` could not have
+    /// discharged this honestly, and a guess written into an append-only
+    /// ledger is worse than the missing row this whole change exists to
+    /// prevent.
+    ReconcileDecision,
 }
 
 impl ObligationKind {
@@ -940,6 +960,7 @@ impl ObligationKind {
             ObligationKind::DispatchBuild => "dispatch_build",
             ObligationKind::UnblockSpec => "unblock_spec",
             ObligationKind::LandBatch => "land_batch",
+            ObligationKind::ReconcileDecision => "reconcile_decision",
         }
     }
 }
@@ -1047,16 +1068,66 @@ impl Directions {
     }
 }
 
-/// What a decision did. Narrower than [`SpecQueueStatus`] on purpose: only
-/// transitions someone *chose* are decisions, so `built` (assigned by a
-/// successful Builder run) is not one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionAction {
-    Approve,
-    NeedsRevision,
-    Reject,
-    RequestBuild,
+/// Define [`DecisionAction`] and everything that must stay in step with it.
+///
+/// A macro rather than four hand-written matches, and the reason is a
+/// property rather than tidiness: `DecisionAction::ALL` is complete **by
+/// construction**. A hand-maintained array is green on the day somebody adds
+/// the tenth GitHub-writing route, which is exactly the day it needed to be
+/// red — `crates/tasks/tests/custodial.rs`'s
+/// `no_write_route_reaches_github_without_recording_first` drives `ALL`
+/// through an exhaustive match, so a new variant does not compile until
+/// somebody says whether it reaches GitHub, and then the guard drives it
+/// without anyone remembering to add it.
+///
+/// The third column is the charter capability the action belongs to. `None`
+/// means no capability stands behind it, which is to say it is the human's
+/// alone (`author_spec` is the only one — see `POST /tasks/{id}/build-now`).
+macro_rules! decision_actions {
+    ($( $(#[$meta:meta])* $variant:ident => $wire:literal, $capability:expr );* $(;)?) => {
+        /// What a decision did. Narrower than [`SpecQueueStatus`] on purpose:
+        /// only transitions someone *chose* are decisions, so `built`
+        /// (assigned by a successful Builder run) is not one.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum DecisionAction {
+            $( $(#[$meta])* $variant, )*
+        }
+
+        impl DecisionAction {
+            /// Every action there is, in declaration order. Complete because
+            /// the macro writes it — see the note above.
+            pub const ALL: &'static [DecisionAction] = &[ $( DecisionAction::$variant, )* ];
+
+            pub fn as_str(&self) -> &'static str {
+                match self { $( DecisionAction::$variant => $wire, )* }
+            }
+
+            pub fn from_str(s: &str) -> Option<Self> {
+                match s {
+                    $( $wire => Some(DecisionAction::$variant), )*
+                    _ => None,
+                }
+            }
+
+            /// The charter capability that governs this action, if any.
+            ///
+            /// Read by `POST /decisions/{seq}/settle` and by the brief, so a
+            /// pending row can say which capability it came from — including
+            /// when that capability has since been demoted, which is the case
+            /// a settle must not be refused for. `None` is human-only work.
+            pub fn capability(&self) -> Option<Capability> {
+                match self { $( DecisionAction::$variant => $capability, )* }
+            }
+        }
+    };
+}
+
+decision_actions! {
+    Approve => "approve", Some(Capability::AutoReviewSpecs);
+    NeedsRevision => "needs_revision", Some(Capability::AutoReviewSpecs);
+    Reject => "reject", Some(Capability::AutoReviewSpecs);
+    RequestBuild => "request_build", Some(Capability::DispatchBuilds);
     /// A human wrote a spec by hand for a task too simple to scout, and it was
     /// approved in the same act.
     ///
@@ -1064,36 +1135,39 @@ pub enum DecisionAction {
     /// rendered on somebody else's artifact; here there is only one opinion in
     /// the whole loop, and one ledger row should say so rather than let a
     /// later reader mistake it for a review that happened.
-    AuthorSpec,
+    ///
+    /// No capability: `POST /tasks/{id}/build-now` refuses the orchestrator
+    /// outright rather than being charter-gated.
+    AuthorSpec => "author_spec", None;
     /// A task was moved from the backlog into the queue, where a Scout will
     /// pick it up. Recorded because it is where spend begins.
-    QueueTask,
+    QueueTask => "queue_task", Some(Capability::QueueTasks);
     /// An issue was filed — work that would otherwise have been lost.
-    CaptureWork,
+    CaptureWork => "capture_work", Some(Capability::CaptureWork);
     /// An issue was closed: finished, or judged no longer worth doing.
-    RetireWork,
+    RetireWork => "retire_work", Some(Capability::RetireWork);
     /// A closed issue was reopened — the recourse for a retirement that was
     /// wrong, and the reason `retire_work` can be trusted with `live`.
-    ReopenWork,
+    ReopenWork => "reopen_work", Some(Capability::RetireWork);
     /// Something was said on an issue or a pull request. The lightest write
     /// here: recorded because a comment is still the system speaking in
     /// public under the owner's name.
-    CommentOnWork,
+    CommentOnWork => "comment_on_work", Some(Capability::CommentOnWork);
     /// A pull request was merged. The only action whose recourse is a revert
     /// rather than an edit.
-    MergeBuild,
+    MergeBuild => "merge_build", Some(Capability::LandBuilds);
     /// A pull request was closed unmerged — the branch is not going to land.
-    AbandonBuild,
+    AbandonBuild => "abandon_build", Some(Capability::LandBuilds);
     /// A comment pinned to a line of a pull request's diff. Separate from
     /// `CommentOnWork` because it points at code rather than at the thread,
     /// and because it can be wrong about a line that no longer exists.
-    ReviewComment,
+    ReviewComment => "review_comment", Some(Capability::CommentOnWork);
     /// An issue's body was rewritten. The only action here that destroys
     /// rather than appends, which is why its ledger row carries the previous
     /// text: the thing worth auditing is the diff, not the event.
-    EditIssue,
+    EditIssue => "edit_issue", Some(Capability::CurateWork);
     /// An issue's labels were replaced.
-    LabelIssue,
+    LabelIssue => "label_issue", Some(Capability::CurateWork);
     /// A scout or a build that was already in flight was stopped.
     ///
     /// Its own action rather than a flavour of `RequestBuild`, because the two
@@ -1101,51 +1175,69 @@ pub enum DecisionAction {
     /// somebody decided it should not finish. The rationale on this row is the
     /// only thing that distinguishes a deliberate stop from a crash when the
     /// run is read back later.
-    CancelRun,
+    CancelRun => "cancel_run", Some(Capability::CancelRuns);
+    /// A pending decision was reconciled against the world: the effect either
+    /// happened or it did not, and the ledger now says which.
+    ///
+    /// Its own action rather than a rewrite of the row it settles, because
+    /// `decisions` is append-only in the half that matters — who decided what
+    /// and why — and a reconciliation is a *second* judgment, by a possibly
+    /// different actor, about a first one. Not charter-gated: see
+    /// `POST /decisions/{seq}/settle`.
+    SettleDecision => "settle_decision", None;
 }
 
-impl DecisionAction {
+/// What became of the effect a decision authorized.
+///
+/// The window this represents is the one #964 is about: every write that lands
+/// in somebody else's system ran the effect and *then* recorded it, so a
+/// SQLite error, a panic or a SIGKILL in between left a real artifact upstream
+/// that nothing in the ledger accounts for. Recording *first* is refused —
+/// a row claiming an effect a failed call never had makes every row suspect,
+/// where a missing row leaves one artifact unexplained — so the window is
+/// represented instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionState {
+    /// The intent is on record and nobody knows what became of it. Written
+    /// before the effect, and *left* there when GitHub never answered at all
+    /// — which is the honest description, and what
+    /// `ObligationKind::ReconcileDecision` chases.
+    Pending,
+    /// The effect happened. Every historical row reads as this, and so does
+    /// every decision whose effect is local (a review verdict, a queueing, a
+    /// cancel): those commit in the same transaction as the state they
+    /// authorize, so there is no window to represent.
+    Applied,
+    /// The effect did not happen, and we know because the other system
+    /// *answered* — a 4xx, a 429, a response we could not read. Nothing
+    /// reached the world, so the row is not a history of one.
+    Annulled,
+}
+
+impl DecisionState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            DecisionAction::Approve => "approve",
-            DecisionAction::NeedsRevision => "needs_revision",
-            DecisionAction::Reject => "reject",
-            DecisionAction::RequestBuild => "request_build",
-            DecisionAction::AuthorSpec => "author_spec",
-            DecisionAction::QueueTask => "queue_task",
-            DecisionAction::CaptureWork => "capture_work",
-            DecisionAction::RetireWork => "retire_work",
-            DecisionAction::ReopenWork => "reopen_work",
-            DecisionAction::CommentOnWork => "comment_on_work",
-            DecisionAction::MergeBuild => "merge_build",
-            DecisionAction::AbandonBuild => "abandon_build",
-            DecisionAction::ReviewComment => "review_comment",
-            DecisionAction::EditIssue => "edit_issue",
-            DecisionAction::LabelIssue => "label_issue",
-            DecisionAction::CancelRun => "cancel_run",
+            DecisionState::Pending => "pending",
+            DecisionState::Applied => "applied",
+            DecisionState::Annulled => "annulled",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "approve" => Some(DecisionAction::Approve),
-            "needs_revision" => Some(DecisionAction::NeedsRevision),
-            "reject" => Some(DecisionAction::Reject),
-            "request_build" => Some(DecisionAction::RequestBuild),
-            "author_spec" => Some(DecisionAction::AuthorSpec),
-            "queue_task" => Some(DecisionAction::QueueTask),
-            "capture_work" => Some(DecisionAction::CaptureWork),
-            "retire_work" => Some(DecisionAction::RetireWork),
-            "reopen_work" => Some(DecisionAction::ReopenWork),
-            "comment_on_work" => Some(DecisionAction::CommentOnWork),
-            "merge_build" => Some(DecisionAction::MergeBuild),
-            "abandon_build" => Some(DecisionAction::AbandonBuild),
-            "review_comment" => Some(DecisionAction::ReviewComment),
-            "edit_issue" => Some(DecisionAction::EditIssue),
-            "label_issue" => Some(DecisionAction::LabelIssue),
-            "cancel_run" => Some(DecisionAction::CancelRun),
+            "pending" => Some(DecisionState::Pending),
+            "applied" => Some(DecisionState::Applied),
+            "annulled" => Some(DecisionState::Annulled),
             _ => None,
         }
+    }
+
+    /// Whether this is somewhere a `pending` row may move to. `pending` is
+    /// not: settling is what ends the window, and a settle that leaves it open
+    /// is a no-op with a ledger row.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, DecisionState::Pending)
     }
 }
 
@@ -1371,7 +1463,35 @@ pub struct Decision {
     /// two as one would turn an evaluation into a history.
     #[serde(default = "crate::models::default_true")]
     pub enforced: bool,
+    /// What became of the effect. See [`DecisionState`].
+    ///
+    /// One row with a state column, and deliberately not an intent row plus a
+    /// confirmation row: every existing aggregate over `decisions` would
+    /// double-count under two rows — the daily cap, `has_decision`, and the
+    /// `NOT EXISTS` behind the `ReviewSpec` obligation — and each would need
+    /// an "and not the intent one" clause the next query written against this
+    /// table would forget. One row keeps every reader correct without being
+    /// taught anything.
+    #[serde(default = "crate::models::default_applied")]
+    pub state: DecisionState,
+    /// What the effect produced or refused with — an issue number, a merge
+    /// SHA, GitHub's own error. Merged rather than replaced when a row is
+    /// settled, so the error a refused call wrote here survives the
+    /// reconciliation that later finds the artifact.
+    ///
+    /// The mutable half of the row. Actor, action, rationale, evidence and
+    /// subject are never rewritten.
+    #[serde(default)]
+    pub outcome: Option<serde_json::Value>,
+    /// When the row left `pending`. `None` while it is still open, and `None`
+    /// on every row that was never pending at all.
+    #[serde(default)]
+    pub settled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+pub(crate) fn default_applied() -> DecisionState {
+    DecisionState::Applied
 }
 
 pub(crate) fn default_true() -> bool {
