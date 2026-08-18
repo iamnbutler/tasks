@@ -2224,22 +2224,10 @@ async fn top_up(
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
 ) -> Result<(), StoreError> {
-    if store.get_mode().await? != Mode::Play {
-        return Ok(());
-    }
-
-    // A stop before the queue, not a filter over it: an outage is a fact about
-    // the world, not about any one task, and skipping held work to find
-    // something else to dispatch would just pick a different victim.
-    if github_hold(health) {
-        return Ok(());
-    }
-
-    // Same shape for a half-applied upgrade: a new scout would run in the
-    // stale half of it. Silent here for the same reason as the GitHub hold —
-    // the transition is announced by the watch itself, once, and `/status`
-    // answers for whoever asks later.
-    if updates.hold(store).await {
+    // Cheap pre-check, and only that: the per-dispatch read below is the one
+    // that decides. A held dispatcher must not walk the whole task table every
+    // `DISPATCH_TICK` to reach the same answer.
+    if dispatch_held(store, health, updates).await? {
         return Ok(());
     }
 
@@ -2249,6 +2237,20 @@ async fn top_up(
         let Some((task, project)) = next_dispatchable(store, in_flight_ids).await? else {
             break;
         };
+
+        // Asked again, per scout, because each iteration starts a VM and a
+        // pause landing mid-pass must stop the next one — not merely the next
+        // pass (#948).
+        //
+        // Placement is the point. It reads *after* `next_dispatchable`, not
+        // before it: a human pauses and *then* queues work, so anything the
+        // scan could see was committed after the pause was, and a read that
+        // follows the scan cannot miss it. Read before the scan, that window
+        // reopens. It is also the last thing before `in_flight.spawn`, with
+        // nothing awaited in between.
+        if dispatch_held(store, health, updates).await? {
+            break;
+        }
 
         let target = ScoutTarget {
             repo_clone_url: clone_url(config, &project),
@@ -2271,6 +2273,52 @@ async fn top_up(
         });
     }
     Ok(())
+}
+
+/// Whether new scouts must wait: the three standing reasons, asked together.
+///
+/// One function rather than three inline checks so a fourth reason cannot be
+/// added at one call site and forgotten at the other — [`top_up`] asks once
+/// before its loop (for cost) and once per dispatch (for freshness), and a new
+/// hold belongs here as one more early `return Ok(true)` rather than at either
+/// call site.
+///
+/// Silent by design, like the checks it replaces: a pause is the human's own
+/// act, the GitHub edge is announced by the poller and the update edge by the
+/// watch, and `/status` answers for whoever asks later. A 500 ms loop that
+/// logged its refusals is what trains a reader to ignore them.
+///
+/// The build lane asks the same three questions in its own match guard (see
+/// [`build_loop`]) and deliberately does **not** call this: it claims at most
+/// one build per pass, so it already re-reads them for every container it
+/// starts, and sharing this would mean restructuring a match guard around an
+/// `await`. The comment there points back here, so whichever site is edited
+/// names the other.
+async fn dispatch_held(
+    store: &Store,
+    health: &GitHubHealth,
+    updates: &crate::updates::UpdateWatch,
+) -> Result<bool, StoreError> {
+    if store.get_mode().await? != Mode::Play {
+        return Ok(true);
+    }
+
+    // A stop before the queue, not a filter over it: an outage is a fact about
+    // the world, not about any one task, and skipping held work to find
+    // something else to dispatch would just pick a different victim.
+    if github_hold(health) {
+        return Ok(true);
+    }
+
+    // Same shape for a half-applied upgrade: a new scout would run in the
+    // stale half of it. Silent here for the same reason as the GitHub hold —
+    // the transition is announced by the watch itself, once, and `/status`
+    // answers for whoever asks later.
+    if updates.hold(store).await {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// The next task to scout: queue order (which [`Store::list_tasks`] already
@@ -2792,6 +2840,15 @@ pub async fn build_loop(
                 // transaction: claiming moves the build to `running` and drags
                 // its batch's tasks to `building`, so a claim-then-refuse would
                 // flip that state on every tick of the outage.
+                //
+                // These are the same three questions [`dispatch_held`] asks for
+                // scouts, and the duplication is deliberate: this lane claims at
+                // most one build per pass, so it already re-reads them for every
+                // container it starts and never had `top_up`'s stale-snapshot bug
+                // (#948) — while sharing the function would mean restructuring
+                // this match guard around an `await`. A fourth reason to hold
+                // new work belongs in both places: add it to `dispatch_held` and
+                // here.
                 Ok(Mode::Play)
                     if in_flight.builds() == 0 && !github_hold(&health) && !update_hold =>
                 {
@@ -3253,6 +3310,56 @@ mod tests {
         let after = store.get_task(&doomed.id).await.unwrap().unwrap();
         assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
         assert_eq!(after.state, TaskState::Rejected);
+    }
+
+    /// A 5xx: the only class [`GhError::is_unavailable`] treats as an outage,
+    /// so the only one that can put a hold on dispatch.
+    fn unavailable() -> Result<(), GhError> {
+        Err(GhError::Rest {
+            what: "pull request".into(),
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: "bad gateway".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatch_held_answers_from_live_state_every_time() {
+        // The freshness itself, deterministically: every read sees the state as
+        // of that read, never a snapshot taken earlier in the pass (#948).
+        let store = Store::open_in_memory().await.unwrap();
+        let health = GitHubHealth::default();
+        let updates = crate::updates::UpdateWatch::at_boot(true);
+
+        store.set_mode(Mode::Play).await.unwrap();
+        assert!(
+            !dispatch_held(&store, &health, &updates).await.unwrap(),
+            "playing, GitHub answering, nothing pending: dispatch is free"
+        );
+
+        for mode in [Mode::Pause, Mode::Stop] {
+            store.set_mode(mode).await.unwrap();
+            assert!(
+                dispatch_held(&store, &health, &updates).await.unwrap(),
+                "{mode:?} must be seen by the very next read"
+            );
+            store.set_mode(Mode::Play).await.unwrap();
+            assert!(
+                !dispatch_held(&store, &health, &updates).await.unwrap(),
+                "and so must the play that follows it"
+            );
+        }
+
+        let now = Utc::now();
+        health.observe(&unavailable(), now);
+        assert!(
+            dispatch_held(&store, &health, &updates).await.unwrap(),
+            "an outage that started mid-pass holds the next dispatch"
+        );
+        health.observe(&Ok::<(), GhError>(()), now);
+        assert!(
+            !dispatch_held(&store, &health, &updates).await.unwrap(),
+            "and a success releases it just as promptly"
+        );
     }
 
     /// A paused repo is a repo the dispatcher walks *past*, not one it stops
