@@ -726,8 +726,25 @@ monotonic budget as it did before the module existed, which is right because the
 in-VM supervisor already re-invokes an agent whose connection dropped
 (`{SCOUT,BUILDER}_MAX_RESUMES`, the failure a short nap causes) and killing the
 run throws that recovery away. It is cumulative, so three four-minute naps trip
-it, and a run can outlive its wall-clock budget by less than that floor, never
-more. `WAIVED_BUDGET_SHARE` (a quarter) is **accountability**, read as how much
+it. And what it bounds is a run's **awake execution past the point wall elapsed
+reached the budget, never wall-clock elapsed** (#955). The sentence that stood
+here claimed the latter, and its reason — "the wall arm is disarmed below it" —
+was right about the regime it named and was then generalised past it: while the
+arm is disarmed the whole suspend is under the floor, so the wall overshoot is
+under it too, but a single nap at or past the floor *arms* the arm, and that nap
+is itself the overshoot. So wall-clock elapsed has no bound and costs nothing —
+`Expiry::remaining` answers `None` once `awake` reaches the budget whatever the
+suspend is, and nothing caps a suspend, so a lid closed for three hours during a
+disarmed run's last tick fires three hours past the wall budget and the run was
+not running for any of it. Awake execution *is* bounded, strictly **under** the
+floor and not by the floor plus a tick, which double-counts: neither arm of
+`remaining` ever answers with more than the monotonic remainder (`elapsed >=
+awake`) and the poll sleeps `remaining.min(tick)`, so `awake` never passes
+`budget` and at most the suspend accumulated at that point is left to spend —
+under the floor if the arm is disarmed there, and at most one tick if it is
+armed, a tick being *less* than the floor rather than an addend to it. The tick
+is not a term in that bound at all; the question it does answer is the one in
+the paragraph below. `WAIVED_BUDGET_SHARE` (a quarter) is **accountability**, read as how much
 of the budget went *unspent awake* (`budget − awake`) — a fraction and not a flat
 ten minutes because every budget it reads against is configurable and shorter
 ones (the reattach remainder, floored at 30s) would make a flat floor
