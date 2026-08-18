@@ -1318,14 +1318,13 @@ async fn pause_blocks_new_dispatches() {
     })
     .await;
 
-    // Pause, then queue more work: the loop must leave it alone.
+    // Pause, then queue more work: the loop must leave it alone. The two
+    // writes are adjacent on purpose, and the ordering is the whole assertion.
+    // The dispatcher re-reads the mode after it scans the queue and
+    // immediately before it spawns, so a task committed after this pause
+    // cannot be dispatched by any interleaving: whatever pass sees the task
+    // also sees the pause.
     store.set_mode(Mode::Pause).await.unwrap();
-    // One tick of daylight between the pause and the task, deliberately.
-    // `top_up` reads the mode and *then* queries the queue, so a tick that
-    // read `Play` a moment before this pause is still entitled to dispatch
-    // whatever it finds — and the assertion below would then be about which
-    // write won rather than about pausing.
-    tokio::time::sleep(Duration::from_millis(600)).await;
     let second = insert_task(&store, &project, 2, "second").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
