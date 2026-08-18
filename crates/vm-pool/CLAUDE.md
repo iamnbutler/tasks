@@ -173,6 +173,36 @@ whitespace read as unset, which is a different thing from wrong.
   loop, so a daemon wedged *above* its accept still refuses the second start —
   that is the intent, and why the error message leads with "stop the running
   daemon first".
+- **What that closes is a live incumbent, not a concurrent start.** The probe
+  answers for the instant it ran, and nothing holds that answer through the
+  `remove_file` and the `bind` after it. Two daemons starting together against
+  the same *stale* path therefore both see "nothing is listening": A unlinks
+  and binds, then B — already past its own probe — unlinks A's now-live socket
+  and binds over it, and A is back on an unlinked inode. That is the
+  displaced-daemon failure above, reassembled out of two processes that each
+  did the right thing. So the rule is "refuses to displace a live daemon", and
+  it must not be read as "binding is safe" — which is why the window is named
+  at the unlink and on `bind_socket`'s rustdoc, where the account of the old
+  failure is written in the past tense and otherwise reads as closed. It is
+  named rather than fixed because it needs two starts inside the same few
+  milliseconds against a socket nobody owns, which no workflow here performs
+  (an upgrade stops one daemon and starts the next). If it is ever taken, the
+  fix is an advisory `flock` on a sibling lockfile — `LOCK_EX | LOCK_NB`,
+  taken **ahead of** the probe, held for the process lifetime, refusal
+  reported as `AlreadyRunning` — and **the probe stays even then**, because a
+  lock cannot see an incumbent that predates it, which is exactly the daemon a
+  vm-pool upgrade leaves running. It is a design and not a patch: `flock(2)`
+  locks are held per *open file description*, so two opens in one process
+  conflict with each other and an fd merely leaked to hold the lock "for the
+  process lifetime" would fail the second of the two `bind_socket` calls
+  `a_stale_socket_is_reclaimed` makes on one path in one test process. The
+  lock has to come back as a guard, which changes a `pub` signature both entry
+  points and several tests use; the live-incumbent refusal would then come
+  from the lock rather than the probe, so
+  `a_live_socket_is_refused_and_its_owner_stays_reachable` keeps asserting
+  what it means only if the lock error maps onto `AlreadyRunning`; and
+  `vm-pool-service` has no `libc`/`rustix`/`fs2` dependency today, while
+  vm-pool stays independently publishable.
 - **There are two leaks, and they need two mechanisms.** A **slot leak** is a
   VM that died while this pool still counted it; a **orphan leak** is a VM
   whose whole daemon went away, since `container run` outlives the process that

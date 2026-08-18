@@ -274,6 +274,41 @@ implementation.
 - **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
   loop.** The server consumes Claude Code's typed output (stream-json, hooks,
   MCP tools, structured outputs); it does not reimplement the loop.
+- **A read-only agent is spelled in verbs, and the quoting is what makes that
+  expressible.** The only worked example this repository had was
+  `BRIEFING_CMD`, deleted whole with `crates/tasks/src/briefing.rs` in #933,
+  and the shape is worth keeping because it is not derivable from anything
+  left in the tree: `claude --print --allowedTools
+  "Bash(gh:*),Bash(curl:*),Bash(git log:*),Bash(git diff:*)"`.
+  `--allowedTools` is default-deny and **prefix-matched**, so the list is
+  written in verbs rather than tools — `Bash(git:*)` would hand the agent
+  `git push` and `git commit` along with the log, which is why the example
+  spelled `git log` and `git diff` out separately instead of saying `git`.
+  And for an agent whose whole point is that it cannot write,
+  `--dangerously-skip-permissions` is never the way to give it more access: it
+  *discards* the allowlist rather than widening it, so what comes up is not a
+  more capable read-only agent but an unrestricted one. The flag is not
+  forbidden in general — an orchestrator deliberately pointed at the checkout
+  to run as a full dev agent takes it, and the `ORCHESTRATOR_WORKDIR` row
+  below says so; it is forbidden where the restriction *is* the design.
+  **The quoting is the load-bearing half, and the one no longer recoverable by
+  reading the tree**: `Bash(git log:*)` contains a space, so a command string
+  split on whitespace shatters it into `Bash(git` and `log:*)`, and the agent
+  comes up holding two permissions that match nothing while default-deny
+  refuses every call they were meant to allow. A restrictive multi-tool
+  allowlist therefore needs a quoting-aware split, and **`orchestrator.rs` is
+  not the template to copy**: the orchestrator's *default* command
+  (`DEFAULT_ORCHESTRATOR_CMD`, `crates/tasks/src/run.rs:96`) has an allowlist
+  of one space-free token, `Bash(curl:*)`, so `invoke`'s `split_whitespace`
+  (`orchestrator.rs:311`) has never been wrong there and *cannot* express a
+  multi-tool read-only allowlist — reaching for that spawn path is the named
+  mistake. Both halves survive in git, in two different files, and it takes
+  both: `git show 63a1fb6^:crates/tasks/src/run.rs` holds the command and the
+  doc comment giving its reasons (`DEFAULT_BRIEFING_CMD`, `:102`), while
+  `git show 63a1fb6^:crates/tasks/src/briefing.rs` holds the splitter that
+  makes it expressible (`split_command`, `:392`, with its test
+  `split_command_groups_quoted_permissions` at `:439`) and no occurrence of
+  the command at all.
 - **A dead API connection is resumed in the supervisor, never re-dispatched
   from the host.** Agent processes die intermittently at ~380s elapsed (#845)
   when the connection drops mid-response — below the agent, in the VM's network
