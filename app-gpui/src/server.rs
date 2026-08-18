@@ -14,8 +14,16 @@
 //!   (`/usr/bin:/bin:/usr/sbin:/sbin`), never a shell's, so `$PATH` finds
 //!   `tasks` for exactly the people who would have used a terminal anyway. The
 //!   pidfile's `exe` is both the most likely to exist and the most obviously
-//!   correct thing to restart — it is *the binary that is serving*. See
-//!   [`resolve_binary`].
+//!   correct thing to restart — it is *the binary that is serving*. A bundle
+//!   installed by `make dist` carries a `tasks` at `Contents/Helpers/tasks`,
+//!   and that is the answer when nothing is serving yet — which on an end
+//!   user's machine is the first launch. See [`resolve_binary`].
+//! - **Whether to build.** `tasks reload` builds by default, and `cargo` does
+//!   not exist on an end user's machine. The decision is derived from the
+//!   binary itself, never from a setting: a `tasks` with no workspace above
+//!   it has nothing to build in, so it is driven with `--no-build` and swaps
+//!   itself in — which for a freshly replaced bundle *is* the upgrade. See
+//!   [`build_in_place`].
 //! - **The child's `PATH`.** The same trap bites twice: `tasks reload` runs
 //!   `cargo build` as its first step, and `cargo` is not on that `PATH`
 //!   either. Hence [`child_path`], and hence [`which`] searching the *child's*
@@ -234,21 +242,29 @@ impl Outcome {
     }
 }
 
-/// `$TASKS_BIN`, else the binary the running server published, else `tasks` on
-/// the child's `PATH`. See the module docs for why that order.
+/// `$TASKS_BIN`, else the binary the running server published, else the
+/// `tasks` riding in this app's own bundle, else `tasks` on the child's
+/// `PATH`. See the module docs for why that order.
+///
+/// The bundle sits *below* the pidfile deliberately: the binary that is
+/// serving is the most obviously correct thing to restart, and after a bundle
+/// update the two agree anyway — the install path is stable, so the pidfile's
+/// `exe` names the new binary at the old path.
 pub fn resolve_binary(data_dir: Option<&Path>) -> PathBuf {
     resolve_binary_with(
         std::env::var_os(BIN_ENV).map(PathBuf::from),
         data_dir,
+        bundled_binary(),
         || which("tasks"),
     )
 }
 
-/// [`resolve_binary`]'s decision, with its two environmental inputs handed in
-/// so every branch is testable without touching the environment.
+/// [`resolve_binary`]'s decision, with its environmental inputs handed in so
+/// every branch is testable without touching the environment.
 fn resolve_binary_with(
     explicit: Option<PathBuf>,
     data_dir: Option<&Path>,
+    bundled: Option<PathBuf>,
     on_path: impl FnOnce() -> Option<PathBuf>,
 ) -> PathBuf {
     if let Some(path) = explicit.filter(|p| !p.as_os_str().is_empty()) {
@@ -264,9 +280,56 @@ fn resolve_binary_with(
             }
         }
     }
+    if let Some(path) = bundled {
+        return path;
+    }
     // Last resort, and a bare name on purpose: unresolved, the child looks it
     // up in the `PATH` it will actually run with.
     on_path().unwrap_or_else(|| PathBuf::from("tasks"))
+}
+
+/// The `tasks` binary a `make dist` bundle carries, at
+/// `Tasks.app/Contents/Helpers/tasks`. `None` in a dev bundle, which carries
+/// only the app — that absence is what keeps dev behaviour identical.
+fn bundled_binary() -> Option<PathBuf> {
+    bundled_binary_from(&std::env::current_exe().ok()?)
+}
+
+/// [`bundled_binary`] with the executable handed in, so the layout rule is
+/// testable.
+///
+/// `Helpers`, and never a sibling in `Contents/MacOS`: the app binary there
+/// is `Tasks`, and the default macOS filesystem is case-insensitive, so a
+/// sibling probe for `tasks` finds *this app itself* and the menu would spawn
+/// the GUI with `reload` for arguments. The same collision is why `make
+/// dist` installs the server binary into its own directory.
+fn bundled_binary_from(exe: &Path) -> Option<PathBuf> {
+    let contents = exe.parent()?.parent()?;
+    let candidate = contents.join("Helpers/tasks");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Whether `binary` has a workspace to build in — the fact that decides
+/// between `tasks reload` (dev: build, then swap in what was built) and
+/// `tasks reload --no-build` (installed: swap the binary in as it is).
+///
+/// Derived, never configured: the probe is the one `reload` itself uses to
+/// find a workspace (`crates/tasks/Cargo.toml` above the binary), so the app
+/// never asks for a build the child would fail to locate. A `$TASKS_REPO`
+/// override means the operator has named a workspace explicitly, and that is
+/// a request to build in it. The bare-name fallback (nothing resolved,
+/// relative path) keeps building, as it always did — `reload` falls back to
+/// its own cwd detection there.
+fn build_in_place(binary: &Path, repo_override: bool) -> bool {
+    if repo_override {
+        return true;
+    }
+    if !binary.is_absolute() {
+        return true;
+    }
+    binary
+        .ancestors()
+        .any(|dir| dir.join("crates/tasks/Cargo.toml").is_file())
 }
 
 /// `PATH` for the child: the usual toolchain locations, then whatever this
@@ -293,8 +356,9 @@ fn which(name: &str) -> Option<PathBuf> {
 pub fn command_for(op: Op, data_dir: Option<&Path>) -> Command {
     let binary = resolve_binary(data_dir);
     let repo = std::env::var_os(REPO_ENV).filter(|r| !r.is_empty());
+    let build = build_in_place(&binary, repo.is_some());
     let mut command = Command::new(&binary);
-    command.args(args_for(op, repo.as_deref()));
+    command.args(args_for(op, repo.as_deref(), build));
     command.env("PATH", child_path());
     if let Some(dir) = data_dir {
         // Be explicit about which server this is: the app resolved the data
@@ -313,8 +377,18 @@ pub fn command_for(op: Op, data_dir: Option<&Path>) -> Command {
 /// answers for `<repo>/target/debug/tasks` and not for an installed binary
 /// outside a checkout. It goes only to the ops that build — `stop` rejects
 /// unknown flags.
-fn args_for(op: Op, repo: Option<&OsStr>) -> Vec<OsString> {
+///
+/// `build: false` turns a building op into `--no-build`: the resolved binary
+/// swaps *itself* in, which is the whole restart story for an installed
+/// bundle. `--repo` is meaningless without a build and never rides with it —
+/// [`build_in_place`] returns `true` whenever a repo was named, so the
+/// combination cannot arise from [`command_for`].
+fn args_for(op: Op, repo: Option<&OsStr>, build: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = op.args().iter().map(OsString::from).collect();
+    if op.builds() && !build {
+        args.push(OsString::from("--no-build"));
+        return args;
+    }
     if let Some(repo) = repo.filter(|_| op.builds()) {
         args.push(OsString::from("--repo"));
         args.push(repo.to_os_string());
@@ -745,15 +819,36 @@ mod tests {
 
         let repo = OsString::from("/w/tasks");
         assert_eq!(
-            args_for(Op::Restart, Some(&repo)),
+            args_for(Op::Restart, Some(&repo), true),
             ["reload", "--repo", "/w/tasks"]
         );
-        assert_eq!(args_for(Op::Stop, Some(&repo)), ["stop"]);
+        assert_eq!(args_for(Op::Stop, Some(&repo), true), ["stop"]);
         assert_eq!(
-            args_for(Op::StopWhenIdle, Some(&repo)),
+            args_for(Op::StopWhenIdle, Some(&repo), true),
             ["stop", "--when-idle"]
         );
-        assert_eq!(args_for(Op::Restart, None), ["reload"]);
+        assert_eq!(args_for(Op::Restart, None, true), ["reload"]);
+    }
+
+    /// An installed binary has no workspace, so every building op turns into
+    /// `--no-build` — the resolved binary swaps itself in — and the ops that
+    /// never build are untouched.
+    #[test]
+    fn without_a_workspace_building_ops_go_no_build() {
+        assert_eq!(args_for(Op::Restart, None, false), ["reload", "--no-build"]);
+        assert_eq!(
+            args_for(Op::RestartWhenIdle, None, false),
+            ["reload", "--when-idle", "--no-build"]
+        );
+        assert_eq!(
+            args_for(Op::RestartAnyway, None, false),
+            ["reload", "--force", "--no-build"]
+        );
+        assert_eq!(args_for(Op::Stop, None, false), ["stop"]);
+        assert_eq!(
+            args_for(Op::StopWhenIdle, None, false),
+            ["stop", "--when-idle"]
+        );
     }
 
     /// The log's first line is the command as the child received it, so a
@@ -761,7 +856,11 @@ mod tests {
     #[test]
     fn the_log_opens_with_what_was_actually_run() {
         let mut command = Command::new("/usr/local/bin/tasks");
-        command.args(args_for(Op::RestartWhenIdle, Some(OsStr::new("/w/tasks"))));
+        command.args(args_for(
+            Op::RestartWhenIdle,
+            Some(OsStr::new("/w/tasks")),
+            true,
+        ));
         assert_eq!(
             command_line(&command),
             "/usr/local/bin/tasks reload --when-idle --repo /w/tasks"
@@ -827,7 +926,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let explicit = PathBuf::from("/somewhere/tasks");
         assert_eq!(
-            resolve_binary_with(Some(explicit.clone()), Some(dir.path()), || panic!(
+            resolve_binary_with(Some(explicit.clone()), Some(dir.path()), None, || panic!(
                 "must not fall through"
             )),
             explicit
@@ -841,8 +940,46 @@ mod tests {
         std::fs::File::create(&exe).unwrap();
         write_pidfile(dir.path(), &exe);
         assert_eq!(
-            resolve_binary_with(None, Some(dir.path()), || panic!("must not fall through")),
+            resolve_binary_with(None, Some(dir.path()), None, || panic!(
+                "must not fall through"
+            )),
             exe
+        );
+    }
+
+    /// The binary that is serving is the most obviously correct thing to
+    /// restart, even from an app that carries its own — and after a bundle
+    /// update the two are the same path anyway.
+    #[test]
+    fn the_serving_binary_beats_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tasks-binary");
+        std::fs::File::create(&exe).unwrap();
+        write_pidfile(dir.path(), &exe);
+        assert_eq!(
+            resolve_binary_with(
+                None,
+                Some(dir.path()),
+                Some(PathBuf::from(
+                    "/Applications/Tasks.app/Contents/MacOS/tasks"
+                )),
+                || panic!("must not fall through")
+            ),
+            exe
+        );
+    }
+
+    /// With nothing serving — the end user's first launch — the bundle's own
+    /// binary is the answer, never a `PATH` that launchd populated.
+    #[test]
+    fn the_bundle_beats_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundled = PathBuf::from("/Applications/Tasks.app/Contents/MacOS/tasks");
+        assert_eq!(
+            resolve_binary_with(None, Some(dir.path()), Some(bundled.clone()), || panic!(
+                "must not fall through"
+            )),
+            bundled
         );
     }
 
@@ -853,7 +990,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_pidfile(dir.path(), Path::new("/nonexistent/tasks"));
         assert_eq!(
-            resolve_binary_with(None, Some(dir.path()), || Some(PathBuf::from(
+            resolve_binary_with(None, Some(dir.path()), None, || Some(PathBuf::from(
                 "/usr/bin/tasks"
             ))),
             PathBuf::from("/usr/bin/tasks")
@@ -863,9 +1000,57 @@ mod tests {
     #[test]
     fn with_nothing_to_go_on_it_is_a_bare_name_for_the_child_to_resolve() {
         assert_eq!(
-            resolve_binary_with(None, None, || None),
+            resolve_binary_with(None, None, None, || None),
             PathBuf::from("tasks")
         );
+    }
+
+    /// The layout rule: the server binary lives in `Contents/Helpers`, and a
+    /// bundle without one — every dev bundle — yields nothing. The probe must
+    /// never look for a `tasks` sibling in `Contents/MacOS`: on the default
+    /// (case-insensitive) macOS filesystem that path *is* the `Tasks` app
+    /// binary, and resolving it would have the menu spawn the GUI with
+    /// `reload` for arguments.
+    #[test]
+    fn the_bundled_server_is_found_in_helpers_and_only_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = dir.path().join("Tasks.app/Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        let app_exe = contents.join("MacOS/Tasks");
+        std::fs::File::create(&app_exe).unwrap();
+
+        // A dev bundle: only the app binary. Nothing to find — and on a
+        // case-insensitive filesystem this is exactly the layout where a
+        // sibling probe would find the app itself.
+        assert_eq!(bundled_binary_from(&app_exe), None);
+
+        std::fs::create_dir_all(contents.join("Helpers")).unwrap();
+        let server = contents.join("Helpers/tasks");
+        std::fs::File::create(&server).unwrap();
+        assert_eq!(bundled_binary_from(&app_exe), Some(server));
+    }
+
+    /// The build decision is derived from the binary's surroundings: a
+    /// checkout's binary builds, an installed one swaps itself in, a named
+    /// `$TASKS_REPO` is an explicit request to build, and the bare-name
+    /// fallback keeps the behaviour it always had.
+    #[test]
+    fn a_workspace_above_the_binary_is_what_makes_it_build() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("crates/tasks")).unwrap();
+        std::fs::File::create(ws.path().join("crates/tasks/Cargo.toml")).unwrap();
+        let in_checkout = ws.path().join("target/debug/tasks");
+        assert!(build_in_place(&in_checkout, false));
+
+        let installed = tempfile::tempdir().unwrap();
+        let bundled = installed.path().join("Tasks.app/Contents/MacOS/tasks");
+        assert!(!build_in_place(&bundled, false));
+        assert!(
+            build_in_place(&bundled, true),
+            "a named repo is a request to build in it"
+        );
+
+        assert!(build_in_place(Path::new("tasks"), false));
     }
 
     /// `cargo` is not on launchd's `PATH`, and `reload`'s first step is a

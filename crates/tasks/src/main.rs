@@ -106,6 +106,12 @@ above the cwd, then the nearest above this binary; the real environment wins):
   VM_POOL_MAX_VMS        VMs `tasks vm-pool` holds at once (default 6). Read
                          by the pool, not by the server, so changing it means
                          restarting the pool
+  TASKS_VM_POOL_AUTOSPAWN
+                         whether a failed vm-pool connect spawns the pool
+                         from this binary (on/off). Unset, derived: on for an
+                         installed binary (no checkout above it — a bundle),
+                         off for a checkout artifact, whose developer runs
+                         and restarts the pool deliberately
   GITHUB_TOKEN           fallback for `tasks secrets set github-token`; needed
                          for polling and clones. Prefer the sealed store —
                          a raw token in .env is what #971 rotated away from
@@ -276,6 +282,10 @@ rather than taking the path over: the incumbent would go on holding its VMs
 while becoming unreachable. Stop the running daemon first, or point this one
 at a different VM_POOL_SOCKET. A socket file left behind by a dead daemon is
 unlinked and reclaimed automatically.
+
+That refusal is also what makes TASKS_VM_POOL_AUTOSPAWN safe: with it on,
+a server that cannot reach the socket spawns this daemon itself (logging to
+<data dir>/vm-pool.log), and racing spawns resolve to one bound pool.
 ";
 
 /// Whether a subcommand's arguments are asking for help.

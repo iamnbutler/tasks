@@ -81,6 +81,9 @@ fn test_config(vm_pool_socket: &Path, data_dir: &Path, clone_root: &Path) -> Con
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
         update_hold: true,
+        // Off in every harness: these tests own their pool (or its absence),
+        // and a server spawning one behind their back would race both.
+        vm_pool_autospawn: false,
     }
 }
 

@@ -331,6 +331,14 @@ pub struct Config {
     /// default on). Off, what is pending is still reported in `/status`; only
     /// the dispatchers stop listening. See [`crate::updates`].
     pub update_hold: bool,
+
+    /// Whether a failed vm-pool connect spawns the pool from this binary
+    /// (`TASKS_VM_POOL_AUTOSPAWN`, `on`/`off`). Unset, the default is
+    /// **derived from where this binary lives**: an installed binary (no
+    /// workspace above `current_exe()` — a `make dist` bundle, an end user's
+    /// machine) manages its own pool, a checkout artifact stays out of the
+    /// developer's way. See [`autospawn_vm_pool`] for why spawning is safe.
+    pub vm_pool_autospawn: bool,
 }
 
 impl Config {
@@ -405,6 +413,16 @@ impl Config {
                     var: "TASKS_UPDATE_HOLD",
                     expected: "`on` or `off`",
                     value: raw.unwrap_or_default(),
+                })?
+            },
+            vm_pool_autospawn: {
+                let raw = env_string("TASKS_VM_POOL_AUTOSPAWN");
+                autospawn_enabled(raw.as_deref(), exe_in_checkout()).map_err(|_| {
+                    ConfigError::Invalid {
+                        var: "TASKS_VM_POOL_AUTOSPAWN",
+                        expected: "`on` or `off`",
+                        value: raw.unwrap_or_default(),
+                    }
                 })?
             },
         })
@@ -2080,7 +2098,10 @@ fn builder_config(config: &Config, leases: Option<crate::broker::LeaseIssuer>) -
 ///
 /// Owns the vm-pool connection: if the socket is missing or the connection
 /// drops, dispatch pauses and reconnects every [`VM_POOL_RETRY`] rather than
-/// taking the process down.
+/// taking the process down. With [`Config::vm_pool_autospawn`] on, each
+/// failed connect also spawns the pool from this same binary
+/// ([`autospawn_vm_pool`]) — an installed system has no terminal where
+/// `tasks vm-pool` would be typed.
 ///
 /// `in_flight` carries scouts this loop did not start — runs
 /// [`resume_in_flight`] picked back up — which are otherwise invisible to its
@@ -2111,6 +2132,16 @@ pub async fn dispatch_loop(
                     retry_secs = VM_POOL_RETRY.as_secs(),
                     "vm-pool unavailable — scout dispatch disabled"
                 );
+                // This loop and not the build lane: one spawner is enough
+                // (the pool serves one socket), and the build lane finds the
+                // socket on its own retry once the pool is up. Every failed
+                // connect may spawn — the pool's refuse-if-listening guard is
+                // what bounds that at one live daemon, so a pool that cannot
+                // boot shows up as a retry-cadence trail in vm-pool.log
+                // rather than a herd of daemons.
+                if config.vm_pool_autospawn {
+                    autospawn_vm_pool(&config);
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(VM_POOL_RETRY) => continue,
                     _ = shutdown.changed() => return,
@@ -2131,6 +2162,121 @@ pub async fn dispatch_loop(
             &mut shutdown,
         )
         .await;
+    }
+}
+
+/// Where an autospawned vm-pool's output goes: appended under the data dir,
+/// beside `serve.log`, so an installed system's two daemons are diagnosed
+/// from one directory.
+const VM_POOL_LOG_NAME: &str = "vm-pool.log";
+
+/// `TASKS_VM_POOL_AUTOSPAWN`, as a decision: explicit `on`/`off` wins, unset
+/// derives from where the binary lives (`in_checkout` — see
+/// [`exe_in_checkout`]), anything else is a refusal to boot rather than a
+/// silent default (the `TASKS_UPDATE_HOLD` rule).
+///
+/// The derivation is the useful half: an installed binary — a `make dist`
+/// bundle, or anything outside a checkout — has no developer beside it to
+/// run `tasks vm-pool`, so it manages its own pool; a checkout artifact has
+/// exactly such a developer, whose deliberate pool restarts (`make drain` →
+/// restart the pool → `make resume`) an eager server would race. The refusal
+/// guard makes that race safe, not polite.
+fn autospawn_enabled(raw: Option<&str>, in_checkout: bool) -> Result<bool, ()> {
+    match raw {
+        None => Ok(!in_checkout),
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(_) => Err(()),
+    }
+}
+
+/// Whether this binary is a checkout artifact: `crates/tasks/Cargo.toml`
+/// somewhere above `current_exe()` — the same probe `reload` uses to find a
+/// workspace to build in, so "would `reload` build here" and "is a developer
+/// running this" cannot drift apart.
+fn exe_in_checkout() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| crate::reload::workspace_above(&exe))
+        .is_some()
+}
+
+/// Spawn `tasks vm-pool` from this same binary, detached: own process group
+/// (the pool must outlive this server — that is what makes
+/// [`resume_in_flight`] worth anything), stdio appended to
+/// [`VM_POOL_LOG_NAME`] under the data dir.
+///
+/// No leader election and no pidfile, because the guard already exists in
+/// the pool itself: it **refuses to start when something is listening on its
+/// socket**. Two racing spawns, or a spawn racing a human's own `tasks
+/// vm-pool`, resolve to exactly one bound daemon and one logged exit. The
+/// socket and data dir are passed explicitly rather than inherited, for the
+/// reason `reload` passes `TASKS_DATA_DIR` to the server it starts: the
+/// child must not resolve a different answer out of a differently-populated
+/// environment.
+///
+/// A spawn failure is a warning, not an error: the connect loop this runs in
+/// is already reporting "vm-pool unavailable" on every retry, and dispatch
+/// staying disabled *is* the failure mode, not a new one.
+fn autospawn_vm_pool(config: &Config) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            warn!(error = %err, "cannot autospawn vm-pool: no current_exe");
+            return;
+        }
+    };
+    let log_path = config.data_dir.join(VM_POOL_LOG_NAME);
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(log) => log,
+        Err(err) => {
+            warn!(log = %log_path.display(), error = %err, "cannot autospawn vm-pool: log unwritable");
+            return;
+        }
+    };
+    let stderr = match log.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => {
+            warn!(error = %err, "cannot autospawn vm-pool: log handle");
+            return;
+        }
+    };
+    let mut command = tokio::process::Command::new(&exe);
+    command
+        .arg("vm-pool")
+        .env("VM_POOL_SOCKET", &config.vm_pool_socket)
+        .env(tasks_api::paths::DATA_DIR_ENV, &config.data_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(stderr))
+        .process_group(0);
+    match command.spawn() {
+        Ok(mut child) => {
+            let pid = child.id().unwrap_or(0);
+            info!(
+                pid,
+                socket = %config.vm_pool_socket.display(),
+                log = %log_path.display(),
+                "spawned vm-pool"
+            );
+            // Reap it. A pool that binds runs until killed and this task
+            // parks forever, which costs nothing; one that exits — most
+            // likely "already running", the refusal doing its job — must not
+            // linger as a zombie for the life of this server.
+            tokio::spawn(async move {
+                match child.wait().await {
+                    Ok(status) => info!(pid, %status, "autospawned vm-pool exited"),
+                    Err(err) => warn!(pid, error = %err, "waiting on autospawned vm-pool"),
+                }
+            });
+        }
+        Err(err) => {
+            warn!(exe = %exe.display(), error = %err, "could not spawn vm-pool");
+        }
     }
 }
 
@@ -3096,6 +3242,23 @@ mod tests {
 
     use super::*;
     use crate::models::{ProjectId, ProjectStatus};
+
+    /// The autospawn default is derived from where the binary lives, and an
+    /// explicit setting beats the derivation in both directions. Garbage is a
+    /// refusal, never a default — the `TASKS_UPDATE_HOLD` rule.
+    #[test]
+    fn autospawn_defaults_to_installed_binaries_only() {
+        // Unset: a checkout artifact stays out of the developer's way, an
+        // installed binary manages its own pool.
+        assert_eq!(autospawn_enabled(None, true), Ok(false));
+        assert_eq!(autospawn_enabled(None, false), Ok(true));
+        // Explicit wins over the derivation, both ways.
+        assert_eq!(autospawn_enabled(Some("on"), true), Ok(true));
+        assert_eq!(autospawn_enabled(Some("off"), false), Ok(false));
+        // Anything else refuses to boot.
+        assert_eq!(autospawn_enabled(Some("yes"), false), Err(()));
+        assert_eq!(autospawn_enabled(Some(""), false), Err(()));
+    }
 
     #[test]
     fn the_shipped_defaults_leave_the_pool_slack() {

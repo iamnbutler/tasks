@@ -264,6 +264,9 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
         update_hold: true,
+        // Off in every harness: these tests own their pool (or its absence),
+        // and a server spawning one behind their back would race both.
+        vm_pool_autospawn: false,
     }
 }
 

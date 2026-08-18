@@ -1129,7 +1129,12 @@ fn find_workspace() -> Option<PathBuf> {
     })
 }
 
-fn workspace_above(start: &Path) -> Option<PathBuf> {
+/// `pub(crate)` because it is also the probe behind the vm-pool autospawn
+/// default ([`crate::run`]): "is this binary a checkout artifact" and "is
+/// there a workspace to build in" must stay one question, or the app could
+/// drive a binary with `--no-build` that the server half still treats as a
+/// developer's.
+pub(crate) fn workspace_above(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|dir| dir.join("crates/tasks/Cargo.toml").is_file())

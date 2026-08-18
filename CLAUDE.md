@@ -397,6 +397,26 @@ implementation.
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
   stays independently publishable.
+- **The system's stable home is never a build cache.** A `cargo clean` once
+  deleted the serving binary out from under a live pipeline, because every
+  runnable artifact lived in `target/` — and an end user who downloads
+  Tasks.app has no `target/` at all. The distribution shape
+  (docs/plans/2026-08-18-end-user-distribution.md) is one bundle for both
+  audiences: `make dist` installs a release `tasks` into the bundle at
+  `Tasks.app/Contents/Helpers/tasks` — never beside the app binary, whose
+  `MacOS/Tasks` is the same case-insensitive directory entry as
+  `MacOS/tasks` — and the app resolves it after the
+  pidfile's `exe` and drives it with `--no-build` — a decision **derived from
+  the binary's surroundings** (no `crates/tasks/Cargo.toml` above it means
+  nothing to build), never a setting. The same derivation picks the vm-pool
+  autospawn default: an installed server spawns `current_exe vm-pool`
+  detached on a failed connect (`TASKS_VM_POOL_AUTOSPAWN`), which is safe
+  only because the pool refuses an occupied socket — no leader election, no
+  pidfile, racing spawns resolve to one daemon. A checkout binary defaults
+  `off`, because a developer's deliberate pool restart (`make drain` → pool →
+  `make resume`) is a race an eager server would lose politely but lose.
+  `make app` stays the dev bundle; the two are distinguished by what they
+  carry, not by a flag baked at build time.
 - **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
   loop.** The server consumes Claude Code's typed output (stream-json, hooks,
   MCP tools, structured outputs); it does not reimplement the loop.
@@ -873,6 +893,10 @@ cargo run -p tasks -- add-project owner/repo
 tasks secrets init                     # create the sealed credential store
 tasks secrets set github-token         # seal a key (value on stdin, never argv);
                                        #   a running server picks it up live
+make dist                              # self-contained Tasks.app: the gpui app
+                                       #   plus a release `tasks` binary at
+                                       #   Contents/Helpers/tasks — survives
+                                       #   `cargo clean`, runs off a checkout
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;
@@ -1333,6 +1357,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |
+| `TASKS_VM_POOL_AUTOSPAWN` | derived | whether a failed vm-pool connect spawns the pool from the serving binary, detached, logging to `<data dir>/vm-pool.log` (`on`/`off`; anything else refuses to boot). Unset, the default is derived from where the binary lives: `on` for an installed binary (no workspace above `current_exe()` — a `make dist` bundle), `off` for a checkout artifact, whose developer restarts the pool deliberately. Safe because the pool refuses an occupied socket, so racing spawns resolve to one daemon. See *End-user distribution* below |
 | `GITHUB_TOKEN` | — | **fallback** for `tasks secrets set github-token`, warned at startup — the sealed store is where production keys live. Needed (either way) for polling; the broker spends it for clones and the land push |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix, and where the broker forwards git traffic. A non-http(s) base (a `file://` mirror) cannot be proxied and clones direct — see the credential-custody rule |
