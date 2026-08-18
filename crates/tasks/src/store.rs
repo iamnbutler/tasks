@@ -4967,7 +4967,16 @@ fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Event, StoreError> {
 /// whole case for letting the orchestrator decide rests on being able to see
 /// why afterwards. Humans owe no explanation — they are the ones the record
 /// is for.
-fn require_rationale(decision: &DecisionInput) -> Result<(), StoreError> {
+///
+/// `pub` because the API layer has to apply this same rule *earlier*: on every
+/// enforced path the store call that writes the ledger row runs after the
+/// GitHub write it explains, so a refusal here has already let the effect
+/// happen (#957). `server::authorize` calls this before any handler reaches
+/// GitHub. It is the same function and not a second copy of the sentence,
+/// because two copies of a rule drift and this one's text is what callers see.
+/// The six store call sites stay: a caller that never went through a handler
+/// still must not be able to record an unexplained decision.
+pub fn require_rationale(decision: &DecisionInput) -> Result<(), StoreError> {
     let missing = decision
         .rationale
         .as_deref()
