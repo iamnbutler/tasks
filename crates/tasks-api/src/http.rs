@@ -368,9 +368,22 @@ pub struct SendMessage {
 
 /// Body of `POST /mode`. `mode` is a string for the same reason as
 /// [`ReviewRequest::status`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `note` is why this mode was set, for the event feed. It exists because the
+/// artifact a maintenance drain leaves behind is a `pause` byte-identical to
+/// any other: an hour later `/status`, `tasks status` and the Server window
+/// all say `pause` and nothing says why. A caller that has a reason sends it
+/// and the server appends it as an [`crate::events::EventPayload::Note`] —
+/// the edge is on the feed, the standing answer is the mode, and there is
+/// deliberately nothing between them (a persisted "held for maintenance"
+/// would be a fourth hold to keep in step). `#[serde(default)]`, so every
+/// existing caller keeps working and sending none is the same request it
+/// always was.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SetMode {
     pub mode: String,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Response of `GET /mode` and `POST /mode`.

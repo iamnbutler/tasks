@@ -84,7 +84,12 @@ const CONNECTION_GRACE: Duration = Duration::from_secs(2);
 /// `limit`, and the ceiling on one the caller asks for. The SSE replay pages at
 /// the maximum until it catches up.
 const DEFAULT_TRANSCRIPT_LIMIT: i64 = 500;
+
 const MAX_TRANSCRIPT_LIMIT: i64 = 2000;
+
+/// Source tag on the `Note` a `POST /mode` carrying a reason appends. One
+/// tag, whoever set the mode: the message says which act it was.
+const MODE_SOURCE: &str = "mode";
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -2679,6 +2684,13 @@ async fn get_mode(State(store): State<Arc<Store>>) -> ApiResult<Json<ModeRespons
     }))
 }
 
+/// `POST /mode` — set the mode, and say why if the caller has a reason.
+///
+/// The `ModeChanged` event is conditional on the mode actually moving; the
+/// `note` is not. A maintenance drain against an already-paused pipeline
+/// changes nothing and is still the fact somebody arriving later needs — and
+/// a `Note` is not `nudge_worthy`, so it costs no orchestrator turn either
+/// way.
 async fn set_mode(
     State(store): State<Arc<Store>>,
     Json(body): Json<SetMode>,
@@ -2690,6 +2702,19 @@ async fn set_mode(
     if from != mode {
         store
             .append_event(EventPayload::ModeChanged { from, to: mode })
+            .await?;
+    }
+    if let Some(note) = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        store
+            .append_event(EventPayload::Note {
+                source: MODE_SOURCE.into(),
+                message: note.to_string(),
+            })
             .await?;
     }
     Ok(Json(ModeResponse { mode }))

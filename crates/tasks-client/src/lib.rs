@@ -648,11 +648,17 @@ impl Client {
     }
 
     /// Mode gates *new* work only — pausing never interrupts a running scout.
+    ///
+    /// No `note`: this is the app's mode switch, and a person who just clicked
+    /// Pause is the answer to "why is it paused". The field exists for callers
+    /// whose pause outlives the moment — `tasks drain` — and an absent one is
+    /// the request this always sent.
     pub fn set_mode(&self, mode: Mode) -> Result<Mode> {
         let response: ModeResponse = self.post_json(
             "/mode",
             &SetMode {
                 mode: mode.as_str().to_string(),
+                note: None,
             },
         )?;
         Ok(response.mode)

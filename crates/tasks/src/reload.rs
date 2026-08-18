@@ -33,6 +33,14 @@
 //! cold start — a crash loop, `launchd` `KeepAlive`, `tasks serve` by hand —
 //! carries nothing and comes back quiet.
 //!
+//! [`drain_for_maintenance`] and [`resume`] are the same wait loop pointed at
+//! a different act. A reload can afford its gate to be a courtesy, because
+//! `resume_in_flight` re-attaches to every live VM; the two *host* acts —
+//! restarting vm-pool on the same socket, and `make images` — have no such
+//! recovery and had no gate at all. `tasks drain` pauses dispatch, waits for
+//! the drain point and **keeps holding**, because what happens next is work
+//! this process can neither do nor observe.
+//!
 //! This is not a service manager: no supervision, no restart-on-crash, no
 //! daemon. The pidfile is a discovery record and the swap is one-shot;
 //! `launchd`/`systemd` compose with it fine, pointed at `tasks serve`.
@@ -42,7 +50,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tasks_api::http::{InFlight, ModeResponse, ServerStatus, SetMode};
+use tasks_api::http::{CancelAck, CancelRunRequest, InFlight, ModeResponse, ServerStatus, SetMode};
 use tasks_api::models::Mode;
 use thiserror::Error;
 use tokio::process::Command;
@@ -174,14 +182,20 @@ impl ModeHandover {
 /// to launch one last scout, which is the unattended VM `--when-idle` exists to
 /// prevent. So a stop leaves dispatch paused, and says so.
 ///
-/// If a third caller of `drain` ever appears it should have to answer this
-/// question rather than inherit an answer.
+/// The third caller is [`drain_for_maintenance`], and it answers the question
+/// differently again: **the pause is the deliverable, not the tool**. Nothing
+/// follows it at all — the server keeps serving, and what happens next is host
+/// work (a vm-pool restart, `make images`) that this process cannot do and
+/// cannot observe. So the hold outlives the command and is undone only by
+/// [`resume`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModeAfterDrain {
     /// The swap carries the pre-drain mode to the new server.
     Restored,
     /// Nothing follows, so the pause outlives the command.
     LeftPaused,
+    /// The pause *is* the point: it is held until `tasks resume`.
+    HeldForMaintenance,
 }
 
 impl ModeAfterDrain {
@@ -194,15 +208,56 @@ impl ModeAfterDrain {
             ModeAfterDrain::LeftPaused => {
                 "paused dispatch for the drain (it stays paused after the stop)"
             }
+            ModeAfterDrain::HeldForMaintenance => {
+                "paused dispatch (it stays paused until `tasks resume`)"
+            }
         }
     }
 
-    /// What a drain timeout did *not* do. Both variants restore the mode
+    /// What a drain timeout did *not* do. Every variant restores the mode
     /// there — nothing happened, and a no-op must not have side effects.
+    ///
+    /// The maintenance sentence is imperative because the next thing that
+    /// operator does is delete containers: a drain that gave up has quiesced
+    /// nothing, and reading "the drain timed out" as "well, near enough" is
+    /// exactly the mistake this command exists to prevent.
     fn nothing_happened(self) -> &'static str {
         match self {
             ModeAfterDrain::Restored => "nothing was restarted",
             ModeAfterDrain::LeftPaused => "nothing was stopped",
+            ModeAfterDrain::HeldForMaintenance => {
+                "the pipeline is not quiesced and dispatch was left as it was — do not \
+                 restart vm-pool or rebuild images yet"
+            }
+        }
+    }
+
+    /// What to put on the event feed when the pause goes on, if anything.
+    ///
+    /// Only the maintenance hold has anything to say there, and it is the one
+    /// that needs it: what it leaves behind is a `pause` byte-identical to any
+    /// other, so an hour later `/status`, `tasks status` and the Server window
+    /// all say `pause` and nothing says why. A restart's pause is undone by
+    /// the swap seconds later and a stop's is announced by the stop itself.
+    fn feed_note(self) -> Option<&'static str> {
+        match self {
+            ModeAfterDrain::Restored | ModeAfterDrain::LeftPaused => None,
+            ModeAfterDrain::HeldForMaintenance => Some(
+                "`tasks drain`: dispatch is held for host maintenance (a vm-pool restart or \
+                 `make images`); `tasks resume` releases it",
+            ),
+        }
+    }
+
+    /// …and when a timeout puts it back. Same asymmetry, same reason: this is
+    /// the edge that would otherwise leave a reader guessing.
+    fn restore_note(self) -> Option<&'static str> {
+        match self {
+            ModeAfterDrain::Restored | ModeAfterDrain::LeftPaused => None,
+            ModeAfterDrain::HeldForMaintenance => Some(
+                "`tasks drain` timed out before the pipeline was quiesced; dispatch is back \
+                 to play and nothing is held",
+            ),
         }
     }
 }
@@ -505,21 +560,53 @@ async fn drain(
     timeout: Duration,
     after: ModeAfterDrain,
 ) -> Result<bool, ReloadError> {
-    let paused = match mode {
-        Mode::Play => {
-            set_mode(port, Mode::Pause)
-                .await
-                .map_err(ReloadError::Other)?;
-            println!("{}", after.pause_note());
-            true
-        }
-        // Already not dispatching; nothing to pause and nothing to undo.
-        other => {
-            println!("mode is {}; nothing new will be dispatched", other.as_str());
-            false
-        }
-    };
+    let paused = pause_dispatch(port, mode, after).await?;
+    wait_for_drain_point(port, timeout, paused, after).await
+}
 
+/// Hold new dispatch, and report whether *this* call is what installed the
+/// hold (`false` when the pipeline was not playing to begin with).
+///
+/// Split out of [`drain`] so [`drain_for_maintenance`] can put its cancels in
+/// the gap between the pause and the wait — cancelling first would let the
+/// dispatcher start a replacement scout within the tick, the same reason a
+/// cancelled scout's task returns to `backlog` rather than `queued`. Splitting
+/// rather than copying is what keeps one pause rule and one wait loop in the
+/// binary.
+///
+/// A mode that is not `Play` is left exactly as it is, never rewritten to
+/// `Pause`: `Stop` is *tighter* than `Pause` (it stops the poller too), so
+/// "pausing" a stopped pipeline would quietly turn intake back on in the name
+/// of holding it. What the maintenance hold still does there is *say so* on
+/// the feed, which is why the note travels with the mode we already have.
+async fn pause_dispatch(port: u16, mode: Mode, after: ModeAfterDrain) -> Result<bool, ReloadError> {
+    let paused = mode == Mode::Play;
+    let target = match paused {
+        true => Mode::Pause,
+        false => mode,
+    };
+    if paused || after.feed_note().is_some() {
+        set_mode(port, target, after.feed_note())
+            .await
+            .map_err(ReloadError::Other)?;
+    }
+    match paused {
+        true => println!("{}", after.pause_note()),
+        // Already not dispatching; nothing to pause and nothing to undo.
+        false => println!("mode is {}; nothing new will be dispatched", mode.as_str()),
+    }
+    Ok(paused)
+}
+
+/// Wait for the last destructible run to land, and answer with the `paused`
+/// it was handed — the value a caller has to know afterwards, and the one the
+/// timeout path has to undo.
+async fn wait_for_drain_point(
+    port: u16,
+    timeout: Duration,
+    paused: bool,
+    after: ModeAfterDrain,
+) -> Result<bool, ReloadError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = String::new();
     loop {
@@ -547,7 +634,7 @@ async fn drain(
             // paused would be a side effect of a no-op. It has to happen here
             // and not at the next boot — a boot takes its configured default
             // now, so nothing else would ever undo it.
-            if paused && let Err(err) = set_mode(port, Mode::Play).await {
+            if paused && let Err(err) = set_mode(port, Mode::Play, after.restore_note()).await {
                 println!("could not restore mode to play: {err}");
             }
             return Err(ReloadError::DrainTimeout(format!(
@@ -652,6 +739,288 @@ pub fn render_left_paused(port: u16) -> String {
          curl -sS -X POST localhost:{port}/mode -H 'content-type: application/json' \
          -d '{{\"mode\":\"play\"}}'"
     )
+}
+
+// --- the maintenance drain ---
+
+/// How long a cancel gets to answer. Longer than [`PROBE_TIMEOUT`] on purpose:
+/// the handler waits out its own settle window before replying, so the honest
+/// budget here is that window plus the round trip.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What `tasks drain` was asked to do.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainOptions {
+    /// Report whether the pipeline is quiesced and exit. Touches neither the
+    /// mode nor any run — this is what `make images` gates on.
+    pub check: bool,
+    /// Cancel running scouts rather than waiting them out. Strictly opt-in,
+    /// and never the default: waiting costs time, cancelling costs work.
+    pub cancel_scouts: bool,
+    /// How long to wait for the drain point before giving up.
+    pub drain_timeout: Duration,
+}
+
+impl Default for DrainOptions {
+    fn default() -> Self {
+        Self {
+            check: false,
+            cancel_scouts: false,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+/// What a drain found, and what it left behind.
+///
+/// Three variants and not two. [`Drained::Clear`] is `--check` finding nothing
+/// to wait for, and it renders **empty**: `Quiesced { left_paused: false }`'s
+/// sentence is about a pipeline this command is holding, and a check holds
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drained {
+    /// No live server. Nothing here can start or watch a container, so there
+    /// is nothing to hold — and the gate has to pass, or it would only ever
+    /// work on a host that happens to be serving.
+    NotServing,
+    /// `--check`: nothing in flight and dispatch is not playing.
+    Clear,
+    /// The pipeline is quiesced and dispatch is held until [`resume`].
+    Quiesced { port: u16, left_paused: bool },
+}
+
+/// `tasks drain`: pause dispatch, wait for in-flight work to land, and **keep
+/// holding** — so the operator can restart vm-pool or rebuild the images.
+///
+/// The half of #961 neither the update hold nor `POST /runs/cancel-all`
+/// covers. `tasks reload` needs no gate (`resume_in_flight` re-attaches to
+/// every live VM); the two *host* actions have no such recovery and had no
+/// gate at all.
+///
+/// Three things it deliberately is not. It never signals the server — the API
+/// keeps serving throughout, which is what makes it usable *before* a pool
+/// restart. It installs no new server-side hold: mode `pause` is the hold,
+/// already read by all three places that select work, and #961 §2 says extend
+/// the existing drain rather than stand a parallel one beside it. And nothing
+/// resumes automatically, because only the operator knows the pool is back and
+/// the images are rebuilt.
+pub async fn drain_for_maintenance(
+    data_dir: &Path,
+    opts: DrainOptions,
+) -> Result<Drained, ReloadError> {
+    let Some(file) = pidfile::read_live(data_dir) else {
+        // Not a refusal: no dispatcher means nothing that can start a
+        // container, and a gate that failed here would only work on a host
+        // already serving.
+        println!("not serving — nothing here can start or watch a container");
+        return Ok(Drained::NotServing);
+    };
+
+    let status = fetch_status(file.port).await.ok();
+    print!(
+        "{}",
+        render_status(Some(&file), status.as_ref(), Utc::now())
+    );
+
+    // The one refusal that is not about the pipeline's state: there is no way
+    // to tell when idle arrives, and "quiesced" about a server we cannot see
+    // into is the wrong direction to be wrong in.
+    let Some(status) = status else {
+        return Err(ReloadError::Busy(format!(
+            "pid {} is alive but is not answering /status on port {}, so there is no way to \
+             tell what is in flight. Do not restart vm-pool or rebuild images yet; re-run \
+             once it answers, or `tasks stop` stops it",
+            file.pid, file.port
+        )));
+    };
+
+    if opts.check {
+        return check(&status).map(|()| Drained::Clear);
+    }
+
+    // Reported and never waited for: an orchestrator turn is a local child, no
+    // VM holds it, and neither host action costs it anything.
+    if status.in_flight.orchestrator.is_some() {
+        println!("note: an orchestrator turn is owed; no VM holds it, so it is not waited for");
+    }
+
+    // Unconditionally, even with nothing in flight — the deliberate inversion
+    // of `stop --when-idle`, which returns early without touching the mode. An
+    // idle pipeline nobody holds starts a scout on the next tick, straight
+    // into the pool that is about to go down.
+    let paused = pause_dispatch(file.port, status.mode, ModeAfterDrain::HeldForMaintenance).await?;
+
+    if opts.cancel_scouts {
+        cancel_running_scouts(file.port).await;
+    }
+
+    wait_for_drain_point(
+        file.port,
+        opts.drain_timeout,
+        paused,
+        ModeAfterDrain::HeldForMaintenance,
+    )
+    .await?;
+
+    Ok(Drained::Quiesced {
+        port: file.port,
+        left_paused: paused,
+    })
+}
+
+/// `--check`: is this host safe to do the destructive work on *right now*?
+///
+/// Two conditions, and the second is the one that is easy to miss. Nothing in
+/// flight is not enough: a *playing* pipeline with nothing in flight tops
+/// scouts up on the dispatcher's next tick, so a multi-minute image rebuild
+/// started here races it — and a scout that starts during a rebuild starts in
+/// the **old** image, which is the #909 staleness [`crate::updates`] exists to
+/// prevent and cannot see, since the identity it reads is only ever observed
+/// from a run that has already started. So a playing server is refused with
+/// `tasks drain` named, and `FORCE=1` remains the escape hatch for someone who
+/// knows better.
+fn check(status: &ServerStatus) -> Result<(), ReloadError> {
+    if status.in_flight.is_destructible() {
+        return Err(ReloadError::Busy(format!(
+            "{} in flight — restarting vm-pool or rebuilding images now would land on it. \
+             `tasks drain` waits it out and holds the pipeline",
+            describe(&status.in_flight)
+        )));
+    }
+    if status.mode == Mode::Play {
+        return Err(ReloadError::Busy(
+            "nothing is in flight, but dispatch is playing: the dispatcher tops scouts up on \
+             its next tick, and a scout that starts during a rebuild starts in the old image. \
+             `tasks drain` holds the pipeline, `tasks resume` releases it"
+                .into(),
+        ));
+    }
+    println!(
+        "quiesced: nothing in flight, dispatch is {}",
+        status.mode.as_str()
+    );
+    Ok(())
+}
+
+/// What a held pipeline leaves the operator holding, and how to give it back.
+///
+/// Pure and rendered from the outcome rather than printed as it goes, so both
+/// arms are unit-testable — and so `--check`, which holds nothing, cannot
+/// borrow the held drain's closing words.
+pub fn render_quiesced(drained: &Drained) -> String {
+    let Drained::Quiesced { port, left_paused } = drained else {
+        return String::new();
+    };
+    let held = match left_paused {
+        true => "dispatch is paused and stays paused",
+        // Not "dispatch was already not playing" for a `Clear` check — see
+        // `Drained`. Here it is true and it is the reader's next question.
+        false => "dispatch was already not playing, and this changed nothing",
+    };
+    format!(
+        "quiesced: nothing is in flight and {held}. vm-pool can be restarted and \
+         `make images` run now.\n\
+         when the host work is done: tasks resume   (or curl -sS -X POST \
+         localhost:{port}/mode -H 'content-type: application/json' -d '{{\"mode\":\"play\"}}')"
+    )
+}
+
+/// Ask the server to stop every running scout, and report what it answered.
+///
+/// **A cancel does not guarantee the drain point arrives.** It writes a durable
+/// `cancellations` row and the *dispatcher following the run* is what concludes
+/// it, so a run nothing is following — its dispatcher died, or vm-pool is
+/// already down — still runs the wait out to the timeout. That is the honest
+/// answer rather than a gap: this command promises the pipeline is quiesced,
+/// and it cannot promise that about a VM nobody is watching. Which is why each
+/// line below repeats the server's own `concluded` instead of flattening
+/// "asked" and "stopped" into one word.
+///
+/// Scouts only, and never builds: a build is one serial lane and a whole
+/// implementation, and #961 §3's own accounting (3 scouts, 0 strikes, ~30 min)
+/// argues waiting beats discarding. Routed through the API rather than by
+/// removing the VM, because a cancel has to interrupt the dispatcher's drain
+/// (#876) — killing the container by hand leaves the row `running` forever.
+async fn cancel_running_scouts(port: u16) {
+    // Re-read *after* the pause: the set worth cancelling is the one running
+    // now, not the one that was running before dispatch was held.
+    let scouts = match fetch_status(port).await {
+        Ok(status) => status.in_flight.scouts,
+        Err(err) => {
+            println!("could not re-read what is in flight ({err}); no scout was cancelled");
+            return;
+        }
+    };
+    if scouts.is_empty() {
+        println!("no running scout to cancel");
+        return;
+    }
+    for scout in &scouts {
+        match cancel_scout(port, &scout.id).await {
+            Ok(ack) => match ack.concluded {
+                true => println!("cancelled scout {}: it is now {}", ack.run_id, ack.status),
+                false => println!(
+                    "asked scout {} to stop; it is still {} — whoever is following the run \
+                     concludes it, and this drain waits for that",
+                    ack.run_id, ack.status
+                ),
+            },
+            Err(err) => println!("could not cancel scout {}: {err}", scout.id),
+        }
+    }
+}
+
+/// One `POST /sessions/{id}/cancel`.
+///
+/// The rationale is not decoration: it lands in the run's `exit_reason`, which
+/// is what tells a reader months later that this was a deliberate stop and not
+/// a crash.
+async fn cancel_scout(port: u16, id: &str) -> Result<CancelAck, String> {
+    let client = reqwest::Client::builder()
+        .timeout(CANCEL_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/sessions/{id}/cancel"))
+        .json(&CancelRunRequest {
+            rationale: Some(
+                "`tasks drain --cancel-scouts`: host maintenance (a vm-pool restart or an \
+                 image rebuild) is about to happen and this run was not waited out"
+                    .into(),
+            ),
+            evidence: None,
+        })
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("/cancel answered {}", response.status()));
+    }
+    response
+        .json::<CancelAck>()
+        .await
+        .map_err(|e| format!("could not read the cancel answer: {e}"))
+}
+
+/// `tasks resume`: the undo for [`drain_for_maintenance`]. Returns the port
+/// and the mode it found, or `None` when nothing is serving.
+///
+/// It reports what it changed *from* rather than assuming `pause`: a drain of
+/// a stopped pipeline holds it without rewriting the mode, so resuming one is
+/// a promotion, and saying so is the least this owes the operator.
+pub async fn resume(data_dir: &Path) -> Result<Option<(u16, Mode)>, ReloadError> {
+    let Some(file) = pidfile::read_live(data_dir) else {
+        return Ok(None);
+    };
+    let status = fetch_status(file.port).await.map_err(ReloadError::Other)?;
+    set_mode(
+        file.port,
+        Mode::Play,
+        Some("`tasks resume`: the maintenance hold is released and dispatch is playing"),
+    )
+    .await
+    .map_err(ReloadError::Other)?;
+    Ok(Some((file.port, status.mode)))
 }
 
 /// `tasks status`: the same report `reload` prints, on its own.
@@ -788,7 +1157,14 @@ async fn fetch_status(port: u16) -> Result<ServerStatus, String> {
         .map_err(|e| format!("could not read /status: {e}"))
 }
 
-async fn set_mode(port: u16, mode: Mode) -> Result<(), String> {
+/// `POST /mode`, with the reason for it when there is one.
+///
+/// The note is what the server puts on the event feed; the mode is the
+/// standing answer. There is deliberately nothing between them — a persisted
+/// "held for maintenance" flag would be a fourth hold to keep in step with
+/// `github_hold` and `update_hold`, for a fact the feed and the mode already
+/// carry between them.
+async fn set_mode(port: u16, mode: Mode, note: Option<&str>) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
         .build()
@@ -797,6 +1173,7 @@ async fn set_mode(port: u16, mode: Mode) -> Result<(), String> {
         .post(format!("http://127.0.0.1:{port}/mode"))
         .json(&SetMode {
             mode: mode.as_str().to_string(),
+            note: note.map(str::to_string),
         })
         .send()
         .await
@@ -1315,6 +1692,107 @@ mod tests {
             ModeAfterDrain::LeftPaused.nothing_happened(),
             "nothing was stopped"
         );
+    }
+
+    /// The third caller answers the question the other two answer differently:
+    /// its pause is the deliverable, so it says "until `tasks resume`" — and
+    /// its timeout sentence is imperative, because the next thing that
+    /// operator does is delete containers.
+    #[test]
+    fn a_maintenance_drain_holds_the_pause_and_says_so_on_the_feed() {
+        let held = ModeAfterDrain::HeldForMaintenance;
+        assert!(
+            held.pause_note().contains("tasks resume"),
+            "{}",
+            held.pause_note()
+        );
+        assert!(
+            held.nothing_happened().contains("not quiesced")
+                && held.nothing_happened().contains("do not restart vm-pool"),
+            "{}",
+            held.nothing_happened()
+        );
+        // The feed half: only this variant has anything to say there. A
+        // restart's pause is undone by the swap seconds later and a stop's is
+        // announced by the stop itself; this one leaves a `pause` nothing can
+        // tell from any other.
+        assert!(held.feed_note().is_some_and(|n| n.contains("tasks resume")));
+        assert!(
+            held.restore_note()
+                .is_some_and(|n| n.contains("nothing is held"))
+        );
+        for quiet in [ModeAfterDrain::Restored, ModeAfterDrain::LeftPaused] {
+            assert!(quiet.feed_note().is_none());
+            assert!(quiet.restore_note().is_none());
+        }
+    }
+
+    /// `--check` holds nothing, so it must not borrow the held drain's closing
+    /// words: the first cut returned `Quiesced { left_paused: false }` for a
+    /// clear check, and told an idle-but-*playing* server "dispatch was
+    /// already not playing".
+    #[test]
+    fn only_a_held_pipeline_gets_the_held_pipelines_words() {
+        assert_eq!(render_quiesced(&Drained::Clear), "");
+        assert_eq!(render_quiesced(&Drained::NotServing), "");
+
+        let held = render_quiesced(&Drained::Quiesced {
+            port: 4811,
+            left_paused: true,
+        });
+        assert!(held.contains("stays paused"), "{held}");
+        assert!(held.contains("make images"), "{held}");
+        assert!(held.contains("tasks resume"), "{held}");
+        assert!(held.contains("localhost:4811/mode"), "{held}");
+
+        let already = render_quiesced(&Drained::Quiesced {
+            port: 4811,
+            left_paused: false,
+        });
+        assert!(already.contains("already not playing"), "{already}");
+        assert!(already.contains("tasks resume"), "{already}");
+    }
+
+    /// The gate `make images` runs on, in its pure half. Nothing in flight is
+    /// **not** enough: a playing pipeline tops scouts up on the next tick, and
+    /// a scout that starts during a rebuild starts in the old image.
+    #[test]
+    fn a_check_refuses_a_playing_pipeline_as_well_as_a_busy_one() {
+        let mut status = status_with(InFlight::default());
+
+        status.mode = Mode::Play;
+        let err = check(&status).expect_err("a playing pipeline is not quiesced");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("tasks drain"), "{err}");
+
+        status.mode = Mode::Pause;
+        check(&status).expect("idle and not playing is the clear case");
+
+        status.mode = Mode::Stop;
+        check(&status).expect("stop dispatches nothing either");
+
+        status.mode = Mode::Pause;
+        status.in_flight = InFlight {
+            scouts: vec![InFlightItem {
+                id: "sess_1".into(),
+                detail: None,
+                since: ts("2026-08-15T12:00:00Z"),
+            }],
+            ..InFlight::default()
+        };
+        let err = check(&status).expect_err("work in flight is not quiesced either");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("1 scout in flight"), "{err}");
+    }
+
+    /// `--cancel-scouts` is opt-in, and the drain waits as long as a reload
+    /// would by default.
+    #[test]
+    fn a_drain_waits_and_cancels_nothing_unless_asked() {
+        let opts = DrainOptions::default();
+        assert!(!opts.check);
+        assert!(!opts.cancel_scouts);
+        assert_eq!(opts.drain_timeout, DEFAULT_DRAIN_TIMEOUT);
     }
 
     /// The lasting consequence of a `--when-idle` stop comes with its undo,

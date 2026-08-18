@@ -37,7 +37,10 @@
 //! top-up and the build claim, the only two places a container starts. Work in
 //! flight runs to completion, queued work stays queued, nothing is charged an
 //! attempt, and `/status` answers with the reasons and their discharges. The
-//! transition is announced once, in the log, by whoever computes it first.
+//! transition is announced once per edge by whoever computes it first — in the
+//! log, and as an [`crate::events::EventPayload::Note`] on the event feed, the
+//! same shape the GitHub hold uses. `/status` is the standing answer for
+//! whoever arrives after the edge has scrolled past.
 //!
 //! `TASKS_UPDATE_HOLD=off` turns the gate off (the observation and the
 //! `/status` report remain); anything that is neither `on` nor `off` refuses
@@ -128,7 +131,7 @@ impl UpdateWatch {
             Err(err) => warn!(error = %err, "could not read image identities for the update watch"),
         }
 
-        self.announce(&reasons);
+        self.announce(store, &reasons).await;
         (!reasons.is_empty()).then_some(UpdatePending {
             reasons,
             enforced: self.enabled,
@@ -156,29 +159,68 @@ impl UpdateWatch {
         })
     }
 
-    fn announce(&self, reasons: &[String]) {
-        let mut announced = self.announced.lock().expect("update watch poisoned");
-        let current = (!reasons.is_empty()).then(|| reasons.to_vec());
-        if *announced == current {
-            return;
-        }
-        match &current {
-            Some(reasons) => warn!(
-                enforced = self.enabled,
-                reasons = reasons.join("; "),
-                "an update is pending{}",
-                match self.enabled {
-                    true =>
-                        "; new scouts and builds wait until it is applied \
-                             (queued work stays queued, nothing is charged)",
-                    false => " (TASKS_UPDATE_HOLD=off: reported, not enforced)",
+    /// Say once, per edge, that the hold went on or came off — in the log and
+    /// on the event feed.
+    ///
+    /// The feed half is what a reader who was not watching the terminal gets:
+    /// a `Note` (source [`UPDATE_WATCH`]), exactly the shape
+    /// [`crate::run::GitHubWatch::observe`] uses for the other hold, and for
+    /// the same reasons. A `Note` is not `nudge_worthy`, so it costs no
+    /// orchestrator turn, and it is deliberately **not** an obligation — the
+    /// orchestrator holds a curl-only token in a VM-less workdir and could no
+    /// more run `make images` than it could fix GitHub, which is the argument
+    /// that keeps `ObligationKind::StaleImage` from existing.
+    ///
+    /// The guard is taken to *claim* the edge and released before the await.
+    /// Both halves matter: holding a [`std::sync::Mutex`] across an await
+    /// would make this future non-`Send` and the spawned dispatch loops would
+    /// not compile, and claiming under the lock is what makes exactly one of
+    /// two racing callers write the `Note`.
+    async fn announce(&self, store: &Store, reasons: &[String]) {
+        let message = {
+            let mut announced = self.announced.lock().expect("update watch poisoned");
+            let current = (!reasons.is_empty()).then(|| reasons.to_vec());
+            if *announced == current {
+                return;
+            }
+            *announced = current.clone();
+            match &current {
+                Some(reasons) => {
+                    let effect = match self.enabled {
+                        true => {
+                            "new scouts and builds wait until it is applied \
+                                 (queued work stays queued, nothing is charged)"
+                        }
+                        false => "TASKS_UPDATE_HOLD=off: reported, not enforced",
+                    };
+                    warn!(
+                        enforced = self.enabled,
+                        reasons = reasons.join("; "),
+                        "an update is pending ({effect})"
+                    );
+                    format!("an update is pending ({effect}): {}", reasons.join("; "))
                 }
-            ),
-            None => info!("the pending update was applied; dispatch resumes"),
+                None => {
+                    info!("the pending update was applied; dispatch resumes");
+                    "the pending update was applied; dispatch resumes".to_string()
+                }
+            }
+        };
+        if let Err(err) = store
+            .append_event(crate::events::EventPayload::Note {
+                source: UPDATE_WATCH.into(),
+                message,
+            })
+            .await
+        {
+            warn!(error = %err, "could not record the update hold on the feed");
         }
-        *announced = current;
     }
 }
+
+/// Source tag on the notes this module appends, so a reader can tell the
+/// update hold's edges from the GitHub hold's.
+pub const UPDATE_WATCH: &str = "update-watch";
 
 /// The pure half of the binary probe. `>` and not `>=`: an exe written in the
 /// same instant the process booted is the build that booted.
@@ -315,6 +357,94 @@ mod tests {
         let pending = watch.pending(&store).await.expect("still reported");
         assert!(!pending.enforced);
         assert!(!watch.hold(&store).await, "reported, never enforced");
+    }
+
+    /// The edge reaches the feed, not only the log. `/status`, `tasks status`
+    /// and the Server window are the standing answer; this is what a reader
+    /// who was not watching gets — and it is a `Note`, so it costs no
+    /// orchestrator turn.
+    #[tokio::test]
+    async fn each_edge_of_the_hold_lands_on_the_feed_exactly_once() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let watch = UpdateWatch::at_boot(true);
+
+        // Nothing pending: nothing to say.
+        watch.pending(&store).await;
+        assert_eq!(notes(&store).await.len(), 0);
+
+        store
+            .record_image_build(
+                "agent:v1",
+                ImageRole::Scout,
+                Some(&SupervisorBuild {
+                    version: "0.1.1".into(),
+                    commit: "0000000".into(),
+                }),
+                "sess_stale",
+            )
+            .await
+            .unwrap();
+        // Every loop consults the watch; only the edge is announced.
+        watch.pending(&store).await;
+        watch.hold(&store).await;
+        watch.pending(&store).await;
+        let held = notes(&store).await;
+        assert_eq!(held.len(), 1, "once per edge, not once per tick: {held:?}");
+        assert!(held[0].contains("an update is pending"), "{}", held[0]);
+        assert!(held[0].contains("agent:v1"), "{}", held[0]);
+        assert!(held[0].contains("make images"), "{}", held[0]);
+
+        // …and the release is its own edge.
+        store
+            .record_image_build(
+                "agent:v1",
+                ImageRole::Scout,
+                Some(&SupervisorBuild {
+                    version: crate::version::VERSION.into(),
+                    commit: "0000000".into(),
+                }),
+                "sess_fresh",
+            )
+            .await
+            .unwrap();
+        watch.pending(&store).await;
+        watch.pending(&store).await;
+        let both = notes(&store).await;
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[1].contains("dispatch resumes"), "{}", both[1]);
+    }
+
+    /// Reported-not-enforced is a different sentence, and the feed has to
+    /// carry the difference: a hold nobody is honouring must not read as one
+    /// that is.
+    #[tokio::test]
+    async fn a_reported_hold_says_it_is_not_enforced() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let watch = UpdateWatch::at_boot(false);
+        store
+            .record_image_build("agent:v1", ImageRole::Scout, None, "sess_unstamped")
+            .await
+            .unwrap();
+        watch.pending(&store).await;
+        let notes = notes(&store).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("TASKS_UPDATE_HOLD=off"), "{}", notes[0]);
+    }
+
+    /// The messages of every `update-watch` note on the feed, in order.
+    async fn notes(store: &Store) -> Vec<String> {
+        store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                crate::events::EventPayload::Note { source, message } if source == UPDATE_WATCH => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
