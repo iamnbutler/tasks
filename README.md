@@ -60,14 +60,21 @@ cached — mergeability, CI, open/closed are queried at decision time.
 ## Running it
 
 Requires macOS with [apple/container](https://github.com/apple/container),
-Rust (edition 2024), and a `GITHUB_TOKEN`.
+Rust (edition 2024), and a GitHub token.
 
 ```sh
 make images                            # build the Scout/Builder VM images (once, and after supervisor changes)
+tasks secrets init                     # sealed credential store; unseal key goes to the Keychain
+tasks secrets set github-token         # paste the token, ctrl-D (same for anthropic-api-key)
 tasks vm-pool &                        # the VM pool, a separate long-lived daemon
 make serve                             # the server, in this terminal
 cargo run -p tasks -- add-project owner/repo
 ```
+
+Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
+through an in-process broker, and the sealed store means no raw key sits in
+`.env` either (raw `GITHUB_TOKEN` / `ANTHROPIC_API_KEY` env vars still work
+as fallbacks). See `docs/plans/2026-08-18-credential-custody.md`.
 
 The server boots **paused**: intake and the API run, nothing dispatches.
 Flip to `play` (from the app, or `POST /mode`) and the pipeline starts

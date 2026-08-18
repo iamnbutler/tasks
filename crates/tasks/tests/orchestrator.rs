@@ -679,7 +679,7 @@ async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expan
 async fn the_actor_header_decides_who_a_write_belongs_to() {
     let store = Arc::new(Store::open_in_memory().await.unwrap());
     let spec = seed_pending_spec(&store).await;
-    let token = store.actor_token().to_string();
+    let token = store.actor_token().expose().to_string();
     // This test is about *who* a write belongs to, not whether it is allowed,
     // so grant the two capabilities it exercises. The charter is checked
     // before the body is validated — permission first, then validity — which

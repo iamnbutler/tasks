@@ -220,6 +220,7 @@ async fn harness_with_env_and_vms(
             image: "builder:test".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(60),
+            leases: None,
             scratch_root: scratch_root.clone(),
         },
     );
@@ -256,7 +257,14 @@ async fn a_batch_of_two_specs_lands_as_one_branch_and_one_pr() {
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
     assert_eq!(claimed.id, build.id);
 
-    let done = h.builder.dispatch(claimed, &h.repo_url).await.unwrap();
+    let done = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap();
     assert_eq!(done.status, BuildStatus::Succeeded);
     assert_eq!(done.pr_number, Some(42));
     let head_sha = done.head_sha.clone().expect("head sha recorded");
@@ -374,7 +382,14 @@ async fn a_failed_build_returns_the_work_without_wedging_the_queue() {
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
 
-    let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+    let err = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap_err();
     assert!(format!("{err}").contains("no commits"), "{err}");
     // An agent that ran to completion and committed nothing judged the specs,
     // and burns one of their three. Waiving this would be switching the cap
@@ -463,7 +478,14 @@ async fn a_transport_death_costs_the_batch_no_build_attempt() {
             .await
             .unwrap_or_else(|e| panic!("attempt {attempt} could not be queued: {e}"));
         let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
-        let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+        let err = h
+            .builder
+            .dispatch(
+                claimed,
+                &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+            )
+            .await
+            .unwrap_err();
 
         // The symptom is still the symptom — the class is what the host reads.
         assert!(format!("{err}").contains("no commits"), "{err}");
@@ -532,7 +554,14 @@ async fn a_silent_build_failure_leaves_a_readable_transcript() {
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
 
-    let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+    let err = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap_err();
     assert!(format!("{err}").contains("no commits"), "{err}");
 
     // The build row is final and says only that it failed …
@@ -623,7 +652,14 @@ async fn a_history_rewriting_build_lands_its_branch() {
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
 
-    let done = h.builder.dispatch(claimed, &h.repo_url).await.unwrap();
+    let done = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap();
     assert_eq!(done.status, BuildStatus::Succeeded);
     let head_sha = done.head_sha.clone().expect("head sha recorded");
 
@@ -720,7 +756,14 @@ async fn the_review_feedback_a_spec_was_approved_with_reaches_the_builder_agent(
         .await
         .unwrap();
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
-    let done = h.builder.dispatch(claimed, &h.repo_url).await.unwrap();
+    let done = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap();
     assert_eq!(done.status, BuildStatus::Succeeded);
 
     let prompt = done.summary.clone().expect("the agent echoed its prompt");
@@ -785,7 +828,14 @@ async fn a_rejected_egress_preserves_the_commits_and_the_command_recovers_them()
     run_git(&h.repo, &["checkout", "-q", "main"]).await;
 
     let claimed = h.store.claim_next_queued_build().await.unwrap().unwrap();
-    let err = h.builder.dispatch(claimed, &h.repo_url).await.unwrap_err();
+    let err = h
+        .builder
+        .dispatch(
+            claimed,
+            &tasks::broker::CloneSource::Direct(h.repo_url.clone()),
+        )
+        .await
+        .unwrap_err();
     let reason = format!("{err}");
     assert!(reason.starts_with("branch egress: "), "{reason}");
     assert!(
@@ -989,6 +1039,7 @@ async fn a_vm_pool_that_goes_away_mid_build_costs_the_batch_no_attempt() {
                 image: "builder:test".into(),
                 vm_config: VmConfig::default(),
                 timeout: Duration::from_secs(60),
+                leases: None,
                 scratch_root: h.scratch_root.clone(),
             },
         );
@@ -1005,7 +1056,11 @@ async fn a_vm_pool_that_goes_away_mid_build_costs_the_batch_no_attempt() {
         let build_id = claimed.id.clone();
 
         let repo_url = h.repo_url.clone();
-        let dispatch = tokio::spawn(async move { builder.dispatch(claimed, &repo_url).await });
+        let dispatch = tokio::spawn(async move {
+            builder
+                .dispatch(claimed, &tasks::broker::CloneSource::Direct(repo_url))
+                .await
+        });
 
         // Wait until the agent is provably running, then cut the connection
         // out from under a live build.

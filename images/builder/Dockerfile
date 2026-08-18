@@ -53,7 +53,10 @@ ENV CARGO_BUILD_JOBS=1
 
 # Headless agent invocation — same shape as the scout image; see
 # images/scout/Dockerfile for why --verbose is mandatory with stream-json.
-# Credentials (ANTHROPIC_API_KEY) are injected per-VM, never baked in.
+# Credentials are injected per-VM, never baked in — and since #971 what is
+# injected is a run lease, not a key: ANTHROPIC_API_KEY holds a short-lived
+# token and ANTHROPIC_BASE_URL points at the host's credential broker, which
+# swaps it for the real key per request.
 ENV BUILDER_AGENT_CMD="claude --print --output-format stream-json --verbose --dangerously-skip-permissions"
 
 # Resumes allowed after a dropped API connection (#845) — read inside the VM,

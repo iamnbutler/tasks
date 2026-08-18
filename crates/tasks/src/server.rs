@@ -3761,7 +3761,7 @@ mod tests {
         }
         let base = spawn(store.clone()).await;
         let http = reqwest::Client::new();
-        let claim = format!("orchestrator {}", store.actor_token());
+        let claim = format!("orchestrator {}", store.actor_token().expose());
 
         let resp = http
             .post(format!("{base}/projects"))
@@ -4562,7 +4562,7 @@ mod tests {
             .post(format!("{base}/tasks/{}/build-now", task.id))
             .header(
                 ACTOR_HEADER,
-                format!("orchestrator {}", store.actor_token()),
+                format!("orchestrator {}", store.actor_token().expose()),
             )
             .json(&json!({"rationale": "trivial"}))
             .send()

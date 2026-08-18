@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use vm_pool_client::{ClientError, ClientHandle};
 use vm_pool_protocol::{VmConfig, VmId};
 
+use crate::broker::{CloneSource, LeaseIssuer, SubjectKind};
 use crate::cancel::Bounded;
 use crate::deadline::{Deadline, Expiry};
 use crate::events::EventPayload;
@@ -142,7 +143,10 @@ impl ScoutError {
 pub struct ScoutConfig {
     /// Image reference to allocate from vm-pool, e.g. `"agent:v1"`.
     pub image: String,
-    /// VM configuration passed to vm-pool.
+    /// VM configuration passed to vm-pool. The *shape* only — what a run
+    /// authenticates with is minted per dispatch through `leases` and
+    /// appended to this env at allocation, so no long-lived credential ever
+    /// rides a VM's environment (#971).
     pub vm_config: VmConfig,
     /// Budget for one dispatch, measured from entry to [`Scout::dispatch`] so
     /// allocation is charged to it too. Measured on both the monotonic and the
@@ -150,6 +154,10 @@ pub struct ScoutConfig {
     /// deallocated and the dispatch fails with [`ScoutError::Timeout`] — or,
     /// if the host was asleep for enough of it, [`ScoutError::Suspended`].
     pub timeout: Duration,
+    /// Mints a run lease per dispatch when the target is
+    /// [`CloneSource::Leased`]. `None` only where there is no broker at all —
+    /// the integration tests, which dispatch against `file://` repos.
+    pub leases: Option<LeaseIssuer>,
 }
 
 /// Least wall-clock budget a resumed run is given, however long the server was
@@ -166,8 +174,9 @@ const RESUME_MIN_BUDGET: Duration = Duration::from_secs(30);
 /// serves every tracked project.
 #[derive(Debug, Clone)]
 pub struct ScoutTarget {
-    /// Repo clone URL (what the scout-supervisor `git clone`s).
-    pub repo_clone_url: String,
+    /// Where the scout-supervisor's `git clone` comes from: a lease minted at
+    /// dispatch (production), or a literal URL (tests, `file://` repos).
+    pub source: CloneSource,
     /// Branch to base the throwaway scout branch on.
     pub base_branch: String,
 }
@@ -265,11 +274,52 @@ impl Scout {
             task.scout_directions.as_ref(),
         );
 
+        // What this run authenticates with. A lease rather than the raw keys:
+        // minted against this session, scoped to this repo, read-only, dead
+        // minutes after the run — see `crate::broker`. Minting is a pre-agent
+        // setup step, so a failure here is charged like any other (a store
+        // that cannot insert a row fails identically every time).
+        let (clone_url, credentials_env) = match (&target.source, &self.config.leases) {
+            (CloneSource::Leased { repo }, Some(leases)) => {
+                let grant = leases
+                    .grant_agent(
+                        SubjectKind::Scout,
+                        session_id.as_str(),
+                        repo,
+                        self.config.timeout,
+                    )
+                    .await?;
+                (grant.clone_url, grant.env)
+            }
+            // The broker cannot front a non-HTTP repo, but this run's API
+            // credit still goes through it rather than riding raw.
+            (CloneSource::Direct(url), Some(leases)) => (
+                url.clone(),
+                leases
+                    .grant_anthropic_env(
+                        SubjectKind::Scout,
+                        session_id.as_str(),
+                        self.config.timeout,
+                    )
+                    .await?,
+            ),
+            (CloneSource::Direct(url), None) => (url.clone(), Vec::new()),
+            // A wiring bug, not a runtime condition: `run` always constructs
+            // the issuer beside the leased targets. Surfaced as an ordinary
+            // pre-session failure — the same shape as a store read failing
+            // right above — so the dispatch loop's outcome recording handles
+            // it like any other.
+            (CloneSource::Leased { .. }, None) => {
+                return Err(ScoutError::Store(StoreError::Invalid(
+                    "leased dispatch with no lease issuer wired".into(),
+                )));
+            }
+        };
+        let mut vm_config = self.config.vm_config.clone();
+        vm_config.env.extend(credentials_env);
+
         // Allocate
-        let vm_id = self
-            .client
-            .allocate(&self.config.image, self.config.vm_config.clone())
-            .await?;
+        let vm_id = self.client.allocate(&self.config.image, vm_config).await?;
         // The VM's shape is logged with the allocation so a failure that only
         // makes sense in terms of memory (an OOM-killed linker) can be
         // correlated with what this VM actually had.
@@ -311,13 +361,14 @@ impl Scout {
                 &vm_id,
                 TaskCommand::Scout(ScoutCommand::Start {
                     task_id: task.id.to_string(),
-                    repo_clone_url: target.repo_clone_url.clone(),
+                    repo_clone_url: clone_url,
                     base_branch: target.base_branch.clone(),
                     prompt,
                 }),
             )
             .await
         {
+            self.revoke_lease(&session_id).await;
             self.finalize_failed(&session_id, &task, Some(&vm_id), format!("send: {e}"))
                 .await?;
             return Err(e.into());
@@ -380,12 +431,29 @@ impl Scout {
         let elapsed = (Utc::now() - session.started_at)
             .to_std()
             .unwrap_or_default();
-        let deadline = Deadline::starting_now(
-            self.config
-                .timeout
-                .saturating_sub(elapsed)
-                .max(RESUME_MIN_BUDGET),
-        );
+        let remaining = self
+            .config
+            .timeout
+            .saturating_sub(elapsed)
+            .max(RESUME_MIN_BUDGET);
+        let deadline = Deadline::starting_now(remaining);
+
+        // The VM still holds the lease it was dispatched with — the only
+        // token it will ever have — and a long outage may have expired it.
+        // Re-arm it for the resumed budget; best-effort, because an
+        // unextendable lease only means the agent's next API call 401s and
+        // the run concludes the way it was already going to.
+        if let Some(leases) = &self.config.leases {
+            let until = Utc::now()
+                + chrono::Duration::from_std(remaining + crate::broker::LEASE_SLACK)
+                    .unwrap_or_default();
+            if let Err(e) = leases
+                .extend(SubjectKind::Scout, session_id.as_str(), until)
+                .await
+            {
+                warn!(session_id = %session_id, error = %e, "could not extend the run's lease");
+            }
+        }
 
         // Rebuilt from the row and the notes table rather than from the
         // replay, because a bounded window is exactly what drops the oldest
@@ -542,6 +610,10 @@ impl Scout {
         )
         .await;
 
+        // The run is over on every path through here, so its credit is too.
+        // Tightening on top of expiry — the lease would die on its own.
+        self.revoke_lease(session_id).await;
+
         let branch = state.branch.clone().unwrap_or_default();
         match result {
             Ok(DrainOutcome::Concluded {
@@ -623,6 +695,17 @@ impl Scout {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Revoke this session's lease, when leases are wired at all.
+    /// Best-effort tightening on top of expiry — see
+    /// [`LeaseIssuer::revoke_best_effort`].
+    async fn revoke_lease(&self, session_id: &SessionId) {
+        if let Some(leases) = &self.config.leases {
+            leases
+                .revoke_best_effort(SubjectKind::Scout, session_id.as_str())
+                .await;
         }
     }
 

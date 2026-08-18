@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::broker::Lease;
 use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::migrations::MIGRATOR;
@@ -598,7 +599,7 @@ pub struct Store {
     /// design. It exists so the orchestrator cannot silently be mistaken for
     /// the human, which matters because the self-nudge filter trusts the
     /// actor field.
-    actor_token: std::sync::Arc<str>,
+    actor_token: crate::redact::Secret,
     /// Migrations *this* open applied, in version order. Empty when the
     /// schema was already current. See [`migrate_reporting`].
     migrations_applied: Vec<AppliedMigration>,
@@ -649,7 +650,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
-            actor_token: Uuid::new_v4().to_string().into(),
+            actor_token: crate::redact::Secret::new(Uuid::new_v4().to_string()),
             migrations_applied,
         })
     }
@@ -675,7 +676,7 @@ impl Store {
             event_tx,
             transcript_tx,
             orchestrator_feed_tx,
-            actor_token: Uuid::new_v4().to_string().into(),
+            actor_token: crate::redact::Secret::new(Uuid::new_v4().to_string()),
             migrations_applied,
         })
     }
@@ -3856,7 +3857,8 @@ impl Store {
     }
 
     /// The secret the orchestrator presents to be attributed as itself.
-    pub fn actor_token(&self) -> &str {
+    /// Exposed at exactly two places: the 0600 curl config write, and tests.
+    pub fn actor_token(&self) -> &crate::redact::Secret {
         &self.actor_token
     }
 
@@ -3875,8 +3877,11 @@ impl Store {
             return ActorClaim::Human;
         };
         match header.split_once(' ') {
+            // `matches` is constant-time in the token bytes — a presented
+            // credential is compared here, and `==` over raw strings would
+            // be a timing oracle on the loopback API.
             Some((role, token))
-                if role.trim() == "orchestrator" && token.trim() == &*self.actor_token =>
+                if role.trim() == "orchestrator" && self.actor_token.matches(token.trim()) =>
             {
                 ActorClaim::Orchestrator
             }
@@ -5064,9 +5069,119 @@ impl Store {
         rows.reverse();
         rows.into_iter().map(event_from_row).collect()
     }
+
+    // --- credential leases (crate::broker) ---
+
+    pub async fn insert_lease(&self, lease: &Lease) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO leases (id, token_hash, scopes, repo, subject_kind, subject_id, \
+             created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&lease.id)
+        .bind(&lease.token_hash)
+        .bind(lease.scopes.encode())
+        .bind(&lease.repo)
+        .bind(lease.subject_kind.as_str())
+        .bind(&lease.subject_id)
+        .bind(lease.created_at.to_rfc3339())
+        .bind(lease.expires_at.to_rfc3339())
+        .bind(lease.revoked_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The lease presenting as `token_hash`, live or not — expiry and
+    /// revocation are judged by the caller against its own `now`, so the
+    /// broker's clock is the only clock in the verdict.
+    pub async fn lease_by_token_hash(&self, token_hash: &str) -> Result<Option<Lease>, StoreError> {
+        sqlx::query(
+            "SELECT id, token_hash, scopes, repo, subject_kind, subject_id, created_at, \
+             expires_at, revoked_at FROM leases WHERE token_hash = ?",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(lease_from_row)
+        .transpose()
+    }
+
+    /// Move a subject's unrevoked leases to `expires_at` — including ones
+    /// already past it, deliberately: the reattach path extends the lease a
+    /// still-running VM already holds, and that VM will never be handed
+    /// another token.
+    pub async fn extend_leases_for_subject(
+        &self,
+        kind: crate::broker::SubjectKind,
+        subject_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE leases SET expires_at = ? \
+             WHERE subject_kind = ? AND subject_id = ? AND revoked_at IS NULL",
+        )
+        .bind(expires_at.to_rfc3339())
+        .bind(kind.as_str())
+        .bind(subject_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn revoke_leases_for_subject(
+        &self,
+        kind: crate::broker::SubjectKind,
+        subject_id: &str,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE leases SET revoked_at = ? \
+             WHERE subject_kind = ? AND subject_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(kind.as_str())
+        .bind(subject_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete leases whose expiry is older than `expired_before`. A lease is
+    /// operational state, not a decision: once nothing could ever redeem it,
+    /// the row is noise. Called at boot with a day of history kept.
+    pub async fn prune_leases(&self, expired_before: DateTime<Utc>) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM leases WHERE expires_at < ?")
+            .bind(expired_before.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // --- row mappers ---
+
+fn lease_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Lease, StoreError> {
+    let kind_raw: String = row.try_get("subject_kind")?;
+    let revoked_at: Option<String> = row.try_get("revoked_at")?;
+    Ok(Lease {
+        id: row.try_get("id")?,
+        token_hash: row.try_get("token_hash")?,
+        // Unknown scope words decode to nothing rather than erroring — see
+        // `Scopes::decode` — so a newer row denies, never crashes, here.
+        scopes: crate::broker::Scopes::decode(&row.try_get::<String, _>("scopes")?),
+        repo: row.try_get("repo")?,
+        subject_kind: crate::broker::SubjectKind::parse(&kind_raw).ok_or(StoreError::BadEnum {
+            column: "subject_kind",
+            value: kind_raw,
+        })?,
+        subject_id: row.try_get("subject_id")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+        expires_at: parse_ts(&row.try_get::<String, _>("expires_at")?, "expires_at")?,
+        revoked_at: revoked_at
+            .as_deref()
+            .map(|s| parse_ts(s, "revoked_at"))
+            .transpose()?,
+    })
+}
 
 fn project_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Project, StoreError> {
     let status_raw: String = row.try_get("status")?;
@@ -7626,7 +7741,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_actor_claim_is_not_the_human() {
         let store = Store::open_in_memory().await.unwrap();
-        let token = store.actor_token().to_string();
+        let token = store.actor_token().expose().to_string();
 
         // No claim at all: the human, who proves nothing.
         assert_eq!(store.resolve_actor(None), ActorClaim::Human);

@@ -34,7 +34,7 @@ impl Harness {
     fn as_orchestrator(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request.header(
             "X-Tasks-Actor",
-            format!("orchestrator {}", self.store.actor_token()),
+            format!("orchestrator {}", self.store.actor_token().expose()),
         )
     }
 }

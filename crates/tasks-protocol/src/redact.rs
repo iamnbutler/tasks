@@ -94,28 +94,54 @@ pub fn redact_owned(text: String) -> String {
     }
 }
 
-/// A credential held in memory with no printable rendering.
+/// A credential held in memory. Three properties, each closing a distinct
+/// leak class:
 ///
-/// `Debug` and `Display` are both `<redacted>`, and the value is reachable
-/// only through [`Secret::expose`] — so a type that holds one can keep its
-/// `#[derive(Debug)]`, and the next `tracing` field over it is safe by
-/// construction rather than by review. That is the whole point: the leaks
-/// this module cleans up were all one derived formatter away from a log sink.
+/// - **`Debug` prints `<redacted>`** — a type that holds one keeps its
+///   `#[derive(Debug)]`, and the next `tracing` field over it is safe by
+///   construction rather than by review. The leaks this module cleans up
+///   were all one derived formatter away from a log sink (#923).
+/// - **There is deliberately no `Display`.** A `Debug` that redacts makes
+///   diagnostics safe; a `Display` that redacts would make *use* silently
+///   wrong — `format!("Bearer {token}")` would compile, authenticate as the
+///   literal string `<redacted>`, and fail far from the bug. Interpolating a
+///   secret is a compile error instead, and the one way to the value is
+///   [`Secret::expose`], which is named to be conspicuous and greppable.
+///   There are meant to be very few call sites.
+/// - **The buffer is wiped on drop** (each clone wipes its own), so a freed
+///   credential does not linger in reusable heap memory. Best-effort hygiene,
+///   not a boundary — the live value is in this process for as long as the
+///   `Secret` is.
 ///
-/// `expose` is named to be conspicuous at the call site. There are meant to be
-/// very few of them.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
+/// Equality is **constant-time** in the value bytes (length is not hidden):
+/// comparing a presented token against a held one is exactly what an
+/// attribution check does, and a derived `==` would make that comparison a
+/// timing oracle.
+#[derive(Clone)]
+pub struct Secret(zeroize::Zeroizing<String>);
 
 impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(zeroize::Zeroizing::new(value.into()))
     }
 
     /// The real value, for handing to whatever has to authenticate with it.
     /// Never for logging.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// Whether `presented` is this credential — constant-time in the value
+    /// bytes. This is the comparison an attribution or auth check should
+    /// make; a bare `==` over the exposed strings would be a timing oracle.
+    /// (The early return on length leaks only the length, which for every
+    /// credential this holds is public shape, not secret content.)
+    pub fn matches(&self, presented: &str) -> bool {
+        let (a, b) = (self.0.as_bytes(), presented.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
     }
 }
 
@@ -125,21 +151,24 @@ impl fmt::Debug for Secret {
     }
 }
 
-impl fmt::Display for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
+impl PartialEq for Secret {
+    /// [`Secret::matches`] — constant-time, see there.
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(&other.0)
     }
 }
 
+impl Eq for Secret {}
+
 impl From<String> for Secret {
     fn from(value: String) -> Self {
-        Self(value)
+        Self::new(value)
     }
 }
 
 impl From<&str> for Secret {
     fn from(value: &str) -> Self {
-        Self(value.to_string())
+        Self::new(value.to_string())
     }
 }
 
@@ -207,12 +236,13 @@ mod tests {
     const FAKE: &str = "not-a-real-credential-0000";
 
     /// A `Secret` has no printable rendering at all, which is what lets the
-    /// types that hold one keep a derived `Debug`.
+    /// types that hold one keep a derived `Debug`. (There is no `Display`
+    /// assertion because there is no `Display`: `format!("{secret}")` is a
+    /// compile error, which is the stronger property.)
     #[test]
     fn a_secret_never_prints_itself() {
         let secret = Secret::new(FAKE);
         assert_eq!(format!("{secret:?}"), "<redacted>");
-        assert_eq!(format!("{secret}"), "<redacted>");
         // A struct holding one is safe to `{:?}` — the hazard this closes.
         // Read only through the derived `Debug`, which is the point.
         #[derive(Debug)]
@@ -232,6 +262,20 @@ mod tests {
         assert!(rendered.contains("main"), "{rendered}");
         // And the value is still there for whoever has to authenticate.
         assert_eq!(secret.expose(), FAKE);
+    }
+
+    /// `matches` (and `==` through it) is the comparison auth checks make.
+    /// Behavioural assertions only — constant-timeness is a property of the
+    /// implementation shape, not something a unit test can time.
+    #[test]
+    fn matching_is_exact() {
+        let secret = Secret::new(FAKE);
+        assert!(secret.matches(FAKE));
+        assert!(!secret.matches("not-a-real-credential-0001"));
+        assert!(!secret.matches(&FAKE[..FAKE.len() - 1]));
+        assert!(!secret.matches(""));
+        assert_eq!(secret, Secret::new(FAKE));
+        assert_ne!(secret, Secret::new("other"));
     }
 
     #[test]

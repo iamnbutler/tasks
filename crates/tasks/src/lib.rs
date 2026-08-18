@@ -5,6 +5,9 @@
 //! on the server stack.
 
 pub mod brief;
+/// Short-lived credential leases and the proxy that redeems them, so VMs
+/// operate on credit and never hold a raw key (#971).
+pub mod broker;
 pub mod builder;
 pub mod bundles;
 pub mod cancel;
@@ -27,6 +30,9 @@ pub mod redact;
 pub mod reload;
 pub mod run;
 pub mod scout;
+/// Sealed at-rest storage for the two upstream keys, and the live handle the
+/// server reads them through (#971).
+pub mod secrets;
 pub mod server;
 pub mod store;
 mod teardown;

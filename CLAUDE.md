@@ -353,6 +353,46 @@ implementation.
   trustworthy; closing it properly is an intent-then-confirm record and its own
   change. Everything that can *refuse* refuses first, which is what makes a 4xx
   safe to retry.
+- **No VM ever holds a raw `ANTHROPIC_API_KEY` or `GITHUB_TOKEN`, and the
+  server holds them only in guarded memory** (#971, after #923/#970 proved
+  that anything injected into a VM's environment eventually reaches a log).
+  What a run receives at dispatch is a **lease** — 256 random bits, stored
+  only as a SHA-256 hash, bound to its session/build and its repo, expiring
+  at the run budget plus slack — plus env and a clone URL that point every
+  credentialed operation at the in-process **broker**
+  (`crates/tasks/src/broker.rs`, `TASKS_BROKER_PORT` 4801): a second
+  listener, deliberately not the loopback-only API, reachable from the VM
+  subnet at `TASKS_BROKER_ADVERTISE` (bridge gateway `192.168.64.1`). The
+  broker validates the lease per request and streams to the real upstream
+  with the real credential injected host-side over TLS, so the keys never
+  cross the vmnet in either direction — and the env var is still named
+  `ANTHROPIC_API_KEY` on purpose, so Claude Code needs no image change and
+  #970's name-based redaction masks even the lease. Scopes are enforcement,
+  not description: agent leases are `anthropic` + `git-read`, so **a Scout or
+  Builder cannot push whatever its prompt talks it into**; the push
+  credential exists only as the server's own ~10-minute `land` lease, minted
+  per landing on loopback, so even host-side `git` argv never carries the
+  PAT. Leases are **rows** because the process that mints one need not be the
+  one serving it — a reattach extends by subject without ever knowing the
+  token, conclusion revokes best-effort, and expiry is the backstop nothing
+  can forget. At rest the keys live ChaCha20-Poly1305-sealed under
+  `<data dir>/secrets/` with the unseal key in the **Keychain** (or
+  `TASKS_SECRETS_KEY_FILE`); neither artifact alone decrypts anything, a
+  sealed store that exists but cannot open **refuses to boot** rather than
+  silently falling back to the environment, and `tasks secrets set` rotates a
+  *running* server off the file's mtime — no restart. Raw values cross module
+  boundaries only as `redact::Secret` (no `Display` at all — interpolating
+  one is a compile error, not a silent `<redacted>`; constant-time equality;
+  zeroized on drop). Two carve-outs are named: a non-http(s)
+  `GITHUB_CLONE_URL_BASE` (a `file://` mirror — the integration tests) is
+  structurally unproxyable by a git smart-HTTP passthrough, so it clones
+  `Direct` while its Anthropic credit still leases; and the broker dying with
+  the server means a restart severs in-VM agent connections mid-response —
+  which is exactly the transport death the supervisors already resume from
+  (#845), and `reload --when-idle` avoids entirely. Env vars keep working as
+  boot-captured fallbacks, warned at startup; the sealed store is where
+  production keys live. Full design:
+  `docs/plans/2026-08-18-credential-custody.md`.
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool
@@ -830,6 +870,9 @@ make drain DRAIN=--cancel-scouts       # ...stopping running scouts rather than
                                        #   waiting them out
 make resume                            # release that hold
 cargo run -p tasks -- add-project owner/repo
+tasks secrets init                     # create the sealed credential store
+tasks secrets set github-token         # seal a key (value on stdin, never argv);
+                                       #   a running server picks it up live
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;
@@ -1290,9 +1333,14 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
 | `VM_POOL_MAX_VMS` | 6 | VMs the pool holds at once. Read by **`tasks vm-pool`** (and the stock `vm-pool` binary), never by the server, so a change takes effect on a pool restart. Anything that is not a positive integer refuses to boot — `0` binds and answers `status` while failing every allocate. See *Pool capacity* |
-| `GITHUB_TOKEN` | — | required for polling; also used for clones |
+| `GITHUB_TOKEN` | — | **fallback** for `tasks secrets set github-token`, warned at startup — the sealed store is where production keys live. Needed (either way) for polling; the broker spends it for clones and the land push |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
-| `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix |
+| `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix, and where the broker forwards git traffic. A non-http(s) base (a `file://` mirror) cannot be proxied and clones direct — see the credential-custody rule |
+| `TASKS_BROKER_PORT` | 4801 | credential broker listener — where VMs redeem run leases. A second listener on purpose; the API stays loopback-only |
+| `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |
+| `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway) |
+| `TASKS_BROKER_ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | where Anthropic traffic forwards — override for tests only |
+| `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the Keychain the store header names. The Linux/test path, and the escape hatch for a locked login keychain |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |

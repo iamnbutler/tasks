@@ -93,9 +93,10 @@ async fn scout_dispatch_end_to_end_produces_spec() {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
         timeout: Duration::from_secs(300),
+        leases: None,
     };
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
     let scout = Scout::new(store.clone(), client.handle(), scout_config);
@@ -203,9 +204,10 @@ async fn two_scouts_dispatch_concurrently() {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
         timeout: Duration::from_secs(300),
+        leases: None,
     };
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
     // One dispatcher, one vm-pool connection, two simultaneous dispatches
@@ -251,9 +253,10 @@ async fn scout_dispatch_failure_resets_task_to_new() {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
         timeout: Duration::from_secs(300),
+        leases: None,
     };
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
     let scout = Scout::new(store.clone(), client.handle(), scout_config);
@@ -304,10 +307,11 @@ async fn re_scout_after_needs_revision_receives_the_review() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
 
@@ -388,10 +392,11 @@ async fn a_scout_that_never_reports_back_times_out() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(2),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
 
@@ -464,10 +469,11 @@ async fn an_interrupted_scout_is_salvaged_without_producing_a_spec() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
 
@@ -538,7 +544,7 @@ async fn the_next_scout_is_handed_the_field_notes_as_unverified_leads() {
     let workdir_root = tmp.path().join("scout-workdirs");
     tokio::fs::create_dir_all(&workdir_root).await.unwrap();
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
 
@@ -548,6 +554,7 @@ async fn the_next_scout_is_handed_the_field_notes_as_unverified_leads() {
         image: "agent:v1".into(),
         vm_config: VmConfig::default(),
         timeout: Duration::from_secs(300),
+        leases: None,
     };
 
     // First attempt: interrupted, so it leaves notes.
@@ -718,10 +725,11 @@ async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
             timeout: BUDGET,
+            leases: None,
         },
     );
     let target = ScoutTarget {
-        repo_clone_url: repo_url,
+        source: tasks::broker::CloneSource::Direct(repo_url),
         base_branch: "main".into(),
     };
 

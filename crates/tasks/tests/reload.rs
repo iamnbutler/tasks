@@ -95,6 +95,14 @@ async fn free_port() -> u16 {
     port
 }
 
+/// The same trick from a non-async caller — `serve_command` is sync, and
+/// making it async would ripple through every test in this file for one
+/// environment variable.
+fn blocking_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 /// An orchestrator that costs nothing: a shell script that reads its prompt
 /// and answers. Without it, `ORCHESTRATOR_CMD` defaults to `claude` and every
 /// nudge-worthy event in this file spawns a real agent turn.
@@ -124,6 +132,14 @@ fn serve_command(data_dir: &Path, port: u16) -> Command {
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
         .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
+        // The broker binds right after the API does and a clash there is a
+        // boot failure, so it needs the same per-test port the API gets: the
+        // default 4801 is one fixed port shared by every server this file
+        // starts, and nextest runs these tests concurrently. Loopback rather
+        // than the default `0.0.0.0` for a second reason — binding every
+        // interface raises the macOS firewall prompt, once per test binary.
+        .env("TASKS_BROKER_PORT", blocking_free_port().to_string())
+        .env("TASKS_BROKER_BIND", "127.0.0.1")
         // Without this the `env_remove` below hands the decision to whichever
         // `.env` this checkout happens to have. See the module docs.
         .env(tasks::env_file::DISABLE_VAR, "off")
@@ -199,6 +215,10 @@ async fn cli_with(
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
         .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
+        // The successor `reload` spawns inherits this environment, so it
+        // needs its own broker port for the reason `serve_command` does.
+        .env("TASKS_BROKER_PORT", blocking_free_port().to_string())
+        .env("TASKS_BROKER_BIND", "127.0.0.1")
         .env(tasks::env_file::DISABLE_VAR, "off")
         .env_remove("GITHUB_TOKEN")
         .stdin(Stdio::null());

@@ -13,6 +13,9 @@ serde.workspace = true
 # crate is shared with the supervisors and must stay cheap to build in a VM.
 serde_json.workspace = true
 vm-pool-protocol.workspace = true
+# `redact::Secret` wipes its buffer on drop. Dependency-free and tiny, so it
+# keeps the supervisors cheap to build.
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
