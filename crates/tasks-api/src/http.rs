@@ -29,6 +29,51 @@ pub struct SetProjectStatus {
     pub status: String,
 }
 
+/// Settle a pending decision: say what became of an effect nobody saw the
+/// answer to.
+///
+/// `state` is `applied` or `annulled`; `pending` is a 400, because settling is
+/// what ends the window and a settle that leaves it open is a no-op with a
+/// ledger row behind it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettleDecisionRequest {
+    pub state: String,
+    /// Merged into the pending row's `outcome`, never replacing it — so the
+    /// error a refused call left there survives the reconciliation that found
+    /// the artifact.
+    #[serde(default)]
+    pub outcome: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// What the server found when it went looking for a pending decision's
+/// artifact — `GET /decisions/{seq}/reconcile`.
+///
+/// The lookup lives on the **server** and not in the caller, because the
+/// server holds the GitHub credential and the caller usually does not: the
+/// orchestrator runs with a curl-only allowlist and no `GITHUB_TOKEN`, so an
+/// obligation whose honest discharge needed its own GitHub read would leave
+/// guessing as its only move — and a guess written into an append-only ledger
+/// is worse than the missing row the whole intent mechanism exists to prevent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionReconciliation {
+    pub seq: i64,
+    pub action: String,
+    /// `applied`, `annulled`, or `unknown` — the state this row should be
+    /// settled to, as far as GitHub could say. `unknown` is never a licence to
+    /// guess: it means the lookup itself could not answer, and the row stays
+    /// pending until it can.
+    pub verdict: String,
+    /// What the server actually saw, so the settle is written from evidence
+    /// the server produced rather than from the caller's recollection.
+    pub found: serde_json::Value,
+    /// One line a human or an agent can act on.
+    pub note: String,
+}
+
 /// The answer to a write the charter shadowed: the decision was recorded and
 /// nothing happened. Deliberately not the normal success body — a shadow run
 /// whose responses look like real ones is an evaluation that lies.

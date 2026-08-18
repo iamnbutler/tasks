@@ -13,7 +13,7 @@
 //! Assertions are on what was *sent* to GitHub as much as on local state — a
 //! close that never left the process would pass a store-only test.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::Json as AxumJson;
@@ -23,23 +23,39 @@ use serde_json::{Value, json};
 use tasks::github::{GitHubClient, IntakeFilter};
 use tasks::github_health::GitHubHealth;
 use tasks::models::{
-    Actor, Build, Capability, CharterLevel, Complexity, DecisionAction, DecisionInput, GhState,
-    Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId,
-    SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
+    Actor, Build, Capability, CharterLevel, Complexity, DecisionAction, DecisionInput,
+    DecisionState, GhState, Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus,
+    Spec, SpecId, SpecQueueEntry, SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::run::{GitHubWatch, poll_once};
 use tasks::store::Store;
 
 /// How the fake's pull request looks, and what it saw.
 struct Fake {
-    /// The PR body `GET /pulls/{n}` answers with.
+    /// The PR body `GET /pulls/{n}` answers with, for any number with no
+    /// entry in `prs`.
     pr: Value,
+    /// Per-number PR bodies, overlaying `pr`. A pipeline that rebuilds a spec
+    /// has *two* PRs with different endings — one closed unmerged, one open —
+    /// and a fake serving one body for every number cannot express that at
+    /// all, which is the shape of #956/#959.
+    prs: HashMap<u64, Value>,
+    /// Which PR numbers were read, in order. What lets a test assert that a
+    /// settled PR is not being re-read every poll.
+    read_numbers: Vec<u64>,
     /// Issue numbers the repository knows about; a closed one drops out of the
     /// open set, like GitHub.
     issues: Vec<u64>,
     closed: HashSet<u64>,
     /// Every PATCH to `/issues/{n}`.
     patched: Vec<(u64, Value)>,
+    /// What `PATCH /issues/{n}` answers with. 503 is GitHub *not answering*,
+    /// which is the branch that must leave the decision pending.
+    close_status: u16,
+    /// Pending decision rows at the instant each close request arrived. The
+    /// fake runs in this process, so it can read the ledger — which is the
+    /// only place the *ordering* of intent and effect is observable.
+    pending_at_close: Vec<usize>,
     /// How many times the PR was read — the ongoing cost this pass pays.
     pr_reads: usize,
     /// What `GET /compare/{base}...{head}` answers with. `identical`/`behind`
@@ -50,12 +66,22 @@ struct Fake {
     compares: Vec<String>,
 }
 
-async fn spawn_fake_github(pr: Value, issues: Vec<u64>) -> (String, String, Arc<Mutex<Fake>>) {
+/// As [`spawn_fake_github`], plus a store the fake reads the pending-decision
+/// count out of when a close arrives.
+async fn spawn_fake_github_watching(
+    pr: Value,
+    issues: Vec<u64>,
+    ledger: Option<Arc<Store>>,
+) -> (String, String, Arc<Mutex<Fake>>) {
     let fake = Arc::new(Mutex::new(Fake {
         pr,
+        prs: HashMap::new(),
+        read_numbers: Vec::new(),
         issues,
         closed: HashSet::new(),
         patched: Vec::new(),
+        close_status: 200,
+        pending_at_close: Vec::new(),
         pr_reads: 0,
         compare_status: "ahead",
         compares: Vec::new(),
@@ -109,10 +135,12 @@ async fn spawn_fake_github(pr: Value, issues: Vec<u64>) -> (String, String, Arc<
             "/repos/{owner}/{repo}/pulls/{number}",
             axum::routing::get(
                 move |State(f): State<Arc<Mutex<Fake>>>,
-                      AxumPath((_owner, _repo, _number)): AxumPath<(String, String, u64)>| async move {
+                      AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>| async move {
                     let mut f = f.lock().unwrap();
                     f.pr_reads += 1;
-                    AxumJson(f.pr.clone())
+                    f.read_numbers.push(number);
+                    let body = f.prs.get(&number).cloned().unwrap_or_else(|| f.pr.clone());
+                    AxumJson(body)
                 },
             ),
         )
@@ -132,11 +160,28 @@ async fn spawn_fake_github(pr: Value, issues: Vec<u64>) -> (String, String, Arc<
             axum::routing::patch(
                 move |State(f): State<Arc<Mutex<Fake>>>,
                       AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>,
-                      AxumJson(body): AxumJson<Value>| async move {
-                    let mut f = f.lock().unwrap();
-                    f.patched.push((number, body));
-                    f.closed.insert(number);
-                    AxumJson(json!({ "number": number, "state": "closed" }))
+                      AxumJson(body): AxumJson<Value>| {
+                    let ledger = ledger.clone();
+                    async move {
+                        let pending = match &ledger {
+                            Some(store) => store.pending_decisions().await.unwrap().len(),
+                            None => 0,
+                        };
+                        let status = {
+                            let mut f = f.lock().unwrap();
+                            f.pending_at_close.push(pending);
+                            f.patched.push((number, body));
+                            let status = f.close_status;
+                            if status == 200 {
+                                f.closed.insert(number);
+                            }
+                            status
+                        };
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            AxumJson(json!({ "number": number, "state": "closed" })),
+                        )
+                    }
                 },
             ),
         )
@@ -148,7 +193,7 @@ async fn spawn_fake_github(pr: Value, issues: Vec<u64>) -> (String, String, Arc<
 }
 
 struct Harness {
-    store: Store,
+    store: Arc<Store>,
     github: GitHubClient,
     project: Project,
     fake: Arc<Mutex<Fake>>,
@@ -179,7 +224,7 @@ impl Harness {
 /// One project, one task parked in `awaiting_merge` behind a succeeded build
 /// whose PR is `pr_number`, and a GitHub that answers with `pr`.
 async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec, Build) {
-    let store = Store::open_in_memory().await.unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
     let project = Project {
         id: ProjectId::new(),
         repo_owner: "test".into(),
@@ -262,7 +307,10 @@ async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec,
         "a build that opened a PR has not shipped anything yet"
     );
 
-    let (graphql, rest, fake) = spawn_fake_github(pr, vec![issue]).await;
+    // The fake reads this store's ledger when a close arrives — see
+    // `a_close_records_its_intent_before_it_reaches_github`.
+    let (graphql, rest, fake) =
+        spawn_fake_github_watching(pr, vec![issue], Some(store.clone())).await;
     let github = GitHubClient::with_base_url("token", graphql).with_rest_base_url(rest);
     (
         Harness {
@@ -613,4 +661,254 @@ async fn a_stranded_batch_raises_a_standing_obligation() {
         "names the PR that has to land: {}",
         landing[0].summary
     );
+}
+
+/// The same story as `store::tests::a_rebuilt_batch_stops_obligating_…`, but
+/// through `poll_once` against a GitHub holding both pull requests — because
+/// the poller half is the destructive one.
+///
+/// PR 946 closed unmerged, the spec was rebuilt, PR 952 is open. The dead
+/// build must be nobody's business: not re-read, not unwound, and not raising
+/// an obligation nothing could discharge. Left unfixed, every poll would read
+/// 946, find it closed-unmerged forever, charge the *live* build's spec a
+/// build attempt, and pull #938 out of `awaiting_merge` while 952 was open.
+#[tokio::test]
+async fn a_rebuilt_batch_leaves_the_build_it_was_rebuilt_past_alone() {
+    // The harness parks the task behind PR 946 for us; the fake answers with
+    // 946's ending until the second PR is registered below.
+    let (h, task, spec, dead) = harness(938, 946, {
+        json!({
+            "number": 946,
+            "state": "closed",
+            "merged": false,
+            "mergeable": Value::Null,
+            "merge_commit_sha": Value::Null,
+        })
+    })
+    .await;
+
+    // Poll one: the genuine verdict on 946. The batch comes back.
+    h.poll().await;
+    assert_eq!(h.task(&task.id).await.state, TaskState::ReadyToBuild);
+
+    // The rebuild, parking the same task behind PR 952 — which is open.
+    let live = h
+        .store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    h.store.claim_next_queued_build().await.unwrap().unwrap();
+    h.store
+        .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+        .await
+        .unwrap();
+    {
+        let mut fake = h.fake.lock().unwrap();
+        fake.prs.insert(
+            952,
+            json!({
+                "number": 952,
+                "state": "open",
+                "merged": false,
+                "mergeable": true,
+                "merge_commit_sha": Value::Null,
+            }),
+        );
+        fake.read_numbers.clear();
+    }
+
+    h.poll().await;
+
+    assert_eq!(
+        h.fake.lock().unwrap().read_numbers,
+        vec![952],
+        "946 is settled and belongs to a build nothing owns any more"
+    );
+    assert_eq!(
+        h.task(&task.id).await.state,
+        TaskState::AwaitingMerge,
+        "PR 952 is open; nothing may drag the task out from under it"
+    );
+    assert_eq!(
+        h.store
+            .get_spec_queue_entry(&spec.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        SpecQueueStatus::Built,
+        "and the live build's spec is not charged for the dead one's PR"
+    );
+
+    let landing: Vec<_> = h
+        .store
+        .open_obligations(chrono::Duration::zero())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.kind == tasks::models::ObligationKind::LandBatch)
+        .collect();
+    assert_eq!(landing.len(), 1, "{landing:?}");
+    assert_eq!(
+        landing[0].subject_id,
+        live.id.to_string(),
+        "an obligation naming PR 946 is one no act could ever discharge (#956)"
+    );
+    assert_ne!(landing[0].subject_id, dead.id.to_string());
+}
+
+/// `watch_merges` is the one GitHub write outside the nine handlers, and no
+/// route guard reaches it: `tests/custodial.rs`'s
+/// `no_write_route_reaches_github_without_recording_first` drives routes, and
+/// this is a poll. So it gets its own.
+///
+/// Three things, in one story. The intent is on record **before** the close
+/// leaves the process — the fake reads the ledger as the request arrives,
+/// which is the only place ordering is observable. A close GitHub never
+/// answers leaves the row `pending`, because a write that may have landed must
+/// not be recorded as one that did not. And the retry reuses that same intent
+/// rather than writing a second one, because there is only one intent and a
+/// poll every minute through an outage would otherwise leave a row a minute.
+#[tokio::test]
+async fn a_close_records_its_intent_before_it_reaches_github() {
+    let (h, task, _spec, _build) = harness(51, 910, merged_pr(910)).await;
+    h.fake.lock().unwrap().close_status = 503;
+
+    h.poll().await;
+
+    {
+        let fake = h.fake.lock().unwrap();
+        assert_eq!(fake.patched.len(), 1, "the close was attempted");
+        assert_eq!(
+            fake.pending_at_close,
+            vec![1],
+            "and its intent was already in the ledger when it landed"
+        );
+    }
+    let pending = h.store.pending_decisions().await.unwrap();
+    assert_eq!(pending.len(), 1, "GitHub never answered, so nobody knows");
+    assert_eq!(pending[0].action, DecisionAction::RetireWork);
+    assert_eq!(pending[0].actor, Actor::System);
+    assert_eq!(pending[0].outcome.as_ref().unwrap()["intent"]["issue"], 51);
+    assert!(
+        pending[0].outcome.as_ref().unwrap()["unanswered"]
+            .as_str()
+            .unwrap()
+            .contains("503"),
+        "{:?}",
+        pending[0].outcome
+    );
+    assert_eq!(
+        h.task(&task.id).await.state,
+        TaskState::AwaitingMerge,
+        "a pending close is neither a failure nor a success: the task stays parked \
+         and the next poll asks again"
+    );
+
+    // The next poll retries the close under the same intent rather than
+    // opening a second one.
+    h.poll().await;
+    assert_eq!(h.fake.lock().unwrap().patched.len(), 2, "retried");
+    assert_eq!(
+        h.store.pending_decisions().await.unwrap().len(),
+        1,
+        "one intent, however many attempts it takes"
+    );
+
+    // And when GitHub finally answers, that same row settles.
+    h.fake.lock().unwrap().close_status = 200;
+    h.poll().await;
+    assert!(
+        h.store.pending_decisions().await.unwrap().is_empty(),
+        "the window closes when the answer arrives"
+    );
+    let settled = h
+        .store
+        .decisions(Some(("task", task.id.as_str())), 10)
+        .await
+        .unwrap();
+    let retire = settled
+        .iter()
+        .find(|d| d.action == DecisionAction::RetireWork)
+        .expect("one row, start to finish");
+    assert_eq!(retire.state, DecisionState::Applied);
+    assert_eq!(retire.outcome.as_ref().unwrap()["closed"], 51);
+    assert_eq!(
+        settled
+            .iter()
+            .filter(|d| d.action == DecisionAction::RetireWork)
+            .count(),
+        1,
+        "and exactly one, across three polls"
+    );
+}
+
+/// GitHub *answered* the close with a 4xx — nothing reached the world — so the
+/// intent is annulled rather than left open. `pending` means nobody knows, and
+/// conflating the two is what the whole state column exists to prevent.
+#[tokio::test]
+async fn a_close_github_refuses_is_annulled_rather_than_left_pending() {
+    let (h, task, _spec, _build) = harness(52, 911, merged_pr(911)).await;
+    h.fake.lock().unwrap().close_status = 422;
+
+    h.poll().await;
+
+    assert!(h.store.pending_decisions().await.unwrap().is_empty());
+    let row = h
+        .store
+        .decisions(Some(("task", task.id.as_str())), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.action == DecisionAction::RetireWork)
+        .expect("the judgment is on record either way");
+    assert_eq!(row.state, DecisionState::Annulled);
+    assert!(row.outcome.as_ref().unwrap()["refused"].is_string());
+    assert_eq!(
+        h.task(&task.id).await.state,
+        TaskState::AwaitingMerge,
+        "nothing shipped, so nothing moves"
+    );
+}
+
+/// #956's parked-rather-than-unwound rule survives the restructuring: a batch
+/// that merged but has not reached the trunk stays parked, and the close it
+/// never made leaves no ledger row at all.
+///
+/// Stated as its own test because the resolution recording is now wrapped
+/// around exactly this branch, and "it must not become an unwind" is the kind
+/// of invariant a refactor takes out silently.
+#[tokio::test]
+async fn a_merged_but_unreachable_batch_stays_parked_and_records_no_close() {
+    let (h, task, spec, _build) = harness(53, 912, merged_pr_into(912, "build/underneath")).await;
+    h.fake.lock().unwrap().compare_status = "ahead";
+
+    h.poll().await;
+    h.poll().await;
+
+    assert_eq!(h.task(&task.id).await.state, TaskState::AwaitingMerge);
+    assert_eq!(
+        h.store
+            .get_spec_queue_entry(&spec.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        SpecQueueStatus::Built,
+        "the stack may still land; unwinding here would rebuild work that is sitting in it"
+    );
+    assert!(
+        h.store
+            .decisions(None, 20)
+            .await
+            .unwrap()
+            .iter()
+            .all(|d| d.action != DecisionAction::RetireWork),
+        "no close was made, so there is no close to explain"
+    );
+    assert!(h.store.pending_decisions().await.unwrap().is_empty());
 }

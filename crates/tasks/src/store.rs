@@ -17,12 +17,12 @@ use crate::github::GhIssue;
 use crate::migrations::MIGRATOR;
 use crate::models::{
     Actor, Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel, ChatRole,
-    CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput, Directions,
-    GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
-    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ReviewedSpec,
-    RunKind, ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec,
-    SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
-    TranscriptLine, TranscriptOwner, TranscriptStream,
+    CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput,
+    DecisionState, Directions, GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent,
+    OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId,
+    ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
+    SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
+    Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream,
 };
 use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
@@ -346,6 +346,49 @@ async fn applied_versions(pool: &SqlitePool) -> Result<std::collections::HashSet
 /// Rows rewritten per transaction by a one-shot repair. Small enough that the
 /// sweep never holds a write lock long enough to matter to a live scout.
 const MAINTENANCE_BATCH: i64 = 500;
+
+/// SQL for "a **later** build already carried this spec, and succeeded".
+///
+/// One notion of supersession, in one place, because the two readers that
+/// disagreed about it are exactly the bug (#956/#959): both
+/// [`Store::list_builds_awaiting_merge`] and the `LandBatch` obligation find a
+/// build by joining `builds → build_specs → specs → tasks` and filtering
+/// `t.state = 'awaiting_merge'` — which identifies a *parking* and says
+/// nothing about which build caused it. The moment a rebuild re-parks a spec,
+/// every earlier succeeded build carrying that spec matches again, gets its
+/// long-settled PR re-read, and gets to act on it.
+///
+/// It needs no GitHub read: supersession is a **Tasks-owned** fact, derivable
+/// from `build_specs`, `builds.status` and `rowid`, while "the PR is closed"
+/// is GitHub's and must never be persisted.
+///
+/// Two parameters because the four call sites genuinely differ in what is in
+/// scope: a query that already has `builds b` passes `("bs.spec_id",
+/// "b.rowid")`, one that only has the build id bound passes `("bs.spec_id",
+/// "(SELECT rowid FROM builds WHERE id = ?1)")`, and inside
+/// [`Store::unwind_unmerged_build`] the outer table is unaliased `spec_queue`.
+/// Do not collapse this into a `const &str` — a single hardcoded form would
+/// silently correlate against the wrong table in two of them.
+///
+/// `rowid` and not `created_at`, for the reason [`Store::build_superseded`]
+/// already documents: two builds stamped inside the same second would let a
+/// build supersede *itself*. `succeeded` only: a later build still queued or
+/// running has not taken the work over, and one that failed gave it back.
+///
+/// The `builds` alias inside the fragment is `lb`, deliberately not `b`: the
+/// original inline copy used `b` for the *later* build, which reads backwards
+/// next to `list_builds_awaiting_merge`, where `b` is the build being judged.
+///
+/// `idx_build_specs_spec` (migration `0007_builds.sql`) already serves the
+/// `EXISTS`, so nothing here needs a migration.
+fn carried_by_a_later_build(spec_col: &str, later_than: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM build_specs later \
+                   JOIN builds lb ON lb.id = later.build_id \
+                  WHERE later.spec_id = {spec_col} AND lb.status = 'succeeded' \
+                    AND lb.rowid > {later_than})"
+    )
+}
 
 /// Run the one-shot repairs a migration asked for, then forget them.
 ///
@@ -1172,33 +1215,31 @@ impl Store {
     /// we already did. The task lands in `backlog` like any other intake —
     /// capturing work and deciding to work on it are separate capabilities,
     /// and the poller will refresh the row from GitHub on its next pass.
+    /// Writes **no ledger row of its own**: the caller filed the issue through
+    /// `server::ledgered`, which recorded the intent before the write and
+    /// settled it after, and that already-settled row is the one this event
+    /// points at. A second row here would be the double-count the whole
+    /// one-row-with-a-state design exists to avoid.
+    ///
+    /// Its subject is the *title*, not this task — no issue number and no task
+    /// existed when the intent was written. That is exactly what the shadow
+    /// branch already did ("a shadow row is a record of judgment, not a
+    /// foreign key"), so both halves of the capability now read alike; the
+    /// task linkage is this event's `decision_seq`.
     pub async fn capture_issue(
         &self,
         project_id: &ProjectId,
         issue: GhIssue,
-        decision: DecisionInput,
+        actor: Actor,
+        decision_seq: i64,
     ) -> Result<Task, StoreError> {
-        require_rationale(&decision)?;
         let number = issue.number;
         let task = self.upsert_gh_issue(project_id, issue).await?.into_inner();
-
-        let now = Utc::now();
-        let mut tx = self.begin_write().await?;
-        let decision_seq = insert_decision(
-            &mut tx,
-            "task",
-            task.id.as_str(),
-            DecisionAction::CaptureWork,
-            &decision,
-            now,
-        )
-        .await?;
-        tx.commit().await?;
 
         self.append_event(EventPayload::IssueCaptured {
             task_id: task.id.clone(),
             gh_issue_number: number,
-            actor: decision.actor,
+            actor,
             decision_seq: Some(decision_seq),
         })
         .await?;
@@ -1212,36 +1253,26 @@ impl Store {
     /// existing path, exactly as for an issue closed in a browser. Pre-marking
     /// it here would persist a GitHub-owned fact and, worse, would make a
     /// failed-then-retried close look successful.
+    /// Writes no ledger row of its own, for the reason [`Self::capture_issue`]
+    /// gives: the close was recorded as an intent before it reached GitHub and
+    /// settled after, and `decision_seq` is that row.
     pub async fn record_issue_closed(
         &self,
         task_id: &TaskId,
         reason: CloseReason,
-        decision: DecisionInput,
+        actor: Actor,
+        decision_seq: i64,
     ) -> Result<(), StoreError> {
-        require_rationale(&decision)?;
         let task = self
             .get_task(task_id)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
 
-        let now = Utc::now();
-        let mut tx = self.begin_write().await?;
-        let decision_seq = insert_decision(
-            &mut tx,
-            "task",
-            task_id.as_str(),
-            DecisionAction::RetireWork,
-            &decision,
-            now,
-        )
-        .await?;
-        tx.commit().await?;
-
         self.append_event(EventPayload::IssueClosed {
             task_id: task.id,
             gh_issue_number: task.gh_issue_number,
             reason,
-            actor: decision.actor,
+            actor,
             decision_seq: Some(decision_seq),
         })
         .await?;
@@ -2987,23 +3018,32 @@ impl Store {
     /// `created_at`: two builds stamped within the same second would let a
     /// build supersede itself, and `rowid` cannot.
     ///
+    /// The first half is [`carried_by_a_later_build`], shared with the two
+    /// queries that decide which build still *owns* a batch's state. It is
+    /// shared rather than copied because two hand-written versions of this
+    /// question is how those readers came to disagree about which build a spec
+    /// belongs to, which is the shape of #956/#959. Only the first half is
+    /// shared: deleting the last copy of an implementation needs the work to
+    /// have actually landed, while declining to rewrite a spec's status only
+    /// needs somebody else to own it now.
+    ///
     /// An empty batch is never superseded. It cannot happen (a build is
     /// created over specs), but the vacuous `NOT EXISTS` would answer "yes"
     /// and delete work, which is the one direction this must not fail in.
     pub async fn build_superseded(&self, id: &BuildId) -> Result<bool, StoreError> {
-        let row = sqlx::query(
+        let carried_sql =
+            carried_by_a_later_build("bs.spec_id", "(SELECT rowid FROM builds WHERE id = ?1)");
+        let row = sqlx::query(&format!(
             "SELECT \
                (SELECT COUNT(*) FROM build_specs WHERE build_id = ?1) AS total_specs, \
-               (SELECT COUNT(*) FROM build_specs bs WHERE bs.build_id = ?1 AND EXISTS ( \
-                    SELECT 1 FROM build_specs later JOIN builds b ON b.id = later.build_id \
-                    WHERE later.spec_id = bs.spec_id AND b.status = 'succeeded' \
-                      AND b.rowid > (SELECT rowid FROM builds WHERE id = ?1))) AS carried, \
+               (SELECT COUNT(*) FROM build_specs bs WHERE bs.build_id = ?1 \
+                    AND {carried_sql}) AS carried, \
                (SELECT COUNT(DISTINCT s.task_id) FROM build_specs bs \
                     JOIN specs s ON s.id = bs.spec_id WHERE bs.build_id = ?1) AS total_tasks, \
                (SELECT COUNT(DISTINCT s.task_id) FROM build_specs bs \
                     JOIN specs s ON s.id = bs.spec_id JOIN tasks t ON t.id = s.task_id \
                     WHERE bs.build_id = ?1 AND t.state = 'done') AS done_tasks",
-        )
+        ))
         .bind(id.as_str())
         .fetch_one(&self.pool)
         .await?;
@@ -3015,6 +3055,36 @@ impl Store {
             && carried == total_specs
             && total_tasks > 0
             && done_tasks == total_tasks)
+    }
+
+    /// Every succeeded build **all** of whose specs a later succeeded build
+    /// has since carried.
+    ///
+    /// The same notion [`carried_by_a_later_build`] serves the two queries
+    /// that decide which build owns a batch's state, offered as a set for
+    /// readers that work over a loaded snapshot rather than over SQL —
+    /// [`crate::brief::Brief`] is the one. A build in here is settled: its
+    /// files are somebody else's claim now, and a brief that reports it as
+    /// still claiming them is the same mis-attribution as #956/#959, read by a
+    /// third loop.
+    ///
+    /// All of its specs, not any: a build a rebuild only partly re-carried
+    /// still owns the half nothing took over, so it still claims those files.
+    pub async fn builds_superseded(&self) -> Result<HashSet<String>, StoreError> {
+        let carried = carried_by_a_later_build("bs.spec_id", "b.rowid");
+        let rows = sqlx::query(&format!(
+            "SELECT b.id AS build_id FROM builds b \
+             JOIN build_specs bs ON bs.build_id = b.id \
+             WHERE b.status = ? \
+             GROUP BY b.id \
+             HAVING COUNT(*) = SUM(CASE WHEN {carried} THEN 1 ELSE 0 END)",
+        ))
+        .bind(BuildStatus::Succeeded.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(row.try_get::<String, _>("build_id")?))
+            .collect()
     }
 
     pub async fn set_build_vm(&self, id: &BuildId, vm_id: &str) -> Result<(), StoreError> {
@@ -3372,11 +3442,26 @@ impl Store {
     /// the merge closes the issue the build drops off this list and the task
     /// is retired from the closure instead — otherwise the poll right after a
     /// close would close the same issue a second time.
+    ///
+    /// And restricted, per spec, to specs no *later* succeeded build has
+    /// carried ([`carried_by_a_later_build`]). This is the destructive half of
+    /// #956/#959 and it is not cosmetic: without it a build whose PR closed
+    /// unmerged and whose specs were rebuilt stays on this list forever, its
+    /// PR answers closed-unmerged on every poll, and
+    /// [`crate::run::watch_merges`] re-runs [`Self::unwind_unmerged_build`]
+    /// against it every pass — charging the **live** build's specs a build
+    /// attempt each time until they hit the cap and `blocked` themselves, and
+    /// dragging their tasks out of `awaiting_merge` while the new PR is still
+    /// open.
+    ///
+    /// Per spec rather than per build: a rebuild that re-carried only half a
+    /// batch leaves the other half nobody's but this build's, and that half
+    /// still has a PR to resolve.
     pub async fn list_builds_awaiting_merge(
         &self,
         project_id: &ProjectId,
     ) -> Result<Vec<AwaitingMergeBuild>, StoreError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT DISTINCT b.id AS build_id, b.pr_number, t.id AS task_id \
              FROM builds b \
              JOIN build_specs bs ON bs.build_id = b.id \
@@ -3384,8 +3469,10 @@ impl Store {
              JOIN tasks t ON t.id = s.task_id \
              WHERE b.project_id = ? AND b.status = ? AND b.pr_number IS NOT NULL \
                AND t.state = ? AND t.gh_state = ? \
+               AND NOT {} \
              ORDER BY b.created_at, b.rowid, t.ingested_at",
-        )
+            carried_by_a_later_build("bs.spec_id", "b.rowid"),
+        ))
         .bind(project_id.as_str())
         .bind(BuildStatus::Succeeded.as_str())
         .bind(TaskState::AwaitingMerge.as_str())
@@ -3427,16 +3514,36 @@ impl Store {
     /// The build row is deliberately left alone. It did succeed — branch
     /// pushed, PR opened — and rewriting a terminal row to match a later
     /// opinion is how audit trails stop being audit trails.
+    ///
+    /// **A spec a later succeeded build has carried is filtered out of all
+    /// three statements** ([`carried_by_a_later_build`]). Belt-and-braces now
+    /// that [`Self::list_builds_awaiting_merge`] is filtered too, and
+    /// deliberate: this is the destructive half, and the cost of one stale
+    /// caller is a *live* build's specs charged a build attempt and its tasks
+    /// dragged out of `awaiting_merge` while its PR is still open. Filtered
+    /// **per spec** rather than refusing the whole call, so a batch a rebuild
+    /// only partly re-carried still returns the half nothing took over.
+    ///
+    /// The three statements use numbered binds because a positional `?` order
+    /// does not survive inserting a correlated subquery: `?1` is the build id
+    /// and is read twice, for batch membership and for the `rowid` every
+    /// comparison is against. In the first two the outer table is unaliased
+    /// `spec_queue`, so the correlated column is `spec_queue.spec_id`; the
+    /// third joins `build_specs bs` and uses `bs.spec_id`.
     pub async fn unwind_unmerged_build(&self, id: &BuildId) -> Result<Vec<TaskId>, StoreError> {
         let now = Utc::now();
+        let later = "(SELECT rowid FROM builds WHERE id = ?1)";
+        let queue_carried = carried_by_a_later_build("spec_queue.spec_id", later);
+        let specs_carried = carried_by_a_later_build("bs.spec_id", later);
         let mut tx = self.begin_write().await?;
 
-        let built = sqlx::query(
+        let built = sqlx::query(&format!(
             "SELECT spec_id FROM spec_queue \
-             WHERE status = ? AND spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?)",
-        )
-        .bind(SpecQueueStatus::Built.as_str())
+             WHERE status = ?2 AND spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?1) \
+               AND NOT {queue_carried}",
+        ))
         .bind(id.as_str())
+        .bind(SpecQueueStatus::Built.as_str())
         .fetch_all(&mut *tx)
         .await?;
         let mut reopened = Vec::new();
@@ -3453,11 +3560,12 @@ impl Store {
             reopened.push(spec_id);
         }
 
-        let exhausted = sqlx::query(
+        let exhausted = sqlx::query(&format!(
             "SELECT spec_id FROM spec_queue \
-             WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?) \
-               AND status = ? AND build_attempts >= ?",
-        )
+             WHERE spec_id IN (SELECT spec_id FROM build_specs WHERE build_id = ?1) \
+               AND status = ?2 AND build_attempts >= ?3 \
+               AND NOT {queue_carried}",
+        ))
         .bind(id.as_str())
         .bind(SpecQueueStatus::Approved.as_str())
         .bind(MAX_BUILD_ATTEMPTS)
@@ -3474,12 +3582,13 @@ impl Store {
             blocked.push(spec_id);
         }
 
-        let task_rows = sqlx::query(
+        let task_rows = sqlx::query(&format!(
             "SELECT DISTINCT t.id FROM build_specs bs \
              JOIN specs s ON s.id = bs.spec_id \
              JOIN tasks t ON t.id = s.task_id \
-             WHERE bs.build_id = ? AND t.state = ?",
-        )
+             WHERE bs.build_id = ?1 AND t.state = ?2 \
+               AND NOT {specs_carried}",
+        ))
         .bind(id.as_str())
         .bind(TaskState::AwaitingMerge.as_str())
         .fetch_all(&mut *tx)
@@ -3927,7 +4036,19 @@ impl Store {
         //
         // `since` is `completed_at`, so the grace period is measured from when
         // the PR opened rather than from when the spec was written.
-        let rows = sqlx::query(
+        //
+        // The subject stays the build. What was wrong is the *selection*:
+        // reaching the task through `builds → build_specs → specs → tasks`
+        // makes the task's state the only thing that can retire this, and the
+        // task's state is a fact about the batch rather than about the build.
+        // When `watch_merges` unwinds a PR that closed unmerged, the same
+        // specs are rebuilt, the rebuild parks the same tasks back in
+        // `awaiting_merge`, and the *old* build matched again forever — an
+        // obligation naming a PR nobody can merge, with no act that discharges
+        // it (#956). `carried_by_a_later_build` is the whole fix, and it is
+        // the same clause `list_builds_awaiting_merge` gained; the two readers
+        // of one join must not answer differently.
+        let rows = sqlx::query(&format!(
             "SELECT b.id AS build_id, b.pr_number, b.branch, b.base_branch, b.completed_at, \
                     COUNT(DISTINCT t.id) AS task_count, MIN(t.gh_issue_number) AS first_issue \
              FROM builds b \
@@ -3937,9 +4058,11 @@ impl Store {
              WHERE b.status = ? AND b.pr_number IS NOT NULL \
                AND b.completed_at IS NOT NULL AND b.completed_at <= ? \
                AND t.state = ? \
+               AND NOT {} \
              GROUP BY b.id \
              ORDER BY b.completed_at",
-        )
+            carried_by_a_later_build("bs.spec_id", "b.rowid"),
+        ))
         .bind(BuildStatus::Succeeded.as_str())
         .bind(&cutoff)
         .bind(TaskState::AwaitingMerge.as_str())
@@ -3971,6 +4094,50 @@ impl Store {
                 kind: ObligationKind::LandBatch,
                 subject_id: row.try_get::<String, _>("build_id")?,
                 summary,
+                since,
+            });
+        }
+
+        // A decision that recorded its intent, reached for somebody else's
+        // system, and never learned what happened. The artifact may exist
+        // upstream with nothing in the ledger accounting for it — which is the
+        // whole of #964 — and unlike every other obligation here, the thing
+        // that discharges it is a *lookup* rather than a judgment.
+        //
+        // Dischargeable by its recipient, which is what
+        // `ObligationKind::StaleImage` could not claim: the summary names
+        // `GET /decisions/{seq}/reconcile`, which asks GitHub with the
+        // *server's* token and returns what it found, and
+        // `POST /decisions/{seq}/settle`, which writes that answer down. The
+        // orchestrator holds a curl-only token and usually no GitHub
+        // credential of its own, so an obligation that required it to read
+        // GitHub directly would leave guessing as its only move — and a guess
+        // written into an append-only ledger is worse than the missing row.
+        let rows = sqlx::query(
+            "SELECT seq, action, subject_kind, subject_id, actor, created_at FROM decisions \
+             WHERE state = ? AND created_at <= ? ORDER BY seq",
+        )
+        .bind(DecisionState::Pending.as_str())
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let since = parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?;
+            let action_raw: String = row.try_get("action")?;
+            let seq: i64 = row.try_get("seq")?;
+            obligations.push(Obligation {
+                kind: ObligationKind::ReconcileDecision,
+                subject_id: seq.to_string(),
+                summary: format!(
+                    "decision {seq} ({} on {} {}) recorded its intent and never learned what \
+                     became of it — GitHub never answered. The artifact may exist upstream with \
+                     nothing accounting for it: GET /decisions/{seq}/reconcile asks GitHub with \
+                     this server's own credential, then POST /decisions/{seq}/settle writes the \
+                     answer down",
+                    action_raw,
+                    row.try_get::<String, _>("subject_kind")?,
+                    row.try_get::<String, _>("subject_id")?,
+                ),
                 since,
             });
         }
@@ -4086,6 +4253,190 @@ impl Store {
         Ok(seq)
     }
 
+    /// Write the intent for an effect that is about to land in somebody
+    /// else's system, and return its `seq`.
+    ///
+    /// The row is `pending`: it says what we are about to do and why, and
+    /// makes no claim that it happened. `outcome` carries the *intent* — what
+    /// is about to be sent — because that is what a reconciler needs in order
+    /// to go looking for the artifact afterwards; the evidence column stays
+    /// the caller's, immutable, and untouched.
+    ///
+    /// [`require_rationale`] applies here for the same reason it applies at
+    /// `server::authorize`: an unexplained autonomous row is exactly the
+    /// unreviewable artifact the rule exists to prevent, and a *pending* one
+    /// is the least reviewable of all.
+    pub async fn record_intent(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: DecisionAction,
+        decision: &DecisionInput,
+        intent: Option<&serde_json::Value>,
+    ) -> Result<i64, StoreError> {
+        require_rationale(decision)?;
+        let outcome = intent.map(|intent| serde_json::json!({ "intent": intent }));
+        let mut tx = self.begin_write().await?;
+        let seq = insert_decision_in_state(
+            &mut tx,
+            subject_kind,
+            subject_id,
+            action,
+            decision,
+            true,
+            DecisionState::Pending,
+            outcome.as_ref(),
+            Utc::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(seq)
+    }
+
+    /// Move a `pending` row to a terminal state. Returns whether it moved.
+    ///
+    /// `WHERE state = 'pending'` is the guard that makes this idempotent and
+    /// makes a settled row unsettleable: two reconciliations cannot silently
+    /// disagree, and the first one wins.
+    ///
+    /// `outcome` is **merged** with `json_patch` rather than replaced, so the
+    /// error a refused call wrote there — and the intent recorded before the
+    /// call — both survive the settle that follows. A `null` value in the
+    /// patch deletes its key, which is JSON Merge Patch's rule and not a
+    /// surprise worth working around here: nothing writes one.
+    pub async fn settle_decision(
+        &self,
+        seq: i64,
+        state: DecisionState,
+        outcome: Option<&serde_json::Value>,
+    ) -> Result<bool, StoreError> {
+        if !state.is_terminal() {
+            return Err(StoreError::Invalid(
+                "a decision settles to applied or annulled; pending is where it already is".into(),
+            ));
+        }
+        let mut tx = self.begin_write().await?;
+        let moved = settle_in(&mut tx, seq, state, outcome, Utc::now()).await?;
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Add to a pending row's `outcome` without settling it.
+    ///
+    /// For the one branch that must stay pending: GitHub never answered, so
+    /// what happened is genuinely unknown — but *what we tried and what came
+    /// back* is worth keeping, and it is what the reconciliation reads.
+    pub async fn note_decision_outcome(
+        &self,
+        seq: i64,
+        outcome: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE decisions SET outcome = json_patch(COALESCE(outcome, '{}'), ?) \
+             WHERE seq = ? AND state = ?",
+        )
+        .bind(serde_json::to_string(outcome)?)
+        .bind(seq)
+        .bind(DecisionState::Pending.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Settle a pending row **and** record who settled it, in one transaction.
+    ///
+    /// Both writes are local, so the ledger's own rule applies: a
+    /// reconciliation that settled the row and then failed to say who settled
+    /// it would reproduce #964 inside its own fix.
+    ///
+    /// Returns the `seq` of the [`DecisionAction::SettleDecision`] row. A row
+    /// that is no longer pending is [`StoreError::Invalid`] — a second settle
+    /// is a refusal, not a silent no-op, because the caller is asserting
+    /// something about a window somebody else already closed.
+    pub async fn reconcile_decision(
+        &self,
+        seq: i64,
+        state: DecisionState,
+        outcome: Option<&serde_json::Value>,
+        decision: &DecisionInput,
+    ) -> Result<i64, StoreError> {
+        if !state.is_terminal() {
+            return Err(StoreError::Invalid(
+                "a decision settles to applied or annulled; pending is where it already is".into(),
+            ));
+        }
+        require_rationale(decision)?;
+        let now = Utc::now();
+        let mut tx = self.begin_write().await?;
+        if !settle_in(&mut tx, seq, state, outcome, now).await? {
+            return Err(StoreError::Invalid(format!(
+                "decision {seq} is not pending — it was settled already, or never had a window"
+            )));
+        }
+        let settle_seq = insert_decision_in_state(
+            &mut tx,
+            "decision",
+            &seq.to_string(),
+            DecisionAction::SettleDecision,
+            decision,
+            true,
+            DecisionState::Applied,
+            Some(&serde_json::json!({ "settled": seq, "state": state.as_str() })),
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(settle_seq)
+    }
+
+    /// One ledger row by `seq`.
+    pub async fn decision(&self, seq: i64) -> Result<Option<Decision>, StoreError> {
+        sqlx::query("SELECT * FROM decisions WHERE seq = ?")
+            .bind(seq)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(decision_from_row)
+            .transpose()
+    }
+
+    /// Every row whose effect nobody has confirmed, oldest first — the order
+    /// they should be chased in.
+    pub async fn pending_decisions(&self) -> Result<Vec<Decision>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM decisions WHERE state = ? ORDER BY seq")
+            .bind(DecisionState::Pending.as_str())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(decision_from_row).collect()
+    }
+
+    /// The oldest unsettled intent for this exact subject and action, if any.
+    ///
+    /// For a caller that is re-asked the same question on a timer and would
+    /// otherwise write one intent row per tick through an outage —
+    /// [`crate::run::watch_merges`] is the one. Retrying the *effect* is
+    /// right; writing a second intent for it is not, because there is only one
+    /// intent.
+    pub async fn pending_decision(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: DecisionAction,
+    ) -> Result<Option<Decision>, StoreError> {
+        sqlx::query(
+            "SELECT * FROM decisions \
+             WHERE subject_kind = ? AND subject_id = ? AND action = ? AND state = ? \
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(action.as_str())
+        .bind(DecisionState::Pending.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .map(decision_from_row)
+        .transpose()
+    }
+
     /// Whether this exact judgment is already in the ledger.
     ///
     /// For callers that are re-asked the same question on a timer. A shadowed
@@ -4199,6 +4550,13 @@ impl Store {
     /// Shadow decisions are excluded deliberately: a cap exists to bound
     /// effects on the world, and a shadowed decision had none. Counting them
     /// would make an evaluation run out of budget, which is exactly backwards.
+    ///
+    /// A **pending** action is charged, on the other hand — `state <>
+    /// 'annulled'` rather than `state = 'applied'`. The cap bounds a runaway
+    /// loop, and a call whose outcome nobody knows is exactly the one a loop
+    /// keeps making. An `annulled` one is not charged, on the same argument
+    /// that excludes a shadow row: GitHub answered no and nothing reached the
+    /// world.
     pub async fn orchestrator_actions_today(
         &self,
         action: DecisionAction,
@@ -4210,10 +4568,12 @@ impl Store {
         let since = DateTime::<Utc>::from_naive_utc_and_offset(since, Utc).to_rfc3339();
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM decisions \
-             WHERE action = ? AND actor = ? AND enforced = 1 AND created_at >= ?",
+             WHERE action = ? AND actor = ? AND enforced = 1 AND state <> ? \
+               AND created_at >= ?",
         )
         .bind(action.as_str())
         .bind(Actor::Orchestrator.as_str())
+        .bind(DecisionState::Annulled.as_str())
         .bind(since)
         .fetch_one(&self.pool)
         .await?;
@@ -5016,13 +5376,80 @@ async fn insert_decision_at(
     enforced: bool,
     now: DateTime<Utc>,
 ) -> Result<i64, StoreError> {
+    insert_decision_in_state(
+        tx,
+        subject_kind,
+        subject_id,
+        action,
+        decision,
+        enforced,
+        DecisionState::Applied,
+        None,
+        now,
+    )
+    .await
+}
+
+/// The `pending -> terminal` UPDATE, inside the caller's transaction.
+///
+/// Returns whether a row actually moved. `WHERE state = 'pending'` is what
+/// makes a settled row unsettleable.
+async fn settle_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    seq: i64,
+    state: DecisionState,
+    outcome: Option<&serde_json::Value>,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let patch = outcome.map(serde_json::to_string).transpose()?;
+    let result = sqlx::query(
+        "UPDATE decisions \
+            SET state = ?1, settled_at = ?2, \
+                outcome = CASE WHEN ?3 IS NULL THEN outcome \
+                               ELSE json_patch(COALESCE(outcome, '{}'), ?3) END \
+          WHERE seq = ?4 AND state = ?5",
+    )
+    .bind(state.as_str())
+    .bind(now.to_rfc3339())
+    .bind(patch)
+    .bind(seq)
+    .bind(DecisionState::Pending.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The only writer that can produce a `pending` row.
+///
+/// Everything else — [`insert_decision`], [`insert_decision_at`],
+/// [`Store::record_decision`] — delegates here with
+/// [`DecisionState::Applied`], so nothing but an explicit intent changes
+/// shape. That is the same argument the migration's `DEFAULT 'applied'`
+/// makes, one layer up: a store-only decision commits in the same transaction
+/// as the state it authorizes and has no window to represent.
+#[allow(clippy::too_many_arguments)]
+async fn insert_decision_in_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_kind: &str,
+    subject_id: &str,
+    action: DecisionAction,
+    decision: &DecisionInput,
+    enforced: bool,
+    state: DecisionState,
+    outcome: Option<&serde_json::Value>,
+    now: DateTime<Utc>,
+) -> Result<i64, StoreError> {
     let evidence = decision
         .evidence
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let outcome = outcome.map(serde_json::to_string).transpose()?;
     let result = sqlx::query(
-        "INSERT INTO decisions             (subject_kind, subject_id, action, actor, rationale, evidence, enforced, created_at)          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO decisions \
+            (subject_kind, subject_id, action, actor, rationale, evidence, enforced, \
+             state, outcome, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(subject_kind)
     .bind(subject_id)
@@ -5031,6 +5458,8 @@ async fn insert_decision_at(
     .bind(decision.rationale.as_deref())
     .bind(evidence)
     .bind(enforced as i64)
+    .bind(state.as_str())
+    .bind(outcome)
     .bind(now.to_rfc3339())
     .execute(&mut **tx)
     .await?;
@@ -5098,6 +5527,26 @@ fn decision_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Decision, StoreErro
             .transpose()?,
         transcript_seq: row.try_get("transcript_seq")?,
         enforced: row.try_get::<i64, _>("enforced")? != 0,
+        // An unreadable state is `BadEnum`, never a default: reading a row we
+        // cannot parse as `applied` would quietly close a window that may
+        // still be open, and the whole point of the column is that nobody
+        // guesses about that.
+        state: {
+            let raw: String = row.try_get("state")?;
+            DecisionState::from_str(&raw).ok_or(StoreError::BadEnum {
+                column: "state",
+                value: raw,
+            })?
+        },
+        outcome: row
+            .try_get::<Option<String>, _>("outcome")?
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        settled_at: row
+            .try_get::<Option<String>, _>("settled_at")?
+            .map(|raw| parse_ts(&raw, "settled_at"))
+            .transpose()?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
     })
 }
@@ -9672,6 +10121,505 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn orchestrator_decision(rationale: &str) -> DecisionInput {
+        DecisionInput {
+            actor: Actor::Orchestrator,
+            rationale: Some(rationale.into()),
+            evidence: None,
+        }
+    }
+
+    /// An intent is a real, attributed, explained row that claims nothing
+    /// about the world — and it carries what was about to be sent, because
+    /// that is what a reconciliation needs in order to go looking.
+    #[tokio::test]
+    async fn an_intent_is_recorded_before_the_effect_and_claims_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let seq = store
+            .record_intent(
+                "capture",
+                "a title",
+                DecisionAction::CaptureWork,
+                &orchestrator_decision("it would be lost otherwise"),
+                Some(&serde_json::json!({ "repo": "own/repo", "title": "a title" })),
+            )
+            .await
+            .unwrap();
+
+        let row = store.decision(seq).await.unwrap().unwrap();
+        assert_eq!(row.state, DecisionState::Pending);
+        assert!(row.settled_at.is_none());
+        assert_eq!(row.outcome.as_ref().unwrap()["intent"]["repo"], "own/repo");
+        assert_eq!(store.pending_decisions().await.unwrap().len(), 1);
+
+        // And an unexplained one is refused, exactly as an applied one is.
+        let err = store
+            .record_intent(
+                "capture",
+                "another",
+                DecisionAction::CaptureWork,
+                &DecisionInput {
+                    actor: Actor::Orchestrator,
+                    ..DecisionInput::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err}");
+    }
+
+    /// A settled row cannot be re-settled, so two reconciliations cannot
+    /// silently disagree — and settling to `pending` is a refusal, not a
+    /// no-op with a ledger row behind it.
+    #[tokio::test]
+    async fn a_decision_settles_once() {
+        let store = Store::open_in_memory().await.unwrap();
+        let seq = store
+            .record_intent(
+                "gh",
+                "812",
+                DecisionAction::CommentOnWork,
+                &orchestrator_decision("the reviewer asked"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .settle_decision(seq, DecisionState::Pending, None)
+                .await,
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(
+            store
+                .settle_decision(seq, DecisionState::Applied, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .settle_decision(seq, DecisionState::Annulled, None)
+                .await
+                .unwrap(),
+            "the first writer wins"
+        );
+        let row = store.decision(seq).await.unwrap().unwrap();
+        assert_eq!(row.state, DecisionState::Applied);
+        assert!(row.settled_at.is_some());
+    }
+
+    /// `outcome` is merged, not replaced: the error a refused call wrote there
+    /// — and the intent recorded before the call — both survive the
+    /// reconciliation that later finds the artifact.
+    #[tokio::test]
+    async fn settling_adds_to_the_outcome_rather_than_replacing_it() {
+        let store = Store::open_in_memory().await.unwrap();
+        let seq = store
+            .record_intent(
+                "task",
+                "task_1",
+                DecisionAction::RetireWork,
+                &orchestrator_decision("the PR landed"),
+                Some(&serde_json::json!({ "issue": 812 })),
+            )
+            .await
+            .unwrap();
+        store
+            .note_decision_outcome(seq, &serde_json::json!({ "unanswered": "502 Bad Gateway" }))
+            .await
+            .unwrap();
+        store
+            .settle_decision(
+                seq,
+                DecisionState::Applied,
+                Some(&serde_json::json!({ "found": "#812 is closed" })),
+            )
+            .await
+            .unwrap();
+
+        let outcome = store.decision(seq).await.unwrap().unwrap().outcome.unwrap();
+        assert_eq!(outcome["intent"]["issue"], 812);
+        assert_eq!(outcome["unanswered"], "502 Bad Gateway");
+        assert_eq!(outcome["found"], "#812 is closed");
+    }
+
+    /// A reconciliation writes its own row in the *same* transaction as the
+    /// settle. One that settled the row and then failed to say who settled it
+    /// would reproduce #964 inside its own fix.
+    #[tokio::test]
+    async fn a_reconciliation_says_who_made_it_and_refuses_without_a_reason() {
+        let store = Store::open_in_memory().await.unwrap();
+        let seq = store
+            .record_intent(
+                "gh",
+                "812",
+                DecisionAction::MergeBuild,
+                &orchestrator_decision("the build reported a passing run"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .reconcile_decision(
+                seq,
+                DecisionState::Applied,
+                None,
+                &DecisionInput {
+                    actor: Actor::Orchestrator,
+                    ..DecisionInput::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err}");
+        assert_eq!(
+            store.decision(seq).await.unwrap().unwrap().state,
+            DecisionState::Pending,
+            "a refusal is a no-op: the row it would have settled is untouched"
+        );
+
+        let settle_seq = store
+            .reconcile_decision(
+                seq,
+                DecisionState::Applied,
+                None,
+                &orchestrator_decision("the server read the PR back and it is merged"),
+            )
+            .await
+            .unwrap();
+        let own = store.decision(settle_seq).await.unwrap().unwrap();
+        assert_eq!(own.action, DecisionAction::SettleDecision);
+        assert_eq!(own.subject_kind, "decision");
+        assert_eq!(own.subject_id, seq.to_string());
+        assert_eq!(
+            own.state,
+            DecisionState::Applied,
+            "and is never itself pending"
+        );
+
+        // A second reconciliation is a refusal, not a silent no-op.
+        assert!(matches!(
+            store
+                .reconcile_decision(
+                    seq,
+                    DecisionState::Annulled,
+                    None,
+                    &orchestrator_decision("changed my mind"),
+                )
+                .await,
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    /// The daily cap charges a **pending** action and not an annulled one. A
+    /// call whose outcome nobody knows is exactly the one a runaway loop keeps
+    /// making, so it must count; an annulled one reached the world never, on
+    /// the same argument that excludes a shadow row.
+    #[tokio::test]
+    async fn the_daily_cap_charges_pending_but_not_annulled() {
+        let store = Store::open_in_memory().await.unwrap();
+        let pending = store
+            .record_intent(
+                "capture",
+                "a",
+                DecisionAction::CaptureWork,
+                &orchestrator_decision("one"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .orchestrator_actions_today(DecisionAction::CaptureWork)
+                .await
+                .unwrap(),
+            1,
+            "a call nobody knows the outcome of is charged"
+        );
+
+        let annulled = store
+            .record_intent(
+                "capture",
+                "b",
+                DecisionAction::CaptureWork,
+                &orchestrator_decision("two"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .settle_decision(annulled, DecisionState::Annulled, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .orchestrator_actions_today(DecisionAction::CaptureWork)
+                .await
+                .unwrap(),
+            1,
+            "GitHub said no, so nothing reached the world"
+        );
+
+        store
+            .settle_decision(pending, DecisionState::Applied, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .orchestrator_actions_today(DecisionAction::CaptureWork)
+                .await
+                .unwrap(),
+            1,
+            "and settling one that did land does not double-count it"
+        );
+    }
+
+    /// A pending row past the grace period raises `ReconcileDecision`, keyed
+    /// to the decision `seq` — the third subject type — and its summary names
+    /// the two calls that discharge it.
+    #[tokio::test]
+    async fn a_pending_decision_past_the_grace_period_is_an_obligation() {
+        let store = Store::open_in_memory().await.unwrap();
+        let seq = store
+            .record_intent(
+                "task",
+                "task_1",
+                DecisionAction::RetireWork,
+                &orchestrator_decision("the PR landed"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let raised: Vec<Obligation> = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == ObligationKind::ReconcileDecision)
+            .collect();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].subject_id, seq.to_string());
+        assert!(
+            raised[0]
+                .summary
+                .contains(&format!("/decisions/{seq}/reconcile")),
+            "it has to name its own discharge: {}",
+            raised[0].summary
+        );
+
+        store
+            .settle_decision(seq, DecisionState::Applied, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .open_obligations(chrono::Duration::zero())
+                .await
+                .unwrap()
+                .iter()
+                .all(|o| o.kind != ObligationKind::ReconcileDecision),
+            "settled is settled"
+        );
+    }
+
+    /// Every store-only decision — and every shadow row — is `applied` by
+    /// construction. Those commit in the same transaction as the state they
+    /// authorize, so there is no window to represent, and a `pending` one
+    /// there would be a bug rather than a window.
+    #[tokio::test]
+    async fn store_only_and_shadow_decisions_are_never_pending() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 1).await;
+
+        store
+            .record_decision(
+                "task",
+                task.id.as_str(),
+                DecisionAction::CaptureWork,
+                orchestrator_decision("shadowed"),
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store.pending_decisions().await.unwrap().is_empty(),
+            "nothing here reaches another system"
+        );
+        for decision in store.decisions(None, 20).await.unwrap() {
+            assert_eq!(
+                decision.state,
+                DecisionState::Applied,
+                "{:?} should not have a window",
+                decision.action
+            );
+        }
+    }
+
+    /// #956/#959. A build whose PR closed unmerged and whose specs were then
+    /// rebuilt keeps matching "a task of mine is `awaiting_merge`" forever,
+    /// because that predicate names the *parking* and not the build behind it.
+    ///
+    /// Both readers of that join have to stop selecting it: the obligation
+    /// (which nothing could ever discharge) and — the destructive one —
+    /// `list_builds_awaiting_merge`, whose PR answers closed-unmerged on every
+    /// poll.
+    ///
+    /// Stub [`carried_by_a_later_build`] to return `"0"` and this fails, which
+    /// is the two-line check that the predicate is load-bearing rather than a
+    /// query that happened to be rewritten.
+    #[tokio::test]
+    async fn a_rebuilt_batch_stops_obligating_the_build_it_was_rebuilt_past() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 938).await;
+
+        // The build whose PR nobody merged.
+        let dead = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+        store
+            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[])
+            .await
+            .unwrap();
+        store.unwind_unmerged_build(&dead.id).await.unwrap();
+
+        // And the rebuild, which parks the same task behind a new PR.
+        let live = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+        store
+            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::AwaitingMerge
+        );
+
+        let landing: Vec<Obligation> = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == ObligationKind::LandBatch)
+            .collect();
+        assert_eq!(landing.len(), 1, "one open PR, one obligation: {landing:?}");
+        assert_eq!(
+            landing[0].subject_id,
+            live.id.to_string(),
+            "the rebuild owns the batch now; PR 946 is nobody's to merge"
+        );
+        assert!(
+            landing[0].summary.contains("#952"),
+            "{}",
+            landing[0].summary
+        );
+
+        let awaiting = store.list_builds_awaiting_merge(&project.id).await.unwrap();
+        assert_eq!(awaiting.len(), 1, "and the poller reads one PR, not two");
+        assert_eq!(awaiting[0].build_id, live.id);
+        assert_eq!(awaiting[0].pr_number, 952);
+    }
+
+    /// The destructive half, asked of the store directly: a stale caller that
+    /// unwinds the dead build must move nothing. Without the filter each call
+    /// charges the *live* build's spec a build attempt and drags its task out
+    /// of `awaiting_merge` while PR 952 is still open — which is how #938
+    /// ended up `ready_to_build` behind an open pull request.
+    #[tokio::test]
+    async fn unwinding_a_build_a_rebuild_has_passed_touches_nothing() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+        let (task, spec) = approved_spec(&store, &project, 938).await;
+
+        let dead = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+        store
+            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[])
+            .await
+            .unwrap();
+        store.unwind_unmerged_build(&dead.id).await.unwrap();
+        let attempts = async |spec_id: &SpecId| -> i64 {
+            sqlx::query_scalar("SELECT build_attempts FROM spec_queue WHERE spec_id = ?")
+                .bind(spec_id.as_str())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+        };
+        let charged = attempts(&spec.id).await;
+        assert_eq!(charged, 1, "one real verdict, one strike");
+
+        let live = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store.claim_next_queued_build().await.unwrap().unwrap();
+        store
+            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+            .await
+            .unwrap();
+
+        // More unwinds than the cap: without the filter this alone would
+        // `blocked` the spec.
+        for _ in 0..=MAX_BUILD_ATTEMPTS {
+            let returned = store.unwind_unmerged_build(&dead.id).await.unwrap();
+            assert!(returned.is_empty(), "no task is this build's to move");
+        }
+
+        let entry = store.get_spec_queue_entry(&spec.id).await.unwrap().unwrap();
+        assert_eq!(entry.status, SpecQueueStatus::Built, "the rebuild's, still");
+        assert_eq!(
+            attempts(&spec.id).await,
+            charged,
+            "and not charged again for a verdict that was never rendered"
+        );
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::AwaitingMerge,
+            "PR 952 is open; nothing may pull the task out from under it"
+        );
     }
 
     /// Concluded work sorts below work somebody can still act on, and does not

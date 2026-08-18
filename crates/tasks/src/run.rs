@@ -56,7 +56,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use vm_pool_client::{Client, ClientError};
 use vm_pool_protocol::{VmConfig, VmId};
 
@@ -67,8 +67,8 @@ use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient, IntakeFilter, PrState};
 use crate::github_health::{GitHubHealth, Transition};
 use crate::models::{
-    Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput, GhState,
-    Mode, Project, Spec, Task, TaskId, TaskState,
+    Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput,
+    DecisionState, GhState, Mode, Project, Spec, Task, TaskId, TaskState,
 };
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
@@ -1823,6 +1823,48 @@ async fn watch_merges(
                     continue;
                 }
 
+                // Intent, then effect, then settle — by hand, because this is
+                // the one GitHub write outside the nine handlers and
+                // `server::ledgered` is not reachable from a poll. The
+                // ordering is the same and so is the `is_unavailable` branch;
+                // `crates/tasks/tests/merges.rs` guards it, since the
+                // all-routes guard in `tests/custodial.rs` drives routes and
+                // cannot see this path.
+                //
+                // The intent is reused rather than rewritten when one is
+                // already open (`pending_decision`): retrying the *effect* is
+                // right, writing a second intent for it is not — there is only
+                // one intent, and a poll every minute through an outage would
+                // otherwise leave one row per minute behind it.
+                let seq = match store
+                    .pending_decision("task", task.id.as_str(), DecisionAction::RetireWork)
+                    .await?
+                {
+                    Some(open) => open.seq,
+                    None => {
+                        store
+                            .record_intent(
+                                "task",
+                                task.id.as_str(),
+                                DecisionAction::RetireWork,
+                                &DecisionInput {
+                                    actor: Actor::System,
+                                    rationale: Some(rationale.clone()),
+                                    evidence: Some(evidence.clone()),
+                                },
+                                Some(&serde_json::json!({
+                                    "repo": format!(
+                                        "{}/{}",
+                                        project.repo_owner, project.repo_name
+                                    ),
+                                    "issue": task.gh_issue_number,
+                                    "reason": CloseReason::Completed.as_str(),
+                                })),
+                            )
+                            .await?
+                    }
+                };
+
                 let closed = github
                     .close_issue(
                         &project.repo_owner,
@@ -1833,24 +1875,73 @@ async fn watch_merges(
                     .await;
                 watch.observe(&closed).await;
                 if let Err(e) = closed {
-                    warn!(
-                        issue = task.gh_issue_number,
-                        pr = build.pr_number,
-                        error = %e,
-                        "closing the issue failed; asking again next poll"
-                    );
+                    // The close outcome is ternary now, and this pass has to
+                    // read all three. **Annulled** — GitHub answered no — ends
+                    // the intent: nothing reached the world. **Pending** —
+                    // GitHub never answered — is left open, because a close
+                    // that may have landed is exactly what must not be written
+                    // down as "did not happen".
+                    //
+                    // Neither costs anything downstream, and that is the
+                    // deliberate answer to what a pending close does to the
+                    // *batch*: there is no stored resolution to withhold (a
+                    // PR's ending is GitHub's fact and is re-read every poll),
+                    // so the task simply stays `awaiting_merge`, the next poll
+                    // reads the same PR, and the close is retried under the
+                    // same intent. A close is idempotent upstream, so a retry
+                    // of one that did land costs a call and changes nothing.
+                    if e.is_unavailable() {
+                        if let Err(store_err) = store
+                            .note_decision_outcome(
+                                seq,
+                                &serde_json::json!({ "unanswered": e.to_string() }),
+                            )
+                            .await
+                        {
+                            warn!(seq, error = %store_err, "noting an unanswered close failed");
+                        }
+                        warn!(
+                            issue = task.gh_issue_number,
+                            pr = build.pr_number,
+                            seq,
+                            error = %e,
+                            "GitHub never answered the close; decision stays pending"
+                        );
+                    } else {
+                        if let Err(store_err) = store
+                            .settle_decision(
+                                seq,
+                                DecisionState::Annulled,
+                                Some(&serde_json::json!({ "refused": e.to_string() })),
+                            )
+                            .await
+                        {
+                            warn!(seq, error = %store_err, "annulling a refused close failed");
+                        }
+                        warn!(
+                            issue = task.gh_issue_number,
+                            pr = build.pr_number,
+                            error = %e,
+                            "closing the issue failed; asking again next poll"
+                        );
+                    }
                     continue;
                 }
-                store
-                    .record_issue_closed(
-                        &task.id,
-                        CloseReason::Completed,
-                        DecisionInput {
-                            actor: Actor::System,
-                            rationale: Some(rationale.clone()),
-                            evidence: Some(evidence.clone()),
-                        },
+                // A settle that fails is loud and not fatal, exactly as in
+                // `ledgered`: the issue is closed, and the honest residue is a
+                // pending row `ReconcileDecision` will chase.
+                if let Err(e) = store
+                    .settle_decision(
+                        seq,
+                        DecisionState::Applied,
+                        Some(&serde_json::json!({ "closed": task.gh_issue_number })),
                     )
+                    .await
+                {
+                    error!(seq, error = %e, "the issue closed and settling its row did not");
+                }
+                store
+                    .record_issue_closed(&task.id, CloseReason::Completed, Actor::System, seq)
                     .await?;
                 info!(
                     issue = task.gh_issue_number,

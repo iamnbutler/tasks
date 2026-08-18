@@ -107,6 +107,10 @@ struct World {
     builds: Vec<Build>,
     /// Spec ids per build, for naming what a build is carrying.
     build_specs: HashMap<String, Vec<SpecId>>,
+    /// Builds whose every spec a later succeeded build has carried. They are
+    /// settled however their own pull request reads — see
+    /// [`Store::builds_superseded`] and [`is_unresolved`].
+    superseded: HashSet<String>,
 }
 
 impl<'a> Brief<'a> {
@@ -171,6 +175,68 @@ impl<'a> Brief<'a> {
                     .into(),
             );
         }
+        Ok(lines)
+    }
+
+    /// Facts for a decision whose effect nobody confirmed: what was about to
+    /// be done, where, and what came back.
+    ///
+    /// It ends by naming the two calls that discharge it, in order, because
+    /// the whole point of `ObligationKind::ReconcileDecision` is that its
+    /// recipient can settle it from evidence rather than from a guess — and
+    /// the evidence comes from the server, which holds the credential.
+    pub async fn for_pending_decision(&self, seq: i64) -> Result<Vec<String>, StoreError> {
+        let Some(decision) = self.store.decision(seq).await? else {
+            return Ok(vec![format!(
+                "decision {seq} is not in the ledger — the obligation named a row that is gone"
+            )]);
+        };
+        let mut lines = vec![format!(
+            "decision {seq}: {} on {} {}, by {}, recorded {}",
+            decision.action.as_str(),
+            decision.subject_kind,
+            decision.subject_id,
+            decision.actor.as_str(),
+            decision.created_at.format("%Y-%m-%d %H:%M UTC"),
+        )];
+        if decision.state != crate::models::DecisionState::Pending {
+            lines.push(format!(
+                "it is already {} — nothing to reconcile",
+                decision.state.as_str()
+            ));
+            return Ok(lines);
+        }
+        if let Some(rationale) = decision.rationale.as_deref() {
+            lines.push(format!("its stated reason: {rationale}"));
+        }
+        if let Some(intent) = decision.outcome.as_ref().and_then(|o| o.get("intent")) {
+            lines.push(format!("what it was about to do: {intent}"));
+        }
+        if let Some(unanswered) = decision.outcome.as_ref().and_then(|o| o.get("unanswered")) {
+            lines.push(format!(
+                "GitHub never answered: {unanswered} — so the write may or may not have landed"
+            ));
+        }
+        // Named even when the capability is `live`, because the case that
+        // matters is the demoted one: settling is deliberately not gated, and
+        // a reader who assumes it is would leave this row open forever.
+        if let Some(capability) = decision.action.capability() {
+            let level = self.store.charter_entry(capability).await?.level;
+            lines.push(format!(
+                "it came from `{}`, currently {} — settling is not gated by the charter either \
+                 way: the effect already happened, and refusing to record it would only keep \
+                 the ledger wrong",
+                capability.as_str(),
+                level.as_str(),
+            ));
+        }
+        lines.push(format!(
+            "to discharge: GET /decisions/{seq}/reconcile — the server asks GitHub with its own \
+             credential and tells you what it found — then POST /decisions/{seq}/settle \
+             {{\"state\":\"applied|annulled\",\"rationale\",\"outcome\"}}. If the lookup \
+             answers `unknown`, leave it pending: that is the honest state, and a guess written \
+             into an append-only ledger is worse than the missing row this exists to prevent"
+        ));
         Ok(lines)
     }
 
@@ -586,6 +652,7 @@ impl<'a> Brief<'a> {
             let ids = self.store.build_spec_ids(&build.id).await?;
             build_specs.insert(build_key(build).to_string(), ids);
         }
+        let superseded = self.store.builds_superseded().await?;
 
         Ok(World {
             specs,
@@ -594,6 +661,7 @@ impl<'a> Brief<'a> {
             projects,
             builds,
             build_specs,
+            superseded,
         })
     }
 
@@ -1013,8 +1081,13 @@ fn build_overlap(spec: &Spec, world: &World) -> Vec<String> {
 /// the batch in `awaiting_merge`, and [`crate::run::watch_merges`] is the only
 /// thing that moves it out, to `done` once the commit reaches the trunk or back
 /// to `ready_to_build` when the PR closed unmerged. So a task still sitting in
-/// `awaiting_merge` *is* "nobody has resolved this PR yet", with nothing
-/// GitHub-owned persisted to say it.
+/// `awaiting_merge` is "nobody has resolved this PR yet", with nothing
+/// GitHub-owned persisted to say it — **once you have subtracted the builds a
+/// later one superseded**. That clause was missing and is what made the
+/// sentence quietly wrong: a rebuild parks the same tasks back in
+/// `awaiting_merge`, so every earlier build carrying those specs read as
+/// unresolved forever. Supersession is Tasks-owned and needs no GitHub read
+/// either; see [`Store::builds_superseded`].
 ///
 /// Everything else is history, and history was drowning the signal. The 14-day
 /// window was standing in for "its PR is plausibly still open", which is a fine
@@ -1056,6 +1129,13 @@ fn is_unresolved(build: &Build, world: &World) -> bool {
         // `approved` — a failed build for another attempt, a cancelled one
         // because somebody stopped it. Nothing is holding the files.
         BuildStatus::Failed | BuildStatus::Cancelled => false,
+        // A later succeeded build carried every one of its specs, so those
+        // files are that build's claim now and this one's PR is nobody's
+        // business. Read first, because the test below is `is any task of mine
+        // still awaiting_merge` — which names a *parking* and not the build
+        // that caused it, and a rebuild re-parks the same tasks. That is the
+        // #956/#959 mis-attribution, arriving here through a third reader.
+        BuildStatus::Succeeded if world.superseded.contains(build_key(build)) => false,
         BuildStatus::Succeeded => {
             let states: Vec<TaskState> = world
                 .build_specs
@@ -1424,6 +1504,7 @@ mod tests {
             projects: HashMap::new(),
             builds: Vec::new(),
             build_specs: HashMap::from([(build_key(build).to_string(), vec![spec_id.clone()])]),
+            superseded: HashSet::new(),
         }
     }
 

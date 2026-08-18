@@ -68,6 +68,92 @@ implementation.
   something it concluded had landed. Nothing auto-unwinds a stranded batch;
   `ObligationKind::LandBatch` makes it loud instead, and it is the first
   obligation whose subject is a **build** id rather than a spec id.
+- **A build owns its batch's state only until a later build carries the same
+  specs.** Both readers of "which build is still waiting on a pull request"
+  found one by joining `builds → build_specs → specs → tasks` and filtering
+  `t.state = 'awaiting_merge'` — which identifies a **parking**, not the build
+  that caused it. A task carries no memory of which build put it there, so the
+  instant a rebuild re-parks a spec, *every* earlier succeeded build carrying
+  it matches again, forever. `carried_by_a_later_build` is one shared SQL
+  predicate applied wherever that join appears, and `Store::build_superseded`
+  is rewired onto it so there is one notion of supersession rather than two
+  that can drift — two hand-written versions of this question is exactly how
+  the readers came to disagree. It needs **no GitHub read**: supersession is a
+  Tasks-owned fact (`build_specs`, `builds.status`, `rowid`), while "the PR is
+  closed" is GitHub's, and a `builds.pr_resolution` column recording the latter
+  would be persisting a GitHub-owned fact that GitHub can *retract* — a PR can
+  be reopened. **The poller half is the destructive one, and reading it as
+  cosmetic is the mistake**: fixing only the obligation leaves
+  `list_builds_awaiting_merge` selecting the dead build, whose PR answers
+  closed-unmerged on every poll forever, so `watch_merges` re-runs
+  `unwind_unmerged_build` against it every pass — charging the **live** build's
+  specs a build attempt each time until they cap and `blocked` themselves, and
+  dragging their tasks out of `awaiting_merge` while the new PR is still open
+  (#938 sat `ready_to_build` behind an open PR #952). The obligation half is
+  #956, a `land_batch` naming a PR nobody can merge with no act that discharges
+  it; the poller half is #959. Three rules hold the predicate's shape.
+  **Keyed on the spec, never the task** — task-keyed would retire the
+  obligation for a PR that genuinely never landed whenever some *other* spec of
+  the same task was built later, and the errors are not symmetric: a stale
+  obligation is noise, a dropped one loses the only thing that notices
+  stranding at all. **`rowid` and not `created_at`**, or two builds stamped
+  inside the same second let a build supersede itself. And `succeeded` only: a
+  later build still queued or running has not taken the work over, and one that
+  failed gave it back. `unwind_unmerged_build` filters **per spec** rather than
+  refusing the whole call, so a batch a rebuild only partly re-carried still
+  returns the half nothing took over — belt-and-braces beside the filtered
+  list, and deliberate, because this is the half that writes. The predicate is
+  falsifiable in two lines: stub it to `"0"` and the three tests that pin this
+  fail. What is deliberately **not** fixed: with `retire_work` `off` or
+  `shadow`, nothing unwinds a PR that closed unmerged, so its batch stays
+  parked and keeps raising `land_batch` — the announced cost of the kill
+  switch, whose discharge is turning the capability back on.
+- **A GitHub write records its intent before it happens, and the window
+  between is a state on the row rather than a gap in the ledger.** #957 closed
+  the half of the attribution gap that can be *refused* — `require_rationale`
+  moved into `authorize`, ahead of every effect. This is the half that cannot
+  be: all ten sites that write to GitHub ran the effect and *then* the
+  `record_decision` explaining it, so a SQLite error, a panic or a SIGKILL in
+  between left a real artifact upstream that nothing accounts for (#964).
+  Recording first stays **refused** — a row claiming an effect a failed call
+  never had makes every row suspect, where a missing row leaves one artifact
+  unexplained — so `decisions` grows a `state` (`pending` → `applied` |
+  `annulled`), and `server::ledgered` takes the effect **as a closure**, which
+  is the point: a handler nobody has written yet cannot reach GitHub without
+  its intent already on record, the same property that made `authorize` the
+  right home for the rationale check. One row with a state column and not an
+  intent row plus a confirmation row, because every existing aggregate over
+  `decisions` would double-count under two and each would need an "and not the
+  intent one" clause the next query would forget; `DEFAULT 'applied'` leaves
+  history and every *store-only* decision alone by construction, since those
+  commit in the same transaction as the state they authorize and have no window
+  to represent. The three outcomes are decided **structurally off
+  `GhError::is_unavailable`, never off message text** — returned → `applied`;
+  refused with an *answer* → `annulled`; **never answered → stays pending**,
+  because we do not know and saying so is the whole point. A settle that itself
+  fails is logged and **not** propagated: the effect happened, and a 500 there
+  sends a well-behaved caller into the retry that files a second issue, which
+  is #957 one level up. What chases the residue is
+  `ObligationKind::ReconcileDecision`, and it is dischargeable only because the
+  **server** holds the lookup: `GET /decisions/{seq}/reconcile` asks GitHub with
+  the server's own credential and returns what it found, then
+  `POST /decisions/{seq}/settle` writes that down. Leaving the lookup to the
+  recipient is what fails — the default `ORCHESTRATOR_CMD` is
+  `--allowedTools Bash(curl:*)` with no `GITHUB_TOKEN`, so its only moves would
+  be to guess (writing `applied` on no evidence into an append-only ledger,
+  worse than the missing row) or to refile the issue. A settle is **never
+  charter-gated**, including for a capability since demoted: `shadow`/`off`
+  exist for demotion and demotion is likeliest exactly when pending rows exist,
+  so gating it would raise a nag its recipient is forbidden to discharge.
+  Settling is not the action — the effect already happened, and refusing to
+  record it only keeps the ledger wrong. The guard is structural rather than a
+  list: `DecisionAction` is macro-generated so `ALL` is complete by
+  construction, and `no_write_route_reaches_github_without_recording_first`
+  drives it through an exhaustive match against a GitHub that never answers —
+  a fake that reads the ledger *as the call arrives*, so the assertion is about
+  ordering and not about the end state. The residue that remains is deliberate
+  and one level smaller: a settle that fails after a successful effect leaves
+  the row `pending`, which is the honest description.
 - **An open PR is chased like every other stage, and the default is to land
   it.** The pipeline used to dead-end at PR open: the `land_batch` bullet ended
   "landing it is the human's" while the charter shipped `land_builds` **live**,

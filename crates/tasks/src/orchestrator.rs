@@ -1026,6 +1026,24 @@ pub async fn format_obligations(
             sections.push((format!("On build {build_id}:"), facts));
             continue;
         }
+        // The third subject type, and the second that is not a spec id: a
+        // decision `seq`. Same reason as `LandBatch` above — a
+        // `SpecId::from_raw("417")` is not a type error, it would just head a
+        // section with a spec that has never existed.
+        if obligation.kind == ObligationKind::ReconcileDecision {
+            let facts = match obligation.subject_id.parse::<i64>() {
+                Ok(seq) => match brief.for_pending_decision(seq).await {
+                    Ok(facts) => facts,
+                    Err(e) => vec![brief_unavailable(&e)],
+                },
+                Err(_) => vec![format!(
+                    "decision {} is not a sequence number",
+                    obligation.subject_id
+                )],
+            };
+            sections.push((format!("On decision {}:", obligation.subject_id), facts));
+            continue;
+        }
         let spec_id = crate::models::SpecId::from_raw(&obligation.subject_id);
         let facts = match obligation.kind {
             // Dispatch wants the same facts as review: overlap with in-flight
@@ -1039,8 +1057,8 @@ pub async fn format_obligations(
                 Ok(facts) => facts,
                 Err(e) => vec![brief_unavailable(&e)],
             },
-            // Handled above, before the `SpecId` this arm cannot use.
-            ObligationKind::LandBatch => unreachable!(),
+            // Handled above, before the `SpecId` these arms cannot use.
+            ObligationKind::LandBatch | ObligationKind::ReconcileDecision => unreachable!(),
         };
         sections.push((spec_heading(store, &spec_id).await, facts));
     }
@@ -1413,6 +1431,11 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            merge commit is an ancestor of the trunk, never on `merged` — so a \
            batch parked behind a merged PR is correct, not stale. \
            {landing}\n\
+         - `reconcile_decision` obligation → a write reached for GitHub and \
+           never learned whether it landed. Its subject is a DECISION SEQ, not \
+           a spec id. Do NOT redo the write — that is how one issue becomes \
+           two. GET /decisions/{{seq}}/reconcile first, and settle from what \
+           it found\n\
          - Scout or build FAILED → investigate (transcript, build row, \
            events) and report the cause and what you'd do about it.\n\
          - New tasks → note anything urgent or related to in-flight work; \
@@ -1550,8 +1573,21 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            {{\"labels\":[...],\"rationale\"}} — the repo's label vocabulary, \
            and the complete set for one issue. Read the vocabulary before \
            writing: inventing labels fragments every filter written later\n\
-         - GET /decisions[?spec=|?build=] — the ledger: who decided what, why, \
-           and which turn of this conversation explains it\n\
+         - GET /decisions[?spec=|?build=|?pending=true] — the ledger: who \
+           decided what, why, and which turn of this conversation explains it. \
+           `?pending=true` is the ones whose effect nobody confirmed\n\
+         - GET /decisions/{{seq}}/reconcile, then \
+           POST /decisions/{{seq}}/settle \
+           {{\"state\":\"applied|annulled\",\"rationale\",\"outcome\"}} — \
+           discharge a `reconcile_decision` obligation. Every write that \
+           reaches GitHub records its intent BEFORE the call, so a write that \
+           landed and then failed to be recorded leaves a `pending` row rather \
+           than nothing at all. `reconcile` is the server asking GitHub with \
+           its OWN credential and telling you what it found — you do not need \
+           a GitHub token, and you must not guess: if it answers `unknown`, \
+           leave the row pending and say so. A settle is never refused by the \
+           charter, even for a capability since demoted: the effect already \
+           happened, and refusing to record it only keeps the ledger wrong\n\
          - GET /builds, GET /builds/{{id}} — build state, PR number\n\
          - GET /bundles, GET /builds/{{id}}/bundle — implementations whose \
            branch could not be pushed. The VM is gone before egress runs, so \

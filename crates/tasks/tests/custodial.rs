@@ -18,8 +18,8 @@ use axum::routing::{post, put};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tasks::models::{
-    Actor, Capability, CharterLevel, GhState, Project, ProjectId, ProjectStatus, Task, TaskId,
-    TaskState,
+    Actor, Capability, CharterLevel, DecisionAction, DecisionState, GhState, Project, ProjectId,
+    ProjectStatus, Task, TaskId, TaskState,
 };
 use tasks::store::Store;
 
@@ -72,6 +72,7 @@ async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
                 move |AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>| async move {
                     AxumJson(json!({
                         "number": number,
+                        "state": "open",
                         "title": "the old title",
                         "body": "the old body, resting on a theory that collapsed",
                     }))
@@ -189,7 +190,28 @@ impl Harness {
 /// owns the question of whether they are permitted at all, and the default for
 /// both is `off`.
 async fn harness(with_github: bool) -> Harness {
-    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let (rest_url, seen) = spawn_fake_github(900).await;
+    build_harness(with_github.then_some(rest_url), seen, None).await
+}
+
+/// The same harness pointed at a GitHub of the caller's choosing — for the
+/// tests that need one which never answers, or which refuses.
+async fn harness_against(rest_url: String) -> Harness {
+    build_harness(Some(rest_url), Arc::new(Mutex::new(Seen::default())), None).await
+}
+
+/// `store` is one the caller already holds — for a fake GitHub that has to
+/// read the ledger at the instant a write arrives, which needs the store to
+/// exist before the fake does.
+async fn build_harness(
+    rest_url: Option<String>,
+    seen: Arc<Mutex<Seen>>,
+    store: Option<Arc<Store>>,
+) -> Harness {
+    let store = match store {
+        Some(store) => store,
+        None => Arc::new(Store::open_in_memory().await.unwrap()),
+    };
     for capability in [
         Capability::CaptureWork,
         Capability::RetireWork,
@@ -211,8 +233,7 @@ async fn harness(with_github: bool) -> Harness {
     };
     store.insert_project(&project).await.unwrap();
 
-    let (rest_url, seen) = spawn_fake_github(900).await;
-    let github = with_github.then(|| {
+    let github = rest_url.map(|rest_url| {
         Arc::new(
             tasks::github::GitHubClient::with_base_url("token", "http://unused.invalid/graphql")
                 .with_rest_base_url(rest_url),
@@ -298,11 +319,49 @@ async fn a_captured_issue_is_filed_tracked_and_explained() {
 
     // And there is a record, which is the entire reason this route exists.
     let decisions = h.store.decisions(None, 10).await.unwrap();
-    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions.len(),
+        1,
+        "one row, not an intent plus a confirmation"
+    );
     assert_eq!(decisions[0].actor, Actor::Orchestrator);
     assert_eq!(decisions[0].action.as_str(), "capture_work");
     assert!(decisions[0].rationale.as_ref().unwrap().contains("lost"));
-    assert_eq!(decisions[0].subject_id, task.id.to_string());
+    // The subject is the **title**, not the task: the intent is recorded
+    // before the call that would create an issue, so no issue number and no
+    // task exists to point at yet. That is what the shadow branch has always
+    // done ("a shadow row is a record of judgment, not a foreign key"), and
+    // both halves of the capability now read alike.
+    assert_eq!(
+        decisions[0].subject_id,
+        "store.rs leaks a transaction on the error path",
+    );
+    assert_eq!(decisions[0].subject_kind, "capture");
+    assert_eq!(decisions[0].state, DecisionState::Applied);
+    assert_eq!(
+        decisions[0].outcome.as_ref().unwrap()["result"],
+        900,
+        "and what it produced is on the row it settled"
+    );
+
+    // The task linkage is the event's `decision_seq`, which is preserved.
+    let captured = h
+        .store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e.payload {
+            tasks::events::EventPayload::IssueCaptured {
+                task_id,
+                decision_seq,
+                ..
+            } => Some((task_id, decision_seq)),
+            _ => None,
+        })
+        .expect("the capture is on the event feed");
+    assert_eq!(captured.0, task.id);
+    assert_eq!(captured.1, Some(decisions[0].seq));
 }
 
 /// An autonomous capture with nowhere to trace it back to is refused. This is
@@ -914,4 +973,441 @@ async fn a_human_still_needs_no_rationale() {
         .unwrap();
     assert_eq!(resp.status(), 201);
     assert_eq!(h.seen.lock().unwrap().created.len(), 1);
+}
+
+/// A GitHub that never answers — every write is a 503, which
+/// `GhError::is_unavailable` reads as "no answer" rather than as a refusal —
+/// **and that reads the ledger at the moment each write arrives**.
+///
+/// That second half is what makes the guard about *ordering* rather than about
+/// the end state. A handler that recorded its intent after the call would
+/// still leave a pending row behind, and an end-state assertion would pass;
+/// what it must not be able to do is reach GitHub with nothing on record, and
+/// the only place that is observable is inside the request. The fake runs in
+/// this process, so it can simply ask the store.
+///
+/// `GET /issues/{n}` still answers, because `edit_issue` reads the text it is
+/// about to replace *before* it records its intent — a read is not an effect,
+/// and the old text belongs in the immutable `evidence` half of the row.
+///
+/// The explicit `patch` handlers matter: a `MethodRouter` that matches a path
+/// answers **405** itself rather than falling through to the router's
+/// `fallback`, and 405 is GitHub *answering*, which is the other branch
+/// entirely.
+async fn spawn_silent_github(store: Arc<Store>) -> String {
+    async fn unavailable(
+        State(store): State<Arc<Store>>,
+    ) -> (axum::http::StatusCode, AxumJson<Value>) {
+        // In the `message`, deliberately: that is the field `rest_error`
+        // carries into `GhError`, so it survives into the `outcome` the test
+        // reads back. Anything else here would be dropped.
+        let pending = store.pending_decisions().await.unwrap().len();
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            AxumJson(json!({ "message": format!("upstream is down; pending_at_call={pending}") })),
+        )
+    }
+    let app = axum::Router::new()
+        .route(
+            "/repos/{owner}/{repo}/issues/{number}",
+            axum::routing::get(
+                move |AxumPath((_o, _r, number)): AxumPath<(String, String, u64)>| async move {
+                    AxumJson(json!({
+                        "number": number,
+                        "title": "the old title",
+                        "body": "the old body",
+                    }))
+                },
+            )
+            .patch(unavailable),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls/{number}",
+            axum::routing::get(unavailable).patch(unavailable),
+        )
+        .fallback(unavailable)
+        .with_state(store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+/// The route that produces one `DecisionAction`, or `None` when the action
+/// never reaches another system.
+///
+/// **This match is the guard.** `DecisionAction::ALL` is complete by
+/// construction (the enum is macro-generated), so a new variant does not
+/// compile here until somebody says whether it reaches GitHub — and the test
+/// below then drives it without anyone remembering to add it to a list. A
+/// hand-written list of nine routes is green on the day the tenth is added,
+/// which is exactly the day it needed to be red.
+///
+/// The one residue: a *new route reusing an existing action* is not covered,
+/// because this drives one request per action. That is narrower than what was
+/// claimed before, and it is stated rather than assumed.
+fn write_route(action: DecisionAction, task: &Task) -> Option<(String, Value)> {
+    match action {
+        DecisionAction::CaptureWork => Some((
+            "/issues".into(),
+            json!({
+                "title": "an issue nobody knows the fate of",
+                "body": "",
+                "provenance": "reviewing #812",
+                "rationale": "it would be lost otherwise",
+            }),
+        )),
+        DecisionAction::RetireWork => Some((
+            format!("/tasks/{}/close", task.id),
+            json!({ "reason": "completed", "rationale": "the PR that implements it landed" }),
+        )),
+        DecisionAction::ReopenWork => Some((
+            format!("/tasks/{}/reopen", task.id),
+            json!({ "rationale": "closing it was wrong" }),
+        )),
+        DecisionAction::CommentOnWork => Some((
+            "/issues/812/comments".into(),
+            json!({ "body": "a note", "rationale": "the reviewer asked" }),
+        )),
+        DecisionAction::ReviewComment => Some((
+            "/pull-requests/812/review-comments".into(),
+            json!({
+                "path": "crates/tasks/src/store.rs",
+                "line": 12,
+                "body": "this leaks",
+                "rationale": "it points at code",
+            }),
+        )),
+        DecisionAction::EditIssue => Some((
+            "/issues/812/edit".into(),
+            json!({ "title": "a better title", "rationale": "the theory collapsed" }),
+        )),
+        DecisionAction::LabelIssue => Some((
+            "/issues/812/labels".into(),
+            json!({ "labels": ["bug"], "rationale": "it is one" }),
+        )),
+        DecisionAction::MergeBuild => Some((
+            "/pull-requests/812/merge".into(),
+            json!({ "rationale": "the build reported a passing run and the base is the trunk" }),
+        )),
+        DecisionAction::AbandonBuild => Some((
+            "/pull-requests/812/close".into(),
+            json!({ "rationale": "the branch will not land" }),
+        )),
+        // No effect in anybody else's system: these commit in the same
+        // transaction as the state they authorize, so there is no window to
+        // represent and they are never written pending.
+        DecisionAction::Approve
+        | DecisionAction::NeedsRevision
+        | DecisionAction::Reject
+        | DecisionAction::RequestBuild
+        | DecisionAction::AuthorSpec
+        | DecisionAction::QueueTask
+        | DecisionAction::CancelRun
+        | DecisionAction::SettleDecision => None,
+    }
+}
+
+/// **The durable one.** Every route that reaches GitHub, driven against a
+/// GitHub that never answers, must leave exactly one `pending` row behind —
+/// which is to say it recorded its intent *before* the call.
+///
+/// Driven off `DecisionAction::ALL` rather than a hand-written list, so a
+/// tenth route fails here rather than on a repository. See [`write_route`].
+#[tokio::test]
+async fn no_write_route_reaches_github_without_recording_first() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let rest_url = spawn_silent_github(store.clone()).await;
+    let h = build_harness(
+        Some(rest_url),
+        Arc::new(Mutex::new(Seen::default())),
+        Some(store),
+    )
+    .await;
+    let task = seed_task(&h.store, &h.project, 812).await;
+
+    let mut driven = 0;
+    for action in DecisionAction::ALL {
+        let Some((path, body)) = write_route(*action, &task) else {
+            continue;
+        };
+        driven += 1;
+        let resp = h
+            .as_orchestrator(h.http.post(format!("{}{path}", h.base)))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "{path}: GitHub never answered, so neither may we claim it did"
+        );
+
+        let pending = h.store.pending_decisions().await.unwrap();
+        let mine: Vec<_> = pending.iter().filter(|d| d.action == *action).collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "{path} left {} pending rows for {}",
+            mine.len(),
+            action.as_str()
+        );
+        assert!(
+            mine[0].outcome.as_ref().unwrap().get("intent").is_some(),
+            "{path}: a pending row with no intent cannot be reconciled"
+        );
+        let unanswered = mine[0].outcome.as_ref().unwrap()["unanswered"]
+            .as_str()
+            .expect("and it should say what came back")
+            .to_string();
+        // **The ordering assertion**, and the one an end-state check cannot
+        // make: the fake read the ledger at the instant the call landed, and
+        // this route's intent was already in it. A handler that recorded
+        // afterwards would still leave a pending row behind — it would just
+        // have reached GitHub with nothing on record first, which is the whole
+        // failure.
+        assert!(
+            unanswered.contains(&format!("pending_at_call={driven}")),
+            "{path} reached GitHub before its intent was on record: {unanswered}"
+        );
+    }
+
+    assert_eq!(driven, 9, "nine routes reach GitHub today");
+    assert_eq!(
+        h.store.pending_decisions().await.unwrap().len(),
+        driven,
+        "one row each, and nothing settled itself"
+    );
+}
+
+/// GitHub *answered* — 4xx — so nothing reached the world and the row is
+/// annulled rather than left open. The two are not the same fact and the
+/// difference is the whole design: `pending` means nobody knows.
+#[tokio::test]
+async fn a_refused_write_is_annulled_rather_than_left_pending() {
+    let app = axum::Router::new().fallback(|| async {
+        (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            AxumJson(json!({ "message": "Validation Failed" })),
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let h = harness_against(url).await;
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+        .json(&json!({
+            "title": "x",
+            "body": "",
+            "provenance": "reviewing #812",
+            "rationale": "it would be lost otherwise",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let decisions = h.store.decisions(None, 10).await.unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].state, DecisionState::Annulled);
+    assert!(decisions[0].settled_at.is_some());
+    assert!(
+        h.store.pending_decisions().await.unwrap().is_empty(),
+        "GitHub said no; there is no window"
+    );
+    assert!(
+        decisions[0].outcome.as_ref().unwrap()["refused"]
+            .as_str()
+            .unwrap()
+            .contains("Validation Failed"),
+        "and GitHub's own message is what makes it readable: {:?}",
+        decisions[0].outcome
+    );
+}
+
+/// Discharging a pending row does not require the caller to hold a GitHub
+/// credential: the **server** looks the artifact up and says what it found,
+/// and the settle is written from that.
+///
+/// This is what makes `reconcile_decision` an obligation its recipient can
+/// actually discharge — the orchestrator runs `--allowedTools Bash(curl:*)`
+/// with no `GITHUB_TOKEN`, so an obligation needing its own GitHub read would
+/// leave it a choice between guessing and doing nothing.
+#[tokio::test]
+async fn a_pending_decision_is_reconciled_from_evidence_the_server_produced() {
+    let h = harness(true).await;
+    let task = seed_task(&h.store, &h.project, 812).await;
+
+    // A close whose ledger row never learned what happened.
+    let seq = h
+        .store
+        .record_intent(
+            "task",
+            task.id.as_str(),
+            DecisionAction::RetireWork,
+            &tasks::models::DecisionInput {
+                actor: Actor::Orchestrator,
+                rationale: Some("the PR that implements it landed".into()),
+                evidence: None,
+            },
+            Some(&json!({
+                "repo": format!("{}/{}", h.project.repo_owner, h.project.repo_name),
+                "issue": 812,
+                "reason": "completed",
+            })),
+        )
+        .await
+        .unwrap();
+
+    // It is listed as pending over HTTP, which is how the recipient finds it.
+    let listed: Vec<Value> = h
+        .http
+        .get(format!("{}/decisions?pending=true", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["seq"], seq);
+    assert_eq!(listed[0]["state"], "pending");
+
+    // Settling it back to `pending` is a 400: that is where it already is, and
+    // a settle that leaves the window open is a no-op with a ledger row.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/decisions/{seq}/settle", h.base)))
+        .json(&json!({ "state": "pending", "rationale": "still unsure" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // The fake answers `GET /issues/812` as open, so the honest verdict is
+    // that the close never landed.
+    let found: Value = h
+        .as_orchestrator(h.http.get(format!("{}/decisions/{seq}/reconcile", h.base)))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["verdict"], "annulled", "{found}");
+    assert_eq!(found["found"]["issue"], 812);
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/decisions/{seq}/settle", h.base)))
+        .json(&json!({
+            "state": "annulled",
+            "rationale": "the server read #812 back and it is open",
+            "outcome": { "reconciled_from": "GET /decisions/{seq}/reconcile" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let settled = h.store.decision(seq).await.unwrap().unwrap();
+    assert_eq!(settled.state, DecisionState::Annulled);
+    assert!(
+        settled.outcome.as_ref().unwrap().get("intent").is_some(),
+        "the intent survives the settle: json_patch merges, it does not replace"
+    );
+    assert_eq!(
+        settled.outcome.as_ref().unwrap()["reconciled_from"],
+        "GET /decisions/{seq}/reconcile"
+    );
+
+    // And the reconciliation said who made it, in the same transaction.
+    let own = h
+        .store
+        .decisions(Some(("decision", &seq.to_string())), 5)
+        .await
+        .unwrap();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].action, DecisionAction::SettleDecision);
+    assert_eq!(own[0].actor, Actor::Orchestrator);
+
+    // A second settle is a refusal, not a silent no-op.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/decisions/{seq}/settle", h.base)))
+        .json(&json!({ "state": "applied", "rationale": "changed my mind" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// A capability demoted to `off` while a row is pending must not make that row
+/// undischargeable — which is the exact property the obligation claims.
+///
+/// Settling is not the action: the effect already happened, and refusing to
+/// record it does not un-file the issue, it only keeps the ledger wrong. So a
+/// settle is never charter-gated, and the response says which capability the
+/// settled row came from so a reader can see it has since been switched off.
+#[tokio::test]
+async fn a_settle_is_not_refused_by_a_capability_since_demoted() {
+    let h = harness(true).await;
+    let seq = h
+        .store
+        .record_intent(
+            "capture",
+            "an issue nobody knows the fate of",
+            DecisionAction::CaptureWork,
+            &tasks::models::DecisionInput {
+                actor: Actor::Orchestrator,
+                rationale: Some("it would be lost otherwise".into()),
+                evidence: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Demotion is most likely exactly when something has gone wrong, which is
+    // when pending rows exist.
+    h.store
+        .set_charter(Capability::CaptureWork, CharterLevel::Off, None)
+        .await
+        .unwrap();
+
+    // The capture route itself is now refused, as it must be.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+        .json(&json!({
+            "title": "another",
+            "body": "",
+            "provenance": "reviewing #812",
+            "rationale": "because",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The settle is not.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/decisions/{seq}/settle", h.base)))
+        .json(&json!({
+            "state": "applied",
+            "rationale": "the server found the issue upstream",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a nag its recipient is forbidden to discharge is what must not ship"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["capability"], "capture_work");
+    assert_eq!(
+        h.store.decision(seq).await.unwrap().unwrap().state,
+        DecisionState::Applied
+    );
 }
