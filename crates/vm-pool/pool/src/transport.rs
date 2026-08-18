@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
+use vm_pool_protocol::redact::{Scrubbed, ScrubbedDebug};
 use vm_pool_protocol::{AppProtocol, NullProtocol, VmCommand, VmEvent};
 
 #[derive(Debug, Error)]
@@ -63,7 +64,10 @@ impl<P: AppProtocol> VmTransport<P> {
     /// Send a command to the VM.
     pub async fn send(&mut self, command: &VmCommand<P>) -> Result<(), TransportError> {
         let json = serde_json::to_string(command)?;
-        debug!("sending command: {}", json);
+        // Scrubbed, not lowered to TRACE: for Tasks this line is a `Start`
+        // carrying the credentialed clone URL, and the level was never what
+        // made it safe (#923).
+        debug!("sending command: {}", Scrubbed(&json));
         self.stdin.write_all(json.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -113,7 +117,9 @@ async fn read_events<P: AppProtocol>(stdout: ChildStdout, tx: mpsc::Sender<VmEve
             }
             Ok(_) => match serde_json::from_str::<VmEvent<P>>(line.trim()) {
                 Ok(event) => {
-                    debug!("received event: {:?}", event);
+                    // Agent output rides these events, so what is printed
+                    // here is not ours and cannot be assumed credential-free.
+                    debug!("received event: {:?}", ScrubbedDebug(&event));
                     if tx.send(event).await.is_err() {
                         break;
                     }

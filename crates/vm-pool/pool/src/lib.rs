@@ -18,6 +18,7 @@ pub use transport::{TransportError, VmTransport, find_supervisor_binary};
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -25,7 +26,64 @@ use std::sync::{Arc, Weak};
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
+use vm_pool_protocol::redact::scrub_text;
 use vm_pool_protocol::{AppProtocol, NullProtocol, VmCommand, VmConfig, VmEvent, VmId};
+
+/// The argument vector for `container run`, owned so that the only rendering
+/// available to a formatter is one that masks credentials.
+///
+/// This replaced a plain `Vec<String>` behind a `?args` field, which wrote the
+/// agent's API key to the log at INFO once per VM allocation (#923). A
+/// scrubbing wrapper the caller has to remember to apply would have fixed that
+/// one call site and left the next one exposed; a type whose `Debug` is the
+/// only way to print it cannot be got wrong that way.
+///
+/// [`Self::as_str_refs`] is the deliberate way back to the raw arguments, and
+/// it goes to `spawn` — never to a formatter. The container still has to start
+/// with the real key in it: redaction is a property of *formatting*, never of
+/// the data.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ContainerArgs(Vec<String>);
+
+impl ContainerArgs {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn push(&mut self, arg: impl Into<String>) {
+        self.0.push(arg.into());
+    }
+
+    /// Push a `-e NAME=VALUE` pair. The name survives every rendering; the
+    /// value is masked in `Debug` when [`is_secret_name`] says so.
+    pub fn push_env(&mut self, name: &str, value: &str) {
+        self.0.push("-e".into());
+        self.0.push(format!("{name}={value}"));
+    }
+
+    /// The real arguments, for handing to a process. Not for logging.
+    pub fn as_str_refs(&self) -> Vec<&str> {
+        self.0.iter().map(String::as_str).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for ContainerArgs {
+    /// Renders exactly like the `Vec<String>` it replaced, minus any secret
+    /// value.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|arg| scrub_text(arg)))
+            .finish()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -96,28 +154,25 @@ impl<P: AppProtocol> VmRuntime<P> for ContainerRuntime {
         let cpus = config.cpus.unwrap_or(2).to_string();
         let memory = format!("{}M", config.memory_mb.unwrap_or(2048));
 
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "--rm".into(),
-            "-i".into(),
-            "--name".into(),
-            vm_id.as_str().into(),
-            "--cpus".into(),
-            cpus,
-            "--memory".into(),
-            memory,
-        ];
+        let mut args = ContainerArgs::new();
+        for arg in ["run", "--rm", "-i", "--name", vm_id.as_str(), "--cpus"] {
+            args.push(arg);
+        }
+        args.push(cpus);
+        args.push("--memory");
+        args.push(memory);
 
         for (key, value) in &config.env {
-            args.push("-e".into());
-            args.push(format!("{}={}", key, value));
+            args.push_env(key, value);
         }
 
         args.push(image_tag);
 
+        // `?args` is safe here because `ContainerArgs` has no unmasked
+        // rendering — see its docs and #923.
         info!(%vm_id, ?args, "starting container");
 
-        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let args_refs = args.as_str_refs();
         let mut transport = VmTransport::<P>::spawn("container", &args_refs)
             .await
             .map_err(|e| PoolError::Runtime(format!("failed to spawn container: {e}")))?;
@@ -900,6 +955,81 @@ mod tests {
     use super::*;
     use vm_pool_protocol::{ShellCommand, ShellEvent, ShellProtocol};
     use vm_pool_test_support::supervisor_binary;
+
+    /// A value that cannot authenticate anywhere. The bug this fixes is a
+    /// credential written to a log; no test here may reproduce one, so the
+    /// fixtures are named for what they are.
+    const FAKE_KEY: &str = "not-a-real-credential-0000";
+
+    /// The reported bug (#923), pinned at the type that replaced the plain
+    /// `Vec<String>` behind `?args`: the rendered vector keeps every
+    /// operational field and loses the value.
+    #[test]
+    fn container_args_render_without_the_credential() {
+        let mut args = ContainerArgs::new();
+        for arg in ["run", "--rm", "-i", "--name", "vm-1", "--cpus", "4"] {
+            args.push(arg);
+        }
+        args.push_env("ANTHROPIC_API_KEY", FAKE_KEY);
+        args.push_env("CARGO_BUILD_JOBS", "3");
+        args.push("agent:v1");
+
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains(FAKE_KEY), "{rendered}");
+        // Diagnostics survive: the name of the masked variable, the
+        // unremarkable variables, the VM id and the image.
+        assert!(
+            rendered.contains("ANTHROPIC_API_KEY=<redacted>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("CARGO_BUILD_JOBS=3"), "{rendered}");
+        assert!(rendered.contains("vm-1"), "{rendered}");
+        assert!(rendered.contains("agent:v1"), "{rendered}");
+    }
+
+    /// Redaction is a property of *formatting*, never of the data — the
+    /// container still has to start with the real key in it.
+    #[test]
+    fn container_args_hand_the_real_values_to_spawn() {
+        let mut args = ContainerArgs::new();
+        args.push("run");
+        args.push_env("ANTHROPIC_API_KEY", FAKE_KEY);
+
+        assert_eq!(
+            args.as_str_refs(),
+            vec!["run", "-e", &format!("ANTHROPIC_API_KEY={FAKE_KEY}")]
+        );
+    }
+
+    /// `VmConfig.env` is where the credential enters the system, so its
+    /// `Debug` — which every caller holds a type with — must mask too.
+    #[test]
+    fn vm_config_debug_masks_secret_env_values() {
+        let config = VmConfig {
+            cpus: Some(4),
+            memory_mb: Some(6144),
+            priority: vm_pool_protocol::Priority::Normal,
+            env: vec![
+                ("ANTHROPIC_API_KEY".into(), FAKE_KEY.into()),
+                ("CARGO_BUILD_JOBS".into(), "3".into()),
+            ],
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(FAKE_KEY), "{rendered}");
+        assert!(rendered.contains("ANTHROPIC_API_KEY"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("6144"), "{rendered}");
+        assert!(
+            rendered.contains(r#"("CARGO_BUILD_JOBS", "3")"#),
+            "{rendered}"
+        );
+
+        // Serialization is untouched: the wire format did not change, which
+        // matters because vm-pool is upgraded separately from its clients.
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(FAKE_KEY));
+    }
 
     /// Poll for a condition rather than sleeping a fixed time: reclamation
     /// lands on the forwarder's own task, so there is no instant it is
