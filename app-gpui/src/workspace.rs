@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, list, px, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    FollowMode, ListAlignment, ListState, MouseButton, SharedString, WeakEntity, Window,
-    WindowHandle,
+    actions, div, list, px, relative, App, ClipboardItem, Context, Div, Entity, FocusHandle,
+    Focusable, FollowMode, Hsla, ListAlignment, ListState, MouseButton, Pixels, SharedString,
+    WeakEntity, Window, WindowHandle,
 };
 use gpuikit::elements::context_menu::{menu_item, MenuItems};
 use gpuikit::elements::icon_button::icon_button;
@@ -41,6 +41,7 @@ use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
     markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
+use crate::context_gauge::{self, Band, Gauge};
 use crate::feed::{self, FeedKey, FeedRowKind};
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
@@ -257,6 +258,13 @@ pub struct Workspace {
     /// (refresh, the Server window). A popover for the same leak reason as
     /// the switcher.
     rail_overflow: Entity<PopoverState>,
+    /// The composer's context-window gauge.
+    ///
+    /// A popover because what it opens onto is a handful of readings, and the
+    /// collapsed pill has to stay a pill — the number a human wants at rest is
+    /// "how full", and the breakdown is what they open when the answer
+    /// surprises them.
+    context_popover: Entity<PopoverState>,
     /// `owner/repo` draft for the Add Repo window. Owned here, like the issue
     /// draft, so a dismissed one survives to the next open.
     pub(crate) repo_input: Entity<InputState>,
@@ -411,6 +419,27 @@ impl Workspace {
         };
         cx.observe(&rail_overflow, |_, _, cx| cx.notify()).detach();
 
+        // Same weak-handle shape as the overflow menu: both halves read the
+        // live gauge rather than a snapshot taken at construction, so a tick
+        // that lands while the popover is open updates it in place.
+        let context_popover = {
+            let trigger = cx.entity().downgrade();
+            let content = cx.entity().downgrade();
+            cx.new(|_cx| {
+                PopoverState::new(
+                    popover("context-gauge")
+                        .trigger(move |window, cx| {
+                            Self::render_context_trigger(&trigger, window, cx)
+                        })
+                        .content(move |window, cx| {
+                            Self::render_context_content(&content, window, cx)
+                        }),
+                )
+            })
+        };
+        cx.observe(&context_popover, |_, _, cx| cx.notify())
+            .detach();
+
         // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
         // escape is gpuikit's own blur, and the blur is how the palette learns
         // it was dismissed — but only when the input is still on screen to
@@ -549,6 +578,7 @@ impl Workspace {
             rail_shows_repos: false,
             avatar: None,
             rail_overflow,
+            context_popover,
             repo_input,
             repo_window: None,
             pending_repo_selection: None,
@@ -1414,6 +1444,10 @@ impl Workspace {
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = self.render_chat(cx).into_any_element();
         sidebar(SidebarSide::Right, self.right_sidebar.width)
+            // The chat is not another surface: per the design it sits on the
+            // window background, same ground as the middle pane — only the
+            // rail keeps the raised tone.
+            .background(cx.theme().bg())
             .on_resize_start({
                 let entity = cx.entity().downgrade();
                 move |_event, _window, cx| {
@@ -1955,9 +1989,11 @@ impl Workspace {
             .child(composer)
     }
 
-    /// The chat composer: grows with its draft (three lines minimum, ten
-    /// maximum), sends on ⌘↩, and gates the send button on content the way
-    /// the review form does.
+    /// The chat composer: one bordered box holding the draft, with a bottom
+    /// row inside it — the context gauge on the left, Send on the right, the
+    /// way the design draws it. Grows with its draft (three lines minimum,
+    /// ten maximum), sends on ⌘↩, and gates the send button on content the
+    /// way the review form does.
     fn render_chat_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let draft = self.input.read(cx).content();
@@ -1965,56 +2001,288 @@ impl Workspace {
         let lines = draft.lines().count().clamp(3, 10);
         let composer_height = px(22. * lines as f32 + 20.);
 
+        // Nothing at all before the first reading: an empty pill would be one
+        // more thing to interpret, and the answer it would be hiding is "no
+        // tick has run yet", which the chat itself already says.
+        let measured = self
+            .app_state
+            .read(cx)
+            .orchestrator_session
+            .as_ref()
+            .and_then(Gauge::new)
+            .is_some();
+
+        div().flex_none().p(px(8.)).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.border_secondary())
+                .child(
+                    // The multiline input fills its parent, so the parent
+                    // must own a height — unsized, it collapses to zero.
+                    div()
+                        .h(composer_height)
+                        .text_sm()
+                        .child(text_area(&self.input, cx).size_full()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .when(measured, |el| el.child(self.context_popover.clone()))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("chat-send")
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(theme.border_secondary())
+                                .text_xs()
+                                .map(|el| {
+                                    if has_text {
+                                        el.cursor_pointer()
+                                            .text_color(theme.fg())
+                                            .hover({
+                                                let hover_bg = theme.surface_secondary();
+                                                move |el| el.bg(hover_bg)
+                                            })
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.send_chat(cx);
+                                            }))
+                                    } else {
+                                        el.text_color(theme.fg_muted()).opacity(0.5)
+                                    }
+                                })
+                                .child("Send")
+                                .child(kbd("⌘↩")),
+                        ),
+                ),
+        )
+    }
+
+    /// The collapsed gauge, the composer's bottom-left: model name, a
+    /// segmented bar, how full the window is, and a chevron into the
+    /// breakdown.
+    fn render_context_trigger(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Some(gauge) = workspace
+            .read_with(cx, |this, cx| {
+                this.app_state
+                    .read(cx)
+                    .orchestrator_session
+                    .as_ref()
+                    .and_then(Gauge::new)
+            })
+            .ok()
+            .flatten()
+        else {
+            return div().into_any_element();
+        };
+
+        let hover_bg = theme.surface_secondary();
         div()
-            .flex_none()
-            .p(px(8.))
-            .border_t_1()
-            .border_color(theme.border_subtle())
             .flex()
             .flex_row()
-            .items_end()
-            .gap(px(8.))
-            .text_sm()
+            .items_center()
+            .gap(px(6.))
+            .px(px(4.))
+            .py(px(2.))
+            .rounded(px(4.))
+            .text_xs()
+            .text_color(theme.fg_muted())
+            .hover(move |el| el.bg(hover_bg))
+            .children(gauge.model.clone())
+            .child(Self::render_context_bar(&gauge, px(48.), px(4.), cx))
+            .child(gauge.headline())
             .child(
-                // The multiline input fills its parent, so the parent
-                // must own a height — unsized, it collapses to zero.
-                div()
-                    .flex_1()
-                    .h(composer_height)
-                    .child(text_area(&self.input, cx).size_full()),
+                Icons::chevron_down()
+                    .size(px(10.))
+                    .text_color(theme.fg_muted()),
             )
+            .into_any_element()
+    }
+
+    /// The segmented bar, at whatever size the caller has room for.
+    ///
+    /// Drawn from [`Gauge::rows`] and nothing else, so the bar and the
+    /// breakdown under it cannot disagree — and a server that reported a
+    /// total with no parts draws no bar rather than a bar of one guessed
+    /// colour. Widths are flex weights rather than pixels, because the bar is
+    /// laid out twice at two different sizes.
+    fn render_context_bar(gauge: &Gauge, width: Pixels, height: Pixels, cx: &App) -> Div {
+        let theme = cx.theme().clone();
+        let mut bar = div()
+            .w(width)
+            .h(height)
+            .rounded(px(2.))
+            .overflow_hidden()
+            .bg(theme.surface_tertiary())
+            .flex()
+            .flex_row();
+        for row in gauge.rows() {
+            // A band with a share too small to draw is dropped rather than
+            // rounded up to a visible sliver: 800 cached-creation tokens
+            // against a 1M window is a rounding error, and painting it as a
+            // pixel makes it look like a category.
+            let Some(share) = row.share.filter(|s| *s > 0.001) else {
+                continue;
+            };
+            bar = bar.child(
+                div()
+                    .h_full()
+                    .flex_grow(1.)
+                    .flex_basis(relative(share))
+                    .bg(Self::band_color(row.band, &theme)),
+            );
+        }
+        bar
+    }
+
+    /// One colour per band, held in one place so the bar's segments and the
+    /// breakdown's swatches are the same colour by construction.
+    fn band_color(band: Band, theme: &std::sync::Arc<gpuikit::theme::Theme>) -> Hsla {
+        match band {
+            Band::CacheRead => theme.info(),
+            Band::CacheCreation => theme.warning(),
+            Band::Input => theme.success(),
+            Band::Free => theme.surface_tertiary(),
+        }
+    }
+
+    /// The expanded gauge: the same bar, the bands that make it up, and the
+    /// two facts that are not shares of it — what the last tick spent, and
+    /// whether the session has ever been compacted.
+    fn render_context_content(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Some((gauge, compacted_at)) = workspace
+            .read_with(cx, |this, cx| {
+                let state = this.app_state.read(cx);
+                let info = state.orchestrator_session.as_ref()?;
+                Some((Gauge::new(info)?, info.last_compacted_at))
+            })
+            .ok()
+            .flatten()
+        else {
+            return div().into_any_element();
+        };
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(10.))
+            .w(px(280.))
+            .text_sm()
+            .text_color(theme.fg())
             .child(
                 div()
-                    .id("chat-send")
-                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(div().child("Context window"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child(gauge.headline()),
+                    ),
+            )
+            .child(Self::render_context_bar(&gauge, px(260.), px(6.), cx));
+
+        for row in gauge.rows() {
+            panel = panel.child(
+                div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(6.))
-                    .px(px(10.))
-                    .py(px(4.))
-                    .rounded(px(5.))
-                    .border_1()
-                    .border_color(theme.border_secondary())
                     .text_xs()
-                    .map(|el| {
-                        if has_text {
-                            el.cursor_pointer()
-                                .text_color(theme.fg())
-                                .hover({
-                                    let hover_bg = theme.surface_secondary();
-                                    move |el| el.bg(hover_bg)
-                                })
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.send_chat(cx);
-                                }))
-                        } else {
-                            el.text_color(theme.fg_muted()).opacity(0.5)
-                        }
-                    })
-                    .child("Send")
-                    .child(kbd("⌘↩")),
-            )
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded(px(2.))
+                            .bg(Self::band_color(row.band, &theme)),
+                    )
+                    .child(div().flex_grow(1.).child(row.band.label()))
+                    .child(
+                        div()
+                            .text_color(theme.fg_muted())
+                            .child(context_gauge::tokens(row.tokens)),
+                    ),
+            );
+        }
+
+        // Below the line: numbers that are not shares of the window. The tick
+        // aggregate re-reads the cached prefix on every internal turn, so it
+        // routinely exceeds the window several times over — it is a bill, and
+        // it is labelled as one rather than drawn as a segment.
+        panel = panel.child(
+            div()
+                .mt(px(2.))
+                .pt(px(6.))
+                .border_t_1()
+                .border_color(theme.border_subtle())
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .text_xs()
+                .text_color(theme.fg_muted())
+                .when_some(gauge.tick_tokens, |el, spent| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child("Last turn spent")
+                            .child(context_gauge::tokens(spent)),
+                    )
+                })
+                // Only when there is a compaction to report. A zero here
+                // means "none counted", and a session that compacted before
+                // the counter existed would read "never" — a claim this
+                // cannot make. Silence claims nothing.
+                .when(gauge.compactions > 0, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child("Compacted")
+                            .child(match compacted_at {
+                                Some(at) => {
+                                    format!("{}× · {} ago", gauge.compactions, time::since(at))
+                                }
+                                None => format!("{}×", gauge.compactions),
+                            }),
+                    )
+                }),
+        );
+        panel.into_any_element()
     }
 
     /// What an empty conversation says about itself.

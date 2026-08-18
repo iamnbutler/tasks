@@ -253,6 +253,28 @@ implementation.
   restart. A transport death also names itself in the terminal reason; "SPEC.md
   not found" or "no commits" alone reads as a verdict on work that was never
   judged — and it is no longer charged for one either, which is the rule below.
+- **The context gauge's denominator is transcribed from the agent, never
+  derived from the model name.** The orchestrator is one long-lived Claude Code
+  session, so "how full is it" is a real operational question — and the
+  tempting way to answer it is a `model -> window` table in our code, which is
+  a fact owned elsewhere that goes stale the next time a model ships. It is not
+  needed: the stream-json `result` record carries `modelUsage`, keyed by wire
+  id, and every entry states its own `contextWindow`. Three things follow. The
+  entry is selected by matching the **last main-chain assistant record's**
+  model, because sub-agents routinely run on a smaller one and reporting their
+  window against our reading would scale it wrongly; with nothing to match and
+  more than one candidate the window is `None`, since a wrong denominator is
+  worse than none and the token count still shows either way. `context_tokens`
+  and its three parts come off that same assistant record, so the parts sum to
+  the whole a client draws beside them — and never off `result.usage`, which
+  aggregates every internal turn and is a *bill* (`tick_tokens`, routinely
+  several times the window; never a segment in the bar). And compaction is
+  **counted, not inferred from the gauge dropping**: it happens inside the
+  agent and keeps the session id, so the only honest signal is the
+  `system`/`status` record's `compact_result: "ok"`. A zero count means "none
+  counted since the column existed", which is why the app shows the row only
+  when there is one — rendering it as "never" would claim history the counter
+  never had.
 - **A strike is charged for a verdict, and for nothing else.**
   `dispatch_attempts` and `build_attempts` exist so that work which genuinely
   cannot be done stops consuming the pipeline after three tries; a run that died

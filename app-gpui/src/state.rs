@@ -15,8 +15,9 @@ use tasks_client::api::events::Event;
 use tasks_client::api::http::RejectedBundle;
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, Project, ProjectId, ProjectStatus, Session, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptOwner,
+    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, Session, Spec,
+    SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
+    TranscriptOwner,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -80,6 +81,14 @@ pub struct AppState {
     /// Newest [`ACTIVITY_LIMIT`] events, newest first.
     pub activity: Vec<Event>,
     pub orchestrator_messages: Vec<OrchestratorMessage>,
+    /// The conversation's Claude Code session: which model it is on, how much
+    /// context it is holding, and whether it has ever been compacted.
+    ///
+    /// `None` only before the first snapshot. Everything in it is a reading
+    /// from the *last completed tick*, so it does not move while one is in
+    /// flight — which is correct: the gauge reports what the session holds,
+    /// and mid-tick that is still the last turn's number.
+    pub orchestrator_session: Option<OrchestratorSessionInfo>,
     /// The tick in flight, if one is showing.
     pub orchestrator_tick: Option<OrchestratorTick>,
     /// The chat pane's rows: durable turns and live-trail entries in arrival
@@ -159,6 +168,7 @@ struct Snapshot {
     bundles: Option<Vec<RejectedBundle>>,
     activity: Option<Vec<Event>>,
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
+    orchestrator_session: Option<OrchestratorSessionInfo>,
     mode: Option<Mode>,
     /// The first failure, if any read failed.
     error: Option<String>,
@@ -212,6 +222,11 @@ impl Snapshot {
                 Some(since) => client.orchestrator_messages(since),
                 None => client.orchestrator_messages_latest(CHAT_WINDOW),
             },
+        );
+        take(
+            &mut snapshot.orchestrator_session,
+            &mut error,
+            client.orchestrator_session(),
         );
         take(&mut snapshot.mode, &mut error, client.mode());
         snapshot.error = error;
@@ -304,6 +319,7 @@ impl AppState {
             bundles: Vec::new(),
             activity: Vec::new(),
             orchestrator_messages: Vec::new(),
+            orchestrator_session: None,
             orchestrator_tick: None,
             chat: ChatLog::new(),
             owed_replies: 0,
@@ -648,6 +664,11 @@ impl AppState {
             };
         }
         merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity);
+        // Whole-value, like every other list: the gauge is a reading, so the
+        // newest one replaces the last rather than merging into it.
+        if let Some(session) = snapshot.orchestrator_session {
+            self.orchestrator_session = Some(session);
+        }
         // Appended, not replaced: a refresh carries only the new turns, and
         // history stays in the pane rather than being refetched to sit there.
         // The opening window is the same code path — an empty list has no

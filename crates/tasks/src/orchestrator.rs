@@ -40,8 +40,8 @@ use crate::brief::Brief;
 use crate::deadline::{self, Deadline, Expiry};
 use crate::events::{Event, EventPayload};
 use crate::models::{
-    Actor, BuildStatus, Capability, CharterEntry, CharterLevel, Obligation, ObligationKind,
-    OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
+    Actor, BuildStatus, Capability, CharterEntry, CharterLevel, ContextBreakdown, Obligation,
+    ObligationKind, OrchestratorFeedEvent, SessionEndReason, SessionStatus, SpecQueueStatus,
 };
 use crate::store::{ACTOR_HEADER, Store, StoreError};
 
@@ -241,11 +241,7 @@ impl Orchestrator {
             {
                 Ok((text, usage)) => {
                     self.store
-                        .record_orchestrator_usage(
-                            &session,
-                            usage.context_tokens,
-                            usage.tick_tokens,
-                        )
+                        .record_orchestrator_usage(&session, &usage)
                         .await?;
                     Ok(Turn {
                         text,
@@ -293,7 +289,7 @@ impl Orchestrator {
             )
             .await?;
         self.store
-            .record_orchestrator_usage(&session, usage.context_tokens, usage.tick_tokens)
+            .record_orchestrator_usage(&session, &usage)
             .await?;
         Ok(Turn {
             text,
@@ -393,6 +389,9 @@ impl Orchestrator {
             let mut raw = String::new();
             let mut result_text: Option<String> = None;
             let mut usage = TurnUsage::default();
+            // The model behind the last main-chain reading, held aside until
+            // the `result` record arrives with the windows to match it to.
+            let mut main_chain_model: Option<String> = None;
             while let Some(line) = lines.next_line().await.map_err(OrchestratorError::Spawn)? {
                 match parse_stream_line(&line) {
                     StreamLine::Delta(text) => self
@@ -400,7 +399,8 @@ impl Orchestrator {
                         .publish_orchestrator_feed(OrchestratorFeedEvent::Delta { text }),
                     StreamLine::Assistant {
                         tools,
-                        context_tokens,
+                        context,
+                        model,
                     } => {
                         for label in tools {
                             self.store
@@ -408,14 +408,25 @@ impl Orchestrator {
                         }
                         // Last main-chain reading wins: the final assistant
                         // turn is the context the next tick resumes from.
-                        if context_tokens.is_some() {
-                            usage.context_tokens = context_tokens;
+                        if let Some(context) = context {
+                            usage.context_tokens = Some(context.total());
+                            usage.context_breakdown = Some(context);
+                            main_chain_model = model;
                         }
                     }
-                    StreamLine::Result { text, tick_tokens } => {
+                    StreamLine::Result {
+                        text,
+                        tick_tokens,
+                        models,
+                    } => {
                         result_text = Some(text);
                         usage.tick_tokens = tick_tokens;
+                        if let Some(model) = resolve_model(&models, main_chain_model.as_deref()) {
+                            usage.context_window = model.context_window;
+                            usage.model_id = Some(model.id);
+                        }
                     }
+                    StreamLine::Compacted => usage.compacted = true,
                     StreamLine::Other => {}
                     StreamLine::NotStreamJson => {
                         raw.push_str(&line);
@@ -468,18 +479,53 @@ struct Turn {
 /// The two token readings a turn produces. They share arithmetic and mean
 /// entirely different things, which is exactly why they are separate fields:
 /// deduplicating them back into one number is the bug this split fixed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct TurnUsage {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnUsage {
     /// How much context the session is *holding*: the input side of the last
     /// main-chain assistant record's `usage`, i.e. the prompt behind a single
     /// model call. An absolute reading, and the one a rotation threshold
     /// compares against. `None` when the agent reports no usage at all
     /// (plain-text agents, test stubs).
-    context_tokens: Option<i64>,
+    pub context_tokens: Option<i64>,
+    /// How [`Self::context_tokens`] is made up, off the same record — so the
+    /// parts sum to it, and are `None` exactly when it is.
+    pub context_breakdown: Option<ContextBreakdown>,
     /// What this tick *spent*: the `result` record's aggregate over every
     /// internal turn of the invocation, each of which re-reads the cached
     /// prefix. A cost signal — never a context size.
-    tick_tokens: Option<i64>,
+    pub tick_tokens: Option<i64>,
+    /// The model the main chain ran on, as the agent's wire id, and the
+    /// context window it reports for it.
+    ///
+    /// Resolved by matching the last main-chain assistant record's model
+    /// against the `result` record's `modelUsage` map: the map is keyed by
+    /// wire id (`claude-opus-5[1m]`) and each entry states its own
+    /// `canonicalModel` (`claude-opus-5`), which is what an assistant record
+    /// carries. Sub-agents routinely run on a different model, so taking any
+    /// entry would sometimes report a window the gauge is not measuring
+    /// against.
+    pub model_id: Option<String>,
+    pub context_window: Option<i64>,
+    /// The agent compacted this session mid-tick.
+    ///
+    /// Worth recording because compaction is otherwise invisible from out
+    /// here: it happens inside the agent, keeps the session id, and shows up
+    /// only as a gauge that reads lower than it did. Counted, so "has this
+    /// ever compacted?" stops being a question you answer by diffing a log.
+    pub compacted: bool,
+}
+
+/// One entry of the `result` record's `modelUsage` map: a model, and the
+/// window it says it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelReport {
+    /// The map key — the wire id, suffix included.
+    id: String,
+    /// `canonicalModel`, which is what an `assistant` record's `message.model`
+    /// carries. `None` on an agent that doesn't report one, in which case only
+    /// the sole-entry fallback can match it.
+    canonical: Option<String>,
+    context_window: Option<i64>,
 }
 
 /// What one line of agent stdout means for the live feed.
@@ -487,17 +533,26 @@ enum StreamLine {
     /// Assistant text as it's generated (`--include-partial-messages`).
     Delta(String),
     /// A completed assistant turn: its tool invocations (for the feed) and,
-    /// for main-chain turns only, the context that produced it.
+    /// for main-chain turns only, the context that produced it and the model
+    /// that held it.
     Assistant {
         tools: Vec<String>,
-        context_tokens: Option<i64>,
+        context: Option<ContextBreakdown>,
+        model: Option<String>,
     },
-    /// The final `result` record: the reply text, and what the whole
-    /// invocation cost when the agent reports usage.
+    /// The final `result` record: the reply text, what the whole invocation
+    /// cost when the agent reports usage, and what every model it used says
+    /// its own context window is.
     Result {
         text: String,
         tick_tokens: Option<i64>,
+        models: Vec<ModelReport>,
     },
+    /// The agent finished compacting this session — a `system`/`status` record
+    /// carrying `compact_result: "ok"`. Anything else (`"failed"`, or the
+    /// `"compacting"` record that opens the operation) is [`Self::Other`]:
+    /// only a compaction that landed changed the session.
+    Compacted,
     /// A stream-json record with nothing for us (init, thinking, tool results).
     Other,
     /// Not stream-json at all — a plain-text agent's output.
@@ -531,20 +586,31 @@ fn parse_stream_line(line: &str) -> StreamLine {
             // tool labels are still worth showing in the feed — only the
             // gauge filters.
             let sidechain = v.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+            let context = (!sidechain)
+                .then(|| context_breakdown(v.pointer("/message/usage")))
+                .flatten();
             StreamLine::Assistant {
                 tools,
-                context_tokens: (!sidechain)
-                    .then(|| input_side_tokens(v.pointer("/message/usage")))
-                    .flatten(),
+                // The model rides with the reading and is dropped with it: on
+                // its own it would name whichever sub-agent spoke last.
+                model: context
+                    .and(v.pointer("/message/model"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string),
+                context,
             }
         }
         Some("result") => match v.get("result").and_then(|r| r.as_str()) {
             Some(text) => StreamLine::Result {
                 text: text.to_string(),
                 tick_tokens: input_side_tokens(v.get("usage")),
+                models: model_reports(v.get("modelUsage")),
             },
             None => StreamLine::Other,
         },
+        Some("system") if v.get("compact_result").and_then(|r| r.as_str()) == Some("ok") => {
+            StreamLine::Compacted
+        }
         Some(_) => StreamLine::Other,
         // JSON, but not a stream record — treat like plain output.
         None => StreamLine::NotStreamJson,
@@ -563,12 +629,70 @@ fn parse_stream_line(line: &str) -> StreamLine {
 /// re-reading the cached prefix — a bill. Shared arithmetic, opposite
 /// meanings; do not fold the call sites back together.
 fn input_side_tokens(usage: Option<&serde_json::Value>) -> Option<i64> {
+    Some(context_breakdown(usage)?.total())
+}
+
+/// The same three numbers [`input_side_tokens`] adds, kept apart.
+///
+/// `None` under exactly the same condition as the sum — nothing input-side
+/// reported — so a client never has a total without its parts or the reverse.
+fn context_breakdown(usage: Option<&serde_json::Value>) -> Option<ContextBreakdown> {
     let usage = usage?;
     let field = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-    let total = field("input_tokens")
-        + field("cache_read_input_tokens")
-        + field("cache_creation_input_tokens");
-    (total > 0).then_some(total)
+    let parts = ContextBreakdown {
+        input: field("input_tokens"),
+        cache_read: field("cache_read_input_tokens"),
+        cache_creation: field("cache_creation_input_tokens"),
+    };
+    (parts.total() > 0).then_some(parts)
+}
+
+/// The `result` record's `modelUsage` map, as a list.
+///
+/// Every field is optional because none of it is load-bearing: a model that
+/// reports no window leaves the gauge without a denominator, which shows the
+/// tokens alone. That is the correct degradation — a made-up window would
+/// render a confident percentage of nothing.
+fn model_reports(usage: Option<&serde_json::Value>) -> Vec<ModelReport> {
+    let Some(map) = usage.and_then(|u| u.as_object()) else {
+        return Vec::new();
+    };
+    map.iter()
+        .map(|(id, entry)| ModelReport {
+            id: id.clone(),
+            canonical: entry
+                .get("canonicalModel")
+                .and_then(|m| m.as_str())
+                .map(str::to_string),
+            context_window: entry.get("contextWindow").and_then(|w| w.as_i64()),
+        })
+        .collect()
+}
+
+/// Which reported model the context gauge is measuring against.
+///
+/// The main chain's model is the one whose window the reading fills, so the
+/// match is by canonical name and not by "the only one" or "the biggest": a
+/// tick that ran three sub-agents reports three more entries, any of which
+/// could carry a different window.
+///
+/// The fallback is deliberately narrow. One entry and no name to match on is
+/// unambiguous — there is nothing else it could be. More than one, with
+/// nothing to match, resolves to `None`: a window attributed to the wrong
+/// model is worse than no window, because the reading it scales is still
+/// shown either way.
+fn resolve_model(models: &[ModelReport], main_chain: Option<&str>) -> Option<ModelReport> {
+    if let Some(model) = main_chain
+        && let Some(hit) = models
+            .iter()
+            .find(|report| report.canonical.as_deref() == Some(model) || report.id == model)
+    {
+        return Some(hit.clone());
+    }
+    match models {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// The curl config the agent presents as its identity: a comment header and
@@ -1729,12 +1853,13 @@ mod tests {
     #[test]
     fn usage_is_read_per_record_and_sidechains_do_not_count() {
         let assistant = |line: &str| match parse_stream_line(line) {
-            StreamLine::Assistant { context_tokens, .. } => context_tokens,
+            StreamLine::Assistant { context, .. } => context.map(|c| c.total()),
             other => panic!(
                 "expected an assistant record, got {}",
                 match other {
                     StreamLine::Delta(_) => "delta",
                     StreamLine::Result { .. } => "result",
+                    StreamLine::Compacted => "compacted",
                     StreamLine::Other => "other",
                     StreamLine::NotStreamJson => "not stream-json",
                     StreamLine::Assistant { .. } => unreachable!(),
@@ -1781,12 +1906,9 @@ mod tests {
                [{"type":"tool_use","name":"Bash","input":{"command":"ls"}}],
                "usage":{"input_tokens":900000}}}"#,
         ) {
-            StreamLine::Assistant {
-                tools,
-                context_tokens,
-            } => {
+            StreamLine::Assistant { tools, context, .. } => {
                 assert_eq!(tools, vec!["Bash: ls".to_string()]);
-                assert_eq!(context_tokens, None, "only the gauge filters");
+                assert_eq!(context, None, "only the gauge filters");
             }
             _ => panic!("expected an assistant record"),
         }
@@ -1796,12 +1918,88 @@ mod tests {
             r#"{"type":"result","subtype":"success","result":"ok","usage":
                {"input_tokens":2000,"cache_read_input_tokens":2700000}}"#,
         ) {
-            StreamLine::Result { text, tick_tokens } => {
+            StreamLine::Result {
+                text, tick_tokens, ..
+            } => {
                 assert_eq!(text, "ok");
                 assert_eq!(tick_tokens, Some(2_702_000));
             }
             _ => panic!("expected a result record"),
         }
+    }
+
+    /// The gauge needs a denominator and must not invent one. The agent
+    /// reports it per model, so the only question is *which* model — and the
+    /// answer is the one the main chain ran on, never whichever entry happens
+    /// to be first.
+    #[test]
+    fn the_context_window_comes_off_the_model_the_main_chain_actually_ran_on() {
+        let StreamLine::Result { models, .. } = parse_stream_line(
+            r#"{"type":"result","subtype":"success","result":"ok","modelUsage":{
+                 "claude-opus-5[1m]":{"contextWindow":1000000,"canonicalModel":"claude-opus-5"},
+                 "claude-haiku-4-5-20251001":{"contextWindow":200000,
+                   "canonicalModel":"claude-haiku-4-5-20251001"}}}"#,
+        ) else {
+            panic!("expected a result record");
+        };
+        assert_eq!(models.len(), 2);
+
+        // A tick whose sub-agents ran on a smaller model still reports the
+        // main chain's window: the reading it scales was taken on Opus.
+        let main =
+            resolve_model(&models, Some("claude-opus-5")).expect("matched by canonical name");
+        assert_eq!(main.id, "claude-opus-5[1m]");
+        assert_eq!(main.context_window, Some(1_000_000));
+
+        // Nothing to match on and more than one candidate: no window rather
+        // than a coin flip. The token count is still shown; only the
+        // percentage goes away.
+        assert_eq!(resolve_model(&models, None), None);
+        assert_eq!(resolve_model(&models, Some("claude-sonnet-5")), None);
+
+        // A sole entry is unambiguous even when the assistant record named no
+        // model at all. Selected by id, not by index: `modelUsage` is a JSON
+        // object, so the order it arrives in is not the order it parses in.
+        let sole = [models
+            .iter()
+            .find(|m| m.id == "claude-opus-5[1m]")
+            .expect("the opus entry")
+            .clone()];
+        assert_eq!(
+            resolve_model(&sole, None).and_then(|m| m.context_window),
+            Some(1_000_000)
+        );
+        assert_eq!(resolve_model(&[], Some("claude-opus-5")), None);
+    }
+
+    /// Compaction is invisible from out here — same session id, and a gauge
+    /// that simply reads lower — so the one record that announces it has to be
+    /// picked out, and only when it says the compaction landed.
+    #[test]
+    fn only_a_compaction_that_succeeded_counts_as_one() {
+        let kind = |line: &str| match parse_stream_line(line) {
+            StreamLine::Compacted => "compacted",
+            StreamLine::Other => "other",
+            _ => "something else",
+        };
+        assert_eq!(
+            kind(r#"{"type":"system","subtype":"status","status":null,"compact_result":"ok"}"#),
+            "compacted"
+        );
+        // The record that opens the operation is not the one that finishes it.
+        assert_eq!(
+            kind(r#"{"type":"system","subtype":"status","status":"compacting"}"#),
+            "other"
+        );
+        // A failed compaction left the context exactly where it was.
+        assert_eq!(
+            kind(
+                r#"{"type":"system","subtype":"status","compact_result":"failed",
+                    "compact_error":"Not enough messages to compact."}"#
+            ),
+            "other"
+        );
+        assert_eq!(kind(r#"{"type":"system","subtype":"init"}"#), "other");
     }
 
     /// The authority section is generated, so an empty charter must read as
