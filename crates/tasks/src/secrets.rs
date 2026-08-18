@@ -279,17 +279,63 @@ fn encrypt_entry(kek: &Key, name: &str, value: &str) -> SealedEntry {
 // Unseal key custody
 // ---------------------------------------------------------------------------
 
+/// Where the unseal key will actually be read from — the
+/// `TASKS_SECRETS_KEY_FILE` override ahead of the source recorded in the
+/// store header.
+///
+/// One decision with two readers: [`resolve_unseal_key`] opens the store with
+/// it and [`status`] reports it. Deciding this twice is how `status` came to
+/// answer "Keychain" while the override was what opened the store — wrong in
+/// exactly the situation the override exists for, since an operator reaches
+/// for it when the Keychain is what is failing and reads `status` to confirm
+/// it took.
+enum KeyLocation {
+    Override(PathBuf),
+    Keychain,
+    File(PathBuf),
+}
+
+fn key_location(file: &SealedFile) -> KeyLocation {
+    key_location_with(file, std::env::var(KEY_FILE_ENV).ok())
+}
+
+/// The decision itself, with the override passed in rather than read — so it
+/// is testable without racing every other test through `set_var`, the same
+/// reason `updates::pending` splits its environment read out.
+fn key_location_with(file: &SealedFile, override_path: Option<String>) -> KeyLocation {
+    if let Some(path) = override_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        return KeyLocation::Override(PathBuf::from(path));
+    }
+    match &file.key_source {
+        KeySource::Keychain => KeyLocation::Keychain,
+        KeySource::File(path) => KeyLocation::File(path.clone()),
+    }
+}
+
+impl std::fmt::Display for KeyLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Named as an override, because the difference between this and
+            // the line below is the whole reason someone is reading it.
+            Self::Override(p) => {
+                write!(f, "key file {} (from {KEY_FILE_ENV})", p.display())
+            }
+            Self::Keychain => write!(f, "Keychain (service `{KEYCHAIN_SERVICE}`)"),
+            Self::File(p) => write!(f, "key file {}", p.display()),
+        }
+    }
+}
+
 /// Read the unseal key for `file`, honouring the `TASKS_SECRETS_KEY_FILE`
 /// override ahead of the recorded source.
 fn resolve_unseal_key(file: &SealedFile) -> Result<Zeroizing<Vec<u8>>, SecretsError> {
-    if let Ok(path) = std::env::var(KEY_FILE_ENV)
-        && !path.trim().is_empty()
-    {
-        return read_key_file(Path::new(path.trim()));
-    }
-    match &file.key_source {
-        KeySource::Keychain => keychain_read(),
-        KeySource::File(path) => read_key_file(path),
+    match key_location(file) {
+        KeyLocation::Override(path) | KeyLocation::File(path) => read_key_file(&path),
+        KeyLocation::Keychain => keychain_read(),
     }
 }
 
@@ -477,10 +523,7 @@ pub fn status(data_dir: &Path) -> Result<StoreStatus, SecretsError> {
         .collect();
     entries.sort_by_key(|e| e.name.as_str());
     Ok(StoreStatus {
-        key_source: match &file.key_source {
-            KeySource::Keychain => format!("Keychain (service `{KEYCHAIN_SERVICE}`)"),
-            KeySource::File(p) => format!("key file {}", p.display()),
-        },
+        key_source: key_location(&file).to_string(),
         path,
         entries,
     })
@@ -876,7 +919,47 @@ mod tests {
     fn secret_string_debug_is_redacted() {
         let s = Secret::new("ghp_very_secret");
         assert_eq!(format!("{s:?}"), "<redacted>");
-        assert!(!format!("{:?}", Secrets::for_tests(Some("tok"), None)).contains("tok"));
+        // The sentinel has to be a string no *name* could contain: `Secrets`
+        // legitimately prints `github-token`, so a value of "tok" fails this
+        // assertion while the redaction it tests is working perfectly.
+        let handle = Secrets::for_tests(Some("ghp_very_secret"), None);
+        let rendered = format!("{handle:?}");
+        assert!(!rendered.contains("ghp_very_secret"), "{rendered}");
+        // ...and the assertion is falsifiable: the name it *does* carry is
+        // there, so this is not passing because the output is empty.
+        assert!(rendered.contains("github-token"), "{rendered}");
+    }
+
+    /// `status` is the one command whose job is to answer "where does the
+    /// unseal key come from?", and the override exists for the case where the
+    /// recorded source is what is failing. Reporting the header there sends an
+    /// operator to debug a Keychain the process is not going to read.
+    #[test]
+    fn status_reports_the_key_source_that_will_actually_be_used() {
+        let keychain = SealedFile {
+            version: 1,
+            key_source: KeySource::Keychain,
+            salt: String::new(),
+            entries: Default::default(),
+        };
+        // No override: the header is the answer.
+        assert!(
+            key_location_with(&keychain, None)
+                .to_string()
+                .contains("Keychain"),
+        );
+        // An override outranks it, and says so.
+        let overridden = key_location_with(&keychain, Some("/tmp/unseal.key".into())).to_string();
+        assert!(overridden.contains("/tmp/unseal.key"), "{overridden}");
+        assert!(overridden.contains(KEY_FILE_ENV), "{overridden}");
+        assert!(!overridden.contains("Keychain"), "{overridden}");
+        // An empty value is not an override — the same reading
+        // `resolve_unseal_key` makes, which is the point of sharing this.
+        assert!(
+            key_location_with(&keychain, Some("  ".into()))
+                .to_string()
+                .contains("Keychain"),
+        );
     }
 
     #[test]
