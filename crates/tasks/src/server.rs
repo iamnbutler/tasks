@@ -49,6 +49,7 @@ use crate::models::{
 };
 use crate::store::{
     ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
+    require_rationale,
 };
 
 /// How many events `/events` returns when the caller doesn't ask for a count.
@@ -671,9 +672,25 @@ async fn queue_under_charter(
     // Parsed before anything is written, so an oversized set 400s having
     // staged nothing *and* queued nothing.
     let directions = parse_directions(body.directions.as_deref(), actor)?;
+    // The one gated action with a *default* rationale, so it has to be
+    // resolved before `authorize` — a check upstream of both branches cannot
+    // see a rationale that does not exist yet. There is now one default rather
+    // than the two there were, because the value validated has to be the value
+    // recorded.
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale.or_else(|| {
+            Some(if front {
+                "scout now".into()
+            } else {
+                "queued".into()
+            })
+        }),
+        evidence: body.evidence,
+    };
     let authority = authorize(
         store,
-        actor,
+        &decision,
         Capability::QueueTasks,
         DecisionAction::QueueTask,
     )
@@ -688,11 +705,7 @@ async fn queue_under_charter(
                 "task",
                 id.as_str(),
                 DecisionAction::QueueTask,
-                DecisionInput {
-                    actor,
-                    rationale: body.rationale.or_else(|| Some("queued in shadow".into())),
-                    evidence: body.evidence,
-                },
+                decision,
                 false,
             )
             .await?;
@@ -714,17 +727,11 @@ async fn queue_under_charter(
                 "task",
                 id.as_str(),
                 DecisionAction::QueueTask,
-                DecisionInput {
-                    actor,
-                    // The caller's own words when it gave any. `directions` is
-                    // never copied in here and `rationale` never reaches the
-                    // Scout: one is read by humans afterwards, the other is
-                    // read by the agent.
-                    rationale: body
-                        .rationale
-                        .or_else(|| Some(if front { "scout now" } else { "queued" }.into())),
-                    evidence: body.evidence,
-                },
+                // The caller's own words when it gave any, and the default
+                // above when it gave none. `directions` is never copied in
+                // here and `rationale` never reaches the Scout: one is read by
+                // humans afterwards, the other is read by the agent.
+                decision,
                 true,
             )
             .await?;
@@ -771,10 +778,18 @@ async fn capture_issue(
         ));
     }
     let project = resolve_project(&store, body.project_id).await?;
+    // Built here rather than in each branch, so `authorize` can refuse a
+    // rationale-less capture before the issue is filed. It has to come after
+    // the `title` and `provenance` validation above, which reads `&body`.
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
 
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::CaptureWork,
         DecisionAction::CaptureWork,
     )
@@ -789,11 +804,7 @@ async fn capture_issue(
                 "capture",
                 &body.title,
                 DecisionAction::CaptureWork,
-                DecisionInput {
-                    actor,
-                    rationale: body.rationale,
-                    evidence: body.evidence,
-                },
+                decision,
                 false,
             )
             .await?;
@@ -825,11 +836,7 @@ async fn capture_issue(
                 state: GhState::Open,
                 updated_at: Utc::now(),
             },
-            DecisionInput {
-                actor,
-                rationale: body.rationale,
-                evidence: body.evidence,
-            },
+            decision,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
@@ -855,9 +862,17 @@ async fn close_task(
         .ok_or_else(|| ApiError::BadRequest(format!("unknown reason: {}", body.reason)))?;
     let id = TaskId::from_raw(task_id);
     let actor = actor_of(&store, &headers)?;
+    // Built here rather than in each branch, so `authorize` can refuse a
+    // rationale-less close before the issue is closed upstream — the same bug
+    // as the capture path, on a route whose only recourse is a reopen.
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::RetireWork,
         DecisionAction::RetireWork,
     )
@@ -869,11 +884,7 @@ async fn close_task(
                 "task",
                 id.as_str(),
                 DecisionAction::RetireWork,
-                DecisionInput {
-                    actor,
-                    rationale: body.rationale,
-                    evidence: body.evidence,
-                },
+                decision,
                 false,
             )
             .await?;
@@ -898,17 +909,7 @@ async fn close_task(
         .await
         .map_err(|e| ApiError::Internal(format!("closing the issue failed: {e}")))?;
 
-    store
-        .record_issue_closed(
-            &id,
-            reason,
-            DecisionInput {
-                actor,
-                rationale: body.rationale,
-                evidence: body.evidence,
-            },
-        )
-        .await?;
+    store.record_issue_closed(&id, reason, decision).await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -940,7 +941,7 @@ async fn reopen_task(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::RetireWork,
         DecisionAction::ReopenWork,
     )
@@ -1020,7 +1021,7 @@ async fn comment_on_work(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::CommentOnWork,
         DecisionAction::CommentOnWork,
     )
@@ -1106,7 +1107,7 @@ async fn merge_pull_request(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::LandBuilds,
         DecisionAction::MergeBuild,
     )
@@ -1183,7 +1184,7 @@ async fn abandon_pull_request(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::LandBuilds,
         DecisionAction::AbandonBuild,
     )
@@ -1249,7 +1250,7 @@ async fn create_review_comment(
     let subject = format!("{number}#{}:{}", body.path, body.line);
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::CommentOnWork,
         DecisionAction::ReviewComment,
     )
@@ -1334,10 +1335,15 @@ async fn edit_issue(
         ));
     }
     let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
 
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::CurateWork,
         DecisionAction::EditIssue,
     )
@@ -1349,11 +1355,7 @@ async fn edit_issue(
                 "gh",
                 &number.to_string(),
                 DecisionAction::EditIssue,
-                DecisionInput {
-                    actor,
-                    rationale: body.rationale,
-                    evidence: body.evidence,
-                },
+                decision,
                 false,
             )
             .await?;
@@ -1379,7 +1381,7 @@ async fn edit_issue(
 
     let evidence = serde_json::json!({
         "replaced": { "title": old_title, "body": old_body },
-        "caller_evidence": body.evidence,
+        "caller_evidence": decision.evidence,
     });
     let seq = store
         .record_decision(
@@ -1387,9 +1389,8 @@ async fn edit_issue(
             &number.to_string(),
             DecisionAction::EditIssue,
             DecisionInput {
-                actor,
-                rationale: body.rationale,
                 evidence: Some(evidence),
+                ..decision
             },
             true,
         )
@@ -1419,7 +1420,7 @@ async fn set_issue_labels(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::CurateWork,
         DecisionAction::LabelIssue,
     )
@@ -1725,7 +1726,7 @@ async fn cancel_run(
 
     if authorize(
         store,
-        actor,
+        &decision,
         Capability::CancelRuns,
         DecisionAction::CancelRun,
     )
@@ -1835,9 +1836,17 @@ async fn cancel_all_runs(
         .into_response());
     }
 
+    // One decision above the gate, cloned per target below: `authorize` has to
+    // see the rationale before any run is torn down, and `record_decision`
+    // takes it by value with one row per run.
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale.clone(),
+        evidence: body.evidence.clone(),
+    };
     let shadowed = authorize(
         &store,
-        actor,
+        &decision,
         Capability::CancelRuns,
         DecisionAction::CancelRun,
     )
@@ -1846,11 +1855,7 @@ async fn cancel_all_runs(
 
     let mut issued: Vec<(RunKind, String, i64)> = Vec::with_capacity(targets.len());
     for (kind, id) in &targets {
-        let decision = DecisionInput {
-            actor,
-            rationale: body.rationale.clone(),
-            evidence: body.evidence.clone(),
-        };
+        let decision = decision.clone();
         let decision_seq = store
             .record_decision(
                 kind.as_str(),
@@ -2036,36 +2041,57 @@ enum Authority {
 ///
 /// The daily cap is a mechanical floor, not a judgment: it bounds a runaway
 /// loop, and it is checked only for actions that will actually be applied.
+///
+/// It takes the whole [`DecisionInput`] rather than just the actor because it
+/// is also where the rationale is required. That rule used to live only inside
+/// the store call that writes the ledger row, which on every enforced path
+/// runs *after* the GitHub write it explains — so a rationale-less
+/// `POST /issues` filed the issue and then 400'd, and every retry filed
+/// another one with no ledger row behind it (#957). This is the one call every
+/// gated handler already makes before its effect, so a handler nobody has
+/// written yet inherits the ordering; a per-handler check does not, which is
+/// what three of nine having one and six not having one demonstrated.
+///
+/// The order of the three refusals is deliberate. `Off` answers first, because
+/// a rationale cannot rescue a capability that was never going to act, and
+/// telling a caller to write one for a call that will 403 anyway sends it to
+/// fix the wrong thing. The rationale answers before `Shadow`, because a
+/// shadow row *is* recorded, and a recorded decision with an empty rationale
+/// is exactly the unreviewable artifact this exists to prevent.
 async fn authorize(
     store: &Store,
-    actor: Actor,
+    decision: &DecisionInput,
     capability: Capability,
     action: DecisionAction,
 ) -> ApiResult<Authority> {
-    if actor == Actor::Human {
+    if decision.actor == Actor::Human {
         return Ok(Authority::Perform);
     }
     let entry = store.charter_entry(capability).await?;
-    match entry.level {
-        CharterLevel::Off => Err(ApiError::Forbidden(format!(
+    if entry.level == CharterLevel::Off {
+        return Err(ApiError::Forbidden(format!(
             "{} is off in the charter — say what you would do and why, and leave it to the human",
             capability.as_str()
-        ))),
-        CharterLevel::Shadow => Ok(Authority::Shadow),
-        CharterLevel::Live => {
-            if let Some(limit) = entry.daily_limit {
-                let used = store.orchestrator_actions_today(action).await?;
-                if used >= limit {
-                    return Err(ApiError::Forbidden(format!(
-                        "{} has used its {limit}/day budget ({used} so far) — \
-                         it resets at midnight UTC",
-                        capability.as_str()
-                    )));
-                }
-            }
-            Ok(Authority::Perform)
+        )));
+    }
+    // `StoreError::Invalid` maps to 400, so a rejected call gets the same
+    // status and the same sentence it always did — only the side effect is
+    // gone.
+    require_rationale(decision)?;
+    if entry.level == CharterLevel::Shadow {
+        return Ok(Authority::Shadow);
+    }
+    if let Some(limit) = entry.daily_limit {
+        let used = store.orchestrator_actions_today(action).await?;
+        if used >= limit {
+            return Err(ApiError::Forbidden(format!(
+                "{} has used its {limit}/day budget ({used} so far) — \
+                 it resets at midnight UTC",
+                capability.as_str()
+            )));
         }
     }
+    Ok(Authority::Perform)
 }
 
 /// The charter as it stands. Readable by anyone; the orchestrator's own
@@ -2148,7 +2174,8 @@ async fn review_spec(
         evidence: body.evidence,
     };
     let action = review_action(status)?;
-    if authorize(&store, actor, Capability::AutoReviewSpecs, action).await? == Authority::Shadow {
+    if authorize(&store, &decision, Capability::AutoReviewSpecs, action).await? == Authority::Shadow
+    {
         // A shadow verdict still discharges the review obligation: the
         // orchestrator has done everything it is allowed to do, and
         // re-reminding it forever would be nagging about work it cannot
@@ -2208,7 +2235,7 @@ async fn request_build(
     };
     if authorize(
         &store,
-        actor,
+        &decision,
         Capability::DispatchBuilds,
         DecisionAction::RequestBuild,
     )

@@ -226,6 +226,47 @@ implementation.
   cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
   from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
   a demotion to human.
+- **A refusal is a no-op, so everything refusable runs before the effect — and
+  the rationale check lives at `authorize`, not in the handlers.** The other
+  end of the attribution rule: a write the server *does* attribute still has to
+  be explained, and the rule that says so used to live only inside the store
+  call that writes the ledger row. On every enforced path that call runs
+  **after** the GitHub write it explains, so a rationale-less `POST /issues`
+  filed the issue upstream and then returned 400 from the bookkeeping — and an
+  agent doing the obviously correct thing with a 4xx filed one issue per retry,
+  each with no `decisions` row behind it (#957). `close_task` was the worse
+  case: its 400 also closed the issue, invisibly in the ledger *and* in the task
+  state, since closure is only ever learned from the poller. So
+  `server::authorize` takes the whole `DecisionInput` and applies
+  `store::require_rationale` itself, at the one call every gated handler already
+  makes before its effect — which is why a handler nobody has written yet
+  inherits the ordering. The alternative, a per-handler `if
+  rationale.is_empty()`, is not a partial fix but the demonstration that the
+  shape cannot hold: three of the nine write routes had one, six did not, and
+  nothing made them. A required parameter cannot be forgotten, because it does
+  not compile. Two orderings inside `authorize` are deliberate. `Off` → 403
+  answers **before** the rationale 400, because a rationale cannot rescue a
+  capability that was never going to act and telling a caller to write one
+  sends it to fix the wrong thing. The rationale 400 answers **before**
+  `Shadow`, because a shadow row *is* recorded and one with an empty rationale
+  is exactly the unreviewable artifact the rule exists to prevent. (Shadow was
+  never the leaky half — it records first and reaches GitHub never — so this
+  only moves *when* it refuses.) The store keeps its six call sites as a
+  backstop for callers that never went through a handler, and both ends call
+  the same `pub fn` so the two sentences cannot drift. **The three bespoke
+  pre-checks in `merge_pull_request`, `abandon_pull_request` and `edit_issue`
+  stay, deliberately** — they look like three redundant copies of a rule that
+  has just been centralised, and they are not: each names what *kind* of
+  rationale its route wants ("an autonomous merge must say why it is safe to
+  land"), which the generic sentence cannot, and they now fire strictly earlier
+  than it. Deleting one loses a better message rather than removing a
+  duplicate. What is deliberately **not** fixed is the other side: a GitHub
+  write that succeeds and then fails to record still leaves an unattributed
+  artifact. Recording first would leave a decision claiming an effect a failed
+  call never had, which is worse in the direction the ledger has to be
+  trustworthy; closing it properly is an intent-then-confirm record and its own
+  change. Everything that can *refuse* refuses first, which is what makes a 4xx
+  safe to retry.
 - **Dependency direction:** `crates/vm-pool/*` are pure infrastructure and
   must never depend on tasks crates. App vocabulary enters vm-pool only
   through the `AppProtocol` generic (see `crates/tasks-protocol`). vm-pool

@@ -38,6 +38,22 @@ struct Seen {
     prs_patched: Vec<(u64, Value)>,
 }
 
+impl Seen {
+    /// Nothing at all reached GitHub. Every vector, rather than the one the
+    /// route under test would have written to: the question a refusal has to
+    /// answer is "did anything happen", and naming one field per route is how
+    /// the tenth route gets tested against the ninth route's evidence.
+    fn is_untouched(&self) -> bool {
+        self.created.is_empty()
+            && self.closed.is_empty()
+            && self.comments.is_empty()
+            && self.review_comments.is_empty()
+            && self.labels_set.is_empty()
+            && self.merged.is_empty()
+            && self.prs_patched.is_empty()
+    }
+}
+
 async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let app = axum::Router::new()
@@ -372,6 +388,11 @@ async fn an_orchestrator_close_without_a_rationale_is_refused() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     assert!(h.store.decisions(None, 10).await.unwrap().is_empty());
+    // And the issue is still open upstream. The sentence above claimed this
+    // from the day the test was written; it was true of the intent and false
+    // of the code, because `require_rationale` sat inside `record_issue_closed`
+    // and that runs *after* `github.close_issue` (#957).
+    assert!(h.seen.lock().unwrap().closed.is_empty());
 }
 
 /// Without a token the server says so rather than failing obscurely — and, in
@@ -708,4 +729,189 @@ async fn labels_can_be_read_and_replaced() {
 
     let decisions = h.store.decisions(None, 10).await.unwrap();
     assert_eq!(decisions[0].action.as_str(), "label_issue");
+}
+
+/// The reported shape of #957: a rationale-less capture 400s, the agent does
+/// the obviously correct thing with a 4xx and retries, and each retry files
+/// another issue nothing in the ledger accounts for.
+///
+/// A 400 has to be a no-op, or the one thing the status code tells a caller to
+/// do is the thing it must not do.
+#[tokio::test]
+async fn a_rejected_capture_files_nothing_however_many_times_it_is_retried() {
+    let h = harness(true).await;
+
+    for _ in 0..3 {
+        let resp = h
+            .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+            .json(&json!({
+                "title": "store.rs leaks a transaction on the error path",
+                "body": "Noticed while reading the review code.",
+                "provenance": "discovered while reviewing spec_abc",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["error"].as_str().unwrap(),
+            "an orchestrator decision must carry a rationale",
+        );
+    }
+
+    // Three refusals, three no-ops: nothing upstream, nothing tracked, and
+    // nothing in the ledger to explain any of it.
+    assert!(h.seen.lock().unwrap().created.is_empty());
+    assert!(h.store.decisions(None, 10).await.unwrap().is_empty());
+    assert!(h.store.list_tasks().await.unwrap().is_empty());
+}
+
+/// The durable one. Every charter-gated write route, called with no rationale,
+/// answers 400 having touched nothing — and it is asserted against the whole
+/// of what the fake GitHub saw rather than against the one call each route
+/// makes, so a tenth route that forgets fails here rather than on a repository.
+///
+/// This holds because the check lives at `authorize`, which every one of these
+/// handlers already called before its effect. A per-handler `if
+/// rationale.is_empty()` is what three of these nine already had, and the six
+/// that did not are the bug.
+#[tokio::test]
+async fn no_write_route_touches_github_before_it_has_a_rationale() {
+    let h = harness(true).await;
+    let task = seed_task(&h.store, &h.project, 812).await;
+
+    let routes: Vec<(String, Value)> = vec![
+        (
+            "/issues".into(),
+            // Provenance supplied, so the refusal under test is the rationale
+            // and not the capture route's own earlier check.
+            json!({ "title": "x", "body": "", "provenance": "reviewing #812" }),
+        ),
+        (
+            format!("/tasks/{}/close", task.id),
+            json!({ "reason": "completed" }),
+        ),
+        (format!("/tasks/{}/reopen", task.id), json!({})),
+        ("/issues/812/comments".into(), json!({ "body": "a note" })),
+        (
+            "/issues/812/edit".into(),
+            json!({ "title": "a better title" }),
+        ),
+        ("/issues/812/labels".into(), json!({ "labels": ["bug"] })),
+        (
+            "/pull-requests/812/review-comments".into(),
+            json!({ "path": "crates/tasks/src/store.rs", "line": 12, "body": "this leaks" }),
+        ),
+        ("/pull-requests/812/merge".into(), json!({})),
+        ("/pull-requests/812/close".into(), json!({})),
+    ];
+
+    for (path, body) in &routes {
+        let resp = h
+            .as_orchestrator(h.http.post(format!("{}{path}", h.base)))
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{path} should refuse");
+        assert!(
+            h.seen.lock().unwrap().is_untouched(),
+            "{path} reached GitHub before it had a rationale",
+        );
+    }
+
+    // Nine refusals, and not one of them recorded a judgment either — there
+    // was no judgment to record.
+    assert!(h.store.decisions(None, 20).await.unwrap().is_empty());
+}
+
+/// Shadow was never the leaky half — it records first and reaches GitHub never
+/// — but it is where a rationale matters most, because the row *is* the
+/// deliverable. A shadow row with an empty rationale is the unreviewable
+/// artifact the rule exists to prevent, so the check runs ahead of the shadow
+/// branch rather than inside it.
+#[tokio::test]
+async fn a_shadowed_write_still_needs_a_rationale() {
+    let h = harness(true).await;
+    h.store
+        .set_charter(Capability::CaptureWork, CharterLevel::Shadow, None)
+        .await
+        .unwrap();
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+        .json(&json!({ "title": "x", "body": "", "provenance": "reviewing #812" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(h.store.decisions(None, 10).await.unwrap().is_empty());
+    assert!(h.seen.lock().unwrap().is_untouched());
+
+    // With one, the shadow row lands as it always did.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+        .json(&json!({
+            "title": "x",
+            "body": "",
+            "provenance": "reviewing #812",
+            "rationale": "it would be lost otherwise",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let decisions = h.store.decisions(None, 10).await.unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert!(!decisions[0].enforced);
+    assert!(h.seen.lock().unwrap().is_untouched());
+}
+
+/// `Off` answers before the rationale does, and the status code is how you can
+/// tell: a rationale cannot rescue a capability that was never going to act,
+/// so sending the caller away to write one would send it to fix the wrong
+/// thing about a call that will 403 either way.
+#[tokio::test]
+async fn a_capability_that_is_off_is_refused_before_the_rationale_is_read() {
+    let h = harness(true).await;
+    h.store
+        .set_charter(Capability::CaptureWork, CharterLevel::Off, None)
+        .await
+        .unwrap();
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/issues", h.base)))
+        .json(&json!({ "title": "x", "body": "", "provenance": "reviewing #812" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("off in the charter"),
+        "{body}",
+    );
+    assert!(h.seen.lock().unwrap().is_untouched());
+}
+
+/// The human is never gated and owes no explanation — they are who the record
+/// is *for* — so the reordering must not have quietly made them owe one. The
+/// issue is filed.
+#[tokio::test]
+async fn a_human_still_needs_no_rationale() {
+    let h = harness(true).await;
+
+    let resp = h
+        .http
+        .post(format!("{}/issues", h.base))
+        .json(&json!({ "title": "something", "body": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(h.seen.lock().unwrap().created.len(), 1);
 }
