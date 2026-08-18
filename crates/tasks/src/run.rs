@@ -2159,7 +2159,39 @@ async fn report_pool(client: &Client<TasksProtocol>, config: &Config) {
         Err(e) => return report_attach_support(&reattach::AttachSupport::Unknown(e)),
     };
     report_attach_support(&reattach::support_of(&status));
+    report_error_kinds(&status);
     report_capacity(Capacity::assess(status.total, config.scout_max_concurrent));
+}
+
+/// Say, once per connect, whether this vm-pool can tell a *busy* pool from a
+/// *broken* configuration.
+///
+/// A refusal from a daemon predating
+/// [`vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION`] carries no `kind`, reads
+/// as [`vm_pool_protocol::ServiceErrorKind::Unspecified`], and is therefore
+/// charged as a verdict — never silently waived, which is the safe direction
+/// and also means #930's fix is **inert** against such a daemon until somebody
+/// restarts it. vm-pool is a separate daemon that a server restart does not
+/// restart, so that is the routine case rather than an exotic one.
+///
+/// A report and not a gate, for exactly the reason
+/// [`vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION`] gates nothing: an old
+/// daemon runs scouts and builds perfectly well, and refusing to dispatch
+/// because its *error* vocabulary is old would turn a rare miscount into an
+/// outage. Without this line an operator's only signal is a task rejected for
+/// a pool that was merely busy — which is the bug.
+fn report_error_kinds(status: &vm_pool_client::PoolStatus) {
+    if status.speaks(vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION) {
+        return;
+    }
+    warn!(
+        speaks = status.protocol_version,
+        needs = vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION,
+        "this vm-pool predates typed error kinds, so a refused allocation cannot be told \
+         apart from a permanent misconfiguration — a full pool will be charged a dispatch \
+         attempt as if it were a verdict on the work. Restart `tasks vm-pool` to pick up \
+         the newer daemon"
+    );
 }
 
 fn report_attach_support(support: &reattach::AttachSupport) {
@@ -2639,10 +2671,17 @@ async fn record_outcome(
 
 /// Retire a task that has burned through [`MAX_DISPATCH_ATTEMPTS`].
 ///
-/// [`Scout::dispatch`]'s failure path has already put the task back to `New` by
-/// the time we get here, which is why this runs last and wins: a task left
-/// `New` at the cap would be picked up again by the next process, which is
-/// exactly the retry-forever loop the persisted count exists to stop.
+/// [`Scout::dispatch`]'s failure path has usually put the task back to
+/// `Queued` (not `New`) by the time we get here, which is why this runs last
+/// and wins: a task left `Queued` at the cap would be picked up again by the
+/// next process, which is exactly the retry-forever loop the persisted count
+/// exists to stop.
+///
+/// "Usually", because there is a path where nothing puts it back at all: a
+/// refused allocation returns before any session row exists, so
+/// `Scout::finalize_failed` — the only writer of that transition — never runs
+/// and the task is left sitting in `Scouting`. That is #967, and it is why a
+/// waived strike for a full pool fixes the ledger and not the task.
 async fn reject_exhausted(
     store: &Store,
     task_id: &TaskId,
@@ -2686,6 +2725,14 @@ async fn reject_exhausted(
 /// Connect(_))` is a disconnect and is still classified a verdict, so folding
 /// either into the other would start charging it — see the `Client(_)` comment
 /// on `BuilderError::failure_class` for why that is a separate argument.
+///
+/// A **refusal is deliberately not a disconnect.** `Client(Service { .. })` is
+/// vm-pool answering — the socket is alive and about to say yes — so
+/// rebuilding a working connection over a condition that clears by itself
+/// would throw away the very socket that clears it. It matters more than it
+/// looks: [`record_outcome`] consults this *first*, so a refusal caught here
+/// would never reach `ScoutError::failure_class` and #930's classification
+/// would never run.
 fn is_disconnect(error: &ScoutError) -> bool {
     matches!(
         error,
@@ -3407,6 +3454,73 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+        let after = store.get_task(&doomed.id).await.unwrap().unwrap();
+        assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
+        assert_eq!(after.state, TaskState::Rejected);
+    }
+
+    /// #930, through the real `record_outcome`: a pool that had no room to
+    /// give must never reject a task, however many times it has no room.
+    ///
+    /// The negative half is in the same test and is most of it — three
+    /// refusals naming a *permanent* condition do reject the task, because a
+    /// reference that does not resolve refuses identically forever and waiving
+    /// it would retry forever with nothing to stop it. And `ConnectionLost` is
+    /// `false` on the capacity path: vm-pool answered, the socket is alive and
+    /// about to say yes, so rebuilding the connection would throw away the
+    /// very socket that clears the condition.
+    #[tokio::test]
+    async fn a_full_pool_costs_the_task_no_dispatch_attempt_and_a_bad_image_still_does() {
+        use vm_pool_protocol::ServiceErrorKind;
+
+        fn refusal(kind: ServiceErrorKind) -> ScoutError {
+            ScoutError::Client(vm_pool_client::ClientError::Service {
+                message: "allocate failed: pool exhausted: 0 available, 1 requested".into(),
+                kind,
+            })
+        }
+
+        let store = Store::open_in_memory().await.unwrap();
+        let project = project();
+        store.insert_project(&project).await.unwrap();
+        let task = seed_task(&store, &project, 1, TaskState::Queued).await;
+
+        for round in 1..=MAX_DISPATCH_ATTEMPTS + 1 {
+            let ConnectionLost(lost) =
+                record_outcome(&store, &task.id, Err(refusal(ServiceErrorKind::Capacity)))
+                    .await
+                    .unwrap();
+            assert!(!lost, "round {round}: a refusal is not a disconnect");
+
+            let after = store.get_task(&task.id).await.unwrap().unwrap();
+            assert_eq!(after.dispatch_attempts, 0, "round {round} charged a strike");
+            assert_ne!(
+                after.state,
+                TaskState::Rejected,
+                "round {round} rejected a task nothing had judged"
+            );
+        }
+
+        // The waiver has to name itself, or an unspent attempt is
+        // indistinguishable from a cap somebody switched off.
+        let notes = store.recent_events(200).await.unwrap();
+        assert!(
+            notes.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Note { message, .. }
+                    if message.contains("failed as transport") && message.contains("keeps its 0")
+            )),
+            "the waiver must say the class and the unchanged count: {notes:#?}"
+        );
+
+        // The negative half: a refusal naming a permanent condition is a
+        // verdict and still rejects at the cap.
+        let doomed = seed_task(&store, &project, 2, TaskState::Queued).await;
+        for _ in 0..MAX_DISPATCH_ATTEMPTS {
+            record_outcome(&store, &doomed.id, Err(refusal(ServiceErrorKind::Image)))
+                .await
+                .unwrap();
         }
         let after = store.get_task(&doomed.id).await.unwrap().unwrap();
         assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);

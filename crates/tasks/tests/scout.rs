@@ -783,3 +783,123 @@ async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
         "cancellation is deallocation; the slot must come back"
     );
 }
+
+/// #930, end to end and with no mocks: a Scout refused a VM by a **full pool**
+/// must not be charged a dispatch attempt.
+///
+/// A real vm-pool with one slot, the slot already taken by a VM this test
+/// holds, so `allocate` returns a real `pool exhausted` over a real socket.
+/// What is asserted is the classification and its consequences at the point
+/// the refusal is produced: the failure reads as `Transport`, `Strike` waives
+/// it, and nothing was written — no session row and no spec, because the
+/// refusal returns before either exists.
+///
+/// **The seam is `Scout::dispatch` directly**, not the dispatch loop, and that
+/// bounds what the second half claims. Since #967 the loop *holds* new
+/// dispatch while the pool has no room, so a refusal is what happens when a
+/// slot goes between the probe and the allocation — driving the dispatcher
+/// here is the only way to produce one on demand. The second half therefore
+/// shows that the *dispatcher* is undamaged by a refusal (free the slot and
+/// the same task scouts to a spec), and specifically not that anything in
+/// production re-dispatches a refused task by itself.
+#[tokio::test]
+async fn a_scout_refused_by_a_full_pool_is_not_charged_for_it() {
+    use tasks::scout::ScoutError;
+    use tasks::store::Strike;
+    use vm_pool_protocol::ServiceErrorKind;
+
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        stub_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+
+    // One slot, and this test takes it.
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+    let squatter = client
+        .handle()
+        .allocate("agent:v1", VmConfig::default())
+        .await
+        .expect("the one slot");
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Stub task", "Do the stub thing").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+            leases: None,
+        },
+    );
+    let target = ScoutTarget {
+        source: tasks::broker::CloneSource::Direct(repo_url),
+        base_branch: "main".into(),
+    };
+
+    let refused = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("a full pool refuses the allocation");
+
+    match &refused {
+        ScoutError::Client(vm_pool_client::ClientError::Service { message, kind }) => {
+            assert!(message.contains("exhausted"), "got: {message}");
+            assert_eq!(*kind, ServiceErrorKind::Capacity);
+        }
+        other => panic!("expected a service refusal, got {other:?}"),
+    }
+    assert_eq!(
+        refused.failure_class(),
+        tasks_protocol::FailureClass::Transport
+    );
+    assert_eq!(Strike::for_class(refused.failure_class()), Strike::Waive);
+
+    // The refusal returns before either row exists, so there is nothing to
+    // find.
+    assert!(
+        store
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.task_id != task.id),
+        "a refused allocation writes no session row"
+    );
+    assert!(
+        store
+            .list_specs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.task_id != task.id),
+        "and no spec"
+    );
+
+    // The other half: free the slot and the same task scouts to a spec. What
+    // this shows is that the dispatcher is undamaged by the refusal — the
+    // refusal was about the moment, not about the work.
+    client
+        .handle()
+        .deallocate(&squatter)
+        .await
+        .expect("hand the slot back");
+    let spec = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect("with a slot free, the same task scouts fine");
+    assert!(spec.content.contains("## Spec"), "spec: {}", spec.content);
+}

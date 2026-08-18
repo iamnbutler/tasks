@@ -20,6 +20,7 @@ use redact::is_secret_name;
 /// | --- | --- |
 /// | 0 ([`PRE_VERSIONING`]) | everything through `unsubscribe_logs` |
 /// | 1 | [`ServiceCommand::Attach`], [`ServiceEvent::VmAttached`], `seq` on [`ServiceEvent::VmApp`], and this field |
+/// | 2 | `kind` on [`ServiceEvent::Error`] ([`ServiceErrorKind`]) |
 ///
 /// vm-pool is a long-lived daemon upgraded separately from its clients, so a
 /// new client routinely talks to a service running an older binary. Serde
@@ -36,7 +37,7 @@ use redact::is_secret_name;
 /// `<THING>_PROTOCOL_VERSION` constant beside [`ATTACH_PROTOCOL_VERSION`], so
 /// callers gate on the capability they actually need rather than on a bare
 /// number they have to keep in their heads.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What a service that predates version reporting says *by omitting the
 /// field*.
@@ -51,11 +52,29 @@ pub const PRE_VERSIONING: u32 = 0;
 /// reattach; see [`ServiceEvent::PoolStatus`].
 pub const ATTACH_PROTOCOL_VERSION: u32 = 1;
 
+/// The revision that introduced [`ServiceErrorKind`] on
+/// [`ServiceEvent::Error`].
+///
+/// It exists because this file's own rule requires one per addition, and it
+/// gates **nothing**. The two situations look alike and are not: an added
+/// *command* is rejected at decode time by the peers it exists to identify, so
+/// [`ServiceCommand::Attach`] has to be asked about first; an added *field* is
+/// covered by `#[serde(default)]`, so an absent `kind` decodes fine and every
+/// reader already handles [`ServiceErrorKind::Unspecified`]. Its only consumer
+/// is a report — "the pool you are talking to predates this, so a refusal
+/// cannot be told apart from a misconfiguration". Do **not** turn it into a
+/// dispatch gate: an old vm-pool runs scouts and builds perfectly well, and
+/// refusing to dispatch because its *error* vocabulary is old would turn a
+/// rare miscount into an outage.
+pub const ERROR_KIND_PROTOCOL_VERSION: u32 = 2;
+
 // A gate above what this build speaks is a permanent, silent "unsupported"
 // against every peer including itself. Catch it at compile time — a `#[test]`
 // would trip clippy's `assertions_on_constants` and is the weaker guarantee.
 const _: () = assert!(PROTOCOL_VERSION >= ATTACH_PROTOCOL_VERSION);
 const _: () = assert!(ATTACH_PROTOCOL_VERSION > PRE_VERSIONING);
+const _: () = assert!(PROTOCOL_VERSION >= ERROR_KIND_PROTOCOL_VERSION);
+const _: () = assert!(ERROR_KIND_PROTOCOL_VERSION > PRE_VERSIONING);
 
 /// Strongly-typed VM identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -354,6 +373,111 @@ pub struct ReplayedEvent<P: AppProtocol = NullProtocol> {
     pub event: P::Event,
 }
 
+/// Which of vm-pool's *own* conditions produced a [`ServiceEvent::Error`].
+///
+/// The message beside it is prose written for a human; this is the field a
+/// caller decides on. `pool exhausted` and `no such image` differ only as
+/// English, and a client that told them apart by grepping would change meaning
+/// the next time somebody improved a sentence — so the fact rides its own
+/// field.
+///
+/// vm-pool learns nothing about its callers from this. It states which of its
+/// conditions was hit; what to do about a "no" — retry, wait, give up, charge
+/// somebody for it — stays entirely the caller's, exactly as this crate's
+/// dependency rule requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceErrorKind {
+    /// This peer did not say — it predates the field, or the condition has no
+    /// better name here. The default, and deliberately the *unhelpful* one:
+    /// a caller must not read silence as any specific condition.
+    #[default]
+    Unspecified,
+    /// The pool has no room: every slot is allocated. A property of the
+    /// moment rather than of the request.
+    Capacity,
+    /// No such VM in this pool.
+    NoSuchVm,
+    /// The VM exists but is not in a state that can take the command.
+    NotReady,
+    /// The image could not be resolved or parsed.
+    Image,
+    /// The container runtime failed — spawning, stopping, or talking to a VM.
+    Runtime,
+    /// vm-pool's own stdio link to a VM failed. **Not** a statement about the
+    /// caller's connection to vm-pool, and not the same question as any
+    /// "transport" a caller may have of its own.
+    Transport,
+    /// The request could not be understood at all.
+    BadRequest,
+    /// Something else this build can name but has no category for.
+    Other,
+}
+
+impl ServiceErrorKind {
+    /// The wire form, and what a log line prints.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Capacity => "capacity",
+            Self::NoSuchVm => "no_such_vm",
+            Self::NotReady => "not_ready",
+            Self::Image => "image",
+            Self::Runtime => "runtime",
+            Self::Transport => "transport",
+            Self::BadRequest => "bad_request",
+            Self::Other => "other",
+        }
+    }
+
+    /// The wire form, read forgivingly: anything unrecognised is
+    /// [`ServiceErrorKind::Unspecified`]. See the [`Deserialize`] impl.
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "capacity" => Self::Capacity,
+            "no_such_vm" => Self::NoSuchVm,
+            "not_ready" => Self::NotReady,
+            "image" => Self::Image,
+            "runtime" => Self::Runtime,
+            "transport" => Self::Transport,
+            "bad_request" => Self::BadRequest,
+            "other" => Self::Other,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
+impl fmt::Display for ServiceErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Skew runs both ways, and only one way is covered by `#[serde(default)]`.
+///
+/// An *older* service omitting the field is the routine case, and the
+/// attribute handles it. This impl is hand-written for the other direction: a
+/// *newer* service naming a kind this build has never heard of must not make
+/// the error response undecodable, because a response that fails to decode is
+/// never delivered — and the request it answers then waits for its connection
+/// to die. **A refusal turned into a hang is strictly worse than a refusal
+/// whose reason is unknown.** Unknown decays to `Unspecified`, which every
+/// reader already handles.
+///
+/// Reading the value as a [`serde_json::Value`] first is what makes a kind
+/// sent as a number or a null decay the same way a misspelt string does;
+/// `#[serde(other)]` cannot express any of this on a plain unit-variant enum.
+/// The same shape as `tasks_protocol::FailureClass`, for the same reason.
+impl<'de> Deserialize<'de> for ServiceErrorKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(raw
+            .as_str()
+            .map(ServiceErrorKind::from_wire)
+            .unwrap_or_default())
+    }
+}
+
 /// Events emitted by vm-pool service to Tasks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -398,7 +522,17 @@ pub enum ServiceEvent<P: AppProtocol = NullProtocol> {
     /// Acknowledgment of log subscription.
     LogsSubscribed { vm_id: Option<VmId> },
     /// An error occurred processing a command.
-    Error { message: String },
+    ///
+    /// `message` is prose for a human. `kind` is the field a caller *decides*
+    /// on — see [`ServiceErrorKind`], and never grep the message. `#[serde(default)]`
+    /// so a service predating [`ERROR_KIND_PROTOCOL_VERSION`] still decodes;
+    /// its silence reads as [`ServiceErrorKind::Unspecified`], which is an
+    /// answer ("this peer cannot say") rather than a missing value.
+    Error {
+        message: String,
+        #[serde(default)]
+        kind: ServiceErrorKind,
+    },
     /// Acknowledgment that an application command was forwarded to a VM.
     CommandSent { vm_id: VmId },
     /// Application event forwarded from a VM.
@@ -688,11 +822,96 @@ mod tests {
     fn service_event_error_roundtrip() {
         let event: ServiceEvent = ServiceEvent::Error {
             message: "pool exhausted".into(),
+            kind: ServiceErrorKind::Capacity,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"kind\":\"capacity\""), "got: {json}");
         let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    /// Every kind goes out and comes back as itself. Without this, the
+    /// forgiving `Deserialize` below could decay *everything* and the
+    /// decay test would still pass.
+    #[test]
+    fn every_error_kind_survives_its_own_wire_form() {
+        for kind in [
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::Capacity,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            let event: ServiceEvent = ServiceEvent::Error {
+                message: "something".into(),
+                kind,
+            };
+            let json = serde_json::to_string(&event).unwrap();
+            assert!(json.contains(kind.as_str()), "{kind} not on the wire: {json}");
+            let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, event, "{kind}");
+        }
+    }
+
+    /// The routine skew: a service predating [`ERROR_KIND_PROTOCOL_VERSION`]
+    /// omits the field entirely. Silence is an answer — "this peer cannot
+    /// say" — and never a decode failure.
+    #[test]
+    fn an_error_from_a_service_that_cannot_say_reads_as_unspecified() {
+        let json = r#"{"type":"error","message":"allocate failed: pool exhausted"}"#;
+        let parsed: ServiceEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            ServiceEvent::Error {
+                message: "allocate failed: pool exhausted".into(),
+                kind: ServiceErrorKind::Unspecified,
+            }
+        );
+    }
+
+    /// The other direction, and the one the hand-written impl is for. A
+    /// *newer* service naming a kind this build has never heard of must still
+    /// deliver the refusal: an undecodable error response is never delivered
+    /// at all, and the request it answers then hangs until the connection
+    /// dies. A known kind is asserted in the same test, or "everything
+    /// decays" would pass this.
+    #[test]
+    fn an_error_kind_this_build_cannot_read_decays_instead_of_failing() {
+        for wire in [
+            r#""quantum_flux""#,
+            "7",
+            "null",
+            "true",
+            r#"{"nested":"object"}"#,
+        ] {
+            let json = format!(r#"{{"type":"error","message":"nope","kind":{wire}}}"#);
+            let parsed: ServiceEvent =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{wire} failed to decode: {e}"));
+            assert_eq!(
+                parsed,
+                ServiceEvent::Error {
+                    message: "nope".into(),
+                    kind: ServiceErrorKind::Unspecified,
+                },
+                "{wire}"
+            );
+        }
+
+        // The negative half: a kind this build *does* know is not decayed.
+        let json = r#"{"type":"error","message":"nope","kind":"capacity"}"#;
+        let parsed: ServiceEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed,
+            ServiceEvent::Error {
+                message: "nope".into(),
+                kind: ServiceErrorKind::Capacity,
+            }
+        );
     }
 
     #[test]
@@ -704,7 +923,13 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
         };
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains("\"protocol_version\":1"), "got: {json}");
+        // Against the constant, not a literal: what matters is that the
+        // field is on the wire, and pinning the number only breaks the next
+        // bump.
+        assert!(
+            json.contains(&format!("\"protocol_version\":{PROTOCOL_VERSION}")),
+            "got: {json}"
+        );
         let parsed: ServiceEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, event);
     }

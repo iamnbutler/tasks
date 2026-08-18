@@ -132,6 +132,25 @@ impl ScoutError {
             // Unconditionally `Transport`, then and now; #944 changed only
             // which expiries are allowed to reach it.
             Self::Suspended(_) => FailureClass::Transport,
+            // A refusal *from* vm-pool: it answered, and said which of its own
+            // conditions produced the "no". One shared statement of what that
+            // means (`FailureClass::for_service_error`), so this dispatcher
+            // and the builder cannot disagree about one refusal. #930 is the
+            // bug: a full pool struck the task, so three busy moments rejected
+            // work nothing had ever judged.
+            //
+            // **The waiver has a dependency outside this file, and it is
+            // load-bearing.** `Capacity` is waived because a full pool is a
+            // property of the moment — but with the strike waived there is no
+            // counter left to stop a refused dispatch retrying twice a second
+            // for as long as the pool stays full. What stops it is
+            // [`crate::pool_health`] holding dispatch at the same two gates as
+            // the GitHub and update holds (#967). That hold is *mandatory
+            // rather than preferable* precisely because this arm removes the
+            // backstop; do not delete it and keep this.
+            Self::Client(ClientError::Service { kind, .. }) => {
+                FailureClass::for_service_error(*kind)
+            }
             Self::Store(_) | Self::Client(_) | Self::Timeout { .. } => FailureClass::Verdict,
         }
     }
@@ -1627,6 +1646,71 @@ mod tests {
         );
         assert_eq!(
             Strike::for_class(ScoutError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
+        );
+    }
+
+    /// #930. A pool that had no room to give refused this dispatch before
+    /// anything looked at the task, so it costs the task nothing — while a
+    /// refusal that will repeat identically forever still does.
+    ///
+    /// The negative half is most of the test on purpose. `Unspecified` is what
+    /// an *older* vm-pool sends (it is a separate daemon, upgraded separately),
+    /// and a default of "waive" there would silently waive every permanent
+    /// misconfiguration on every daemon that predates the field.
+    #[test]
+    fn a_pool_with_no_room_costs_the_task_nothing_and_a_missing_image_still_does() {
+        use crate::store::Strike;
+        use vm_pool_protocol::ServiceErrorKind;
+
+        fn refusal(kind: ServiceErrorKind) -> ScoutError {
+            ScoutError::Client(ClientError::Service {
+                message: "allocate failed".into(),
+                kind,
+            })
+        }
+
+        assert_eq!(
+            refusal(ServiceErrorKind::Capacity).failure_class(),
+            FailureClass::Transport,
+        );
+        assert_eq!(
+            Strike::for_class(refusal(ServiceErrorKind::Capacity).failure_class()),
+            Strike::Waive,
+        );
+
+        // Everything else is a verdict and is charged: a reference that does
+        // not resolve refuses identically forever, and waiving it is the
+        // retry-forever loop the cap exists to stop.
+        for kind in [
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            // vm-pool's stdio link to a VM — deliberately *not* the same
+            // question as `FailureClass::Transport`.
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            assert_eq!(
+                Strike::for_class(refusal(kind).failure_class()),
+                Strike::Charge,
+                "{kind}",
+            );
+        }
+
+        // And an ordinary empty-handed run is still charged too, so "nothing
+        // was waived" cannot be read as the cap being switched off.
+        assert_eq!(
+            Strike::for_class(
+                ScoutError::ScoutFailed {
+                    reason: "SPEC.md not found".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
             Strike::Charge,
         );
     }

@@ -73,7 +73,7 @@ use tracing::{debug, warn};
 use vm_pool_protocol::redact::Scrubbed;
 use vm_pool_protocol::{
     AppProtocol, LogLine, NullProtocol, ReplayedEvent, Request, Response, ServiceCommand,
-    ServiceEvent, VmConfig, VmId,
+    ServiceErrorKind, ServiceEvent, VmConfig, VmId,
 };
 
 /// How many pushed events a subscriber may fall behind before the oldest are
@@ -88,8 +88,22 @@ pub enum ClientError {
     Json(#[from] serde_json::Error),
     #[error("connection closed")]
     Closed,
-    #[error("service error: {0}")]
-    Service(String),
+    /// vm-pool answered "no", and said which of its own conditions produced
+    /// the "no".
+    ///
+    /// `message` is prose for a human; `kind` is the field a caller *decides*
+    /// on. A struct variant rather than a `String` because `pool exhausted`
+    /// and `no such image` differ only as English, and a caller that told them
+    /// apart by grepping would change meaning the next time somebody improved
+    /// a sentence. A service predating
+    /// [`vm_pool_protocol::ERROR_KIND_PROTOCOL_VERSION`] sends no kind and is
+    /// read as [`ServiceErrorKind::Unspecified`] — an answer ("this peer
+    /// cannot say"), never a licence to assume any particular condition.
+    #[error("service error: {message}")]
+    Service {
+        message: String,
+        kind: ServiceErrorKind,
+    },
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
 }
@@ -325,7 +339,7 @@ impl<P: AppProtocol> ClientHandle<P> {
     /// Convert a ServiceEvent::Error into a ClientError, or return the event.
     fn check_error(event: ServiceEvent<P>) -> Result<ServiceEvent<P>, ClientError> {
         match event {
-            ServiceEvent::Error { message } => Err(ClientError::Service(message)),
+            ServiceEvent::Error { message, kind } => Err(ClientError::Service { message, kind }),
             other => Ok(other),
         }
     }
@@ -846,7 +860,17 @@ mod tests {
             .await
             .unwrap();
         let result = client.allocate("agent:v1", VmConfig::default()).await;
-        assert!(matches!(result, Err(ClientError::Service(_))));
+        // The kind is read off a real refusal from a real service over a real
+        // socket: a pool of zero slots refuses every allocate, and that is
+        // `Capacity` — the fact a caller needs in order to *not* charge the
+        // work for it.
+        match result {
+            Err(ClientError::Service { message, kind }) => {
+                assert!(message.contains("exhausted"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::Capacity);
+            }
+            other => panic!("expected a service refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

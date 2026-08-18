@@ -16,7 +16,7 @@
 //! the supervisor, not a convention in the caller.
 
 use serde::{Deserialize, Deserializer, Serialize};
-use vm_pool_protocol::AppProtocol;
+use vm_pool_protocol::{AppProtocol, ServiceErrorKind};
 
 pub mod agent_run;
 pub mod redact;
@@ -96,6 +96,57 @@ impl FailureClass {
                 "the run could not be picked up after a server restart, which is the \
                  restart's fault and not the work's",
             ),
+        }
+    }
+
+    /// How a vm-pool refusal reads as a strike decision — **one statement**,
+    /// so a Scout and a Builder cannot disagree about the same "no" (#930).
+    ///
+    /// [`ServiceErrorKind::Capacity`] is the only waiver. A full pool is a
+    /// property of the *moment* rather than of the work: nothing was even
+    /// asked to judge the task, and the next dispatch of the same task
+    /// succeeds as soon as a slot frees. Everything else — including
+    /// `Image`, a reference that does not resolve and will not resolve on the
+    /// next attempt either, and `Unspecified`, which is what a vm-pool
+    /// predating the field sends — stays a [`FailureClass::Verdict`]. Waiving
+    /// those is the retry-forever loop the attempt cap exists to stop, and
+    /// `Unspecified` charging is what keeps an *old* daemon (the routine case:
+    /// it is upgraded separately and restarted ahead of the server) from
+    /// silently waiving every permanent misconfiguration.
+    ///
+    /// **The `Transport => Verdict` arm is not a typo.**
+    /// [`ServiceErrorKind::Transport`] names vm-pool's own stdio link to a VM;
+    /// [`FailureClass::Transport`] names "nothing here judged the work". A
+    /// VM whose stdio broke is a VM that failed to run the work, and that is a
+    /// verdict-shaped fact about this dispatch.
+    ///
+    /// The match is exhaustive and explicit rather than `_ => Transport`, so a
+    /// kind added to vm-pool tomorrow cannot widen a waiver without somebody
+    /// deciding it here.
+    ///
+    /// **The waiver depends on something outside this function**, and the
+    /// dependency runs the other way to the obvious reading: separating
+    /// `Capacity` from `Image` on "whether the condition clears by itself" is
+    /// an *expectation* about capacity, not a property of it — a pool wedged
+    /// full by leaked VMs does not clear by itself either. What keeps a waived
+    /// refusal from becoming an unbounded retry is therefore not this arm but
+    /// `crate::pool_health`-shaped holding of dispatch in the host
+    /// (`tasks`: `pool_health::PoolHealth`, #967): with the attempt counter
+    /// waived, the hold is **mandatory rather than preferable**, because this
+    /// arm removes the backstop that used to stop the loop. Do not delete the
+    /// hold and keep the waiver.
+    pub fn for_service_error(kind: ServiceErrorKind) -> Self {
+        match kind {
+            ServiceErrorKind::Capacity => Self::Transport,
+            ServiceErrorKind::Unspecified
+            | ServiceErrorKind::NoSuchVm
+            | ServiceErrorKind::NotReady
+            | ServiceErrorKind::Image
+            | ServiceErrorKind::Runtime
+            // Not a typo — see this function's docs.
+            | ServiceErrorKind::Transport
+            | ServiceErrorKind::BadRequest
+            | ServiceErrorKind::Other => Self::Verdict,
         }
     }
 

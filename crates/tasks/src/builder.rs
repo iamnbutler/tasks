@@ -137,13 +137,26 @@ impl BuilderError {
             // changed is only which expiries reach this arm — the class is
             // unconditionally `Transport` and always was.
             Self::Suspended(_) => FailureClass::Transport,
-            // `Client(_)` stays a verdict deliberately, not by oversight.
+            // A refusal *from* vm-pool — it answered, and said which of its
+            // own conditions produced the "no". One statement of what that
+            // means, shared with the scout, so the two dispatchers cannot
+            // disagree about one refusal (#930). Behaviour-neutral here today:
+            // `Capacity` can only come from `allocate`, a build that failed at
+            // `allocate` has no `vm_id`, and
             // `Store::finalize_build_unsuccessfully` only charges `if
-            // started` (the row has a `vm_id`, set immediately after
-            // `allocate`), so this arm can only bite after a VM exists —
-            // whether that is really transport is a separate question with
-            // its own argument to make, and widening it silently here would
-            // decide it for the scout too.
+            // started`. Written anyway, because the disagreement is the
+            // hazard — the `if started` guard is a coincidence of where the
+            // failure lands rather than a decision anybody made about
+            // refusals.
+            Self::Client(ClientError::Service { kind, .. }) => {
+                FailureClass::for_service_error(*kind)
+            }
+            // Every *other* `Client(_)` stays a verdict deliberately, not by
+            // oversight. This arm can only bite after a VM exists (the row
+            // has a `vm_id`, set immediately after `allocate`) — whether that
+            // is really transport is a separate question with its own
+            // argument to make, and widening it silently here would decide it
+            // for the scout too.
             Self::Store(_) | Self::Client(_) | Self::GitHub(_) | Self::Timeout { .. } => {
                 FailureClass::Verdict
             }
@@ -1450,6 +1463,62 @@ mod tests {
     /// The negative half is not optional: this rule is a *cap*, and "nothing
     /// was charged" reads identically to the cap having been switched off
     /// unless something in the same test still gets charged.
+    /// #930's builder half. The bug is a scout bug and this dispatcher is
+    /// already spared by `Store::finalize_build_unsuccessfully`'s `if started`
+    /// guard, so this asserts a *classification* rather than a behaviour
+    /// change — which is the point. Two dispatchers giving different answers
+    /// about one refusal is how the next such bug gets written, and the guard
+    /// that spares this one is a coincidence of where the failure lands rather
+    /// than a decision anybody made about refusals.
+    #[test]
+    fn a_refused_allocation_reads_the_same_here_as_it_does_for_a_scout() {
+        use crate::scout::ScoutError;
+        use crate::store::Strike;
+        use vm_pool_protocol::ServiceErrorKind;
+
+        for kind in [
+            ServiceErrorKind::Capacity,
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            let refusal = |k| ClientError::Service {
+                message: "allocate failed".into(),
+                kind: k,
+            };
+            let here = BuilderError::Client(refusal(kind)).failure_class();
+            let there = ScoutError::Client(refusal(kind)).failure_class();
+            assert_eq!(here, there, "the two dispatchers disagree about {kind}");
+        }
+
+        // And the reading itself: a full pool is waived, a bad image is not.
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::Client(ClientError::Service {
+                    message: "allocate failed: pool exhausted".into(),
+                    kind: ServiceErrorKind::Capacity,
+                })
+                .failure_class()
+            ),
+            Strike::Waive,
+        );
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::Client(ClientError::Service {
+                    message: "allocate failed: no such image".into(),
+                    kind: ServiceErrorKind::Image,
+                })
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+    }
+
     #[test]
     fn a_closed_event_stream_is_transport_and_costs_the_batch_no_attempt() {
         use crate::store::Strike;
