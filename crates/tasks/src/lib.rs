@@ -34,6 +34,7 @@ pub mod scout;
 /// server reads them through (#971).
 pub mod secrets;
 pub mod server;
+pub mod service;
 pub mod store;
 mod teardown;
 pub mod transcript;
