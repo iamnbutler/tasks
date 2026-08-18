@@ -43,8 +43,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tasks::models::{
-    GhState, Mode, Project, ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Task,
-    TaskId, TaskState,
+    GhState, Mode, Project, ProjectId, ProjectStatus, RunKind, Session, SessionId, SessionStatus,
+    Task, TaskId, TaskState,
 };
 use tasks::pidfile;
 use tasks::store::Store;
@@ -267,6 +267,25 @@ async fn finish_session(data_dir: &Path, id: &SessionId) {
         .update_session_completion(id, SessionStatus::ScoutSucceeded, chrono::Utc::now(), None)
         .await
         .unwrap();
+}
+
+/// The `mode`-sourced notes on the feed, which is where a drain and a resume
+/// record their edges — the mode itself is the standing answer, and there is
+/// deliberately nothing between them.
+async fn drain_notes(data_dir: &Path) -> Vec<String> {
+    let store = Store::open(data_dir.join("tasks.db")).await.unwrap();
+    store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            tasks::events::EventPayload::Note { source, message } if source == "mode" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn wait_until_gone(pid: u32) {
@@ -909,4 +928,410 @@ async fn reload_with_nothing_running_is_just_a_start() {
     assert!(stdout.contains(&format!("pid {}", status.pid)), "{stdout}");
 
     cli(dir.path(), &["stop"]).await;
+}
+
+// --- the maintenance drain ---
+
+/// The deliverable: a pipeline that is quiesced *and stays that way*, so the
+/// operator can restart vm-pool or rebuild the images. The pause is the point
+/// here, not the tool — nothing follows a drain that could undo it.
+#[tokio::test]
+async fn a_drain_holds_dispatch_until_it_is_resumed() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+    let session = insert_running_session(dir.path()).await;
+
+    let data_dir = dir.path().to_path_buf();
+    let drain =
+        tokio::spawn(
+            async move { cli(&data_dir, &["drain", "--drain-timeout", DRAIN_TIMEOUT]).await },
+        );
+
+    // It pauses before it waits — without which the wait never terminates.
+    let mut paused = false;
+    for _ in 0..100 {
+        if mode(port).await == Mode::Pause {
+            paused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(paused, "the drain must pause dispatch or it never ends");
+    assert!(
+        pidfile::pid_alive(status.pid),
+        "a drain never signals the server: it has to be usable before a pool restart"
+    );
+
+    finish_session(dir.path(), &session).await;
+
+    let (code, stdout, stderr) = drain.await.unwrap();
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("stays paused until `tasks resume`"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("drained"), "{stdout}");
+    assert!(stdout.contains("quiesced"), "{stdout}");
+    assert!(stdout.contains("make images"), "{stdout}");
+    assert!(stdout.contains("tasks resume"), "{stdout}");
+
+    // Still serving, and still held.
+    assert!(pidfile::pid_alive(status.pid));
+    assert_eq!(
+        mode(port).await,
+        Mode::Pause,
+        "the hold outlives the command"
+    );
+
+    // The edge is on the feed, because the artifact it leaves behind is a
+    // `pause` nothing can tell from any other.
+    assert!(
+        drain_notes(dir.path())
+            .await
+            .iter()
+            .any(|n| n.contains("held for host maintenance")),
+        "{:?}",
+        drain_notes(dir.path()).await
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The deliberate inversion of `stop --when-idle`, which returns early without
+/// touching the mode: an idle pipeline nobody holds starts a scout on the next
+/// tick, straight into the pool that is about to go down.
+#[tokio::test]
+async fn a_drain_of_an_idle_pipeline_still_holds_it() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("paused dispatch"), "{stdout}");
+    assert_eq!(
+        mode(port).await,
+        Mode::Pause,
+        "an idle pipeline nobody holds dispatches on the next tick"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// A pipeline that is already not playing is left exactly as it is — `stop` is
+/// tighter than `pause`, so "pausing" it would quietly turn intake back on —
+/// and the closing words say which of the two happened.
+#[tokio::test]
+async fn a_drain_of_a_stopped_pipeline_changes_no_mode_and_says_so() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Stop).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("already not playing"), "{stdout}");
+    assert_eq!(mode(port).await, Mode::Stop, "stop is tighter than pause");
+    // Held all the same, and the feed says so.
+    assert!(
+        drain_notes(dir.path())
+            .await
+            .iter()
+            .any(|n| n.contains("held for host maintenance")),
+        "a drain that changed no mode still records why the pipeline is quiet"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// `--check` on the state `make images` is safe in: nothing in flight and
+/// dispatch not playing. It touches neither the mode nor any run.
+#[tokio::test]
+async fn a_check_passes_on_a_quiesced_pipeline_and_touches_nothing() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    assert_eq!(
+        mode(port).await,
+        Mode::Pause,
+        "the default on a fresh database"
+    );
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--check"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("quiesced"), "{stdout}");
+    // A check holds nothing, so it must not borrow the held drain's words.
+    assert!(!stdout.contains("tasks resume"), "{stdout}");
+    assert!(
+        drain_notes(dir.path()).await.is_empty(),
+        "a check records nothing"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The other half of the gate: work in flight is not quiesced, and the refusal
+/// names the command that waits it out.
+#[tokio::test]
+async fn a_check_refuses_work_in_flight() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    insert_running_session(dir.path()).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--check"]).await;
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("1 scout in flight"), "{stderr}");
+    assert!(stderr.contains("tasks drain"), "{stderr}");
+    assert_eq!(mode(port).await, Mode::Pause, "a check touches no mode");
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The important one. Nothing in flight is **not** enough: a *playing*
+/// pipeline tops scouts up on the dispatcher's next tick, so a multi-minute
+/// rebuild started here races it — and a scout that starts during a rebuild
+/// starts in the old image, which is the staleness the update hold exists to
+/// prevent and is the one case it cannot see.
+#[tokio::test]
+async fn a_check_refuses_a_playing_pipeline_with_nothing_in_flight() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--check"]).await;
+    assert_eq!(
+        code, 3,
+        "a playing pipeline is not quiesced\n{stdout}{stderr}"
+    );
+    assert!(stderr.contains("in flight  nothing") || stdout.contains("in flight  nothing"));
+    assert!(stderr.contains("tasks drain"), "{stderr}");
+    assert!(stderr.contains("old image"), "{stderr}");
+    assert_eq!(
+        mode(port).await,
+        Mode::Play,
+        "a check refuses; it does not hold"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// …and it passes with nothing serving, or the `make images` gate would only
+/// work on a host that happens to be running the server. No dispatcher means
+/// nothing that can start a container.
+#[tokio::test]
+async fn a_check_passes_with_nothing_serving() {
+    let dir = DataDir::new();
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--check"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("not serving"), "{stdout}");
+
+    // And so does the drain proper — there is nothing to hold.
+    let (code, stdout, stderr) = cli(dir.path(), &["drain"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("not serving"), "{stdout}");
+}
+
+/// A drain that gives up has quiesced nothing, and a no-op must not have side
+/// effects — least of all one whose whole purpose is to be relied on before
+/// something destructive.
+#[tokio::test]
+async fn a_drain_that_times_out_holds_nothing_and_puts_the_mode_back() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, status) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+    insert_running_session(dir.path()).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--drain-timeout", "1"]).await;
+    assert_eq!(code, 4, "a drain timeout has its own exit code\n{stderr}");
+    assert!(stderr.contains("not quiesced"), "{stderr}");
+    assert!(stderr.contains("do not restart vm-pool"), "{stderr}");
+    assert!(stdout.contains("waiting"), "{stdout}");
+    assert!(
+        !stdout.contains("make images"),
+        "nothing was held: {stdout}"
+    );
+
+    assert!(pidfile::pid_alive(status.pid), "a drain signals nothing");
+    assert_eq!(mode(port).await, Mode::Play, "the mode was put back");
+    assert!(
+        drain_notes(dir.path())
+            .await
+            .iter()
+            .any(|n| n.contains("nothing is held")),
+        "the unwind is an edge too: {:?}",
+        drain_notes(dir.path()).await
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The one refusal that is not about the pipeline's state: a live pid that
+/// will not answer cannot be waited on, and "quiesced" about a server we
+/// cannot see into is the wrong direction to be wrong in.
+///
+/// A bare `tempdir` rather than [`DataDir`] on purpose — `DataDir::drop`
+/// SIGKILLs whatever the pidfile names, and that is this test process.
+#[tokio::test]
+async fn a_drain_against_a_server_that_will_not_answer_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port().await;
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "port": port,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "exe": tasks_bin(),
+    });
+    std::fs::write(
+        pidfile::path(dir.path()),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+
+    for args in [vec!["drain"], vec!["drain", "--check"]] {
+        let (code, stdout, stderr) = cli(dir.path(), &args).await;
+        assert_eq!(code, 3, "{args:?}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("not answering /status"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("Do not restart vm-pool or rebuild images yet"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(
+        pidfile::pid_alive(std::process::id()),
+        "a refusal must not signal anything"
+    );
+}
+
+/// They say opposite things about whether anything is touched, so whichever
+/// way it fell, half the people who typed both would get the opposite of what
+/// they asked for.
+#[tokio::test]
+async fn check_and_cancel_scouts_together_are_refused() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["drain", "--check", "--cancel-scouts"]).await;
+    assert_ne!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("contradict"), "{stderr}");
+    assert_eq!(
+        mode(port).await,
+        Mode::Play,
+        "a usage error touches nothing"
+    );
+
+    // And an unknown flag stays an error, rather than meaning "proceed".
+    let (code, _, stderr) = cli(dir.path(), &["drain", "--cancel-builds"]).await;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// `--cancel-scouts` routes through the API — a durable `cancellations` row
+/// the dispatcher following the run reads — rather than removing the VM (#876).
+///
+/// And it does **not** guarantee the drain point arrives: nothing is following
+/// this session (vm-pool is unreachable in these tests, exactly as it would be
+/// mid-restart), so the wait still runs out and this exits 4. That is the
+/// honest answer — the drain promises the pipeline is quiesced, and it cannot
+/// promise that about a VM nobody is watching.
+#[tokio::test]
+async fn cancel_scouts_records_the_request_and_still_waits_for_the_run() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+    let session = insert_running_session(dir.path()).await;
+
+    let (code, stdout, stderr) = cli(
+        dir.path(),
+        &["drain", "--cancel-scouts", "--drain-timeout", "1"],
+    )
+    .await;
+    assert_eq!(code, 4, "nothing is following the run\n{stdout}{stderr}");
+    assert!(stdout.contains("asked scout"), "{stdout}");
+    assert!(stdout.contains(session.as_str()), "{stdout}");
+
+    let store = Store::open(dir.path().join("tasks.db")).await.unwrap();
+    let request = store
+        .pending_cancel(RunKind::Session, session.as_str())
+        .await
+        .unwrap()
+        .expect("a durable cancellation row");
+    assert!(
+        request
+            .rationale
+            .as_deref()
+            .unwrap_or_default()
+            .contains("maintenance"),
+        "the rationale lands in the run's exit_reason: {request:?}"
+    );
+    assert_eq!(
+        mode(port).await,
+        Mode::Play,
+        "the timeout put the mode back"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// The undo, and the only thing that is: nothing resumes automatically,
+/// because only the operator knows the pool is back and the images are built.
+#[tokio::test]
+async fn resume_releases_the_hold_and_reports_what_it_found() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let (code, _, stderr) = cli(dir.path(), &["drain"]).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(mode(port).await, Mode::Pause);
+
+    let (code, stdout, stderr) = cli(dir.path(), &["resume"]).await;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("was pause"), "{stdout}");
+    assert_eq!(mode(port).await, Mode::Play);
+    assert!(
+        drain_notes(dir.path())
+            .await
+            .iter()
+            .any(|n| n.contains("hold is released")),
+        "both edges are on the feed: {:?}",
+        drain_notes(dir.path()).await
+    );
+
+    // An unknown argument is an error, and nothing serving is exit 1: there is
+    // no mode to write, and claiming otherwise would report a hold released
+    // that nothing is holding.
+    let (code, _, stderr) = cli(dir.path(), &["resume", "--now"]).await;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+
+    cli(dir.path(), &["stop"]).await;
+    let _ = server.start_kill();
+    let (code, stdout, _) = cli(dir.path(), &["resume"]).await;
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("not serving"), "{stdout}");
 }

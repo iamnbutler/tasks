@@ -2,8 +2,9 @@
 //!
 //! `serve` runs the server (GitHub poller + scout dispatcher + HTTP control
 //! API — see [`tasks::run`]); `reload` / `status` / `stop` are the upgrade
-//! loop around it (see [`tasks::reload`]); `add-project` writes straight to
-//! the store. Everything else is driven over the API — see [`tasks::server`]
+//! loop around it and `drain` / `resume` the one for host work the server
+//! itself cannot do (all in [`tasks::reload`]); `add-project` writes straight
+//! to the store. Everything else is driven over the API — see [`tasks::server`]
 //! for the route list.
 
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use chrono::Utc;
 
 use tasks::events::EventPayload;
 use tasks::models::{Project, ProjectId, ProjectStatus};
-use tasks::reload::{self, ReloadOptions, StopOptions};
+use tasks::reload::{self, DrainOptions, ReloadOptions, StopOptions};
 use tasks::run::{self, Config};
 use tasks::store::Store;
 
@@ -29,6 +30,10 @@ usage:
                                 new binary (alias: restart)
   tasks status                  who is serving, since when, what is in flight
   tasks stop [flags]            SIGTERM the running server and wait for it
+  tasks drain [flags]           quiesce the pipeline for host maintenance
+                                (a vm-pool restart, `make images`) and hold
+                                dispatch until `tasks resume`
+  tasks resume                  release that hold: dispatch plays again
   tasks add-project <owner/repo>  track a GitHub repository
   tasks vm-pool                 run the vm-pool service specialized for
                                 scouts (ContainerRuntime + TasksProtocol)
@@ -61,6 +66,20 @@ stop flags:
 stop exit codes:
   3 --when-idle against a server that will not say what is in flight
   4 drain timed out (nothing was stopped)
+
+drain flags:
+  --check                       report whether the pipeline is quiesced and
+                                exit, touching neither the mode nor any run
+                                (this is what `make images` gates on)
+  --cancel-scouts               cancel running scouts instead of waiting them
+                                out; never the default, and refused together
+                                with --check
+  --drain-timeout SECS          how long to wait for the drain point
+                                (default 3900)
+
+drain exit codes:
+  3 not quiesced: work in flight, dispatch playing, or a server that will not
+    say   4 the drain timed out (nothing is held; the mode was put back)
 
 environment (also read from .env — the data dir's, then the nearest one at or
 above the cwd, then the nearest above this binary; the real environment wins):
@@ -148,6 +167,49 @@ exit codes: 3 --when-idle against a server that will not say what is in
 flight   4 drain timed out (nothing was stopped)
 ";
 
+const DRAIN_USAGE: &str = "\
+usage: tasks drain [flags]
+
+Quiesce the pipeline for host maintenance — restarting vm-pool, or rebuilding
+the VM images with `make images` — and KEEP it held. Pause dispatch, wait for
+in-flight scouts and builds to land, and leave dispatch paused until
+`tasks resume` says otherwise.
+
+  --check                 report whether the pipeline is quiesced and exit.
+                          Touches neither the mode nor any run; passes with
+                          nothing serving, refuses a playing pipeline even
+                          with nothing in flight (the dispatcher tops scouts
+                          up on its next tick)
+  --cancel-scouts         cancel running scouts rather than waiting them out.
+                          Opt-in and never the default: waiting costs time,
+                          cancelling costs work. A cancel is a request the
+                          dispatcher following the run concludes, so this
+                          still waits for the drain point
+  --drain-timeout SECS    how long to wait for the drain point (default 3900)
+
+--check and --cancel-scouts are refused together: they say opposite things
+about whether anything is touched.
+
+The server keeps serving throughout — a drain is neither a stop nor a reload,
+which is what makes it usable before a *pool* restart.
+
+exit codes: 3 not quiesced (work in flight, dispatch playing, or a server that
+will not say)   4 the drain timed out (nothing is held)
+";
+
+const RESUME_USAGE: &str = "\
+usage: tasks resume
+
+Release the hold `tasks drain` left behind: set the mode back to play. Takes
+no arguments, and reports the mode it found — a drain of a stopped pipeline
+holds it without rewriting the mode, so resuming one is a promotion.
+
+Nothing resumes automatically: only the operator knows vm-pool is back up and
+the images are rebuilt.
+
+Exits 1 when nothing is serving — there is no mode to write.
+";
+
 const ADD_PROJECT_USAGE: &str = "\
 usage: tasks add-project <owner/repo>
 
@@ -164,6 +226,11 @@ usage: tasks vm-pool
 Run the vm-pool daemon specialized for Tasks (ContainerRuntime +
 TasksProtocol) on VM_POOL_SOCKET (default /tmp/vm-pool.sock). Takes no
 arguments; runs in the foreground until killed.
+
+Run `tasks drain` before restarting a pool that is already up: the daemon
+that takes the socket stops the containers its predecessor left running, off
+the orphan ledger, and the scouts and builds inside them are nobody's to
+recover.
 
 It REFUSES to start when something is already listening on that socket,
 rather than taking the path over: the incumbent would go on holding its VMs
@@ -197,6 +264,8 @@ fn usage_for(command: &str) -> &'static str {
         "reload" | "restart" => RELOAD_USAGE,
         "status" => STATUS_USAGE,
         "stop" => STOP_USAGE,
+        "drain" => DRAIN_USAGE,
+        "resume" => RESUME_USAGE,
         "add-project" => ADD_PROJECT_USAGE,
         "vm-pool" => VM_POOL_USAGE,
         _ => USAGE,
@@ -250,6 +319,8 @@ async fn dispatch() -> Result<()> {
         Some("reload") | Some("restart") => reload_cmd(&args[1..]).await,
         Some("status") => status_cmd(&args[1..]).await,
         Some("stop") => stop_cmd(&args[1..]).await,
+        Some("drain") => drain_cmd(&args[1..]).await,
+        Some("resume") => resume_cmd(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
         Some("vm-pool") => vm_pool(&args[1..]).await,
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -383,6 +454,77 @@ async fn stop_cmd(args: &[String]) -> Result<()> {
         Ok(None) => {
             println!("not serving");
             Ok(())
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(err.exit_code());
+        }
+    }
+}
+
+/// `tasks drain`: quiesce the pipeline and hold it, for host work this
+/// process cannot do — a vm-pool restart, or `make images`.
+///
+/// `--check` and `--cancel-scouts` together are a **refusal** rather than a
+/// precedence rule: they say opposite things about whether anything is
+/// touched, so whichever way it fell, half the people who typed both would get
+/// the opposite of what they asked for.
+async fn drain_cmd(args: &[String]) -> Result<()> {
+    let data_dir = run::data_dir()?;
+    let mut opts = DrainOptions::default();
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--check" => opts.check = true,
+            "--cancel-scouts" => opts.cancel_scouts = true,
+            "--drain-timeout" => {
+                let raw = rest.next().context("--drain-timeout requires a value")?;
+                opts.drain_timeout = Duration::from_secs(
+                    raw.parse()
+                        .with_context(|| format!("not a number of seconds: {raw}"))?,
+                );
+            }
+            other => bail!("unexpected argument: {other}"),
+        }
+    }
+    if opts.check && opts.cancel_scouts {
+        bail!(
+            "--check and --cancel-scouts contradict each other: --check touches nothing, \
+             --cancel-scouts stops running work. Pick one.\n\n{DRAIN_USAGE}"
+        );
+    }
+
+    match reload::drain_for_maintenance(&data_dir, opts).await {
+        Ok(drained) => {
+            let closing = reload::render_quiesced(&drained);
+            if !closing.is_empty() {
+                println!("{closing}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(err.exit_code());
+        }
+    }
+}
+
+/// `tasks resume`: give the pipeline back. Exits 1 with nothing serving —
+/// there is no mode to write, and reporting success would claim a hold was
+/// released that nothing is holding.
+async fn resume_cmd(args: &[String]) -> Result<()> {
+    if let Some(other) = args.first() {
+        bail!("unexpected argument: {other}\n\n{RESUME_USAGE}");
+    }
+    match reload::resume(&run::data_dir()?).await {
+        Ok(Some((port, was))) => {
+            println!("dispatch resumed on port {port} (was {})", was.as_str());
+            Ok(())
+        }
+        Ok(None) => {
+            println!("not serving — there is no mode to resume");
+            std::process::exit(1);
         }
         Err(err) => {
             eprintln!("{err}");

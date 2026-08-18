@@ -614,11 +614,59 @@ implementation.
   upgrade one run may start in a genuinely stale image — it reports the fact
   and closes the gate behind itself. In-flight
   work runs on, queued work stays queued, nothing is charged an attempt; the
-  transition is announced once by the watch and `/status`/`tasks status`
-  carry the standing answer with each reason naming its own discharge.
+  transition is announced once per edge by the watch — in the log **and as an
+  `EventPayload::Note` on the event feed**, the same shape `GitHubWatch::observe`
+  uses, since a hold announced only to a terminal that has scrolled away is one
+  nobody arriving later can see — while `/status`/`tasks status`
+  carry the standing answer with each reason naming its own discharge. A `Note`
+  and not an obligation, for the reason `ObligationKind::StaleImage` does not
+  exist: the orchestrator can no more run `make images` than it can fix GitHub.
   `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate; anything else
   non-`on` refuses to boot. The hold sits beside `github_hold` at the same two
   gates, ahead of the claim, for the same claim-then-refuse reason.
+- **The two host acts get a drain, and its deliverable is a hold that
+  outlives the command.** The hold-new-work half of #961 is `UpdateWatch` above
+  and the kill-active-work half is `POST /runs/cancel-all`; the middle — waiting
+  for what is already running to *land* — is `tasks drain`, and it exists
+  because `tasks reload` is the only one of the three ways this pipeline gets
+  upgraded that could ever afford to be ungated. A reload re-attaches to every
+  live VM (`resume_in_flight`), and has had a gate since it was written anyway.
+  Restarting **vm-pool** on the same socket has no such recovery — the successor
+  stops its predecessor's containers off the orphan ledger, which is #961's three
+  orphans — and **`make images`** has none either. What a `container build` does
+  to a container that is already running is **not established here and is
+  deliberately not written down as though it were**; the checkable reason the
+  rebuild is gated is the other one: a scout dispatched while the rebuild is in
+  flight starts in the **old** image, which is exactly the #909 staleness
+  `UpdateWatch` exists to prevent and the one case it cannot see, since the
+  identity it reads is only ever observed from a run that has already started.
+  So: pause dispatch, wait for the drain point, and **keep holding** until
+  `tasks resume`. Four things are load-bearing. **Mode `pause` is the hold** —
+  no fourth thing to keep in step beside `github_hold` and `update_hold`, and
+  #961 §2's own instruction to extend the existing drain rather than stand a
+  parallel one beside it; `reload.rs` splits `drain` into `pause_dispatch` +
+  `wait_for_drain_point` so there is still one wait loop and one pause rule in
+  the binary, with `--cancel-scouts`' cancels in the gap between them (cancel
+  first and the dispatcher starts a replacement within the tick). **It pauses an
+  idle pipeline too**, the deliberate inversion of `stop --when-idle`, which
+  returns early without touching the mode: an idle pipeline nobody holds starts
+  a scout on the next tick, into the pool that is about to go down. **`--check`
+  refuses a *playing* pipeline, not only a busy one**, for that same reason —
+  it is what `make images` gates on, and passing an idle-but-playing server
+  would let the rebuild race the next tick; nothing serving passes untouched,
+  because no dispatcher means nothing that can start a container, and `FORCE=1`
+  is the escape hatch. And **the edge goes on the feed**: what a drain leaves
+  behind is a `pause` byte-identical to a human's, so `POST /mode` takes an
+  optional `note` and the drain, its timeout unwind and `tasks resume` each
+  append one. There is deliberately **nothing between the edge and the mode** —
+  no persisted "held for maintenance" field, which would be the fourth hold
+  again. Two limits are stated rather than implied: a drain never signals the
+  server (the API keeps serving, which is what makes it usable *before* a pool
+  restart), and `--cancel-scouts` cannot guarantee the drain point — a cancel
+  is a durable row the *dispatcher following the run* concludes, so a run
+  nothing is following runs the wait out to the timeout, which is why the
+  output repeats the server's own `CancelAck.concluded` rather than flattening
+  "asked" and "stopped" into one word.
 
 ## Project structure
 
@@ -689,9 +737,17 @@ make restart                           # build, take over, background it
 make restart RELOAD=--when-idle        # ...but wait out in-flight scouts first
 make status / make stop
 make stop STOP=--when-idle             # ...but wait out in-flight scouts first
+make drain                             # quiesce the pipeline and HOLD it, for
+                                       #   host work (a vm-pool restart,
+                                       #   `make images`); undo with make resume
+make drain DRAIN=--cancel-scouts       # ...stopping running scouts rather than
+                                       #   waiting them out
+make resume                            # release that hold
 cargo run -p tasks -- add-project owner/repo
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
+                                       #   (gated on `tasks drain --check`;
+                                       #   FORCE=1 skips the gate)
 make images-check                      # boot each image, read `--version` back
 make verify-warm                       # prime the orchestrator's build directory
 make test                              # see Tests below
@@ -699,7 +755,10 @@ make test                              # see Tests below
 
 `make images` is the whole deployment step for anything inside a VM — a
 supervisor fix reaches nothing until someone runs it on a Mac with
-apple/container and the cross toolchain. `images-check` (which `images` ends by
+apple/container and the cross toolchain. It now runs `tasks drain --check`
+first (`make check-quiesced`), because a scout dispatched into the middle of a
+rebuild starts in the *old* image: the workflow is `make drain` → `make images`
+→ `make resume`, and `FORCE=1 make images` is for someone who knows better. `images-check` (which `images` ends by
 invoking) is the only reading available in the window between a rebuild and the
 first run in the new image; everywhere else, the identity is observed from the
 runs themselves. Until the images are rebuilt, `unstamped` / "PREDATES
@@ -1012,9 +1071,10 @@ gated: `reattach::attach_support` asks `status` once per boot and reads the
 too old, unanswerable, or unreachable — `ResumedWork` membership is a promise
 to conclude the row, so a claim made against a pool that cannot decode `attach`
 would fail the run rather than lose the stream. The remaining cost is the
-one-time restart itself: whatever vm-pool is holding is lost once (the event
-log is in memory), and the VMs it leaves running are stopped by the pool that
-takes the socket next, off the ledger the old one wrote — that is the orphan
+one-time restart itself, and it is what `tasks drain` is for: whatever vm-pool
+is holding is lost once (the event log is in memory), and the VMs it leaves
+running are stopped by the pool that takes the socket next, off the ledger the
+old one wrote — that is the orphan
 half of *Pool capacity* above, and it is why the restarted pool is the thing
 that cleans up rather than the server's own sweep, which never sees them.
 `dispatch_loop` logs the skew on every connect, because the bill

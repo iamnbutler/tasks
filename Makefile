@@ -31,13 +31,17 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         check-nextest test-bins test test-ci test-cargo app run \
         check-darwin app-build app-stop app-install \
         app-check app-stubs app-test \
-        server serve restart status stop migration verify-warm
+        server serve restart status stop drain resume check-quiesced \
+        migration verify-warm
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
 RELOAD ?=
 # ...and for `stop`, deliberately a separate variable: `stop` rejects --force
 # and --no-build, so one shared variable would turn a typo into a usage error.
 STOP ?=
+# ...and for `drain`, for the same reason again: its flags are its own
+# (--check, --cancel-scouts) and no other target accepts them.
+DRAIN ?=
 TASKS_BIN := $(CARGO_TARGET_DIR)/debug/tasks
 
 # The build identity stamped into every artifact this Makefile installs:
@@ -261,6 +265,37 @@ status: server
 stop: server
 	@$(TASKS_BIN) stop $(STOP)
 
+# Quiesce the pipeline for host work this repo's own tooling has to do to the
+# machine rather than to the server: restarting vm-pool (the successor stops
+# its predecessor's containers off the orphan ledger) and `make images`.
+# Neither is something `tasks reload` covers, because a reload re-attaches to
+# every live VM and these do not.
+#
+# `make drain DRAIN=--cancel-scouts` stops running scouts instead of waiting
+# them out. The hold outlives the command: `make resume` is what gives it back.
+drain: server
+	@$(TASKS_BIN) drain $(DRAIN)
+
+resume: server
+	@$(TASKS_BIN) resume
+
+# The gate `make images` runs before it rebuilds anything, and the reason it
+# is not merely advisory: a scout dispatched while the rebuild is in flight
+# starts in the OLD image — the #909 staleness the update hold exists to
+# prevent, and the one case it cannot see, since the identity it reads is only
+# ever observed from a run that has already started.
+#
+# It passes with nothing serving (no dispatcher, nothing that can start a
+# container), and refuses a *playing* pipeline even with nothing in flight,
+# because the dispatcher tops scouts up on its next tick. FORCE=1 is the
+# escape hatch for someone who knows better.
+check-quiesced: server
+	@if [ -n "$(FORCE)" ]; then \
+		echo "FORCE=$(FORCE): skipping the drain check"; \
+	else \
+		$(TASKS_BIN) drain --check; \
+	fi
+
 # Prime the orchestrator's verification build directory, so the first merge
 # decision it makes is not also the first cold build.
 #
@@ -381,8 +416,15 @@ image-builder: image-agent builder-supervisor-linux
 	container build -t builder:v1 images/builder
 	rm -f images/builder/builder-supervisor
 
-images: image-scout image-builder
-	@$(MAKE) images-check
+# Sub-makes rather than prerequisites, for the reason `app`, `run` and
+# `images-check` already give: `make -j` gives prerequisites no ordering at
+# all, and every property of this sequence is an ordering. The gate has to run
+# *before* the build, or it is checking the state the rebuild already raced.
+images:
+	@$(MAKE) --no-print-directory check-quiesced
+	@$(MAKE) --no-print-directory image-scout
+	@$(MAKE) --no-print-directory image-builder
+	@$(MAKE) --no-print-directory images-check
 
 # Boot each image and read `--version` out of it.
 #
