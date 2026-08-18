@@ -8,7 +8,7 @@
 //! handle's own hitbox immediately).
 
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, App, MouseDownEvent, Pixels, Window};
+use gpui::{div, px, AnyElement, App, Hsla, MouseDownEvent, Pixels, Window};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use smallvec::SmallVec;
 
@@ -117,6 +117,7 @@ type ResizeStartHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + '
 pub struct Sidebar {
     side: SidebarSide,
     width: Pixels,
+    background: Option<Hsla>,
     children: SmallVec<[AnyElement; 4]>,
     on_resize_start: Option<ResizeStartHandler>,
 }
@@ -125,12 +126,21 @@ pub fn sidebar(side: SidebarSide, width: Pixels) -> Sidebar {
     Sidebar {
         side,
         width,
+        background: None,
         children: SmallVec::new(),
         on_resize_start: None,
     }
 }
 
 impl Sidebar {
+    /// Override the panel background. Default is `theme.surface()` — the
+    /// rail's raised tone; the chat pane sits on the window background per
+    /// the design, and passes it here.
+    pub fn background(mut self, color: Hsla) -> Self {
+        self.background = Some(color);
+        self
+    }
+
     pub fn child(mut self, child: impl IntoElement) -> Self {
         self.children.push(child.into_any_element());
         self
@@ -185,7 +195,7 @@ impl RenderOnce for Sidebar {
             .flex_none()
             .h_full()
             .overflow_hidden()
-            .bg(theme.surface())
+            .bg(self.background.unwrap_or_else(|| theme.surface()))
             .map(|el| match side {
                 SidebarSide::Left => el.border_r_1(),
                 SidebarSide::Right => el.border_l_1(),

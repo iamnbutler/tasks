@@ -830,6 +830,64 @@ pub struct OrchestratorSessionInfo {
     /// over — never compare it against one, and never render it as "context
     /// used".
     pub tick_tokens: Option<i64>,
+    /// The model the session's main chain last ran on, as the agent's own wire
+    /// id (`claude-opus-5[1m]`). Never derived from configuration:
+    /// `ORCHESTRATOR_CMD` may name no model at all, and the agent's default is
+    /// the agent's to choose.
+    pub model_id: Option<String>,
+    /// That model's context window, in tokens — the denominator
+    /// [`Self::context_tokens`] is read against, as reported by the agent
+    /// rather than as a table in our code. `None` until a tick has run under a
+    /// model that reports one, and a client with no window must show the
+    /// tokens alone rather than inventing a percentage.
+    pub context_window: Option<i64>,
+    /// How [`Self::context_tokens`] is made up. Same record, so the parts sum
+    /// to the whole.
+    pub context_breakdown: Option<ContextBreakdown>,
+    /// How many times this session has been compacted, and when it last was.
+    ///
+    /// Compaction happens *inside* the agent and keeps the session id, so
+    /// nothing else here distinguishes it from a turn that simply held less:
+    /// the gauge just reads lower. This is the record that it fired.
+    ///
+    /// `0` means "none counted", which is not the same as "never happened" —
+    /// a session that predates this counter carries its earlier compactions
+    /// only in the server log. So a client shows the count when there is one
+    /// and shows *nothing* when there isn't, rather than rendering a zero as
+    /// "never".
+    pub compactions: i64,
+    pub last_compacted_at: Option<DateTime<Utc>>,
+}
+
+/// What a context reading is made of: the input side of one model call, split
+/// by how each token was paid for.
+///
+/// The three sum to `context_tokens`. They are the same tokens as far as the
+/// *window* is concerned — which is why the gauge adds them — and entirely
+/// different tokens as far as the bill is concerned, which is why they are
+/// kept apart. On a long resumed session `cache_read` is nearly all of it, so
+/// a client that showed `input` alone would report a 400k session as holding
+/// a few thousand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    /// Fresh tokens, sent and billed in full this call.
+    pub input: i64,
+    /// Served from the prompt cache.
+    pub cache_read: i64,
+    /// Written into the cache by this call.
+    pub cache_creation: i64,
+}
+
+impl ContextBreakdown {
+    /// What the context window sees: every input-side token, cached or not.
+    ///
+    /// This is the same number as `OrchestratorSessionInfo::context_tokens`,
+    /// which is why that field is authoritative and this is a convenience — a
+    /// client rendering the parts should not have to add them back up to draw
+    /// the whole.
+    pub fn total(&self) -> i64 {
+        self.input + self.cache_read + self.cache_creation
+    }
 }
 
 /// Something the pipeline is owed, computed from its state.

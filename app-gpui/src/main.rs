@@ -2,6 +2,7 @@ mod about;
 mod chat_log;
 mod commands;
 mod components;
+mod context_gauge;
 mod feed;
 mod issue_composer;
 mod menus;

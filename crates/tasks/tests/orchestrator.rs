@@ -453,14 +453,23 @@ async fn usage_separates_context_size_from_what_the_tick_spent() {
             "\n",
             // The last main-chain turn — this is the reading that counts.
             r#"{"type":"assistant","parent_tool_use_id":null,"message":"#,
-            r#"{"content":[],"usage":{"input_tokens":1200,"#,
+            r#"{"model":"claude-opus-5","content":[],"usage":{"input_tokens":1200,"#,
             r#""cache_read_input_tokens":180000,"cache_creation_input_tokens":800,"#,
             r#""output_tokens":450}}}"#,
             "\n",
-            // And the invocation's aggregate bill.
+            // A compaction that landed, mid-tick.
+            r#"{"type":"system","subtype":"status","status":null,"#,
+            r#""compact_result":"ok"}"#,
+            "\n",
+            // And the invocation's aggregate bill, with each model's own
+            // window: the sub-agent's is smaller and is not ours.
             r#"{"type":"result","subtype":"success","result":"ok","usage":"#,
             r#"{"input_tokens":2000,"cache_read_input_tokens":2700000,"#,
-            r#""output_tokens":9000}}"#,
+            r#""output_tokens":9000},"modelUsage":{"#,
+            r#""claude-opus-5[1m]":{"contextWindow":1000000,"#,
+            r#""canonicalModel":"claude-opus-5"},"#,
+            r#""claude-haiku-4-5-20251001":{"contextWindow":200000,"#,
+            r#""canonicalModel":"claude-haiku-4-5-20251001"}}}"#,
             "\n",
         ),
     )
@@ -504,6 +513,21 @@ async fn usage_separates_context_size_from_what_the_tick_spent() {
         Some(2_702_000),
         "the result aggregate is what the tick spent, kept under its own name"
     );
+    // The denominator is transcribed from the agent, and from the entry for
+    // the model the main chain ran on — not the sub-agent's 200k.
+    assert_eq!(info.model_id.as_deref(), Some("claude-opus-5[1m]"));
+    assert_eq!(info.context_window, Some(1_000_000));
+    let parts = info.context_breakdown.expect("the parts of that reading");
+    assert_eq!(parts.input, 1_200);
+    assert_eq!(parts.cache_read, 180_000);
+    assert_eq!(parts.cache_creation, 800);
+    assert_eq!(
+        parts.total(),
+        info.context_tokens.unwrap(),
+        "the parts have to sum to the whole they are shown beside"
+    );
+    assert_eq!(info.compactions, 1);
+    assert!(info.last_compacted_at.is_some());
     // The reply itself is attributed to the session that produced it.
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.last().unwrap().content, "ok");
@@ -522,6 +546,11 @@ async fn usage_separates_context_size_from_what_the_tick_spent() {
     let info = store.orchestrator_session_info().await.unwrap();
     assert_eq!(info.context_tokens, Some(182_000));
     assert_eq!(info.tick_tokens, Some(2_702_000));
+    // Everything the second tick was silent about holds its last real value,
+    // and the compaction count in particular does not restart.
+    assert_eq!(info.model_id.as_deref(), Some("claude-opus-5[1m]"));
+    assert_eq!(info.context_window, Some(1_000_000));
+    assert_eq!(info.compactions, 1);
 }
 
 /// The regression test for #826, and deliberately end-to-end: a stub agent

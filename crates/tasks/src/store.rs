@@ -17,13 +17,14 @@ use crate::github::GhIssue;
 use crate::migrations::MIGRATOR;
 use crate::models::{
     Actor, Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel, ChatRole,
-    CloseReason, Complexity, Decision, DecisionAction, DecisionInput, Directions, GhState, Mode,
-    Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSession,
-    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ReviewedSpec, RunKind, ScoutNotes,
-    Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec, SpecId,
-    SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
-    TranscriptOwner, TranscriptStream,
+    CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput, Directions,
+    GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent, OrchestratorMessage,
+    OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ReviewedSpec,
+    RunKind, ScoutNotes, Session, SessionEndReason, SessionId, SessionStatus, SessionUsage, Spec,
+    SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    TranscriptLine, TranscriptOwner, TranscriptStream,
 };
+use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
 use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
 use tasks_api::version::{ImageFreshness, ImageIdentity, ImageRole};
@@ -4318,23 +4319,44 @@ impl Store {
     /// Each column is written with `COALESCE`, so a `None` stalls that gauge
     /// rather than clearing it: an agent that isn't reporting usage at all (a
     /// plain-text agent, a test stub) must not erase the last real reading.
+    /// The breakdown columns are written from the same `Option` as the total,
+    /// so a stalled gauge stalls whole rather than leaving parts that no
+    /// longer sum to it.
+    ///
+    /// The compaction counter is the one thing here that accumulates, because
+    /// it is the only one that is an *event* rather than a reading: every
+    /// other column answers "what is it now", and this one answers "has this
+    /// ever happened, and when".
     pub async fn record_orchestrator_usage(
         &self,
         cc_session_id: &str,
-        context_tokens: Option<i64>,
-        tick_tokens: Option<i64>,
+        usage: &TurnUsage,
     ) -> Result<(), StoreError> {
-        if context_tokens.is_none() && tick_tokens.is_none() {
+        if usage == &TurnUsage::default() {
             return Ok(());
         }
         sqlx::query(
             "UPDATE orchestrator_sessions \
              SET last_context_tokens = COALESCE(?, last_context_tokens), \
-                 last_tick_tokens = COALESCE(?, last_tick_tokens) \
+                 last_tick_tokens = COALESCE(?, last_tick_tokens), \
+                 last_input_tokens = COALESCE(?, last_input_tokens), \
+                 last_cache_read_tokens = COALESCE(?, last_cache_read_tokens), \
+                 last_cache_creation_tokens = COALESCE(?, last_cache_creation_tokens), \
+                 model_id = COALESCE(?, model_id), \
+                 context_window = COALESCE(?, context_window), \
+                 compactions = compactions + ?, \
+                 last_compacted_at = COALESCE(?, last_compacted_at) \
              WHERE cc_session_id = ?",
         )
-        .bind(context_tokens)
-        .bind(tick_tokens)
+        .bind(usage.context_tokens)
+        .bind(usage.tick_tokens)
+        .bind(usage.context_breakdown.map(|b| b.input))
+        .bind(usage.context_breakdown.map(|b| b.cache_read))
+        .bind(usage.context_breakdown.map(|b| b.cache_creation))
+        .bind(usage.model_id.as_deref())
+        .bind(usage.context_window)
+        .bind(i64::from(usage.compacted))
+        .bind(usage.compacted.then(|| Utc::now().to_rfc3339()))
         .bind(cc_session_id)
         .execute(&self.pool)
         .await?;
@@ -4367,11 +4389,27 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens,                     s.last_tick_tokens              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens,                     s.last_tick_tokens, s.last_input_tokens, s.last_cache_read_tokens,                     s.last_cache_creation_tokens, s.model_id, s.context_window,                     s.compactions, s.last_compacted_at              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
         let checked_out_at: Option<String> = row.try_get("checked_out_at")?;
+        let last_compacted_at: Option<String> = row.try_get("last_compacted_at")?;
+        // All three or none: they are written from one `Option` and only mean
+        // anything as a set, since what makes them useful is that they sum to
+        // the total shown beside them.
+        let context_breakdown = match (
+            row.try_get("last_input_tokens")?,
+            row.try_get("last_cache_read_tokens")?,
+            row.try_get("last_cache_creation_tokens")?,
+        ) {
+            (Some(input), Some(cache_read), Some(cache_creation)) => Some(ContextBreakdown {
+                input,
+                cache_read,
+                cache_creation,
+            }),
+            _ => None,
+        };
         Ok(OrchestratorSessionInfo {
             cc_session_id: row.try_get("cc_session_id")?,
             workdir: row.try_get("workdir")?,
@@ -4380,6 +4418,16 @@ impl Store {
                 .is_some_and(checkout_heartbeat_fresh),
             context_tokens: row.try_get("last_context_tokens")?,
             tick_tokens: row.try_get("last_tick_tokens")?,
+            model_id: row.try_get("model_id")?,
+            context_window: row.try_get("context_window")?,
+            context_breakdown,
+            // The LEFT JOIN misses entirely before the first session exists,
+            // and a NULL count is zero compactions either way.
+            compactions: row.try_get::<Option<i64>, _>("compactions")?.unwrap_or(0),
+            last_compacted_at: last_compacted_at
+                .as_deref()
+                .map(|ts| parse_ts(ts, "last_compacted_at"))
+                .transpose()?,
         })
     }
 
