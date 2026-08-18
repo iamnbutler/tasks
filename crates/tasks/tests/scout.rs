@@ -17,8 +17,8 @@ use chrono::Utc;
 use vm_pool_protocol::VmConfig;
 
 use tasks::models::{
-    DecisionInput, GhState, Project, ProjectId, ProjectStatus, SessionStatus, SpecQueueStatus,
-    Task, TaskId, TaskState,
+    DecisionInput, GhState, Project, ProjectId, ProjectStatus, SessionId, SessionStatus,
+    SpecQueueStatus, Task, TaskId, TaskState,
 };
 use tasks::scout::{Scout, ScoutConfig, ScoutTarget};
 use tasks::store::Store;
@@ -606,6 +606,58 @@ async fn the_next_scout_is_handed_the_field_notes_as_unverified_leads() {
     );
 }
 
+/// The salvage precondition, observed rather than raced.
+///
+/// A `scout_notes` row exists only once the checkpoint sink `Scout::follow`
+/// spawns has been handed an event, and the drain hands it that event in the
+/// same match arm that sets its own `state.checkpoint` — so the row is proof
+/// that the dispatcher is holding a checkpoint, which is exactly the
+/// precondition a salvaged timeout is about. `cancel.rs`'s
+/// `a_cancelled_scout_keeps_its_salvage_and_stamps_the_reason` waits on this
+/// same row before it cancels; this is that idiom with the deadline
+/// substituted for the cancel.
+///
+/// Written out rather than routed through `common::wait_until` for two
+/// reasons: the session id has to come back, and the failure has to name the
+/// precondition that never arrived rather than say `condition not met`.
+async fn await_streamed_checkpoint(store: &Store, within: Duration) -> SessionId {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if let Some(session) = store.list_sessions().await.unwrap().last()
+            && store.get_scout_notes(&session.id).await.unwrap().is_some()
+        {
+            return session.id.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no scout_notes row within {within:?}: the dispatcher never streamed a checkpoint, \
+             so a deadline fired now would be testing the wrong thing"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Retire a running budget from the harness instead of waiting it out.
+///
+/// [`tasks::deadline::Deadline`] anchors on a `tokio::time::Instant` —
+/// deliberately, so its poll loop still advances under a paused clock (see the
+/// doc comment on `Deadline::awake_from`) — so pausing, jumping past the
+/// budget and resuming is the one seam that expires a dispatch on demand
+/// without a test-only knob in production code.
+///
+/// The pause spans a single `advance` and nothing real: a paused clock
+/// auto-advances whenever the runtime parks, so holding it across store or
+/// socket I/O would freeze nothing and would jump straight to the next timer.
+/// The jump itself has to stay modest for the same reason `brief.rs` opens its
+/// store before pausing — past 30s it can trip an in-flight sqlx pool acquire,
+/// past 60s it wakes the test pool's health check, and past 300s the pool
+/// reaps the VM out from under the run.
+async fn expire_the_budget(budget: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(budget + Duration::from_secs(1)).await;
+    tokio::time::resume();
+}
+
 /// The headline case: the deadline. The VM is destroyed where it stands, so
 /// nothing on its disk is recoverable and the supervisor never gets to report
 /// anything — the last checkpoint the dispatcher already holds is the entire
@@ -614,8 +666,27 @@ async fn the_next_scout_is_handed_the_field_notes_as_unverified_leads() {
 ///
 /// The error keeps its shape: a salvaged timeout is still `Timeout`, and
 /// `exit_reason` still says "timed out". CLAUDE.md and two other tests pin it.
+///
+/// What this proves is a deadline firing against a run that is *already
+/// holding* a checkpoint. It does not exercise a deadline arriving naturally —
+/// `a_scout_that_never_reports_back_times_out` and
+/// `a_hung_scout_times_out_and_frees_its_slot` are for that. The budget here is
+/// never waited out: the harness watches the checkpoint into the store and then
+/// fires the deadline itself. The ordering is the whole guarantee. Because
+/// `CHECKPOINT_WAIT` is strictly under `BUDGET`, the run's own deadline can
+/// never fire while the harness is still watching, so a machine too slow to
+/// stream a checkpoint fails on a named precondition rather than on a verdict
+/// about salvage (#958 — a 3s budget against ~1-2s of checkpoint latency,
+/// which passed alone and failed with seven siblings on the machine).
 #[tokio::test]
 async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
+    /// Never waited out — see above. Capped at 20s because
+    /// [`expire_the_budget`] jumps `BUDGET + 1s` and that jump has ceilings.
+    const BUDGET: Duration = Duration::from_secs(20);
+    /// Strictly under [`BUDGET`], which is what keeps the two failure modes
+    /// from swapping places.
+    const CHECKPOINT_WAIT: Duration = Duration::from_secs(10);
+
     let supervisor_bin = workspace_bin("scout-supervisor").await;
     let tmp = tempfile::tempdir().unwrap();
     let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
@@ -623,9 +694,10 @@ async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
     let workdir_root = tmp.path().join("scout-workdirs");
     tokio::fs::create_dir_all(&workdir_root).await.unwrap();
 
-    // 3s against a 1s checkpoint interval: one checkpoint reaches the host,
-    // then the deadline lands. The agent's own `sleep 10` outlives it — see
-    // the note in `a_scout_that_never_reports_back_times_out`.
+    // The wrapper sets a 1s checkpoint interval, and the supervisor's watcher
+    // sleeps first, so the first checkpoint cannot land before ~1s. The agent's
+    // own `sleep 10` outlives the run — see the note in
+    // `a_scout_that_never_reports_back_times_out`.
     let wrapper = write_supervisor_wrapper(
         tmp.path(),
         &supervisor_bin,
@@ -645,7 +717,7 @@ async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
         ScoutConfig {
             image: "agent:v1".into(),
             vm_config: VmConfig::default(),
-            timeout: Duration::from_secs(3),
+            timeout: BUDGET,
         },
     );
     let target = ScoutTarget {
@@ -653,17 +725,24 @@ async fn a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed() {
         base_branch: "main".into(),
     };
 
-    let err = scout
-        .dispatch(task.clone(), &target)
-        .await
-        .expect_err("should time out");
+    let dispatched = task.clone();
+    let dispatch = tokio::spawn(async move { scout.dispatch(dispatched, &target).await });
+
+    let streamed = await_streamed_checkpoint(&store, CHECKPOINT_WAIT).await;
+    expire_the_budget(BUDGET).await;
+
+    let err = dispatch.await.unwrap().expect_err("should time out");
     assert!(
-        matches!(err, tasks::scout::ScoutError::Timeout { secs: 3 }),
+        matches!(err, tasks::scout::ScoutError::Timeout { secs } if secs == BUDGET.as_secs()),
         "a salvaged timeout is still a timeout: {err:?}"
     );
 
     let sessions = store.list_sessions().await.unwrap();
     let session = sessions.last().expect("a session row");
+    assert_eq!(
+        session.id, streamed,
+        "the session that timed out is the one whose checkpoint we watched land"
+    );
     assert_eq!(session.status, SessionStatus::ScoutStoppedEarly);
     assert!(
         session
