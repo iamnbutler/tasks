@@ -30,6 +30,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         images-check \
         check-nextest test-bins test test-ci test-cargo app run \
         check-darwin app-build app-stop app-install \
+        server-release dist-install dist \
         app-check app-stubs app-test \
         server serve restart status stop drain resume check-quiesced \
         migration verify-warm
@@ -150,6 +151,49 @@ app-install: check-darwin
 app:
 	@$(MAKE) --no-print-directory app-build
 	@$(MAKE) --no-print-directory app-install
+
+# The self-contained bundle: `make app` plus a release `tasks` binary at
+# Contents/Helpers/tasks — the distribution an end user downloads, and the
+# stable home that survives a `cargo clean` on a dev machine (the serving
+# binary used to live in target/, which is a build cache, not a home; see
+# docs/plans/2026-08-18-end-user-distribution.md).
+#
+# Helpers, NOT Contents/MacOS: the app binary there is `Tasks`, and the
+# default macOS filesystem is case-insensitive, so `MacOS/tasks` is the same
+# directory entry — a cp "beside" the app binary silently overwrites it and
+# every claim about the bundle stays green while the app is gone. Measured,
+# not assumed: the first dist build did exactly that. Helpers is a standard
+# nested-code location, so codesigning (phase 2) needs no exception for it.
+#
+# `make app` stays the dev bundle — no embedded server, no release-build tax
+# on the inner loop. The app treats the two identically except that a bundle
+# carrying its own `tasks` is driven with `--no-build`, a decision the app
+# derives from the binary's surroundings rather than from which target built
+# the bundle (app-gpui/src/server.rs).
+server-release:
+	TASKS_SERVER_VERSION=$(BUILD_VERSION) TASKS_SERVER_COMMIT=$(BUILD_COMMIT) \
+		cargo build --release -p tasks
+
+# Embed the release server binary into an already-installed bundle. Separate
+# from app-install so `make app` keeps meaning what it always meant, and a
+# recipe rather than a cp in `dist`, so the failure ("no release binary") has
+# a name and a fix instead of a bare cp error.
+dist-install: check-darwin
+	@[ -f "$(CARGO_TARGET_DIR)/release/tasks" ] || { \
+		echo "no release tasks binary at $(CARGO_TARGET_DIR)/release/tasks; run make dist"; exit 1; }
+	@bundle="$(APP_BUNDLE)"; \
+	[ -d "$$bundle/Contents/MacOS" ] || { echo "no installed bundle at $$bundle; run make dist"; exit 1; }; \
+	mkdir -p "$$bundle/Contents/Helpers"; \
+	cp "$(CARGO_TARGET_DIR)/release/tasks" "$$bundle/Contents/Helpers/tasks"; \
+	echo "embedded server binary in $$bundle ($(BUILD_VERSION), $(BUILD_COMMIT))"
+
+# Sub-makes for the ordering, as everywhere else in this file. app-build runs
+# first for the reason `run` gives: a compile error must cost nothing.
+dist:
+	@$(MAKE) --no-print-directory app-build
+	@$(MAKE) --no-print-directory server-release
+	@$(MAKE) --no-print-directory app-install
+	@$(MAKE) --no-print-directory dist-install
 
 # Build, stop, install, launch — in that order, and each step is where it is
 # for a reason:

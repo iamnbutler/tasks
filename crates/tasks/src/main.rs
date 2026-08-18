@@ -42,6 +42,10 @@ usage:
   tasks vm-pool                 run the vm-pool service specialized for
                                 scouts (ContainerRuntime + TasksProtocol)
                                 on VM_POOL_SOCKET
+  tasks service <subcommand>    the server as a launchd service: install this
+                                binary to ~/.tasks/bin, register one
+                                LaunchAgent (start at login, restart on
+                                crash), and manage it (see `tasks service -h`)
 
 reload flags:
   --when-idle                   wait for in-flight scouts/builds to finish
@@ -106,6 +110,12 @@ above the cwd, then the nearest above this binary; the real environment wins):
   VM_POOL_MAX_VMS        VMs `tasks vm-pool` holds at once (default 6). Read
                          by the pool, not by the server, so changing it means
                          restarting the pool
+  TASKS_VM_POOL_AUTOSPAWN
+                         whether a failed vm-pool connect spawns the pool
+                         from this binary (on/off). Unset, derived: on for an
+                         installed binary (no checkout above it — a bundle),
+                         off for a checkout artifact, whose developer runs
+                         and restarts the pool deliberately
   GITHUB_TOKEN           fallback for `tasks secrets set github-token`; needed
                          for polling and clones. Prefer the sealed store —
                          a raw token in .env is what #971 rotated away from
@@ -276,6 +286,48 @@ rather than taking the path over: the incumbent would go on holding its VMs
 while becoming unreachable. Stop the running daemon first, or point this one
 at a different VM_POOL_SOCKET. A socket file left behind by a dead daemon is
 unlinked and reclaimed automatically.
+
+That refusal is also what makes TASKS_VM_POOL_AUTOSPAWN safe: with it on,
+a server that cannot reach the socket spawns this daemon itself (logging to
+<data dir>/vm-pool.log), and racing spawns resolve to one bound pool.
+";
+
+const SERVICE_USAGE: &str = "\
+usage: tasks service <install|uninstall|start|stop|restart|status>
+
+The server as a launchd-managed service — the daemon is the product, and
+every client (the app included) is just a client. One LaunchAgent
+(com.iamnbutler.tasks.server) runs `tasks serve` from ~/.tasks/bin/tasks:
+start at login, restart on crash. There is deliberately no second agent for
+vm-pool — an installed server spawns and supervises its own pool (see
+TASKS_VM_POOL_AUTOSPAWN).
+
+  tasks service install [--default-mode play|pause]
+        copy THIS binary to ~/.tasks/bin/tasks, write the LaunchAgent, load
+        it, and wait for the server to answer. Idempotent, and also the
+        upgrade: run it from a newer binary (the app's bundled seed, a
+        checkout, an installer download) to make the service serve that
+        binary. --default-mode pins TASKS_DEFAULT_MODE in the agent's
+        environment; without it every boot, crash restarts included, comes
+        up in the server's own quiet default (pause)
+  tasks service start
+        load the agent (refuses when nothing is installed)
+  tasks service stop
+        unload the agent — the only stop that sticks, since KeepAlive turns
+        a plain SIGTERM into a restart. Loads again at next login;
+        uninstall is the durable off
+  tasks service restart
+        kill-and-relaunch, then wait for the new server to answer
+  tasks service uninstall
+        unload and remove the LaunchAgent. The binary and the data dir stay
+  tasks service status
+        agent / binary / launchd state, then the serving report
+
+While the service is installed and serving, `tasks reload` and `tasks stop`
+delegate to launchd (a reload replaces ~/.tasks/bin/tasks and kickstarts; a
+stop unloads) — a bare SIGTERM under KeepAlive would report \"stopped\" while
+launchd resurrects the server behind the report. A developer's own server
+(a pidfile naming any other binary) is never delegated.
 ";
 
 /// Whether a subcommand's arguments are asking for help.
@@ -308,6 +360,7 @@ fn usage_for(command: &str) -> &'static str {
         "add-project" => ADD_PROJECT_USAGE,
         "secrets" => SECRETS_USAGE,
         "vm-pool" => VM_POOL_USAGE,
+        "service" => SERVICE_USAGE,
         _ => USAGE,
     }
 }
@@ -363,6 +416,7 @@ async fn dispatch() -> Result<()> {
         Some("resume") => resume_cmd(&args[1..]).await,
         Some("add-project") => add_project(&args[1..]).await,
         Some("secrets") => secrets_cmd(&args[1..]),
+        Some("service") => service_cmd(&args[1..]).await,
         Some("vm-pool") => vm_pool(&args[1..]).await,
         Some("-h") | Some("--help") | Some("help") | None => {
             print!("{USAGE}");
@@ -787,6 +841,113 @@ fn secrets_cmd(args: &[String]) -> Result<()> {
             print!("{SECRETS_USAGE}");
             Ok(())
         }
+    }
+}
+
+/// `tasks service <install|uninstall|start|stop|restart|status>` — the
+/// launchd lifecycle. macOS-only in substance (launchctl), and it says so
+/// rather than failing on a missing binary.
+async fn service_cmd(args: &[String]) -> Result<()> {
+    use tasks::service;
+    use tasks_api::models::Mode;
+
+    if !cfg!(target_os = "macos") {
+        bail!("`tasks service` manages a launchd agent, which is macOS-only");
+    }
+    let data_dir = run::data_dir()?;
+    match args.first().map(String::as_str) {
+        Some("install") => {
+            let mut default_mode = None;
+            let mut rest = args[1..].iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--default-mode" => {
+                        let raw = rest
+                            .next()
+                            .context("--default-mode requires play or pause")?;
+                        default_mode = Some(
+                            Mode::from_str(raw)
+                                .with_context(|| format!("not a mode: {raw} (play or pause)"))?,
+                        );
+                    }
+                    other => bail!("unexpected argument: {other}\n\n{SERVICE_USAGE}"),
+                }
+            }
+            let outcome = service::install(&data_dir, default_mode).await?;
+            if outcome.copied {
+                println!("installed {}", outcome.paths.bin.display());
+            } else {
+                println!("already installed at {}", outcome.paths.bin.display());
+            }
+            println!("agent {}", outcome.paths.plist.display());
+            println!(
+                "serving: pid {} on port {}",
+                outcome.file.pid, outcome.file.port
+            );
+            match default_mode {
+                Some(mode) => println!("boots come up in {} (pinned in the agent)", mode.as_str()),
+                None => println!(
+                    "boots come up paused; `tasks service install --default-mode play` \
+                     makes restarts resume dispatch"
+                ),
+            }
+            Ok(())
+        }
+        Some("uninstall") => {
+            no_more_args(&args[1..])?;
+            let paths = service::uninstall().await?;
+            println!("removed {}", paths.plist.display());
+            println!(
+                "the binary ({}) and the data dir ({}) were left alone",
+                paths.bin.display(),
+                data_dir.display()
+            );
+            Ok(())
+        }
+        Some("start") => {
+            no_more_args(&args[1..])?;
+            let file = service::start(&data_dir).await?;
+            println!("serving: pid {} on port {}", file.pid, file.port);
+            Ok(())
+        }
+        Some("stop") => {
+            no_more_args(&args[1..])?;
+            match service::stop(&data_dir).await? {
+                Some(file) => println!("stopped pid {} (port {})", file.pid, file.port),
+                None => println!("the service was not running"),
+            }
+            println!(
+                "the agent stays unloaded until `tasks service start` or the next login; \
+                 `tasks service uninstall` is the durable off"
+            );
+            Ok(())
+        }
+        Some("restart") => {
+            no_more_args(&args[1..])?;
+            let file = service::restart(&data_dir).await?;
+            println!("serving: pid {} on port {}", file.pid, file.port);
+            Ok(())
+        }
+        Some("status") => {
+            no_more_args(&args[1..])?;
+            print!("{}", service::status_lines().await?);
+            let (report, _serving) = reload::report(&data_dir).await;
+            print!("{report}");
+            Ok(())
+        }
+        Some(other) => bail!("unknown service subcommand: {other}\n\n{SERVICE_USAGE}"),
+        None => {
+            print!("{SERVICE_USAGE}");
+            Ok(())
+        }
+    }
+}
+
+/// The rejection every no-argument subcommand shares.
+fn no_more_args(rest: &[String]) -> Result<()> {
+    match rest.first() {
+        Some(other) => bail!("unexpected argument: {other}\n\n{SERVICE_USAGE}"),
+        None => Ok(()),
     }
 }
 

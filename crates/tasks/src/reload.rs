@@ -327,10 +327,35 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         .or(existing.as_ref().map(|f| f.port))
         .unwrap_or(crate::run::DEFAULT_PORT);
 
+    // Delegation: when the serving binary is the launchd service's (or the
+    // service is installed and nothing serves), launchd owns the lifecycle.
+    // Under `KeepAlive` a bare SIGTERM is a *restart* — this path would
+    // report a swap while launchd resurrects the old server behind it — so
+    // the swap becomes: put the binary in the service's home, kickstart, and
+    // verify. A pidfile naming any other binary is a developer serving
+    // beside the service, and their reload keeps meaning what it always did.
+    let managed = crate::service::managed(&opts.data_dir);
+    if managed.is_some() && opts.foreground && existing.is_some() {
+        return Err(ReloadError::Other(format!(
+            "this server is launchd-managed ({}); --foreground would race the \
+             service for the port. `tasks service stop` first, or drop --foreground",
+            crate::service::LABEL
+        )));
+    }
+
     let Some(existing) = existing else {
         // Nothing is running: a reload is just a start, and a start is a cold
-        // start — there is no mode to carry from anywhere.
-        return start(&binary, port, &opts, ModeHandover::none()).await;
+        // start — there is no mode to carry from anywhere. With a service
+        // installed the start *is* the service's (`--foreground` excepted:
+        // an exec into this terminal touches no agent, and the pidfile it
+        // writes names a non-service binary, so nothing later mistakes it
+        // for the service).
+        return match (&managed, opts.foreground) {
+            (Some(paths), false) => {
+                managed_swap(&binary, &opts, paths, None, ModeHandover::none()).await
+            }
+            _ => start(&binary, port, &opts, ModeHandover::none()).await,
+        };
     };
 
     // 3. Gate. A live pid that will not answer may be mid-shutdown; killing
@@ -347,7 +372,19 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         // A server too wedged to answer `/status` never told us its mode, and
         // guessing `play` at a machine nobody is watching is the wrong way to
         // be wrong.
-        return swap(&binary, &existing, port, &opts, ModeHandover::none()).await;
+        return match &managed {
+            Some(paths) => {
+                managed_swap(
+                    &binary,
+                    &opts,
+                    paths,
+                    Some(existing.pid),
+                    ModeHandover::none(),
+                )
+                .await
+            }
+            None => swap(&binary, &existing, port, &opts, ModeHandover::none()).await,
+        };
     };
 
     // The mode to carry is read *now*, before the drain: `--when-idle` writes
@@ -387,7 +424,75 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         );
     }
 
-    swap(&binary, &existing, port, &opts, handover).await
+    match &managed {
+        Some(paths) => managed_swap(&binary, &opts, paths, Some(existing.pid), handover).await,
+        None => swap(&binary, &existing, port, &opts, handover).await,
+    }
+}
+
+/// The managed half of a swap: make the launchd service serve `binary`.
+///
+/// Install into the service's home (write-then-rename; a no-op when the
+/// binary already is the home's), kickstart, and verify against the *new*
+/// pid — launchd reports nothing when it relaunches, so the proof comes from
+/// `/status`, the same two facts the unmanaged swap proves.
+///
+/// The mode carry is the one part that degrades: an unmanaged start hands
+/// the mode over in the child's environment, but launchd owns this child's
+/// environment, and pinning a carried mode into the plist would change what
+/// a *crash* restart boots into. So the carry is a `POST /mode` after the
+/// verify, and the window between boot and that write runs in the plist's
+/// default — quiet, unless the operator pinned `--default-mode play`, which
+/// is why the carry names the window when it happens.
+async fn managed_swap(
+    binary: &Path,
+    opts: &ReloadOptions,
+    paths: &crate::service::ServicePaths,
+    previous: Option<u32>,
+    handover: ModeHandover,
+) -> Result<(), ReloadError> {
+    let to_err = |e: crate::service::ServiceError| ReloadError::Other(e.to_string());
+
+    if crate::service::install_binary(binary, paths).map_err(to_err)? {
+        println!("installed {} -> {}", binary.display(), paths.bin.display());
+    }
+    println!(
+        "restarting the launchd service ({})…",
+        crate::service::LABEL
+    );
+    match crate::service::loaded().await.map_err(to_err)? {
+        true => crate::service::launchctl_kickstart(true)
+            .await
+            .map_err(to_err)?,
+        false => crate::service::bootstrap(paths).await.map_err(to_err)?,
+    }
+    let file = crate::service::wait_for_serving(&opts.data_dir, previous)
+        .await
+        .map_err(|e| ReloadError::SwapFailed(e.to_string()))?;
+    println!("serving: pid {} on port {}", file.pid, file.port);
+    if let Ok(status) = fetch_status(file.port).await {
+        print!("{}", render_migrations(&status));
+    }
+    if let Some(mode) = handover.carry {
+        match set_mode(file.port, mode, Some("mode carried over a managed restart")).await {
+            Ok(()) => println!(
+                "mode carried: {} (the boot itself ran in the agent's default until this write)",
+                mode.as_str()
+            ),
+            Err(err) => {
+                // The same lasting consequence swap() names: the drain may
+                // have paused a pipeline the carry was about to unpause.
+                println!(
+                    "could not carry the mode ({err}); set it by hand: \
+                     curl -sS -X POST localhost:{}/mode -H 'content-type: application/json' \
+                     -d '{{\"mode\":\"{}\"}}'",
+                    file.port,
+                    mode.as_str()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// SIGTERM the old server, start the new one, verify, carry the mode over.
@@ -686,6 +791,39 @@ pub async fn stop(data_dir: &Path, opts: StopOptions) -> Result<Option<Stopped>,
         true => wait_for_idle(&file, opts.drain_timeout).await?,
         false => false,
     };
+    // A launchd-managed server cannot be stopped by SIGTERM — `KeepAlive`
+    // turns that into a restart, and this function would report "stopped"
+    // while launchd resurrects the server behind the report. Unloading the
+    // job is the stop that sticks. `managed` already requires the pidfile to
+    // name the service's own binary, so a developer's server beside the
+    // service still takes the signal path below.
+    if crate::service::managed(data_dir).is_some() {
+        println!(
+            "this server is launchd-managed ({}); unloading the agent",
+            crate::service::LABEL
+        );
+        match crate::service::bootout().await {
+            Ok(()) => {
+                if !wait_gone(file.pid, STOP_GRACE).await {
+                    return Err(ReloadError::SwapFailed(format!(
+                        "the agent was unloaded but pid {} is still running",
+                        file.pid
+                    )));
+                }
+                pidfile::remove_if_ours(data_dir, file.pid);
+                println!(
+                    "the agent stays unloaded until `tasks service start` or the next \
+                     login; `tasks service uninstall` is the durable off"
+                );
+                return Ok(Some(Stopped { file, left_paused }));
+            }
+            // A serving pid from the service's binary with no loaded job —
+            // someone exec'd it in a terminal. The signal path below is then
+            // both safe (nothing will resurrect it) and the only stop there
+            // is.
+            Err(err) => println!("could not unload the agent ({err}); stopping the pid directly"),
+        }
+    }
     stop_pid(file.pid).await?;
     // Belt and braces: the server clears its own record on the way out, but a
     // SIGKILLed one cannot.
@@ -1047,7 +1185,7 @@ async fn signal(pid: u32, sig: &str) {
         .await;
 }
 
-async fn wait_gone(pid: u32, budget: Duration) -> bool {
+pub(crate) async fn wait_gone(pid: u32, budget: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         if !pidfile::pid_alive(pid) {
@@ -1129,7 +1267,12 @@ fn find_workspace() -> Option<PathBuf> {
     })
 }
 
-fn workspace_above(start: &Path) -> Option<PathBuf> {
+/// `pub(crate)` because it is also the probe behind the vm-pool autospawn
+/// default ([`crate::run`]): "is this binary a checkout artifact" and "is
+/// there a workspace to build in" must stay one question, or the app could
+/// drive a binary with `--no-build` that the server half still treats as a
+/// developer's.
+pub(crate) fn workspace_above(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|dir| dir.join("crates/tasks/Cargo.toml").is_file())
@@ -1138,7 +1281,7 @@ fn workspace_above(start: &Path) -> Option<PathBuf> {
 
 // --- probes ---
 
-async fn fetch_status(port: u16) -> Result<ServerStatus, String> {
+pub(crate) async fn fetch_status(port: u16) -> Result<ServerStatus, String> {
     let client = reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
         .build()
@@ -1394,7 +1537,7 @@ pub fn humanize(d: chrono::Duration) -> String {
 /// The last few lines of `serve.log`, for a boot that died with something to
 /// say. Missing or unreadable reads as empty — this is diagnostics, and a
 /// failure to read the log must not replace the failure being reported.
-fn log_tail(path: &Path) -> String {
+pub(crate) fn log_tail(path: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
         return String::new();
     };
