@@ -132,8 +132,8 @@ fn serve_command(data_dir: &Path, port: u16) -> Command {
         .env("TASKS_DATA_DIR", data_dir)
         .env("VM_POOL_SOCKET", data_dir.join("vm-pool.sock"))
         .env("ORCHESTRATOR_CMD", stub_orchestrator(data_dir))
-        // The broker binds before the API does and a clash there is a boot
-        // failure, so it needs the same per-test port the API gets: the
+        // The broker binds right after the API does and a clash there is a
+        // boot failure, so it needs the same per-test port the API gets: the
         // default 4801 is one fixed port shared by every server this file
         // starts, and nextest runs these tests concurrently. Loopback rather
         // than the default `0.0.0.0` for a second reason — binding every

@@ -152,9 +152,11 @@ into the login Keychain (service `tasks-v2-secrets`). Neither artifact alone
 decrypts anything, which is the whole property — so **back them up
 separately, or not at all**. On a host where the login Keychain is locked
 non-interactively (a headless or launchd-started server), use
-`tasks secrets init --key-file PATH` instead and set `TASKS_SECRETS_KEY_FILE`;
-`tasks secrets status` will name the override rather than the Keychain, which
-is how you confirm it took.
+`tasks secrets init --key-file PATH` instead — the store header records the
+location, so no environment variable is needed, and `tasks secrets status`
+names the file. (`TASKS_SECRETS_KEY_FILE` exists for the *other* direction:
+overriding a store whose header says Keychain when the Keychain is what is
+failing; `status` names the override when it is in force.)
 
 ### 3. Seal the keys you already have
 
@@ -164,11 +166,27 @@ end to end while the values are still ones you can afford to lose:
     printf %s "$ANTHROPIC_API_KEY" | tasks secrets set anthropic-api-key
     printf %s "$GITHUB_TOKEN"      | tasks secrets set github-token
 
-Values come from **stdin, never argv** (argv is readable in `ps`). Pasting
-interactively and pressing ctrl-D works too. A running server picks the change
-up on its next read — rotation needs no restart — so verify with:
+Values come from **stdin, never argv** (argv is readable in `ps`). The `$VAR`
+forms assume your interactive shell actually has the values exported — a
+`.env` the *server* reads is not your shell's environment. If they are not
+exported, paste interactively and press ctrl-D instead; an empty pipe is
+refused (`empty value; nothing sealed`), so this fails loudly rather than
+sealing nothing. Same caveat for step 4.1's `grep "$GITHUB_TOKEN"`: with the
+variable unset that greps for the empty string and matches everything.
+
+A running server picks the change up on its next read — rotation needs no
+restart — and verify with:
 
     tasks secrets status     # names and timestamps, never values
+
+One boot-order subtlety worth knowing here: the server from step 1 booted
+*before* the store existed, so its first pickup also unlocks the Keychain —
+once, lazily. If that unlock fails (a locked login Keychain), the server
+logs `a sealed store appeared but could not be unlocked; restart to pick it
+up` and keeps serving on the env fallbacks; `tasks secrets status` (its own
+process) still answers happily, so **the log line, not `status`, is the
+check** — or just `make restart`, after which an unopenable store refuses to
+boot loudly.
 
 ### 4. Prove the broker path before trusting it
 
