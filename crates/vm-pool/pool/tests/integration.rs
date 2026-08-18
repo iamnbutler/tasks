@@ -6,11 +6,103 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::broadcast;
 use vm_pool_manager::{
-    EventLog, EventPayload, ImageRef, Pool, PoolConfig, SupervisorRuntime, VmState,
+    Event, EventLog, EventPayload, ImageRef, Pool, PoolConfig, SupervisorRuntime, VmState,
 };
-use vm_pool_protocol::{Priority, ShellCommand, ShellEvent, ShellProtocol, VmConfig};
+use vm_pool_protocol::{Priority, ShellCommand, ShellEvent, ShellProtocol, VmConfig, VmId};
 use vm_pool_test_support::supervisor_binary;
+
+/// How long [`await_vm_events`] waits before reporting what it has.
+///
+/// A stall detector, not a schedule — nothing here is expected to spend any of
+/// it. See [`await_vm_events`].
+const AWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait until this VM's events satisfy `done`, then return them.
+///
+/// These tests used to `sleep` a fixed span and assert over whatever had
+/// arrived. What they were waiting for is a chain of process forks — the
+/// supervisor awaits each `Execute` before reading the next line, and each one
+/// forks `sh` — so the sleep was a claim about how fast a loaded machine
+/// forks. Under `cargo nextest` against a freshly linked binary those forks
+/// were observed at 75–162ms apiece, which is how the four commands below
+/// overran a 500ms sleep and how these tests came to fail in parallel and pass
+/// alone.
+///
+/// Subscribing *before* the first snapshot is what makes this a wait and not a
+/// poll: no append can fall between the two, so the loop sleeps until an event
+/// arrives and wakes on the one that satisfies it.
+///
+/// The ceiling stays because a wait that ended *only* on success would hang a
+/// genuine regression instead of reporting it. On expiry this returns what the
+/// log holds and leaves the caller's own assertion to say what was missing —
+/// the same message a fixed sleep gave, minus the false alarms.
+///
+/// Duplicated from the pool crate's own test module rather than shared through
+/// `vm-pool-test-support`, on the same grounds as `RecordingRuntime`: that
+/// crate is a dev-dependency of this one, and a shared home would need a
+/// dev-dependency cycle to reach `EventLog`.
+async fn await_vm_events<F>(
+    events: &EventLog<ShellProtocol>,
+    vm_id: &VmId,
+    mut done: F,
+) -> Vec<Event<ShellProtocol>>
+where
+    F: FnMut(&[Event<ShellProtocol>]) -> bool,
+{
+    let mut rx = events.subscribe();
+    let deadline = tokio::time::Instant::now() + AWAIT_TIMEOUT;
+    loop {
+        let snapshot = events.for_vm(vm_id).await;
+        if done(&snapshot) {
+            return snapshot;
+        }
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(_)) => {}
+            // Lagged only means this loop missed a wakeup; the log is the
+            // source of truth and is re-read at the top regardless.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            // Nothing more is coming, or the ceiling was reached.
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                return events.for_vm(vm_id).await;
+            }
+        }
+    }
+}
+
+/// The application events among a VM's log entries, oldest first.
+fn app_events(events: &[Event<ShellProtocol>]) -> Vec<ShellEvent> {
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::VmApp { event, .. } => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The lifecycle states among a VM's log entries, oldest first.
+fn lifecycle_states(events: &[Event<ShellProtocol>]) -> Vec<VmState> {
+    events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::VmLifecycle { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many commands have reported completion.
+fn completions(events: &[Event<ShellProtocol>]) -> Vec<i32> {
+    app_events(events)
+        .iter()
+        .filter_map(|e| match e {
+            ShellEvent::CommandCompleted { exit_code } => Some(*exit_code),
+            _ => None,
+        })
+        .collect()
+}
 
 fn make_pool(
     binary: &PathBuf,
@@ -58,20 +150,12 @@ async fn allocate_execute_and_verify_events() {
     .await
     .unwrap();
 
-    // Wait for events to propagate through the system
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Verify events in the log
-    let vm_events = events.for_vm(&vm_id).await;
+    // Wait for the command to report completion, rather than for a span of
+    // time in which it is hoped to.
+    let vm_events = await_vm_events(&events, &vm_id, |evts| !completions(evts).is_empty()).await;
 
     // Should have lifecycle events (Allocating, Ready) + application events (Output, CommandCompleted)
-    let lifecycle_events: Vec<_> = vm_events
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::VmLifecycle { state, .. } => Some(*state),
-            _ => None,
-        })
-        .collect();
+    let lifecycle_events = lifecycle_states(&vm_events);
     assert!(
         lifecycle_events.contains(&VmState::Allocating),
         "missing Allocating event"
@@ -81,13 +165,7 @@ async fn allocate_execute_and_verify_events() {
         "missing Ready event"
     );
 
-    let app_events: Vec<_> = vm_events
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::VmApp { event, .. } => Some(event.clone()),
-            _ => None,
-        })
-        .collect();
+    let app_events = app_events(&vm_events);
     assert!(
         !app_events.is_empty(),
         "expected app events from Execute command"
@@ -170,16 +248,10 @@ async fn priority_eviction() {
     // The high-priority VM should be ready
     assert_eq!(pool.get(&high_id).await, Some(VmState::Ready));
 
-    // Verify the evicted VM has Stopping/Stopped events in the log
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let evicted_events = events.for_vm(&evicted_id).await;
-    let evicted_states: Vec<_> = evicted_events
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::VmLifecycle { state, .. } => Some(*state),
-            _ => None,
-        })
-        .collect();
+    // Verify the evicted VM has Stopping/Stopped events in the log. No wait:
+    // the eviction is a `deallocate` this call already awaited, and both
+    // events are appended before it returns.
+    let evicted_states = lifecycle_states(&events.for_vm(&evicted_id).await);
     assert!(
         evicted_states.contains(&VmState::Stopping),
         "evicted VM should have Stopping event"
@@ -259,26 +331,10 @@ async fn full_lifecycle_with_multiple_commands() {
     .await
     .unwrap();
 
-    // Wait for all events
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let vm_events = events.for_vm(&vm_id).await;
-    let app_events: Vec<_> = vm_events
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::VmApp { event, .. } => Some(event.clone()),
-            _ => None,
-        })
-        .collect();
-
-    // Count CommandCompleted events
-    let completed: Vec<_> = app_events
-        .iter()
-        .filter_map(|e| match e {
-            ShellEvent::CommandCompleted { exit_code } => Some(*exit_code),
-            _ => None,
-        })
-        .collect();
+    // The supervisor runs these serially, one `sh` fork each, so what bounds
+    // this is four process spawns and not any interval worth naming.
+    let vm_events = await_vm_events(&events, &vm_id, |evts| completions(evts).len() >= 4).await;
+    let completed = completions(&vm_events);
     assert_eq!(
         completed.len(),
         4,
@@ -294,16 +350,12 @@ async fn full_lifecycle_with_multiple_commands() {
     // Deallocate
     pool.deallocate(&vm_id).await.unwrap();
 
-    // Verify final lifecycle
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let final_events = events.for_vm(&vm_id).await;
-    let states: Vec<_> = final_events
-        .iter()
-        .filter_map(|e| match &e.payload {
-            EventPayload::VmLifecycle { state, .. } => Some(*state),
-            _ => None,
-        })
-        .collect();
+    // No wait here, and none needed: `deallocate` appends both Stopping and
+    // Stopped before it returns, and the VM it removed from the map is one
+    // slot reclamation will not append `Crashed` for. Sleeping would only
+    // widen the window for something else to land in a sequence asserted
+    // whole.
+    let states = lifecycle_states(&events.for_vm(&vm_id).await);
     assert_eq!(
         states,
         vec![
@@ -346,20 +398,19 @@ async fn concurrent_vms() {
         .unwrap();
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // Each VM should have its own events
+    // Each VM should have its own events. Waited for one at a time, which
+    // costs nothing: the three run concurrently, so whichever is slowest is
+    // what this ends on however the loop is ordered.
     for (i, vm_id) in vm_ids.iter().enumerate() {
-        let vm_events = events.for_vm(vm_id).await;
-        let has_output = vm_events.iter().any(|e| match &e.payload {
-            EventPayload::VmApp {
-                event: ShellEvent::Output { data, .. },
-                ..
-            } => data.contains(&format!("vm-{}-output", i)),
-            _ => false,
-        });
+        let marker = format!("vm-{}-output", i);
+        let carries_its_marker = |evts: &[Event<ShellProtocol>]| {
+            app_events(evts)
+                .iter()
+                .any(|e| matches!(e, ShellEvent::Output { data, .. } if data.contains(&marker)))
+        };
+        let vm_events = await_vm_events(&events, vm_id, carries_its_marker).await;
         assert!(
-            has_output,
+            carries_its_marker(&vm_events),
             "VM {} missing its unique output in events",
             vm_id
         );
