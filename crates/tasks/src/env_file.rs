@@ -492,4 +492,201 @@ mod tests {
             err.message
         );
     }
+
+    /// The repository root, resolved from this crate's manifest directory
+    /// rather than guessed from the test's cwd — the same shape
+    /// [`crate::migrations`]'s guard uses to reach its own directory, and for
+    /// the same reason: cargo knows where the source is, a test process's cwd
+    /// is whatever ran it.
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/tasks sits two levels below the repository root")
+            .to_path_buf()
+    }
+
+    /// One line of `.env.example` as an assignment, with any leading `#`
+    /// removed — or `None` if it is prose.
+    ///
+    /// Commented-out lines count, and that is the point: the example ships
+    /// with *every* line commented, so an extractor that skipped them would
+    /// read the whole file as prose and assert nothing. A dead variable hides
+    /// in a commented line exactly as well as in a live one.
+    ///
+    /// The anchor is the start of the line, which is why a prose comment must
+    /// never be reflowed so that a sentence *begins* with `NAME=`. The first
+    /// draft of the example wrapped one into `# VM_POOL_MAX_VMS=6, three is
+    /// the ceiling.`, which this reads as an assignment — as does a skimming
+    /// human, which is the better reason to keep such references mid-line or
+    /// backticked.
+    fn assignment(line: &str) -> Option<&str> {
+        let bare = line
+            .trim_start()
+            .strip_prefix('#')
+            .unwrap_or(line)
+            .trim_start();
+        let (name, _) = bare.split_once('=')?;
+        let shaped = !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        shaped.then_some(bare)
+    }
+
+    /// Every file under `crates/` and `images/`, plus the `Makefile`,
+    /// concatenated — the places a variable this project reads can be named.
+    ///
+    /// Two exclusions. `target/` is build output: not a source of truth, and
+    /// large enough to turn a fast test into a slow one. **This file itself**
+    /// is excluded because the guard below would otherwise be satisfied by its
+    /// own prose — its doc comment names the three dead variables it exists to
+    /// keep out, so adding `TASKS_CONTAINER_IMAGE` to the example was green
+    /// until this line existed. A guard a comment can talk out of firing is
+    /// not a guard, and the falsification check is what caught it.
+    fn searchable_tree(root: &Path) -> String {
+        fn collect(dir: &Path, skip: &Path, out: &mut String) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name() == Some(OsStr::new("target")) {
+                        continue;
+                    }
+                    collect(&path, skip, out);
+                } else if path != skip
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+        }
+
+        // `file!()` is workspace-root-relative under cargo, so this tracks the
+        // module if it ever moves.
+        let this_file = root.join(file!());
+        assert!(this_file.is_file(), "{this_file:?} should be this source");
+
+        let mut out = String::new();
+        for dir in ["crates", "images"] {
+            collect(&root.join(dir), &this_file, &mut out);
+        }
+        out.push_str(&std::fs::read_to_string(root.join("Makefile")).expect("Makefile"));
+        assert!(
+            out.len() > 100_000,
+            "read back only {} bytes of tree — the walk found nothing to search",
+            out.len()
+        );
+        out
+    }
+
+    /// Nothing in `.env.example` may name a variable this repository has never
+    /// heard of. The failure it exists for is real and was live when this was
+    /// written: `TASKS_MAX_SESSIONS`, `TASKS_DISPATCH_INTERVAL` and
+    /// `TASKS_CONTAINER_IMAGE` sat in the working `.env` on the host this
+    /// pipeline runs on, with zero occurrences in the tree *and* zero in the
+    /// whole of git history — v1 residue that no reader here ever had. An
+    /// example file is the one place such a name would be copied onward.
+    ///
+    /// It is a **naming check, not a proof of use**: a variable mentioned only
+    /// in a doc comment passes. That is deliberately the same bar a human
+    /// applies with `grep -rn <name> crates/`, and it is enough for the whole
+    /// failure mode — a name that is invented, renamed away, or misspelled.
+    ///
+    /// The check is deliberately one-directional. The reverse — every variable
+    /// the tree reads is documented — is the drift that produced a *known*
+    /// live instance while this was being written (`BUILDER_IMAGE` is real and
+    /// missing from CLAUDE.md's table; it is filed as its own issue). It is
+    /// not implemented here because "a variable the tree reads" has no
+    /// grep-shaped definition: `std::env::var` calls are wrapped, names are
+    /// built from constants, and test fixtures set variables no operator ever
+    /// should. A guard that cannot be made precise fires on things that are
+    /// fine, and a guard that fires on things that are fine gets deleted —
+    /// taking this direction, which *can* be made precise, with it.
+    #[test]
+    fn every_variable_the_example_names_is_known_to_the_tree() {
+        let root = repo_root();
+        let example = std::fs::read_to_string(root.join(".env.example")).expect(".env.example");
+        let tree = searchable_tree(&root);
+
+        let mut names: Vec<&str> = example
+            .lines()
+            .filter_map(assignment)
+            .filter_map(|a| a.split_once('=').map(|(name, _)| name))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+
+        assert!(
+            !names.is_empty(),
+            "extracted no assignments at all — the extractor, not the example, is broken"
+        );
+
+        let unknown: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !tree.contains(name))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            ".env.example names {unknown:?}, which appears nowhere under crates/, images/ \
+             or the Makefile — either it is dead, or it is misspelled"
+        );
+    }
+
+    /// The example's quoting has to survive the one thing anyone does with the
+    /// file: uncommenting a line. `ORCHESTRATOR_CMD` is the value that makes
+    /// this worth pinning — it contains spaces, so it is quoted, and a parser
+    /// that kept the quotes would produce a command whose *program name*
+    /// starts with `"`, failing a long way downstream of the mistake.
+    ///
+    /// Run through this module's own [`parse`], so the assertion is about the
+    /// parser the server actually uses rather than about a second reading of
+    /// the same file.
+    #[test]
+    fn the_examples_orchestrator_command_survives_being_uncommented() {
+        let example =
+            std::fs::read_to_string(repo_root().join(".env.example")).expect(".env.example");
+        let uncommented: String = example
+            .lines()
+            .filter_map(assignment)
+            .map(|a| format!("{a}\n"))
+            .collect();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(tmp.path(), &uncommented);
+        let pairs = parse(&path).expect("every line of the example must parse once uncommented");
+
+        let commands: Vec<&str> = pairs
+            .iter()
+            .filter(|(key, _)| key == "ORCHESTRATOR_CMD")
+            .map(|(_, value)| value.as_str())
+            .collect();
+
+        assert_eq!(
+            commands.len(),
+            2,
+            "both orchestrator shapes belong in the example: {commands:?}"
+        );
+        for command in &commands {
+            assert!(
+                command.starts_with("claude --print "),
+                "a quote leaked into what would become the program name: {command:?}"
+            );
+        }
+        assert!(
+            commands.iter().any(|c| c.contains("Bash(curl:*)")),
+            "the curl-only shape lost its allowlist: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("--dangerously-skip-permissions")),
+            "the full-dev-agent shape lost its flag: {commands:?}"
+        );
+    }
 }

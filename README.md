@@ -69,6 +69,7 @@ tasks secrets init                     # sealed credential store; unseal key goe
                                        #    an unsigned dev build is a new application to a
                                        #    macOS access list on every rebuild)
 tasks secrets set github-token         # paste the token, ctrl-D (same for anthropic-api-key)
+cp .env.example .env                   # everything that is *not* a credential
 tasks vm-pool &                        # the VM pool, a separate long-lived daemon
 make serve                             # the server, in this terminal
 cargo run -p tasks -- add-project owner/repo
@@ -86,7 +87,8 @@ nothing.
 Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
 through an in-process broker, and the sealed store means no raw key sits in
 `.env` either (raw `GITHUB_TOKEN` / `ANTHROPIC_API_KEY` env vars still work
-as fallbacks). See `docs/plans/2026-08-18-credential-custody.md`.
+as fallbacks, and `.env.example` documents them as exactly that). See
+`docs/plans/2026-08-18-credential-custody.md`.
 
 The server boots **paused**: intake and the API run, nothing dispatches.
 Flip to `play` (from the app, or `POST /mode`) and the pipeline starts
