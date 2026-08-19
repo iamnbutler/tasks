@@ -493,6 +493,34 @@ pub struct ServerStatus {
     /// reason as the fields above.
     #[serde(default)]
     pub update: Option<UpdatePending>,
+    /// Set for as long as scout and build dispatch is being held because
+    /// vm-pool has no free slot. `#[serde(default)]` for the same reload-skew
+    /// reason as the fields above.
+    #[serde(default)]
+    pub pool: Option<PoolHold>,
+}
+
+/// Why the pipeline is idle when vm-pool has no room.
+///
+/// A dispatch into a full pool is refused, and a refused Scout used to be both
+/// charged an attempt and stranded in `Scouting` until the next boot (#930,
+/// #967). Holding costs nothing: queued work stays queued, and the next VM
+/// handed back releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolHold {
+    /// When the pool was first observed full — "no room since", which later
+    /// observations do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent observation. The gap between this and now is the
+    /// difference between a hold a dispatcher is still refreshing and one
+    /// about to expire on its own.
+    pub last_seen: DateTime<Utc>,
+    /// How many observations have been made since `since`.
+    pub observations: u32,
+    /// Slots the pool holds in total, so a reader can tell `0 of 0` — a
+    /// `VM_POOL_MAX_VMS` that can never dispatch — from `0 of 6`, which is work
+    /// or a leak holding every slot.
+    pub total: usize,
 }
 
 /// Why new containers are waiting: an upgrade is half-applied.

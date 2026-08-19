@@ -197,6 +197,10 @@ impl ServerWindow {
             .as_ref()
             .and_then(update_pending_line)
             .map(|line| self.fact("Update", line, cx));
+        let pool = status
+            .as_ref()
+            .and_then(pool_hold_line)
+            .map(|line| self.fact("vm-pool", line, cx));
 
         div()
             .flex()
@@ -206,6 +210,7 @@ impl ServerWindow {
             .child(self.fact("Pipeline", mode, cx))
             .children(github)
             .children(update)
+            .children(pool)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -764,6 +769,24 @@ fn github_hold_line(status: &ServerStatus) -> Option<String> {
     ))
 }
 
+/// Why new work is waiting, when the reason is that vm-pool has no free slot.
+/// Same contract as [`github_hold_line`]: `None` renders no row at all.
+///
+/// `0 of N` rather than "full" — `0 of 0` is a `VM_POOL_MAX_VMS` that can never
+/// dispatch anything, and `0 of 6` is work or a leak holding every slot.
+fn pool_hold_line(status: &ServerStatus) -> Option<String> {
+    let hold = status.pool.as_ref()?;
+    Some(format!(
+        "0 of {} slots free for {} ({} observation(s), last {} ago) — scout and build \
+         dispatch waits for one; queued work stays queued and nothing is charged an \
+         attempt.",
+        hold.total,
+        time::since(hold.since),
+        hold.observations,
+        time::since(hold.last_seen),
+    ))
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -812,6 +835,7 @@ mod tests {
             images: Vec::new(),
             github: None,
             update: None,
+            pool: None,
         }
     }
 
@@ -839,6 +863,30 @@ mod tests {
         );
         assert!(line.contains("12 failed call"), "{line}");
         assert!(line.contains("503"), "{line}");
+    }
+
+    /// The third hold's row, same contract: absent until it binds, and when it
+    /// binds it says how full the pool is and what waiting costs.
+    #[test]
+    fn a_full_pool_is_named_only_while_it_lasts() {
+        use tasks_client::api::http::PoolHold;
+
+        let mut status = status();
+        assert_eq!(pool_hold_line(&status), None);
+
+        status.pool = Some(PoolHold {
+            since: Utc::now() - chrono::Duration::minutes(12),
+            last_seen: Utc::now() - chrono::Duration::seconds(30),
+            observations: 138,
+            total: 6,
+        });
+        let line = pool_hold_line(&status).expect("a hold is worth a row");
+        assert!(line.contains("0 of 6"), "{line}");
+        assert!(line.contains("dispatch waits"), "{line}");
+        assert!(
+            line.contains("nothing is charged an attempt"),
+            "the reader's next question is whether work is being lost: {line}"
+        );
     }
 
     #[test]

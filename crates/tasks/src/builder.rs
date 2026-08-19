@@ -137,13 +137,24 @@ impl BuilderError {
             // changed is only which expiries reach this arm — the class is
             // unconditionally `Transport` and always was.
             Self::Suspended(_) => FailureClass::Transport,
-            // `Client(_)` stays a verdict deliberately, not by oversight.
-            // `Store::finalize_build_unsuccessfully` only charges `if
-            // started` (the row has a `vm_id`, set immediately after
-            // `allocate`), so this arm can only bite after a VM exists —
-            // whether that is really transport is a separate question with
-            // its own argument to make, and widening it silently here would
-            // decide it for the scout too.
+            // A refusal from vm-pool is classified off the *kind* it carries,
+            // never off its message: `pool exhausted` and `no such image` are
+            // both a refused allocation and differ only as prose (#930).
+            // Behaviour-neutral here — `Store::finalize_build_unsuccessfully`
+            // only charges `if started`, and a build refused at `allocate` has
+            // no `vm_id` — and written anyway, because two dispatchers giving
+            // different answers about one refusal is how the next such bug
+            // gets written. `FailureClass::for_service_error` is the single
+            // statement; a build and a scout read it together.
+            Self::Client(ClientError::Service { kind, .. }) => {
+                FailureClass::for_service_error(*kind)
+            }
+            // Every *other* `Client(_)` stays a verdict deliberately, not by
+            // oversight. `finalize_build_unsuccessfully`'s `if started` guard
+            // means those can only bite after a VM exists — whether that is
+            // really transport is a separate question with its own argument to
+            // make, and widening it silently here would decide it for the
+            // scout too.
             Self::Store(_) | Self::Client(_) | Self::GitHub(_) | Self::Timeout { .. } => {
                 FailureClass::Verdict
             }
@@ -1486,6 +1497,72 @@ mod tests {
         );
         assert_eq!(
             Strike::for_class(BuilderError::Timeout { secs: 1 }.failure_class()),
+            Strike::Charge,
+        );
+    }
+
+    /// The builder half of #930, and the reason it is here at all: the arm is
+    /// provably behaviour-neutral today — `Store::finalize_build_unsuccessfully`
+    /// only charges `if started`, and a build refused at `allocate` has no
+    /// `vm_id` — but two dispatchers giving different answers about *one*
+    /// refusal is how the next such bug gets written. So the assertion is that
+    /// they agree, not merely that this one is right.
+    #[test]
+    fn a_full_pool_reads_the_same_from_a_build_as_from_a_scout() {
+        use crate::scout::ScoutError;
+        use crate::store::Strike;
+        use vm_pool_client::ClientError;
+        use vm_pool_protocol::ServiceErrorKind;
+
+        for kind in [
+            ServiceErrorKind::Capacity,
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::Other,
+        ] {
+            let refusal = || ClientError::Service {
+                message: "allocate failed".into(),
+                kind,
+            };
+            assert_eq!(
+                BuilderError::Client(refusal()).failure_class(),
+                ScoutError::Client(refusal()).failure_class(),
+                "the two dispatchers must not disagree about a {kind} refusal"
+            );
+        }
+
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::Client(ClientError::Service {
+                    message: "allocate failed: pool exhausted".into(),
+                    kind: ServiceErrorKind::Capacity,
+                })
+                .failure_class()
+            ),
+            Strike::Waive,
+        );
+        // The negative half, on this side too: a permanent refusal, and a run
+        // that concluded empty-handed, both still pay.
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::Client(ClientError::Service {
+                    message: "allocate failed: no such image".into(),
+                    kind: ServiceErrorKind::Image,
+                })
+                .failure_class()
+            ),
+            Strike::Charge,
+        );
+        assert_eq!(
+            Strike::for_class(
+                BuilderError::BuildFailed {
+                    reason: "agent produced no commits".into(),
+                    class: FailureClass::Verdict,
+                }
+                .failure_class()
+            ),
             Strike::Charge,
         );
     }
