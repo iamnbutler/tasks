@@ -25,6 +25,19 @@
 //! the server's own `GITHUB_TOKEN` is stripped from the child env — when the
 //! agent talks to GitHub it authenticates as itself (gh's keychain auth),
 //! not with the server's credential.
+//!
+//! One generated section is **guidance and not enforcement**, and it is worth
+//! knowing which. [`authority_section`] mirrors rows `authorize` applies,
+//! [`landing_section`] mirrors a capability the endpoint enforces, and
+//! [`verification_section`] mirrors a directory that either exists or does
+//! not — each states a fact something else makes true. [`reporting_section`]
+//! has no such half: output format is not server-enforceable, so generating it
+//! buys only that it cannot *contradict* the charter. Nothing stops an agent
+//! drifting from it forty turns into a conversation, and nothing detects a
+//! report that ignores it. A prompt sentence is the weakest mechanism this
+//! codebase has — the charter exists because authority should not be something
+//! a long conversation can talk itself out of — and this one is a prompt
+//! sentence.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1365,6 +1378,106 @@ fn degradation_section(github_configured: bool) -> String {
         .to_string()
 }
 
+/// How the orchestrator writes a report, generated from the `auto_review_specs`
+/// charter row.
+///
+/// Generated for the reason [`landing_section`] is, one level over. "Keep the
+/// chat half terse — the detail is in `feedback`" is a true instruction only
+/// where a verdict is actually applied. Under `shadow` it is false in a
+/// stronger way than it first looks: `server::review_spec` returns straight
+/// after `record_decision`, so `body.feedback` never reaches
+/// `Store::review_spec` and is discarded at the handler — stored nowhere, not
+/// even on the spec's queue entry. Under `off` there is no verdict route at
+/// all. On both, the conversation is the only copy the review has, and an
+/// instruction to keep it short *because the detail lives elsewhere* sends the
+/// detail nowhere. The fix for a prompt sentence contradicting a charter row is
+/// never a better sentence; it is one source.
+///
+/// The two arms are mutually exclusive by construction — one `match` producing
+/// one bullet — rather than a shared bullet with a caveat appended under
+/// `shadow`. A permission to drop findings sitting above a statement that
+/// nothing else carries them is exactly the contradiction the generation
+/// exists to prevent.
+///
+/// This section is **guidance and not enforcement**, unlike every other
+/// generated section in this module — see the module doc.
+///
+/// Always present, at every level. [`degradation_section`] and
+/// [`verification_section`] are empty when the environment cannot do the thing
+/// they describe, and there is no such state for reporting: there is no boot on
+/// which the orchestrator makes no reports. This is the [`authority_section`]
+/// shape (always present, contents vary), not theirs.
+fn reporting_section(charter: &[CharterEntry]) -> String {
+    let level = charter
+        .iter()
+        .find(|e| e.capability == Capability::AutoReviewSpecs)
+        .map(|e| e.level)
+        .unwrap_or(CharterLevel::Off);
+    let mut out = String::from(
+        "How to report — all of it, not only reviews. What you write is read \
+         as a stream: pipeline notifications arrive hours apart, and each one \
+         is read cold by someone who was not here for the one before it.\n\
+         - LEAD WITH THE SUBJECT. An issue number is not a name, and neither \
+         is a spec id or a build id — \"#984 approved with five required \
+         changes\" names nothing a reader can hold. Open with one line saying \
+         what the work IS and what it would do, and put the verdict, the \
+         count, the id and the next step after it. This is not a rule about \
+         reviews: a failed build, an answer about the state of the pipeline \
+         and an obligation you are declining are each exactly as unreadable \
+         identified only by a number.\n\
+         - REPORT FACTS, NOT ASSESSMENTS. The axis is factual versus \
+         evaluative, and it is not positive versus negative — a fact is worth \
+         reporting whichever way it points, a favourable one included: that \
+         the spec disproves the issue's premise, that the build's own test run \
+         passed. What to cut is the reading you put on a fact in place of the \
+         fact — \"well-scoped\", \"solid\", \"a little concerning\" — which \
+         asks the human to take your judgment where the fact itself would have \
+         let them use their own.\n\
+         - THERE IS NO FORM. Do not render a report into fixed slots — \
+         \"Good:\" and \"Bad:\", or any pair like them — and do not fix that by \
+         making one of the slots optional: a slot that can be left empty is \
+         still a slot, and a slot gets filled. There is no template to put in \
+         its place either. A spec review, a build failure, a batch waiting to \
+         land and a direct answer to a question do not share a shape; write \
+         the prose the report in front of you needs.\n",
+    );
+    match level {
+        CharterLevel::Live => out.push_str(
+            "- YOUR CHAT REPORT IS NOT AN ABRIDGED REVIEW. They are two \
+             artifacts with two readers: a review's `feedback` goes to the \
+             agent that will build the thing and carries the review in full, \
+             while the conversation goes to the human deciding whether it \
+             should be built at all. So the chat half can be terse — reporting \
+             one finding out of five is right when that one is the finding \
+             this reader needs. But what you may leave out of it is bounded by \
+             what `feedback` carries to someone who can act on it: a wrong \
+             layer, a missing test, an unchecked claim — the Builder reads \
+             those and acts on them. A finding only the human can act on has \
+             no home in `feedback` at all — that the task may not be worth \
+             doing, that it contradicts something decided last week, that it \
+             breaks work shipped three commits ago, that two specs in flight \
+             are solving the same problem. Put one of those in `feedback` and \
+             it is addressed to a Builder that cannot act on it and will \
+             account for it in SUMMARY.md while building the thing anyway. \
+             Report it here however terse the rest is, because there is no \
+             second copy of it.\n",
+        ),
+        CharterLevel::Shadow | CharterLevel::Off => out.push_str(
+            "- THE DETAIL HAS NOWHERE ELSE TO GO. Your review verdicts are not \
+             being applied on this server, so a review's `feedback` reaches \
+             nobody: a shadowed verdict is recorded and applied to nothing, \
+             and its feedback is dropped by the server before it is stored \
+             anywhere — not even on the spec's queue entry — while with the \
+             capability off there is no verdict for it to travel on at all. \
+             The conversation is the only copy your review has. So lead with \
+             the subject and stay factual as above, and then carry the \
+             findings in full, at whatever length that takes. Terseness here \
+             loses them.\n",
+        ),
+    }
+    out
+}
+
 /// Assemble the standing system prompt.
 ///
 /// Takes the whole [`OrchestratorConfig`] rather than five positional
@@ -1378,6 +1491,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
     let can_verify = config.workdir_is_checkout && config.target_dir.is_some();
     let authority = authority_section(charter);
     let landing = landing_section(charter, can_verify);
+    let reporting = reporting_section(charter);
     let workdir = workdir_section(config.workdir_is_checkout);
     let verification = verification_section(config.target_dir.as_deref(), config.timeout);
     let degradation = degradation_section(config.github_configured);
@@ -1412,9 +1526,10 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            flight and where the project is going, and is the underlying task \
            worth doing at all? You are the one place \"why are we doing \
            this?\" gets asked — did the agent miss the forest for the trees? \
-           Lead with your strongest objection, then render the verdict — \
-           what you may do with it is in the authority section below, not \
-           here.\n\
+           Within the review itself, lead with your strongest objection, \
+           then render the verdict — what you may do with it is in the \
+           authority section below, and how it reaches the human is in the \
+           reporting section, not here.\n\
          - You approved a spec → carry it through in the same turn. Approval \
            is not delivery: nothing dispatches on its own, and your own \
            verdicts do not come back to you as news. Either queue the build \
@@ -1449,6 +1564,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          then say what you tried.\n\
          Be brief on notifications — a quiet pipeline deserves a quiet \
          channel. Never fabricate activity.\n\n\
+         {reporting}\n\
          {authority}\n\n\
          {degradation}\
          {workdir}\n\n\
@@ -2135,6 +2251,187 @@ mod tests {
                 "{section}"
             );
         }
+    }
+
+    /// A charter carrying the one row [`reporting_section`] reads.
+    fn review_charter(level: CharterLevel) -> Vec<CharterEntry> {
+        vec![CharterEntry {
+            capability: Capability::AutoReviewSpecs,
+            level,
+            daily_limit: None,
+            updated_at: chrono::Utc::now(),
+        }]
+    }
+
+    /// The failure this comes from: "#984 approved with five required changes"
+    /// opens a report that names nothing, read hours later by someone who was
+    /// not here for the notification before it.
+    #[test]
+    fn every_report_names_its_subject_before_it_says_anything_about_it() {
+        let p = prompt(4800, &review_charter(CharterLevel::Live));
+        assert!(p.contains("read as a stream"), "{p}");
+        assert!(p.contains("LEAD WITH THE SUBJECT"), "{p}");
+        assert!(p.contains("An issue number is not a name"), "{p}");
+        assert!(p.contains("what the work IS and what it would do"), "{p}");
+        // Not a rule about reviews. The non-review kinds are named inside the
+        // bullet so it cannot be quietly narrowed back to reviews later.
+        assert!(p.contains("a failed build"), "{p}");
+        assert!(p.contains("an obligation you are declining"), "{p}");
+        // The subject rule does not depend on the charter — only the fourth
+        // bullet does.
+        for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
+            let section = reporting_section(&review_charter(level));
+            assert!(section.contains("LEAD WITH THE SUBJECT"), "{section}");
+        }
+        // And it sits with the turn-handling guidance it qualifies, ahead of
+        // the authority section, as its own paragraph rather than glued to the
+        // sentence above it.
+        assert!(
+            p.contains("Never fabricate activity.\n\nHow to report"),
+            "{p}"
+        );
+    }
+
+    /// The chat report and the review's `feedback` are two artifacts with two
+    /// readers, not one artifact at two lengths.
+    #[test]
+    fn the_chat_report_and_the_review_feedback_are_different_artifacts() {
+        let live = reporting_section(&review_charter(CharterLevel::Live));
+        assert!(live.contains("NOT AN ABRIDGED REVIEW"), "{live}");
+        // Both readers named, because the whole permission turns on which of
+        // them can act on a given finding.
+        assert!(
+            live.contains("the agent that will build the thing"),
+            "{live}"
+        );
+        assert!(
+            live.contains("the human deciding whether it should be built"),
+            "{live}"
+        );
+        assert!(live.contains("one finding out of five"), "{live}");
+        // The qualifier: what may be dropped is bounded by what `feedback`
+        // carries to someone who can act on it, and a finding whose only
+        // possible audience is the human is reported regardless of terseness.
+        // Unqualified, the licence to report one of five is a licence to drop
+        // exactly the finding no other channel carries.
+        assert!(live.contains("bounded by"), "{live}");
+        assert!(live.contains("no home in `feedback` at all"), "{live}");
+        assert!(live.contains("may not be worth doing"), "{live}");
+        assert!(live.contains("no second copy of it"), "{live}");
+    }
+
+    /// Terseness is offered only where the other channel actually carries the
+    /// detail — the [`landing_section`] argument one level over.
+    #[test]
+    fn terseness_is_only_offered_where_the_feedback_channel_actually_carries() {
+        let live = reporting_section(&review_charter(CharterLevel::Live));
+        assert!(
+            !live.contains("THE DETAIL HAS NOWHERE ELSE TO GO"),
+            "{live}"
+        );
+
+        for level in [CharterLevel::Shadow, CharterLevel::Off] {
+            let section = reporting_section(&review_charter(level));
+            assert!(
+                section.contains("THE DETAIL HAS NOWHERE ELSE TO GO"),
+                "{section}"
+            );
+            assert!(section.contains("carry the findings in full"), "{section}");
+            // The negative half, and the point of the split: the permission to
+            // drop findings is ABSENT here, not present with a caveat under it.
+            assert!(!section.contains("NOT AN ABRIDGED REVIEW"), "{section}");
+            assert!(!section.contains("one finding out of five"), "{section}");
+            assert!(!section.contains("can be terse"), "{section}");
+        }
+
+        // A missing row reads `off`, as `Store::charter_entry` does — and here
+        // that is also the direction that carries the detail rather than
+        // dropping it.
+        assert_eq!(
+            reporting_section(&[]),
+            reporting_section(&review_charter(CharterLevel::Off))
+        );
+    }
+
+    /// The axis the section states is factual versus evaluative, and the
+    /// property under test is that the anti-praise rule is stated ONCE.
+    ///
+    /// Deliberately not an occurrence count of "congratulatory" over the whole
+    /// prompt: that goes red on a reword ("never praise a spec") that breaks
+    /// nothing, and a test that fails on a legitimate edit is a test people
+    /// delete. What can actually drift is this section restating the rule, so
+    /// that is what is asserted. The one whole-prompt assertion catches the
+    /// rule being *deleted*, not reworded — "praise is noise" is the clause it
+    /// cannot lose without changing meaning.
+    #[test]
+    fn the_reporting_format_cannot_invite_praise() {
+        let section = reporting_section(&review_charter(CharterLevel::Live));
+        assert!(!section.contains("congratulatory"), "{section}");
+        assert!(!section.contains("praise"), "{section}");
+        assert!(
+            section.contains("REPORT FACTS, NOT ASSESSMENTS"),
+            "{section}"
+        );
+        // Naming the axis is what keeps "no praise" from collapsing into
+        // "report nothing favourable" — both of the bullet's own examples are
+        // favourable facts.
+        assert!(
+            section.contains("not positive versus negative"),
+            "{section}"
+        );
+        assert!(section.contains("the build's own test run"), "{section}");
+
+        let p = prompt(4800, &review_charter(CharterLevel::Live));
+        assert!(p.contains("praise is noise"), "{p}");
+    }
+
+    /// No slots, and no replacement template either.
+    #[test]
+    fn reports_are_prose_fitted_to_the_report_and_not_a_rendered_form() {
+        let section = reporting_section(&review_charter(CharterLevel::Live));
+        assert!(section.contains("THERE IS NO FORM"), "{section}");
+        assert!(section.contains("\"Good:\""), "{section}");
+        assert!(section.contains("\"Bad:\""), "{section}");
+        // The non-fix is named too, so the next reader does not rediscover
+        // "make Good: optional" as a patch.
+        assert!(
+            section.contains("a slot that can be left empty is still a slot"),
+            "{section}"
+        );
+        assert!(
+            section.contains("no template to put in its place"),
+            "{section}"
+        );
+
+        // And the issue's illustration did not harden into the very form the
+        // bullet warns against, which is the thing most likely to have gone
+        // wrong here.
+        let p = prompt(4800, &review_charter(CharterLevel::Live));
+        for form in ["What it does:", "Risks & defects:"] {
+            assert!(!p.contains(form), "{form} became the form: {p}");
+        }
+    }
+
+    /// Two instructions about what a report leads with is the same
+    /// two-sources failure in miniature. The review's internal ordering is
+    /// unchanged; only its scope is now stated.
+    #[test]
+    fn the_reviews_ordering_does_not_contradict_the_reports_ordering() {
+        let p = prompt(4800, &review_charter(CharterLevel::Live));
+        assert!(
+            p.contains("Within the review itself, lead with your strongest objection"),
+            "{p}"
+        );
+        assert!(
+            p.contains("how it reaches the human is in the reporting section"),
+            "{p}"
+        );
+        // The unscoped sentence is gone, not merely outvoted by one further
+        // down — the regression shape `landing_section`'s own test pins.
+        assert!(
+            !p.contains("trees? Lead with your strongest objection"),
+            "{p}"
+        );
     }
 
     /// Same rule as the workdir and degradation sections: anything the prompt
