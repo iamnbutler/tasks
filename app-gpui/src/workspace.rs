@@ -1246,7 +1246,7 @@ impl Workspace {
             .child(
                 Self::header_button("mode-play", Icons::play())
                     .selected(mode == Some(Mode::Play))
-                    .tooltip(tooltip("Play — work moves on its own"))
+                    .tooltip(tooltip(crate::disclaimer::PLAY_TOOLTIP))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.set_mode(Mode::Play, cx);
                     })),

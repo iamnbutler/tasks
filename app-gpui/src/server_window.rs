@@ -358,6 +358,16 @@ impl ServerWindow {
                         .child(error),
                 )
             })
+            // Always, not only while paused: a caution that disappears once
+            // the risk is taken only ever warns the people not taking it.
+            .child(
+                div()
+                    .pl(px(102.))
+                    .max_w(px(420.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(crate::disclaimer::PIPELINE_CAUTION),
+            )
     }
 
     fn mode_button(
