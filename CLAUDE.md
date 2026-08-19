@@ -312,6 +312,71 @@ implementation.
   cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
   from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
   a demotion to human.
+- **A bind address is not access control against a browser, so the API refuses
+  the two shapes only a browser sends.** The other half of the attribution
+  rule: a request with no `X-Tasks-Actor` is read as the human's, and the human
+  is never gated — so before #985 any page you had open could drive the
+  pipeline. Two ways, and they are *not* one: a CORS-**simple** `POST` (no
+  body, no `Content-Type`, hence no preflight) whose opaque response does not
+  matter because `POST /tasks/{id}/build-now` has already dispatched a VM that
+  writes code and opens pull requests; and **DNS rebinding**, where a name the
+  attacker controls resolving to `127.0.0.1` makes their page genuinely
+  same-origin and lifts the simple-request restriction entirely — `/tasks`,
+  `/decisions`, the transcripts, `POST /pull-requests/{n}/merge`. So
+  `crate::loopback` is one middleware over the whole router enforcing two rules
+  that are **not interchangeable, because each is blind to the other's path**:
+  every authority the request states must name this machine's loopback, and an
+  `Origin` header — *any* value, `null` and a loopback one included — is a
+  refusal. The rebind arrives with an ordinary `Origin` naming the attacker's
+  own site *and* a `Host` naming it too; the simple `POST` arrives with a
+  loopback `Host` the first rule has no quarrel with. Both apply to reads as
+  well as writes, because deciding it per method means re-deciding it for every
+  route added later — the shape `authorize` exists not to have. The **route
+  list is a separate private `fn routes`** and the layer wraps it, rather than
+  a `.layer()` chained onto the end of a 120-line list that a later route can
+  be appended *after*, silently unguarded; the property is pinned on an
+  **unrouted** path answering **403 rather than 404**, which is what makes it
+  hold for routes nobody has written yet. The port is parsed and never
+  compared — a browser fills `Host` from the URL's *hostname*, so a rebind
+  fails on the host part alone, and comparing `:4800` would refuse every test
+  in the tree, which binds `:0` — but the `u16` parse is what stops
+  `127.0.0.1:80.evil.example`; `get_all` for `Host`, because "the first one is
+  loopback" is the reading a smuggled second one is built to get; and the URI
+  authority is checked too, since **HTTP/2 carries no `Host` header** and an
+  absolute-form request line must not name a host the header would have
+  refused. **The coverage claim is stated exactly, because a security change
+  that overstates it is worse than one that states a gap** — the gap stops
+  being anybody's job. `GET` is covered against *rebinding* by the authority
+  rule and is **not** covered against a direct-to-loopback cross-site
+  subresource load: browsers send no `Origin` on `<img src>`/`<script
+  src>`/`<iframe>`, so `<img src="http://127.0.0.1:4800/…">` passes both rules.
+  That residual is bounded to routes whose responses the attacker cannot read
+  (this API sends no CORS headers) and whose only effect is server-side, and
+  today exactly one route is not nil: **`GET /decisions/{seq}/reconcile`**,
+  which spends the server's own GitHub credential outbound. It is **accepted**
+  rather than moved to `POST` — idempotent, locally mutating nothing, answering
+  only for a `pending` decision, and named as a `GET` by the obligation loop
+  and the orchestrator's own `curl` — so what it costs is one GitHub read per
+  pending decision, a rate-limit lever and not the `build-now` hole; closing it
+  wants `Sec-Fetch-Site`, which is its own decision. There is **no knob**, and
+  the argument is no longer the one that fits on a line: a disable switch whose
+  only user bypasses the fix was the whole reason until a *legitimate*
+  deployment shape turned out to be refused. Through an SSH `-L` tunnel the
+  client connects to `localhost:PORT` and the `Host` arrives loopback, so that
+  shape is untouched; through an **HTTP reverse proxy** (`tailscale serve`,
+  nginx) the proxy forwards `Host: mini.tail….ts.net` and every request 403s —
+  which the menubar's `TASKS_MENUBAR_MACHINES` can name. That is **accepted
+  breakage with the tunnel as the answer**, and an `X-Forwarded-Host`-aware
+  allowance is rejected rather than unconsidered: it would trust a header any
+  client can send, on a listener with no way to tell a proxy from a page, which
+  is the guard deleting itself. A trusted-authority list is the honest shape
+  and belongs with the bind — this guard **assumes the loopback bind**
+  (`server::bind` takes `Ipv4Addr::LOCALHOST`, no knob), so if Tasks ever binds
+  beyond loopback the allow-list widens *and* something real goes in front of
+  the port, deliberately, rather than a switch being flipped. The one
+  deliberate exclusion is the **broker** (port 4801): a second listener on
+  purpose, reachable from the VM subnet, where every route already demands a
+  live lease — it builds its own router and must not get this layer.
 - **A refusal is a no-op, so everything refusable runs before the effect — and
   the rationale check lives at `authorize`, not in the handlers.** The other
   end of the attribution rule: a write the server *does* attribute still has to

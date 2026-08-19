@@ -20,6 +20,10 @@ pub mod github;
 pub mod github_health;
 /// What the VM images are running, observed from the runs inside them (#909).
 pub mod images;
+/// The two rules that keep a web page you visit from driving the local API:
+/// the authority must be this machine's loopback, and an `Origin` header is a
+/// refusal (#985).
+pub mod loopback;
 /// The migration set plus the naming rule that keeps parallel branches from
 /// colliding on it — private, like `teardown`: the store is the only caller.
 mod migrations;

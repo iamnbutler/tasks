@@ -240,7 +240,24 @@ pub fn router(store: Arc<Store>) -> Router {
 /// writes can go through the server rather than through an agent's own
 /// credential, and the bundle service so a preserved implementation can be
 /// found without an `ls` on the server host.
+///
+/// Every route goes through [`crate::loopback::guard`], which refuses a
+/// request that names a host other than this machine's loopback or that
+/// carries an `Origin` header at all. Both constructors come through here, so
+/// a test that builds a router directly is guarded like the served one.
 pub fn router_with_services(store: Arc<Store>, services: Services) -> Router {
+    routes(store, services).layer(axum::middleware::from_fn(crate::loopback::guard))
+}
+
+/// The route list, unguarded.
+///
+/// Split from [`router_with_services`] deliberately: a `.layer()` chained
+/// onto the end of a 120-line route list is one line a later route can be
+/// appended *after*, silently unguarded. With the split, a route added here
+/// is guarded by construction — including one nobody has written yet, which
+/// is what `the_guard_covers_a_path_with_no_route` pins by asserting that an
+/// unrouted path answers 403 rather than 404.
+fn routes(store: Arc<Store>, services: Services) -> Router {
     Router::new()
         // First on purpose: no state, no store, no auth — the one route that
         // answers while everything else might still be wrong.
@@ -5579,5 +5596,141 @@ mod tests {
             ts.ends_with('Z') && ts.contains('T'),
             "expected RFC3339 Zulu, got {ts}"
         );
+    }
+
+    // --- the loopback guard (#985) -------------------------------------
+
+    /// A path with no route answers **403 rather than 404**.
+    ///
+    /// This is what pins the layer as outermost, and therefore that the
+    /// property holds for routes nobody has written yet. Unwrap the layer —
+    /// or chain it inside `routes` instead of around it — and this is the
+    /// test that goes red.
+    #[tokio::test]
+    async fn the_guard_covers_a_path_with_no_route() {
+        let (store, _project) = store_with_project().await;
+        let base = spawn(store).await;
+        let http = reqwest::Client::new();
+
+        // Control: the same unrouted path, no offending header, is a 404 —
+        // so the 403 below is the guard and not a route that never existed.
+        let resp = http
+            .get(format!("{base}/no-such-route"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let resp = http
+            .get(format!("{base}/no-such-route"))
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "an unrouted path must be refused by the guard before it is a 404"
+        );
+    }
+
+    /// The issue's path 1: a CORS-*simple* `POST` — no body, no
+    /// `Content-Type`, therefore no preflight — from any page you have open.
+    /// The opaque response does not matter, because the VM is already
+    /// dispatched.
+    #[tokio::test]
+    async fn a_cross_origin_post_cannot_reach_a_handler() {
+        let (store, project) = store_with_project().await;
+        let task = insert_task(&store, &project, 1, 0).await;
+        let base = spawn(store).await;
+        let http = reqwest::Client::new();
+
+        for path in [
+            format!("/tasks/{}/build-now", task.id),
+            format!("/tasks/{}/scout", task.id),
+            format!("/tasks/{}/queue", task.id),
+            "/runs/cancel-all".to_string(),
+        ] {
+            // Control: without the header the same call reaches the handler,
+            // so the assertion below is about the header and not about a
+            // route that was broken anyway.
+            let resp = http.post(format!("{base}{path}")).send().await.unwrap();
+            assert_ne!(resp.status(), 403, "control: {path} without an Origin");
+
+            let resp = http
+                .post(format!("{base}{path}"))
+                .header("origin", "https://evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "cross-origin POST to {path}");
+        }
+    }
+
+    /// The issue's path 2: DNS rebinding. A name the attacker controls
+    /// resolving to `127.0.0.1` makes their page genuinely same-origin, which
+    /// lifts the simple-request restriction entirely — so reads matter as
+    /// much as writes here.
+    #[tokio::test]
+    async fn a_rebound_host_can_neither_read_nor_write() {
+        let (store, _project) = store_with_project().await;
+        let base = spawn(store).await;
+        let http = reqwest::Client::new();
+
+        for (method, path) in [
+            ("GET", "/tasks"),
+            ("GET", "/decisions"),
+            ("GET", "/status"),
+            ("GET", "/version"),
+            ("POST", "/pull-requests/1/merge"),
+        ] {
+            let url = format!("{base}{path}");
+            let request = |host: Option<&str>| {
+                let builder = match method {
+                    "GET" => http.get(&url),
+                    _ => http.post(&url),
+                };
+                match host {
+                    Some(host) => builder.header("host", host),
+                    None => builder,
+                }
+            };
+
+            // Control: the same call with the real loopback authority.
+            let resp = request(None).send().await.unwrap();
+            assert_ne!(resp.status(), 403, "control: {method} {path}");
+
+            let resp = request(Some("evil.example:4800")).send().await.unwrap();
+            assert_eq!(resp.status(), 403, "rebound {method} {path}");
+        }
+    }
+
+    /// The three authorities every real client in this tree sends: `ureq`
+    /// (the app, `tasks status`, `tasks-client`) and `reqwest` (`tasks
+    /// reload`) both derive `Host` from the URL, and the orchestrator's
+    /// `curl -K` config carries `X-Tasks-Actor` and nothing else.
+    #[tokio::test]
+    async fn the_shapes_real_clients_send_are_untouched() {
+        let (store, _project) = store_with_project().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router(store)).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+
+        for host in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("[::1]:{port}"),
+        ] {
+            let resp = http
+                .get(format!("http://127.0.0.1:{port}/version"))
+                .header("host", &host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{host} should be accepted");
+        }
     }
 }
