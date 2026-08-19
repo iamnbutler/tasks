@@ -5,6 +5,47 @@ GitHub issue tracker into shipped pull requests by orchestrating headless
 [Claude Code](https://claude.com/claude-code) agents — and keeps a human in
 the position of *reviewer*, not operator.
 
+## Read this first
+
+Tasks runs coding agents against your repositories with nobody in the loop
+between a decision and the act. Before you point it at anything, know what it
+does.
+
+- **The agents run unattended, with permission checks off.** Scouts and
+  Builders are Claude Code processes started with
+  `--dangerously-skip-permissions` (`images/scout/Dockerfile`,
+  `images/builder/Dockerfile`): inside their VM they run whatever commands
+  they decide to run, and nothing asks you first. The VM is the boundary, and
+  it is a real one — each is ephemeral, and the credentials a run is given
+  reach Anthropic and read the one repository it was dispatched for. Agents
+  cannot push.
+- **The server can.** On an agent's say-so, under its own GitHub credential,
+  while you are not watching, it pushes branches, opens pull requests, merges
+  them, comments on issues and closes them. All nine capabilities in the
+  orchestrator's charter ship `live`
+  (`crates/tasks/migrations/0016_charter_live.sql`) — the charter is a kill
+  switch, not a promotion ladder, and the append-only decisions ledger is
+  something you read afterwards.
+- **The local API has no authentication.** Anything running on your machine
+  that can reach port 4800 can drive the pipeline — start a Scout, start a
+  Builder, merge a pull request — and it is recorded as you, because a caller
+  that does not identify itself is read as the human and the human is never
+  gated. Web pages are refused (`crates/tasks/src/loopback.rs`), but that
+  guard is about pages, not about processes.
+- **The orchestrator is not in a VM.** It is a Claude Code agent in an
+  ordinary child process on the machine running the server, and what it may
+  do is whatever `ORCHESTRATOR_CMD` allows. The default is `curl` and nothing
+  else; pointing `ORCHESTRATOR_WORKDIR` at a checkout and adding
+  `--dangerously-skip-permissions`, which `CLAUDE.md` describes as a
+  supported way to run it, makes it a full developer agent on your host.
+
+The server boots paused, so nothing moves until you say so. Point it at a
+repository you would not mind rewriting — a fork, a scratch repo, something
+where a bad pull request costs you a click. This is software one person wrote
+to run on his own machine, published in case it is useful to you: there is no
+warranty, nobody is on call, and if it breaks something of yours, fixing it is
+your job. The `LICENSE` says the same thing in the legal register.
+
 ## The idea
 
 Most agent tooling makes you drive: prompt, watch, approve, repeat. Tasks

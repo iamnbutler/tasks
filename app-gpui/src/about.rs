@@ -1,8 +1,15 @@
-//! The About window — the app's name and the build it came from.
+//! The About window — the app's name, the build it came from, and what this
+//! thing does when you turn it on.
 //!
 //! Same information set the Swift about panel showed: a marketing version and
 //! a monospaced commit line. Both are stamped by `build.rs`; `0.1.0` with
 //! `commit unknown` means the binary was built without git in reach.
+//!
+//! Beneath them, [`crate::disclaimer`]. This is the window a stranger opens
+//! before pointing the pipeline at their repositories, so it is where the
+//! plain statement belongs. Left-aligned and width-bounded on purpose:
+//! centred prose past one line reads as a splash screen, which is the
+//! register this must not have.
 
 use gpui::prelude::*;
 use gpui::{
@@ -10,6 +17,8 @@ use gpui::{
     WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
+
+use crate::disclaimer;
 
 /// `0.1.<commit count>`, or the crate version with no git in reach.
 pub const VERSION: &str = env!("TASKS_GPUI_VERSION");
@@ -48,7 +57,7 @@ pub fn open(cx: &mut App) {
         }),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(320.), px(200.)),
+            size(px(380.), px(300.)),
             cx,
         ))),
         is_resizable: false,
@@ -73,10 +82,11 @@ impl Render for About {
         div()
             .flex()
             .flex_col()
-            .items_center()
+            .items_start()
             .justify_center()
             .gap(px(6.))
             .size_full()
+            .p(px(20.))
             .bg(theme.bg())
             .font_family(crate::workspace::FONT)
             .child(div().text_color(theme.fg()).child("Tasks"))
@@ -91,6 +101,28 @@ impl Render for About {
                     .text_xs()
                     .text_color(theme.fg_muted())
                     .child(format!("commit {COMMIT}")),
+            )
+            .child(
+                div()
+                    .mt(px(6.))
+                    .max_w(px(320.))
+                    .text_sm()
+                    .text_color(theme.fg())
+                    .child(disclaimer::HEADLINE),
+            )
+            .child(
+                div()
+                    .max_w(px(320.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(disclaimer::SUMMARY),
+            )
+            .child(
+                div()
+                    .max_w(px(320.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(disclaimer::README_POINTER),
             )
     }
 }

@@ -3,6 +3,7 @@ mod chat_log;
 mod commands;
 mod components;
 mod context_gauge;
+mod disclaimer;
 mod feed;
 mod issue_composer;
 mod menus;
