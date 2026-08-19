@@ -200,8 +200,10 @@ tasks doctor                           # 3: every precondition for a scout, as a
                                        #    checklist; exit 1 on any failure
 ```
 
-With `tasks doctor` clean, wait one poll interval (60s by default) for intake,
-then queue something and start the pipeline:
+With `tasks doctor` clean, the issues are already in: the first GitHub poll
+runs at startup rather than one interval into it, and a paused server still
+polls. (Add a project *after* the server is up and it is the next poll —
+`TASKS_POLL_INTERVAL`, 60s.) Now queue something and start the pipeline:
 
 ```sh
 curl -s localhost:4800/tasks | jq -r '.[] | "\(.id)  #\(.gh_issue_number)  \(.state)  \(.title)"'
