@@ -34,6 +34,9 @@ usage:
                                 (a vm-pool restart, `make images`) and hold
                                 dispatch until `tasks resume`
   tasks resume                  release that hold: dispatch plays again
+  tasks doctor [flags]          check every precondition for a scout on this
+                                machine and print a checklist; reports and
+                                never fixes, exits 1 on any failure
   tasks add-project <owner/repo>  track a GitHub repository
   tasks secrets <subcommand>    custody of the upstream credentials: seal
                                 ANTHROPIC_API_KEY / GITHUB_TOKEN under the
@@ -232,6 +235,42 @@ the images are rebuilt.
 Exits 1 when nothing is serving — there is no mode to write.
 ";
 
+const DOCTOR_USAGE: &str = "\
+usage: tasks doctor [flags]
+
+Ask every precondition for a scout at once and print a checklist, in the order
+the preconditions bite: .env and the data dir, whether the configuration
+parses, the container CLI and its system services, the toolchain `make images`
+needs, vm-pool's socket / protocol / slot and memory ledgers, the server, the
+VM images, credential custody, the credential broker VMs redeem leases
+against, GitHub's answer to this token, whether any project is tracked, and
+the orchestrator's surroundings.
+
+It reports and never fixes: every failing check names the command that changes
+it. It writes nothing — not to GitHub, not to the store (Store::open would run
+migrations), not to a VM — with one stated exception, a single temporary file
+under the data dir to answer whether the data dir is writable. It never prints
+a credential, only which source answered.
+
+  --strict          treat any warning as a failure too
+  --probe-images    additionally boot each VM image and read `--version` back,
+                    the cold read `make images-check` performs. Off by default
+                    because it starts a container: the default answers
+                    presence, which is what fails on a fresh machine
+
+levels:
+  ok    asked and answered
+  warn  everything required is present, but something is degraded (a pool with
+        no slack, a stale image) or is deliberately set not to run (mode
+        pause, no project tracked)
+  FAIL  a required capability is missing or broken: a scout dispatched now
+        would not start, or would start and die
+  skip  the check could not be MADE, and says why. Never a pass, and never an
+        exit code — the failure that caused it is what fails the run
+
+exit codes: 0 clean   1 a failure (or, with --strict, any warning)   2 usage
+";
+
 const ADD_PROJECT_USAGE: &str = "\
 usage: tasks add-project <owner/repo>
 
@@ -371,6 +410,7 @@ fn usage_for(command: &str) -> &'static str {
         "stop" => STOP_USAGE,
         "drain" => DRAIN_USAGE,
         "resume" => RESUME_USAGE,
+        "doctor" => DOCTOR_USAGE,
         "add-project" => ADD_PROJECT_USAGE,
         "secrets" => SECRETS_USAGE,
         "vm-pool" => VM_POOL_USAGE,
@@ -404,11 +444,15 @@ fn main() -> Result<()> {
         .init();
     tasks::env_file::report(&env_sources);
 
-    dispatch()
+    // Threaded through rather than dropped after the report: `tasks doctor`
+    // has to say *what each file contributed* (names only, never values), and
+    // re-reading them there would report a different answer than the one
+    // actually in force — the files were applied before the runtime started.
+    dispatch(env_sources)
 }
 
 #[tokio::main]
-async fn dispatch() -> Result<()> {
+async fn dispatch(env_sources: Vec<tasks::env_file::Source>) -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Ahead of every subcommand, so asking for help is a side-effect-free act
@@ -428,6 +472,7 @@ async fn dispatch() -> Result<()> {
         Some("stop") => stop_cmd(&args[1..]).await,
         Some("drain") => drain_cmd(&args[1..]).await,
         Some("resume") => resume_cmd(&args[1..]).await,
+        Some("doctor") => doctor_cmd(&args[1..], env_sources).await,
         Some("add-project") => add_project(&args[1..]).await,
         Some("secrets") => secrets_cmd(&args[1..]),
         Some("service") => service_cmd(&args[1..]).await,
@@ -691,6 +736,42 @@ async fn vm_pool(args: &[String]) -> Result<()> {
         .run()
         .await
         .map_err(|e| anyhow::anyhow!("vm-pool service: {e}"))
+}
+
+/// `tasks doctor`: the checklist, and an exit code a setup script can branch
+/// on.
+///
+/// An unrecognized argument exits 2 rather than proceeding, like every other
+/// subcommand here — and 2 is the usage code the help text promises, kept
+/// apart from the 1 a real failure gets so a script can tell "your machine is
+/// broken" from "you typed it wrong".
+async fn doctor_cmd(args: &[String], env_sources: Vec<tasks::env_file::Source>) -> Result<()> {
+    let mut strict = false;
+    let mut probe_images = false;
+    for arg in args {
+        match arg.as_str() {
+            "--strict" => strict = true,
+            "--probe-images" => probe_images = true,
+            other => {
+                eprint!("unexpected argument: {other}\n\n{DOCTOR_USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let report = tasks::doctor::run(tasks::doctor::DoctorOptions {
+        data_dir: run::data_dir()?,
+        strict,
+        probe_images,
+        env_sources,
+    })
+    .await;
+    println!("{report}");
+    let code = report.exit_code(strict);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 async fn add_project(args: &[String]) -> Result<()> {

@@ -72,7 +72,16 @@ tasks secrets set github-token         # paste the token, ctrl-D (same for anthr
 tasks vm-pool &                        # the VM pool, a separate long-lived daemon
 make serve                             # the server, in this terminal
 cargo run -p tasks -- add-project owner/repo
+tasks doctor                           # ...and check the lot: every precondition for a
+                                       #   scout, as a checklist, exit 1 on any failure
 ```
+
+`tasks doctor` is the answer to "can this machine actually run a scout?" — it
+asks the container CLI, vm-pool's socket and both its ledgers, the images, the
+sealed store, the credential broker VMs redeem leases against, GitHub's answer
+to your token, and the rest, in the order the preconditions bite, and names the
+command that fixes each failure. It reports and never fixes, and it writes
+nothing.
 
 Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
 through an in-process broker, and the sealed store means no raw key sits in
@@ -90,6 +99,7 @@ Day to day:
 ```sh
 make restart      # upgrade a running server in place (drain, swap, verify)
 make status
+tasks doctor      # preflight: every precondition for a scout, with its fix
 make test         # ~565 tests, real processes and real SQLite, no mocks
 ```
 

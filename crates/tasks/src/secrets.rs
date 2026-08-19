@@ -824,6 +824,35 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), SecretsError> {
     Ok(())
 }
 
+/// Which of the three resolution steps answered for one secret — the *location*
+/// of a value, never the value.
+///
+/// This is what a diagnostic prints. It is structurally incapable of leaking a
+/// credential: there is no value in the type, so no rendering of it, however
+/// careless, can put one on a terminal. [`Secrets::source_of`] is [`Secrets::get`]
+/// with the value thrown away and this kept, resolving through the same order in
+/// the same function, so the two can never disagree about who won — which is the
+/// only property that makes the answer worth printing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// The sealed store under the data dir. What production should say.
+    Sealed,
+    /// The named environment variable, captured at boot.
+    Environment(&'static str),
+    /// The host's Claude Code `apiKeyHelper` — Anthropic only.
+    ApiKeyHelper(PathBuf),
+}
+
+impl std::fmt::Display for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sealed => f.write_str("the sealed store"),
+            Self::Environment(var) => write!(f, "{var} in the environment"),
+            Self::ApiKeyHelper(path) => write!(f, "apiKeyHelper {}", path.display()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The runtime handle
 // ---------------------------------------------------------------------------
@@ -833,6 +862,16 @@ struct Cache {
     entries: HashMap<SecretName, Secret>,
 }
 
+/// One boot-captured fallback: the value, and where it was read from.
+///
+/// The location rides *with* the value rather than being recomputed on demand,
+/// because recomputing it would re-run the `apiKeyHelper` — a subprocess, at
+/// report time, whose answer could differ from the one actually in use.
+struct EnvFallback {
+    value: Secret,
+    source: CredentialSource,
+}
+
 struct Inner {
     /// `None` for [`Secrets::for_tests`], which is env-map-only.
     path: Option<PathBuf>,
@@ -840,9 +879,9 @@ struct Inner {
     /// created *after* boot is unlocked lazily, once.
     kek: RwLock<Option<Key>>,
     late_unlock_attempted: AtomicBool,
-    /// Boot-captured environment fallbacks. Read only when the sealed store
-    /// has no entry for the name.
-    env: HashMap<SecretName, Secret>,
+    /// Boot-captured environment fallbacks, each with the location it came
+    /// from. Read only when the sealed store has no entry for the name.
+    env: HashMap<SecretName, EnvFallback>,
     cache: RwLock<Cache>,
 }
 
@@ -917,11 +956,19 @@ impl Secrets {
     /// for callers that already resolved their credentials.
     pub fn for_tests(github_token: Option<&str>, anthropic_api_key: Option<&str>) -> Self {
         let mut env = HashMap::new();
-        if let Some(t) = github_token {
-            env.insert(SecretName::GithubToken, Secret::new(t));
-        }
-        if let Some(k) = anthropic_api_key {
-            env.insert(SecretName::AnthropicApiKey, Secret::new(k));
+        for (name, value) in [
+            (SecretName::GithubToken, github_token),
+            (SecretName::AnthropicApiKey, anthropic_api_key),
+        ] {
+            if let Some(value) = value {
+                env.insert(
+                    name,
+                    EnvFallback {
+                        value: Secret::new(value),
+                        source: CredentialSource::Environment(name.env_var()),
+                    },
+                );
+            }
         }
         Self(Arc::new(Inner {
             path: None,
@@ -943,7 +990,38 @@ impl Secrets {
                 return Some(value.clone());
             }
         }
-        self.0.env.get(&name).cloned()
+        self.0.env.get(&name).map(|f| f.value.clone())
+    }
+
+    /// Where [`Self::get`] would find `name` — or `None` if it would find
+    /// nothing.
+    ///
+    /// The same three steps in the same order, deliberately written as one
+    /// `match` beside `get`'s body rather than as a second traversal
+    /// somewhere else: a report that says "the sealed store answers for this"
+    /// while the environment is what the server actually spends is worse than
+    /// no report, and two hand-written versions of one resolution order is how
+    /// that happens.
+    pub(crate) fn source_of(&self, name: SecretName) -> Option<CredentialSource> {
+        if self.0.path.is_some() {
+            self.refresh_if_changed();
+            let cache = self.0.cache.read().expect("secrets cache lock poisoned");
+            if cache.entries.contains_key(&name) {
+                return Some(CredentialSource::Sealed);
+            }
+        }
+        self.0.env.get(&name).map(|f| f.source.clone())
+    }
+
+    /// A handle that resolves nothing and knows it — for a caller that could
+    /// not open the store at all.
+    ///
+    /// Distinct from [`Self::for_tests`] with two `None`s only in what it
+    /// says at the call site: doctor carries on past an unopenable store so
+    /// that every non-credential check still runs, and the thing it must not
+    /// do is then report "no credentials" as if it had looked.
+    pub(crate) fn unresolvable() -> Self {
+        Self::for_tests(None, None)
     }
 
     pub fn github_token(&self) -> Option<Secret> {
@@ -1049,25 +1127,36 @@ fn decrypt_all(
 /// `ANTHROPIC_API_KEY`, and — for the Anthropic key only — the host's Claude
 /// Code `apiKeyHelper` script, exactly the chain `agent_credentials_env` used
 /// to resolve before it was replaced by leases.
-fn env_fallbacks() -> HashMap<SecretName, Secret> {
+fn env_fallbacks() -> HashMap<SecretName, EnvFallback> {
     let mut out = HashMap::new();
     for name in SecretName::ALL {
         if let Ok(value) = std::env::var(name.env_var())
             && !value.is_empty()
         {
-            out.insert(name, Secret::new(value));
+            out.insert(
+                name,
+                EnvFallback {
+                    value: Secret::new(value),
+                    source: CredentialSource::Environment(name.env_var()),
+                },
+            );
         }
     }
     if let std::collections::hash_map::Entry::Vacant(entry) = out.entry(SecretName::AnthropicApiKey)
-        && let Some(key) = anthropic_key_from_host_helper()
+        && let Some((key, helper)) = anthropic_key_from_host_helper()
     {
-        entry.insert(key);
+        entry.insert(EnvFallback {
+            value: key,
+            source: CredentialSource::ApiKeyHelper(helper),
+        });
     }
     out
 }
 
-/// The output of the host's `~/.claude/anthropic_key.sh`, when one exists.
-fn anthropic_key_from_host_helper() -> Option<Secret> {
+/// The output of the host's `~/.claude/anthropic_key.sh`, when one exists —
+/// with the script's path, so a report can name *which* helper answered rather
+/// than only that one did.
+fn anthropic_key_from_host_helper() -> Option<(Secret, PathBuf)> {
     let helper = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|h| h.join(".claude/anthropic_key.sh"))
@@ -1079,7 +1168,7 @@ fn anthropic_key_from_host_helper() -> Option<Secret> {
                 None
             } else {
                 tracing::info!("anthropic credential: host apiKeyHelper");
-                Some(Secret::new(key))
+                Some((Secret::new(key), helper))
             }
         }
         Ok(out) => {
@@ -1113,6 +1202,66 @@ mod tests {
         let secrets = Secrets::open(dir.path()).unwrap();
         assert_eq!(secrets.github_token().unwrap().expose(), "ghp_sealed_value");
         assert!(secrets.github_configured());
+    }
+
+    /// `source_of` is `get` with the value thrown away and the location kept,
+    /// so the two must agree about who wins. Sealed outranks the environment
+    /// in **both** — the failure this pins is a report that says "the sealed
+    /// store answers for this" while the server spends the environment's copy,
+    /// or the reverse.
+    #[test]
+    fn sealed_outranks_the_environment_in_get_and_in_source_of_alike() {
+        let dir = TempDir::new().unwrap();
+        init_with_key_file(&dir);
+        set(dir.path(), SecretName::GithubToken, "sealed-value").unwrap();
+
+        let mut secrets = Secrets::open(dir.path()).unwrap();
+        // A boot-captured environment fallback, injected the way `open` would
+        // have found one.
+        let inner = Arc::get_mut(&mut secrets.0).expect("sole owner");
+        inner.env.insert(
+            SecretName::GithubToken,
+            EnvFallback {
+                value: Secret::new("environment-value"),
+                source: CredentialSource::Environment("GITHUB_TOKEN"),
+            },
+        );
+
+        assert_eq!(
+            secrets.get(SecretName::GithubToken).unwrap().expose(),
+            "sealed-value"
+        );
+        assert_eq!(
+            secrets.source_of(SecretName::GithubToken),
+            Some(CredentialSource::Sealed)
+        );
+    }
+
+    /// It names a *location*, and there is no value in the type to leak.
+    #[test]
+    fn a_source_names_a_location_and_never_a_value() {
+        let secrets = Secrets::for_tests(Some("ghp_do_not_print_me"), None);
+        let source = secrets.source_of(SecretName::GithubToken).unwrap();
+        assert_eq!(source, CredentialSource::Environment("GITHUB_TOKEN"));
+        let rendered = format!("{source} {source:?}");
+        assert!(rendered.contains("GITHUB_TOKEN"));
+        assert!(!rendered.contains("ghp_do_not_print_me"));
+        // ...and it agrees with `get` about which name resolves at all.
+        assert_eq!(secrets.source_of(SecretName::AnthropicApiKey), None);
+        assert!(secrets.get(SecretName::AnthropicApiKey).is_none());
+    }
+
+    /// The handle doctor carries on with after a store it could not open.
+    /// "Nothing resolves" is what it says; the caller is what turns that into
+    /// "we cannot tell".
+    #[test]
+    fn the_unresolvable_handle_answers_nothing() {
+        let secrets = Secrets::unresolvable();
+        for name in SecretName::ALL {
+            assert!(secrets.get(name).is_none());
+            assert!(secrets.source_of(name).is_none());
+        }
+        assert!(!secrets.github_configured());
     }
 
     #[test]

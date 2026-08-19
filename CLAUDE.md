@@ -897,6 +897,54 @@ implementation.
   output repeats the server's own `CancelAck.concluded` rather than flattening
   "asked" and "stopped" into one word.
 
+- **A diagnostic reports and never fixes, and the one check worth writing is
+  the one every other check is blind to.** `tasks doctor` asks every
+  precondition for a scout at once — the container CLI, vm-pool's socket and
+  its *two* ledgers, the images, custody, the broker, GitHub, the
+  orchestrator's surroundings — in the order the preconditions bite, because a
+  missing container CLI explains the vm-pool failure below it which explains
+  the dispatch failure below that; **do not sort by severity**, a reader who
+  sees the first cause first does not have to work out which of six complaints
+  is the root. There is no `--fix` flag and there should not be one: a
+  diagnostic that changes state cannot be run when you are unsure, and the fix
+  it would most want to perform (`make images`) cannot be reached from inside
+  this pipeline at all. Four rules hold its shape. **The fix is a required
+  parameter, not a convention** — `Check::fail` and `Check::warn` take it by
+  value, because every earlier version of "name the fix beside the complaint"
+  here (`make check-toolchain`, `ImageFreshness`, the update-hold reasons) does
+  it by convention and a convention is what the next check quietly skips;
+  `Check::note` is the *named* escape hatch for the two warnings with genuinely
+  no command, so "there is nothing to run" cannot be mistaken for "somebody
+  forgot". **It never opens the store**, because `Store::open` migrates and a
+  diagnostic that moved the schema is worse than none — which is why mode,
+  projects and the observed image identities come from the running server's
+  API, and why a host with no server reports "not serving" rather than reaching
+  past it. **A `Skip` never sets the exit code**: every skip has a failure above
+  it that caused it, and a skip that failed too would report one broken thing as
+  two. And the single write — one uniquely-named file under the data dir — is
+  the write probe, because writability is only answerable by writing (mode bits
+  lie under ACLs, a read-only mount, a full disk). The **broker check** is the
+  one that justifies the command: on 2026-08-19 every host-side signal on this
+  machine was green — pool healthy with slack, socket live, images present,
+  token valid, server serving — and no scout could have run, because the macOS
+  application firewall was severing the broker's non-loopback listener after a
+  `cargo clean` removed the binary its verdict was attached to. So the probe
+  goes to **`TASKS_BROKER_ADVERTISE:TASKS_BROKER_PORT`, never loopback**, and
+  **an unauthenticated 401 is the success condition** — during that outage
+  loopback answered a correct `a lease is required` while the bridge gateway
+  accepted the connection and returned zero bytes, so a `127.0.0.1` probe reads
+  as a pass at exactly the moment the thing is broken. Anything that fails
+  *after* the connect is `Silent` and a `Fail`, never `Unreachable`: the connect
+  already proved the address is reachable, and demoting that to a `Skip` sets no
+  exit code, which is the false negative the check exists to prevent. A gateway
+  that cannot be reached at all *is* a `Skip`, because apple/container's bridge
+  does not exist until the first container has started — a cold machine has not
+  been shown to be broken. Finally, severity is **read, never re-decided**:
+  `Capacity::level`/`describe`/`fix` are what both the connect-time log line and
+  the checklist use, and doctor reads `ImageFreshness::needs_rebuild` rather
+  than judging freshness a second time — two hand-written versions of one
+  question is exactly how two readers come to disagree.
+
 ## Project structure
 
 - `crates/tasks/` — the server binary: SQLite store, event log, GitHub
@@ -983,6 +1031,12 @@ tasks service install                  # THIS binary -> ~/.tasks/bin, one
                                        #   LaunchAgent (login + crash restart);
                                        #   idempotent, and also the upgrade
 tasks service status                   # agent / binary / launchd / serving
+tasks doctor                           # every precondition for a scout as one
+                                       #   checklist, each failure naming its
+                                       #   fix; 0 clean, 1 on a failure (or on
+                                       #   any warning under --strict), 2 usage
+tasks doctor --probe-images            # ...and boot each image to read its
+                                       #   --version, as `make images-check` does
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;

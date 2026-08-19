@@ -344,10 +344,25 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let data_dir = data_dir()?;
-        // Opened once: this is what shells out to the Keychain (or the
+        // Opened once: this is what reads the credential store (or the
         // apiKeyHelper fallback), and a sealed store that exists but cannot
         // be opened is a startup error here, before anything binds.
         let secrets = crate::secrets::Secrets::open(&data_dir)?;
+        Self::from_env_with(data_dir, secrets)
+    }
+
+    /// The rest of the resolution, with the data dir and the credential
+    /// handle already in hand.
+    ///
+    /// Split out for exactly one caller — [`crate::doctor`], which must open
+    /// the sealed store *itself* so that a store it cannot unseal is one
+    /// finding rather than the whole report. `from_env` would turn that into
+    /// a hard error and collapse every other check into the one line it
+    /// exists to explain.
+    pub(crate) fn from_env_with(
+        data_dir: PathBuf,
+        secrets: crate::secrets::Secrets,
+    ) -> Result<Self, ConfigError> {
         let clone_url_base =
             env_string("GITHUB_CLONE_URL_BASE").unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into());
         Ok(Self {
@@ -2365,11 +2380,47 @@ fn report_attach_support(support: &reattach::AttachSupport) {
 /// container runtime to service an image build, as an ordinary host process
 /// this pool never allocated and does not count. It bills to host memory, not
 /// to a slot.
-const BUILD_LANE_SLOTS: usize = 1;
+pub(crate) const BUILD_LANE_SLOTS: usize = 1;
+
+/// Host memory `buildkit` reserves while it is up.
+///
+/// The other ledger. `buildkit` is not a slot — the container runtime starts
+/// it to service `container build`, as an ordinary host process this pool
+/// never allocated — but it is very much memory, and on a small machine the
+/// memory ledger is the one that bites first.
+///
+/// CLAUDE.md's *Pool capacity* arithmetic is this number's only calibration
+/// and it is a back-solve rather than a measurement: at the default shapes
+/// (`SCOUT_MAX_CONCURRENT` 2 × 6144 MB, a Builder at 8192 MB) the ≈22 GB it
+/// states leaves 2 GB for buildkit. A test pins the sum, so changing either
+/// default without revisiting that sentence goes red here rather than
+/// silently making the report's arithmetic disagree with the document it came
+/// from.
+pub(crate) const BUILDKIT_RESERVE_MB: u64 = 2048;
+
+/// What this configuration asks of *host memory*, in MB: every concurrent
+/// scout, the one Builder, and buildkit.
+///
+/// Separate from [`Capacity`] because they are two different ledgers with two
+/// different failure modes — a slot ledger that fits can still be a memory
+/// ledger that swaps — and keeping them in one function is how the buildkit
+/// term would end up wrongly added to the slot count.
+pub(crate) fn memory_reserve_mb(
+    scout_max_concurrent: usize,
+    scout_memory_mb: u32,
+    builder_memory_mb: u32,
+) -> u64 {
+    scout_max_concurrent as u64 * scout_memory_mb as u64
+        + builder_memory_mb as u64
+        + BUILDKIT_RESERVE_MB
+}
 
 /// How this server's configuration fits the pool it just connected to.
+///
+/// `pub(crate)` rather than `pub`: [`crate::doctor`] is the only reader
+/// outside this module, and it is in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Capacity {
+pub(crate) enum Capacity {
     /// The pool cannot hold what a full complement of work would need. Some
     /// dispatch will be refused with `pool exhausted`.
     Short { needed: usize, total: usize },
@@ -2387,7 +2438,7 @@ enum Capacity {
 impl Capacity {
     /// Weigh a pool of `total` slots against what this server may ask of it:
     /// every scout it will run at once, plus the one serial build lane.
-    fn assess(total: usize, scout_max_concurrent: usize) -> Self {
+    pub(crate) fn assess(total: usize, scout_max_concurrent: usize) -> Self {
         let needed = scout_max_concurrent + BUILD_LANE_SLOTS;
         match total.checked_sub(needed) {
             None => Self::Short { needed, total },
@@ -2399,44 +2450,108 @@ impl Capacity {
             },
         }
     }
+
+    /// How loudly to say it — for the connect-time log line *and* for
+    /// `tasks doctor`, which asks the same question of the same enum.
+    ///
+    /// The severity lives here rather than at each reader because it is the
+    /// second half of one classification, and a classification decided twice
+    /// drifts: somebody who later concludes an exactly-sized pool is fine
+    /// fixes the logger and leaves the diagnostic warning, or the reverse.
+    /// One method, two callers, and changing the judgement is one edit.
+    ///
+    /// `NoSlack` is a warning rather than a note on purpose: a pool sized
+    /// exactly to the steady state dispatches perfectly well right up until
+    /// one VM leaks, and then refuses everything for as long as that leak
+    /// lasts. It is a **window rather than a ratchet** — the pool frees a slot
+    /// when that VM's own event stream ends, which for a scout whose owner
+    /// died early can be most of an hour, and a whole daemon's worth is
+    /// stopped by the next daemon on its socket. Long enough to strand a
+    /// night's dispatch, which is why it is still a warning.
+    pub(crate) fn level(self) -> crate::doctor::Level {
+        match self {
+            Self::Short { .. } => crate::doctor::Level::Fail,
+            Self::NoSlack { .. } => crate::doctor::Level::Warn,
+            Self::Slack { .. } => crate::doctor::Level::Ok,
+        }
+    }
+
+    /// The arithmetic, in words — the connect-time log line and the doctor
+    /// check's detail are the same sentence for the same reason the severity
+    /// is the same method.
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::Short { needed, total } => format!(
+                "vm-pool is too small for this server: {needed} slots are needed ({} \
+                 scouts + the serial build lane) and it holds {total} — dispatch will be \
+                 refused with `pool exhausted`",
+                needed - BUILD_LANE_SLOTS,
+            ),
+            Self::NoSlack { needed, total } => format!(
+                "vm-pool fits this server exactly ({needed} of {total} slots) — one \
+                 leaked VM exhausts it until that VM's own event stream ends, which can \
+                 be most of an hour"
+            ),
+            Self::Slack {
+                needed,
+                total,
+                spare,
+            } => format!(
+                "vm-pool holds {total} slots for the {needed} this server may ask for ({spare} spare)"
+            ),
+        }
+    }
+
+    /// What to do about it, where there is anything to do.
+    ///
+    /// The `Short` case names the alternative too: lowering
+    /// `SCOUT_MAX_CONCURRENT` is as good an answer as raising the pool, and a
+    /// fix that names only the expensive half reads as the only option.
+    pub(crate) fn fix(self) -> Option<String> {
+        match self {
+            Self::Short { .. } => Some(
+                "raise VM_POOL_MAX_VMS and restart `tasks vm-pool`, or lower \
+                 SCOUT_MAX_CONCURRENT"
+                    .into(),
+            ),
+            Self::NoSlack { .. } => {
+                Some("raise VM_POOL_MAX_VMS and restart `tasks vm-pool`".into())
+            }
+            Self::Slack { .. } => None,
+        }
+    }
+
+    pub(crate) fn needed(self) -> usize {
+        match self {
+            Self::Short { needed, .. }
+            | Self::NoSlack { needed, .. }
+            | Self::Slack { needed, .. } => needed,
+        }
+    }
+
+    pub(crate) fn total(self) -> usize {
+        match self {
+            Self::Short { total, .. } | Self::NoSlack { total, .. } | Self::Slack { total, .. } => {
+                total
+            }
+        }
+    }
 }
 
-/// Log a [`Capacity`], picking the level.
+/// Log a [`Capacity`] at the level [`Capacity::level`] gives it, in the words
+/// [`Capacity::describe`] gives it.
 ///
-/// `NoSlack` is a `warn!` rather than an `info!` on purpose: a pool sized
-/// exactly to the steady state dispatches perfectly well right up until one VM
-/// leaks, and then refuses everything for as long as that leak lasts. It is a
-/// **window rather than a ratchet** — the pool frees a slot when that VM's own
-/// event stream ends, which for a scout whose owner died early can be most of
-/// an hour, and a whole daemon's worth is stopped by the next daemon on its
-/// socket. Long enough to strand a night's dispatch, which is why this is
-/// still a warning. The operator reading this line is the person who can act
-/// on it, so both warnings name the variable *and* the fix — and the `Short`
-/// one names the alternative, since lowering `SCOUT_MAX_CONCURRENT` is as good
-/// an answer as raising the pool.
+/// Neither the severity nor the sentence is decided here — both are read off
+/// the enum, so this line and `tasks doctor` cannot come to disagree about
+/// what an exactly-sized pool means. The operator reading either is the person
+/// who can act on it, which is why the sentence carries its own fix.
 fn report_capacity(capacity: Capacity) {
-    match capacity {
-        Capacity::Short { needed, total } => warn!(
-            needed,
-            total,
-            "vm-pool is too small for this server: {needed} slots are needed \
-             ({} scouts + the serial build lane) and it holds {total} — dispatch will \
-             be refused with `pool exhausted`. Raise VM_POOL_MAX_VMS and restart \
-             `tasks vm-pool`, or lower SCOUT_MAX_CONCURRENT",
-            needed - BUILD_LANE_SLOTS,
-        ),
-        Capacity::NoSlack { needed, total } => warn!(
-            needed,
-            total,
-            "vm-pool fits this server exactly ({needed} of {total} slots) — one leaked \
-             VM exhausts it until that VM's own event stream ends, which can be most of \
-             an hour. Raise VM_POOL_MAX_VMS and restart `tasks vm-pool`"
-        ),
-        Capacity::Slack {
-            needed,
-            total,
-            spare,
-        } => info!(needed, total, spare, "vm-pool capacity is sufficient"),
+    let (needed, total) = (capacity.needed(), capacity.total());
+    let message = capacity.describe();
+    if capacity.level().is_bad() {
+        warn!(needed, total, "{message}");
+    } else {
+        info!(needed, total, "{message}");
     }
 }
 
@@ -3405,6 +3520,46 @@ mod tests {
         // Anything else refuses to boot.
         assert_eq!(autospawn_enabled(Some("yes"), false), Err(()));
         assert_eq!(autospawn_enabled(Some(""), false), Err(()));
+    }
+
+    /// The two ledgers are two ledgers. `buildkit` bills to host memory and
+    /// **not** to a slot — the container runtime starts it to service
+    /// `container build`, as an ordinary host process the pool never
+    /// allocated — and CLAUDE.md's *Pool capacity* arithmetic (3 scouts + a
+    /// Builder + buildkit ≈ 22 GB at the default shapes) is what calibrates
+    /// the reserve. Add buildkit to the slot count and the first assertion
+    /// goes red; drop it from the memory sum and the second does.
+    #[test]
+    fn the_memory_ledger_counts_buildkit_and_the_slot_ledger_does_not() {
+        let recommended_scouts = 3;
+        assert_eq!(
+            Capacity::assess(vm_pool_manager::DEFAULT_MAX_VMS, recommended_scouts),
+            Capacity::Slack {
+                needed: recommended_scouts + BUILD_LANE_SLOTS,
+                total: vm_pool_manager::DEFAULT_MAX_VMS,
+                spare: 2,
+            },
+            "4 of 6 slots, two spare — buildkit is not on this ledger"
+        );
+
+        // The memory sum is stated at the *default* concurrency, because that
+        // is the configuration CLAUDE.md's ≈22 GB describes.
+        let reserve = memory_reserve_mb(
+            DEFAULT_SCOUT_MAX_CONCURRENT,
+            SCOUT_VM.default_memory_mb,
+            BUILDER_VM.default_memory_mb,
+        );
+        assert_eq!(
+            reserve,
+            DEFAULT_SCOUT_MAX_CONCURRENT as u64 * SCOUT_VM.default_memory_mb as u64
+                + BUILDER_VM.default_memory_mb as u64
+                + BUILDKIT_RESERVE_MB
+        );
+        assert_eq!(
+            reserve / 1024,
+            22,
+            "the memory ledger drifted from CLAUDE.md's ~22 GB: {reserve} MB"
+        );
     }
 
     #[test]
