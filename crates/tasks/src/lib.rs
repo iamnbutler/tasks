@@ -14,6 +14,9 @@ pub mod cancel;
 /// Run budgets measured on both the monotonic and the wall clock, so a
 /// suspended host reads as a suspend and not as a timeout (#929).
 pub mod deadline;
+/// What the scout dispatcher may start and whether it may start it, asked
+/// together — so the hold read cannot be dropped from the dispatch (#973).
+pub mod dispatch_gate;
 pub mod env_file;
 pub mod github;
 /// Whether GitHub is answering, and whether dispatch should wait for it (#939).

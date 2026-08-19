@@ -63,12 +63,13 @@ use vm_pool_protocol::{VmConfig, VmId};
 use crate::brief::Brief;
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::bundles::RejectedBundles;
+use crate::dispatch_gate;
 use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient, IntakeFilter, PrState};
 use crate::github_health::{GitHubHealth, Transition};
 use crate::models::{
     Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput,
-    DecisionState, GhState, Mode, Project, Spec, Task, TaskId, TaskState,
+    DecisionState, GhState, Mode, Project, Spec, TaskId, TaskState,
 };
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
@@ -202,7 +203,7 @@ const POLLER: &str = "poller";
 /// Matches the re-explore cap the plan puts on the server rather than the
 /// orchestrator. The count lives in the store (`tasks.dispatch_attempts`), so
 /// restarts don't hand a poison task a fresh set of strikes.
-const MAX_DISPATCH_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_DISPATCH_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -1407,7 +1408,11 @@ impl<'a> GitHubWatch<'a> {
 /// disagree about whether a hold is in force. **Silent**: the loops tick every
 /// 500 ms, the edge was announced by the poller, and `/status` answers for
 /// whoever arrives later.
-fn github_hold(health: &GitHubHealth) -> bool {
+///
+/// `pub(crate)` because the scout side reads it through
+/// [`crate::dispatch_gate::dispatch_held`], while the build lane reads it here
+/// directly from its own match guard.
+pub(crate) fn github_hold(health: &GitHubHealth) -> bool {
     health.hold(chrono::Utc::now()).is_some()
 }
 
@@ -2571,8 +2576,15 @@ async fn dispatch_connected(
     }
 }
 
-/// Start scouts until we are at the concurrency limit or run out of eligible
-/// tasks.
+/// Start scouts until we are at the concurrency limit, run out of eligible
+/// tasks, or a hold lands mid-pass.
+///
+/// The loop body cannot start a VM without re-reading the four dispatch holds,
+/// and that is structural rather than a convention:
+/// [`crate::dispatch_gate::next_scout`] is the only source of a
+/// [`Cleared`](crate::dispatch_gate::Cleared), whose fields are private to that
+/// module, and the scan that finds a `(Task, Project)` is private to it too. A
+/// pass that skipped the read has nowhere to get its arguments from (#973).
 #[expect(clippy::too_many_arguments, reason = "the dispatch loop's working set")]
 async fn top_up(
     store: &Arc<Store>,
@@ -2586,33 +2598,44 @@ async fn top_up(
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
     in_flight_ids: &mut HashSet<TaskId>,
 ) -> Result<(), StoreError> {
-    // Cheap pre-check, and only that: the per-dispatch read below is the one
-    // that decides. A held dispatcher must not walk the whole task table every
-    // `DISPATCH_TICK` to reach the same answer.
-    if dispatch_held(store, health, updates, pool_health, handle).await? {
+    // Cheap pre-check, and only that: the per-dispatch read inside
+    // `next_scout` is the one that decides. A held dispatcher must not walk the
+    // whole task table every `DISPATCH_TICK` to reach the same answer.
+    if dispatch_gate::dispatch_held(store, health, updates, pool_health, handle).await? {
         return Ok(());
     }
 
     // Scouts this loop started plus scouts it inherited. Counting only its own
     // would let a restart with two runs in flight start two more.
     while in_flight.len() + resumed.scouts() < config.scout_max_concurrent {
-        let Some((task, project)) = next_dispatchable(store, in_flight_ids).await? else {
-            break;
+        // One call, two questions: what is next, and may it start *now*. The
+        // gate scans and then re-reads the holds, so a pause landing mid-pass
+        // stops the next scout rather than merely the next pass (#948) — and
+        // there is no way to ask only the first half from here.
+        let cleared = match dispatch_gate::next_scout(
+            store,
+            health,
+            updates,
+            pool_health,
+            handle,
+            in_flight_ids,
+        )
+        .await?
+        {
+            dispatch_gate::NextScout::Start(cleared) => cleared,
+            // Both stop the pass; they are logged apart because "why is the
+            // pipeline idle" is a question with two very different answers, and
+            // a held pass has work waiting where a drained one does not.
+            dispatch_gate::NextScout::Held => {
+                debug!("a dispatch hold landed mid-pass; starting no more scouts this tick");
+                break;
+            }
+            dispatch_gate::NextScout::Drained => {
+                debug!("no eligible task left in the queue");
+                break;
+            }
         };
-
-        // Asked again, per scout, because each iteration starts a VM and a
-        // pause landing mid-pass must stop the next one — not merely the next
-        // pass (#948).
-        //
-        // Placement is the point. It reads *after* `next_dispatchable`, not
-        // before it: a human pauses and *then* queues work, so anything the
-        // scan could see was committed after the pause was, and a read that
-        // follows the scan cannot miss it. Read before the scan, that window
-        // reopens. It is also the last thing before `in_flight.spawn`, with
-        // nothing awaited in between.
-        if dispatch_held(store, health, updates, pool_health, handle).await? {
-            break;
-        }
+        let (task, project) = cleared.into_parts();
 
         let target = ScoutTarget {
             source: clone_source(config, &project),
@@ -2635,160 +2658,6 @@ async fn top_up(
         });
     }
     Ok(())
-}
-
-/// Whether new scouts must wait: the four standing reasons, asked together.
-///
-/// One function rather than three inline checks so a fourth reason cannot be
-/// added at one call site and forgotten at the other — [`top_up`] asks once
-/// before its loop (for cost) and once per dispatch (for freshness), and a new
-/// hold belongs here as one more early `return Ok(true)` rather than at either
-/// call site.
-///
-/// Silent by design, like the checks it replaces: a pause is the human's own
-/// act, the GitHub edge is announced by the poller and the update edge by the
-/// watch, and `/status` answers for whoever asks later. A 500 ms loop that
-/// logged its refusals is what trains a reader to ignore them.
-///
-/// The build lane asks the same three questions in its own match guard (see
-/// [`build_loop`]) and deliberately does **not** call this: it claims at most
-/// one build per pass, so it already re-reads them for every container it
-/// starts, and sharing this would mean restructuring a match guard around an
-/// `await`. The comment there points back here, so whichever site is edited
-/// names the other.
-async fn dispatch_held(
-    store: &Store,
-    health: &GitHubHealth,
-    updates: &crate::updates::UpdateWatch,
-    pool_health: &crate::pool_health::PoolHealth,
-    handle: &ClientHandle<TasksProtocol>,
-) -> Result<bool, StoreError> {
-    if store.get_mode().await? != Mode::Play {
-        return Ok(true);
-    }
-
-    // A stop before the queue, not a filter over it: an outage is a fact about
-    // the world, not about any one task, and skipping held work to find
-    // something else to dispatch would just pick a different victim.
-    if github_hold(health) {
-        return Ok(true);
-    }
-
-    // Same shape for a half-applied upgrade: a new scout would run in the
-    // stale half of it. Silent here for the same reason as the GitHub hold —
-    // the transition is announced by the watch itself, once, and `/status`
-    // answers for whoever asks later.
-    if updates.hold(store).await {
-        return Ok(true);
-    }
-
-    // And the pool itself: a dispatch into a full pool is refused, and a
-    // refused Scout is one whose task has to be unwound back to `Queued` —
-    // which, without this, the 500 ms tick would re-attempt twice a second for
-    // as long as the pool stayed full (#967). Unlike the two above, this one
-    // does its own observing: the probe is claimed at most once per
-    // `PROBE_INTERVAL` across both gates, so asking here costs at most one
-    // local round trip every five seconds.
-    if pool_hold(pool_health, handle, store).await {
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-/// Refresh the capacity record if a probe is due, then read the hold.
-///
-/// The probe is a `status` round trip and never a classified refusal: the
-/// quantity `Pool::allocate` checks is `available`, and a refusal reaches this
-/// process as prose. It is also what breaks the circle — the natural clearing
-/// signal for a refusal-driven record is a successful allocation, which is the
-/// one thing a hold prevents.
-async fn pool_hold(
-    pool_health: &crate::pool_health::PoolHealth,
-    handle: &ClientHandle<TasksProtocol>,
-    store: &Store,
-) -> bool {
-    if pool_health.probe_due(chrono::Utc::now()) {
-        let status = handle.status().await;
-        let transition = pool_health.observe(&status, chrono::Utc::now());
-        announce_pool(store, transition).await;
-    }
-    pool_health.hold(chrono::Utc::now()).is_some()
-}
-
-/// Say once, per edge, that the pool filled up or freed a slot — in the log
-/// and on the event feed.
-///
-/// Driven by the [`Transition`](crate::pool_health::Transition) that
-/// [`crate::pool_health::PoolHealth::observe`] returns under the probe claim,
-/// and never by the `hold` predicate: two loops reading a held predicate every
-/// tick would write a `Note` per tick, which is the event-log flood this change
-/// exists to prevent, one level up. The claim is what makes exactly one of two
-/// racing gates write it — the same rule the update watch's `announce` states
-/// for its own mutex.
-async fn announce_pool(store: &Store, transition: crate::pool_health::Transition) {
-    use crate::pool_health::Transition;
-    let message = match transition {
-        Transition::Unchanged => return,
-        Transition::Exhausted(run) => {
-            let message = run.describe();
-            warn!(total = run.total, "{message}");
-            message
-        }
-        Transition::Freed(run) => {
-            let message = format!(
-                "vm-pool has a slot again (it was full for {}s, {} observation(s)); \
-                 dispatch resumes",
-                (run.last - run.since).num_seconds(),
-                run.observations
-            );
-            info!("{message}");
-            message
-        }
-    };
-    if let Err(e) = store
-        .append_event(EventPayload::Note {
-            source: DISPATCHER.into(),
-            message,
-        })
-        .await
-    {
-        warn!(error = %e, "could not record the vm-pool capacity hold on the feed");
-    }
-}
-
-/// The next task to scout: queue order (which [`Store::list_tasks`] already
-/// applies), state `Queued` (explicitly picked up), still open on GitHub, not in flight, not past the
-/// attempt cap, and belonging to a project the dispatcher is still working on.
-///
-/// A task at the cap is rejected the moment it gets there, so the attempt
-/// filter here is belt-and-braces: it also covers rows an older build (or a
-/// crash between the increment and the rejection) left `Queued` at three strikes.
-async fn next_dispatchable(
-    store: &Store,
-    skip: &HashSet<TaskId>,
-) -> Result<Option<(Task, Project)>, StoreError> {
-    for task in store.list_tasks().await? {
-        if task.state != TaskState::Queued
-            || task.gh_state == GhState::Closed
-            || skip.contains(&task.id)
-            || task.dispatch_attempts >= MAX_DISPATCH_ATTEMPTS
-        {
-            continue;
-        }
-        let Some(project) = store.get_project(&task.project_id).await? else {
-            warn!(task_id = %task.id, project_id = %task.project_id, "task references a missing project");
-            continue;
-        };
-        // `continue`, not `break`: a paused repo at the head of the queue must
-        // not starve the ones behind it — that is the whole difference between
-        // pausing one repo and pausing the server.
-        if !project.status.dispatches() {
-            continue;
-        }
-        return Ok(Some((task, project)));
-    }
-    Ok(None)
 }
 
 /// Whether the finished dispatch took the vm-pool connection down with it.
@@ -3286,7 +3155,7 @@ pub async fn build_loop(
             // before the mode check because a match guard cannot await; the
             // cost of probing while paused is one local round trip every five
             // seconds, shared with the scout loop.
-            let pool_hold = pool_hold(&pool_health, &handle, &store).await;
+            let pool_hold = dispatch_gate::pool_hold(&pool_health, &handle, &store).await;
             match store.get_mode().await {
                 // A build this process inherited is `running` in the store, so
                 // `claim_next_queued_build` already refuses to start another.
@@ -3299,14 +3168,15 @@ pub async fn build_loop(
                 // its batch's tasks to `building`, so a claim-then-refuse would
                 // flip that state on every tick of the outage.
                 //
-                // These are the same four questions [`dispatch_held`] asks for
-                // scouts, and the duplication is deliberate: this lane claims at
-                // most one build per pass, so it already re-reads them for every
-                // container it starts and never had `top_up`'s stale-snapshot bug
-                // (#948) — while sharing the function would mean restructuring
-                // this match guard around an `await`. A fifth reason to hold
-                // new work belongs in both places: add it to `dispatch_held` and
-                // here.
+                // These are the same four questions
+                // [`crate::dispatch_gate::dispatch_held`] asks for scouts, and
+                // the duplication is deliberate: this lane claims at most one
+                // build per pass, so it already re-reads them for every
+                // container it starts and never had `top_up`'s stale-snapshot
+                // bug (#948) — while sharing the function would mean
+                // restructuring this match guard around an `await`. A fifth
+                // reason to hold new work belongs in both places: add it to
+                // `dispatch_gate::dispatch_held` and here.
                 Ok(Mode::Play)
                     if in_flight.builds() == 0
                         && !github_hold(&health)
@@ -3388,7 +3258,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::models::{ProjectId, ProjectStatus};
+    // `Task` left the production half with `next_dispatchable` (#973); the
+    // fixtures below still build one.
+    use crate::models::{ProjectId, ProjectStatus, Task};
 
     /// The autospawn default is derived from where the binary lives, and an
     /// explicit setting beats the derivation in both directions. Garbage is a
@@ -3789,162 +3661,6 @@ mod tests {
         let after = store.get_task(&doomed.id).await.unwrap().unwrap();
         assert_eq!(after.dispatch_attempts, MAX_DISPATCH_ATTEMPTS);
         assert_eq!(after.state, TaskState::Rejected);
-    }
-
-    /// A 5xx: the only class [`GhError::is_unavailable`] treats as an outage,
-    /// so the only one that can put a hold on dispatch.
-    fn unavailable() -> Result<(), GhError> {
-        Err(GhError::Rest {
-            what: "pull request".into(),
-            status: reqwest::StatusCode::BAD_GATEWAY,
-            message: "bad gateway".into(),
-        })
-    }
-
-    /// A real vm-pool on a temp socket, with room — the pool hold is one of
-    /// the four questions [`dispatch_held`] asks, and it asks it over a
-    /// connection. No mocks, per the house rule; `NoRuntime` starts no
-    /// containers, which is all this needs.
-    async fn pool_with_room(
-        dir: &std::path::Path,
-        max_vms: usize,
-    ) -> (
-        Arc<vm_pool_service::Service<vm_pool_manager::NoRuntime, TasksProtocol>>,
-        Client<TasksProtocol>,
-    ) {
-        let config = vm_pool_service::ServiceConfig {
-            socket_path: dir.join("vm-pool.sock"),
-            snapshot_dir: dir.join("snapshots"),
-            state_dir: dir.join("state"),
-            pool: vm_pool_manager::PoolConfig {
-                max_vms,
-                health_check_interval: 60,
-                vm_timeout: 300,
-            },
-        };
-        let socket = config.socket_path.clone();
-        let service =
-            vm_pool_service::Service::<vm_pool_manager::NoRuntime, TasksProtocol>::new(config)
-                .await
-                .expect("service");
-        let svc = service.clone();
-        tokio::spawn(async move {
-            let _ = svc.run().await;
-        });
-        for _ in 0..200 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let client = Client::<TasksProtocol>::connect(&socket)
-            .await
-            .expect("connect");
-        (service, client)
-    }
-
-    #[tokio::test]
-    async fn dispatch_held_answers_from_live_state_every_time() {
-        // The freshness itself, deterministically: every read sees the state as
-        // of that read, never a snapshot taken earlier in the pass (#948).
-        let store = Store::open_in_memory().await.unwrap();
-        let health = GitHubHealth::default();
-        let updates = crate::updates::UpdateWatch::at_boot(true);
-        let dir = tempfile::tempdir().unwrap();
-        let (_svc, client) = pool_with_room(dir.path(), 4).await;
-        let pool_health = crate::pool_health::PoolHealth::new();
-        let handle = client.handle();
-
-        store.set_mode(Mode::Play).await.unwrap();
-        assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                .await
-                .unwrap(),
-            "playing, GitHub answering, nothing pending: dispatch is free"
-        );
-
-        for mode in [Mode::Pause, Mode::Stop] {
-            store.set_mode(mode).await.unwrap();
-            assert!(
-                dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                    .await
-                    .unwrap(),
-                "{mode:?} must be seen by the very next read"
-            );
-            store.set_mode(Mode::Play).await.unwrap();
-            assert!(
-                !dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                    .await
-                    .unwrap(),
-                "and so must the play that follows it"
-            );
-        }
-
-        let now = Utc::now();
-        health.observe(&unavailable(), now);
-        assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                .await
-                .unwrap(),
-            "an outage that started mid-pass holds the next dispatch"
-        );
-        health.observe(&Ok::<(), GhError>(()), now);
-        assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                .await
-                .unwrap(),
-            "and a success releases it just as promptly"
-        );
-    }
-
-    /// A paused repo is a repo the dispatcher walks *past*, not one it stops
-    /// at. That `continue` rather than `break` is the whole difference between
-    /// pausing one repo and pausing the server.
-    #[tokio::test]
-    async fn next_dispatchable_skips_a_paused_repo_without_starving_the_queue() {
-        let store = Store::open_in_memory().await.unwrap();
-        let paused = project();
-        store.insert_project(&paused).await.unwrap();
-        let live = Project {
-            id: ProjectId::new(),
-            repo_owner: "iamnbutler".into(),
-            repo_name: "other".into(),
-            added_at: Utc::now(),
-            status: ProjectStatus::Active,
-        };
-        store.insert_project(&live).await.unwrap();
-
-        // The paused repo's task is at the head of the queue.
-        let head = seed_task(&store, &paused, 1, TaskState::Queued).await;
-        let behind = seed_task(&store, &live, 2, TaskState::Queued).await;
-        store
-            .set_queue_order(&[head.id.clone(), behind.id.clone()])
-            .await
-            .unwrap();
-        store
-            .set_project_status(&paused.id, ProjectStatus::Paused)
-            .await
-            .unwrap();
-
-        let skip = HashSet::new();
-        let (task, project) = next_dispatchable(&store, &skip)
-            .await
-            .unwrap()
-            .expect("the repo behind the paused one is still dispatchable");
-        assert_eq!(task.id, behind.id);
-        assert_eq!(project.id, live.id);
-
-        // Pause that one too and there is simply nothing to dispatch — the
-        // head's task is still `queued`, not rejected or returned.
-        store
-            .set_project_status(&live.id, ProjectStatus::Paused)
-            .await
-            .unwrap();
-        assert!(next_dispatchable(&store, &skip).await.unwrap().is_none());
-        assert_eq!(
-            store.get_task(&head.id).await.unwrap().unwrap().state,
-            TaskState::Queued
-        );
     }
 
     /// The whole closure-derived retirement path: issues vanish from the open

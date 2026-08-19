@@ -597,6 +597,48 @@ implementation.
   blocking dispatch on a signal that may never arrive. It is narrower than it
   looks, since a boot takes `TASKS_DEFAULT_MODE` (`pause`) and the path that
   carries `play` over is `tasks reload`, a deliberate human act.
+- **The scout dispatcher asks *what is next* and *may I start it* in one call,
+  because a call site is not pinnable by a test of its predicate.** `top_up`
+  reads the four dispatch holds twice — once before its loop for cost, and once
+  **per scout**, since each iteration starts a VM and a pause landing mid-pass
+  must stop the next one rather than merely the next pass (#948). That
+  per-scout read was correct and invisible: deleting it left the whole suite
+  green (#973), and `dispatch_held_answers_from_live_state_every_time` could
+  not see it, because a test of a predicate never observes a caller that
+  stopped calling it. **The obvious repair is not available, and this is
+  measured rather than argued**: an integration test that races a pause against
+  a second dispatch fails identically against the correct code and against the
+  mutant, since nothing is awaited between the hold read and `in_flight.spawn`
+  — the very fact that makes the fix correct is what leaves no window to
+  schedule against, and widening one artificially (thousands of skipped rows,
+  so the scan is slow) pins the test to `next_dispatchable` staying a full
+  table walk, so the first `WHERE`-clause optimisation makes it flaky. So the
+  rule is pinned **structurally**, on the `server::ledgered` precedent:
+  `crates/tasks/src/dispatch_gate.rs` answers both questions in `next_scout`,
+  and the only thing `top_up` can dispatch is a `Cleared` whose fields are
+  private to that module. **The load-bearing half is that `next_dispatchable`
+  is private, not that the enum is new** — had `next_scout` been added *beside*
+  it, a later refactor could call the old one and go green again; with it
+  private there is no route from `run.rs` to a `(Task, Project)` at all, so a
+  pass that starts a VM without re-reading the holds cannot be written rather
+  than being written and caught. The ordering inside `next_scout` is scan
+  **then** holds, and that is not tidiness: a human pauses and *then* queues
+  work, so anything the scan can see was committed after the pause was, and a
+  read that follows the scan cannot miss it — read first, the window reopens.
+  `NextScout::Held` and `Drained` are distinct because the caller's `debug!`
+  says which kind of idle a stopped pass was, which is the question `/status`,
+  `tasks status` and the feed already answer elsewhere; an `Option<Cleared>`
+  would also leave the ordering unpinned, since a hold read first answers
+  `None` for an empty queue and nothing could tell. Two unit tests hold it, one
+  mutation each and neither catching the other's: deleting the in-`next_scout`
+  read fails only `a_hold_that_lands_after_the_pass_began_stops_the_next_scout`
+  (which takes the first `Cleared` of a pass, reserves it in `skip` exactly as
+  `top_up` does, and commits the hold between the two turns — one leg per
+  reason, releases included), and hoisting it above the scan fails only
+  `the_holds_are_read_after_the_scan_not_before_it` (every hold live, the one
+  task `Backlog`: the answer must be `Drained`). `dispatch_held_answers_from_live_state_every_time`
+  stays deliberately — it is the narrower statement and the one that fails
+  first if the predicate itself breaks rather than its call site.
 - **A full pool is a property of the moment, so it costs no strike and starts
   no retry loop — and those are two mechanisms, not one.** A Scout refused a VM
   used to be charged a dispatch attempt *and* left in `Scouting`: `dispatch`
