@@ -22,6 +22,41 @@
 //! bundled data dir), not against an attacker already running code as this
 //! user, who could read the Keychain the same way the server does.
 //!
+//! # Where the unseal key lives, and why the key file stays first-class
+//!
+//! Custody goes through the [`keyring`] crate's native backends —
+//! Security.framework on macOS, the Credential Manager on Windows, the Secret
+//! Service elsewhere — rather than through `/usr/bin/security` (#1003).
+//! [`keychain_read`] and [`keychain_write`] are the entire boundary.
+//!
+//! What that does **not** buy, stated here because the change reads like it
+//! does. An item created by the `security` CLI keeps that command's access
+//! list through any number of native writes: `set_password` on macOS is
+//! find-then-modify-in-place, so rewriting rebinds nothing. The legacy
+//! `security` read therefore stays on the read path as the default fallback,
+//! which is what keeps existing installs working — and means custody for one
+//! of them is **unchanged** until a human runs `tasks secrets rehome-key`.
+//! Nothing forces that; a `warn!` is the only prompt.
+//!
+//! And on a Mac an access list is a decision about an *application*, so an
+//! unsigned development build is a different application on every `cargo
+//! build` — a natively-created item re-prompts each rebuild, and a server
+//! started by launchd with no window server to show the prompt cannot answer
+//! it at all. That is why `--key-file` / `TASKS_SECRETS_KEY_FILE` is a
+//! first-class way to run this system and not a fallback for exotic hosts.
+//! The real improvement arrives with a signed, stable application identity
+//! (#988, undecided).
+//!
+//! One asymmetry is known and **not** detected: the `security` CLI writes the
+//! *default* keychain (a user preference, `security default-keychain -s`)
+//! while the native backend reads the user domain's default. Normally the same
+//! `login.keychain-db`. Where they differ nothing reports it — `status` reads
+//! the store header, which says `keychain` either way, and it is documented as
+//! needing no unseal key so it cannot probe one. The symptom is a
+//! [`rehome_key`] whose delete reports no entry while its write appears to
+//! succeed; its read-back comparison is what turns that into a refusal
+//! instead of a lost key.
+//!
 //! # Rotation without a restart
 //!
 //! The running server reads through [`Secrets`], which re-checks the sealed
@@ -57,7 +92,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
 use std::time::SystemTime;
 
 use base64::Engine as _;
@@ -79,9 +114,17 @@ use crate::redact::Secret;
 /// silently decrypted with v1 semantics.
 const HKDF_INFO: &[u8] = b"tasks-secrets-v1 kek";
 const STORE_VERSION: u32 = 1;
-/// Keychain coordinates for the unseal key. The service name carries the
-/// project so `security find-generic-password -s tasks-v2-secrets` is
+/// Credential-store coordinates for the unseal key. The service name carries
+/// the project so `security find-generic-password -s tasks-v2-secrets` is
 /// self-describing in Keychain Access.
+///
+/// [`keychain_read`] and [`keychain_write`] are the **whole** custody
+/// boundary: they are the only two functions in this repository that touch an
+/// OS key store, and everything else — [`init`], [`rehome_key`], the server's
+/// [`Secrets::open`] — goes through them. Anything that needs the unseal key
+/// (an API route that auto-initialises a store, say) calls one of them; a
+/// second key-store path is how the two ends of this come to disagree about
+/// which item, which store, and which access list.
 const KEYCHAIN_SERVICE: &str = "tasks-v2-secrets";
 const KEYCHAIN_ACCOUNT: &str = "unseal";
 /// Overrides where the unseal key is read from, whatever the store header
@@ -363,10 +406,92 @@ fn read_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, SecretsError> {
     decode_key_hex(&raw, "the key file")
 }
 
-/// Read the unseal key out of the login Keychain via `/usr/bin/security`.
-/// A missing binary (any non-mac host) maps to a message that names the
-/// file-based alternative rather than a bare ENOENT.
+/// Turn a credential-store failure into a [`SecretsError`] that names a way
+/// out. Pure, and separate from the calls that produce these errors, so its
+/// wording is testable on a host with no credential store at all — which is
+/// every host `make test` runs on.
+///
+/// The way out is always the same two moves, because they are the only two
+/// that exist: create the item (`tasks secrets init`), or stop reading the
+/// item at all ([`KEY_FILE_ENV`]). A backend error with neither named is how
+/// an operator ends up debugging a Keychain instead of setting a variable.
+fn keyring_error(op: &str, err: &keyring::Error) -> SecretsError {
+    match err {
+        keyring::Error::NoEntry => SecretsError::Key(format!(
+            "this host's credential store has no `{KEYCHAIN_SERVICE}` item — \
+             run `tasks secrets init`, or set {KEY_FILE_ENV} to a key file"
+        )),
+        // Everything else carries the backend's own words: `NoDefaultStore`
+        // (no Security.framework, no Credential Manager, no Secret Service —
+        // a headless Linux box), a locked keychain, an access list that
+        // refuses this binary. None of them is actionable from here, and all
+        // of them are survivable by the same variable.
+        other => SecretsError::Key(format!(
+            "could not {op} the `{KEYCHAIN_SERVICE}` item in this host's credential \
+             store: {other}; run `tasks secrets init`, or set {KEY_FILE_ENV} to a key file"
+        )),
+    }
+}
+
+/// The entry the unseal key lives in. One function, so the platform choice
+/// (Security.framework, Credential Manager, Secret Service) is the
+/// dependency's and the `cfg` count in this module stays zero.
+fn keychain_entry() -> Result<keyring::Entry, SecretsError> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| keyring_error("open", &e))
+}
+
+/// The unseal key as the native store holds it: hex, still encoded.
+fn native_key_read() -> Result<Zeroizing<String>, SecretsError> {
+    keychain_entry()?
+        .get_password()
+        .map(Zeroizing::new)
+        .map_err(|e| keyring_error("read", &e))
+}
+
+/// Read the unseal key out of the OS credential store, falling back to the
+/// pre-#1003 `/usr/bin/security` read.
+///
+/// The fallback is the **default** path and not a contingency: an item created
+/// by `security add-generic-password` carries that command's access list, and
+/// whether a *different* binary may then decrypt it silently, with a prompt,
+/// or not at all is a question only a Mac answers. So the migration read is
+/// the one that ships, and an operator moves custody deliberately with
+/// [`rehome_key`] — never this path, which must not write (see its own doc).
 fn keychain_read() -> Result<Zeroizing<Vec<u8>>, SecretsError> {
+    match native_key_read() {
+        Ok(hex) => decode_key_hex(&hex, "the credential store item"),
+        Err(native) => match legacy_security_read() {
+            Some(hex) => {
+                LEGACY_READ_WARNED.call_once(|| {
+                    warn!(
+                        reason = %native,
+                        "unseal key read through /usr/bin/security, not the native \
+                         credential store; `tasks secrets rehome-key` moves it"
+                    );
+                });
+                decode_key_hex(&hex, "the Keychain item")
+            }
+            // The native error, not the subprocess's: a message about a
+            // missing `/usr/bin/security` is noise on every host that never
+            // had one.
+            None => Err(native),
+        },
+    }
+}
+
+/// Warned once per process, not per read: the late-unlock guard already
+/// bounds the server to one credential-store read ever, and this keeps a CLI
+/// that reads twice (`rehome-key`) from saying it twice.
+static LEGACY_READ_WARNED: Once = Once::new();
+
+/// The pre-#1003 read: `security find-generic-password -s … -a … -w`.
+///
+/// Kept **read-only** — there is no `security` write left in this module — and
+/// deliberately *not* `cfg`-gated. It is an ordinary subprocess spawn that
+/// compiles everywhere and answers `None` where there is no such binary, so
+/// the migration path is built and type-checked by every platform rather than
+/// only by the one that can exercise it.
+fn legacy_security_read() -> Option<Zeroizing<String>> {
     let out = Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
@@ -377,61 +502,188 @@ fn keychain_read() -> Result<Zeroizing<Vec<u8>>, SecretsError> {
             "-w",
         ])
         .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .output()
-        .map_err(|e| {
-            SecretsError::Key(format!(
-                "could not run /usr/bin/security ({e}); on a non-mac host set {KEY_FILE_ENV}"
-            ))
-        })?;
+        .ok()?;
     if !out.status.success() {
-        return Err(SecretsError::Key(format!(
-            "Keychain has no `{KEYCHAIN_SERVICE}` item ({}); \
-             run `tasks secrets init`, or set {KEY_FILE_ENV}",
-            out.status
-        )));
+        return None;
     }
-    let hex = String::from_utf8_lossy(&out.stdout).into_owned();
-    decode_key_hex(&hex, "the Keychain item")
+    let hex = Zeroizing::new(String::from_utf8_lossy(&out.stdout).into_owned());
+    if hex.trim().is_empty() {
+        return None;
+    }
+    Some(hex)
 }
 
-/// Write the unseal key into the login Keychain.
+/// Write the unseal key into the OS credential store.
 ///
-/// Via `security -i` with the command on **stdin**: `add-generic-password -w
-/// <hex>` as an ordinary argument would put the key in argv, which is exactly
-/// the exposure class this module exists to close.
+/// The hex is a *value* here, which is what the old `security -i`-on-stdin
+/// dance existed to achieve: `add-generic-password -w <hex>` as an ordinary
+/// argument would have put the key in argv, the exposure class this module
+/// exists to close. Through the native API it is free.
 fn keychain_write(hex: &str) -> Result<(), SecretsError> {
-    let mut child = Command::new("/usr/bin/security")
-        .arg("-i")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
+    keychain_entry()?
+        .set_password(hex)
+        .map_err(|e| keyring_error("write", &e))
+}
+
+/// Where a [`rehome_key`] parks the only copy of the unseal key for the
+/// duration of the delete-then-add, and permanently if that window fails.
+///
+/// **Not under `<data dir>/secrets/`, and not under the data dir at all.** The
+/// whole property this module rests on is that the sealed store and the unseal
+/// key are two artifacts and neither alone decrypts anything; a rescue file
+/// beside `sealed.json` would put both halves in one `cp -r`, one backup
+/// sweep, one `tar` — exactly when the file is deliberately being kept,
+/// because the rehome failed. `$HOME/.tasks/` is the service home #1012
+/// established (the installed binary lives at `~/.tasks/bin/tasks`), it is
+/// per-user, and it is not what anyone backs up when they back up the
+/// server's state. `write_private` tightens it to 0700 on the way past.
+fn rescue_path() -> Result<PathBuf, SecretsError> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| !h.as_os_str().is_empty())
+        .ok_or_else(|| {
             SecretsError::Key(format!(
-                "could not run /usr/bin/security ({e}); on a non-mac host use --key-file"
+                "HOME is not set, so there is nowhere outside the sealed store's own \
+                 directory to park a rescue copy of the unseal key; \
+                 re-home from a session that has one, or set {KEY_FILE_ENV}"
             ))
         })?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .expect("stdin was piped two lines above");
-        // `-U` updates in place, so a re-key writes over the old item rather
-        // than failing on the duplicate.
-        writeln!(
-            stdin,
-            "add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w {hex}"
-        )?;
+    Ok(home
+        .join(crate::service::HOME_DIR)
+        .join("unseal.key.rescue"))
+}
+
+/// The sentence every failure after the delete carries. It has to say the
+/// path, and it has to say the file is a live copy of the key that must not
+/// be left lying around.
+fn rescue_hint(rescue: &Path) -> String {
+    format!(
+        "the unseal key is still at {} — the store opens with \
+         `{KEY_FILE_ENV}={}`, and that file must be deleted once custody is settled \
+         again (it is the other half of the two-artifact property)",
+        rescue.display(),
+        rescue.display()
+    )
+}
+
+/// Recreate the unseal-key item through the native API, so *this* binary's
+/// access list governs it rather than `/usr/bin/security`'s.
+///
+/// This is a separate operator command and not something the read path does,
+/// for a platform reason rather than a taste one: `set_password` on macOS is
+/// find-then-`SecKeychainItemModifyAttributesAndData` — an **in-place**
+/// modify — so rewriting a CLI-created item through `keyring` rebinds nothing
+/// and is a silent no-op. Only delete-then-add moves the access list, that is
+/// destructive, and a delete that lands with an add that does not takes the
+/// only copy of the key with it.
+///
+/// Hence the order, which is the design: read the key, park it in a rescue
+/// file *outside the data dir* ([`rescue_path`]), delete, add, **read back and
+/// compare**, prove the store still opens, and only then remove the rescue
+/// file. Every failure from the delete onwards returns [`rescue_hint`]. The
+/// key itself is never printed, returned or logged.
+pub fn rehome_key(data_dir: &Path) -> Result<String, SecretsError> {
+    let path = store_path(data_dir);
+    let file = read_store(&path)?;
+    match key_location(&file) {
+        KeyLocation::Keychain => {}
+        KeyLocation::File(p) => {
+            return Err(SecretsError::Key(format!(
+                "this store's unseal key is a file ({}), not a credential-store item — \
+                 there is nothing to re-home",
+                p.display()
+            )));
+        }
+        KeyLocation::Override(p) => {
+            return Err(SecretsError::Key(format!(
+                "{KEY_FILE_ENV} points the unseal key at {}, so a re-home would move \
+                 whatever that file holds and not what the credential store holds; \
+                 unset it and run this again",
+                p.display()
+            )));
+        }
     }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
+
+    // Read through the same seam the server reads through, so a store that
+    // only the legacy path can open is exactly the one this can move.
+    let before = match native_key_read() {
+        Ok(hex) => hex,
+        Err(native) => legacy_security_read().ok_or(native)?,
+    };
+    // Validate before touching anything: a rehome that deletes a live item and
+    // then discovers the value was never a key is the one outcome with no
+    // recovery, and this costs nothing. Trimmed on the way through, so the
+    // item this writes back is clean of the trailing newline the `security`
+    // read carries — `decode_key_hex` tolerates it, the byte-for-byte
+    // read-back comparison below would not have to.
+    let _ = decode_key_hex(&before, "the credential store item")?;
+    let before = Zeroizing::new(before.trim().to_string());
+
+    let rescue = rescue_path()?;
+    write_private(&rescue, before.as_bytes())?;
+
+    // From here on, every error names the rescue file.
+    let entry = keychain_entry()?;
+    match entry.delete_credential() {
+        Ok(()) => {}
+        // Nothing native to delete: the item exists only where the legacy
+        // read found it (or, on a host whose default keychain has been moved,
+        // somewhere this API does not look — see the module header). Adding is
+        // still the right next move.
+        Err(keyring::Error::NoEntry) => {}
+        Err(e) => {
+            return Err(SecretsError::Key(format!(
+                "{}; {}",
+                keyring_error("delete", &e),
+                rescue_hint(&rescue)
+            )));
+        }
+    }
+    entry.set_password(&before).map_err(|e| {
+        SecretsError::Key(format!(
+            "{}; {}",
+            keyring_error("write", &e),
+            rescue_hint(&rescue)
+        ))
+    })?;
+
+    // Read back and *compare*, constant-time. A bare "the read succeeded"
+    // would pass against a stale item in another keychain, or against any
+    // item that happens to be readable under these coordinates.
+    let after = native_key_read()
+        .map_err(|e| SecretsError::Key(format!("{e}; {}", rescue_hint(&rescue))))?;
+    if !Secret::new(before.to_string()).matches(&after) {
         return Err(SecretsError::Key(format!(
-            "security add-generic-password failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            "the re-homed `{KEYCHAIN_SERVICE}` item reads back as a different value than \
+             was written — this host may have more than one keychain in play; {}",
+            rescue_hint(&rescue)
         )));
     }
-    Ok(())
+
+    // ...and that the store itself still opens under it, which is the thing
+    // an operator actually cares about. No third credential-store read: the
+    // bytes just read back are the ones under test.
+    let key = decode_key_hex(&after, "the credential store item")
+        .map_err(|e| SecretsError::Key(format!("{e}; {}", rescue_hint(&rescue))))?;
+    let salt = b64_field(&path, "salt", &file.salt)?;
+    decrypt_all(&derive_kek(&key, &salt), &path, &file)
+        .map_err(|e| SecretsError::Key(format!("{e}; {}", rescue_hint(&rescue))))?;
+
+    std::fs::remove_file(&rescue).or_else(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(SecretsError::Key(format!(
+            "the unseal key was re-homed, but the rescue copy could not be removed ({e}); \
+             delete {} by hand",
+            rescue.display()
+        ))),
+    })?;
+
+    Ok(format!(
+        "unseal key re-homed into this host's credential store (service {KEYCHAIN_SERVICE}); \
+         read back, and the sealed store opens under it"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -721,9 +973,11 @@ impl Secrets {
             }
         }
         // The store appeared after a boot that had none: unlock it now, once.
-        // One subprocess (`security`) at most, ever — a failure is warned and
-        // not retried until a restart, so a broken Keychain cannot become a
-        // subprocess storm on the poll path.
+        // One credential-store read at most, ever — a failure is warned and
+        // not retried until a restart. That bound mattered when this was a
+        // subprocess (no `security` storm on the poll path) and it matters
+        // more now: on macOS it is what stands between a locked or unfamiliar
+        // keychain and one access dialog per poll interval.
         if mtime.is_some() && self.0.kek.read().expect("kek lock poisoned").is_none() {
             if self.0.late_unlock_attempted.swap(true, Ordering::SeqCst) {
                 return;
@@ -960,6 +1214,62 @@ mod tests {
                 .to_string()
                 .contains("Keychain"),
         );
+    }
+
+    /// Every way a credential store can refuse has to end in something an
+    /// operator can do. Asserted off the pure mapper, because no host `make
+    /// test` runs on has a credential store to produce these for real.
+    #[test]
+    fn every_credential_store_failure_names_the_way_out() {
+        let cases = [
+            keyring::Error::NoEntry,
+            keyring::Error::NoDefaultStore,
+            keyring::Error::PlatformFailure("the keychain is locked".into()),
+            keyring::Error::NotSupportedByStore("no".into()),
+        ];
+        for err in cases {
+            let mapped = keyring_error("read", &err).to_string();
+            assert!(
+                mapped.contains(KEY_FILE_ENV),
+                "{err:?} maps to a message with no escape hatch: {mapped}"
+            );
+            assert!(
+                mapped.contains("tasks secrets init"),
+                "{err:?} maps to a message that does not say how to create the item: {mapped}"
+            );
+        }
+        // ...and the assertion is falsifiable: the two arms differ, so this is
+        // not passing because one sentence covers everything.
+        let missing = keyring_error("read", &keyring::Error::NoEntry).to_string();
+        assert!(missing.contains("has no"), "{missing}");
+        assert!(
+            !missing.contains("could not read"),
+            "a missing item is not a failed read: {missing}"
+        );
+    }
+
+    /// A file-keyed store has no credential-store item to move, and a rehome
+    /// that got that far would delete whatever else answers to these
+    /// coordinates. The refusal is also the cheap half to get right — so the
+    /// test proves the store is untouched on the way out, which is the part
+    /// that would actually cost something.
+    #[test]
+    fn rehome_refuses_a_file_keyed_store() {
+        let dir = TempDir::new().unwrap();
+        init_with_key_file(&dir);
+        set(dir.path(), SecretName::GithubToken, "value").unwrap();
+
+        let err = rehome_key(dir.path()).unwrap_err();
+        let rendered = err.to_string();
+        assert!(matches!(err, SecretsError::Key(_)), "{rendered}");
+        assert!(
+            rendered.contains("not a credential-store item"),
+            "{rendered}"
+        );
+
+        // The refusal did no damage on its way out.
+        let secrets = Secrets::open(dir.path()).unwrap();
+        assert_eq!(secrets.github_token().unwrap().expose(), "value");
     }
 
     #[test]

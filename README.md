@@ -65,6 +65,9 @@ Rust (edition 2024), and a GitHub token.
 ```sh
 make images                            # build the Scout/Builder VM images (once, and after supervisor changes)
 tasks secrets init                     # sealed credential store; unseal key goes to the Keychain
+                                       #   (--key-file PATH is first-class, not a fallback:
+                                       #    an unsigned dev build is a new application to a
+                                       #    macOS access list on every rebuild)
 tasks secrets set github-token         # paste the token, ctrl-D (same for anthropic-api-key)
 tasks vm-pool &                        # the VM pool, a separate long-lived daemon
 make serve                             # the server, in this terminal

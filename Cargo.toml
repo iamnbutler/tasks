@@ -74,6 +74,19 @@ hkdf = "0.12"
 sha2 = "0.10"
 zeroize = "1"
 rand = "0.8"
+# The unseal key's custody: native OS credential stores (Security.framework on
+# macOS, Credential Manager on Windows, the Secret Service elsewhere) instead
+# of shelling out to /usr/bin/security. The whole crate rather than
+# `keyring-core` + a target-gated store, deliberately: the cheaper shape puts
+# every line of `secrets.rs`'s custody path behind `#[cfg(target_os =
+# "macos")]`, so Linux would never compile, lint or test the one module the
+# credential design rests on. Version 4 and not 3: with no platform feature
+# enabled, keyring 3 silently falls back to an in-memory *mock* store, so a
+# `set_password` reports success and loses the key; keyring 4 answers
+# `NoDefaultStore`, which is a sentence this module can turn into
+# `TASKS_SECRETS_KEY_FILE`. `default-features = false` is not available —
+# keyring 4 `compile_error!`s without `v1` or `cli`.
+keyring = "4"
 
 # vm-pool (vendored infrastructure — these crates must never depend on
 # tasks crates; app vocabulary enters only through the AppProtocol generic)
