@@ -1525,12 +1525,19 @@ async fn pause_blocks_new_dispatches() {
     })
     .await;
 
-    // Pause, then queue more work: the loop must leave it alone. The two
-    // writes are adjacent on purpose, and the ordering is the whole assertion.
-    // The dispatcher re-reads the mode after it scans the queue and
-    // immediately before it spawns, so a task committed after this pause
-    // cannot be dispatched by any interleaving: whatever pass sees the task
-    // also sees the pause.
+    // Pause, then queue more work: the loop must leave it alone, and pick it
+    // straight back up on the play below.
+    //
+    // What this pins is the *pass-level* rule — a pass that begins after the
+    // pause is committed starts no scout — and `top_up`'s pre-loop read alone
+    // is enough for that. It deliberately no longer claims more: the adjacency
+    // of these two writes does not demonstrate that the mid-pass window is
+    // closed, because every pass that could see the second task begins after
+    // the pause, so the pre-loop read (which predates #948) already refuses.
+    // The per-scout re-read is pinned where it can actually be observed —
+    // `dispatch_gate::tests::a_hold_that_lands_after_the_pass_began_stops_the_next_scout`,
+    // which takes the first `Cleared` of a pass and commits the pause between
+    // that turn and the next one.
     store.set_mode(Mode::Pause).await.unwrap();
     let second = insert_task(&store, &project, 2, "second").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
