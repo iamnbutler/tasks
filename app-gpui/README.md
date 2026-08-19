@@ -255,6 +255,54 @@ are on `PATH`:
 is stamped exactly. A bare `cargo run` lets `build.rs` probe git itself,
 which can lag the `-dirty` suffix by a build.
 
+## The menu bar app
+
+```sh
+cargo run --bin tasks-menubar
+```
+
+A second binary in this package (`src/bin/tasks-menubar/`), deliberately
+separate from the app: since #1012 the daemon is a background service, and a
+machine that only serves still wants a glanceable answer to "is the pipeline
+moving" without the whole workspace window. It puts one item in the status
+bar; a click drops a panel shaped like a menu, top to bottom: a **SERVER**
+section (Start or Stop by state, Restart, and Kill All Runs when work is in
+flight — the same ops the app's Server menu runs, from the same `server.rs`,
+included via `#[path]` so the binary-resolution and verdict logic cannot
+fork), then a **section per machine running the pool** — name, mode chip
+(toggles play ↔ pause; stop is never one click), serving pid and uptime, one
+row per in-flight Scout/Builder with what it is working on and for how long,
+and a line each for a GitHub hold or a pending update — then Open Tasks and
+Quit. A Stop with work in flight parks the same question the app asks,
+rendered inline as Stop Anyway / Keep Running. It shares this package rather
+than being its own crate so the 600 MB gpui dependency tree is compiled once,
+but it is a separate executable: running it installs nothing and assumes
+nothing about the app.
+
+vm-pool is single-machine today, so the list is normally one section — this
+Mac, found the same way the app finds its server (`TASKS_SERVER_PORT`,
+default 4800). The multi-machine shape is already load-bearing though:
+`TASKS_MENUBAR_MACHINES="studio=http://10.0.0.2:4800,http://10.0.0.3:4800"`
+adds sections, each just another tasks server reached over its HTTP API.
+Every fact shown is a `/status` answer re-read on a timer (30s in the
+background, 5s while the panel is open) — nothing GitHub-owned or pool-owned
+is cached, per the server's own rule.
+
+Three implementation notes worth keeping. gpui has no NSStatusItem concept,
+so `status_item.rs` creates the one AppKit object itself, with the same
+`objc`/`cocoa` bindings (and versions) gpui-macos pins — and it must run in
+`Application::run`'s callback, which fires *after* gpui forces the activation
+policy to Regular; that ordering is why its Accessory write (no Dock icon)
+wins. The dropdown is a stock `WindowKind::PopUp` — a non-activating panel
+that can still become key — so dismissal is gpui's own resign-key activation
+observer, no global event monitor; the one seam is that clicking the status
+item while the panel is open can fire both the resign-key dismissal and the
+toggle action, which is what `REOPEN_DEBOUNCE` in `popup.rs` absorbs. And on
+non-mac hosts `main` opens the same view as a plain window, which is what
+lets the Linux agent VMs that develop this crate compile, test and run it;
+`TASKS_MENUBAR_OPEN_AT_LAUNCH=1` opens the panel immediately on a Mac for the
+same iterate-without-clicking purpose.
+
 ### Optimizing dependencies in dev builds — a local opt-in
 
 `cargo run` from this directory builds gpui and wgpu unoptimized, and a debug
