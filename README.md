@@ -22,10 +22,19 @@ does.
 - **The server can.** On an agent's say-so, under its own GitHub credential,
   while you are not watching, it pushes branches, opens pull requests, merges
   them, comments on issues and closes them. All nine capabilities in the
-  orchestrator's charter ship `live`
-  (`crates/tasks/migrations/0016_charter_live.sql`) — the charter is a kill
-  switch, not a promotion ladder, and the append-only decisions ledger is
-  something you read afterwards.
+  orchestrator's charter ship `live` and uncapped
+  (`crates/tasks/migrations/0016_charter_live.sql`) — no daily limit, no
+  pre-approval gate, nothing that stops at the tenth merge of the day. The
+  charter is a kill switch, not a promotion ladder, and the append-only
+  decisions ledger is something you read afterwards. Any one capability can be
+  switched off on its own, which is how you keep the pipeline and merge by
+  hand:
+
+  ```sh
+  curl -X POST localhost:4800/charter/land_builds \
+       -H 'content-type: application/json' -d '{"level":"off"}'
+  ```
+
 - **The local API has no authentication.** Anything running on your machine
   that can reach port 4800 can drive the pipeline — start a Scout, start a
   Builder, merge a pull request — and it is recorded as you, because a caller
@@ -100,55 +109,157 @@ cached — mergeability, CI, open/closed are queried at decision time.
 
 ## Running it
 
-Requires macOS with [apple/container](https://github.com/apple/container),
-Rust (edition 2024), and a GitHub token.
+Read [Read this first](#read-this-first) before you point this at a
+repository — it is the section about what runs unattended, and what the server
+is allowed to do to your GitHub while you are not looking.
+
+### Prerequisites
+
+**To build and test.** This half works on Linux as well as macOS, `app-gpui`
+included:
+
+- Rust, edition 2024.
+- `cargo install cargo-nextest --locked`, for `make test`. `make test-cargo`
+  is the fallback that needs nothing.
+
+**To run the pipeline.** macOS only, because the VMs are apple/container's:
+
+- [apple/container](https://github.com/apple/container), *and* its services
+  started — `container system start`. The CLI being installed is not the same
+  fact as the runtime running, and only the second one starts a VM.
+- `rustup target add aarch64-unknown-linux-gnu`, plus the cross linker
+  (`brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu`).
+  Both are needed only by `make images`.
+- **A GitHub token.** With none, polling is disabled and the pipeline has no
+  intake at all. `.env.example` names the exact scopes.
+- **An Anthropic credential.** This is the one that fails quietly. Nothing
+  warns at boot, the server comes up looking healthy, and every scout then
+  dies inside its VM on agent auth — the recognisable symptom is a 502 from
+  the broker reading `the host has no anthropic key configured`. If you
+  already use Claude Code with an `apiKeyHelper` at
+  `~/.claude/anthropic_key.sh`, that is the third resolution step and may
+  already be answering for you, which is exactly why it surprises the second
+  machine.
+
+`tasks doctor` asks all of this and more, in the order the preconditions
+bite. `make check-toolchain` is the narrow version — cross linker, Rust
+target, `container` on `PATH` — and it deliberately cannot see
+`container system start` or either credential.
+
+### Setup
+
+Once, in a checkout:
 
 ```sh
-make images                            # build the Scout/Builder VM images (once, and after supervisor changes)
+cargo build -p tasks
+export PATH="$PWD/target/debug:$PATH"   # every `tasks …` line below
+
 tasks secrets init                     # sealed credential store; unseal key goes to the Keychain
                                        #   (--key-file PATH is first-class, not a fallback:
                                        #    an unsigned dev build is a new application to a
                                        #    macOS access list on every rebuild)
-tasks secrets set github-token         # paste the token, ctrl-D (same for anthropic-api-key)
+tasks secrets set anthropic-api-key    # value on stdin: paste, then ctrl-D
+tasks secrets set github-token         # ...and the same for this one
 cp .env.example .env                   # everything that is *not* a credential
-tasks vm-pool &                        # the VM pool, a separate long-lived daemon
-make serve                             # the server, in this terminal
 cargo run -p tasks -- add-project owner/repo
-tasks doctor                           # ...and check the lot: every precondition for a
-                                       #   scout, as a checklist, exit 1 on any failure
+make images                            # the Scout/Builder VM images
 ```
 
-`tasks doctor` is the answer to "can this machine actually run a scout?" — it
-asks the container CLI, vm-pool's socket and both its ledgers, the images, the
-sealed store, the credential broker VMs redeem leases against, GitHub's answer
-to your token, and the rest, in the order the preconditions bite, and names the
-command that fixes each failure. It reports and never fixes, and it writes
-nothing.
+`target/debug/tasks` is not a convenience copy: it is literally what `make
+serve` and `make restart` run (`TASKS_BIN` in the `Makefile`), so putting it on
+`PATH` leaves one binary and nothing that can drift. `tasks service install` is
+the other shape — one LaunchAgent, login and crash restart — and it is for
+leaving this running rather than for trying it out: with a managed server up,
+`make serve` refuses outright, since `--foreground` would race the service for
+the port.
+
+`make images` has no progress bar and takes a while. It cross-compiles three
+supervisors in release to `aarch64-unknown-linux-gnu`, runs four
+`container build`s in sequence (`vm-pool-base` → `vm-pool-agent` → `agent:v1`
+and `builder:v1`), and finishes by booting each image to read its `--version`
+back. Long silences are the cross-compiles; it has not hung. Running it here,
+before anything is serving, is safe — it gates on `tasks drain --check`, which
+passes when nothing is serving. Once a server *is* up, that gate is real, and
+the sequence is the one under **Day to day**.
 
 Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
 through an in-process broker, and the sealed store means no raw key sits in
 `.env` either (raw `GITHUB_TOKEN` / `ANTHROPIC_API_KEY` env vars still work
-as fallbacks, and `.env.example` documents them as exactly that). See
-`docs/plans/2026-08-18-credential-custody.md`.
+as fallbacks, warned at startup, and `.env.example` documents them as exactly
+that). See `docs/plans/2026-08-18-credential-custody.md`.
 
-The server boots **paused**: intake and the API run, nothing dispatches.
-Flip to `play` (from the app, or `POST /mode`) and the pipeline starts
-pulling queued work. Bulk intake never auto-dispatches — adding a repo with
-10,000 issues creates 10,000 backlog rows and zero VM runs; only explicitly
-queued tasks reach a Scout.
+### First run
 
-Day to day:
+Three terminals. The first two block, and `PATH` is per-terminal — re-export
+it, or use `./target/debug/tasks`.
+
+```sh
+tasks vm-pool                          # 1: the VM pool, a separate long-lived daemon
+make serve                             # 2: the server, logging here
+tasks doctor                           # 3: every precondition for a scout, as a
+                                       #    checklist; exit 1 on any failure
+```
+
+With `tasks doctor` clean, wait one poll interval (60s by default) for intake,
+then queue something and start the pipeline:
+
+```sh
+curl -s localhost:4800/tasks | jq -r '.[] | "\(.id)  #\(.gh_issue_number)  \(.state)  \(.title)"'
+curl -X POST localhost:4800/tasks/<task-id>/queue
+curl -X POST localhost:4800/mode -H 'content-type: application/json' -d '{"mode":"play"}'
+```
+
+Both of those last two lines are needed, for two independent reasons, and
+skipping either leaves a healthy-looking server that dispatches nothing:
+
+- **Ingested issues land in `backlog`, and backlog is never dispatched from.**
+  Only explicitly queued tasks reach a Scout. That is what makes intake safe —
+  adding a repo with 10,000 issues creates 10,000 rows and zero VM runs — and
+  it is not a thing that times out into happening.
+- **Every boot comes up `pause`d**, overwriting whatever mode the last process
+  left in the store. Intake and the API run; nothing dispatches. Say `play`
+  here, or `TASKS_DEFAULT_MODE=play` in `.env` for a host you want dispatching
+  unattended.
+
+The app (`app-gpui`, built separately — `cd app-gpui && cargo run`) does all
+three of those, and is where the loop actually closes: watch a Scout's live
+Claude Code stream, read its spec, approve it, and talk to the orchestrator
+about why it did what it did.
+
+### Day to day
 
 ```sh
 make restart      # upgrade a running server in place (drain, swap, verify)
 make status
 tasks doctor      # preflight: every precondition for a scout, with its fix
-make test         # ~565 tests, real processes and real SQLite, no mocks
+make test         # real processes, real SQLite, no mocks
 ```
 
-The app (`app-gpui`, built separately — `cd app-gpui && cargo run`) is where
-the loop closes: watch a Scout's live Claude Code stream, read its spec,
-approve it, and talk to the orchestrator about why it did what it did.
+`tasks doctor` is the answer to "can this machine actually run a scout?" — it
+asks the container CLI and its services, vm-pool's socket and both its
+ledgers, the images, the sealed store, the credential broker VMs redeem leases
+against, GitHub's answer to your token, and the rest, in the order the
+preconditions bite, and names the command that fixes each failure. It reports
+and never fixes, and it writes nothing.
+
+Host work the server cannot do to itself — restarting vm-pool, rebuilding
+images — wants the pipeline quiesced first, and the hold outlives the command:
+
+```sh
+make drain        # hold dispatch, and wait for work in flight to land
+make images       # ...then the host work: this, or a vm-pool restart
+make resume       # ...then give dispatch back
+```
+
+### When something is wrong
+
+| symptom | check | fix |
+| --- | --- | --- |
+| anything, or you don't know yet | `tasks doctor` | whatever it names — every failing check prints the command that changes it |
+| doctor is clean, mode is `play`, nothing dispatches | `curl -s localhost:4800/tasks \| jq -r '.[] \| "\(.id) \(.state)"'` — is it `backlog`? | `POST /tasks/{id}/queue`; backlog never dispatches on its own |
+| doctor warns that dispatch is held | `make status` names which hold: GitHub not answering, an update pending, or a full pool | each clears on its own terms — a GitHub hold on the next good poll, an update hold on `make restart` / `make images`, a pool hold on the next VM handed back |
+| a supervisor change seems to have no effect | `make images-check` (or `tasks doctor --probe-images`) — the images are rebuilt by hand and nothing does it for you | `make drain` → `make images` → `make resume` |
+| a scout started and then died | its transcript, in the app or `GET /sessions/{id}/transcript`, and the `exit_reason` on the session | nothing, usually: a dropped API connection is resumed in the VM and costs the task no attempt. Only a run that reached a verdict is charged one, and three of those reject the task |
 
 ## Reading further
 
