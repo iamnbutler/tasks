@@ -266,14 +266,15 @@ separate from the app: since #1012 the daemon is a background service, and a
 machine that only serves still wants a glanceable answer to "is the pipeline
 moving" without the whole workspace window. It puts one item in the status
 bar; a click drops a panel shaped like a menu, top to bottom: a **SERVER**
-section (Start or Stop by state, Restart, and Kill All Runs when work is in
+section (the mode chip — mode is a whole-server fact, one dispatcher however
+many pool machines; it toggles play ↔ pause, and stop is never one click —
+plus Start or Stop by state, Restart, and Kill All Runs when work is in
 flight — the same ops the app's Server menu runs, from the same `server.rs`,
 included via `#[path]` so the binary-resolution and verdict logic cannot
-fork), then a **section per machine running the pool** — name, mode chip
-(toggles play ↔ pause; stop is never one click), serving pid and uptime, one
-row per in-flight Scout/Builder with what it is working on and for how long,
-and a line each for a GitHub hold or a pending update — then Open Tasks and
-Quit. A Stop with work in flight parks the same question the app asks,
+fork), then a **section per machine running the pool** — name, serving pid
+and uptime, one row per in-flight Scout/Builder with what it is working on
+and for how long, and a line each for a GitHub hold or a pending update —
+then Open Tasks and Quit. A Stop with work in flight parks the same question the app asks,
 rendered inline as Stop Anyway / Keep Running. It shares this package rather
 than being its own crate so the 600 MB gpui dependency tree is compiled once,
 but it is a separate executable: running it installs nothing and assumes
