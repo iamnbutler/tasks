@@ -37,6 +37,7 @@ hkdf.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 rand.workspace = true
+keyring.workspace = true
 
 [build-dependencies]
 build-stamp.workspace = true

@@ -85,6 +85,50 @@ SSE with 15s keepalive comments). The intended client shape:
 
 No auth, loopback only — don't build a login flow.
 
+### What a client must not send
+
+A bind address is not access control against a browser: with no auth, a
+request carrying no `X-Tasks-Actor` is the human's, and the human is never
+gated. So every route — reads included — goes through one guard
+(`crate::loopback`), and there are two ways to trip it:
+
+- **The authority must be this machine's loopback.** `127.0.0.0/8`, `::1`
+  (bare or bracketed) or `localhost`, with or without a port; the port is
+  parsed but never compared, so `:0` in a test is as good as `:4800`. Every
+  authority the request states is checked — the `Host` header (all of them, if
+  something sent more than one) *and* the URI authority, which is where HTTP/2
+  states it. Anything else is **403**. This is what a DNS rebind fails on: a
+  browser fills `Host` from the URL's hostname, so an attacker's name that
+  resolves to `127.0.0.1` still arrives as `evil.example:4800`.
+- **An `Origin` header is a refusal — any value at all**, including `null` and
+  including a loopback one. This API has no browser clients, so the header's
+  presence is the finding; a future local web UI gets an explicit allow-list
+  on the day it exists, decided by someone thinking about it.
+
+No client in this tree has to do anything: `ureq` (the app, `tasks status`,
+`tasks-client`) and `reqwest` (`tasks reload`) both derive `Host` from the URL
+and send no `Origin`, and the orchestrator's `curl -K` config holds one line —
+the actor header. If you are writing a new client, just don't add an `Origin`
+and don't rewrite the `Host`.
+
+**Deployment, not client library, is what this can break.** Through an SSH
+`-L` tunnel the client connects to `localhost:PORT`, so the `Host` arrives
+loopback and nothing changes. Through an **HTTP reverse proxy** (`tailscale
+serve`, nginx) the proxy forwards its own `Host` and every request 403s — that
+is accepted breakage, and the tunnel is the answer. There is deliberately no
+switch to turn the guard off, and no `X-Forwarded-Host` allowance: that would
+trust a header any client can send on a listener with no way to tell a proxy
+from a web page.
+
+**What the guard does not cover**, stated so it doesn't become nobody's job: a
+cross-site subresource `GET` straight to loopback. Browsers send no `Origin`
+on `<img src>`, `<script src>` or `<iframe>`, so such a request passes both
+rules. Responses stay unreadable to the attacker (this API sends no CORS
+headers), so the residual is routes with a server-side effect — today just
+`GET /decisions/{seq}/reconcile`, which spends the server's own GitHub
+credential outbound. That one is accepted: idempotent, locally inert, and only
+ever for a decision still `pending`.
+
 ## Interaction surface (where to hook UI actions)
 
 | UI action | Call | Semantics |

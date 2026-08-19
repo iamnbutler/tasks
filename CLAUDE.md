@@ -312,6 +312,71 @@ implementation.
   cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
   from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
   a demotion to human.
+- **A bind address is not access control against a browser, so the API refuses
+  the two shapes only a browser sends.** The other half of the attribution
+  rule: a request with no `X-Tasks-Actor` is read as the human's, and the human
+  is never gated — so before #985 any page you had open could drive the
+  pipeline. Two ways, and they are *not* one: a CORS-**simple** `POST` (no
+  body, no `Content-Type`, hence no preflight) whose opaque response does not
+  matter because `POST /tasks/{id}/build-now` has already dispatched a VM that
+  writes code and opens pull requests; and **DNS rebinding**, where a name the
+  attacker controls resolving to `127.0.0.1` makes their page genuinely
+  same-origin and lifts the simple-request restriction entirely — `/tasks`,
+  `/decisions`, the transcripts, `POST /pull-requests/{n}/merge`. So
+  `crate::loopback` is one middleware over the whole router enforcing two rules
+  that are **not interchangeable, because each is blind to the other's path**:
+  every authority the request states must name this machine's loopback, and an
+  `Origin` header — *any* value, `null` and a loopback one included — is a
+  refusal. The rebind arrives with an ordinary `Origin` naming the attacker's
+  own site *and* a `Host` naming it too; the simple `POST` arrives with a
+  loopback `Host` the first rule has no quarrel with. Both apply to reads as
+  well as writes, because deciding it per method means re-deciding it for every
+  route added later — the shape `authorize` exists not to have. The **route
+  list is a separate private `fn routes`** and the layer wraps it, rather than
+  a `.layer()` chained onto the end of a 120-line list that a later route can
+  be appended *after*, silently unguarded; the property is pinned on an
+  **unrouted** path answering **403 rather than 404**, which is what makes it
+  hold for routes nobody has written yet. The port is parsed and never
+  compared — a browser fills `Host` from the URL's *hostname*, so a rebind
+  fails on the host part alone, and comparing `:4800` would refuse every test
+  in the tree, which binds `:0` — but the `u16` parse is what stops
+  `127.0.0.1:80.evil.example`; `get_all` for `Host`, because "the first one is
+  loopback" is the reading a smuggled second one is built to get; and the URI
+  authority is checked too, since **HTTP/2 carries no `Host` header** and an
+  absolute-form request line must not name a host the header would have
+  refused. **The coverage claim is stated exactly, because a security change
+  that overstates it is worse than one that states a gap** — the gap stops
+  being anybody's job. `GET` is covered against *rebinding* by the authority
+  rule and is **not** covered against a direct-to-loopback cross-site
+  subresource load: browsers send no `Origin` on `<img src>`/`<script
+  src>`/`<iframe>`, so `<img src="http://127.0.0.1:4800/…">` passes both rules.
+  That residual is bounded to routes whose responses the attacker cannot read
+  (this API sends no CORS headers) and whose only effect is server-side, and
+  today exactly one route is not nil: **`GET /decisions/{seq}/reconcile`**,
+  which spends the server's own GitHub credential outbound. It is **accepted**
+  rather than moved to `POST` — idempotent, locally mutating nothing, answering
+  only for a `pending` decision, and named as a `GET` by the obligation loop
+  and the orchestrator's own `curl` — so what it costs is one GitHub read per
+  pending decision, a rate-limit lever and not the `build-now` hole; closing it
+  wants `Sec-Fetch-Site`, which is its own decision. There is **no knob**, and
+  the argument is no longer the one that fits on a line: a disable switch whose
+  only user bypasses the fix was the whole reason until a *legitimate*
+  deployment shape turned out to be refused. Through an SSH `-L` tunnel the
+  client connects to `localhost:PORT` and the `Host` arrives loopback, so that
+  shape is untouched; through an **HTTP reverse proxy** (`tailscale serve`,
+  nginx) the proxy forwards `Host: mini.tail….ts.net` and every request 403s —
+  which the menubar's `TASKS_MENUBAR_MACHINES` can name. That is **accepted
+  breakage with the tunnel as the answer**, and an `X-Forwarded-Host`-aware
+  allowance is rejected rather than unconsidered: it would trust a header any
+  client can send, on a listener with no way to tell a proxy from a page, which
+  is the guard deleting itself. A trusted-authority list is the honest shape
+  and belongs with the bind — this guard **assumes the loopback bind**
+  (`server::bind` takes `Ipv4Addr::LOCALHOST`, no knob), so if Tasks ever binds
+  beyond loopback the allow-list widens *and* something real goes in front of
+  the port, deliberately, rather than a switch being flipped. The one
+  deliberate exclusion is the **broker** (port 4801): a second listener on
+  purpose, reachable from the VM subnet, where every route already demands a
+  live lease — it builds its own router and must not get this layer.
 - **A refusal is a no-op, so everything refusable runs before the effect — and
   the rationale check lives at `authorize`, not in the handlers.** The other
   end of the attribution rule: a write the server *does* attribute still has to
@@ -380,7 +445,26 @@ implementation.
   `TASKS_SECRETS_KEY_FILE`); neither artifact alone decrypts anything, a
   sealed store that exists but cannot open **refuses to boot** rather than
   silently falling back to the environment, and `tasks secrets set` rotates a
-  *running* server off the file's mtime — no restart. Raw values cross module
+  *running* server off the file's mtime — no restart. **That unseal key is
+  read and written through the `keyring` crate's native backends
+  (Security.framework, Credential Manager, Secret Service) rather than
+  `/usr/bin/security`, and for an existing install that buys nothing yet**
+  (#1003). Three things compound: `set_password` on macOS is
+  find-then-modify-*in-place*, so an item the CLI created keeps the CLI's
+  access list through any number of native writes; the `security` read stays on
+  the read path as the **default** fallback, so nothing breaks and nothing
+  improves; and an unsigned dev build is a different *application* to an access
+  list on every `cargo build`, which is why `TASKS_SECRETS_KEY_FILE` stays
+  first-class rather than being the exotic-host path. So custody is
+  **unchanged** until a human runs `tasks secrets rehome-key` — a
+  delete-then-add, the only thing that moves an access list, spanning the
+  window with a 0600 rescue file **outside the data dir** (`~/.tasks/`, the
+  #1012 service home) because a rescue copy beside `sealed.json` would put both
+  halves of the two-artifact property in one `tar`; nothing forces that
+  command, a `warn!` is the only prompt, and the real benefit arrives with a
+  signed application identity (#988, undecided). `keychain_read` and
+  `keychain_write` are the whole custody boundary and a second key-store path
+  is never the answer — an API route that auto-initialises a store calls them. Raw values cross module
   boundaries only as `redact::Secret` (no `Display` at all — interpolating
   one is a compile error, not a silent `<redacted>`; constant-time equality;
   zeroized on drop). Two carve-outs are named: a non-http(s)
@@ -920,6 +1004,54 @@ implementation.
   output repeats the server's own `CancelAck.concluded` rather than flattening
   "asked" and "stopped" into one word.
 
+- **A diagnostic reports and never fixes, and the one check worth writing is
+  the one every other check is blind to.** `tasks doctor` asks every
+  precondition for a scout at once — the container CLI, vm-pool's socket and
+  its *two* ledgers, the images, custody, the broker, GitHub, the
+  orchestrator's surroundings — in the order the preconditions bite, because a
+  missing container CLI explains the vm-pool failure below it which explains
+  the dispatch failure below that; **do not sort by severity**, a reader who
+  sees the first cause first does not have to work out which of six complaints
+  is the root. There is no `--fix` flag and there should not be one: a
+  diagnostic that changes state cannot be run when you are unsure, and the fix
+  it would most want to perform (`make images`) cannot be reached from inside
+  this pipeline at all. Four rules hold its shape. **The fix is a required
+  parameter, not a convention** — `Check::fail` and `Check::warn` take it by
+  value, because every earlier version of "name the fix beside the complaint"
+  here (`make check-toolchain`, `ImageFreshness`, the update-hold reasons) does
+  it by convention and a convention is what the next check quietly skips;
+  `Check::note` is the *named* escape hatch for the two warnings with genuinely
+  no command, so "there is nothing to run" cannot be mistaken for "somebody
+  forgot". **It never opens the store**, because `Store::open` migrates and a
+  diagnostic that moved the schema is worse than none — which is why mode,
+  projects and the observed image identities come from the running server's
+  API, and why a host with no server reports "not serving" rather than reaching
+  past it. **A `Skip` never sets the exit code**: every skip has a failure above
+  it that caused it, and a skip that failed too would report one broken thing as
+  two. And the single write — one uniquely-named file under the data dir — is
+  the write probe, because writability is only answerable by writing (mode bits
+  lie under ACLs, a read-only mount, a full disk). The **broker check** is the
+  one that justifies the command: on 2026-08-19 every host-side signal on this
+  machine was green — pool healthy with slack, socket live, images present,
+  token valid, server serving — and no scout could have run, because the macOS
+  application firewall was severing the broker's non-loopback listener after a
+  `cargo clean` removed the binary its verdict was attached to. So the probe
+  goes to **`TASKS_BROKER_ADVERTISE:TASKS_BROKER_PORT`, never loopback**, and
+  **an unauthenticated 401 is the success condition** — during that outage
+  loopback answered a correct `a lease is required` while the bridge gateway
+  accepted the connection and returned zero bytes, so a `127.0.0.1` probe reads
+  as a pass at exactly the moment the thing is broken. Anything that fails
+  *after* the connect is `Silent` and a `Fail`, never `Unreachable`: the connect
+  already proved the address is reachable, and demoting that to a `Skip` sets no
+  exit code, which is the false negative the check exists to prevent. A gateway
+  that cannot be reached at all *is* a `Skip`, because apple/container's bridge
+  does not exist until the first container has started — a cold machine has not
+  been shown to be broken. Finally, severity is **read, never re-decided**:
+  `Capacity::level`/`describe`/`fix` are what both the connect-time log line and
+  the checklist use, and doctor reads `ImageFreshness::needs_rebuild` rather
+  than judging freshness a second time — two hand-written versions of one
+  question is exactly how two readers come to disagree.
+
 ## Project structure
 
 - `crates/tasks/` — the server binary: SQLite store, event log, GitHub
@@ -1006,6 +1138,12 @@ tasks service install                  # THIS binary -> ~/.tasks/bin, one
                                        #   LaunchAgent (login + crash restart);
                                        #   idempotent, and also the upgrade
 tasks service status                   # agent / binary / launchd / serving
+tasks doctor                           # every precondition for a scout as one
+                                       #   checklist, each failure naming its
+                                       #   fix; 0 clean, 1 on a failure (or on
+                                       #   any warning under --strict), 2 usage
+tasks doctor --probe-images            # ...and boot each image to read its
+                                       #   --version, as `make images-check` does
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;
@@ -1484,7 +1622,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |
 | `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway) |
 | `TASKS_BROKER_ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | where Anthropic traffic forwards — override for tests only |
-| `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the Keychain the store header names. The Linux/test path, and the escape hatch for a locked login keychain |
+| `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the credential-store item the store header names. The Linux/test path — and **first-class on macOS too, not a fallback**: an access list is granted to an *application*, so an unsigned dev build is a different one on every `cargo build` and a natively-stored key re-prompts each time, which a launchd-started server has no window server to answer |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |

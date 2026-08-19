@@ -1,5 +1,19 @@
 # Credential custody: sealed secrets, short-lived leases, and the broker
 
+> **Amended by #1003.** This document records #971 as it shipped and is not
+> rewritten. One thing below has moved: the unseal key is read and written
+> through the `keyring` crate's native backends (Security.framework on macOS,
+> Credential Manager on Windows, the Secret Service elsewhere), not through
+> the `/usr/bin/security` CLI. Same service (`tasks-v2-secrets`), same
+> account, same store format, same `key_source: "keychain"` header, same
+> `TASKS_SECRETS_KEY_FILE` escape. The `security` **read** survives as the
+> default fallback so an existing item is never locked out — which also means
+> an existing install's custody is unchanged until someone runs the new
+> `tasks secrets rehome-key`, because a native `set_password` cannot rebind a
+> macOS access list (it is find-then-modify-in-place; only delete-then-add
+> moves one). See `crates/tasks/src/secrets.rs`'s module header for what this
+> does and does not buy.
+
 Issue #971 asks for the keys to be rotated. Before rotating, this change makes
 the rotated keys structurally unleakable in the ways the old ones leaked
 (#923/#970): after it, **no VM ever holds a raw `ANTHROPIC_API_KEY` or
@@ -15,7 +29,8 @@ Raw keys live in one place: `<data dir>/secrets/sealed.json`, encrypted
 per-entry with ChaCha20-Poly1305 under a key derived (HKDF-SHA256, per-store
 salt, entry name as AAD) from a 32-byte **unseal key** that is *not stored
 next to the ciphertext* — that is the "two key" property. The unseal key lives
-in the macOS Keychain (`security` CLI, service `tasks-v2-secrets`) or, where a
+in the macOS Keychain (service `tasks-v2-secrets`; the `security` CLI when
+this was written, the `keyring` crate's native backend since #1003) or, where a
 Keychain is not available (Linux, tests, CI), in a file named by
 `TASKS_SECRETS_KEY_FILE`. A copied data dir — a backup, a synced folder, a
 bundle of the server's state — yields ciphertext only; a copied Keychain entry

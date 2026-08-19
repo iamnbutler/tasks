@@ -119,6 +119,7 @@ async fn every_subcommand_answers_help() {
         ("restart", "usage: tasks reload"),
         ("status", "usage: tasks status"),
         ("stop", "usage: tasks stop"),
+        ("doctor", "usage: tasks doctor"),
         ("add-project", "usage: tasks add-project"),
         ("vm-pool", "usage: tasks vm-pool"),
     ] {
@@ -147,6 +148,7 @@ async fn top_level_help_still_lists_the_subcommands() {
         "reload",
         "status",
         "stop",
+        "doctor",
         "add-project",
         "vm-pool",
     ] {
@@ -204,4 +206,79 @@ async fn a_second_vm_pool_refuses_a_live_socket() {
         .await
         .expect("the incumbent still owns the path");
     drop(incumbent);
+}
+
+/// `tasks doctor` on a machine with nothing set up: it has to *answer*, and
+/// it has to leave the data dir it was pointed at as it found it.
+///
+/// The exit code is not asserted to be 1 here — a host that happens to have
+/// every precondition would legitimately pass — but the report's shape is,
+/// because "the same shape every time" is the property that lets a reader tell
+/// "not asked" from "not present".
+#[tokio::test]
+async fn doctor_reports_without_writing_anything() {
+    let (output, dir) = run(&["doctor"]).await;
+    let text = stdout(&output);
+
+    for section in [
+        "environment",
+        "configuration",
+        "container runtime",
+        "vm-pool",
+        "server",
+        "VM images",
+        "credentials",
+        "credential broker",
+        "github",
+        "projects",
+        "orchestrator",
+    ] {
+        assert!(text.contains(section), "{section} missing from:\n{text}");
+    }
+    // Nothing short-circuits: a question that could not be asked says so
+    // rather than being omitted.
+    assert!(text.contains("skip"), "{text}");
+
+    // The write probe is the one deliberate write, and it cleans up after
+    // itself; nothing else here may create a file at all. In particular the
+    // store is never opened, so no `tasks.db` and no migrations.
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "doctor left files in the data dir it was pointed at: {left:?}"
+    );
+}
+
+/// Every failing check names the command that changes it — asserted through
+/// the real binary, not just at the constructor.
+#[tokio::test]
+async fn doctor_names_a_fix_beside_every_complaint() {
+    let (output, _dir) = run(&["doctor"]).await;
+    let text = stdout(&output);
+    let complaints = text.lines().filter(|l| l.contains("FAIL ")).count();
+    let fixes = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("-> "))
+        .count();
+    assert!(
+        complaints > 0,
+        "expected a bare tempdir to fail something:\n{text}"
+    );
+    assert!(
+        fixes >= complaints,
+        "{complaints} failure(s) but only {fixes} fix line(s):\n{text}"
+    );
+}
+
+/// A usage error is 2, kept apart from the 1 a real failure gets, so a setup
+/// script can tell "your machine is broken" from "you typed it wrong".
+#[tokio::test]
+async fn doctor_exits_two_on_an_unknown_flag() {
+    let (output, _dir) = run(&["doctor", "--fix"]).await;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(text.contains("--fix"), "{text}");
 }

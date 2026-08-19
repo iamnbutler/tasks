@@ -65,16 +65,30 @@ Rust (edition 2024), and a GitHub token.
 ```sh
 make images                            # build the Scout/Builder VM images (once, and after supervisor changes)
 tasks secrets init                     # sealed credential store; unseal key goes to the Keychain
+                                       #   (--key-file PATH is first-class, not a fallback:
+                                       #    an unsigned dev build is a new application to a
+                                       #    macOS access list on every rebuild)
 tasks secrets set github-token         # paste the token, ctrl-D (same for anthropic-api-key)
+cp .env.example .env                   # everything that is *not* a credential
 tasks vm-pool &                        # the VM pool, a separate long-lived daemon
 make serve                             # the server, in this terminal
 cargo run -p tasks -- add-project owner/repo
+tasks doctor                           # ...and check the lot: every precondition for a
+                                       #   scout, as a checklist, exit 1 on any failure
 ```
+
+`tasks doctor` is the answer to "can this machine actually run a scout?" — it
+asks the container CLI, vm-pool's socket and both its ledgers, the images, the
+sealed store, the credential broker VMs redeem leases against, GitHub's answer
+to your token, and the rest, in the order the preconditions bite, and names the
+command that fixes each failure. It reports and never fixes, and it writes
+nothing.
 
 Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
 through an in-process broker, and the sealed store means no raw key sits in
 `.env` either (raw `GITHUB_TOKEN` / `ANTHROPIC_API_KEY` env vars still work
-as fallbacks). See `docs/plans/2026-08-18-credential-custody.md`.
+as fallbacks, and `.env.example` documents them as exactly that). See
+`docs/plans/2026-08-18-credential-custody.md`.
 
 The server boots **paused**: intake and the API run, nothing dispatches.
 Flip to `play` (from the app, or `POST /mode`) and the pipeline starts
@@ -87,6 +101,7 @@ Day to day:
 ```sh
 make restart      # upgrade a running server in place (drain, swap, verify)
 make status
+tasks doctor      # preflight: every precondition for a scout, with its fix
 make test         # ~565 tests, real processes and real SQLite, no mocks
 ```
 
@@ -100,3 +115,37 @@ approve it, and talk to the orchestrator about why it did what it did.
 - `docs/plans/` — implementation plans, including the v2 architecture and
   the v3 UI spec
 - `crates/vm-pool/CLAUDE.md` — vm-pool's own conventions
+
+## License
+
+MIT. `Copyright (c) 2026 Nate Butler` — a single year, because every commit in
+this repository is dated 2026 (the first is 2026-03-11) and a range would
+claim authorship years that do not exist.
+
+`crates/vm-pool/` carries its own copy of that text, and so does each of the
+three crates `cargo publish` can reach (`vm-pool-protocol`, `vm-pool-client`,
+`vm-pool-manager`). That is not redundancy: `cargo package` ships only files
+under the *package* root and never walks up, so a published crate whose
+LICENSE lived in a parent directory would reproduce exactly the bug this file
+is about — a `license` field with no text behind it. The three vm-pool crates
+carrying `publish = false` deliberately get no copy; adding one would imply a
+publish path that is switched off.
+
+### Third-party
+
+The app links Apache-2.0 code: `gpui-unofficial` (and its platform crate) is
+`license = "Apache-2.0"` and ships `LICENSE-APACHE` in the published artifact,
+and `gpuikit` is `MIT OR Apache-2.0` at the pinned rev — taken here under its
+MIT arm, which is directly compatible with licensing this repository MIT.
+GitHub's detector reports `gpuikit` as Apache-only because it picks one of a
+dual pair, and the `gpui-unofficial` *repository* has no LICENSE file at all
+because it is release automation with no gpui source in it; neither is a
+blocker on redistributing a built `Tasks.app`.
+
+Apache-2.0 §4(a) asks that a copy of the License travel with a binary
+distribution, so `make app`/`make dist` copy `app-gpui/third-party/` into
+`Tasks.app/Contents/Resources/third-party/` and the bundle's
+`NSHumanReadableCopyright` points there rather than claiming MIT for the whole
+artifact. That directory covers the crates `app-gpui/Cargo.toml` declares
+directly, read from the artifacts the build consumes; a full **transitive**
+audit (`cargo about` / `cargo-deny`) is still owed and is its own issue.

@@ -24,6 +24,8 @@
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>@COMMIT@</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 Nate Butler. Tasks is MIT licensed; this bundle also contains Apache-2.0 components — see Contents/Resources/third-party/NOTICES.md.</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSHighResolutionCapable</key>

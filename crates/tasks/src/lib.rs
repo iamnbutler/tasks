@@ -17,12 +17,18 @@ pub mod deadline;
 /// What the scout dispatcher may start and whether it may start it, asked
 /// together — so the hold read cannot be dropped from the dispatch (#973).
 pub mod dispatch_gate;
+/// Every precondition for a scout, asked at once: `tasks doctor` (#990).
+pub mod doctor;
 pub mod env_file;
 pub mod github;
 /// Whether GitHub is answering, and whether dispatch should wait for it (#939).
 pub mod github_health;
 /// What the VM images are running, observed from the runs inside them (#909).
 pub mod images;
+/// The two rules that keep a web page you visit from driving the local API:
+/// the authority must be this machine's loopback, and an `Origin` header is a
+/// refusal (#985).
+pub mod loopback;
 /// The migration set plus the naming rule that keeps parallel branches from
 /// colliding on it — private, like `teardown`: the store is the only caller.
 mod migrations;

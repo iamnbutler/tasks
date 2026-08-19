@@ -1,12 +1,14 @@
 //! The dropdown: a gpui PopUp panel under the status item.
 //!
 //! Its structure is menu-shaped, top to bottom: a **SERVER** section (the
-//! local daemon's lifecycle — Start/Stop by state, Restart, Kill All Runs),
-//! then one section per **machine** running the pool (name, mode chip, one
-//! row per in-flight scout/builder), then Open Tasks and Quit. The server ops
-//! come from the same `server.rs` the app's Server menu drives — see
-//! `main.rs` for the sharing arrangement — so both front ends resolve the
-//! same binary and speak the same verdicts.
+//! local daemon's lifecycle — Start/Stop by state, Restart, Kill All Runs —
+//! with the mode chip in its header, because mode is a whole-server fact:
+//! one dispatcher, however many pool machines), then one section per
+//! **machine** running the pool (name, one row per in-flight
+//! scout/builder), then Open Tasks and Quit. The server ops come from the
+//! same `server.rs` the app's Server menu drives — see `main.rs` for the
+//! sharing arrangement — so both front ends resolve the same binary and
+//! speak the same verdicts.
 //!
 //! gpui's `WindowKind::PopUp` is a non-activating panel at popup window level
 //! that can still become key — so showing it steals no focus from whatever
@@ -323,15 +325,24 @@ impl Render for Popup {
 impl Popup {
     fn render_server(&self, now: DateTime<Utc>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let section = server_section(self.server.read(cx), now);
+        let control = self.server.read(cx);
+        let section = server_section(control, now);
+        // Mode is a whole-server fact — one dispatcher, however many pool
+        // machines — so the chip lives here and nowhere else.
+        let mode = control.status.as_ref().map(|status| status.mode);
 
         let label = div()
             .h(px(HEADER_HEIGHT))
             .flex()
             .items_center()
-            .text_size(px(10.))
-            .text_color(theme.fg_muted())
-            .child("SERVER");
+            .child(
+                div()
+                    .flex_grow(1.)
+                    .text_size(px(10.))
+                    .text_color(theme.fg_muted())
+                    .child("SERVER"),
+            )
+            .children(mode.map(|mode| self.render_mode_chip(mode, cx)));
 
         let info = section
             .info
@@ -393,7 +404,6 @@ impl Popup {
 
         let name = machine.spec.name.clone();
         let dot = machine_dot(machine, theme.as_ref());
-        let mode = machine.status.as_ref().map(|status| status.mode);
         let lines = machine_lines(machine, now);
 
         let header = div()
@@ -409,8 +419,7 @@ impl Popup {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .child(name),
-            )
-            .children(mode.map(|mode| self.render_mode_chip(index, mode, cx)));
+            );
 
         div()
             .flex()
@@ -458,24 +467,21 @@ impl Popup {
             }))
     }
 
-    /// The mode as a chip, and the chip as the one control on a machine:
-    /// click toggles play ↔ pause (never stop — see
-    /// [`machines::toggled_mode`]).
-    fn render_mode_chip(
-        &self,
-        index: usize,
-        mode: Mode,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// The server's mode as a chip in the SERVER header: click toggles
+    /// play ↔ pause (never stop — see [`machines::toggled_mode`]). Wired to
+    /// [`ServerControl::set_mode`], whose refresh is what repaints the chip
+    /// with what the server accepted; a refused write surfaces through the
+    /// section's `mode_error` info line.
+    fn render_mode_chip(&self, mode: Mode, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let color = match mode {
             Mode::Play => theme.success(),
             Mode::Pause => theme.warning(),
             Mode::Stop => theme.danger(),
         };
-        let machines = self.machines.clone();
+        let server = self.server.clone();
         div()
-            .id(SharedString::from(format!("mode-{index}")))
+            .id("server-mode")
             .flex_none()
             .px(px(6.))
             .py(px(1.))
@@ -487,8 +493,8 @@ impl Popup {
             .hover(|style| style.bg(theme.surface_secondary()))
             .child(mode.as_str().to_uppercase())
             .on_click(move |_, _, cx| {
-                machines.update(cx, |m, cx| {
-                    m.set_mode(index, machines::toggled_mode(mode), cx)
+                server.update(cx, |server, cx| {
+                    server.set_mode(machines::toggled_mode(mode), cx)
                 });
             })
     }
@@ -707,6 +713,12 @@ pub fn server_section(control: &ServerControl, now: DateTime<Utc>) -> ServerSect
             .map(|work| work.scouts.len() + work.builds.len())
             .unwrap_or(0);
         info.push((format!("{in_flight} running — stop anyway?"), Tone::Warn));
+    }
+    // A refused mode write (the chip's toggle) — kept apart from the probe
+    // error by ServerControl for exactly this rendering, and standing until
+    // the next successful write clears it.
+    if let Some(error) = &control.mode_error {
+        info.push((format!("mode change failed — {error}"), Tone::Warn));
     }
 
     ServerSection {

@@ -181,26 +181,6 @@ impl Machines {
         })
         .detach();
     }
-
-    /// Set one machine's pipeline mode, then re-probe it so the chip shows
-    /// what the server accepted rather than what was asked for.
-    pub fn set_mode(&mut self, index: usize, mode: Mode, cx: &mut Context<Self>) {
-        let Some(machine) = self.machines.get(index) else {
-            return;
-        };
-        let client = machine.client.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { client.set_mode(mode) });
-        cx.spawn(async move |this, cx| {
-            // The refresh reports the outcome either way; an error here has
-            // nowhere better to go than the next probe's answer.
-            let _ = work.await;
-            this.update(cx, |this: &mut Machines, cx| this.refresh_one(index, cx))
-                .ok();
-        })
-        .detach();
-    }
 }
 
 /// The name this machine goes by, the way the Mac states it. Falls back down

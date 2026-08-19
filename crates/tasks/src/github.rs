@@ -369,6 +369,61 @@ enum TokenSource {
     Live(crate::secrets::Secrets),
 }
 
+/// Who a token is and what it may do, as [`GitHubClient::viewer`] found out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Viewer {
+    /// The account or app the token authenticates as.
+    pub(crate) login: String,
+    /// Classic-PAT scopes, or `None` where **no response carried the header
+    /// at all** — fine-grained PATs and GitHub App tokens have permissions
+    /// rather than scopes and send none.
+    ///
+    /// `None` and `Some(vec![])` must stay distinguishable the whole way to
+    /// the renderer: they are opposite verdicts. "This token type does not
+    /// enumerate its permissions here" is fine; "this token has no scopes at
+    /// all" means replace it, and telling an operator to replace a token that
+    /// works is the failure this distinction exists to prevent.
+    pub(crate) scopes: Option<Vec<String>>,
+    /// Which response the scopes came off, so a reader can see *that* the
+    /// premise held rather than inferring it. `None` exactly when `scopes` is.
+    pub(crate) scope_source: Option<ScopeSource>,
+}
+
+/// Which response carried `x-oauth-scopes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeSource {
+    /// The GraphQL response itself — one round trip, no fallback needed.
+    GraphQlHeader,
+    /// `GET /rate_limit`, the documented source.
+    RestHeader,
+}
+
+impl std::fmt::Display for ScopeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GraphQlHeader => f.write_str("graphql response header"),
+            Self::RestHeader => f.write_str("REST /rate_limit response header"),
+        }
+    }
+}
+
+/// `x-oauth-scopes` off a response, as a list.
+///
+/// Absent is `None` and present-but-empty is `Some(vec![])` — see
+/// [`Viewer::scopes`]. GitHub sends the list comma-separated and normalizes
+/// it on issue (`user,gist,user:email` is stored as `user, gist`), so this
+/// splits and trims and does not attempt to compare against anything.
+fn scopes_from(headers: &reqwest::header::HeaderMap) -> Option<Vec<String>> {
+    let raw = headers.get("x-oauth-scopes")?.to_str().ok()?;
+    Some(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
     token: TokenSource,
@@ -1269,6 +1324,92 @@ impl GitHubClient {
             .collect())
     }
 
+    /// Who this token is, and what it may do.
+    ///
+    /// One GraphQL round trip that names **no repository** — deliberately the
+    /// cheapest call that keeps the three answers a diagnostic needs apart:
+    /// the token is good (a login comes back), GitHub rejected it (a 401 with
+    /// GitHub's own `message`, which `is_unavailable` reads as *answering*),
+    /// or GitHub is unreachable (no answer at all). Nothing else in this file
+    /// can do that — every other call names a repository, and a 404 there is
+    /// ambiguous between "no such repo" and "this token cannot see it".
+    ///
+    /// The status is checked through [`rest_ok`] rather than
+    /// `error_for_status`, so a revoked token reports "Bad credentials"
+    /// instead of a naked `401 Unauthorized`.
+    pub(crate) async fn viewer(&self) -> Result<Viewer, GhError> {
+        let body = serde_json::json!({ "query": "query { viewer { login } }" });
+        let resp = self
+            .http
+            .post(&self.base_url)
+            .bearer_auth(self.token().expose())
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let graphql_scopes = scopes_from(resp.headers());
+        let body = rest_ok(resp, "viewer").await?;
+
+        let Some(login) = body
+            .pointer("/data/viewer/login")
+            .and_then(|l| l.as_str())
+            .map(str::to_owned)
+        else {
+            if let Some(errs) = body.get("errors").and_then(|e| e.as_array()) {
+                let msg = errs
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(GhError::GraphQl(msg));
+            }
+            return Err(GhError::Shape("viewer.login is absent".into()));
+        };
+
+        let (scopes, scope_source) = match graphql_scopes {
+            Some(scopes) => (Some(scopes), Some(ScopeSource::GraphQlHeader)),
+            None => match self.scopes_from_rest().await {
+                Some(scopes) => (Some(scopes), Some(ScopeSource::RestHeader)),
+                None => (None, None),
+            },
+        };
+        Ok(Viewer {
+            login,
+            scopes,
+            scope_source,
+        })
+    }
+
+    /// The documented place to read `x-oauth-scopes`: a REST response.
+    ///
+    /// This second call exists because the first one's premise is *unverified*.
+    /// GitHub documents the header on REST — `gh auth status` reads it off
+    /// `GET /` for exactly this purpose — and documents it nowhere for
+    /// GraphQL; what the GraphQL endpoint does volunteer is an
+    /// `access-control-expose-headers` list naming `X-OAuth-Scopes`, which is
+    /// suggestive and is not the same as observing one. So the GraphQL header
+    /// is *used* when present and never *relied on*, because the failure of
+    /// relying on it is silent: absence would read as the fine-grained-PAT
+    /// case for every token including classic ones, and "not enumerable" is a
+    /// verdict nobody re-investigates.
+    ///
+    /// `/rate_limit` rather than the API root, because it is documented as not
+    /// counting against the rate limit — a diagnostic should not spend the
+    /// budget it is reporting on. A failure here is `None`, not an error: the
+    /// token has already been judged by the call above, and scopes are the
+    /// part of this answer that is allowed to be missing.
+    async fn scopes_from_rest(&self) -> Option<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/rate_limit", self.rest_base_url))
+            .bearer_auth(self.token().expose())
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .ok()?;
+        scopes_from(resp.headers())
+    }
+
     async fn fetch_page(
         &self,
         owner: &str,
@@ -1492,6 +1633,180 @@ mod tests {
         let url = format!("http://{addr}/graphql");
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, queue, handle)
+    }
+
+    /// A GraphQL responder that also sets response headers, so the scope read
+    /// can be exercised in both of its shapes. Returns (graphql url, rest
+    /// root) — `viewer` falls back to `GET /rate_limit` under the REST root
+    /// when the GraphQL response carries no `x-oauth-scopes`.
+    async fn spawn_viewer_fake(
+        graphql: Value,
+        graphql_status: u16,
+        graphql_scopes: Option<&str>,
+        rest_scopes: Option<&str>,
+    ) -> (String, String) {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+        use axum::routing::get;
+
+        fn header_map(scopes: Option<&str>) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            if let Some(scopes) = scopes {
+                headers.insert(
+                    HeaderName::from_static("x-oauth-scopes"),
+                    HeaderValue::from_str(scopes).unwrap(),
+                );
+            }
+            headers
+        }
+
+        let gql_headers = header_map(graphql_scopes);
+        let rest_headers = header_map(rest_scopes);
+        let status = StatusCode::from_u16(graphql_status).unwrap();
+        let app = Router::new()
+            .route(
+                "/graphql",
+                post(move |_body: String| async move {
+                    (status, gql_headers.clone(), AxumJson(graphql.clone()))
+                }),
+            )
+            .route(
+                "/rate_limit",
+                get(move || async move { (rest_headers.clone(), AxumJson(json!({"rate": {}}))) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/graphql"), format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn viewer_reads_the_login_and_splits_the_scope_header() {
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {"login": "iamnbutler"}}}),
+            200,
+            Some("repo, read:org , workflow"),
+            None,
+        )
+        .await;
+        let viewer = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap();
+        assert_eq!(viewer.login, "iamnbutler");
+        assert_eq!(
+            viewer.scopes.as_deref(),
+            Some(["repo".to_string(), "read:org".into(), "workflow".into()].as_slice())
+        );
+        assert_eq!(viewer.scope_source, Some(ScopeSource::GraphQlHeader));
+    }
+
+    /// The premise this fallback exists for. `x-oauth-scopes` is documented on
+    /// REST and nowhere for GraphQL, so a GraphQL response without it must not
+    /// end the question — reading absence there as "this token has no scopes
+    /// to enumerate" would report every classic token that way.
+    #[tokio::test]
+    async fn scopes_fall_back_to_the_documented_rest_header() {
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {"login": "someone"}}}),
+            200,
+            None,
+            Some("repo"),
+        )
+        .await;
+        let viewer = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap();
+        assert_eq!(
+            viewer.scopes.as_deref(),
+            Some(["repo".to_string()].as_slice())
+        );
+        assert_eq!(viewer.scope_source, Some(ScopeSource::RestHeader));
+    }
+
+    /// `None` and `Some(vec![])` are opposite verdicts and must stay apart the
+    /// whole way out: absent means a fine-grained PAT or an App token, which
+    /// has permissions rather than scopes; empty means a token that can do
+    /// nothing. Reading the first as the second tells an operator to replace a
+    /// token that works.
+    #[tokio::test]
+    async fn an_absent_scope_header_is_not_an_empty_one() {
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {"login": "app"}}}),
+            200,
+            None,
+            None,
+        )
+        .await;
+        let absent = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap();
+        assert_eq!(absent.scopes, None);
+        assert_eq!(absent.scope_source, None);
+
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {"login": "app"}}}),
+            200,
+            Some(""),
+            None,
+        )
+        .await;
+        let empty = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap();
+        assert_eq!(empty.scopes, Some(Vec::new()));
+    }
+
+    /// A rejected token is GitHub *answering*, in either of its two error
+    /// shapes — a 401 body and a 200 with an `errors` block. Neither may read
+    /// as an outage, or a diagnostic would report a revoked credential as "we
+    /// could not tell" and hold dispatch for it.
+    #[tokio::test]
+    async fn a_rejected_token_is_not_an_outage_in_either_shape() {
+        let (gql, rest) =
+            spawn_viewer_fake(json!({"message": "Bad credentials"}), 401, None, None).await;
+        let err = GitHubClient::with_base_url("bad", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap_err();
+        assert!(!err.is_unavailable(), "{err}");
+        assert!(err.to_string().contains("Bad credentials"), "{err}");
+
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"errors": [{"message": "Bad credentials"}]}),
+            200,
+            None,
+            None,
+        )
+        .await;
+        let err = GitHubClient::with_base_url("bad", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap_err();
+        assert!(!err.is_unavailable(), "{err}");
+        assert!(err.to_string().contains("Bad credentials"), "{err}");
+    }
+
+    /// ...and a 5xx *is* one, decided structurally off the status rather than
+    /// off the message text.
+    #[tokio::test]
+    async fn a_5xx_is_an_outage() {
+        let (gql, rest) =
+            spawn_viewer_fake(json!({"message": "unavailable"}), 503, None, None).await;
+        let err = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap_err();
+        assert!(err.is_unavailable(), "{err}");
     }
 
     fn page(nodes: Vec<Value>, has_next: bool, end_cursor: Option<&str>) -> Value {
