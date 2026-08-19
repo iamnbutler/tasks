@@ -2,6 +2,14 @@
 name = "tasks-gpui"
 version = "0.1.0"
 edition = "2021"
+# Spelled out rather than inherited: this crate is `exclude`d from the
+# workspace (root Cargo.toml), so `license.workspace = true` is unavailable to
+# it — and without these two lines it asserted *nothing*, which is the same
+# defect #983 is about (a license claim with nothing behind it) with the claim
+# missing too. The bundle it builds carries Apache-2.0 code as well; see
+# Contents/Resources/third-party/ and README ▸ License.
+license = "MIT"
+repository = "https://github.com/iamnbutler/tasks"
 
 [dependencies]
 # Exact, not caret: gpuikit asks for ^1.14.2, so `=1.14.2` unifies with it,
