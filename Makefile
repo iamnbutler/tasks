@@ -129,6 +129,15 @@ app-stop:
 # path collapses to `/Applications/Tasks.app` and this recipe deletes whatever
 # is there. Refusing costs a Mac user nothing — HOME is always set in a login
 # shell — and it is the only line here that can destroy something.
+#
+# Contents/Resources/third-party is not decoration: the bundle links
+# Apache-2.0 code (gpui-unofficial, and gpuikit's dual-licensed Apache arm),
+# and §4(a) asks that a copy of the License travel with a binary
+# distribution. The plist's NSHumanReadableCopyright points at it rather than
+# claiming MIT for the whole artifact — which is #983's own defect, a license
+# assertion with nothing behind it, one level out. Copied here rather than in
+# `dist-install` because `make app` is a redistribution too the moment anyone
+# hands the bundle over.
 app-install: check-darwin
 	@[ -n "$$HOME" ] || { echo "HOME is unset; refusing to install to $(APP_BUNDLE)"; exit 1; }
 	@pgrep -x Tasks >/dev/null 2>&1 && \
@@ -140,6 +149,7 @@ app-install: check-darwin
 	cp app-gpui/target/release/tasks-gpui "$$bundle/Contents/MacOS/Tasks"; \
 	sed -e 's/@VERSION@/$(APP_VERSION)/' -e 's/@COMMIT@/$(APP_COMMIT)/' \
 		app-gpui/Info.plist.in > "$$bundle/Contents/Info.plist"; \
+	cp -R app-gpui/third-party "$$bundle/Contents/Resources/third-party"; \
 	echo "installed $$bundle ($(APP_VERSION), $(APP_COMMIT))"
 
 # Build and install, exactly as `make app` always did.
