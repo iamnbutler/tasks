@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tasks — an autonomous software pipeline with a human in the loop</title>
+<meta name="description" content="Tasks turns a GitHub issue tracker into shipped pull requests by orchestrating coding agents — you review, it works.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9 6 L15 16 L9 26 L3 16 Z' fill='none' stroke='%23a89984' stroke-width='2'/%3E%3Cpath d='M23 6 L29 16 L23 26 L17 16 Z' fill='%23a89984'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --paper: #fbf1c7;
+    --ink: #3c3836;
+    --muted: #7c6f64;
+    --link: #076678;
+    --danger: #9d0006;
+    --rule: #d5c4a1;
+    --code-bg: #ebdbb2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #282828;
+      --ink: #ebdbb2;
+      --muted: #a89984;
+      --link: #83a598;
+      --danger: #fb4934;
+      --rule: #504945;
+      --code-bg: #3c3836;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 0.9375rem;
+    line-height: 1.55;
+  }
+  main {
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 1.5rem;
+  }
+  a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+
+  h1 {
+    font-size: 1.625rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+    margin-bottom: 0.5rem;
+  }
+  .lede { font-size: 1rem; }
+  .meta {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.75rem;
+  }
+  .meta a { color: var(--muted); }
+
+  h2 {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-top: 1px solid var(--rule);
+    padding-top: 0.8rem;
+    margin: 1.8rem 0 0.6rem;
+  }
+  p + p { margin-top: 0.7rem; }
+  strong { font-weight: 700; }
+
+  code {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.875em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+
+  .warning {
+    border-left: 3px solid var(--danger);
+    padding-left: 0.9rem;
+    margin-top: 0.6rem;
+  }
+  .warning-head { border-top: none; color: var(--danger); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    margin-top: 2rem;
+    padding: 0.8rem 0;
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  footer a { color: var(--muted); }
+
+  .banner {
+    background: var(--code-bg);
+    border-bottom: 1px solid var(--rule);
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    text-align: center;
+    padding: 0.5rem 1.25rem;
+  }
+  .soon { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="banner">Tasks isn't quite ready yet — follow the
+<a href="https://github.com/iamnbutler/tasks/issues/999">road to release</a>.</div>
+<main>
+
+<header>
+  <h1>Tasks</h1>
+  <p class="lede">An autonomous software pipeline with a human in the loop.
+  Tasks turns a GitHub issue tracker into shipped pull requests by
+  orchestrating coding agents — you review, it works.</p>
+  <p class="meta">alpha &nbsp;·&nbsp; macOS &nbsp;·&nbsp; Rust &nbsp;·&nbsp; MIT
+  &nbsp;·&nbsp; <a href="https://github.com/iamnbutler/tasks">GitHub</a></p>
+</header>
+
+<h2>Download</h2>
+<p><a>Download</a> &nbsp;|&nbsp; <a>Client only</a> &nbsp;|&nbsp;
+<a>Server only</a> &nbsp;<span class="soon">(coming soon)</span></p>
+
+<h2 class="warning-head">Warning</h2>
+<div class="warning">
+  <p>Running Tasks is risky. It runs autonomous agents, without permission
+  prompts, holding credentials that spend your Anthropic API budget and push
+  to your GitHub repositories. Research how it works before you run it, and
+  pay attention while it runs.</p>
+</div>
+
+<h2>Scouting</h2>
+<p>Scouts run in parallel, each in a throwaway VM. A Scout explores the
+codebase and writes a spec — a text document saying what to build and how.
+The spec is the deliverable; the Scout's code is discarded.</p>
+
+<h2>Building</h2>
+<p>Approved specs go to a Builder, one build at a time. A Builder starts from
+a fresh branch and the spec alone — never Scout code — implements it, and
+opens a pull request. The issue closes only once the work reaches trunk:
+<code>done</code> means <em>shipped</em>.</p>
+
+<h2>Orchestration</h2>
+<p>Between the two sits a review, by you or by the orchestrator — an agent
+that reads everything owed a decision and acts: queueing work, reviewing
+specs, dispatching and landing builds. What it may do is a nine-capability
+charter you control, and every act lands in a decisions ledger with its
+rationale, open to audit.</p>
+
+<footer>
+  <p>MIT &nbsp;·&nbsp;
+  <a href="https://github.com/iamnbutler/tasks">source</a> &nbsp;·&nbsp;
+  <a href="https://github.com/iamnbutler/tasks/issues">issues</a> &nbsp;·&nbsp;
+  <a href="https://github.com/iamnbutler/tasks/blob/main/CLAUDE.md">design rules</a></p>
+</footer>
+
+</main>
+</body>
+</html>
