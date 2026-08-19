@@ -45,6 +45,14 @@ serde_json = "1"
 # this one leaves the machine.
 ureq = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The menu bar binary's status item. gpui draws the dropdown (a PopUp panel)
+# but does not own NSStatusBar, so the item itself is made with the same
+# bindings gpui-macos uses — pinned to the versions it pins, so nothing new
+# enters the tree. Used only by `src/bin/tasks-menubar/status_item.rs`.
+objc = "0.2"
+cocoa = "=0.26.0"
+
 [dev-dependencies]
 # The Server menu's model reads a pidfile and drives a child process; both
 # are tested against real files and a real process, per the workspace's

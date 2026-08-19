@@ -5612,10 +5612,12 @@ version = "0.1.0"
 dependencies = [
  "build-stamp",
  "chrono",
+ "cocoa 0.26.0",
  "futures",
  "gpui-platform-gpui-unofficial",
  "gpui-unofficial",
  "gpuikit",
+ "objc",
  "serde_json",
  "smallvec",
  "tasks-api",
