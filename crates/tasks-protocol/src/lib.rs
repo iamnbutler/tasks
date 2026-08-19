@@ -16,7 +16,7 @@
 //! the supervisor, not a convention in the caller.
 
 use serde::{Deserialize, Deserializer, Serialize};
-use vm_pool_protocol::AppProtocol;
+use vm_pool_protocol::{AppProtocol, ServiceErrorKind};
 
 pub mod agent_run;
 pub mod redact;
@@ -96,6 +96,51 @@ impl FailureClass {
                 "the run could not be picked up after a server restart, which is the \
                  restart's fault and not the work's",
             ),
+        }
+    }
+
+    /// What a vm-pool refusal means for the attempt cap — one statement, so a
+    /// Scout and a Builder cannot give different answers about the same "no".
+    ///
+    /// Only [`ServiceErrorKind::Capacity`] is waived, and the line is **whether
+    /// the condition clears by itself**: a full pool is a property of the
+    /// moment, and the same dispatch of the same task succeeds once something
+    /// is handed back. A reference that does not resolve refuses identically
+    /// forever, and waiving *that* is the retry-forever loop the cap exists to
+    /// stop — which is why [`ServiceErrorKind::Image`] and everything beside it
+    /// stays charged, [`ServiceErrorKind::Unspecified`] included. Unspecified
+    /// is the routine reading against a vm-pool older than the field (a
+    /// separate daemon, upgraded separately), so defaulting it to a waiver
+    /// would silently waive every permanent misconfiguration on every old
+    /// daemon.
+    ///
+    /// The waiver of `Capacity` is only safe while something *else* stops the
+    /// refused task being re-attempted twice a second: `Scout::dispatch` now
+    /// returns it to `Queued`, and `crate::run`'s pool hold is what keeps that
+    /// requeue from becoming a 500 ms loop against a pool that stays full
+    /// (#967). Waiving a strike removes the backstop that used to bound that
+    /// loop, so the hold is mandatory rather than preferable — if it is ever
+    /// removed, this arm has to be revisited with it.
+    ///
+    /// The match is exhaustive rather than `_ => Transport`, so a kind added to
+    /// vm-pool tomorrow cannot widen a waiver without somebody deciding it
+    /// here.
+    pub fn for_service_error(kind: ServiceErrorKind) -> Self {
+        match kind {
+            ServiceErrorKind::Capacity => Self::Transport,
+            // Not a typo, and not the same word twice: `ServiceErrorKind::
+            // Transport` is vm-pool's stdio link to a VM failing, which is a
+            // real failure of *this* run's infrastructure with nothing to
+            // suggest the next attempt goes better. `FailureClass::Transport`
+            // means "nothing here judged the work", and this does not qualify.
+            ServiceErrorKind::Transport
+            | ServiceErrorKind::Unspecified
+            | ServiceErrorKind::NoSuchVm
+            | ServiceErrorKind::NotReady
+            | ServiceErrorKind::Image
+            | ServiceErrorKind::Runtime
+            | ServiceErrorKind::BadRequest
+            | ServiceErrorKind::Other => Self::Verdict,
         }
     }
 
@@ -494,6 +539,37 @@ mod tests {
                 class: FailureClass::Verdict,
             })
         );
+    }
+
+    /// One statement of what a vm-pool refusal costs, so the two dispatchers
+    /// cannot disagree. `Capacity` is the only waiver — it is the kind that
+    /// clears by itself — and the negative half is every other kind still
+    /// charging, `Unspecified` above all: that is what an old daemon says, and
+    /// a waiver there would silently spare every permanent misconfiguration.
+    #[test]
+    fn only_a_full_pool_is_waived_and_every_other_refusal_is_charged() {
+        assert_eq!(
+            FailureClass::for_service_error(ServiceErrorKind::Capacity),
+            FailureClass::Transport
+        );
+        assert!(!FailureClass::for_service_error(ServiceErrorKind::Capacity).is_verdict());
+
+        for kind in [
+            ServiceErrorKind::Unspecified,
+            ServiceErrorKind::NoSuchVm,
+            ServiceErrorKind::NotReady,
+            ServiceErrorKind::Image,
+            ServiceErrorKind::Runtime,
+            ServiceErrorKind::Transport,
+            ServiceErrorKind::BadRequest,
+            ServiceErrorKind::Other,
+        ] {
+            assert_eq!(
+                FailureClass::for_service_error(kind),
+                FailureClass::Verdict,
+                "{kind} must cost an attempt"
+            );
+        }
     }
 
     /// The other direction, and the one that has to be hand-written: a

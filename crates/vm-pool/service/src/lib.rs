@@ -16,7 +16,7 @@ use vm_pool_manager::{
     SnapshotStore, VmRuntime,
 };
 use vm_pool_protocol::{
-    AppProtocol, NullProtocol, Request, Response, ServiceCommand, ServiceEvent,
+    AppProtocol, NullProtocol, Request, Response, ServiceCommand, ServiceErrorKind, ServiceEvent,
 };
 
 /// Recover just the `id` field from a request line that failed to parse as a
@@ -442,6 +442,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                             let id = parse_request_id(line.trim());
                             let err = ServiceEvent::Error {
                                 message: format!("invalid request: {e}"),
+                                kind: ServiceErrorKind::BadRequest,
                             };
                             let response = match id {
                                 Some(id) => Response::to_request(id, err),
@@ -491,6 +492,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                 match self.pool.allocate(image_ref, config).await {
                     Ok(vm_id) => ServiceEvent::VmAllocated { vm_id, image },
                     Err(e) => ServiceEvent::Error {
+                        kind: e.kind(),
                         message: format!("allocate failed: {e}"),
                     },
                 }
@@ -499,6 +501,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
             ServiceCommand::Deallocate { vm_id } => match self.pool.deallocate(&vm_id).await {
                 Ok(()) => ServiceEvent::VmStopped { vm_id },
                 Err(e) => ServiceEvent::Error {
+                    kind: e.kind(),
                     message: format!("deallocate failed: {e}"),
                 },
             },
@@ -510,6 +513,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                         ServiceEvent::CommandSent { vm_id }
                     }
                     Err(e) => ServiceEvent::Error {
+                        kind: e.kind(),
                         message: format!("send failed: {e}"),
                     },
                 }
@@ -522,11 +526,13 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                         ServiceEvent::VmStopped { vm_id }
                     }
                     Err(e) => ServiceEvent::Error {
+                        kind: e.kind(),
                         message: format!("snapshot failed: {e}"),
                     },
                 },
                 None => ServiceEvent::Error {
                     message: format!("VM not found: {vm_id}"),
+                    kind: ServiceErrorKind::NoSuchVm,
                 },
             },
 
@@ -537,6 +543,7 @@ impl<R: VmRuntime<P>, P: AppProtocol> Service<R, P> {
                         ServiceEvent::VmReady { vm_id }
                     }
                     Err(e) => ServiceEvent::Error {
+                        kind: e.kind(),
                         message: format!("restore failed: {e}"),
                     },
                 }
@@ -1054,8 +1061,12 @@ mod tests {
             .await;
 
         match resp {
-            ServiceEvent::Error { message } => {
+            // The kind is what a caller decides on — a full pool is a property
+            // of the moment, and telling that from `no such image` used to be
+            // possible only by matching prose.
+            ServiceEvent::Error { message, kind } => {
                 assert!(message.contains("exhausted"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::Capacity);
             }
             other => panic!("expected Error, got {:?}", other),
         }
@@ -1070,8 +1081,9 @@ mod tests {
             })
             .await;
         match resp {
-            ServiceEvent::Error { message } => {
+            ServiceEvent::Error { message, kind } => {
                 assert!(message.contains("not found"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::NoSuchVm);
             }
             other => panic!("expected Error, got {:?}", other),
         }
@@ -1089,8 +1101,9 @@ mod tests {
             })
             .await;
         match resp {
-            ServiceEvent::Error { message } => {
+            ServiceEvent::Error { message, kind } => {
                 assert!(message.contains("not found"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::NoSuchVm);
             }
             other => panic!("expected Error, got {:?}", other),
         }
@@ -1106,8 +1119,9 @@ mod tests {
             })
             .await;
         match resp {
-            ServiceEvent::Error { message } => {
+            ServiceEvent::Error { message, kind } => {
                 assert!(message.contains("not found"), "got: {message}");
+                assert_eq!(kind, ServiceErrorKind::NoSuchVm);
             }
             other => panic!("expected Error, got {:?}", other),
         }

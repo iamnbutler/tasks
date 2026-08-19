@@ -27,7 +27,9 @@ use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use vm_pool_protocol::redact::scrub_text;
-use vm_pool_protocol::{AppProtocol, NullProtocol, VmCommand, VmConfig, VmEvent, VmId};
+use vm_pool_protocol::{
+    AppProtocol, NullProtocol, ServiceErrorKind, VmCommand, VmConfig, VmEvent, VmId,
+};
 
 /// The argument vector for `container run`, owned so that the only rendering
 /// available to a formatter is one that masks credentials.
@@ -99,6 +101,36 @@ pub enum PoolError {
     Transport(#[from] TransportError),
     #[error("runtime error: {0}")]
     Runtime(String),
+    /// Asked to stop a VM and could not confirm it is gone — the runtime
+    /// refused, answered in a way this build cannot classify, or could not be
+    /// asked at all.
+    ///
+    /// Its own variant rather than a [`PoolError::Runtime`] string because two
+    /// callers *decide* on it — [`Pool::reclaim_carried_over`] keeps the id for
+    /// the next boot, [`Pool::deallocate`] keeps the ledger entry — and a
+    /// decision that greps a message changes meaning the next time somebody
+    /// improves a sentence.
+    #[error("could not confirm {vm_id} stopped: {detail}")]
+    StopFailed { vm_id: VmId, detail: String },
+}
+
+impl PoolError {
+    /// Which of this pool's own conditions this is, for the caller that has to
+    /// decide something on a field rather than on prose.
+    ///
+    /// A `match` here rather than at the call sites, and deliberately
+    /// exhaustive: a new variant has to answer this question rather than
+    /// inherit an answer from a `_` arm.
+    pub fn kind(&self) -> ServiceErrorKind {
+        match self {
+            Self::Exhausted { .. } => ServiceErrorKind::Capacity,
+            Self::VmNotFound(_) => ServiceErrorKind::NoSuchVm,
+            Self::VmNotReady(_) => ServiceErrorKind::NotReady,
+            Self::Image(_) => ServiceErrorKind::Image,
+            Self::Transport(_) => ServiceErrorKind::Transport,
+            Self::Runtime(_) | Self::StopFailed { .. } => ServiceErrorKind::Runtime,
+        }
+    }
 }
 
 /// Handle to a running VM, providing command/event channels.
@@ -116,6 +148,21 @@ pub trait VmRuntime<P: AppProtocol = NullProtocol>: Send + Sync + 'static {
         config: &VmConfig,
     ) -> impl Future<Output = Result<VmHandle<P>, PoolError>> + Send;
 
+    /// Stop a VM, and **answer whether it is stopped**.
+    ///
+    /// `Ok(())` is a claim about the world rather than about the call: that VM
+    /// is not running. A VM that was already gone satisfies it — that is the
+    /// ordinary case for a `--rm` container whose workload exited — and so
+    /// does one this call killed. Anything else, including a failure to ask at
+    /// all, is an `Err`; [`PoolError::StopFailed`] is the variant for "asked
+    /// and could not confirm".
+    ///
+    /// An implementation must not swallow a failure into `Ok(())`. That is not
+    /// a style rule, it is a consequence: [`Pool::reclaim_carried_over`] and
+    /// [`Pool::deallocate`] both forget an id **only** on a verdict, so a
+    /// runtime that always answers `Ok` drops every id from the ledger after
+    /// one attempt and reduces orphan recovery to one shot per VM whether or
+    /// not the VM died (#950).
     fn stop(&self, vm_id: &VmId) -> impl Future<Output = Result<(), PoolError>> + Send;
 }
 
@@ -274,6 +321,12 @@ impl<P: AppProtocol> VmRuntime<P> for ContainerRuntime {
         })
     }
 
+    /// See [`VmRuntime::stop`] for the contract. Exit 0 is the CLI's word that
+    /// the container is stopped; a non-zero exit whose output says there is no
+    /// such container is the same claim by a different route; everything else
+    /// — including a `container` binary that could not be spawned at all — is
+    /// [`PoolError::StopFailed`], and the id stays in the ledger for a boot
+    /// that can do something about it.
     async fn stop(&self, vm_id: &VmId) -> Result<(), PoolError> {
         self.transports.write().await.remove(vm_id);
 
@@ -286,18 +339,133 @@ impl<P: AppProtocol> VmRuntime<P> for ContainerRuntime {
         match output {
             Ok(o) if o.status.success() => {
                 info!(%vm_id, "container stopped");
+                Ok(())
             }
             Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                debug!(%vm_id, %stderr, "container stop returned non-zero (may already be gone)");
+                // Both streams: which one an error lands on is the CLI's
+                // choice, not a contract.
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stderr),
+                    String::from_utf8_lossy(&o.stdout)
+                );
+                if reads_as_already_gone(&said) {
+                    debug!(%vm_id, "container was already gone");
+                    return Ok(());
+                }
+                let detail = one_line(&said);
+                warn!(
+                    %vm_id,
+                    status = ?o.status.code(),
+                    said = %detail,
+                    "`container stop` failed in a way this build cannot read as \
+                     already-gone; keeping the VM in the ledger. If this text means \
+                     the container is gone, add it to ALREADY_GONE in \
+                     crates/vm-pool/pool/src/lib.rs"
+                );
+                Err(PoolError::StopFailed {
+                    vm_id: vm_id.clone(),
+                    detail,
+                })
             }
             Err(e) => {
                 warn!(%vm_id, error = %e, "failed to run container stop");
+                Err(PoolError::StopFailed {
+                    vm_id: vm_id.clone(),
+                    detail: format!("could not run `container stop`: {e}"),
+                })
             }
         }
-
-        Ok(())
     }
+}
+
+/// Ways a container CLI says *the container* is not there, matched after
+/// [`squash`].
+///
+/// **Every entry names the container as its subject.** A message that the
+/// *runtime* is not running is a failure to ask, and it is the worst thing to
+/// read as an answer: nothing can be stopped until the runtime is back, so
+/// those ids are precisely the ones worth keeping for a boot that can stop
+/// them. Hence `containerisnotrunning` and not `isnotrunning`, which "the
+/// container runtime is not running" satisfies; and no `nocontainer` entry,
+/// which "no container runtime configured" satisfies.
+///
+/// `notfound` keeps a residual collision with a runtime reporting its own
+/// missing socket, and it stays: it is the likeliest real wording, and a list
+/// without it leaves the common case retrying forever. [`NOT_AN_ANSWER`] is
+/// what closes that collision from the other end.
+const ALREADY_GONE: &[&str] = &[
+    "notfound",
+    "nosuchcontainer",
+    "nosuchvm",
+    "containerdoesnotexist",
+    "containerisnotrunning",
+    "containeralreadystopped",
+    "isnotrunning",
+];
+
+/// Ways a runtime says *it* is not available, which is never an answer about
+/// a container.
+///
+/// Consulted **before** [`ALREADY_GONE`] and overriding it, which is what
+/// makes the subject rule hold for the one entry that could not be shaped to
+/// obey it: "cannot connect to the container daemon: socket not found" says
+/// nothing whatever about the VM, and reading it as gone drops the only
+/// record that the VM exists.
+const NOT_AN_ANSWER: &[&str] = &[
+    "containerruntime",
+    "daemon",
+    "socket",
+    "connectionrefused",
+    "cannotconnect",
+    "couldnotconnect",
+    "nosuchfileordirectory",
+];
+
+/// Lowercase, keeping only alphanumerics.
+///
+/// This is what lets one [`ALREADY_GONE`] entry cover a CLI's several
+/// spellings of one condition — `notFound`, `not found`, `not_found`,
+/// `NotFound:` — and what makes a message reflowed across lines still match.
+fn squash(said: &str) -> String {
+    said.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether what the CLI printed means the container was already gone.
+///
+/// Pure, so the one line of this fix that only macOS runs is nonetheless
+/// unit-tested everywhere. **An answer this build cannot classify is a
+/// failure**, and the asymmetry is deliberate: a wrong failure costs one CLI
+/// call and one log line per boot and announces itself, while a wrong success
+/// is the silent leak #950 is about.
+fn reads_as_already_gone(said: &str) -> bool {
+    let squashed = squash(said);
+    if NOT_AN_ANSWER.iter().any(|n| squashed.contains(n)) {
+        return false;
+    }
+    ALREADY_GONE.iter().any(|n| squashed.contains(n))
+}
+
+/// Bound on what one of these details may be.
+const DETAIL_MAX: usize = 400;
+
+/// What the runtime said, on one bounded line.
+///
+/// The text goes into a log field *and* into a [`PoolError::StopFailed`] its
+/// own callers format again, so command output is treated as untrusted in
+/// shape if not in origin: whitespace collapsed, capped, and cut on a char
+/// boundary so a multi-byte answer cannot panic the daemon that is trying to
+/// report it.
+fn one_line(said: &str) -> String {
+    let collapsed = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= DETAIL_MAX {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(DETAIL_MAX).collect();
+    format!("{cut}…")
 }
 
 /// A runtime that uses the supervisor binary directly (no container).
@@ -669,15 +837,21 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
     /// they are the predecessor's, and the only thing wanted from them is that
     /// they stop.
     ///
-    /// **Single-shot against [`ContainerRuntime`]**, whose `stop` returns
-    /// `Ok(())` whether or not the container died. So an id here is forgotten
-    /// after *one* attempt: the honest sentence is "the successor asked the
-    /// runtime to stop it", not "it is stopped". An id whose `stop` reports
-    /// `Err` is kept in the ledger for the next boot — the retry mechanism for
-    /// a runtime that can report failure, which this one cannot. What *is*
-    /// recoverable everywhere is an interrupted reclaim: each forget persists
-    /// the remainder, so a daemon that dies partway through this loop hands
-    /// what it did not reach to the next one.
+    /// An id is forgotten **only on a verdict** ([`VmRuntime::stop`] returning
+    /// `Ok`), so one whose stop could not be confirmed is carried to the next
+    /// boot and asked again — which is what makes recovery a retry rather than
+    /// one shot per VM (#950). What that costs is one `container stop` per
+    /// stuck id per boot, forever: a stuck id is kept rather than aged out,
+    /// because the alternative is dropping the only record that a VM exists.
+    ///
+    /// A *reported* success is still the runtime's word. `ContainerRuntime`
+    /// trusts exit 0 and nothing here verifies the container died, so on that
+    /// path the honest verb remains "asked the runtime to stop it".
+    ///
+    /// Independently of either, an **interrupted** reclaim is recoverable on
+    /// every runtime: each forget persists the remainder, so a daemon that
+    /// dies partway through this loop hands what it did not reach to the next
+    /// one.
     pub async fn reclaim_carried_over(&self, carried: Vec<VmId>) {
         if carried.is_empty() {
             return;
@@ -686,6 +860,15 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
             count = carried.len(),
             "the last pool on this socket left VMs running; asking the runtime to stop them"
         );
+        // Collected rather than logged per id. The realistic failure of the
+        // already-gone classification is that it is too *narrow*, at which
+        // point every teardown keeps its id and this loop is as long as every
+        // VM ever allocated — one line each is a diagnosis at three and a wall
+        // of noise at three hundred, and "loud" would stop being true exactly
+        // when it matters most. Formatting over what the loop already holds:
+        // no bookkeeping is added.
+        let mut kept = 0usize;
+        let mut said: Vec<String> = Vec::new();
         for vm_id in carried {
             match self.runtime.stop(&vm_id).await {
                 Ok(()) => {
@@ -693,14 +876,24 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
                     self.state.ledger.forget(&vm_id).await;
                 }
                 Err(e) => {
-                    warn!(
-                        %vm_id,
-                        error = %e,
-                        "could not stop a VM left by the previous pool; keeping it in the \
-                         ledger for the next boot"
-                    );
+                    kept += 1;
+                    let detail = match &e {
+                        PoolError::StopFailed { detail, .. } => detail.clone(),
+                        other => other.to_string(),
+                    };
+                    if !said.contains(&detail) {
+                        said.push(detail);
+                    }
                 }
             }
+        }
+        if kept > 0 {
+            warn!(
+                kept,
+                said = said.join(" | "),
+                "could not stop {kept} VM(s) left by the previous pool; keeping them in \
+                 the ledger to ask again at the next boot"
+            );
         }
     }
 
@@ -796,14 +989,30 @@ impl<R: VmRuntime<P>, P: AppProtocol> Pool<R, P> {
             })
             .await;
 
-        if let Err(e) = self.runtime.stop(vm_id).await {
+        // The verdict decides the ledger, never the return: a teardown that
+        // could not be confirmed still frees *this pool's* slot — that is its
+        // own accounting, and a caller must not be made to fail over it — while
+        // the ledger entry is a claim about a container somebody may still have
+        // to stop. Two different questions, and forgetting unconditionally
+        // answered the second with the first.
+        let stopped = self.runtime.stop(vm_id).await;
+        if let Err(e) = &stopped {
             warn!(%vm_id, error = %e, "failed to stop VM via runtime");
         }
 
         drop(entry);
 
-        // The only place a VM leaves the ledger through this pool's own work.
-        self.state.ledger.forget(vm_id).await;
+        // Where a VM leaves the ledger through this pool's own work — on a
+        // confirmed stop only. (The other exit is `allocate`'s failure path,
+        // where the VM never started.)
+        match stopped {
+            Ok(()) => self.state.ledger.forget(vm_id).await,
+            Err(_) => warn!(
+                %vm_id,
+                "keeping this VM in the ledger: its stop could not be confirmed, so the \
+                 next daemon on this socket asks again"
+            ),
+        }
 
         self.state
             .events
@@ -1158,6 +1367,13 @@ mod tests {
 
         fn fail_stop_for(&self, vm_id: &VmId) {
             self.inner.failing.lock().unwrap().insert(vm_id.clone());
+        }
+
+        /// Let a previously-refused id stop — a container that was still
+        /// there at the last boot and is answerable at this one, which is the
+        /// whole point of carrying it.
+        fn allow_stop_for(&self, vm_id: &VmId) {
+            self.inner.failing.lock().unwrap().remove(vm_id);
         }
 
         /// End a VM's event stream without any deallocate — a VM dying on its
@@ -1772,8 +1988,8 @@ mod tests {
     }
 
     /// Carried VMs are the predecessor's. They are stopped, they consume no
-    /// slot, and — against a runtime whose `stop` reports success — they are
-    /// forgotten after that *one* attempt.
+    /// slot, and — on a runtime's verdict that they stopped — they are
+    /// forgotten.
     #[tokio::test]
     async fn carried_vms_are_stopped_consume_no_slot_and_are_forgotten() {
         let dir = tempfile::tempdir().unwrap();
@@ -1813,11 +2029,9 @@ mod tests {
         assert!(second.ledger_outstanding().await.is_empty());
     }
 
-    /// The retry mechanism, for a runtime that can report failure.
-    /// [`ContainerRuntime`] is **not** such a runtime — its `stop` returns
-    /// `Ok(())` whether or not the container died — so nothing here claims
-    /// this fires in production. The branch is ready if `stop` ever gets a
-    /// verdict.
+    /// The retry mechanism: an id whose stop could not be confirmed is kept.
+    /// [`ContainerRuntime`] now reports such a failure rather than swallowing
+    /// it, so this is the production path and not a branch waiting for one.
     #[tokio::test]
     async fn an_id_whose_stop_reports_failure_stays_in_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
@@ -1845,6 +2059,170 @@ mod tests {
         let (third, _) = recording_pool(2);
         assert_eq!(third.adopt_ledger(dir.path(), &socket).await, vec![a]);
         assert_ne!(b, VmId::new(""));
+    }
+
+    /// What #950 bought, stated as the behaviour that did not exist before:
+    /// an id whose stop could not be confirmed is asked again at the *next*
+    /// boot, and the one after that, until a runtime answers — rather than
+    /// being dropped from the only record of its existence after one try.
+    ///
+    /// Four boots: recorded, refused-and-kept, asked-again-and-retired,
+    /// nothing left.
+    #[tokio::test]
+    async fn a_carried_id_that_failed_to_stop_is_asked_again_at_the_next_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vm-pool.sock");
+
+        let (first, _) = recording_pool(1);
+        first.adopt_ledger(dir.path(), &socket).await;
+        let a = first
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        drop(first);
+
+        // Boot two: the runtime refuses, so the id is kept.
+        let (second, refusing) = recording_pool(1);
+        refusing.fail_stop_for(&a);
+        let carried = second.adopt_ledger(dir.path(), &socket).await;
+        assert_eq!(carried, vec![a.clone()]);
+        second.reclaim_carried_over(carried).await;
+        assert_eq!(second.ledger_outstanding().await, vec![a.clone()]);
+        drop(second);
+
+        // Boot three: asked *again* — this is the retry — and this time the
+        // runtime answers, so it is retired.
+        let (third, answering) = recording_pool(1);
+        answering.allow_stop_for(&a);
+        let carried = third.adopt_ledger(dir.path(), &socket).await;
+        assert_eq!(carried, vec![a.clone()], "the id survived to a second boot");
+        third.reclaim_carried_over(carried).await;
+        assert_eq!(answering.stopped(), vec![a.clone()]);
+        assert!(third.ledger_outstanding().await.is_empty());
+        drop(third);
+
+        // Boot four: nothing left to carry — the negative half, without which
+        // "kept forever" and "retried until stopped" look the same.
+        let (fourth, _) = recording_pool(1);
+        assert!(fourth.adopt_ledger(dir.path(), &socket).await.is_empty());
+    }
+
+    /// The half of the fix that is easy to miss: an ordinary teardown whose
+    /// stop could not be confirmed frees this pool's slot and still returns
+    /// `Ok(())` — the caller must not be made to fail over a teardown — while
+    /// keeping the ledger entry, because those are different questions.
+    #[tokio::test]
+    async fn a_deallocate_whose_stop_fails_frees_the_slot_and_keeps_the_ledger_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vm-pool.sock");
+
+        let (pool, runtime) = recording_pool(1);
+        pool.adopt_ledger(dir.path(), &socket).await;
+        let a = pool
+            .allocate(ImageRef::new("agent", "v1"), VmConfig::default())
+            .await
+            .unwrap();
+        runtime.fail_stop_for(&a);
+
+        pool.deallocate(&a).await.expect("a teardown never fails");
+        assert_eq!(pool.status().await.available, 1, "the slot is this pool's");
+        assert_eq!(pool.ledger_outstanding().await, vec![a.clone()]);
+        drop(pool);
+
+        // And the next daemon carries it, which is what keeping it was for.
+        let (next, _) = recording_pool(1);
+        assert_eq!(next.adopt_ledger(dir.path(), &socket).await, vec![a]);
+    }
+
+    /// The classification is the one line only macOS runs, so it is a pure
+    /// function and tested everywhere. `squash` is what makes one entry cover
+    /// a CLI's several spellings of one condition.
+    #[test]
+    fn the_ways_a_cli_says_there_is_no_such_container_all_read_as_gone() {
+        for said in [
+            "Error: not found",
+            "no such container: vm-1",
+            "NotFound: vm-1",
+            "not_found",
+            "no such vm: vm-1",
+            "container is not running",
+            "container\n  not\n  found",
+        ] {
+            assert!(reads_as_already_gone(said), "should read as gone: {said:?}");
+        }
+    }
+
+    /// The asymmetry, pinned: an answer this build cannot classify is a
+    /// **failure**, because a wrong failure costs one CLI call and one log
+    /// line per boot while a wrong success is the silent leak #950 is about.
+    #[test]
+    fn an_answer_this_build_cannot_classify_is_a_failure() {
+        for said in [
+            "Error: permission denied",
+            "internal error: 500",
+            "",
+            "container stop: unexpected end of JSON input",
+        ] {
+            assert!(
+                !reads_as_already_gone(said),
+                "should not read as gone: {said:?}"
+            );
+        }
+    }
+
+    /// The subject rule, in both directions: a message that the *runtime* is
+    /// down is a failure to ask, never an answer about the container — and
+    /// those ids are precisely the ones worth keeping, since nothing can be
+    /// stopped until the runtime is back. `notfound` keeps its residual
+    /// collision, and [`NOT_AN_ANSWER`] is what closes it.
+    #[test]
+    fn a_runtime_that_is_not_running_is_not_an_answer_about_the_container() {
+        for said in [
+            "cannot connect to the container runtime",
+            "the container runtime is not running",
+            "dial unix /var/run/container.sock: connect: connection refused",
+            "Error: socket not found",
+            "container daemon: no such file or directory",
+        ] {
+            assert!(
+                !reads_as_already_gone(said),
+                "should not read as gone: {said:?}"
+            );
+        }
+        // The negative half: a plain "not found" *about a container* still
+        // reads as gone, or the common case retries forever.
+        assert!(reads_as_already_gone("Error: vm-1 not found"));
+
+        // And the cost of the deny list, stated rather than hidden: a message
+        // that names the daemon reads as a failure *even when it also says
+        // there is no such container*. That direction is chosen — it costs one
+        // `container stop` and one line per boot, and it announces itself —
+        // where the other silently drops the record that a VM exists.
+        assert!(!reads_as_already_gone(
+            "Error response from daemon: no such container: vm-1"
+        ));
+    }
+
+    /// The detail goes into a log field and into a `StopFailed` its callers
+    /// format again, so it is collapsed, bounded, and cut on a char boundary
+    /// — the multi-byte case is why the cut is by chars and not by bytes.
+    #[test]
+    fn what_the_runtime_said_is_reported_on_one_bounded_line() {
+        assert_eq!(one_line("  a\n  b \t c  "), "a b c");
+
+        let long = "x".repeat(DETAIL_MAX * 2);
+        let cut = one_line(&long);
+        assert_eq!(
+            cut.chars().count(),
+            DETAIL_MAX + 1,
+            "capped, plus the ellipsis"
+        );
+        assert!(cut.ends_with('…'));
+
+        // Multi-byte, so a naive byte slice would panic rather than truncate.
+        let wide = "é".repeat(DETAIL_MAX * 2);
+        let cut = one_line(&wide);
+        assert_eq!(cut.chars().count(), DETAIL_MAX + 1);
     }
 
     /// Required item (1), end to end: a daemon that dies partway through the

@@ -271,19 +271,43 @@ whitespace read as unset, which is a different thing from wrong.
   `Pool::reclaim_carried_over` (stops) are two calls for the same reason, and
   the first sits on the impl block *without* the `VmRuntime` bound so the split
   is in the types and not only in the prose.
-- **Orphan recovery against `ContainerRuntime` is single-shot; an interrupted
-  reclaim is not.** `ContainerRuntime::stop` returns `Ok(())` whether or not
-  `container stop` succeeded — it `warn!`s a spawn error and `debug!`s a
-  non-zero exit — and changing that contract was out of scope. So the honest
-  sentence is "the successor asked the runtime to stop it", never "it is
-  stopped", and that is the sentence used at every site rather than a footnote.
-  An id whose `stop` reports `Err` is kept for the next boot; that branch is
-  implemented and tested, and it is what starts working for free if `stop` ever
-  gets a verdict. What *is* recoverable on every runtime is a reclaim
-  interrupted partway through, and only because `enable` **seeds** the
-  in-memory set with the carried ids — without that, the first `record` or
-  `forget` rewrites the file from an empty set and erases every carried id at
-  once, stopped or not.
+- **`VmRuntime::stop` answers a question, and the ledger keys on the answer.**
+  `Ok(())` is a claim about the world rather than about the call — that VM is
+  not running, which a VM that was already gone satisfies — and anything else,
+  including a failure to ask, is `Err`. Both `reclaim_carried_over` and
+  `deallocate` forget an id **only on the claim**, so a stop that could not be
+  confirmed is carried to the next boot and asked again; a runtime that
+  swallows failures into `Ok` reduces orphan recovery to one shot per VM
+  whether or not the VM died (#950). The contract is on the *trait*, so any
+  future runtime gets retry-across-boots by returning an error it already
+  knows about; `NoRuntime` and `SupervisorRuntime` are single-shot by nature
+  rather than by defect, since their stops genuinely cannot fail. What is
+  still not promised is that a reported success is *true*: `ContainerRuntime`
+  trusts `container stop`'s exit 0, so on that path the honest verb remains
+  "asked the runtime to stop it". A stuck id is therefore kept forever, at one
+  stop and one warn per boot — the behaviour, not a leak, since the
+  alternative is dropping the only record that a VM exists. What *is*
+  recoverable on every runtime is a reclaim interrupted partway through, and
+  only because `enable` **seeds** the in-memory set with the carried ids —
+  without that, the first `record` or `forget` rewrites the file from an empty
+  set and erases every carried id at once, stopped or not.
+- **A failed `stop` does not fail a `deallocate`.** Freeing the slot is this
+  pool's own accounting and the ledger entry is a claim about a container:
+  different questions, and forgetting unconditionally answered the second with
+  the first. `deallocate` still returns `Ok(())` — a caller must not be made to
+  fail over a teardown — and keeps the id.
+- **Deciding "already gone" is `ContainerRuntime`'s alone, and it is pure.**
+  `reads_as_already_gone` matches a squashed (lowercased, alphanumeric-only)
+  form of what the CLI printed on both streams, so one needle covers
+  `notFound` / `not found` / `NOT_FOUND` and a message reflowed across lines.
+  Every `ALREADY_GONE` entry names the **container** as its subject and
+  `NOT_AN_ANSWER` is consulted first, because a message that the *runtime* is
+  down is a failure to ask — and those ids are precisely the ones worth
+  keeping. An answer this build cannot classify is a **failure**: a wrong
+  failure costs one CLI call and one log line per boot and announces itself, a
+  wrong success is the silent leak. apple/container is macOS-only, so this is
+  a guess made from the shapes CLIs use, unit-tested everywhere and
+  instrumented to name the constant to extend.
 - **A ledger, not `container ls`.** Two independent reasons, either fatal. VM
   names carry no daemon identity (`vm-<micros>-<counter>`), and pointing a
   second pool at another `VM_POOL_SOCKET` is a configuration
