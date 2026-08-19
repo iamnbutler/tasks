@@ -25,6 +25,9 @@ pub mod images;
 mod migrations;
 pub mod orchestrator;
 pub mod pidfile;
+/// Whether vm-pool has a slot to give, and whether dispatch should wait for
+/// one (#967).
+pub mod pool_health;
 pub mod reattach;
 pub mod redact;
 pub mod reload;

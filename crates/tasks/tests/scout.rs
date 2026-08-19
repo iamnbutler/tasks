@@ -274,6 +274,157 @@ async fn scout_dispatch_failure_resets_task_to_new() {
     );
 }
 
+/// #930 and #967 together, end to end and over a real socket: a Scout refused
+/// a VM by a full pool is **not charged** a dispatch attempt, and its task is
+/// **not left in `Scouting`**.
+///
+/// A pool of one slot with the slot already taken produces a real `pool
+/// exhausted` from a real vm-pool, so the kind under test is the one the
+/// service actually sends rather than one constructed here.
+///
+/// The second half is the unwind's own negative: the task really is back in
+/// `Queued`, which is the only state `run::next_dispatchable` will pick up.
+/// Note what it does **not** show — the dispatcher re-dispatching by itself.
+/// Nothing in production re-dispatches a task sitting in `Scouting`, and this
+/// test calls `Scout::dispatch` directly; what it demonstrates is that the
+/// refusal cost the task neither an attempt nor its place in the queue.
+#[tokio::test]
+async fn a_scout_refused_by_a_full_pool_keeps_its_attempts_and_its_place_in_the_queue() {
+    use tasks::protocol::FailureClass;
+    use tasks::store::Strike;
+
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let repo_url = format!("file://{}", repo.display());
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper = write_supervisor_wrapper(
+        tmp.path(),
+        &supervisor_bin,
+        stub_agent_path().to_str().unwrap(),
+        &workdir_root,
+    )
+    .await;
+
+    // One slot, and something else is holding it.
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 1).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+    let occupant = client
+        .handle()
+        .allocate("agent:v1", VmConfig::default())
+        .await
+        .expect("the first allocation gets the only slot");
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "Refused", "The pool is full").await;
+
+    let scout_config = ScoutConfig {
+        image: "agent:v1".into(),
+        vm_config: VmConfig::default(),
+        timeout: Duration::from_secs(300),
+        leases: None,
+    };
+    let target = ScoutTarget {
+        source: tasks::broker::CloneSource::Direct(repo_url),
+        base_branch: "main".into(),
+    };
+    let scout = Scout::new(store.clone(), client.handle(), scout_config);
+
+    let err = scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("a full pool refuses");
+    assert_eq!(
+        err.failure_class(),
+        FailureClass::Transport,
+        "a full pool judged nothing: {err}"
+    );
+    assert_eq!(Strike::for_class(err.failure_class()), Strike::Waive);
+
+    // Nothing was started, so there is nothing to conclude: no session row, no
+    // spec — and the task is back where the dispatcher can see it (#967),
+    // rather than stranded in `Scouting` until the next boot.
+    assert!(store.list_sessions().await.unwrap().is_empty());
+    assert!(store.list_specs().await.unwrap().is_empty());
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Queued);
+    assert_eq!(stored.dispatch_attempts, 0);
+
+    // The other half, over the same socket: hand the slot back and the same
+    // task scouts to a spec. The refusal was about the moment, not the work.
+    client.handle().deallocate(&occupant).await.unwrap();
+    let spec = scout
+        .dispatch(stored, &target)
+        .await
+        .expect("the same task, once there is room");
+    assert!(spec.content.contains("## Spec"), "{}", spec.content);
+    let after = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(after.state, TaskState::InReview);
+    assert_eq!(after.dispatch_attempts, 0);
+}
+
+/// The unwind on its own, against a pool that can never allocate
+/// (`max_vms: 0`), because the gate makes the refusal rare rather than
+/// impossible: a slot can go between the probe and the allocation, and the
+/// probe interval is five seconds wide. This is what makes losing that race
+/// cost a tick instead of a restart.
+#[tokio::test]
+async fn a_refused_dispatch_returns_its_task_to_the_queue() {
+    let supervisor_bin = workspace_bin("scout-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path(), "fixture-repo").await;
+    let workdir_root = tmp.path().join("scout-workdirs");
+    tokio::fs::create_dir_all(&workdir_root).await.unwrap();
+    let wrapper =
+        write_supervisor_wrapper(tmp.path(), &supervisor_bin, "true", &workdir_root).await;
+    let (_service, socket) = spawn_vm_pool(tmp.path(), &wrapper, 0).await;
+    let client: Client<TasksProtocol> = Client::connect(&socket).await.unwrap();
+
+    let store = Arc::new(Store::open(tmp.path().join("tasks.db")).await.unwrap());
+    let (_project, task) = insert_project_and_task(&store, "No room", "Ever").await;
+
+    let scout = Scout::new(
+        store.clone(),
+        client.handle(),
+        ScoutConfig {
+            image: "agent:v1".into(),
+            vm_config: VmConfig::default(),
+            timeout: Duration::from_secs(300),
+            leases: None,
+        },
+    );
+    let target = ScoutTarget {
+        source: tasks::broker::CloneSource::Direct(format!("file://{}", repo.display())),
+        base_branch: "main".into(),
+    };
+    scout
+        .dispatch(task.clone(), &target)
+        .await
+        .expect_err("a pool of zero refuses every allocate");
+
+    let stored = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TaskState::Queued,
+        "a scout that never started must not leave its task in Scouting"
+    );
+    // And the transition is on the feed, so the unwind is legible rather than
+    // a state that silently changed under a reader.
+    let events = store.all_events().await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.payload,
+            tasks::events::EventPayload::TaskStateChanged {
+                from: TaskState::Scouting,
+                to: TaskState::Queued,
+                ..
+            }
+        )),
+        "the unwind logs its own transition"
+    );
+}
+
 /// #760: a task re-dispatched after `needs_revision` must receive the
 /// reviewer's feedback and the spec it referred to.
 ///

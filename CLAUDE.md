@@ -597,6 +597,56 @@ implementation.
   blocking dispatch on a signal that may never arrive. It is narrower than it
   looks, since a boot takes `TASKS_DEFAULT_MODE` (`pause`) and the path that
   carries `play` over is `tasks reload`, a deliberate human act.
+- **A full pool is a property of the moment, so it costs no strike and starts
+  no retry loop — and those are two mechanisms, not one.** A Scout refused a VM
+  used to be charged a dispatch attempt *and* left in `Scouting`: `dispatch`
+  claims the task before it allocates, the `?` on `allocate` returns before any
+  session row exists, so `finalize_failed` — the only path back to `Queued` —
+  never ran, and `next_dispatchable` (which reads only `Queued`) could not see
+  the task again until the next boot's `reconcile_orphaned_work`. Three busy
+  moments therefore rejected a task nothing had judged (#930), and a single one
+  cost a task a restart (#967); on the morning of 2026-08-19 a host whose
+  container runtime was down charged twelve tasks an attempt each and stranded
+  every one of them. The **strike** half reads a *field*: vm-pool's
+  `ServiceEvent::Error` now carries a `ServiceErrorKind` (protocol revision 2,
+  `#[serde(default)]`, unknown values decaying rather than failing the decode —
+  an undecodable error response is never delivered, which turns a refusal into
+  a hang), `ClientError::Service` carries it, and
+  `FailureClass::for_service_error` states the reading once for both
+  dispatchers. Only `Capacity` is waived, because the line is **whether the
+  condition clears by itself**; `Image` and every other kind stays charged, and
+  so does `Unspecified` — which is what a vm-pool older than the field says, and
+  it is the routine case, so a waiver there would silently spare every permanent
+  misconfiguration on every old daemon. That the fix is inert until the pool is
+  restarted is said out loud once per connect (`run::report_error_kinds`) rather
+  than discovered in a rejected task, and `ERROR_KIND_PROTOCOL_VERSION`
+  deliberately **gates nothing**: an added *field* needs no gate (its absence is
+  an answer every reader handles), where an added *command* does, because an old
+  service rejects the line at decode time. The **stranding** half is
+  `Scout::start` as the boundary — one `match` in `dispatch` undoes the
+  `Scouting` claim on every pre-session failure, reading the state back so it
+  can only undo its own change, best-effort so a bookkeeping error cannot
+  replace the error being reported, and writing no `Note` because
+  `record_outcome` already writes one. Neither half works alone, and the
+  asymmetry is the point: waiving the strike *removes the backstop* that
+  bounded the retry, so `pool_health::PoolHealth` — the third dispatch hold,
+  beside `github_hold` and `UpdateWatch`, at the same two gates — is **mandatory
+  rather than preferable**, or the requeue becomes a 500 ms loop against a pool
+  that stays full. Its evidence is a `status` round trip and **never** a
+  classified refusal: `available` is the exact quantity `Pool::allocate` checks,
+  this codebase does not decide on reason text, and a refusal-driven record
+  would want a successful allocation as its clearing signal — which is the one
+  thing a hold prevents. `probe_due` claims the slot, so the two gates share one
+  round trip *and* exactly one of two racing callers writes the edge `Note`;
+  announcing off the `hold` predicate instead would be a `Note` per loop per
+  tick, which is the flood the whole change exists to prevent one level up.
+  Nothing observed never holds, an unreadable `status` touches nothing, and an
+  unrefreshed record expires. `0 of N` is reported rather than "full", because
+  `0 of 0` is a `VM_POOL_MAX_VMS` that can never dispatch and `0 of 6` is work
+  or a leak holding every slot. The gate makes the unwind rare, not
+  unnecessary — a slot can go between the probe and the allocation — which is
+  why both are tested, and disabling either alone produces a different named
+  failure.
 - **A build is whichever tip the reconciliation chooses, and the head is read
   out of the bundle — in that order.** `git rev-parse HEAD` and
   `refs/heads/<branch>` are the same commit only while HEAD stays symbolically
@@ -1060,8 +1110,9 @@ reserve ≈22 GB.
 So the recommended ceiling against the default pool is **`SCOUT_MAX_CONCURRENT
 = 3`** — 4 of 6 slots, two spare. 4 scouts is 5 of 6 and 5 is 6 of 6, where a
 single leaked VM (one whose owner died between allocate and deallocate, held
-until its own event stream ends) exhausts the pool and every dispatch is
-refused. To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check
+until its own event stream ends) exhausts the pool and dispatch waits (see the
+capacity-hold rule above: it is a wait rather than a refusal, and it costs no
+attempt — but nothing dispatches for as long as the leak lasts). To go higher, raise `VM_POOL_MAX_VMS`, restart the *pool*, and check
 the memory ledger first.
 
 **Two leaks eat slots, and they need two mechanisms — neither of which is the
@@ -1083,11 +1134,20 @@ data dir, deliberately not `/tmp`, which a reboot may clear) keyed by socket
 path. The ledger is read and discharged strictly **between the bind and the
 accept loop** — never at construction, where a second pool started against a
 live one would kill that pool's in-flight scouts and Builder and then exit on
-`AlreadyRunning`. Two limits are stated rather than implied. Against
-`ContainerRuntime`, whose `stop` returns `Ok(())` whether or not the container
-died, orphan recovery is **single-shot**: the true sentence is "the successor
-asked the runtime to stop it", not "it is stopped". What *is* recoverable on
-every runtime is an **interrupted** reclaim, because the ledger seeds its
+`AlreadyRunning`. Two limits are stated rather than implied, and only
+one of them has moved. A stop that is **refused** is now retried across boots:
+`VmRuntime::stop` answers a question — `Ok(())` claims the VM is not running,
+anything else declines to claim it — and both `reclaim_carried_over` and
+`deallocate` forget an id only on the claim, so an unconfirmed stop is carried
+to the next daemon and asked again (#950; before it, `ContainerRuntime::stop`
+returned `Ok(())` whether or not `container stop` worked, so the `Err` branch
+was unreachable in production and recovery was single-shot). A stop that
+**succeeds** is still the CLI's word: nothing verifies the container died, so
+the honest sentence there remains "the successor asked the runtime to stop it".
+The cost of the retry is one stop and one warn per stuck id per boot, forever,
+which is the behaviour rather than a leak — the alternative is dropping the
+only record that a VM exists. What *is* recoverable on every runtime, untouched
+by any of this, is an **interrupted** reclaim, because the ledger seeds its
 in-memory set at read time and persists the remainder after each stop — so a
 daemon that dies partway through hands the rest to the next one.
 

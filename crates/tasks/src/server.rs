@@ -180,6 +180,11 @@ pub struct Services {
     /// The update watch the two dispatchers consult. Absent for the same
     /// reason as `github_health`: a router with no dispatchers holds nothing.
     pub updates: Option<Arc<crate::updates::UpdateWatch>>,
+    /// The vm-pool capacity record the two dispatchers write and read. Absent
+    /// for the same reason again — and, unlike the other two, it is only ever
+    /// written by a gate, so a router with no dispatchers behind it would have
+    /// nothing to report even if it held one.
+    pub pool_health: Option<Arc<crate::pool_health::PoolHealth>>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -216,6 +221,12 @@ impl FromRef<AppState> for Option<Arc<GitHubHealth>> {
 impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.updates.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.pool_health.clone()
     }
 }
 
@@ -3152,6 +3163,7 @@ async fn get_status(
     State(store): State<Arc<Store>>,
     State(github_health): State<Option<Arc<GitHubHealth>>>,
     State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
+    State(pool_health): State<Option<Arc<crate::pool_health::PoolHealth>>>,
 ) -> ApiResult<Json<ServerStatus>> {
     // Through the same watch the dispatchers consult, so `/status` cannot
     // claim a hold they are not honouring.
@@ -3181,6 +3193,14 @@ async fn get_status(
                 error: outage.error,
             }),
         update,
+        // The third hold, read through the same predicate the gates use. It is
+        // deliberately *not* probed here: a status request must not make a
+        // round trip to another daemon, and the gates refresh the record every
+        // few seconds anyway — the staleness window is what keeps this honest
+        // if they stop.
+        pool: pool_health
+            .and_then(|health| health.hold(Utc::now()))
+            .map(|run| run.to_hold()),
     }))
 }
 

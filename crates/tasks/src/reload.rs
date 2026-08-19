@@ -1365,6 +1365,7 @@ pub fn render_status(
             out.push_str(&format!("mode     {}\n", status.mode.as_str()));
             out.push_str(&render_github_hold(status, now));
             out.push_str(&render_update_pending(status));
+            out.push_str(&render_pool_hold(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -1416,6 +1417,27 @@ pub fn render_update_pending(status: &ServerStatus) -> String {
         out.push_str(&format!("         {reason}\n"));
     }
     out
+}
+
+/// Why the pipeline is idle, when the reason is that vm-pool has no room.
+///
+/// Silent with no hold, for the same reason as the two lines above it. It
+/// prints `0 of N` rather than "full", because `0 of 0` is a `VM_POOL_MAX_VMS`
+/// that can never dispatch anything and `0 of 6` is work — or a leak — holding
+/// every slot, and those want different actions from the reader.
+pub fn render_pool_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(hold) = &status.pool else {
+        return String::new();
+    };
+    format!(
+        "vm-pool  0 of {} slots free for {} ({} observation(s), last {} ago) — scout \
+         and build dispatch waits for one; queued work stays queued and nothing is \
+         charged an attempt\n",
+        hold.total,
+        humanize(now - hold.since),
+        hold.observations,
+        humanize(now - hold.last_seen),
+    )
 }
 
 /// What the VM images are running, and whether that is a problem.
@@ -1574,6 +1596,7 @@ mod tests {
             images: Vec::new(),
             github: None,
             update: None,
+            pool: None,
         }
     }
 
@@ -1662,6 +1685,42 @@ mod tests {
                 ts("2026-08-15T13:00:00Z")
             )
             .contains("dispatch is held")
+        );
+    }
+
+    /// The third hold reports like the other two: silent until it binds, and
+    /// when it binds it answers "why is nothing dispatching" and "is work
+    /// being lost". `0 of N` and not "full" — a pool of zero can never
+    /// dispatch and wants a different fix from a pool that is merely busy.
+    #[test]
+    fn a_full_pool_says_how_full_and_what_it_costs() {
+        use tasks_api::http::PoolHold;
+
+        let mut status = status_with(InFlight::default());
+        assert_eq!(render_pool_hold(&status, ts("2026-08-15T13:00:00Z")), "");
+
+        status.pool = Some(PoolHold {
+            since: ts("2026-08-15T12:48:00Z"),
+            last_seen: ts("2026-08-15T12:59:30Z"),
+            observations: 138,
+            total: 6,
+        });
+        let line = render_pool_hold(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("0 of 6"), "{line}");
+        assert!(line.contains("12m00s"), "the age of the hold: {line}");
+        assert!(line.contains("30s"), "the age of the last look: {line}");
+        assert!(
+            line.contains("nothing is charged an attempt"),
+            "the reader's next question is whether work is being lost: {line}"
+        );
+        assert!(
+            render_status(
+                Some(&pidfile_at(4800)),
+                Some(&status),
+                ts("2026-08-15T13:00:00Z")
+            )
+            .contains("0 of 6"),
+            "part of the report, not a function nobody calls"
         );
     }
 
