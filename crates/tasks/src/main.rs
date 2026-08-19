@@ -243,18 +243,25 @@ Removal is archive, never delete: POST /projects/{id}/status.
 ";
 
 const SECRETS_USAGE: &str = "\
-usage: tasks secrets <init|set|status|rm> [args]
+usage: tasks secrets <init|set|status|rm|rehome-key> [args]
 
 Custody of the two upstream credentials (docs/plans/2026-08-18-credential-custody.md):
 raw keys live ChaCha20-Poly1305-sealed under <data dir>/secrets/, the unseal
-key lives in the macOS Keychain (or a file), and what VMs receive at dispatch
-is a short-lived, repo-bound lease the in-process broker redeems per request.
-Neither artifact alone — data dir or Keychain — decrypts anything.
+key lives in the OS credential store — the macOS Keychain — or in a file, and
+what VMs receive at dispatch is a short-lived, repo-bound lease the in-process
+broker redeems per request. Neither artifact alone — data dir or Keychain —
+decrypts anything.
 
   tasks secrets init [--key-file PATH]
         create the store: generate the unseal key into the Keychain (service
         tasks-v2-secrets) or into --key-file (mandatory off macOS). Refuses
         to overwrite an existing store.
+
+        --key-file is a first-class way to run this, not a fallback: a macOS
+        access list is a decision about an *application*, so an unsigned
+        development build is a different one on every rebuild and a
+        natively-stored key re-prompts each time — which a launchd-started
+        server has no window server to answer.
   tasks secrets set <anthropic-api-key|github-token>
         seal a value, read from STDIN (never argv — argv is readable in
         `ps`). Pipe it, or paste and press ctrl-D. A running server picks
@@ -264,6 +271,13 @@ Neither artifact alone — data dir or Keychain — decrypts anything.
         values. Works without the unseal key.
   tasks secrets rm <name>
         remove one entry; the environment fallback (if any) applies again.
+  tasks secrets rehome-key
+        recreate the unseal-key item through the native credential store, so
+        this binary's access list governs it rather than /usr/bin/security's.
+        Only for a Keychain-keyed store. Delete-then-add is the only thing
+        that moves an access list, so the key is parked in a 0600 rescue file
+        outside the data dir for the window, and the command names that file
+        if anything goes wrong. The key is never printed.
 
 The environment variables keep working as fallbacks, warned at startup: the
 sealed store is where production keys should live.
@@ -761,7 +775,18 @@ fn secrets_cmd(args: &[String]) -> Result<()> {
             println!("sealed store created at {}", path.display());
             match key_file {
                 Some(kf) => println!("unseal key written to {} (0600)", kf.display()),
-                None => println!("unseal key stored in the Keychain (service tasks-v2-secrets)"),
+                None => {
+                    println!(
+                        "unseal key stored in this host's credential store \
+                         (service tasks-v2-secrets)"
+                    );
+                    println!(
+                        "note: a macOS access list is granted to an *application*, so an \
+                         unsigned dev build re-prompts on every rebuild — \
+                         `tasks secrets init --key-file PATH` (or TASKS_SECRETS_KEY_FILE) \
+                         is a first-class alternative, not a fallback"
+                    );
+                }
             }
             println!("next: tasks secrets set anthropic-api-key");
             println!("      tasks secrets set github-token");
@@ -834,6 +859,13 @@ fn secrets_cmd(args: &[String]) -> Result<()> {
             } else {
                 println!("`{name}` was not set");
             }
+            Ok(())
+        }
+        Some("rehome-key") => {
+            if let Some(extra) = args.get(1) {
+                bail!("unexpected argument: {extra}\n\n{SECRETS_USAGE}");
+            }
+            println!("{}", secrets::rehome_key(&data_dir)?);
             Ok(())
         }
         Some(other) => bail!("unknown secrets subcommand: {other}\n\n{SECRETS_USAGE}"),

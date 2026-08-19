@@ -380,7 +380,26 @@ implementation.
   `TASKS_SECRETS_KEY_FILE`); neither artifact alone decrypts anything, a
   sealed store that exists but cannot open **refuses to boot** rather than
   silently falling back to the environment, and `tasks secrets set` rotates a
-  *running* server off the file's mtime — no restart. Raw values cross module
+  *running* server off the file's mtime — no restart. **That unseal key is
+  read and written through the `keyring` crate's native backends
+  (Security.framework, Credential Manager, Secret Service) rather than
+  `/usr/bin/security`, and for an existing install that buys nothing yet**
+  (#1003). Three things compound: `set_password` on macOS is
+  find-then-modify-*in-place*, so an item the CLI created keeps the CLI's
+  access list through any number of native writes; the `security` read stays on
+  the read path as the **default** fallback, so nothing breaks and nothing
+  improves; and an unsigned dev build is a different *application* to an access
+  list on every `cargo build`, which is why `TASKS_SECRETS_KEY_FILE` stays
+  first-class rather than being the exotic-host path. So custody is
+  **unchanged** until a human runs `tasks secrets rehome-key` — a
+  delete-then-add, the only thing that moves an access list, spanning the
+  window with a 0600 rescue file **outside the data dir** (`~/.tasks/`, the
+  #1012 service home) because a rescue copy beside `sealed.json` would put both
+  halves of the two-artifact property in one `tar`; nothing forces that
+  command, a `warn!` is the only prompt, and the real benefit arrives with a
+  signed application identity (#988, undecided). `keychain_read` and
+  `keychain_write` are the whole custody boundary and a second key-store path
+  is never the answer — an API route that auto-initialises a store calls them. Raw values cross module
   boundaries only as `redact::Secret` (no `Display` at all — interpolating
   one is a compile error, not a silent `<redacted>`; constant-time equality;
   zeroized on drop). Two carve-outs are named: a non-http(s)
@@ -1442,7 +1461,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |
 | `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway) |
 | `TASKS_BROKER_ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | where Anthropic traffic forwards — override for tests only |
-| `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the Keychain the store header names. The Linux/test path, and the escape hatch for a locked login keychain |
+| `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the credential-store item the store header names. The Linux/test path — and **first-class on macOS too, not a fallback**: an access list is granted to an *application*, so an unsigned dev build is a different one on every `cargo build` and a natively-stored key re-prompts each time, which a launchd-started server has no window server to answer |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
