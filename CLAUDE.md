@@ -339,6 +339,22 @@ implementation.
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
   and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
   rather than beside it: it is per-task, human-only, and one call is one build.
+  `Rejected` is a **second door in**, and it is narrow on purpose (#1028): the
+  state names two unrelated outcomes — a *verdict* (someone decided not to do
+  this; the issue is closed) and *attrition* (three scouts failed to produce a
+  spec; the issue is still open and the work is still wanted) — and
+  `Store::queue_task` admits only the second, gated on `gh_state` being open, so
+  reopening an issue is the deliberate act that makes a verdict-rejected task
+  eligible again. It clears `dispatch_attempts` as it goes, and that half is not
+  a courtesy: `dispatch_gate` skips anything at or past the cap, so a task
+  returned still carrying 3 of 3 would sit in the queue looking like it was
+  waiting its turn and never dispatch — which is worse than the stranding it
+  fixes, because it is invisible. Before this the decision surface
+  `list_active_tasks` deliberately keeps on screen ("close the issue or
+  re-queue?") offered a decision with one arm missing: nothing, for anyone,
+  could re-queue a rejected task, and the only route back was to close the issue
+  and file a new one, losing its number, comments, labels and history for work
+  whose only failure was infrastructural.
 - **Builds dispatch when the lane frees, and the lane-free turn is where
   batching lives.** A build sent into a busy lane gains nothing by existing
   early — builds are strictly serial — and it costs the two things batching

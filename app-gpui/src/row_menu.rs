@@ -19,10 +19,11 @@
 //!
 //! Legality is the server's to enforce; this only mirrors it, so a verb that
 //! slips through greying still comes back as the server's own message in the
-//! banner. The predicates below are the store's: `queue_task` requires
-//! `Backlog`, `dequeue_task` requires `Queued`, `push_task_to_front` takes
-//! either, `create_build` takes only an approved spec, and a review verdict
-//! needs a `pending_review` entry.
+//! banner. The predicates below are the store's: `queue_task` takes `Backlog`,
+//! or `Rejected` while the issue is still open (#1028 — a task rejected by
+//! attrition rather than by verdict), `dequeue_task` requires `Queued`,
+//! `push_task_to_front` takes either, `create_build` takes only an approved
+//! spec, and a review verdict needs a `pending_review` entry.
 
 use tasks_client::api::models::{GhState, SpecQueueStatus, TaskState};
 
@@ -262,7 +263,14 @@ fn queue_refusal(context: RowContext) -> Option<&'static str> {
         TaskState::Building => Some("a build is running"),
         TaskState::AwaitingMerge => Some("its pull request is open"),
         TaskState::Done => Some("this task is done"),
-        TaskState::Rejected => Some("this task was rejected"),
+        // `Rejected` names two outcomes and the server admits only one of them
+        // back (#1028): a task rejected by *attrition* — three scouts, no spec
+        // — still has an open issue and is re-queueable, while one rejected by
+        // *verdict* has a closed issue and is not. Mirrored from
+        // `Store::queue_task` rather than invented here; enabling the item for
+        // a closed issue would produce a button that 400s.
+        TaskState::Rejected if context.gh_state == GhState::Open => None,
+        TaskState::Rejected => Some("this task was rejected and its issue is closed"),
     }
 }
 
@@ -396,6 +404,37 @@ mod tests {
             .filter(|item| item.disabled.is_none())
             .map(|item| item.action)
             .collect()
+    }
+
+    /// #1028: the server admits a task rejected by *attrition* back into the
+    /// queue while its issue is still open, so the menu must offer it. This
+    /// mirrors `Store::queue_task` and is the whole reason those rows are kept
+    /// on screen — `list_active_tasks` calls them the "close the issue or
+    /// re-queue?" decision surface, and until the server grew the second arm
+    /// the menu could only ever grey it out.
+    #[test]
+    fn a_rejected_task_with_an_open_issue_can_be_queued_again() {
+        let rejected_open = RowContext {
+            gh_state: GhState::Open,
+            ..context(TaskState::Rejected)
+        };
+        assert_eq!(refusal(rejected_open, RowAction::Queue), None);
+        assert!(enabled(rejected_open).contains(&RowAction::Queue));
+    }
+
+    /// The other kind: a closed issue means the rejection was a verdict, the
+    /// server refuses it, and offering the verb would produce a button that
+    /// 400s. The refusal also has to say *which* rejection this is, or it reads
+    /// as the old blanket one.
+    #[test]
+    fn a_rejected_task_with_a_closed_issue_still_cannot_be_queued() {
+        let rejected_closed = RowContext {
+            gh_state: GhState::Closed,
+            ..context(TaskState::Rejected)
+        };
+        let reason = refusal(rejected_closed, RowAction::Queue).expect("still refused");
+        assert!(reason.contains("issue is closed"), "{reason}");
+        assert!(!enabled(rejected_closed).contains(&RowAction::Queue));
     }
 
     /// Why `action` cannot run on this row, or `None` when it can.
