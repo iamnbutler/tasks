@@ -1,0 +1,17 @@
+#!/bin/sh
+# How this repository is tested, read by the Builder supervisor out of a
+# build's BASE commit and run inside the VM before any bundle is packaged.
+#
+# Invoked as `sh .tasks/verify` from the repository root — the shebang is
+# decorative and the executable bit is deliberately not consulted, because
+# honouring it would mean two invocation paths that can drift and a mode bit a
+# `git apply` can drop silently.
+#
+# `test-ci` rather than `test`: no fail-fast, so one red test reports the whole
+# picture instead of the first failure, and retries absorb the known-flaky
+# leak-timeout cases. Both are no-ops on a green run.
+#
+# A non-zero exit here fails the build inside the VM: the agent gets exactly one
+# repair round and then no pull request is opened at all.
+set -e
+make test-ci

@@ -27,27 +27,56 @@
 //!      onto whatever HEAD is
 //!   8. Sweeps everything the agent left uncommitted into a final commit —
 //!      losing a build to a forgotten `git commit` is a bad failure mode
-//!   9. `tip == base` → `Failed` (the analogue of a scout's missing SPEC.md);
-//!      otherwise emits `Completed` with a base64 thin bundle of
-//!      `base_sha..branch`, whose `head_sha` is read back **out of the
-//!      bundle** so there is one value where there used to be two that had to
-//!      agree
+//!   9. `tip == base` → `Failed` (the analogue of a scout's missing SPEC.md)
+//!  10. Runs the project's own test suite ([`run_verification`]) and stamps a
+//!      [`Verification`] on the terminal event. A **red** suite buys one
+//!      bounded repair round and then fails the build — it never packages a
+//!      bundle, so untested-and-broken work cannot reach GitHub at all
+//!  11. Emits `Completed` with a base64 thin bundle of `base_sha..branch`,
+//!      whose `head_sha` is read back **out of the bundle** so there is one
+//!      value where there used to be two that had to agree
+//!
+//! Steps 6-10 are a **loop**, because a repair round's commits have to travel
+//! the same path: read the summary again (the repair prompt asks the agent to
+//! account for changed tests in it), reconcile again, sweep again, and only
+//! then re-run the suite. The suite runs *after* the reconciliation and the
+//! sweep and immediately before the packaging, because the sweep is what turns
+//! the working tree into the branch and the reconciliation is what decides
+//! which tip the build *is* (#891) — a suite run any earlier judges a tree that
+//! is not the deliverable.
 //!
 //! No credential ever needs to enter this VM for egress: the bundle rides the
 //! event stream and the server pushes with its own token.
 //!
 //! The agent command is configured via `BUILDER_AGENT_CMD` (tokens
 //! space-separated; no shell expansion). Default: `claude --print`.
+//!
+//! # Why the supervisor runs the suite and the agent does not
+//!
+//! What this replaced was `Verification: PASSED|FAILED|NOT RUN`, a line the
+//! agent wrote into `SUMMARY.md` and the host grepped to decide whether a pull
+//! request could be landed. That is a gate on prose authored by the party
+//! being graded. Running it here makes it a check: the graded party cannot
+//! write the answer, and — the larger prize — a red suite never becomes a pull
+//! request at all, where before it opened one, parked a batch in
+//! `awaiting_merge` and spent a reviewer's attention.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use tasks_protocol::agent_run::{
-    AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, max_resumes_from_env,
+    AgentRun, RESUME_PROMPT, ResultWatcher, ResumeDecision, command_selects_session,
+    max_resumes_from_env, resume_argv,
 };
 use tasks_protocol::redact::redact;
+use tasks_protocol::verify::{
+    SuiteBudget, VERIFY_SCRIPT_PATH, Verification, VerificationStatus, suite_budget_cap_from_env,
+    suite_budget_secs,
+};
 use tasks_protocol::vm_memory::{AgentOutcome, MemorySample, sample_memory};
 use tasks_protocol::{
     BuildCommand, BuildEvent, FailureClass, LogStream, MAX_BUNDLE_BASE64_BYTES, SupervisorBuild,
@@ -165,6 +194,8 @@ async fn main() -> Result<()> {
                         base_branch,
                         branch,
                         prompt,
+                        budget_secs,
+                        trunk_branch,
                     }),
             } => {
                 let tx = evt_tx.clone();
@@ -174,6 +205,8 @@ async fn main() -> Result<()> {
                     &base_branch,
                     &branch,
                     &prompt,
+                    budget_secs,
+                    trunk_branch.as_deref(),
                     tx,
                 )
                 .await;
@@ -217,14 +250,23 @@ async fn emit(tx: &mpsc::Sender<TaskVmEvent>, event: BuildEvent) {
 }
 
 /// Run the Builder workflow. Every failure path emits `Failed` and returns.
+#[allow(clippy::too_many_arguments)]
 async fn run_build(
     build_id: &str,
     repo_clone_url: &str,
     base_branch: &str,
     branch: &str,
     prompt: &str,
+    budget_secs: Option<u64>,
+    trunk_branch: Option<&str>,
     tx: mpsc::Sender<TaskVmEvent>,
 ) {
+    // Anchored before the clone, so the suite's budget is sized against what
+    // is *left* rather than against what the run was given. Monotonic: a
+    // suspended host is the outer deadline's business (the host holds it and
+    // classifies it), and a suite budget that grew across a lid would be the
+    // one thing that cannot help — the outer deadline kills the VM regardless.
+    let started = Instant::now();
     // The `class:` arm must come FIRST: the catch-all below matches
     // `class: …` too, and would wrap a classified failure in a second class.
     //
@@ -313,58 +355,131 @@ async fn run_build(
     )
     .await;
 
-    // SUMMARY.md is read before the artifact cleanup removes it. Optional:
-    // missing prose does not fail a build — the code is the deliverable.
-    let summary = tokio::fs::read_to_string(workdir.join("SUMMARY.md"))
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Steps 6-10, once per round. A red suite buys exactly one repair round,
+    // and the round's commits have to travel this same path — which is why
+    // this is a loop and not a straight line.
+    let mut run = run;
+    let mut summary: Option<String> = None;
+    let mut abandoned: Vec<String> = Vec::new();
+    // The first round that came back red, if one did. Once this is set, no
+    // later status may package a bundle: we reached a verdict and then spent a
+    // repair round failing to overturn it, and shipping on "we do not know"
+    // when the last thing we actually knew was red is the one direction this
+    // whole check exists to make impossible. It is kept separately from the
+    // round's own observed status precisely so the second round's status stays
+    // honest — a repair round that times out reports `TimedOut`, and the build
+    // fails anyway.
+    let mut first_red: Option<String> = None;
+    let mut repair_spent = false;
 
-    // Remove the artifacts from the worktree, reconcile, then sweep. `git add
-    // -A` stages the removals as deletions if the agent committed them,
-    // alongside any implementation work the agent left uncommitted.
-    remove_artifacts(&workdir).await;
+    let (verification, tip) = loop {
+        // Read once per ROUND, not once before the loop: the repair prompt asks
+        // the agent to account for changed tests in the summary, and a pre-loop
+        // read drops exactly that. Latest non-empty wins, so a repair round
+        // that rewrote nothing keeps the first round's prose. Optional
+        // throughout: missing prose does not fail a build — the code is the
+        // deliverable.
+        if let Some(latest) = read_summary(&workdir).await {
+            summary = Some(latest);
+        }
 
-    // The reconciliation runs BEFORE the sweep, and the order is load-bearing:
-    // the sweep commits onto whatever HEAD is, so on a stranded checkout a
-    // sweep-first ordering manufactures a divergence no ancestry rule can
-    // undo — and the build ships a PR containing the sweep and none of the
-    // implementation. See [`reconcile_checkout`].
-    let abandoned = match reconcile_checkout(&workdir, branch, &tx).await {
-        Ok(abandoned) => abandoned,
-        Err(e) => fail!(class: run.failure_class(), "reconcile: {e}"),
+        // Remove the artifacts from the worktree, reconcile, then sweep. `git
+        // add -A` stages the removals as deletions if the agent committed
+        // them, alongside any implementation work the agent left uncommitted.
+        remove_artifacts(&workdir).await;
+
+        // The reconciliation runs BEFORE the sweep, and the order is
+        // load-bearing: the sweep commits onto whatever HEAD is, so on a
+        // stranded checkout a sweep-first ordering manufactures a divergence no
+        // ancestry rule can undo — and the build ships a PR containing the
+        // sweep and none of the implementation. See [`reconcile_checkout`].
+        match reconcile_checkout(&workdir, branch, &tx).await {
+            // Accumulated across rounds: the reconciliation runs once per
+            // round, so a repair round can strand a second tip, and a single
+            // `Option` could only hold one of them.
+            Ok(Some(left)) => abandoned.push(left),
+            Ok(None) => {}
+            Err(e) => fail!(class: run.failure_class(), "reconcile: {e}"),
+        }
+        // A `checkout --force` back onto the branch can restore an artifact the
+        // agent had committed there; removing them again turns that into a
+        // deletion the sweep below picks up.
+        remove_artifacts(&workdir).await;
+
+        if let Err(e) = commit_worktree(&workdir, SWEEP_MESSAGE).await {
+            fail!(class: run.failure_class(), "sweep: {e}");
+        }
+
+        let branch_ref = format!("refs/heads/{branch}");
+        let tip = match git_stdout(&workdir, &["rev-parse", &branch_ref]).await {
+            Ok(sha) => sha,
+            Err(e) => fail!(class: run.failure_class(), "rev-parse branch: {e}"),
+        };
+        if tip == base_sha {
+            // "no commits" on its own reads as a verdict on the agent's work,
+            // so an OOM kill, a signal death or a dropped API connection (#845)
+            // is named here rather than left for someone to infer from a budget
+            // that vanished.
+            fail!(
+                class: run.failure_class(),
+                "agent produced no commits (tip == base){}",
+                run.failure_context()
+            );
+        }
+
+        // The suite judges the swept tree, which is the thing the bundle will
+        // carry — see the module docs for why nothing earlier would do.
+        let remaining = budget_secs.map(|b| b.saturating_sub(started.elapsed().as_secs()));
+        match run_verification(&workdir, &base_sha, trunk_branch, remaining, &tx).await {
+            SuiteResult::Reported(verification) => match &first_red {
+                // A verdict was reached, the repair round did not overturn it,
+                // and whatever the re-run observed is not evidence that it did.
+                // The observed status is reported in the reason rather than
+                // rewritten into a red it never was.
+                Some(red) if !verification.is_green() => fail!(
+                    class: FailureClass::Verdict,
+                    "the project's test suite failed and the repair round did not fix it: \
+                     {red} — the re-run then reported {} ({}), which does not overturn a red \
+                     run, so nothing was packaged",
+                    verification.status,
+                    or_unstated(&verification.detail),
+                ),
+                _ => break (verification, tip),
+            },
+            SuiteResult::Red { detail, tail } => {
+                if repair_spent {
+                    fail!(
+                        class: FailureClass::Verdict,
+                        "the project's test suite failed, and failed again after a repair \
+                         round: {detail}",
+                    );
+                }
+                let Some(session_id) = run.session_id.clone() else {
+                    fail!(
+                        class: FailureClass::Verdict,
+                        "the project's test suite failed: {detail} — and the agent announced \
+                         no session id, so there was no conversation to hand the failure back \
+                         to",
+                    );
+                };
+                repair_spent = true;
+                first_red = Some(detail.clone());
+                match repair_round(&workdir, &session_id, &detail, &tail, &tx).await {
+                    Ok(repaired) => run = repaired,
+                    Err(e) => fail!(
+                        class: FailureClass::Verdict,
+                        "the project's test suite failed: {detail} — and the repair round \
+                         could not be started: {e}",
+                    ),
+                }
+            }
+        }
     };
-    // A `checkout --force` back onto the branch can restore an artifact the
-    // agent had committed there; removing them again turns that into a
-    // deletion the sweep below picks up.
-    remove_artifacts(&workdir).await;
-
-    if let Err(e) = commit_worktree(&workdir, SWEEP_MESSAGE).await {
-        fail!(class: run.failure_class(), "sweep: {e}");
-    }
-
-    let branch_ref = format!("refs/heads/{branch}");
-    let tip = match git_stdout(&workdir, &["rev-parse", &branch_ref]).await {
-        Ok(sha) => sha,
-        Err(e) => fail!(class: run.failure_class(), "rev-parse branch: {e}"),
-    };
-    if tip == base_sha {
-        // "no commits" on its own reads as a verdict on the agent's work, so
-        // an OOM kill, a signal death or a dropped API connection (#845) is
-        // named here rather than left for someone to infer from a budget that
-        // vanished.
-        fail!(
-            class: run.failure_class(),
-            "agent produced no commits (tip == base){}",
-            run.failure_context()
-        );
-    }
 
     // Thin bundle with base_sha as its prerequisite, carrying the branch ref
     // the server will fetch by name — and the head is read back out of it.
     let (bundle_base64, head_sha) =
-        match package_bundle(&workdir, &base_sha, branch, abandoned.as_deref(), &tx).await {
+        match package_bundle(&workdir, &base_sha, branch, &abandoned, &tx).await {
             Ok(packaged) => packaged,
             Err(e) => fail!(class: run.failure_class(), "bundle: {e}"),
         };
@@ -404,9 +519,28 @@ async fn run_build(
             bundle_base64,
             summary,
             files_touched,
+            verification: Some(verification),
         },
     )
     .await;
+}
+
+/// `SUMMARY.md`, if the agent wrote one with anything in it.
+async fn read_summary(workdir: &Path) -> Option<String> {
+    tokio::fs::read_to_string(workdir.join("SUMMARY.md"))
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A detail string, or a stand-in when there is none. Never an empty pair of
+/// brackets in a reason a human reads.
+fn or_unstated(detail: &str) -> &str {
+    match detail.trim().is_empty() {
+        true => "no detail",
+        false => detail,
+    }
 }
 
 /// The sweep commit: work the agent left uncommitted *on* the build branch.
@@ -713,24 +847,30 @@ async fn package_bundle(
     workdir: &Path,
     base_sha: &str,
     branch: &str,
-    abandoned: Option<&str>,
+    abandoned: &[String],
     tx: &mpsc::Sender<TaskVmEvent>,
 ) -> Result<(String, String)> {
     let branch_ref = format!("refs/heads/{branch}");
-    let abandoned_ref = format!("refs/abandoned/{branch}");
     let bundle_path = workdir.join(".git").join("egress.bundle");
     let bundle_arg = bundle_path.display().to_string();
 
-    let mut carry_abandoned = false;
-    if let Some(sha) = abandoned {
-        match git(workdir, &["update-ref", &abandoned_ref, sha]).await {
-            Ok(()) => carry_abandoned = true,
+    // A slice and not an `Option`: the reconciliation runs once per round, so a
+    // repair round can strand a second tip, and one ref name could only hold
+    // one of them. `-2`, `-3`… rather than `<branch>/2`, because git cannot
+    // hold both a ref and a directory at one path.
+    let mut abandoned_refs = Vec::new();
+    for (i, sha) in abandoned.iter().enumerate() {
+        let name = match i {
+            0 => format!("refs/abandoned/{branch}"),
+            n => format!("refs/abandoned/{branch}-{}", n + 1),
+        };
+        match git(workdir, &["update-ref", &name, sha]).await {
+            Ok(()) => abandoned_refs.push(name),
             Err(e) => {
                 progress(
                     tx,
                     format!(
-                        "builder-supervisor: could not record the abandoned tip {} as \
-                         {abandoned_ref}: {e}",
+                        "builder-supervisor: could not record the abandoned tip {} as {name}: {e}",
                         short(sha)
                     ),
                 )
@@ -746,8 +886,8 @@ async fn package_bundle(
             bundle_arg.clone(),
             format!("{base_sha}..{branch_ref}"),
         ];
-        if carry_abandoned {
-            args.push(format!("{base_sha}..{abandoned_ref}"));
+        for name in &abandoned_refs {
+            args.push(format!("{base_sha}..{name}"));
         }
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -770,17 +910,18 @@ async fn package_bundle(
                 return Ok((bundle_base64, tip));
             }
             // Insurance must never cost the thing it insures: drop the
-            // abandoned ref and ship the branch alone.
-            Err(e) if carry_abandoned => {
+            // abandoned refs and ship the branch alone.
+            Err(e) if !abandoned_refs.is_empty() => {
                 progress(
                     tx,
                     format!(
-                        "builder-supervisor: could not ship {abandoned_ref} alongside the build \
-                         branch ({e}); shipping the branch alone"
+                        "builder-supervisor: could not ship {} alongside the build branch ({e}); \
+                         shipping the branch alone",
+                        abandoned_refs.join(", ")
                     ),
                 )
                 .await;
-                carry_abandoned = false;
+                abandoned_refs.clear();
             }
             Err(e) => return Err(e),
         }
@@ -805,6 +946,416 @@ async fn bundle_head(workdir: &Path, bundle: &Path, ref_name: &str) -> Result<St
         .find(|(_, name)| name.trim() == ref_name)
         .map(|(sha, _)| sha.trim().to_string())
         .with_context(|| format!("{ref_name} is not in the bundle"))
+}
+
+/// What one run of the project's suite came back with.
+///
+/// Two arms and not four, because red is structurally different from every
+/// other answer: [`VerificationStatus`] has no `Failed` variant, so a red suite
+/// has no status to report and cannot be packaged. Everything else — a pass, or
+/// one of the several ways there is no evidence — is a [`Verification`] the
+/// build ships.
+#[derive(Debug)]
+enum SuiteResult {
+    /// The declared suite ran and failed. `tail` is what the repair round is
+    /// shown.
+    Red { detail: String, tail: String },
+    /// A pass, or an honest absence of one.
+    Reported(Verification),
+}
+
+/// Bytes of suite output kept for the repair round.
+///
+/// The **tail**, not the head: every plausible runner puts its failures and its
+/// summary at the end, and a head would hand the agent the compile lines it
+/// already knows about.
+const SUITE_TAIL_BYTES: usize = 16 * 1024;
+
+/// How long to wait for the output readers after the suite's own process has
+/// exited.
+///
+/// Bounded rather than awaited, for the smaller size of the same hazard that
+/// makes the timeout path abort them outright: a suite that leaves a daemon
+/// behind leaves that daemon holding the pipes, so EOF never arrives and an
+/// unbounded await here would hang a build that had already finished.
+const COLLECT_GRACE: Duration = Duration::from_secs(5);
+
+/// Run the project's declared test suite against the swept tree, and say what
+/// it found.
+///
+/// # The gate is read at the BASE commit, never at the tip
+///
+/// The Builder agent has write access to this worktree. A tip-resolved gate is
+/// the same forgery this check exists to prevent, one level down, with `exit 0`
+/// in place of `PASSED`. The argument for tip-resolution — "a pull request that
+/// changes how the project is tested changes its own gate" — is a property of
+/// GitHub Actions, where a human reviews the diff *before* the gate matters,
+/// and it inverts here: this gate decides whether a pull request is opened at
+/// all, so the reviewer only ever sees the diff **after** it has ruled.
+///
+/// A branch that edits the script is *reported* rather than refused. Changing
+/// how a project is tested is ordinary work; the reviewer needs to know which
+/// script ruled, not to be blocked.
+///
+/// # Which gate ruled is always reported
+///
+/// `detail` always names the blob SHA of the script that ran, matching or not —
+/// a field that appears only on disagreement is one nobody learns to read. The
+/// comparison is against the **trunk's** copy and not against this build's own
+/// diff, because this pipeline stacks builds routinely: build A weakens the
+/// script and opens a PR, build B is dispatched onto A's branch, and the
+/// weakened script is already in B's base commit. Comparing against the base is
+/// exactly what would miss that. It is best-effort — a trunk that is not in the
+/// clone is reported as an unmade comparison, never as agreement.
+async fn run_verification(
+    workdir: &Path,
+    base_sha: &str,
+    trunk_branch: Option<&str>,
+    remaining_secs: Option<u64>,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> SuiteResult {
+    let spec = format!("{base_sha}:{VERIFY_SCRIPT_PATH}");
+    // `git show` fails identically for "no such path" and "no such commit", and
+    // the second cannot happen here — `base_sha` was read out of this clone a
+    // few steps ago — so the failure is read as "the project declares nothing".
+    let Ok(script) = git_stdout_raw(workdir, &["show", &spec]).await else {
+        verifying(
+            tx,
+            format!(
+                "this project declares no {VERIFY_SCRIPT_PATH} at its base commit; nothing to run"
+            ),
+        )
+        .await;
+        return SuiteResult::Reported(Verification::new(
+            VerificationStatus::Undeclared,
+            format!(
+                "the project declares no {VERIFY_SCRIPT_PATH} at {}",
+                short(base_sha)
+            ),
+        ));
+    };
+    // An empty script is the cheapest possible forgery: `sh` on an empty file
+    // exits 0, so reading it as a pass would ship anything.
+    if script.trim().is_empty() {
+        verifying(
+            tx,
+            format!("{VERIFY_SCRIPT_PATH} is empty, which `sh` exits 0 on; refusing to read that as a pass"),
+        )
+        .await;
+        return SuiteResult::Reported(Verification::new(
+            VerificationStatus::Undeclared,
+            format!("{VERIFY_SCRIPT_PATH} is empty, and an empty script is not a passing run"),
+        ));
+    }
+
+    let gate = gate_identity(workdir, base_sha, trunk_branch, tx).await;
+
+    let budget = match suite_budget_secs(remaining_secs, suite_budget_cap_from_env()) {
+        SuiteBudget::Run(budget) => budget,
+        SuiteBudget::Skip(mut skipped) => {
+            verifying(tx, format!("not running the suite: {}", skipped.detail)).await;
+            skipped.detail = format!("{} ({gate})", skipped.detail);
+            return SuiteResult::Reported(skipped);
+        }
+    };
+
+    // Staged OUTSIDE the worktree — inside `.git`, which `git add -A` never
+    // sees and a `checkout --force` never touches. Writing it into the tree
+    // would make the sweep commit the gate into the branch it is judging.
+    let staged = workdir.join(".git").join("tasks-verify");
+    if let Err(e) = tokio::fs::write(&staged, script.as_bytes()).await {
+        return SuiteResult::Reported(Verification::new(
+            VerificationStatus::Unavailable,
+            format!("{VERIFY_SCRIPT_PATH} could not be staged for running: {e} ({gate})"),
+        ));
+    }
+
+    verifying(
+        tx,
+        format!(
+            "running {VERIFY_SCRIPT_PATH} ({gate}) with a budget of {}s",
+            budget.as_secs()
+        ),
+    )
+    .await;
+
+    // Always `sh <script>`: the shebang is decorative and the executable bit is
+    // deliberately not consulted, because honouring it would mean two
+    // invocation paths that can drift and a mode bit a `git apply` can drop
+    // silently. cwd is the repo root, which is what a project's own suite
+    // expects.
+    let script_arg = staged.display().to_string();
+    match run_script(workdir, &["sh", &script_arg], budget, tx).await {
+        ScriptOutcome::Exited { success: true, .. } => {
+            verifying(tx, format!("{VERIFY_SCRIPT_PATH} passed ({gate})")).await;
+            SuiteResult::Reported(Verification::new(
+                VerificationStatus::Passed,
+                format!("{VERIFY_SCRIPT_PATH} passed ({gate})"),
+            ))
+        }
+        ScriptOutcome::Exited { code, tail, .. } => {
+            verifying(
+                tx,
+                format!("{VERIFY_SCRIPT_PATH} FAILED with {code} ({gate})"),
+            )
+            .await;
+            SuiteResult::Red {
+                detail: format!("{VERIFY_SCRIPT_PATH} exited with {code} ({gate})"),
+                tail,
+            }
+        }
+        // Not a failure of the build: a suite that never finished is not
+        // evidence about the work, and throwing away a possibly-perfect
+        // implementation because a cold `target/` compiled slowly is the
+        // failure #929 and #884 were filed about. Ships, and is never green.
+        ScriptOutcome::TimedOut => {
+            verifying(
+                tx,
+                format!(
+                    "{VERIFY_SCRIPT_PATH} did not finish inside {}s and was killed; the \
+                     build ships with no passing run behind it",
+                    budget.as_secs()
+                ),
+            )
+            .await;
+            SuiteResult::Reported(Verification::new(
+                VerificationStatus::TimedOut,
+                format!(
+                    "{VERIFY_SCRIPT_PATH} was killed after {}s ({gate})",
+                    budget.as_secs()
+                ),
+            ))
+        }
+        ScriptOutcome::NotStarted(e) => {
+            verifying(tx, format!("{VERIFY_SCRIPT_PATH} could not be run: {e}")).await;
+            SuiteResult::Reported(Verification::new(
+                VerificationStatus::Unavailable,
+                format!("{VERIFY_SCRIPT_PATH} could not be run: {e} ({gate})"),
+            ))
+        }
+    }
+}
+
+/// Which gate ruled, as a clause every `detail` carries.
+///
+/// Always names this build's own blob SHA. The trunk half is best-effort and
+/// says so when it could not be made — "the comparison was not available" and
+/// "the scripts agree" are different facts, and only one of them is reassuring.
+async fn gate_identity(
+    workdir: &Path,
+    base_sha: &str,
+    trunk_branch: Option<&str>,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> String {
+    let blob = git_stdout(
+        workdir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base_sha}:{VERIFY_SCRIPT_PATH}"),
+        ],
+    )
+    .await
+    .ok()
+    .filter(|s| !s.is_empty());
+    let Some(blob) = blob else {
+        // The script was readable a moment ago, so this is a git that answered
+        // one question and not the other. Say so rather than inventing an id.
+        return "gate unidentified".to_string();
+    };
+    let gate = format!("gate {}", short(&blob));
+
+    let Some(trunk) = trunk_branch else {
+        return format!("{gate}, not compared against the trunk (the server named none)");
+    };
+    let trunk_blob = git_stdout(
+        workdir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("origin/{trunk}:{VERIFY_SCRIPT_PATH}"),
+        ],
+    )
+    .await
+    .ok()
+    .filter(|s| !s.is_empty());
+    match trunk_blob {
+        Some(trunk_blob) if trunk_blob == blob => format!("{gate}, same as {trunk}"),
+        Some(trunk_blob) => {
+            // `declaration_changed`, raised on the right comparison. Reported
+            // and never refused — see [`run_verification`].
+            verifying(
+                tx,
+                format!(
+                    "declaration_changed: the {VERIFY_SCRIPT_PATH} that ruled ({}) is NOT \
+                     the one on {trunk} ({}); this build was gated by a script the trunk does \
+                     not have",
+                    short(&blob),
+                    short(&trunk_blob)
+                ),
+            )
+            .await;
+            format!("{gate}, DIFFERS from {trunk}'s {}", short(&trunk_blob))
+        }
+        None => format!("{gate}, {trunk} not reachable in this clone so no comparison was made"),
+    }
+}
+
+/// A verification line, in the build transcript (#825).
+async fn verifying(tx: &mpsc::Sender<TaskVmEvent>, line: String) {
+    progress(tx, format!("builder-supervisor: verification: {line}")).await;
+}
+
+/// How a script run ended.
+#[derive(Debug)]
+enum ScriptOutcome {
+    Exited {
+        success: bool,
+        code: String,
+        tail: String,
+    },
+    TimedOut,
+    NotStarted(String),
+}
+
+/// Run a command under a budget, streaming both pipes into the transcript and
+/// keeping a bounded tail.
+///
+/// # The collector must not be awaited on the timeout path
+///
+/// Killing `sh` does not close the pipes its children inherited, so the readers
+/// never see EOF and an await here hangs the supervisor **forever** — strictly
+/// worse than the timeout it was reporting. Found by a test that hung.
+/// `collector.abort()` is the fix, and the tail lives outside the task so
+/// aborting it costs nothing that was already collected.
+async fn run_script(
+    workdir: &Path,
+    argv: &[&str],
+    budget: Duration,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> ScriptOutcome {
+    let Some((prog, args)) = argv.split_first() else {
+        return ScriptOutcome::NotStarted("empty command".into());
+    };
+    let mut child = match Command::new(prog)
+        .args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return ScriptOutcome::NotStarted(format!("spawn {prog}: {e}")),
+    };
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return ScriptOutcome::NotStarted("could not capture the script's output".into());
+    };
+
+    let tail = Arc::new(Mutex::new(Tail::new(SUITE_TAIL_BYTES)));
+    let collector = tokio::spawn({
+        let tail = tail.clone();
+        let tx = tx.clone();
+        async move {
+            let out = pump(stdout, LogStream::Stdout, tail.clone(), tx.clone());
+            let err = pump(stderr, LogStream::Stderr, tail, tx);
+            tokio::join!(out, err);
+        }
+    });
+
+    let outcome = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = tokio::time::sleep(budget) => None,
+    };
+
+    match outcome {
+        Some(status) => {
+            // Bounded, never unbounded — see the doc comment.
+            if tokio::time::timeout(COLLECT_GRACE, collector)
+                .await
+                .is_err()
+            {
+                warn!("the suite left something holding its pipes; reporting without waiting");
+            }
+            let tail = tail.lock().map(|t| t.take()).unwrap_or_default();
+            match status {
+                Ok(status) => ScriptOutcome::Exited {
+                    success: status.success(),
+                    code: describe_status(&status),
+                    tail,
+                },
+                Err(e) => ScriptOutcome::NotStarted(format!("wait: {e}")),
+            }
+        }
+        None => {
+            let _ = child.kill().await;
+            collector.abort();
+            ScriptOutcome::TimedOut
+        }
+    }
+}
+
+/// Forward one pipe into the transcript, keeping every line in `tail` too.
+async fn pump(
+    pipe: impl tokio::io::AsyncRead + Unpin,
+    stream: LogStream,
+    tail: Arc<Mutex<Tail>>,
+    tx: mpsc::Sender<TaskVmEvent>,
+) {
+    let mut lines = BufReader::new(pipe).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Ok(mut tail) = tail.lock() {
+            tail.push_line(&line);
+        }
+        emit(&tx, BuildEvent::Progress { stream, line }).await;
+    }
+}
+
+/// An exit status, as a clause. A signal death has no code at all, which is
+/// exactly the case a bare `code.unwrap_or(-1)` would render as a lie.
+fn describe_status(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => format!("no exit code ({status})"),
+    }
+}
+
+/// The last `cap` bytes of a stream, kept whole lines at a time.
+#[derive(Debug, Default)]
+struct Tail {
+    buf: String,
+    cap: usize,
+}
+
+impl Tail {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: String::new(),
+            cap,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        self.buf.push_str(line);
+        self.buf.push('\n');
+        // Drop whole lines from the front: a tail cut mid-line reads as a
+        // corrupt first line to whoever is handed it.
+        while self.buf.len() > self.cap {
+            match self.buf.find('\n') {
+                Some(i) => drop(self.buf.drain(..=i)),
+                None => {
+                    self.buf.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn take(&self) -> String {
+        self.buf.clone()
+    }
 }
 
 /// A SHA, shortened for a log line.
@@ -860,6 +1411,29 @@ async fn git_stdout(workdir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `git_stdout`, keeping stdout byte-for-byte.
+///
+/// Separate from [`git_stdout`] because that one trims, and this one's caller
+/// writes the bytes back out as a script: a trailing heredoc terminator or a
+/// deliberate final newline is not whitespace to be tidied away.
+async fn git_stdout_raw(workdir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .await
+        .with_context(|| format!("spawn git {}", args.first().unwrap_or(&"")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} exited with {}: {}",
+            redact(&args.join(" ")),
+            output.status,
+            redact(String::from_utf8_lossy(&output.stderr).trim())
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Run the agent to a conclusion, resuming it across dropped API connections,
 /// and report how the whole run ended — including whether anything in this VM
 /// was OOM-killed while it ran. See [`tasks_protocol::vm_memory`] for why the
@@ -875,14 +1449,121 @@ async fn run_agent(
     prompt: &str,
     tx: mpsc::Sender<TaskVmEvent>,
 ) -> Result<AgentRun> {
+    let argv = agent_argv()?;
+    agent_loop(workdir, &argv, argv.clone(), prompt.to_string(), tx).await
+}
+
+/// The operator's configured agent command.
+fn agent_argv() -> Result<Vec<String>> {
     let cmd_str = std::env::var("BUILDER_AGENT_CMD").unwrap_or_else(|_| "claude --print".into());
     let argv: Vec<String> = cmd_str.split_whitespace().map(str::to_string).collect();
     anyhow::ensure!(!argv.is_empty(), "BUILDER_AGENT_CMD is empty");
+    Ok(argv)
+}
+
+/// Hand a red test suite back to the agent that wrote it, once.
+///
+/// Goes through `--resume` on the **same conversation and the same worktree**,
+/// which is what makes one round enough to be worth having: the agent still has
+/// everything it built, and is told what broke rather than asked to start over.
+///
+/// # It shares `BUILDER_MAX_RESUMES`'s mechanism and must never share its
+/// counter
+///
+/// They answer different questions. `BUILDER_MAX_RESUMES` bounds how many times
+/// a **dropped API connection** may be picked back up; this bounds how many
+/// times the agent may be told **its own tests are red**. So a build that
+/// already spent both resumes on dropped connections still gets its repair
+/// round, and a repair round that itself dies mid-response is still resumed —
+/// it goes through the same [`agent_loop`], which owns that ladder. The total
+/// is bounded by the wall budget, which is the right bound for it.
+///
+/// One round, hardcoded, and not an env knob: an unbounded repair loop burns
+/// the budget with nothing that stops it, and an agent that cannot make its own
+/// tests pass in two attempts has produced a verdict.
+async fn repair_round(
+    workdir: &Path,
+    session_id: &str,
+    detail: &str,
+    tail: &str,
+    tx: &mpsc::Sender<TaskVmEvent>,
+) -> Result<AgentRun> {
+    let argv = agent_argv()?;
+    // The same guard [`decide`] applies, asked here rather than restated:
+    // appending a selector beside one the operator already chose would change
+    // which conversation runs.
+    if let Some(flag) = command_selects_session(&argv) {
+        anyhow::bail!("the configured agent command already selects a session ({flag})");
+    }
+    let line = format!(
+        "builder-supervisor: the test suite failed; handing it back to the agent for one repair \
+         round on session {session_id}"
+    );
+    warn!(%line, "repairing a red suite");
+    progress(tx, line).await;
+    agent_loop(
+        workdir,
+        &argv,
+        resume_argv(&argv, session_id),
+        repair_prompt(detail, tail),
+        tx.clone(),
+    )
+    .await
+}
+
+/// What the agent is told about its own red suite.
+///
+/// It deliberately **does not restate the specs**. That is [`RESUME_PROMPT`]'s
+/// rule and it is the whole reason a resume is not a restart: the task is above
+/// this in the conversation, and re-sending it is how a resume silently becomes
+/// one.
+///
+/// Two things are said outright rather than left to be discovered. That editing
+/// the gate cannot help — an agent that does not know the script is read at the
+/// base commit will spend its one round finding out. And that deleting,
+/// skipping or `#[ignore]`-ing a failing test is the one repair that makes the
+/// whole check worthless — the thing an agent optimising for a green exit code
+/// reaches for first.
+fn repair_prompt(detail: &str, tail: &str) -> String {
+    format!(
+        "STOP. Your implementation is finished but the project's test suite does not pass.\n\n\
+         This is not your own test run and not a claim from your summary: the supervisor ran \
+         `{VERIFY_SCRIPT_PATH}` itself, just now, against the committed tree your branch \
+         actually carries. It failed: {detail}\n\n\
+         The last of its output:\n\n```\n{tail}\n```\n\n\
+         You have EXACTLY ONE attempt to fix this. If the suite is still red after it, this \
+         build fails and no pull request is opened — nothing you have written reaches anyone.\n\n\
+         Three things to know before you start:\n\
+         1. Editing `{VERIFY_SCRIPT_PATH}` cannot help you. It is read out of the build's BASE \
+         commit, so your version of it is never the one that runs.\n\
+         2. Deleting a failing test, skipping it, or marking it `#[ignore]` is the one repair \
+         that makes this whole check worthless. Do not. If a test is genuinely wrong, fix the \
+         test and say so plainly in `SUMMARY.md`.\n\
+         3. If you change or add tests, account for that in `SUMMARY.md` — it is the pull \
+         request body, and the reviewer reads it rather than this message.\n\n\
+         Fix the failure, commit it, and stop.",
+    )
+}
+
+/// Run the agent to a conclusion, resuming it across dropped API connections.
+///
+/// `base_argv` is the operator's configured command, which is what [`decide`]
+/// reads; `first_argv` is what this particular invocation starts with, and
+/// differs from it only for a repair round (which starts already aimed at a
+/// session).
+async fn agent_loop(
+    workdir: &Path,
+    base_argv: &[String],
+    first_argv: Vec<String>,
+    first_input: String,
+    tx: mpsc::Sender<TaskVmEvent>,
+) -> Result<AgentRun> {
+    let argv = base_argv.to_vec();
     let max_resumes = max_resumes_from_env("BUILDER_MAX_RESUMES");
 
     let before = sample_memory();
-    let mut attempt_argv = argv.clone();
-    let mut input = prompt.to_string();
+    let mut attempt_argv = first_argv;
+    let mut input = first_input;
     let mut resumes = 0u32;
 
     loop {
@@ -932,6 +1613,11 @@ async fn run_agent(
                     ending,
                     resumes,
                     no_resume: Some(no_resume),
+                    // Carried off the run so the repair round has a
+                    // conversation to hand a red suite back to. `None` is an
+                    // agent that never announced one, and the only honest
+                    // response to that is not to resume.
+                    session_id: watcher.session_id().map(str::to_string),
                 });
             }
         }
