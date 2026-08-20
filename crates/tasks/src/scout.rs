@@ -1533,6 +1533,7 @@ fn render_prompt(
          reaches a reviewer looking finished. If you want to record progress, \
          that is what `NOTES.md` is for.\n\
          5. Do NOT create a PR or push anywhere.\n\n\
+         {pipe_clause}\n\n\
          ## Two things about this run that are not true of an ordinary session\n\n\
          **You have {budget_mins} minutes, once.** That is the whole run — \
          the clone before you started, this turn, and the packaging after it \
@@ -1585,6 +1586,12 @@ fn render_prompt(
         field_notes = field_notes,
         directions = directions,
         budget_mins = budget.as_secs() / 60,
+        // Deliberately above the `## Two things` heading rather than under
+        // it: that heading counts its own contents, and a pipe reporting the
+        // wrong status is true of every shell everywhere rather than of this
+        // run. It sits with step 3 — verifying the conclusion — which is
+        // where a Scout decides whether its change works.
+        pipe_clause = crate::prompt::PIPE_EXIT_STATUS,
     )
 }
 
@@ -1994,6 +2001,27 @@ mod tests {
             prompt.contains("`SPEC.md` is not a checkpoint"),
             "and the rule that makes the draft go to NOTES.md is still there: {prompt}"
         );
+    }
+
+    /// #1071: the third clause of that kind and the worst of them, because
+    /// the other two lose a run while this one produces a false pass. Pinned
+    /// as the whole const rather than a keyword, so a paraphrase or a dropped
+    /// splice goes red — and pinned on the near side of the `## Two things`
+    /// heading, because that heading counts its own contents and a pipe
+    /// reporting the wrong status is true of every shell everywhere.
+    #[test]
+    fn the_prompt_says_a_pipe_reports_the_pipes_exit_status() {
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
+        assert!(prompt.contains(crate::prompt::PIPE_EXIT_STATUS), "{prompt}");
+        let (before, after) = prompt
+            .split_once("## Two things about this run")
+            .expect("the heading is still there");
+        assert!(
+            before.contains(crate::prompt::PIPE_EXIT_STATUS),
+            "the clause belongs with step 3, above the heading that counts \
+             its own contents: {prompt}"
+        );
+        assert!(!after.contains(crate::prompt::PIPE_EXIT_STATUS), "{prompt}");
     }
 
     /// #962: an agent backgrounded three `until … sleep 20` waiters over a
