@@ -58,6 +58,7 @@ async fn harness(with_service: bool) -> Harness {
         store.clone(),
         tasks::server::Services {
             bundles: with_service.then(|| Arc::new(bundles.clone())),
+            secrets: None,
             ..Default::default()
         },
     );

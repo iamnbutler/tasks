@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
+use crate::models::{Build, BuildId, Mode, ProjectId, RunKind, SecretName, SpecId, TaskId};
 use crate::version::ImageIdentity;
 
 /// Body of `POST /projects`.
@@ -1043,6 +1043,109 @@ impl Viewer {
 pub struct LabelInfo {
     pub name: String,
     pub description: String,
+}
+
+// --- custody (`/secrets`) ---
+
+/// `POST /secrets/{name}`. The only place a credential appears in the wire
+/// vocabulary at all, and it only ever travels **inbound**: there is no type
+/// here that can carry a value outbound, which is what makes the write-only
+/// property structural rather than a rule somebody remembers.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SetSecret {
+    pub value: String,
+}
+
+/// What is *currently* serving a name — which is not the same question as
+/// whether it is sealed.
+///
+/// Four variants rather than a `bool` beside an `Option`: "sealed, but the
+/// environment is what serves it" is a real state (the unseal key moved) and
+/// the one a human most needs to see, and a renderer is forced by the compiler
+/// to answer all four.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecretSource {
+    /// The sealed store under the data dir. What production should say.
+    Sealed,
+    /// A boot-captured environment variable.
+    Environment { var: String },
+    /// The host's Claude Code `apiKeyHelper` — Anthropic only.
+    ApiKeyHelper { path: String },
+    /// Nothing resolves this name at all.
+    Unset,
+}
+
+impl SecretSource {
+    /// Whether what serves this name is a fallback rather than the store.
+    pub fn is_fallback(&self) -> bool {
+        matches!(
+            self,
+            SecretSource::Environment { .. } | SecretSource::ApiKeyHelper { .. }
+        )
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            SecretSource::Sealed => "the sealed store".into(),
+            SecretSource::Environment { var } => format!("{var} in the environment"),
+            SecretSource::ApiKeyHelper { path } => format!("apiKeyHelper {path}"),
+            SecretSource::Unset => "nothing".into(),
+        }
+    }
+}
+
+/// One name's public metadata. Never a value.
+///
+/// `set_at` and `serving` are independent on purpose: the first is read from
+/// the store file, the second through the live handle. Deriving one from the
+/// other flattens "sealed, but the environment serves it" into a lie whichever
+/// way it falls.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretEntry {
+    pub name: SecretName,
+    /// When it was sealed, or `None` if it is not in the store.
+    pub set_at: Option<DateTime<Utc>>,
+    pub serving: SecretSource,
+}
+
+/// `GET /secrets`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretsStatus {
+    pub store_path: String,
+    pub initialized: bool,
+    /// Where the unseal key lives, as the store header records it.
+    pub key_source: Option<String>,
+    /// One entry per name in the closed set, always — an absent name is
+    /// `set_at: None`, never a missing row.
+    pub entries: Vec<SecretEntry>,
+}
+
+impl SecretsStatus {
+    pub fn entry(&self, name: SecretName) -> Option<&SecretEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+}
+
+/// `POST /secrets/{name}` 201: this call created the store, so the response
+/// has to say where the unseal key went.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretsInitialized {
+    pub store_path: String,
+    pub key_source: String,
+}
+
+/// `POST /secrets/{name}` 200: the write landed and this process cannot read
+/// it back until a restart.
+///
+/// A 2xx and not a 5xx, and that is the whole point of the type: the
+/// ciphertext **is** on disk, and a 5xx renders everywhere as "your paste did
+/// not work", whose obvious human response is to paste again — forever, while
+/// the value was stored correctly every time.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretNeedsRestart {
+    pub name: SecretName,
+    pub detail: String,
 }
 
 #[cfg(test)]

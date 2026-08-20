@@ -75,11 +75,16 @@ const PATH_PREFIXES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 /// changes its name (see [`Op::label`]) and the op does not multiply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// `tasks reload` — refuses if a scout or a build is in flight.
+    /// `tasks reload` — reports work in flight and swaps anyway. The swap
+    /// re-attaches to every live VM, so the worst it costs is one write-off
+    /// that charges no attempt.
     Restart,
-    /// `tasks reload --when-idle` — waits for a drain point instead.
+    /// `tasks reload --when-idle` — waits for a drain point instead, for
+    /// someone who would rather not spend even that.
     RestartWhenIdle,
-    /// `tasks reload --force` — swaps regardless of what is running.
+    /// `tasks reload --force` — swaps against a server that is alive but will
+    /// not answer `/status`. No longer the way past work in flight; nothing
+    /// refuses on that.
     RestartAnyway,
     /// `tasks stop` — immediate, and the one op this window asks about first.
     Stop,
@@ -115,10 +120,12 @@ impl Op {
 
     /// Whether to ask before running it with work in flight.
     ///
-    /// Only the immediate `Stop`: it is the one op that ends the process under
-    /// running work with nothing to hand it to. Every other op either refuses
-    /// on its own (`Restart`, exit 3), waits (`--when-idle`), or has already
-    /// been told twice (`--force`).
+    /// Only the immediate `Stop`, and it keeps the prompt even though a
+    /// *restart* no longer refuses: the premise is not the same. A restart has
+    /// a successor, and `resume_in_flight` re-attaches it to every live VM. A
+    /// stop has none — it leaves those VMs running with nothing following them
+    /// until some later boot writes them off. Every other op either waits
+    /// (`--when-idle`) or replaces the process it interrupts.
     pub fn needs_confirmation(self) -> bool {
         matches!(self, Op::Stop)
     }
@@ -157,7 +164,8 @@ pub enum Outcome {
     /// Exit 1. Overwhelmingly a failed build — which is the one failure that
     /// costs nothing, because `reload` builds before it signals anything.
     BuildFailed,
-    /// Exit 3: work in flight, and a restart would destroy it.
+    /// Exit 3: a server that is alive and will not say what is in flight. No
+    /// longer "work in flight" — nothing refuses on that.
     Busy,
     /// Exit 4: `--when-idle` gave up waiting.
     DrainTimeout,
@@ -190,11 +198,12 @@ impl Outcome {
     pub fn headline(self, op: Op) -> String {
         match (self, op) {
             (Outcome::Done, Op::Stop) => "Stopped. Nothing is serving.".to_string(),
-            // The one lasting consequence of waiting: nothing follows a stop
-            // that could carry the mode, and no boot resumes the stored one.
+            // What waiting left the mode at — a report, not a debt: a boot
+            // takes TASKS_DEFAULT_MODE and overwrites the stored mode before
+            // the listener binds, so nothing needs to put this back.
             (Outcome::Done, Op::StopWhenIdle) => {
-                "Stopped once the work had landed. Nothing is serving, and dispatch \
-                 is left paused."
+                "Stopped once the work had landed. Nothing is serving; the mode was left \
+                 paused, and the next boot takes TASKS_DEFAULT_MODE regardless."
                     .to_string()
             }
             (Outcome::Done, _) => "Up. The new build is serving.".to_string(),
@@ -211,7 +220,7 @@ impl Outcome {
                     .to_string()
             }
             (Outcome::Busy, _) => {
-                "Refused: work is in flight that a restart would destroy.".to_string()
+                "Refused: the server would not say what is in flight.".to_string()
             }
             (Outcome::DrainTimeout, op) if op.stops() => {
                 "Gave up waiting for a drain point; nothing was stopped.".to_string()

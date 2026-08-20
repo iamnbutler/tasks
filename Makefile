@@ -56,7 +56,8 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         check-signing check-notary release-bundle sign notarize dmg \
         notarize-dmg verify-release check-clean-tree release release-clean \
         app-check app-stubs app-test \
-        server serve restart status stop drain resume check-quiesced \
+        server serve restart status stop drain resume \
+        images-rebuild \
         migration verify-warm site-check
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
@@ -452,7 +453,8 @@ verify-release: check-darwin
 
 # A release names a commit — #997 tags them v0.1.<commit count>, the same
 # number BUILD_VERSION already carries — so a dirty tree makes the tag a lie.
-# FORCE=1 overrides, matching the `make images` convention.
+# FORCE=1 overrides, the escape-hatch convention this Makefile uses wherever a
+# recipe would otherwise refuse.
 check-clean-tree:
 	@if [ -n "$(FORCE)" ]; then \
 		echo "FORCE=$(FORCE): releasing a dirty tree; $(BUILD_VERSION) will not name what shipped"; \
@@ -602,11 +604,11 @@ status: server
 stop: server
 	@$(TASKS_BIN) stop $(STOP)
 
-# Quiesce the pipeline for host work this repo's own tooling has to do to the
-# machine rather than to the server: restarting vm-pool (the successor stops
-# its predecessor's containers off the orphan ledger) and `make images`.
-# Neither is something `tasks reload` covers, because a reload re-attaches to
-# every live VM and these do not.
+# Quiesce the pipeline for the one host act with no recovery: restarting
+# vm-pool on the same socket, where the successor stops its predecessor's
+# containers off the orphan ledger. `tasks reload` does not need this (a reload
+# re-attaches to every live VM) and neither does `make images` any more — that
+# wraps `tasks hold`, which holds for the rebuild's own duration.
 #
 # `make drain DRAIN=--cancel-scouts` stops running scouts instead of waiting
 # them out. The hold outlives the command: `make resume` is what gives it back.
@@ -615,23 +617,6 @@ drain: server
 
 resume: server
 	@$(TASKS_BIN) resume
-
-# The gate `make images` runs before it rebuilds anything, and the reason it
-# is not merely advisory: a scout dispatched while the rebuild is in flight
-# starts in the OLD image — the #909 staleness the update hold exists to
-# prevent, and the one case it cannot see, since the identity it reads is only
-# ever observed from a run that has already started.
-#
-# It passes with nothing serving (no dispatcher, nothing that can start a
-# container), and refuses a *playing* pipeline even with nothing in flight,
-# because the dispatcher tops scouts up on its next tick. FORCE=1 is the
-# escape hatch for someone who knows better.
-check-quiesced: server
-	@if [ -n "$(FORCE)" ]; then \
-		echo "FORCE=$(FORCE): skipping the drain check"; \
-	else \
-		$(TASKS_BIN) drain --check; \
-	fi
 
 # Prime the orchestrator's verification build directory, so the first merge
 # decision it makes is not also the first cold build.
@@ -772,12 +757,28 @@ image-builder: image-agent builder-supervisor-linux
 	container build -t builder:v1 images/builder
 	rm -f images/builder/builder-supervisor
 
+# The rebuild, wrapped in a hold rather than gated on a human.
+#
+# What a rebuild can actually spoil is a run DISPATCHED INTO it: that one
+# starts in the OLD image — the #909 staleness the update hold exists to
+# prevent and the one case it cannot see, since the identity it reads is only
+# ever observed from a run that has already started. A run that started
+# earlier is not that case, so there is nothing here to wait for.
+#
+# `tasks hold` pauses dispatch, runs the sub-make as its own child, and puts
+# the mode back the instant that child exits — success, failure or Ctrl-C —
+# exiting with its status. A parent process rather than two recipe lines,
+# because a `make` that died between a `tasks drain` and a `tasks resume`
+# would leave the pipeline paused with nothing left running that knows to undo
+# it. That is why `images-rebuild` exists as a target: `hold` needs exactly one
+# command to be the parent of.
+images: server
+	@$(TASKS_BIN) hold --label 'make images' -- $(MAKE) --no-print-directory images-rebuild
+
 # Sub-makes rather than prerequisites, for the reason `app`, `run` and
 # `images-check` already give: `make -j` gives prerequisites no ordering at
-# all, and every property of this sequence is an ordering. The gate has to run
-# *before* the build, or it is checking the state the rebuild already raced.
-images:
-	@$(MAKE) --no-print-directory check-quiesced
+# all, and every property of this sequence is an ordering.
+images-rebuild:
 	@$(MAKE) --no-print-directory image-scout
 	@$(MAKE) --no-print-directory image-builder
 	@$(MAKE) --no-print-directory images-check

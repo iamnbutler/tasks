@@ -136,44 +136,15 @@ const UNSEAL_KEY_BYTES: usize = 32;
 const SALT_BYTES: usize = 16;
 const NONCE_BYTES: usize = 12;
 
+use tasks_api::http::{SecretEntry, SecretSource, SecretsStatus};
 /// The closed set of secrets this system holds. Closed on purpose: an open
 /// namespace would invite values nothing reads, and the broker's scopes and
 /// the redaction deny-list are both written against these two names.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SecretName {
-    AnthropicApiKey,
-    GithubToken,
-}
-
-impl SecretName {
-    pub const ALL: [SecretName; 2] = [SecretName::AnthropicApiKey, SecretName::GithubToken];
-
-    /// The store-file / CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SecretName::AnthropicApiKey => "anthropic-api-key",
-            SecretName::GithubToken => "github-token",
-        }
-    }
-
-    /// The environment variable this entry supersedes.
-    pub fn env_var(self) -> &'static str {
-        match self {
-            SecretName::AnthropicApiKey => "ANTHROPIC_API_KEY",
-            SecretName::GithubToken => "GITHUB_TOKEN",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|n| n.as_str() == raw)
-    }
-}
-
-impl std::fmt::Display for SecretName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+///
+/// Defined in `tasks-api` and re-exported here, so the sealed store's JSON
+/// key, the `tasks secrets` argument and the `/secrets/{name}` path segment
+/// are the same string by construction rather than by two copies agreeing.
+pub use tasks_api::models::SecretName;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretsError {
@@ -1428,4 +1399,170 @@ mod tests {
         }
         assert_eq!(SecretName::parse("nope"), None);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The custody service (`/secrets`)
+// ---------------------------------------------------------------------------
+
+/// Where a seal put the value, and whether it created the store on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealedInto {
+    /// The store was already there.
+    ExistingStore,
+    /// This call created it. The response has to say where the unseal key
+    /// went, which is the whole reason this variant carries it.
+    NewStore { path: PathBuf, key_source: String },
+}
+
+/// What actually happened, as distinct from what was attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealOutcome {
+    /// The value is sealed and this process resolves it from the store.
+    Sealed,
+    /// The write landed and this process cannot read it back.
+    ///
+    /// [`Secrets::refresh_if_changed`]'s late unlock is one-shot per process,
+    /// so a server whose single attempt already failed writes ciphertext it
+    /// cannot open. A bare success there would be a lie in the expensive
+    /// direction — the paste looks accepted and the pipeline goes on spending
+    /// the old credential — and a 5xx would be a lie in the *other* expensive
+    /// direction, since the ciphertext is on disk and "paste it again" would
+    /// fail identically forever.
+    NeedsRestart,
+}
+
+/// The custody acts `tasks secrets` gives an operator at a terminal, over the
+/// loopback API — with no second implementation of custody behind them.
+///
+/// It holds the *same* live [`Secrets`] handle the poller and the broker read
+/// through, so `serving` below cannot disagree with what the pipeline spends.
+pub struct Custody {
+    data_dir: PathBuf,
+    secrets: Secrets,
+}
+
+impl Custody {
+    pub fn new(data_dir: PathBuf, secrets: Secrets) -> Self {
+        Self { data_dir, secrets }
+    }
+
+    /// Names, timestamps, the key-source line, and per name what is currently
+    /// serving it. Never a value.
+    ///
+    /// `NotInitialized` is folded to `initialized: false` rather than
+    /// propagated: "there is no store yet" is an answer, not a failure, and it
+    /// is the answer a first-run client needs.
+    pub fn status(&self) -> Result<SecretsStatus, SecretsError> {
+        let path = store_path(&self.data_dir);
+        let store = match status(&self.data_dir) {
+            Ok(status) => Some(status),
+            Err(SecretsError::NotInitialized(_)) => None,
+            Err(err) => return Err(err),
+        };
+        let entries = SecretName::ALL
+            .into_iter()
+            .map(|name| SecretEntry {
+                name,
+                set_at: store
+                    .as_ref()
+                    .and_then(|s| s.entries.iter().find(|e| e.name == name).map(|e| e.set_at)),
+                serving: wire_source(self.secrets.source_of(name)),
+            })
+            .collect();
+        Ok(SecretsStatus {
+            store_path: path.display().to_string(),
+            initialized: store.is_some(),
+            key_source: store.as_ref().map(|s| s.key_source.clone()),
+            entries,
+        })
+    }
+
+    /// Seal `value` under `name`, creating the store if there is none.
+    ///
+    /// Auto-init goes through [`init`] **itself**, which is the whole argument
+    /// for allowing it at all: `init` is the only function that decides where
+    /// an unseal key goes, so a paste-created store cannot pick a different
+    /// key source than a terminal-created one, and there is no second code
+    /// path for a second custody location to exist in.
+    ///
+    /// It refuses one case the CLI does not. [`keychain_write`] is
+    /// `set_password`, which on macOS is find-then-modify-**in-place**, and
+    /// `init` guards on the *store* existing and never on the credential-store
+    /// item — so a data dir with no store on a host that still holds a
+    /// `tasks-v2-secrets` item (an older data dir, a restored backup, a
+    /// deleted `secrets/`) would auto-init and overwrite the unseal key for
+    /// *that* store, stranding it permanently. A human typed those words at a
+    /// terminal; a paste field must not decide it for them.
+    pub fn seal(
+        &self,
+        name: SecretName,
+        value: &crate::redact::Secret,
+    ) -> Result<(SealedInto, SealOutcome), SecretsError> {
+        let path = store_path(&self.data_dir);
+        let into = match path.exists() {
+            true => SealedInto::ExistingStore,
+            false => {
+                if unseal_key_present() {
+                    return Err(SecretsError::Key(format!(
+                        "there is no sealed store at {} but this host already holds a \
+                         `{KEYCHAIN_SERVICE}` credential-store item. Creating one here would \
+                         overwrite that key in place and strand whatever store it belongs to. \
+                         Point TASKS_SECRETS_KEY_FILE at a key file, or run `tasks secrets \
+                         init` at a terminal, where the choice is yours to make",
+                        path.display()
+                    )));
+                }
+                let created = init(&self.data_dir, None)?;
+                let key_source = status(&self.data_dir)
+                    .map(|s| s.key_source)
+                    .unwrap_or_else(|_| "unknown".into());
+                SealedInto::NewStore {
+                    path: created,
+                    key_source,
+                }
+            }
+        };
+
+        set(&self.data_dir, name, value.expose())?;
+
+        // Ask what is serving it *now*, rather than assuming the write is
+        // readable: this is the one-shot late unlock above.
+        let outcome = match self.secrets.source_of(name) {
+            Some(CredentialSource::Sealed) => SealOutcome::Sealed,
+            _ => SealOutcome::NeedsRestart,
+        };
+        Ok((into, outcome))
+    }
+
+    /// Remove `name`. Answers whether it was there.
+    pub fn unseal(&self, name: SecretName) -> Result<bool, SecretsError> {
+        match remove(&self.data_dir, name) {
+            Err(SecretsError::NotInitialized(_)) => Ok(false),
+            other => other,
+        }
+    }
+}
+
+fn wire_source(source: Option<CredentialSource>) -> SecretSource {
+    match source {
+        Some(CredentialSource::Sealed) => SecretSource::Sealed,
+        Some(CredentialSource::Environment(var)) => SecretSource::Environment {
+            var: var.to_string(),
+        },
+        Some(CredentialSource::ApiKeyHelper(path)) => SecretSource::ApiKeyHelper {
+            path: path.display().to_string(),
+        },
+        None => SecretSource::Unset,
+    }
+}
+
+/// Whether *any* unseal key is already parked under this host's credential
+/// store, by either read path.
+///
+/// Either one answering means an item is there, which is all
+/// [`Custody::seal`] needs to know — it does not care which read wins, so
+/// this is independent of the keyring/`security` question (#1003).
+fn unseal_key_present() -> bool {
+    native_key_read().is_ok() || legacy_security_read().is_some()
 }

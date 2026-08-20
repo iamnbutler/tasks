@@ -10,8 +10,11 @@
 //! 2. **report** what is in flight, with ages, so "this would kill a scout
 //!    that has been running for 20 minutes" is a thing you are told rather
 //!    than a thing you discover;
-//! 3. **gate** on that report unless told otherwise (`--when-idle`,
-//!    `--force`);
+//! 3. **gate** — on a server that is alive and silent, and on nothing else.
+//!    Work in flight is *reported* rather than refused: `resume_in_flight`
+//!    re-attaches to every live VM, so a swap costs at most one `Orphaned`
+//!    write-off, which charges no attempt. `--when-idle` waits for a drain
+//!    point for someone who would rather not spend even that;
 //! 4. **swap** with SIGTERM and a real wait for the pid to be gone;
 //! 5. **verify** against the *new* pid, and print the migrations that boot
 //!    applied.
@@ -54,6 +57,7 @@ use tasks_api::http::{CancelAck, CancelRunRequest, InFlight, ModeResponse, Serve
 use tasks_api::models::Mode;
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::signal::unix::{Signal, SignalKind};
 
 use crate::pidfile::{self, PidFile};
 
@@ -125,7 +129,8 @@ pub struct ReloadOptions {
     pub when_idle: bool,
     /// How long `--when-idle` waits before giving up.
     pub drain_timeout: Duration,
-    /// Swap regardless of what is in flight.
+    /// Swap against a server that is alive but will not answer `/status`.
+    /// No longer the way past work in flight — nothing refuses on that.
     pub force: bool,
     /// Replace this process with the new server rather than spawning it into
     /// the background — the log in your terminal *is* the verification.
@@ -196,6 +201,9 @@ enum ModeAfterDrain {
     LeftPaused,
     /// The pause *is* the point: it is held until `tasks resume`.
     HeldForMaintenance,
+    /// The pause lasts exactly as long as a child process this command
+    /// started, and is put back the instant that child exits.
+    HeldForCommand,
 }
 
 impl ModeAfterDrain {
@@ -210,6 +218,9 @@ impl ModeAfterDrain {
             }
             ModeAfterDrain::HeldForMaintenance => {
                 "paused dispatch (it stays paused until `tasks resume`)"
+            }
+            ModeAfterDrain::HeldForCommand => {
+                "paused dispatch (it goes back the moment the command exits)"
             }
         }
     }
@@ -229,6 +240,11 @@ impl ModeAfterDrain {
                 "the pipeline is not quiesced and dispatch was left as it was — do not \
                  restart vm-pool or rebuild images yet"
             }
+            // Unreachable: a hold never waits for a drain point. Spelled out
+            // anyway, so the match stays exhaustive by construction and a
+            // fifth variant is a compile error rather than a wildcard's
+            // problem.
+            ModeAfterDrain::HeldForCommand => "nothing was run",
         }
     }
 
@@ -246,6 +262,10 @@ impl ModeAfterDrain {
                 "`tasks drain`: dispatch is held for host maintenance (a vm-pool restart or \
                  `make images`); `tasks resume` releases it",
             ),
+            ModeAfterDrain::HeldForCommand => Some(
+                "`tasks hold`: dispatch is paused for the duration of a host command; it goes \
+                 back when that command exits",
+            ),
         }
     }
 
@@ -258,6 +278,9 @@ impl ModeAfterDrain {
                 "`tasks drain` timed out before the pipeline was quiesced; dispatch is back \
                  to play and nothing is held",
             ),
+            ModeAfterDrain::HeldForCommand => {
+                Some("`tasks hold`: the command has exited and dispatch is back to play")
+            }
         }
     }
 }
@@ -287,8 +310,12 @@ impl Default for StopOptions {
 #[derive(Debug, Clone)]
 pub struct Stopped {
     pub file: PidFile,
-    /// The drain paused dispatch and nothing will undo it — a boot takes its
-    /// configured default, so the next server does not resume it either.
+    /// The drain paused dispatch and nothing put it back. Not a debt: a boot
+    /// takes `TASKS_DEFAULT_MODE` and overwrites the stored mode before the
+    /// listener binds, and nothing reads the column in between — so the
+    /// successor's mode is that variable's, never this one's. What this still
+    /// cannot do is put it back *before* the SIGTERM, which would hand the
+    /// dispatcher a window for one last scout.
     pub left_paused: bool,
 }
 
@@ -397,24 +424,31 @@ pub async fn reload(opts: ReloadOptions) -> Result<(), ReloadError> {
         paused_for_drain: false,
     };
 
-    if status.in_flight.is_destructible() && !opts.force {
+    if status.in_flight.is_destructible() {
         if !opts.when_idle {
-            return Err(ReloadError::Busy(format!(
-                "{} in flight; a restart would destroy it. \
-                 `--when-idle` waits for a drain point, `--force` swaps anyway",
+            // Reported, never refused. `resume_in_flight` re-attaches to every
+            // still-running session and build that names a live VM, so the
+            // worst case is one `Orphaned` write-off, which charges no
+            // attempt. `--when-idle` stays as the opt-in for someone who
+            // would rather wait than spend that.
+            println!(
+                "note: {} in flight; the swap re-attaches to it \
+                 (`--when-idle` waits for a drain point instead)",
                 describe(&status.in_flight)
-            )));
+            );
+        } else {
+            // 4. Drain. Pausing is load-bearing, not politeness: with a
+            //    non-empty queue the dispatcher starts a fresh scout the moment
+            //    one finishes, so a wait that did not pause would never
+            //    terminate.
+            handover.paused_for_drain = drain(
+                existing.port,
+                status.mode,
+                opts.drain_timeout,
+                ModeAfterDrain::Restored,
+            )
+            .await?;
         }
-        // 4. Drain. Pausing is load-bearing, not politeness: with a non-empty
-        //    queue the dispatcher starts a fresh scout the moment one
-        //    finishes, so a wait that did not pause would never terminate.
-        handover.paused_for_drain = drain(
-            existing.port,
-            status.mode,
-            opts.drain_timeout,
-            ModeAfterDrain::Restored,
-        )
-        .await?;
     }
 
     if status.in_flight.orchestrator.is_some() {
@@ -869,13 +903,22 @@ async fn wait_for_idle(file: &PidFile, timeout: Duration) -> Result<bool, Reload
     drain(file.port, status.mode, timeout, ModeAfterDrain::LeftPaused).await
 }
 
-/// The undo for the pause a `--when-idle` stop leaves behind. Printed last, so
-/// the lasting consequence is the last thing said.
+/// What a `--when-idle` stop left the mode at. Printed last, so the reader's
+/// last question is answered last.
+///
+/// This is a *report*, not a debt. The pause cannot outlive the process it was
+/// written into: [`crate::run::apply_startup_mode`] overwrites the stored mode
+/// from `TASKS_DEFAULT_MODE` before the next listener binds, and between the
+/// SIGTERM and that boot nothing reads the column at all. So the successor's
+/// mode is decided by `TASKS_DEFAULT_MODE` on this host and by nothing that
+/// happened here. The `curl` is for the one case where it matters — a server
+/// that is already back up and is not the mode you wanted.
 pub fn render_left_paused(port: u16) -> String {
     format!(
-        "dispatch is left paused, and no boot will resume it. Once a server is up: \
-         curl -sS -X POST localhost:{port}/mode -H 'content-type: application/json' \
-         -d '{{\"mode\":\"play\"}}'"
+        "dispatch was paused for the drain and nothing put it back — but nothing needs to: \
+         the next boot takes TASKS_DEFAULT_MODE (default pause) whatever is stored. \
+         If a server is already up: curl -sS -X POST localhost:{port}/mode \
+         -H 'content-type: application/json' -d '{{\"mode\":\"play\"}}'"
     )
 }
 
@@ -890,7 +933,7 @@ const CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Copy)]
 pub struct DrainOptions {
     /// Report whether the pipeline is quiesced and exit. Touches neither the
-    /// mode nor any run — this is what `make images` gates on.
+    /// mode nor any run — a diagnostic, and nothing in the repo gates on it.
     pub check: bool,
     /// Cancel running scouts rather than waiting them out. Strictly opt-in,
     /// and never the default: waiting costs time, cancelling costs work.
@@ -1006,7 +1049,12 @@ pub async fn drain_for_maintenance(
     })
 }
 
-/// `--check`: is this host safe to do the destructive work on *right now*?
+/// `--check`: is this host quiesced *right now*?
+///
+/// A **diagnostic**, and since #1070 nothing in the repo refuses on it: `make
+/// images` wraps its rebuild in `tasks hold` instead, which holds for the
+/// rebuild's own duration rather than for a human's drain-resume cycle. The
+/// exit code is kept for a script that wants to branch on the answer.
 ///
 /// Two conditions, and the second is the one that is easy to miss. Nothing in
 /// flight is not enough: a *playing* pipeline with nothing in flight tops
@@ -1061,6 +1109,273 @@ pub fn render_quiesced(drained: &Drained) -> String {
          when the host work is done: tasks resume   (or curl -sS -X POST \
          localhost:{port}/mode -H 'content-type: application/json' -d '{{\"mode\":\"play\"}}')"
     )
+}
+
+// --- the command hold ---
+
+/// How long a signalled child gets to die before we stop waiting for it and
+/// report the signal anyway. The hold's restore must not be blocked by a
+/// rebuild that ignores its interrupt.
+const CHILD_SIGNAL_GRACE: Duration = Duration::from_secs(20);
+
+/// What `tasks hold` was asked to do.
+#[derive(Debug, Clone)]
+pub struct HoldOptions {
+    /// The command to run, argv-style. Everything after `--`.
+    pub command: Vec<String>,
+    /// What to call this hold in the output. Cosmetic; the argv is the truth.
+    pub label: Option<String>,
+}
+
+/// Whether the mode this call installed was put back, and what happened if
+/// not. Separate from [`Held`] because the interesting failures are all here:
+/// a hold that ran the command perfectly and could not undo itself is the one
+/// outcome a reader has to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restore {
+    /// This call never installed a pause, so there is nothing to put back.
+    NotNeeded,
+    /// Dispatch is playing again.
+    Done,
+    /// Somebody moved the mode while the command ran, so it is no longer the
+    /// pause this command installed and it is left exactly as found. The
+    /// window is the command's own duration and the *human* wins it — a
+    /// restore that promoted a deliberate `stop` back to `play` would be the
+    /// same error `pause_dispatch` refuses to make at the other end.
+    Superseded(Mode),
+    /// The mode could not be put back. The pipeline is paused and nothing
+    /// else will undo it.
+    Failed(String),
+}
+
+/// What a hold held, if anything. The command runs in every arm — a hold that
+/// refused to run the command would be the gate this replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// No live server. Nothing dispatches, so nothing needed holding.
+    NotServing,
+    /// A server is alive but will not say what state it is in, so the command
+    /// ran **unheld**.
+    ///
+    /// This is the one honest arm of the old `drain --check` refusal, inverted
+    /// rather than deleted: refusing was right while the promise was
+    /// quiescence, and the promise now is only that nothing *new* dispatches
+    /// into the command. The cost of running anyway is at most one run
+    /// starting in the old image — which reports itself through
+    /// `ImageFreshness` the moment it does — against a rebuild that does not
+    /// happen at all.
+    Unheld { port: u16 },
+    /// The command ran with dispatch held.
+    Held {
+        port: u16,
+        /// Whether *this* call installed the pause.
+        paused: bool,
+        restore: Restore,
+    },
+}
+
+/// A hold's two answers: what it held, and what the child exited with.
+#[derive(Debug, Clone)]
+pub struct HoldOutcome {
+    pub held: Held,
+    /// The child's status, `128 + signum` for a signal death — the shell
+    /// convention, so a recipe that propagates this says what it would have
+    /// said unwrapped.
+    pub code: i32,
+}
+
+/// `tasks hold -- <command>`: pause dispatch, run `command` as our own child,
+/// and put the mode back the instant it exits.
+///
+/// **A run already in flight is not a reason to refuse.** What a host act like
+/// `make images` can actually spoil is a run *dispatched into it* — which
+/// starts in the old image, the #909 staleness [`crate::updates`] structurally
+/// cannot see, since the identity it reads comes only from a run that has
+/// already started. A run that started earlier is not that case, and what a
+/// `container build` does to an already-running container is deliberately not
+/// what this rests on: if it does disturb one, that run dies `Transport` /
+/// `Orphaned`, charges no attempt and is re-dispatched.
+///
+/// **The hold is a parent process, not two recipe lines.** `tasks hold` before
+/// and `tasks resume` after would reintroduce exactly the failure being
+/// removed: a `make` that dies in between leaves the pipeline paused with
+/// nothing left running that knows to undo it.
+///
+/// So the restore runs **before the child's outcome is inspected** and is
+/// unconditional, and a SIGINT or SIGTERM of *this* process runs it too (and
+/// forwards the signal on, so the rebuild actually stops). The one case that
+/// still strands a pause is a **SIGKILL of this process**, which nothing can
+/// catch: `tasks resume` puts it back, or
+/// `curl -sS -X POST localhost:<port>/mode -H 'content-type: application/json'
+/// -d '{"mode":"play"}'`.
+///
+/// It waits for nothing and cancels nothing — it is not a drain. For a host
+/// act that destroys *running* work (restarting vm-pool on the same socket)
+/// that is still [`drain_for_maintenance`], and it is that command's only
+/// caller.
+pub async fn hold_for_command(
+    data_dir: &Path,
+    opts: HoldOptions,
+) -> Result<HoldOutcome, ReloadError> {
+    if opts.command.is_empty() {
+        return Err(ReloadError::Other(
+            "nothing to run: `tasks hold [--label TEXT] -- <command>`".into(),
+        ));
+    }
+    let what = opts.label.clone().unwrap_or_else(|| opts.command.join(" "));
+
+    let Some(file) = pidfile::read_live(data_dir) else {
+        println!("not serving — nothing dispatches, so nothing needs holding");
+        let code = run_child(&opts.command).await?;
+        return Ok(HoldOutcome {
+            held: Held::NotServing,
+            code,
+        });
+    };
+
+    let Ok(status) = fetch_status(file.port).await else {
+        println!(
+            "pid {} is alive but is not answering /status on port {}, so dispatch cannot be \
+             held; running `{what}` unheld. At most one run may start in the old image, and \
+             it reports its own identity when it does",
+            file.pid, file.port
+        );
+        let code = run_child(&opts.command).await?;
+        return Ok(HoldOutcome {
+            held: Held::Unheld { port: file.port },
+            code,
+        });
+    };
+
+    let paused = pause_dispatch(file.port, status.mode, ModeAfterDrain::HeldForCommand).await?;
+    println!("running: {what}");
+
+    let ran = run_child(&opts.command).await;
+    // Before the outcome is inspected, and whatever it was: the whole reason
+    // the child is ours is that its failure must not strand the hold.
+    let restore = restore_after_hold(file.port, paused).await;
+    let code = ran?;
+
+    Ok(HoldOutcome {
+        held: Held::Held {
+            port: file.port,
+            paused,
+            restore,
+        },
+        code,
+    })
+}
+
+/// Put the mode back, unless somebody else has moved it in the meantime.
+async fn restore_after_hold(port: u16, paused: bool) -> Restore {
+    if !paused {
+        return Restore::NotNeeded;
+    }
+    // Re-read rather than writing `play` unconditionally. If a human set
+    // `stop` from the app while the rebuild ran, this is no longer the pause
+    // this command installed, and "restoring" it would promote them.
+    // An unreadable status still restores: a hold left on is the worse error.
+    if let Ok(status) = fetch_status(port).await
+        && status.mode != Mode::Pause
+    {
+        return Restore::Superseded(status.mode);
+    }
+    match set_mode(
+        port,
+        Mode::Play,
+        ModeAfterDrain::HeldForCommand.restore_note(),
+    )
+    .await
+    {
+        Ok(()) => Restore::Done,
+        Err(err) => Restore::Failed(err),
+    }
+}
+
+/// Run the child, forwarding SIGINT/SIGTERM to it and answering with the
+/// shell's own status convention.
+///
+/// Ctrl-C during a multi-minute image rebuild is ordinary behaviour, not an
+/// edge case, so the signal arms are what make the restore above reliable
+/// rather than merely likely.
+async fn run_child(command: &[String]) -> Result<i32, ReloadError> {
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .spawn()
+        .map_err(|err| ReloadError::Other(format!("could not run `{}`: {err}", command[0])))?;
+    let pid = child.id();
+
+    let mut interrupt = unix_signal(SignalKind::interrupt())?;
+    let mut terminate = unix_signal(SignalKind::terminate())?;
+
+    let signum = tokio::select! {
+        status = child.wait() => return Ok(exit_code(status?)),
+        _ = interrupt.recv() => libc_sigint(),
+        _ = terminate.recv() => libc_sigterm(),
+    };
+
+    if let Some(pid) = pid {
+        signal(
+            pid,
+            if signum == libc_sigint() {
+                "INT"
+            } else {
+                "TERM"
+            },
+        )
+        .await;
+    }
+    // Bounded: the restore must not be blocked by a child that ignores it.
+    let _ = tokio::time::timeout(CHILD_SIGNAL_GRACE, child.wait()).await;
+    Ok(128 + signum)
+}
+
+fn unix_signal(kind: SignalKind) -> Result<Signal, ReloadError> {
+    tokio::signal::unix::signal(kind)
+        .map_err(|err| ReloadError::Other(format!("could not install a signal handler: {err}")))
+}
+
+fn libc_sigint() -> i32 {
+    2
+}
+
+fn libc_sigterm() -> i32 {
+    15
+}
+
+/// A child's status as a shell reports it: its own code, or `128 + signum`.
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    })
+}
+
+/// What the hold held and what it left behind. Pure and rendered from the
+/// outcome, like [`render_quiesced`], so every arm is unit-testable.
+pub fn render_held(held: &Held) -> String {
+    match held {
+        Held::NotServing => String::new(),
+        Held::Unheld { .. } => "dispatch was never held: the server would not say what state \
+             it is in"
+            .into(),
+        Held::Held { paused: false, .. } => {
+            "dispatch was already not playing, so nothing was held and nothing was put back".into()
+        }
+        Held::Held { restore, port, .. } => match restore {
+            Restore::NotNeeded | Restore::Done => "dispatch is playing again".into(),
+            Restore::Superseded(mode) => format!(
+                "dispatch is {}: the mode was changed while the command ran, so the pause was \
+                 left as found rather than promoted back to play",
+                mode.as_str()
+            ),
+            Restore::Failed(err) => format!(
+                "dispatch is STILL PAUSED — could not put the mode back: {err}\n\
+                 release it with: tasks resume   (or curl -sS -X POST localhost:{port}/mode \
+                 -H 'content-type: application/json' -d '{{\"mode\":\"play\"}}')"
+            ),
+        },
+    }
 }
 
 /// Ask the server to stop every running scout, and report what it answered.
@@ -1801,6 +2116,99 @@ mod tests {
             )
             .contains("dispatch is held")
         );
+    }
+
+    /// The fourth `ModeAfterDrain` says what it is for in each of its four
+    /// notes, and the unreachable one is spelled out rather than wildcarded.
+    #[test]
+    fn the_command_hold_says_the_mode_comes_back_by_itself() {
+        let held = ModeAfterDrain::HeldForCommand;
+        assert!(
+            held.pause_note().contains("the command exits"),
+            "{}",
+            held.pause_note()
+        );
+        assert!(
+            held.feed_note().unwrap().contains("`tasks hold`"),
+            "the feed edge names the command that installed it"
+        );
+        assert!(
+            held.restore_note().unwrap().contains("back to play"),
+            "and the edge that takes it off"
+        );
+        // Unreachable in production — a hold never waits for a drain point —
+        // and present so the match cannot be closed with a wildcard.
+        assert_eq!(held.nothing_happened(), "nothing was run");
+        // The maintenance hold is still the one that outlives its command.
+        assert!(
+            ModeAfterDrain::HeldForMaintenance
+                .pause_note()
+                .contains("tasks resume")
+        );
+    }
+
+    /// Every arm of what a hold leaves behind, and the one that matters is the
+    /// failure: a pipeline left paused has to say so and say the undo.
+    #[test]
+    fn render_held_answers_for_every_way_a_hold_ends() {
+        assert_eq!(render_held(&Held::NotServing), "");
+
+        let unheld = render_held(&Held::Unheld { port: 4800 });
+        assert!(unheld.contains("never held"), "{unheld}");
+
+        let untouched = render_held(&Held::Held {
+            port: 4800,
+            paused: false,
+            restore: Restore::NotNeeded,
+        });
+        assert!(
+            untouched.contains("already not playing"),
+            "a pipeline that was not playing is not promoted: {untouched}"
+        );
+
+        let done = render_held(&Held::Held {
+            port: 4800,
+            paused: true,
+            restore: Restore::Done,
+        });
+        assert_eq!(done, "dispatch is playing again");
+
+        let superseded = render_held(&Held::Held {
+            port: 4800,
+            paused: true,
+            restore: Restore::Superseded(Mode::Stop),
+        });
+        assert!(superseded.contains("stop"), "{superseded}");
+        assert!(
+            superseded.contains("left as found"),
+            "a human who moved the mode wins the race: {superseded}"
+        );
+
+        let failed = render_held(&Held::Held {
+            port: 4800,
+            paused: true,
+            restore: Restore::Failed("connection refused".into()),
+        });
+        assert!(failed.contains("STILL PAUSED"), "{failed}");
+        assert!(
+            failed.contains("tasks resume") && failed.contains("4800"),
+            "the undo is named, both ways: {failed}"
+        );
+    }
+
+    /// A shell reports a signal death as `128 + signum`, and so does a hold —
+    /// so a recipe that propagates its status says what it would have said
+    /// unwrapped.
+    #[test]
+    fn a_signal_death_is_reported_the_way_a_shell_reports_it() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit_code(std::process::ExitStatus::from_raw(0)),
+            0,
+            "a clean exit"
+        );
+        // Raw wait status: low byte is the signal, so 9 is SIGKILL.
+        assert_eq!(exit_code(std::process::ExitStatus::from_raw(9)), 128 + 9);
     }
 
     /// The third hold reports like the other two: silent until it binds, and
