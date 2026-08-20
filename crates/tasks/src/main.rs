@@ -38,6 +38,10 @@ usage:
                                 machine and print a checklist; reports and
                                 never fixes, exits 1 on any failure
   tasks add-project <owner/repo>  track a GitHub repository
+  tasks auth login              sign in to GitHub by device flow: shows a
+                                code to enter at github.com/login/device and
+                                seals the resulting token as github-token —
+                                no PAT to mint, no scopes to choose
   tasks secrets <subcommand>    custody of the upstream credentials: seal
                                 ANTHROPIC_API_KEY / GITHUB_TOKEN under the
                                 data dir so no raw key lives in .env, the
@@ -281,6 +285,25 @@ are never dispatched until something queues them explicitly.
 Removal is archive, never delete: POST /projects/{id}/status.
 ";
 
+const AUTH_USAGE: &str = "\
+usage: tasks auth login
+
+Sign in to GitHub with the OAuth device flow (#1002): print a one-time code,
+wait while you enter it at github.com/login/device, and seal the resulting
+token into the sealed store as `github-token` — the same place
+`tasks secrets set github-token` writes, so the poller, the broker and the
+leases pick it up with no restart and no configuration.
+
+Compared to minting a PAT by hand: there are no scopes to choose (the app
+asks for what the pipeline exercises — repo, workflow), no value to paste,
+and nothing readable in `ps` or shell history. The store must exist first:
+`tasks secrets init`.
+
+The token is requested non-expiring, and an expiring one is refused rather
+than sealed — if that happens, the OAuth app's \"Expire user access tokens\"
+setting was re-enabled and needs unchecking (see #1002).
+";
+
 const SECRETS_USAGE: &str = "\
 usage: tasks secrets <init|set|status|rm|rehome-key> [args]
 
@@ -412,6 +435,7 @@ fn usage_for(command: &str) -> &'static str {
         "resume" => RESUME_USAGE,
         "doctor" => DOCTOR_USAGE,
         "add-project" => ADD_PROJECT_USAGE,
+        "auth" => AUTH_USAGE,
         "secrets" => SECRETS_USAGE,
         "vm-pool" => VM_POOL_USAGE,
         "service" => SERVICE_USAGE,
@@ -474,6 +498,7 @@ async fn dispatch(env_sources: Vec<tasks::env_file::Source>) -> Result<()> {
         Some("resume") => resume_cmd(&args[1..]).await,
         Some("doctor") => doctor_cmd(&args[1..], env_sources).await,
         Some("add-project") => add_project(&args[1..]).await,
+        Some("auth") => auth_cmd(&args[1..]).await,
         Some("secrets") => secrets_cmd(&args[1..]),
         Some("service") => service_cmd(&args[1..]).await,
         Some("vm-pool") => vm_pool(&args[1..]).await,
@@ -834,6 +859,47 @@ async fn open_store() -> Result<Store> {
 /// `tasks secrets <init|set|status|rm>` — the sealed store's CLI. Synchronous
 /// on purpose: everything here is local file and Keychain work, and none of
 /// it should ever touch the server, the store, or the network.
+/// `tasks auth login`: the GitHub device flow, end to end. [`tasks::auth`]
+/// does the HTTP and never prints; this owns the conversation with the human.
+async fn auth_cmd(args: &[String]) -> Result<()> {
+    use tasks::auth;
+    use tasks::secrets::{self, SecretName};
+
+    match args.first().map(String::as_str) {
+        Some("login") => {
+            if let Some(extra) = args.get(1) {
+                bail!("unexpected argument: {extra}\n\n{AUTH_USAGE}");
+            }
+            let data_dir = run::data_dir()?;
+
+            // Probe the store before GitHub is involved: a human who walks
+            // through the code entry and then learns the store is missing has
+            // spent the interactive half for nothing. `status` is the probe
+            // because it works without the unseal key — and the error it
+            // returns for a missing store already names `tasks secrets init`.
+            secrets::status(&data_dir)?;
+
+            let base = std::env::var("GITHUB_OAUTH_URL")
+                .unwrap_or_else(|_| auth::DEFAULT_BASE.to_string());
+            let authorization = auth::request_code(&base).await?;
+            println!("open   {}", authorization.verification_uri);
+            println!("enter  {}", authorization.user_code);
+            println!(
+                "waiting for the authorization (the code is good for {} minutes)…",
+                authorization.expires_in / 60
+            );
+            let token = auth::poll_for_token(&base, &authorization).await?;
+            secrets::set(&data_dir, SecretName::GithubToken, token.expose())?;
+            println!("sealed `github-token`; a running server picks this up on its next read");
+            Ok(())
+        }
+        _ => {
+            eprint!("{AUTH_USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn secrets_cmd(args: &[String]) -> Result<()> {
     use tasks::secrets::{self, SecretName};
 
