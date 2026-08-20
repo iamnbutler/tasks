@@ -352,13 +352,18 @@ implementation.
   src>`/`<iframe>`, so `<img src="http://127.0.0.1:4800/…">` passes both rules.
   That residual is bounded to routes whose responses the attacker cannot read
   (this API sends no CORS headers) and whose only effect is server-side, and
-  today exactly one route is not nil: **`GET /decisions/{seq}/reconcile`**,
-  which spends the server's own GitHub credential outbound. It is **accepted**
+  today exactly two routes are not nil, and both spend the server's own GitHub
+  credential outbound. **`GET /decisions/{seq}/reconcile`** is **accepted**
   rather than moved to `POST` — idempotent, locally mutating nothing, answering
   only for a `pending` decision, and named as a `GET` by the obligation loop
   and the orchestrator's own `curl` — so what it costs is one GitHub read per
   pending decision, a rate-limit lever and not the `build-now` hole; closing it
-  wants `Sec-Fetch-Site`, which is its own decision. There is **no knob**, and
+  wants `Sec-Fetch-Site`, which is its own decision. **`GET /viewer`** is the
+  second, and it is the cheaper of the two *because of the cache it needed
+  anyway*: the app asks on every SSE event, so the answer is held for 30
+  minutes (5 on a failure), which bounds a forced read to one GitHub call per
+  failure TTL however hard the page hammers it. The same `Sec-Fetch-Site`
+  decision covers both. There is **no knob**, and
   the argument is no longer the one that fits on a line: a disable switch whose
   only user bypasses the fix was the whole reason until a *legitimate*
   deployment shape turned out to be refused. Through an SSH `-L` tunnel the

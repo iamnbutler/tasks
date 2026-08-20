@@ -947,6 +947,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
             pool_health: Some(pool_health.clone()),
+            viewer: Default::default(),
         },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`

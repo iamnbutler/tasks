@@ -370,10 +370,27 @@ enum TokenSource {
 }
 
 /// Who a token is and what it may do, as [`GitHubClient::viewer`] found out.
+///
+/// Named `GhViewer` and not `Viewer` on purpose: [`tasks_api::http::Viewer`]
+/// is the *wire* answer a client reads, with three states and no scopes, and
+/// two types with one name meaning different things across that boundary is a
+/// trap. This one is GitHub's answer; that one is ours.
+///
+/// Two readers share it — `tasks doctor`, which wants the login and the
+/// scopes, and `GET /viewer`, which wants the login, the avatar and the
+/// profile link — because it is **one GraphQL round trip either way**, and two
+/// methods asking GitHub the same question is strictly worse than one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Viewer {
+pub(crate) struct GhViewer {
     /// The account or app the token authenticates as.
     pub(crate) login: String,
+    /// Where this account's avatar image lives. Rendered by the app's chat
+    /// chip; nothing here fetches it.
+    pub(crate) avatar_url: String,
+    /// **GitHub's own `url`**, never `https://github.com/{login}` assembled
+    /// from the login — on GitHub Enterprise the origin is not github.com and
+    /// a link built that way opens the wrong host.
+    pub(crate) profile_url: String,
     /// Classic-PAT scopes, or `None` where **no response carried the header
     /// at all** — fine-grained PATs and GitHub App tokens have permissions
     /// rather than scopes and send none.
@@ -410,7 +427,7 @@ impl std::fmt::Display for ScopeSource {
 /// `x-oauth-scopes` off a response, as a list.
 ///
 /// Absent is `None` and present-but-empty is `Some(vec![])` — see
-/// [`Viewer::scopes`]. GitHub sends the list comma-separated and normalizes
+/// [`GhViewer::scopes`]. GitHub sends the list comma-separated and normalizes
 /// it on issue (`user,gist,user:email` is stored as `user, gist`), so this
 /// splits and trims and does not attempt to compare against anything.
 fn scopes_from(headers: &reqwest::header::HeaderMap) -> Option<Vec<String>> {
@@ -1337,8 +1354,20 @@ impl GitHubClient {
     /// The status is checked through [`rest_ok`] rather than
     /// `error_for_status`, so a revoked token reports "Bad credentials"
     /// instead of a naked `401 Unauthorized`.
-    pub(crate) async fn viewer(&self) -> Result<Viewer, GhError> {
-        let body = serde_json::json!({ "query": "query { viewer { login } }" });
+    ///
+    /// `errors` is read **before** the `/data/viewer` pointer, and the order is
+    /// load-bearing: a bad credential answers HTTP **200** with
+    /// `data.viewer: null` and its reason only in `errors`, so a pointer-first
+    /// read reports "unexpected response shape" where GitHub said "Bad
+    /// credentials" — and that sentence is the whole value of the failure to
+    /// whoever is looking at a placeholder avatar or a red `doctor` line.
+    ///
+    /// All three identity fields or [`GhError::Shape`]: a half-identity dies
+    /// here rather than arriving at a renderer as an avatar with no profile to
+    /// open. GitHub's schema declares `avatarUrl` and `url` non-null on `User`,
+    /// so this cannot fail against a GitHub that answered at all.
+    pub(crate) async fn viewer(&self) -> Result<GhViewer, GhError> {
+        let body = serde_json::json!({ "query": "query { viewer { login avatarUrl url } }" });
         let resp = self
             .http
             .post(&self.base_url)
@@ -1350,20 +1379,30 @@ impl GitHubClient {
         let graphql_scopes = scopes_from(resp.headers());
         let body = rest_ok(resp, "viewer").await?;
 
-        let Some(login) = body
-            .pointer("/data/viewer/login")
-            .and_then(|l| l.as_str())
-            .map(str::to_owned)
+        // Errors first — see the doc comment. A 200 whose `errors` explain a
+        // rejected credential must not be reported as a shape problem.
+        if let Some(errs) = body.get("errors").and_then(|e| e.as_array())
+            && !errs.is_empty()
+        {
+            let msg = errs
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(GhError::GraphQl(msg));
+        }
+
+        let field = |name: &str| -> Option<String> {
+            body.pointer(&format!("/data/viewer/{name}"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        };
+        let (Some(login), Some(avatar_url), Some(profile_url)) =
+            (field("login"), field("avatarUrl"), field("url"))
         else {
-            if let Some(errs) = body.get("errors").and_then(|e| e.as_array()) {
-                let msg = errs
-                    .iter()
-                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(GhError::GraphQl(msg));
-            }
-            return Err(GhError::Shape("viewer.login is absent".into()));
+            return Err(GhError::Shape(
+                "viewer.login, viewer.avatarUrl or viewer.url is absent".into(),
+            ));
         };
 
         let (scopes, scope_source) = match graphql_scopes {
@@ -1373,8 +1412,10 @@ impl GitHubClient {
                 None => (None, None),
             },
         };
-        Ok(Viewer {
+        Ok(GhViewer {
             login,
+            avatar_url,
+            profile_url,
             scopes,
             scope_source,
         })
@@ -1679,10 +1720,20 @@ mod tests {
         (format!("http://{addr}/graphql"), format!("http://{addr}"))
     }
 
+    /// A complete `viewer` payload. Every identity field is required, so the
+    /// scope tests below say so once here rather than each restating it.
+    fn viewer_body(login: &str) -> Value {
+        json!({"data": {"viewer": {
+            "login": login,
+            "avatarUrl": format!("https://avatars.example/{login}.png"),
+            "url": format!("https://github.example/{login}"),
+        }}})
+    }
+
     #[tokio::test]
     async fn viewer_reads_the_login_and_splits_the_scope_header() {
         let (gql, rest) = spawn_viewer_fake(
-            json!({"data": {"viewer": {"login": "iamnbutler"}}}),
+            viewer_body("iamnbutler"),
             200,
             Some("repo, read:org , workflow"),
             None,
@@ -1707,13 +1758,7 @@ mod tests {
     /// to enumerate" would report every classic token that way.
     #[tokio::test]
     async fn scopes_fall_back_to_the_documented_rest_header() {
-        let (gql, rest) = spawn_viewer_fake(
-            json!({"data": {"viewer": {"login": "someone"}}}),
-            200,
-            None,
-            Some("repo"),
-        )
-        .await;
+        let (gql, rest) = spawn_viewer_fake(viewer_body("someone"), 200, None, Some("repo")).await;
         let viewer = GitHubClient::with_base_url("token", gql)
             .with_rest_base_url(rest)
             .viewer()
@@ -1733,13 +1778,7 @@ mod tests {
     /// token that works.
     #[tokio::test]
     async fn an_absent_scope_header_is_not_an_empty_one() {
-        let (gql, rest) = spawn_viewer_fake(
-            json!({"data": {"viewer": {"login": "app"}}}),
-            200,
-            None,
-            None,
-        )
-        .await;
+        let (gql, rest) = spawn_viewer_fake(viewer_body("app"), 200, None, None).await;
         let absent = GitHubClient::with_base_url("token", gql)
             .with_rest_base_url(rest)
             .viewer()
@@ -1748,13 +1787,7 @@ mod tests {
         assert_eq!(absent.scopes, None);
         assert_eq!(absent.scope_source, None);
 
-        let (gql, rest) = spawn_viewer_fake(
-            json!({"data": {"viewer": {"login": "app"}}}),
-            200,
-            Some(""),
-            None,
-        )
-        .await;
+        let (gql, rest) = spawn_viewer_fake(viewer_body("app"), 200, Some(""), None).await;
         let empty = GitHubClient::with_base_url("token", gql)
             .with_rest_base_url(rest)
             .viewer()
@@ -1807,6 +1840,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_unavailable(), "{err}");
+    }
+
+    /// The identity half of the same round trip: the login, the avatar and the
+    /// profile link all come **off the wire**. `profile_url` in particular is
+    /// GitHub's own `url` and is never assembled from the login — on an
+    /// Enterprise host the origin is not github.com, and guessing it is the
+    /// same class of mistake that hardcoded one maintainer's profile (#987).
+    #[tokio::test]
+    async fn viewer_reads_the_avatar_and_the_profile_link_off_the_wire() {
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {
+                "login": "octocat",
+                "avatarUrl": "https://avatars.enterprise.example/u/9",
+                "url": "https://github.enterprise.example/octocat",
+            }}}),
+            200,
+            Some("repo"),
+            None,
+        )
+        .await;
+        let viewer = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap();
+        assert_eq!(viewer.login, "octocat");
+        assert_eq!(viewer.avatar_url, "https://avatars.enterprise.example/u/9");
+        assert_eq!(
+            viewer.profile_url,
+            "https://github.enterprise.example/octocat"
+        );
+    }
+
+    /// A half-identity dies here rather than reaching a renderer as an avatar
+    /// with no profile to open.
+    #[tokio::test]
+    async fn a_viewer_missing_a_field_is_a_shape_error() {
+        let (gql, rest) = spawn_viewer_fake(
+            json!({"data": {"viewer": {"login": "octocat", "avatarUrl": "https://a/1"}}}),
+            200,
+            Some("repo"),
+            None,
+        )
+        .await;
+        let err = GitHubClient::with_base_url("token", gql)
+            .with_rest_base_url(rest)
+            .viewer()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GhError::Shape(_)), "{err}");
     }
 
     fn page(nodes: Vec<Value>, has_next: bool, end_cursor: Option<&str>) -> Value {
