@@ -644,9 +644,20 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Set the pipeline mode — the title bar's play/pause buttons and the
-    /// Server menu's radio group, on one path.
+    /// Set the pipeline mode — the title bar's play/pause buttons, the Server
+    /// menu's radio group, the command palette and the Tasks list's empty
+    /// state, on one path.
+    ///
+    /// [`crate::autonomy::intercepts`] is what makes it one path that matters:
+    /// the first Play press on a fresh install opens the notice instead, and
+    /// its button carries this press through. Every guarded path in the app
+    /// funnels here; the Server window has its own, because it sets the mode
+    /// through `ServerControl` with no workspace in reach.
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        let app_state = self.app_state.clone();
+        if crate::autonomy::intercepts(mode, &app_state, cx) {
+            return;
+        }
         self.app_state
             .update(cx, |state, cx| state.set_mode(mode, cx));
     }
@@ -2875,6 +2886,11 @@ impl Workspace {
             }
             EmptyStateAction::AddRepo => self.open_repo_window(cx),
             EmptyStateAction::OpenAllTasks => self.navigate(MiddleView::AllTasks, cx),
+            // Through `Workspace::set_mode` rather than `AppState::set_mode`,
+            // so the Tasks list's "press Play to start work" inherits the
+            // first-run notice like every other Play press (#992/#993). A
+            // direct `self.app_state.update(…)` here would be the fifth,
+            // unguarded path.
             EmptyStateAction::Play => self.set_mode(Mode::Play, cx),
         }
     }

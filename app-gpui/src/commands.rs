@@ -43,8 +43,8 @@ use tasks_client::api::models::Mode;
 
 use crate::menus::{
     self, About, CloseWindow, Hide, HideOthers, MenuState, Minimize, OpenDataDirectory, Quit,
-    RestartServer, RestartServerWhenIdle, RevealServeLog, ShowAll, ShowServerStatus, StopServer,
-    StopServerWhenIdle, Zoom,
+    RestartServer, RestartServerWhenIdle, RevealServeLog, ShowAll, ShowAutonomyNotice, ShowCharter,
+    ShowServerStatus, StopServer, StopServerWhenIdle, Zoom,
 };
 use crate::palette::{GoToAnything, ShowCommandPalette};
 use crate::row_menu::{self, RowAction, RowContext};
@@ -427,6 +427,16 @@ pub const COMMANDS: &[Command] = &[
     .on_workspace()
     .menu(Slot::Server)
     .refusal(running_server_refusal),
+    // Under Kill All Containers, in the pipeline group, because both are
+    // answers to "make it stop". Neither is `.on_workspace()`: an off switch
+    // that greys out because the wrong window is focused is not an off
+    // switch, and the Server window is exactly where somebody worried about
+    // this already is.
+    Command::new("charter", "Charter…", || Box::new(ShowCharter)).menu(Slot::Server),
+    Command::new("what-play-does", "What Play Does…", || {
+        Box::new(ShowAutonomyNotice)
+    })
+    .menu(Slot::Server),
     Command::new("reveal-serve-log", "Reveal serve.log", || {
         Box::new(RevealServeLog)
     })
@@ -497,6 +507,17 @@ fn running_server_refusal(facts: Facts) -> Option<&'static str> {
     })
 }
 
+/// The command with this id, or `None`.
+///
+/// Ids are unique (`ids_are_unique` pins that), so this is the one lookup.
+/// It exists so a surface that *names* a menu item can render the registry's
+/// own label rather than a copy of it — see [`crate::autonomy::OFF_SWITCHES`],
+/// where a hand-written "Kill All Containers" would silently point at nothing
+/// after a rename.
+pub fn by_id(id: &str) -> Option<&'static Command> {
+    COMMANDS.iter().find(|command| command.id == id)
+}
+
 /// The items of one top-level menu, greyed and checked against `facts`.
 ///
 /// `MenuItem::Action` is built as a struct literal rather than through
@@ -565,7 +586,7 @@ mod tests {
 
     /// The command with this id. Ids are unique — the first test pins that.
     fn command(id: &str) -> Option<&'static Command> {
-        COMMANDS.iter().find(|command| command.id == id)
+        super::by_id(id)
     }
 
     fn facts() -> Facts {

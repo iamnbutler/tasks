@@ -312,6 +312,52 @@ implementation.
   attention than just letting the thing act, and attention is the scarce
   resource here. The human is never gated — this governs autonomy, not the
   owner.
+- **The first press of Play explains itself, and every later one does not —
+  and that is a notice, never a gate.** Play starts VMs, spends API credit,
+  pushes branches and opens pull requests, and with the charter as it ships
+  merges them and closes the issues behind them, none of it asking. Nothing in
+  the app said so before the click, and the charter governing the sharp half
+  was rendered nowhere, so the answer to "how do I stop it merging things" was
+  `curl`. `autonomy_notice` is one row (`CHECK (id = 1)`) recording whether
+  this install's owner has ever been shown what that means. **Nothing reads it
+  to decide whether an action may happen** — no handler consults it, no
+  dispatcher does, and the pipeline behaves identically set or unset; turning
+  it into a gate later takes a deliberate new reader rather than a refactor.
+  Three properties keep it from becoming one, and each is a way it would
+  quietly rot into consent: the record is server-side and write-only from the
+  server's point of view; `autonomy::intercepts` fires for `Play` alone and at
+  most once per install; and it answers *carry on* for every uncertainty
+  there is — an unreachable server, a route too old to exist, a platform that
+  refuses the window — because **absence of evidence must not fire it**. The
+  tempting reading of unknown is "probably never told, so show it", which
+  turns a down endpoint into a modal on every press, which is how a notice
+  stops being read; `state::autonomy_acknowledged` is tri-state for exactly
+  that, and only a positive "nobody ever has" fires. The **words are generated
+  from the charter rows**, since those are what the server enforces and a
+  restatement in the app's own prose goes stale the first time somebody
+  narrows one: `Capability::consequence()` is an arm of the same exhaustive
+  match as `describe()`, so a tenth capability cannot answer one and not the
+  other — it fails to compile — and the two voices differ because `describe`
+  addresses the agent holding the permission while a person deciding what to
+  let loose on their repository is asking what appears on it.
+  `Capability::is_sharp()` means **cannot be taken back** and not "worth being
+  told about"; filing thirty issues is among the most *visible* things this
+  does and is quiet there, because it is deletable. What is deliberately *not*
+  generated is `autonomy::ALWAYS`: mode gates dispatch, so a charter narrowed
+  to nothing still spends the machine, and a notice assembled only from
+  capabilities would read as "Play does nothing now". The static claims are
+  `disclaimer.rs`'s (#984), quoted rather than rewritten — one vocabulary for
+  risk copy, or the app grows two modules describing the same acts in
+  different words. `INSERT OR IGNORE`, so the **first** acknowledgement
+  stands: a second click from another surface must not rewrite when this
+  person was told into a later, wronger answer. It is human-only and not
+  charter-gated on the `build-now` precedent — an agent that could write it
+  would be clicking through its own disclosure, and the row would then claim a
+  human had been informed when none had. The converse gap is deliberate and
+  named: a server booting straight into `play` dispatches with nobody having
+  pressed anything and the notice does **not** fire, because a modal on launch
+  is the one that gets clicked through — `Server ▸ What Play Does…` is the
+  standing answer instead, and it never greys out.
 - **The charter only binds what the server can attribute, so attribution must
   work under the *tightest* agent permissions.** A write the server cannot
   attribute is recorded as the human's — and the human is never gated, so a

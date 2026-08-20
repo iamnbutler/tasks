@@ -62,7 +62,9 @@ actions!(
         StopServer,
         StopServerWhenIdle,
         RevealServeLog,
-        OpenDataDirectory
+        OpenDataDirectory,
+        ShowCharter,
+        ShowAutonomyNotice
     ]
 );
 
@@ -178,6 +180,11 @@ pub fn init(cx: &mut App) {
             }
         }
     });
+    // Neither is `.on_workspace()`, and that is the point: the moment
+    // somebody goes looking for an off switch is not the moment to grey it
+    // out for want of a focused window.
+    cx.on_action(|_: &ShowCharter, cx| crate::charter_window::open(cx));
+    cx.on_action(|_: &ShowAutonomyNotice, cx| crate::autonomy::open_from_menu(cx));
     cx.on_action(|_: &OpenDataDirectory, _cx| {
         if let Some(dir) = tasks_api::paths::data_dir() {
             server::open_path(&dir);
@@ -391,6 +398,8 @@ mod tests {
                 "workspace::SetModePause",
                 "workspace::SetModeStop",
                 "workspace::KillAllContainers",
+                "tasks::ShowCharter",
+                "tasks::ShowAutonomyNotice",
                 "tasks::RevealServeLog",
                 "tasks::OpenDataDirectory",
             ]
@@ -492,6 +501,31 @@ mod tests {
         assert!(!item(unknown, "Server", "Pipeline: Play").is_checked());
     }
 
+    /// The two answers to "make it stop" are never greyed.
+    ///
+    /// Neither is `.on_workspace()` and neither carries a refusal, because the
+    /// moment somebody goes looking for an off switch is not the moment to
+    /// grey it out for want of a focused window — or because no server is
+    /// answering, which is when "what does this thing do" is most likely to
+    /// be the question.
+    #[test]
+    fn the_charter_and_the_notice_are_reachable_in_every_state() {
+        for state in [
+            MenuState::default(),
+            serving(Mode::Play),
+            MenuState {
+                busy: true,
+                ..serving(Mode::Stop)
+            },
+        ] {
+            for label in ["Charter…", "What Play Does…"] {
+                assert!(
+                    !item(state, "Server", label).is_disabled(),
+                    "{label} greyed out in {state:?}"
+                );
+            }
+        }
+    }
     /// Whatever the state, the menu offers each op exactly once — the
     /// renaming item is one item, not a pair that can both show up.
     #[test]

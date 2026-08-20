@@ -1,4 +1,6 @@
 mod about;
+mod autonomy;
+mod charter_window;
 mod chat_log;
 mod commands;
 mod components;
