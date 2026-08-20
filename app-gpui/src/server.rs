@@ -47,7 +47,7 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, Global};
-use tasks_client::api::http::{InFlight, ServerStatus};
+use tasks_client::api::http::{InFlight, SecretsStatus, ServerStatus};
 use tasks_client::api::models::Mode;
 use tasks_client::api::version::VersionInfo;
 use tasks_client::Client;
@@ -560,6 +560,15 @@ pub struct ServerControl {
     /// one, and it never survives a run starting.
     pub pending: Option<Op>,
     pub status: Option<ServerStatus>,
+    /// What `GET /secrets` last said, or `None` when nothing has been read.
+    ///
+    /// Read on the **same** probe as `/status`, deliberately: one poll instead
+    /// of two, the same coalescing against a wedged server, and — the
+    /// load-bearing one — the banners in the empty pane clear on the next
+    /// status poll only if the two are read together. A failure clears it to
+    /// `None`, which every reader treats as "not observed" and never as "not
+    /// configured", the `images: Vec<ImageIdentity>` rule one surface over.
+    pub secrets: Option<SecretsStatus>,
     pub version: Option<VersionInfo>,
     /// Why the last probe failed. Not an error banner: "nothing is serving"
     /// is a state this window exists to produce.
@@ -593,6 +602,7 @@ impl ServerControl {
             run: None,
             pending: None,
             status: None,
+            secrets: None,
             version: None,
             probe_error: None,
             mode_error: None,
@@ -716,9 +726,9 @@ impl ServerControl {
         let client = self.client.clone();
         let probe = cx
             .background_executor()
-            .spawn(async move { (client.status(), client.server_version()) });
+            .spawn(async move { (client.status(), client.server_version(), client.secrets()) });
         cx.spawn(async move |this, cx| {
-            let (status, version) = probe.await;
+            let (status, version, secrets) = probe.await;
             this.update(cx, |this: &mut ServerControl, cx| {
                 this.probing = false;
                 match status {
@@ -742,6 +752,9 @@ impl ServerControl {
                 // the route; keeping the last known one would be a lie about
                 // the build that is serving now.
                 this.version = version.ok();
+                // `None` is "not observed", never "not configured" — the
+                // difference every reader of this field turns on.
+                this.secrets = secrets.ok();
                 this.probed_at = Some(Utc::now());
                 cx.notify();
             })

@@ -1743,7 +1743,28 @@ pub fn render_update_pending(status: &ServerStatus) -> String {
 /// prints `0 of N` rather than "full", because `0 of 0` is a `VM_POOL_MAX_VMS`
 /// that can never dispatch anything and `0 of 6` is work — or a leak — holding
 /// every slot, and those want different actions from the reader.
+///
+/// **Unreachable outranks exhausted, and they share this one row.** A capacity
+/// record can only have been written down a connection that existed, so with
+/// no connection it is stale by construction; printing both would tell a
+/// reader that a pool nobody can reach also has no free slots, and send them
+/// hunting a leaked VM instead of starting a daemon (#991). The unreachable
+/// line also says the server retries the socket by itself, so what needs
+/// starting is vm-pool and *not* this — otherwise the reader's next move is a
+/// server restart, which fixes nothing.
 pub fn render_pool_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    if let Some(out) = &status.pool_unreachable {
+        return format!(
+            "vm-pool  not answering at {} for {} ({} attempt(s), last {} ago) — nothing \
+             can be dispatched at all; this server retries the socket on its own, so \
+             what needs starting is vm-pool (`tasks vm-pool`), not this\n         {}\n",
+            out.socket,
+            humanize(now - out.since),
+            out.attempts,
+            humanize(now - out.last_seen),
+            out.error
+        );
+    }
     let Some(hold) = &status.pool else {
         return String::new();
     };
@@ -2024,6 +2045,7 @@ mod tests {
             github: None,
             update: None,
             pool: None,
+            pool_unreachable: None,
             broker: None,
             runtime: None,
             verify_dir: None,

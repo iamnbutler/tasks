@@ -1177,6 +1177,12 @@ async fn service_cmd(args: &[String]) -> Result<()> {
                      makes restarts resume dispatch"
                 ),
             }
+            // Last, and silent when `tasks` already resolves to the binary
+            // just installed — however it got onto the PATH.
+            print!(
+                "{}",
+                service::path_advice_lines(&outcome.paths.bin, &outcome.paths.home)
+            );
             Ok(())
         }
         Some("uninstall") => {

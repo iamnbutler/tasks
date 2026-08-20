@@ -35,11 +35,14 @@
 //!   [`Situation::Stopped`] and [`Action::Play`], which goes through
 //!   `Workspace::set_mode` — the same path the title bar's play button takes,
 //!   so a prompt added there is inherited here for free.
-//! - **#1005 (paste credentials in)** owns *the token*. This module owns
-//!   [`Situation::NoTasks`], whose sentence says the poller needs a token on
-//!   the server and deliberately does **not** guess whether one is
-//!   configured: nothing in the app can see that today. #1005 adds the
-//!   observation, and either a situation above `NoTasks` or an action on it.
+//! - **#1005 (paste credentials in)** owned *the token*, and has taken this
+//!   slot: [`Pipeline::github_credential`] / [`Pipeline::anthropic_credential`]
+//!   are the observation, [`Situation::NoCredentials`] is the situation above
+//!   `NoProjects`, and [`Action::ConfigureKeys`] is the action on it. The
+//!   sentence on [`Situation::NoTasks`] used to say the app could not see
+//!   whether a token was configured; that is no longer true, and both the
+//!   sentence and this paragraph moved together, because a reader who trusts
+//!   a stale comment here is exactly who would re-derive the wrong thing.
 //!
 //! The caution on the Play button is **not** ours to word: it is
 //! [`crate::disclaimer::PLAY_TOOLTIP`] and [`crate::disclaimer::PIPELINE_CAUTION`],
@@ -48,12 +51,14 @@
 //! second wording here would be the disagreement [`Action`] exists as an enum
 //! to prevent, one module boundary out.
 
-use tasks_client::api::http::ServerStatus;
+use tasks_client::api::http::{SecretsStatus, ServerStatus};
+use tasks_client::api::models::SecretName;
 use tasks_client::api::models::{
     Mode, Project, ProjectStatus, SpecQueueItem, SpecQueueStatus, Task, TaskState,
 };
 
 use crate::projects::ProjectFilter;
+use crate::secrets::KeyState;
 
 /// How much of the server this app can currently see.
 ///
@@ -163,7 +168,25 @@ pub fn observe(status: Option<&ServerStatus>) -> Vec<Hold> {
             binding: true,
         });
     }
-    if let Some(pool) = &status.pool {
+    // **Unreachable outranks exhausted, and they share this one entry** —
+    // a capacity record can only have been written down a connection that
+    // existed, so with no connection it is stale by construction, and
+    // reporting both would tell a reader that a pool nobody can reach also
+    // has no free slots and send them hunting a leaked VM instead of
+    // starting a daemon (#991).
+    if let Some(out) = &status.pool_unreachable {
+        holds.push(Hold {
+            kind: HoldKind::Pool,
+            sentence: format!(
+                "vm-pool is not answering at {} ({}), so nothing can be \
+                 dispatched at all — not scouts, not builds. The server keeps \
+                 retrying the socket on its own, so what needs starting is \
+                 vm-pool, not this.",
+                out.socket, out.error
+            ),
+            binding: true,
+        });
+    } else if let Some(pool) = &status.pool {
         holds.push(Hold {
             kind: HoldKind::Pool,
             sentence: format!(
@@ -233,6 +256,25 @@ pub struct Pipeline {
     pub awaiting_merge: usize,
     pub mode: Option<Mode>,
     pub holds: Vec<Hold>,
+    /// How the server's GitHub token is resolving, or `None` before the first
+    /// `GET /secrets` answers.
+    ///
+    /// `Option<KeyState>` and not a whole `SecretsStatus`, for the reason
+    /// every other field here is a count: the walk asks "is one resolvable",
+    /// and handing it the status invites a placement to render a timestamp
+    /// out of it.
+    ///
+    /// **`None` must never diagnose.** Before the first answer both of these
+    /// are `None` and [`diagnose`] falls through to the states it had. This is
+    /// the `images`-is-not-a-clean-bill-of-health rule inverted: absence of
+    /// evidence must not *accuse* either.
+    pub github_credential: Option<KeyState>,
+    /// The same, for the Anthropic key — a **note**, never a situation and
+    /// never a [`HoldKind`]. The server does not hold dispatch on a missing
+    /// credential (the six holds are update, runtime, pool, broker, GitHub and
+    /// none is credential-shaped), so modelling it as a hold would claim an
+    /// enforcement that does not exist.
+    pub anthropic_credential: Option<KeyState>,
 }
 
 impl Pipeline {
@@ -250,6 +292,8 @@ impl Pipeline {
             awaiting_merge: 0,
             mode: None,
             holds: Vec::new(),
+            github_credential: None,
+            anthropic_credential: None,
         }
     }
 
@@ -267,8 +311,13 @@ impl Pipeline {
         filter: &ProjectFilter,
         mode: Option<Mode>,
         holds: Vec<Hold>,
+        credentials: Option<&SecretsStatus>,
     ) -> Self {
         let mut pipeline = Pipeline::new(reachability);
+        pipeline.github_credential = credentials
+            .map(|status| KeyState::read(status, SecretName::GithubToken));
+        pipeline.anthropic_credential = credentials
+            .map(|status| KeyState::read(status, SecretName::AnthropicApiKey));
         pipeline.projects = projects
             .iter()
             .filter(|project| project.status != ProjectStatus::Archived)
@@ -314,6 +363,9 @@ pub enum Situation {
     NoServer,
     /// The server refused this build.
     Incompatible,
+    /// The server has no GitHub credential at all, so nothing below can be
+    /// populated — see [`diagnose`] for why this sits above `NoProjects`.
+    NoCredentials,
     /// Nothing is tracked.
     NoProjects,
     /// Repositories are tracked and no issue has arrived.
@@ -351,6 +403,9 @@ pub enum Action {
     AddRepo,
     OpenAllTasks,
     Play,
+    /// Raise the Credentials surface — the same one the menu and the command
+    /// palette raise, through the same `Workspace` method.
+    ConfigureKeys,
 }
 
 impl Action {
@@ -361,6 +416,7 @@ impl Action {
             Action::AddRepo => "Add a Repository",
             Action::OpenAllTasks => "Open All Tasks",
             Action::Play => "Play",
+            Action::ConfigureKeys => "Add Your Keys",
         }
     }
 
@@ -438,6 +494,19 @@ pub fn diagnose(pipeline: &Pipeline) -> Situation {
         Reachability::Incompatible => return Situation::Incompatible,
         Reachability::Up => {}
     }
+    // Above `NoProjects`, and gated on `Unconfigured` **alone**. Without a
+    // GitHub credential nothing can be ingested, so "no repositories" and "no
+    // issues" are both misdiagnoses that send a new user to Add a Repository
+    // — a button that cannot help. But a token resolving from the environment
+    // or a helper is *serving*: polling works, writes work, the lists below
+    // are populated, and diagnosing `NoCredentials` there would tell a working
+    // pipeline it has no credentials. That is the same false accusation the
+    // `None` rule guards against, one state over — which is why this reads
+    // `Some(KeyState::Unconfigured)` and not `!is_serving()` or a `None`
+    // check.
+    if matches!(pipeline.github_credential, Some(KeyState::Unconfigured)) {
+        return Situation::NoCredentials;
+    }
     if pipeline.projects == 0 {
         return Situation::NoProjects;
     }
@@ -505,6 +574,15 @@ pub fn explain(pipeline: &Pipeline) -> Explanation {
                 .to_string(),
             Some(Action::RestartServer),
         ),
+        Situation::NoCredentials => (
+            "No GitHub credential on the server.",
+            "The poller needs a GitHub token to ingest issues, and every write \
+             back — a comment, a close, a pull request — spends one too. Paste \
+             it here and it is sealed on the server; nothing below can fill in \
+             until it is."
+                .to_string(),
+            Some(Action::ConfigureKeys),
+        ),
         Situation::NoProjects => (
             "No repositories yet.",
             "Tasks works on GitHub repositories you point it at. Add one and \
@@ -514,8 +592,11 @@ pub fn explain(pipeline: &Pipeline) -> Explanation {
         ),
         Situation::NoTasks => (
             "No issues have arrived yet.",
-            "The poller ingests open GitHub issues on a timer, and it needs a \
-             token on the server to do it. Nothing here is queued by hand."
+            // It no longer has to hedge about the token: a missing one is
+            // `NoCredentials` above, so reaching here means one is serving.
+            "The poller ingests open GitHub issues on a timer. Nothing here is \
+             queued by hand — give it a poll interval or two, or check that \
+             this repository has open issues the intake label admits."
                 .to_string(),
             None,
         ),
@@ -608,12 +689,29 @@ pub fn explain(pipeline: &Pipeline) -> Explanation {
     let headlined = matches!(situation, Situation::Held)
         .then(|| pipeline.binding_hold())
         .flatten();
-    let notes = pipeline
+    let mut notes: Vec<String> = pipeline
         .holds
         .iter()
         .filter(|hold| Some(*hold) != headlined)
         .map(|hold| hold.sentence.clone())
         .collect();
+    // A missing Anthropic key is **said, never pressed** — a note and not a
+    // situation, and emphatically not a `HoldKind`: the server holds dispatch
+    // on six things and none of them is credential-shaped, so modelling it as
+    // a hold would claim an enforcement that does not exist. The paste that
+    // fixes it lives on the row in the Credentials pane, which is where the
+    // row also states it.
+    if matches!(
+        pipeline.anthropic_credential,
+        Some(crate::secrets::KeyState::Unconfigured)
+    ) {
+        notes.push(
+            "No Anthropic credential is resolving on the server, so a Scout or a \
+             Builder that starts will fail at its first API call. Dispatch is not \
+             held on it — nothing stops the attempt."
+                .to_string(),
+        );
+    }
     Explanation {
         situation,
         headline,
@@ -816,15 +914,23 @@ mod tests {
         assert_eq!(diagnose(&pipeline), Situation::NoTasks);
     }
 
-    /// The sentence must not guess at a token it cannot see — that is #1005's,
-    /// and a wrong guess here sends the reader to the wrong place.
+    /// This sentence used to hedge about a token the app could not see. With
+    /// #1005's observation in place a missing one is `NoCredentials` above,
+    /// so reaching `NoTasks` means one is **serving** — and the sentence and
+    /// the comment moved together, because a reader who trusts a stale
+    /// comment re-derives the wrong thing.
     #[test]
-    fn no_tasks_names_the_poller_without_claiming_a_token_is_missing() {
+    fn no_tasks_no_longer_hedges_about_a_token_it_can_now_see() {
         let mut pipeline = Pipeline::new(Reachability::Up);
         pipeline.projects = 1;
+        pipeline.github_credential = Some(KeyState::Sealed { at: None });
         let explanation = explain(&pipeline);
-        assert!(explanation.detail.contains("token"));
-        assert!(!explanation.detail.to_lowercase().contains("no token"));
+        assert_eq!(explanation.situation, Situation::NoTasks);
+        assert!(
+            !explanation.detail.contains("token"),
+            "a serving token is not this pane's subject any more: {}",
+            explanation.detail
+        );
         assert_eq!(explanation.action, None);
     }
 
@@ -1049,6 +1155,10 @@ mod tests {
                 observations: 4,
                 total: 6,
             }),
+            // Deliberately `None` in the every-hold fixture: the precedence
+            // rule is pinned by the test that is about it, not by a fixture
+            // that would then be reporting two pool facts at once.
+            pool_unreachable: None,
             runtime: Some(RuntimeHold {
                 since: Utc::now(),
                 last_seen: Utc::now(),
@@ -1086,6 +1196,7 @@ mod tests {
             &ProjectFilter::All,
             Some(Mode::Play),
             Vec::new(),
+            None,
         );
         assert_eq!(pipeline.projects, 0);
         assert_eq!(diagnose(&pipeline), Situation::NoProjects);
@@ -1104,6 +1215,7 @@ mod tests {
             &ProjectFilter::All,
             Some(Mode::Play),
             Vec::new(),
+            None,
         );
         assert_eq!(pipeline.projects, 1);
         assert_eq!(diagnose(&pipeline), Situation::NoTasks);
@@ -1127,6 +1239,7 @@ mod tests {
             &ProjectFilter::All,
             Some(Mode::Play),
             Vec::new(),
+            None,
         );
         assert_eq!(pipeline.tasks, 23);
         assert_eq!(pipeline.backlog, 4);
@@ -1154,6 +1267,7 @@ mod tests {
             &ProjectFilter::One(ProjectId::from_raw("here")),
             Some(Mode::Pause),
             Vec::new(),
+            None,
         );
         assert_eq!(scoped.projects, 2);
         assert_eq!(scoped.tasks, 2);
@@ -1178,6 +1292,7 @@ mod tests {
             &ProjectFilter::All,
             Some(Mode::Play),
             Vec::new(),
+            None,
         );
         assert_eq!(pipeline.awaiting_review, 2);
         assert_eq!(diagnose(&pipeline), Situation::AwaitingReview);
@@ -1194,6 +1309,7 @@ mod tests {
             &ProjectFilter::All,
             Some(Mode::Play),
             Vec::new(),
+            None,
         );
         assert_eq!(pipeline.awaiting_review, 0);
         assert_eq!(diagnose(&pipeline), Situation::Idle);
@@ -1385,4 +1501,135 @@ mod tests {
             up(|p| p.tasks = 12),
         ]
     }
+
+    // --- #1005: the credential predicate ---
+
+    fn credential_pipeline() -> Pipeline {
+        let mut p = Pipeline::new(Reachability::Up);
+        p.projects = 1;
+        p.tasks = 3;
+        p.backlog = 3;
+        p.mode = Some(Mode::Play);
+        p
+    }
+
+    /// The predicate, stated exactly: **`Unconfigured` alone**, with one leg
+    /// per state so a later "simplification" to `!is_serving()` goes red.
+    #[test]
+    fn only_an_unconfigured_github_key_diagnoses_no_credentials() {
+        let mut p = credential_pipeline();
+        p.github_credential = Some(KeyState::Unconfigured);
+        assert_eq!(diagnose(&p), Situation::NoCredentials);
+
+        // A token resolving from the environment is *serving* — polling
+        // works, writes work, the lists below are populated — so diagnosing
+        // `NoCredentials` there would tell a working pipeline it has none.
+        p.github_credential = Some(KeyState::EnvironmentOnly {
+            var: "GITHUB_TOKEN".into(),
+        });
+        assert_eq!(diagnose(&p), Situation::NothingQueued);
+
+        p.github_credential = Some(KeyState::HelperOnly {
+            path: "/usr/local/bin/example-helper".into(),
+        });
+        assert_eq!(diagnose(&p), Situation::NothingQueued);
+
+        p.github_credential = Some(KeyState::Sealed { at: None });
+        assert_eq!(diagnose(&p), Situation::NothingQueued);
+    }
+
+    /// **`None` must never diagnose.** Before the first `GET /secrets`
+    /// answers the field is `None` and the walk falls through to the states
+    /// it had — absence of evidence must not accuse either.
+    #[test]
+    fn an_unobserved_credential_never_diagnoses() {
+        let mut p = credential_pipeline();
+        p.github_credential = None;
+        assert_eq!(diagnose(&p), Situation::NothingQueued);
+
+        let mut fresh = Pipeline::new(Reachability::Up);
+        fresh.mode = Some(Mode::Play);
+        assert_eq!(diagnose(&fresh), Situation::NoProjects);
+    }
+
+    /// Above `NoProjects`: without a token nothing can be ingested, so both
+    /// "no repositories" and "no issues" are misdiagnoses that send a new
+    /// user to a button that cannot help.
+    #[test]
+    fn no_credentials_outranks_no_projects_and_no_tasks() {
+        let mut p = Pipeline::new(Reachability::Up);
+        p.mode = Some(Mode::Play);
+        p.github_credential = Some(KeyState::Unconfigured);
+        assert_eq!(diagnose(&p), Situation::NoCredentials);
+
+        let explanation = explain(&p);
+        assert_eq!(explanation.action, Some(Action::ConfigureKeys));
+        assert!(
+            !Action::ConfigureKeys.starts_the_pipeline(),
+            "pasting a key dispatches nothing"
+        );
+    }
+
+    /// …but a dead stream still outranks it: every field below reachability
+    /// is a claim about a snapshot nothing delivered.
+    #[test]
+    fn reachability_still_comes_before_credentials() {
+        let mut p = Pipeline::new(Reachability::Down);
+        p.github_credential = Some(KeyState::Unconfigured);
+        assert_eq!(diagnose(&p), Situation::NoServer);
+    }
+
+    /// A missing Anthropic key is **said, never pressed**: a note beside
+    /// whatever the headline is, never a situation and never a `HoldKind` —
+    /// the server does not hold dispatch on it.
+    #[test]
+    fn a_missing_anthropic_key_is_a_note_and_not_a_situation() {
+        let mut p = credential_pipeline();
+        p.github_credential = Some(KeyState::Sealed { at: None });
+        p.anthropic_credential = Some(KeyState::Unconfigured);
+        let explanation = explain(&p);
+        assert_eq!(explanation.situation, Situation::NothingQueued);
+        assert_eq!(explanation.notes.len(), 1);
+        assert!(explanation.notes[0].contains("Anthropic"));
+        assert!(
+            explanation.notes[0].contains("not held"),
+            "it must not claim an enforcement that does not exist"
+        );
+
+        p.anthropic_credential = Some(KeyState::HelperOnly {
+            path: "/usr/local/bin/example-helper".into(),
+        });
+        assert!(
+            explain(&p).notes.is_empty(),
+            "a helper-served key is serving"
+        );
+    }
+
+    /// #991: the pool row is one row, and an unreachable pool takes it. A
+    /// capacity record can only have been written down a connection, so with
+    /// no connection it is stale by construction.
+    #[test]
+    fn an_unreachable_pool_outranks_a_full_one_and_says_which_daemon_to_start() {
+        use tasks_client::api::http::PoolUnreachable;
+        let mut status = status_with_every_hold(true);
+        status.pool_unreachable = Some(PoolUnreachable {
+            since: Utc::now(),
+            last_seen: Utc::now(),
+            attempts: 2,
+            socket: "/tmp/vm-pool.sock".into(),
+            error: "connection refused".into(),
+        });
+        let pool: Vec<_> = observe(Some(&status))
+            .into_iter()
+            .filter(|hold| hold.kind == HoldKind::Pool)
+            .collect();
+        assert_eq!(pool.len(), 1, "one row, not two");
+        assert!(pool[0].sentence.contains("/tmp/vm-pool.sock"));
+        assert!(
+            !pool[0].sentence.contains("0 of 6"),
+            "the capacity record is stale by construction"
+        );
+        assert!(pool[0].sentence.contains("not this"));
+    }
+
 }

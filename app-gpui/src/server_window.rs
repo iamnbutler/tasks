@@ -261,6 +261,28 @@ impl ServerWindow {
             .and_then(verify_dir_line)
             .map(|line| self.fact("Verify dir", line, cx));
 
+        // One row per sealed name, always both — this is the read half of
+        // #1005's Credentials surface: what is serving each name, and what
+        // sealing or removing it would do. The paste field that would make it
+        // writable is not here yet; until it is, the row names the command
+        // that seals one, so the reader is never told a fact with no act
+        // beside it.
+        let credentials: Vec<_> = crate::secrets::rows(self.control.read(cx).secrets.clone().as_ref())
+            .into_iter()
+            .map(|row| {
+                let mut line = row.detail.clone();
+                if let Some(nudge) = &row.degraded {
+                    line.push_str("  ");
+                    line.push_str(nudge);
+                    line.push_str(&format!("  (`tasks secrets set {}`)", row.name));
+                } else if !row.consequence.is_empty() {
+                    line.push_str("  ");
+                    line.push_str(&row.consequence);
+                }
+                self.fact(credential_label(row.name), line, cx)
+            })
+            .collect();
+
         div()
             .flex()
             .flex_col()
@@ -273,6 +295,7 @@ impl ServerWindow {
             .children(broker)
             .children(runtime)
             .children(verify_dir)
+            .children(credentials)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -889,12 +912,40 @@ fn github_hold_line(status: &ServerStatus) -> Option<String> {
     ))
 }
 
+/// The row label for one sealed name. `&'static str` because `fact` takes
+/// one, and the set of names is closed.
+fn credential_label(name: tasks_client::api::models::SecretName) -> &'static str {
+    use tasks_client::api::models::SecretName;
+    match name {
+        SecretName::AnthropicApiKey => "Anthropic key",
+        SecretName::GithubToken => "GitHub token",
+    }
+}
+
 /// Why new work is waiting, when the reason is that vm-pool has no free slot.
 /// Same contract as [`github_hold_line`]: `None` renders no row at all.
 ///
 /// `0 of N` rather than "full" — `0 of 0` is a `VM_POOL_MAX_VMS` that can never
 /// dispatch anything, and `0 of 6` is work or a leak holding every slot.
+///
+/// **Unreachable outranks exhausted, and they share this one row.** Capacity
+/// is only askable down a connection that exists, so with no connection the
+/// capacity record is stale by construction; printing both would tell a reader
+/// that a pool nobody can reach also has no free slots and send them hunting a
+/// leaked VM instead of starting a daemon (#991).
 fn pool_hold_line(status: &ServerStatus) -> Option<String> {
+    if let Some(out) = &status.pool_unreachable {
+        return Some(format!(
+            "not answering at {} for {} ({} attempt(s), last {} ago) — nothing can be \
+             dispatched at all. The server retries the socket on its own, so what \
+             needs starting is vm-pool, not this. {}",
+            out.socket,
+            time::since(out.since),
+            out.attempts,
+            time::since(out.last_seen),
+            out.error
+        ));
+    }
     let hold = status.pool.as_ref()?;
     Some(format!(
         "0 of {} slots free for {} ({} observation(s), last {} ago) — scout and build \
@@ -1063,10 +1114,40 @@ mod tests {
             github: None,
             update: None,
             pool: None,
+            pool_unreachable: None,
             broker: None,
             runtime: None,
             verify_dir: None,
         }
+    }
+
+    /// Unreachable outranks exhausted and they share the one row: a pool
+    /// nobody can reach is not additionally reported as full, which would
+    /// send the reader hunting a leaked VM instead of starting a daemon.
+    #[test]
+    fn an_unreachable_pool_outranks_a_full_one_and_says_which_daemon_to_start() {
+        use tasks_client::api::http::{PoolHold, PoolUnreachable};
+        let mut status = status();
+        status.pool = Some(PoolHold {
+            since: Utc::now(),
+            last_seen: Utc::now(),
+            observations: 9,
+            total: 6,
+        });
+        status.pool_unreachable = Some(PoolUnreachable {
+            since: Utc::now(),
+            last_seen: Utc::now(),
+            attempts: 3,
+            socket: "/tmp/vm-pool.sock".into(),
+            error: "connection refused".into(),
+        });
+        let line = pool_hold_line(&status).expect("an unreachable pool is worth a row");
+        assert!(line.contains("/tmp/vm-pool.sock"), "{line}");
+        assert!(line.contains("not this"), "{line}");
+        assert!(
+            !line.contains("0 of 6"),
+            "the capacity record is stale by construction: {line}"
+        );
     }
 
     /// The row exists only while there is a hold, and when it does it has to
