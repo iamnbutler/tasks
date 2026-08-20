@@ -22,6 +22,12 @@ members = [
 ]
 
 [workspace.package]
+# INERT. This is not the version of anything anyone reads: the identity of a
+# build is `0.1.<commit count>`, computed by `crates/build-stamp` and carried
+# by every binary, the git tag, the DMG name and `GET /version` alike (#997).
+# Moving this per release would buy nothing — nothing in this workspace
+# publishes to crates.io, and vm-pool's separate-publishability story is its
+# own and untouched — and would add a second number to keep in step.
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"

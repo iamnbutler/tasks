@@ -983,6 +983,48 @@ implementation.
   Safe with no leader election only because the pool refuses an occupied
   socket. Boot mode stays the quiet default; `tasks service install
   --default-mode play` is the explicit, crash-restart-inclusive opt-in.
+- **A release is one number, cut by a human, and its changelog is generated
+  from the commits rather than written per merge.** The number is
+  `0.1.<commit count>` — `build-stamp`'s identity, borrowed rather than a second
+  scheme — so the annotated tag, the DMG name, the CLI zip, the `CHANGELOG.md`
+  heading and `GET /version` all say the same thing;
+  `[workspace.package] version` is declared **inert** in `Cargo.toml`, because
+  nothing here publishes to crates.io and a second number is a second thing to
+  keep in step. `make publish` is the whole act and it is **human-only with no
+  API route at all** — the `build-now` / `POST /projects` category, deciding
+  what the project publishes rather than doing a unit of work inside the
+  pipeline. Three things hold its shape. **Nothing public happens until the
+  artifacts are verified**: build → sign → notarize → staple → verify, and only
+  then tag → push → upload, so a failed notarization retries with nothing to
+  un-tag; and `push` sends both refs with `git push --atomic`, so a `main`
+  rejected because someone merged under us leaves no orphaned tag. **The
+  version is `count + 1`, written in exactly one place** — the changelog commit
+  is inside its own release, so `scripts/changelog.sh --next-version` owns that
+  arithmetic and the Makefile calls it rather than repeating it, since two
+  copies of an off-by-one is how one of them gets fixed alone; every stage is a
+  **sub-make**, because `BUILD_VERSION :=` is expanded at parse time and would
+  be stale the moment `changelog` commits, and `tag` **refuses unless
+  `CHANGELOG.md`'s newest `## v` heading is the stamp it is about to tag**,
+  which catches that mistake in both directions rather than documenting it. And
+  **the walk is not `--first-parent`**: a build merged into another build's
+  branch rather than into the trunk is reachable from `main` and off its
+  first-parent chain, so a first-parent-only log drops it silently — this
+  pipeline stacks builds routinely, and `28c879e` (the Mac app) is the proof on
+  this repository's own history. The walk keeps a commit that is on the trunk
+  *or* is itself a pull-request merge by subject shape, which is also what puts
+  the housekeeping denylist to work; the denylist is **stated, never a
+  heuristic**, so a new kind of noise shows up in a section and gets added
+  deliberately instead of a cleverness quietly eating a real entry. The PR title
+  comes from the merge commit's **body**, where GitHub already put it, with `gh`
+  as the bounded fallback — free, offline, deterministic. What
+  `check-publish` cannot answer is stated rather than papered over: it reads
+  check runs for HEAD and `changelog` then commits on top, so the tagged commit
+  is one CI never saw. There is no fix — check runs for an unpushed commit are
+  unconditionally absent, so a re-read would refuse every release — and what
+  bounds it is that the commit is changelog-only and `make release` builds every
+  artifact locally from it. Its dirty-tree refusal is a **second copy** of
+  `release`'s `check-clean-tree` on purpose: this one has to refuse before the
+  changelog commit. Design: `docs/plans/2026-08-20-release-flow.md`.
 - **What never leaves this machine may be unsigned; what is downloaded is
   signed, notarized and stapled — and the chain refuses rather than
   degrades.** `make app` and `make dist` stay unsigned, and that is not an
@@ -1853,6 +1895,16 @@ make release SIGN_IDENTITY='Developer ID Application: … (TEAM)'
 make release-clean                     # rm -rf dist/ — the release staging
                                        #   directory only, never what `make
                                        #   dist` installed
+make publish HEADLINE="…"              # cut a release: refuse unless HEAD is a
+                                       #   green origin/main, generate the
+                                       #   CHANGELOG section, run `make
+                                       #   release`, then tag, push both refs
+                                       #   atomically, upload and re-download
+                                       #   the two assets. Human-only, and
+                                       #   there is no API route
+bash scripts/changelog.sh <from> <to>  # that section on its own, to stdout;
+                                       #   `--next-version` is the one place
+                                       #   0.1.<count + 1> is written
 tasks service install                  # THIS binary -> ~/.tasks/bin, one
                                        #   LaunchAgent (login + crash restart);
                                        #   idempotent, and also the upgrade
