@@ -25,10 +25,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
 use crate::builder::summary_accounts_for_review_feedback;
 use crate::github::GitHubClient;
+use crate::github_health::GitHubHealth;
 use crate::models::{
     Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
     Task, TaskId, TaskState, Verification, VerificationStatus,
@@ -81,6 +83,11 @@ pub struct Brief<'a> {
     /// The branch specs are written against, and therefore the one to compare
     /// against ([`crate::run::Config::scout_base_branch`]).
     base_branch: &'a str,
+    /// Whether GitHub is answering, as last observed by the poller. `None`
+    /// where nothing is observing — the two unit-test call sites and any
+    /// caller built before the record existed — and an unobserved record says
+    /// nothing, exactly as an unobserved image does.
+    github_health: Option<&'a GitHubHealth>,
     /// Read on first use and shared by every fact on this brief. A turn
     /// briefing three specs plus the pipeline reads the tables once, not four
     /// times, and — more importantly — every line in one `[brief]` block
@@ -117,9 +124,20 @@ impl<'a> Brief<'a> {
             store,
             github,
             base_branch,
+            github_health: None,
             world: tokio::sync::OnceCell::new(),
             github_deadline: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Read the dispatch hold from the record the poller writes.
+    ///
+    /// A builder method rather than a fourth parameter on [`Self::new`]:
+    /// every caller that has a health record is a serving one, and the unit
+    /// tests that do not have to stay constructible without inventing a fake.
+    pub fn with_github_health(mut self, health: &'a GitHubHealth) -> Self {
+        self.github_health = Some(health);
+        self
     }
 
     /// Facts for judging one spec: what else claims its files, what was
@@ -303,7 +321,9 @@ impl<'a> Brief<'a> {
     /// approved and waiting behind it.
     pub async fn pipeline(&self) -> Result<Vec<String>, StoreError> {
         let world = self.world().await?;
-        let mut lines = Vec::new();
+        // First, because it changes how every line under it reads: a queue
+        // that is not moving during a hold is not a queue that is stuck.
+        let mut lines = self.github_hold_facts(Utc::now());
 
         let in_flight: Vec<&Build> = world
             .builds
@@ -373,14 +393,65 @@ impl<'a> Brief<'a> {
         Ok(lines)
     }
 
+    /// Whether GitHub is answering, when it is not.
+    ///
+    /// #939 shipped the hold and reported it to `/status`, `tasks status` and
+    /// the Server window, and argued the orchestrator out of the picture: it
+    /// cannot fix GitHub, an obligation it can never discharge is raised every
+    /// pass forever, and a `Note` is deliberately not nudge-worthy. Every
+    /// clause of that is right and none of it reaches this, because **a brief
+    /// line is not an obligation** — the precedent is one function down, where
+    /// a stale image is reported on the brief with no `ObligationKind` behind
+    /// it, for exactly the same reason: worth showing, not worth waking
+    /// anyone for.
+    ///
+    /// It matters more here than there, because during an outage the
+    /// orchestrator is not a bystander. It is the process still issuing GitHub
+    /// writes *through the server* — merges, comments, closes, issue edits —
+    /// over the same API that is returning 503, and it does not read `/status`
+    /// unprompted. The brief is what it reads.
+    ///
+    /// So the wording is what the hold actually is: a hold on **dispatch**,
+    /// which says nothing about whether any given write will succeed. The
+    /// reading to produce is "expect your writes to fail and stop retrying",
+    /// never "you are blocked" — the orchestrator has plenty it can still do,
+    /// and a line that reads as a stop order costs a turn.
+    ///
+    /// Silent when there is no hold, like every other renderer of this record,
+    /// so it costs nothing on a healthy pipeline. It reads
+    /// [`GitHubHealth::hold`] — the same predicate the two dispatchers and
+    /// `/status` read, bound to the same staleness window — rather than
+    /// deciding freshness a second time.
+    fn github_hold_facts(&self, now: DateTime<Utc>) -> Vec<String> {
+        let Some(outage) = self.github_health.and_then(|h| h.hold(now)) else {
+            return Vec::new();
+        };
+        vec![format!(
+            "GitHub has not answered since {} ({} failed call(s); latest: {}). Scout and \
+             build dispatch is held until it does — queued work stays queued and nothing \
+             is charged an attempt. This is not a hold on you: it means your own writes \
+             through the server (merges, comments, closes, issue edits) are going to the \
+             same API and are likely to fail, so read a failure as the outage rather than \
+             as a refusal, and do not retry it this turn",
+            outage.since.to_rfc3339(),
+            outage.failures,
+            outage.error,
+        )]
+    }
+
     /// What the VM images are running, when that changes how a failure should
     /// be read.
     ///
-    /// A **fact, not an obligation**, and deliberately so: obligations are
-    /// surfaced only to the orchestrator, which holds a curl-only token in a
-    /// VM-less workdir and can neither cross-compile a supervisor nor reach
-    /// the `container` CLI. An obligation it can never discharge is raised on
-    /// every pass forever, which is how a signal gets trained out of use.
+    /// A **fact, not an obligation**, and deliberately so — but not because
+    /// the orchestrator lacks the means. It routinely runs in the checkout
+    /// with the `container` CLI and the cross toolchain within reach, so the
+    /// honest reason is what a rebuild *decides*: it is a deployment, changing
+    /// what every future run executes with no review in front of it and no
+    /// revert but another rebuild, which puts it in the human-only
+    /// `build-now` category. The decision is a human's however the host is
+    /// configured, so an obligation would be undischargeable by the party it
+    /// is addressed to, raised every pass forever — which is how a signal gets
+    /// trained out of use.
     ///
     /// Worded around the judgment the orchestrator actually makes, rather than
     /// around the rebuild it cannot perform: a run that failed inside a stale

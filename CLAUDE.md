@@ -877,8 +877,22 @@ implementation.
   outage. It is announced once per edge as a `Note` and reported for as long as
   it lasts on `/status`, `tasks status` and the Server window, so an idle
   pipeline can always say why it is idle. **No obligation and no orchestrator
-  prompt section** — the orchestrator cannot fix GitHub, and an undischargeable
-  signal raised every pass is how a signal gets trained out of use. It reaches
+  prompt section, but a brief line** — the orchestrator cannot fix GitHub, and
+  an undischargeable signal raised every pass is how a signal gets trained out
+  of use; a brief line is neither, and this is the precedent `images.rs`
+  already set (reported on `/status`, `tasks status`, the Server window **and**
+  the brief, with no `ObligationKind` behind it). #939 adopted three quarters
+  of that and dropped the quarter that matters most here, because during an
+  outage the orchestrator is not a bystander: it is the process still pushing
+  merges, comments, closes and issue edits *through the server* over the same
+  API returning 503, and it does not read `/status` unprompted. So
+  `Brief::github_hold_facts` is silent on a healthy pipeline, reads
+  `GitHubHealth::hold` rather than deciding freshness a second time, and is
+  worded as what the hold is — a hold on **dispatch**, which says nothing about
+  whether a given write will succeed. The reading it has to produce is "expect
+  your writes to fail and stop retrying", never "you are blocked": the
+  orchestrator has plenty it can still do, and a line that reads as a stop
+  order costs a turn. It reaches
   the same place `ObligationKind::StaleImage` does and by a different road:
   there the means are present and the *decision* is not the orchestrator's,
   here the decision would be its to make and the means do not exist. The one

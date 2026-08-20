@@ -908,6 +908,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let nudge = tokio::spawn(orchestrator_nudge_loop(
         store.clone(),
         config.clone(),
+        health.clone(),
         NUDGE_DEBOUNCE,
         NUDGE_MAX_WAIT,
         shutdown_rx.clone(),
@@ -915,6 +916,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let obligations = tokio::spawn(obligation_loop(
         store.clone(),
         config.clone(),
+        health.clone(),
         OBLIGATION_GRACE,
         OBLIGATION_REMINDER,
         OBLIGATION_TICK,
@@ -3061,6 +3063,7 @@ pub async fn orchestrator_loop(
 pub async fn orchestrator_nudge_loop(
     store: Arc<Store>,
     config: Config,
+    health: Arc<GitHubHealth>,
     debounce: Duration,
     max_wait: Duration,
     mut shutdown: watch::Receiver<bool>,
@@ -3108,7 +3111,8 @@ pub async fn orchestrator_nudge_loop(
             }
         }
 
-        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch)
+            .with_github_health(&health);
         let content = orchestrator::format_nudge(&store, &brief, &batch).await;
         info!(events = batch.len(), "nudging orchestrator");
         if let Err(e) = store
@@ -3146,6 +3150,7 @@ const OBLIGATION_TICK: Duration = Duration::from_secs(60);
 pub async fn obligation_loop(
     store: Arc<Store>,
     config: Config,
+    health: Arc<GitHubHealth>,
     grace: Duration,
     reminder: Duration,
     tick: Duration,
@@ -3182,7 +3187,8 @@ pub async fn obligation_loop(
         }
 
         info!(obligations = due.len(), "surfacing standing obligations");
-        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch);
+        let brief = Brief::new(&store, github.as_ref(), &config.scout_base_branch)
+            .with_github_health(&health);
         let content = orchestrator::format_obligations(&store, &brief, &due).await;
         if let Err(e) = store
             .append_orchestrator_message(ChatRole::Event, &content)

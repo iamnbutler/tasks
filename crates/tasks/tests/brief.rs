@@ -19,7 +19,8 @@ use axum::extract::{Path as AxumPath, State};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tasks::brief::Brief;
-use tasks::github::GitHubClient;
+use tasks::github::{GhError, GitHubClient};
+use tasks::github_health::GitHubHealth;
 use tasks::models::{
     Actor, Build, Complexity, DecisionInput, GhState, Obligation, ObligationKind, Project,
     ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
@@ -1147,4 +1148,84 @@ async fn brief_lines(store: &Store, spec_id: &SpecId) -> Vec<String> {
         .for_spec(spec_id)
         .await
         .unwrap()
+}
+
+/// #949: the hold reached `/status`, `tasks status` and the Server window and
+/// not the brief — which is the one thing the orchestrator actually reads.
+/// During an outage it is not a bystander: it is the process still pushing
+/// merges, comments and closes through the server over the same API that is
+/// returning 503.
+#[tokio::test]
+async fn a_github_hold_is_on_the_brief_and_says_it_is_not_a_hold_on_you() {
+    let store = Store::open_in_memory().await.unwrap();
+    seed_project(&store).await;
+
+    let health = GitHubHealth::default();
+    health.observe::<()>(
+        &Err(GhError::Rest {
+            what: "list open issues".into(),
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: "unavailable".into(),
+        }),
+        Utc::now(),
+    );
+
+    let text = joined(
+        &Brief::new(&store, None, "main")
+            .with_github_health(&health)
+            .pipeline()
+            .await
+            .unwrap(),
+    );
+    assert!(text.contains("GitHub has not answered"), "{text}");
+    assert!(
+        text.contains("dispatch is held"),
+        "says what is held, which is dispatch: {text}"
+    );
+    assert!(
+        text.contains("not a hold on you"),
+        "the reading to produce is 'stop retrying', never 'you are blocked': {text}"
+    );
+    assert!(
+        text.contains("nothing is charged an attempt"),
+        "the reader's next question is whether work is being lost: {text}"
+    );
+}
+
+/// Silent on a healthy pipeline, like every other renderer of this record —
+/// and silent with no record at all, since an unobserved health record says
+/// nothing, exactly as an unobserved image does.
+#[tokio::test]
+async fn a_healthy_github_puts_nothing_on_the_brief() {
+    let store = Store::open_in_memory().await.unwrap();
+    seed_project(&store).await;
+
+    let health = GitHubHealth::default();
+    let text = joined(
+        &Brief::new(&store, None, "main")
+            .with_github_health(&health)
+            .pipeline()
+            .await
+            .unwrap(),
+    );
+    assert!(!text.contains("GitHub has not answered"), "{text}");
+
+    // And a 4xx is GitHub *answering*, so it is not an outage and holds
+    // nothing — the same rule the dispatchers read.
+    health.observe::<()>(
+        &Err(GhError::Rest {
+            what: "read pull request".into(),
+            status: reqwest::StatusCode::NOT_FOUND,
+            message: "Not Found".into(),
+        }),
+        Utc::now(),
+    );
+    let text = joined(
+        &Brief::new(&store, None, "main")
+            .with_github_health(&health)
+            .pipeline()
+            .await
+            .unwrap(),
+    );
+    assert!(!text.contains("GitHub has not answered"), "{text}");
 }
