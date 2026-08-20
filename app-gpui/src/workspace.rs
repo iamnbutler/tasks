@@ -170,6 +170,14 @@ pub struct Workspace {
     /// resets on relaunch: the app has no settings store, and a view filter
     /// that states its own count in a footer does not need one.
     pub(crate) show_done: bool,
+    /// Whether the rail's tree shows the rows whose work is finished — the
+    /// `awaiting_merge` band. Per-window and resetting on relaunch, exactly
+    /// like [`Self::show_done`], which governs a different set on a different
+    /// surface: `done` in the All Tasks footer against `awaiting_merge` in the
+    /// rail header. The two sets are disjoint by construction. Defaults to
+    /// `true` because the rail has always shown these rows — Clear is
+    /// something the reader does, not a state the app boots into.
+    pub(crate) show_finished: bool,
     /// Which rows of the All Tasks list are ticked.
     ///
     /// The catalog's own selection, and the list's *first*:
@@ -566,6 +574,7 @@ impl Workspace {
             selected_task: None,
             bundle_delete_armed: None,
             show_done: false,
+            show_finished: true,
             task_selection: TaskSelection::default(),
             input,
             review_input,
