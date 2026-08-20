@@ -424,7 +424,9 @@ fn system_prompt(config: &WorkerConfig) -> String {
          Budgets: one command may run for {command_secs}s and the whole session for \
          {total_secs}s. A backgrounded command dies with the session — never park \
          yourself waiting on one, and never start a command another run has \
-         measured at longer than your budget.\n\n"
+         measured at longer than your budget.\n\n\
+         {pipe_clause}\n\n",
+        pipe_clause = crate::prompt::PIPE_EXIT_STATUS,
     );
     if config.workdir_is_checkout {
         out.push_str(
@@ -501,6 +503,25 @@ mod tests {
         );
         assert!(tail.text().ends_with('é'));
         assert!(!tail.text().contains("first"), "the old text is gone");
+    }
+
+    /// #1071. A widening past the two files the issue names, and deliberate:
+    /// this lane exists to run suites and report what they did, its prompt
+    /// already says "Report facts, not assessments", and its report is what
+    /// an orchestrator merge decision rests on — so a pipe that manufactures
+    /// a green exit here is the same defect one level up with a wider blast
+    /// radius. Unconditional, so a host with no build directory gets it too.
+    #[test]
+    fn the_worker_prompt_says_a_pipe_reports_the_pipes_exit_status() {
+        let bare = system_prompt(&WorkerConfig {
+            command: "stub".into(),
+            timeout: Duration::from_secs(600),
+            workdir: PathBuf::from("/tmp/w"),
+            workdir_is_checkout: false,
+            target_dir: None,
+            worktree_dir: PathBuf::from("/tmp/verify-worktree"),
+        });
+        assert!(bare.contains(crate::prompt::PIPE_EXIT_STATUS), "{bare}");
     }
 
     #[test]

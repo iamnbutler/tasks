@@ -1871,6 +1871,13 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
         ""
     };
     let degradation = degradation_section(config.github_configured);
+    // Unconditional, and deliberately not part of `verification_section`:
+    // that function returns nothing when there is no target directory, so a
+    // clause spliced there would be absent on precisely the hosts that cannot
+    // verify and must therefore reason hardest from command output. Every
+    // other reader of this clause loses a run or writes a wrong sentence when
+    // a pipe manufactures a green exit; this one merges.
+    let pipe_clause = crate::prompt::PIPE_EXIT_STATUS;
     let curl_config = config.curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
@@ -1971,6 +1978,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          {authority}\n\n\
          {degradation}\
          {workdir}\n\n\
+         {pipe_clause}\n\n\
          {verification}\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
@@ -3123,6 +3131,39 @@ mod tests {
         }
     }
 
+    /// #1071, and this is the consumer where a false pass becomes a merge:
+    /// the orchestrator reads an exit status and what it does with the
+    /// reading is `POST /pull-requests/{n}/merge`, whose recourse is a
+    /// revert. Unconditional — and specifically **not** inside
+    /// `verification_section`, which returns nothing when there is no target
+    /// directory, i.e. on precisely the hosts that cannot verify and must
+    /// therefore reason hardest from command output.
+    #[test]
+    fn the_orchestrator_prompt_says_a_pipe_reports_the_pipes_exit_status() {
+        let charter = crate::models::Capability::ALL
+            .iter()
+            .map(|&capability| CharterEntry {
+                capability,
+                level: CharterLevel::Live,
+                daily_limit: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .collect::<Vec<_>>();
+        // A host that can verify, and one that cannot: the clause is present
+        // either way, which is the whole point of keeping it out of
+        // `verification_section`.
+        for target_dir in [Some(PathBuf::from("/state/verify-target")), None] {
+            let p = system_prompt(
+                &OrchestratorConfig {
+                    target_dir,
+                    ..prompt_config()
+                },
+                &charter,
+            );
+            assert!(p.contains(crate::prompt::PIPE_EXIT_STATUS), "{p}");
+        }
+    }
+
     /// #1053: with the worker lane live and a host that can build, the labor
     /// moves off the orchestrator's own turn. The prompt must say so in every
     /// generated section at once — a delegation instruction beside a standing
@@ -3332,12 +3373,24 @@ mod tests {
     /// Code refuses to run under a static `Bash(curl:*)` allowlist — so the
     /// safest deployment was the one where nothing could be attributed and
     /// the charter was inert.
+    ///
+    /// The blanket "no `$` anywhere" was a proxy for that, and #1071 is the
+    /// first legitimate `$` this prompt has carried: the shared pipe clause
+    /// names `${PIPESTATUS[0]}`, which is not a credential and is not a
+    /// command the prompt asks be run. So the blanket is kept over everything
+    /// this file writes and the one shared const is excised before the check
+    /// — narrower than deleting the assertion, since a `$FOO` added anywhere
+    /// else still goes red, and the const has its own wording test. Under a
+    /// static allowlist the agent cannot run a pipeline at all, and the clause
+    /// ends on the escape that needs no variable in any case.
     #[test]
     fn the_prompt_asks_for_the_config_file_and_never_a_shell_variable() {
         let p = prompt(4800, &[]);
         assert!(p.contains("-K /data/orchestrator-curl.conf"), "{p}");
+        let own_words = p.replace(crate::prompt::PIPE_EXIT_STATUS, "");
+        assert_ne!(own_words.len(), p.len(), "the clause is spliced in: {p}");
         assert!(
-            !p.contains("TASKS_ACTOR_TOKEN") && !p.contains('$'),
+            !own_words.contains("TASKS_ACTOR_TOKEN") && !own_words.contains('$'),
             "a command with a variable in it is not statically verifiable: {p}"
         );
         // The two things `-K` makes possible to get wrong: pointing it at
