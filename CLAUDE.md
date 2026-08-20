@@ -878,8 +878,10 @@ implementation.
   it lasts on `/status`, `tasks status` and the Server window, so an idle
   pipeline can always say why it is idle. **No obligation and no orchestrator
   prompt section** — the orchestrator cannot fix GitHub, and an undischargeable
-  signal raised every pass is how a signal gets trained out of use, the same
-  argument that kept `ObligationKind::StaleImage` from existing. The one
+  signal raised every pass is how a signal gets trained out of use. It reaches
+  the same place `ObligationKind::StaleImage` does and by a different road:
+  there the means are present and the *decision* is not the orchestrator's,
+  here the decision would be its to make and the means do not exist. The one
   remaining gap is deliberate: the record is in memory, so a restart mid-outage
   can dispatch once, and closing it would mean persisting a GitHub-owned fact or
   blocking dispatch on a signal that may never arrive. It is narrower than it
@@ -1130,10 +1132,23 @@ implementation.
   the images are. And **nothing observed is not a clean bill of health** — no
   poll exists, so an empty list means no run has started in an image yet, and
   every renderer says "none observed yet" rather than "current". There is no
-  `ObligationKind::StaleImage`: obligations go only to the orchestrator, which
-  holds a curl-only token in a VM-less workdir and could never discharge one,
-  and an undischargeable obligation raised every pass is how a signal gets
-  trained out of use. `make images-check` covers the one window observation
+  `ObligationKind::StaleImage`, and the reason is **what a rebuild decides, not
+  what the orchestrator can reach** — a capability claim would be checkable and
+  wrong: `ORCHESTRATOR_WORKDIR` is routinely the checkout, `ORCHESTRATOR_CMD`
+  routinely carries `--dangerously-skip-permissions`, and the `container` CLI
+  and the cross toolchain are on this host, so the orchestrator can run `make
+  images` today. It must not, because a rebuild is a **deployment**: it changes
+  what every future run executes, with no review in front of it and no revert
+  but another rebuild. That is the `build-now` category — `POST /projects`,
+  `POST /projects/{id}/status`, `DELETE /builds/{id}/bundle` — all human-only
+  for what they decide rather than for any lack of means. The obligation
+  argument then follows rather than carrying the weight: the decision is a
+  human's however the host is configured, so an obligation raised every pass
+  would be undischargeable *by the party it is addressed to*, which is how a
+  signal gets trained out of use. Writing it the other way round is the trap
+  this document already names one section down — the first person to run `which
+  container` finds the stated objection evaporated and enables the thing without
+  re-deriving whether it is safe. `make images-check` covers the one window observation
   cannot — right after a rebuild, before anything has run — and `make images`
   ends by invoking it.
 - **While an update is pending, new containers wait — observing a gap and
@@ -1162,7 +1177,9 @@ implementation.
   nobody arriving later can see — while `/status`/`tasks status`
   carry the standing answer with each reason naming its own discharge. A `Note`
   and not an obligation, for the reason `ObligationKind::StaleImage` does not
-  exist: the orchestrator can no more run `make images` than it can fix GitHub.
+  exist: discharging this one means a rebuild or a restart, and both are
+  deployments a human decides — not because the orchestrator could not run
+  them.
   `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate; anything else
   non-`on` refuses to boot. The hold sits beside `github_hold` at the same two
   gates, ahead of the claim, for the same claim-then-refuse reason.
