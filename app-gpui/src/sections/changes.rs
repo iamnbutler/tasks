@@ -15,9 +15,7 @@
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context};
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::models::{
-    Build, BuildStatus, TaskState, Verification, VerificationStatus,
-};
+use tasks_client::api::models::{Build, BuildStatus, TaskState, Verification, VerificationStatus};
 
 use crate::components::{status_badge, task_state_color, title_case};
 use crate::time;

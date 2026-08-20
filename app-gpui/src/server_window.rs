@@ -22,7 +22,9 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::http::{InFlight, ServerStatus, VerifyDirTier};
+use tasks_client::api::http::{
+    DeviceFlow, DeviceFlowStatus, InFlight, ServerStatus, VerifyDirTier,
+};
 use tasks_client::api::models::Mode;
 
 use crate::about;
@@ -191,6 +193,11 @@ impl ServerWindow {
             .as_ref()
             .map(|dir| dir.display().to_string())
             .unwrap_or_else(|| "unknown ($HOME is not set)".to_string());
+        // The sign-in surface (#1061). A standing fact like the verify dir,
+        // not an exception report — but only while the surface answers, so a
+        // dead or pre-route server hides the row rather than guessing.
+        let sign_in_status = control.sign_in.clone();
+        let sign_in_error = control.sign_in_error.clone();
 
         // The freshness of the answer belongs next to the answer: this is a
         // poll, so "not serving" is a claim with an age on it.
@@ -273,6 +280,7 @@ impl ServerWindow {
             .children(broker)
             .children(runtime)
             .children(verify_dir)
+            .children(self.sign_in_fact(sign_in_status, sign_in_error, cx))
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -301,6 +309,81 @@ impl ServerWindow {
                     .child(label),
             )
             .child(div().flex_1().text_color(theme.fg()).child(value))
+    }
+
+    /// The sign-in row (#1061). The code renders large while one is waiting
+    /// to be entered, because entering it at github.com/login/device is the
+    /// whole job; the sentence and the affordance are decided by
+    /// [`sign_in_row`], which is the pure, tested half.
+    fn sign_in_fact(
+        &self,
+        status: Option<DeviceFlowStatus>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let status = status?;
+        let theme = cx.theme().clone();
+        let (line, affordance) = sign_in_row(&status);
+        let code = match &status.flow {
+            DeviceFlow::Pending { user_code, .. } => Some(user_code.clone()),
+            _ => None,
+        };
+        let button = match affordance {
+            SignInAffordance::Start(label) => Some(self.button(
+                "sign-in-start",
+                label,
+                true,
+                None,
+                cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                    this.control
+                        .update(cx, |control, cx| control.start_sign_in(cx));
+                }),
+                cx,
+            )),
+            SignInAffordance::Open(uri) => Some(self.button(
+                "sign-in-open",
+                "Open github.com/login/device",
+                true,
+                None,
+                move |_event, _window, cx| cx.open_url(&uri),
+                cx,
+            )),
+            SignInAffordance::None => None,
+        };
+        let error = error.map(|err| {
+            div()
+                .text_color(theme.fg_muted())
+                .child(format!("sign-in failed: {err}"))
+        });
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(10.))
+                .text_xs()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(96.))
+                        .text_color(theme.fg_muted())
+                        .child("Sign-in"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .children(
+                            code.map(|code| div().text_lg().text_color(theme.fg()).child(code)),
+                        )
+                        .child(div().text_color(theme.fg()).child(line))
+                        .children(error)
+                        .children(button.map(|button| div().flex().flex_row().child(button))),
+                )
+                .into_any_element(),
+        )
     }
 
     // --- the operations ---
@@ -1033,6 +1116,55 @@ fn work_lines(in_flight: &InFlight) -> String {
     parts.join(", ")
 }
 
+/// The sign-in row's sentence and affordance (#1061), decided as data — the
+/// [`github_hold_line`] shape, tested the same way. Unlike the hold lines it
+/// is not an exception report: whenever the surface answers at all the row
+/// shows, because "what serves as the GitHub credential" is a standing fact
+/// the app could never observe before this route existed.
+#[derive(Debug, PartialEq)]
+enum SignInAffordance {
+    /// Offer to start (or restart) the flow, with the button's label.
+    Start(&'static str),
+    /// Offer to open the verification page the code gets entered at.
+    Open(String),
+    /// Nothing to offer.
+    None,
+}
+
+fn sign_in_row(status: &DeviceFlowStatus) -> (String, SignInAffordance) {
+    match &status.flow {
+        DeviceFlow::Idle => match &status.credential {
+            // The server's own sentence for the source ("the sealed store",
+            // "the environment (GITHUB_TOKEN)") — no client-side wording.
+            Some(source) => (
+                format!("serving from {source}"),
+                SignInAffordance::Start("Sign in again"),
+            ),
+            None => (
+                "no GitHub credential — polling, intake and every write are off".to_string(),
+                SignInAffordance::Start("Sign in with GitHub"),
+            ),
+        },
+        DeviceFlow::Pending {
+            user_code,
+            verification_uri,
+            ..
+        } => (
+            format!("enter {user_code} at {verification_uri} — waiting for the authorization"),
+            SignInAffordance::Open(verification_uri.clone()),
+        ),
+        DeviceFlow::Sealed { .. } => (
+            "sealed `github-token` — the running server picks it up on its next read".to_string(),
+            SignInAffordance::None,
+        ),
+        // Verbatim, never reworded here: the expiring-token refusal names the
+        // OAuth-app checkbox to uncheck, and it was written for this reader.
+        DeviceFlow::Refused { message, .. } => {
+            (message.clone(), SignInAffordance::Start("Try again"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,5 +1357,74 @@ mod tests {
         let line = in_flight_lines(&status);
         assert!(line.contains("scout sess_1"), "{line}");
         assert!(line.contains("owed turn 17"), "{line}");
+    }
+
+    // --- the sign-in row (#1061) ---
+
+    fn sign_in(credential: Option<&str>, flow: DeviceFlow) -> DeviceFlowStatus {
+        DeviceFlowStatus {
+            credential: credential.map(str::to_string),
+            flow,
+        }
+    }
+
+    #[test]
+    fn no_credential_names_the_cost_and_offers_the_button() {
+        let (line, affordance) = sign_in_row(&sign_in(None, DeviceFlow::Idle));
+        assert!(line.contains("no GitHub credential"), "{line}");
+        assert_eq!(affordance, SignInAffordance::Start("Sign in with GitHub"));
+    }
+
+    #[test]
+    fn a_serving_credential_reports_the_servers_own_sentence() {
+        let (line, affordance) = sign_in_row(&sign_in(Some("the sealed store"), DeviceFlow::Idle));
+        assert!(line.contains("the sealed store"), "{line}");
+        assert_eq!(affordance, SignInAffordance::Start("Sign in again"));
+    }
+
+    #[test]
+    fn a_pending_flow_shows_the_code_and_opens_the_page() {
+        let (line, affordance) = sign_in_row(&sign_in(
+            None,
+            DeviceFlow::Pending {
+                user_code: "ABCD-1234".into(),
+                verification_uri: "https://github.com/login/device".into(),
+                expires_at: Utc::now(),
+            },
+        ));
+        assert!(line.contains("ABCD-1234"), "{line}");
+        assert_eq!(
+            affordance,
+            SignInAffordance::Open("https://github.com/login/device".into())
+        );
+    }
+
+    /// The refusal is the server's sentence, verbatim: the expiring-token one
+    /// names the OAuth-app checkbox to uncheck, and rewording it here is
+    /// exactly what #1061 forbids.
+    #[test]
+    fn a_refusal_reaches_the_row_verbatim() {
+        let message = "GitHub returned an expiring token, so the OAuth app still has \
+                       \"Expire user access tokens\" checked."
+            .to_string();
+        let (line, affordance) = sign_in_row(&sign_in(
+            None,
+            DeviceFlow::Refused {
+                message: message.clone(),
+                at: Utc::now(),
+            },
+        ));
+        assert_eq!(line, message);
+        assert_eq!(affordance, SignInAffordance::Start("Try again"));
+    }
+
+    #[test]
+    fn sealed_says_the_server_picks_it_up_and_offers_nothing() {
+        let (line, affordance) = sign_in_row(&sign_in(
+            Some("the sealed store"),
+            DeviceFlow::Sealed { at: Utc::now() },
+        ));
+        assert!(line.contains("picks it up"), "{line}");
+        assert_eq!(affordance, SignInAffordance::None);
     }
 }

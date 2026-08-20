@@ -47,7 +47,7 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, Global};
-use tasks_client::api::http::{InFlight, ServerStatus};
+use tasks_client::api::http::{DeviceFlowStatus, InFlight, ServerStatus};
 use tasks_client::api::models::Mode;
 use tasks_client::api::version::VersionInfo;
 use tasks_client::Client;
@@ -563,6 +563,15 @@ pub struct ServerControl {
     /// answer here explains every other surprising answer.
     pub data_dir: Option<PathBuf>,
     probing: bool,
+    /// The GitHub sign-in (#1061): what `GET /auth/github/device` last
+    /// answered. `None` while the server is unreachable, predates the route,
+    /// or has not been asked yet — the row simply does not render, because
+    /// the Server row above already says what is wrong.
+    pub sign_in: Option<DeviceFlowStatus>,
+    /// Why the last *start* failed — user-initiated, so it is shown beside
+    /// the button, unlike the poll's own failures, which just empty the row.
+    pub sign_in_error: Option<String>,
+    sign_in_probing: bool,
 }
 
 /// The global wrapper. gpui globals are values, so the entity lives inside
@@ -590,6 +599,9 @@ impl ServerControl {
             probed_at: None,
             data_dir: tasks_api::paths::data_dir(),
             probing: false,
+            sign_in: None,
+            sign_in_error: None,
+            sign_in_probing: false,
         }
     }
 
@@ -700,6 +712,9 @@ impl ServerControl {
     /// Coalesced, because the window polls on a timer and a wedged server can
     /// hold a probe for the client's whole call timeout.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // The sign-in rides the same cadence: one more loopback GET per poll,
+        // coalesced on its own flag so a wedged server cannot stack probes.
+        self.refresh_sign_in(cx);
         if self.probing {
             return;
         }
@@ -734,6 +749,57 @@ impl ServerControl {
                 // the build that is serving now.
                 this.version = version.ok();
                 this.probed_at = Some(Utc::now());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-read the sign-in status (#1061). Quiet on failure: a poll error
+    /// empties the row rather than raising anything — an unreachable server
+    /// and one predating the route both read as "nothing to say", and the
+    /// Server row is where unreachability is already reported.
+    pub fn refresh_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.sign_in_probing {
+            return;
+        }
+        self.sign_in_probing = true;
+        let client = self.client.clone();
+        let probe = cx
+            .background_executor()
+            .spawn(async move { client.github_device_flow() });
+        cx.spawn(async move |this, cx| {
+            let result = probe.await;
+            this.update(cx, |this: &mut ServerControl, cx| {
+                this.sign_in_probing = false;
+                this.sign_in = result.ok();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Start (or supersede) the GitHub sign-in. The server answers
+    /// already-`Pending` with the code, so one round trip puts the code on
+    /// screen; the server polls GitHub and seals the token itself, and this
+    /// app only ever sees status.
+    pub fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { client.start_github_device_flow() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this: &mut ServerControl, cx| {
+                match result {
+                    Ok(status) => {
+                        this.sign_in = Some(status);
+                        this.sign_in_error = None;
+                    }
+                    Err(err) => this.sign_in_error = Some(err.to_string()),
+                }
                 cx.notify();
             })
             .ok();

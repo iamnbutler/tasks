@@ -1025,6 +1025,50 @@ pub struct LabelInfo {
     pub description: String,
 }
 
+/// `GET`/`POST /auth/github/device` — the GitHub sign-in surface (#1061).
+///
+/// `credential` answers the question the app could never see before #1061:
+/// what serves as the server's GitHub credential right now. It is the
+/// server's own sentence ("the sealed store", "the environment
+/// (GITHUB_TOKEN)") rather than an enum, deliberately — the wording source is
+/// the server's `CredentialSource` display, and a client-side translation
+/// table would be a second copy of it that drifts. `None` means nothing
+/// serves, which is the state the sign-in button exists for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceFlowStatus {
+    pub credential: Option<String>,
+    pub flow: DeviceFlow,
+}
+
+/// Where the sign-in stands. Strict on purpose, like every enum in this
+/// crate: a state the client does not know is a build error, not a runtime
+/// fallback — a pane guessing at an unknown sign-in state is exactly the
+/// wrong place to degrade quietly.
+///
+/// The flow is in-memory on the server: a restart lands back on `Idle`, and
+/// the pane simply offers the button again. `Refused`'s `message` is the
+/// server's verbatim sentence — the expiring-token refusal names the OAuth
+/// app checkbox to uncheck, and it was written for exactly this reader.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeviceFlow {
+    /// No sign-in underway. The button state.
+    Idle,
+    /// A code is waiting to be entered. The pane shows `user_code` large,
+    /// offers `verification_uri`, and keeps polling.
+    Pending {
+        user_code: String,
+        verification_uri: String,
+        expires_at: DateTime<Utc>,
+    },
+    /// The token is sealed as `github-token`; the running server picks it up
+    /// on its next read.
+    Sealed { at: DateTime<Utc> },
+    /// The flow ended without sealing anything. Terminal until the next
+    /// start; the message is shown verbatim.
+    Refused { message: String, at: DateTime<Utc> },
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppliedMigration, Viewer};

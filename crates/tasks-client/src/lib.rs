@@ -24,9 +24,9 @@ use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
     BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse, CancelRunRequest,
-    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
-    ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
+    CaptureIssue, CloseTaskRequest, CreateProject, DeviceFlowStatus, ErrorResponse, ModeResponse,
+    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest,
+    SendMessage, ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -652,6 +652,22 @@ impl Client {
     /// the app's read of it for why that is deliberately not bannered.
     pub fn viewer(&self) -> Result<Viewer> {
         self.get_json("/viewer", &[])
+    }
+
+    // --- the GitHub sign-in (#1061) ---
+
+    /// Where the sign-in stands, plus what currently serves as the server's
+    /// GitHub credential. Human-only at the server; a 403 here means this
+    /// client sent an actor header, which the app never does.
+    pub fn github_device_flow(&self) -> Result<DeviceFlowStatus> {
+        self.get_json("/auth/github/device", &[])
+    }
+
+    /// Start (or supersede) a sign-in. The answer is already `Pending` with
+    /// the code to show; the server polls GitHub and seals the token itself,
+    /// so no credential ever reaches this client.
+    pub fn start_github_device_flow(&self) -> Result<DeviceFlowStatus> {
+        self.post_empty("/auth/github/device")
     }
 
     // --- mode ---
