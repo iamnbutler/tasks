@@ -158,7 +158,7 @@ async fn rebuild_and_ship(h: &Harness, spec_ids: &[SpecId], pr: u64) -> Build {
         .unwrap();
     h.store.claim_next_queued_build().await.unwrap();
     h.store
-        .finalize_build_succeeded(&build.id, "deadbeef", pr, Some("summary"), &[])
+        .finalize_build_succeeded(&build.id, "deadbeef", pr, Some("summary"), &[], None)
         .await
         .unwrap();
     h.store.get_build(&build.id).await.unwrap().unwrap()
@@ -502,7 +502,7 @@ async fn a_build_cannot_supersede_itself() {
         .unwrap();
     h.store.claim_next_queued_build().await.unwrap();
     h.store
-        .finalize_build_succeeded(&build.id, "deadbeef", 42, None, &[])
+        .finalize_build_succeeded(&build.id, "deadbeef", 42, None, &[], None)
         .await
         .unwrap();
     h.bundles.preserve(&build.id, b"PACK").await.unwrap();

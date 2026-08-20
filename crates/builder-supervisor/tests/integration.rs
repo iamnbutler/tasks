@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine as _;
+use tasks_protocol::verify::{VERIFY_SCRIPT_PATH, Verification, VerificationStatus};
 use tasks_protocol::{
     BuildCommand, BuildEvent, FailureClass, ScoutCommand, TaskCommand, TaskEvent, TasksProtocol,
 };
@@ -44,6 +45,16 @@ async fn run_git(dir: &Path, args: &[&str]) -> String {
 }
 
 async fn make_fixture_repo(dir: &Path) -> PathBuf {
+    make_repo(dir, None).await
+}
+
+/// A fixture repo, optionally **declaring a test suite in its base commit**.
+///
+/// The base commit is the point: the supervisor reads `.tasks/verify` at
+/// `base_sha`, so a script committed anywhere else is not the one that runs —
+/// which is the property `a_branch_that_weakens_its_own_gate_is_still_judged_by_the_base_one`
+/// exists to prove.
+async fn make_repo(dir: &Path, verify: Option<&str>) -> PathBuf {
     let repo = dir.join("fixture-repo");
     tokio::fs::create_dir_all(&repo).await.unwrap();
     run_git(&repo, &["init", "-b", "main"]).await;
@@ -52,7 +63,14 @@ async fn make_fixture_repo(dir: &Path) -> PathBuf {
     tokio::fs::write(repo.join("README.md"), "# fixture\n")
         .await
         .unwrap();
-    run_git(&repo, &["add", "."]).await;
+    if let Some(script) = verify {
+        let path = repo.join(VERIFY_SCRIPT_PATH);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, script).await.unwrap();
+    }
+    run_git(&repo, &["add", "-A"]).await;
     run_git(&repo, &["commit", "-m", "init"]).await;
     repo
 }
@@ -128,6 +146,34 @@ impl SupervisorProc {
 }
 
 fn start(repo_url: String) -> TVmCommand {
+    start_with_budget(repo_url, Some(600))
+}
+
+fn start_with_trunk(repo_url: String, trunk: Option<&str>) -> TVmCommand {
+    let mut cmd = start_with_budget(repo_url, Some(600));
+    if let VmCommand::App {
+        payload: TaskCommand::Build(BuildCommand::Start { trunk_branch, .. }),
+    } = &mut cmd
+    {
+        *trunk_branch = trunk.map(str::to_string);
+    }
+    cmd
+}
+
+/// A build **stacked** on another build's branch, which is the routine case
+/// here and the one the trunk comparison exists for.
+fn start_stacked(repo_url: String, base: &str) -> TVmCommand {
+    let mut cmd = start_with_budget(repo_url, Some(600));
+    if let VmCommand::App {
+        payload: TaskCommand::Build(BuildCommand::Start { base_branch, .. }),
+    } = &mut cmd
+    {
+        *base_branch = base.to_string();
+    }
+    cmd
+}
+
+fn start_with_budget(repo_url: String, budget_secs: Option<u64>) -> TVmCommand {
     VmCommand::App {
         payload: TaskCommand::Build(BuildCommand::Start {
             build_id: "build_1".into(),
@@ -135,6 +181,8 @@ fn start(repo_url: String) -> TVmCommand {
             base_branch: "main".into(),
             branch: BRANCH.into(),
             prompt: "## Spec 1 of 1: do the thing".into(),
+            budget_secs,
+            trunk_branch: Some("main".into()),
         }),
     }
 }
@@ -177,6 +225,9 @@ struct Landed {
     /// Whether the bundle also carried `refs/abandoned/<branch>`. The server
     /// never fetches it — nothing may push it — but nothing may lose it either.
     abandoned: bool,
+    /// What the supervisor's own run of the project's suite said. `None` only
+    /// from a supervisor that predates the field, which this tree's cannot be.
+    verification: Option<Verification>,
     scratch: PathBuf,
     _tmp: tempfile::TempDir,
 }
@@ -201,24 +252,39 @@ impl Landed {
 /// that agreed with the reported head by shipping the wrong ref would sail
 /// through that comparison, so every caller then asserts on the contents.
 async fn land(agent: &Path) -> Landed {
+    land_verifying(agent, None, &[]).await
+}
+
+/// [`land`], with the repository declaring a test suite the supervisor will
+/// run, and extra environment for the supervisor process.
+async fn land_verifying(agent: &Path, verify: Option<&str>, env: &[(&str, &str)]) -> Landed {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = make_fixture_repo(tmp.path()).await;
+    let repo = make_repo(tmp.path(), verify).await;
     let repo_url = format!("file://{}", repo.display());
 
     let mut sup =
-        SupervisorProc::spawn(&supervisor_bin(), agent.to_str().unwrap(), tmp.path()).await;
+        SupervisorProc::spawn_with_env(&supervisor_bin(), agent.to_str().unwrap(), tmp.path(), env)
+            .await;
     assert!(matches!(sup.recv().await, VmEvent::Ready));
     sup.send(start(repo_url.clone())).await;
 
     let (terminal, progress) = drain_with_progress(&mut sup).await;
-    let (base_sha, head_sha, bundle_base64, summary, files) = match terminal {
+    let (base_sha, head_sha, bundle_base64, summary, files, verification) = match terminal {
         BuildEvent::Completed {
             base_sha,
             head_sha,
             bundle_base64,
             summary,
             files_touched,
-        } => (base_sha, head_sha, bundle_base64, summary, files_touched),
+            verification,
+        } => (
+            base_sha,
+            head_sha,
+            bundle_base64,
+            summary,
+            files_touched,
+            verification,
+        ),
         other => panic!("expected Completed, got {other:?}"),
     };
     sup.send(VmCommand::Shutdown).await;
@@ -264,6 +330,7 @@ async fn land(agent: &Path) -> Landed {
         summary,
         progress,
         abandoned,
+        verification,
         scratch,
         _tmp: tmp,
     }
@@ -434,16 +501,32 @@ async fn a_build_ships_a_bundle_that_reconstructs_the_branch() {
 
     sup.send(start(repo_url.clone())).await;
 
-    let (base_sha, head_sha, bundle_base64, summary, files) = match drain(&mut sup).await {
-        BuildEvent::Completed {
-            base_sha,
-            head_sha,
-            bundle_base64,
-            summary,
-            files_touched,
-        } => (base_sha, head_sha, bundle_base64, summary, files_touched),
-        other => panic!("expected Completed, got {other:?}"),
-    };
+    let (base_sha, head_sha, bundle_base64, summary, files, verification) =
+        match drain(&mut sup).await {
+            BuildEvent::Completed {
+                base_sha,
+                head_sha,
+                bundle_base64,
+                summary,
+                files_touched,
+                verification,
+            } => (
+                base_sha,
+                head_sha,
+                bundle_base64,
+                summary,
+                files_touched,
+                verification,
+            ),
+            other => panic!("expected Completed, got {other:?}"),
+        };
+
+    // A repo that declares nothing is never green, and never a failure either:
+    // refusing to dispatch would wedge a project on a convention it has not
+    // adopted, which is exactly today's behaviour preserved.
+    let verification = verification.expect("this supervisor always stamps a verification");
+    assert_eq!(verification.status, VerificationStatus::Undeclared);
+    assert!(!verification.is_green());
 
     assert_eq!(base_sha, base_tip, "branch grew from the fixture tip");
     assert_ne!(head_sha, base_sha);
@@ -736,4 +819,361 @@ async fn a_scout_command_is_refused_not_acted_on() {
 
     sup.send(VmCommand::Shutdown).await;
     sup.close().await;
+}
+
+// --- the supervisor runs the project's suite (#1020) ---------------------
+//
+// The gate a project declares, as these tests declare it. Reading it out of the
+// base commit is what makes the forgery in `gate-editing-agent.sh` fail.
+
+/// Passes only once the sweep has already committed the work the agent left
+/// behind — which is what pins the ordering the module doc claims: the suite
+/// judges the tree the bundle carries, not the tree the agent walked away from.
+const GATE_NEEDS_THE_SWEEP: &str = "#!/bin/sh\nexec git cat-file -e HEAD:src/forgotten.rs\n";
+
+/// Red while `BROKEN` is in the tree; hangs forever while `SLOW` is.
+const GATE_BROKEN_OR_SLOW: &str = "#!/bin/sh\n\
+    if [ -f SLOW ]; then while :; do :; done; fi\n\
+    test ! -f BROKEN\n";
+
+/// Always red, whatever the branch does to its own copy of this file.
+const GATE_ALWAYS_RED: &str = "#!/bin/sh\nexit 1\n";
+
+/// Run a build with a declared gate and a stateful agent, returning the
+/// terminal event and every progress line.
+async fn build_with_gate(
+    agent: &Path,
+    gate: &str,
+    env: &[(&str, &str)],
+) -> (BuildEvent, Vec<String>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path(), Some(gate)).await;
+    let repo_url = format!("file://{}", repo.display());
+    let state = tmp.path().join("stub-state");
+    tokio::fs::create_dir_all(&state).await.unwrap();
+
+    let mut env: Vec<(&str, &str)> = env.to_vec();
+    let state_str = state.to_str().unwrap().to_string();
+    env.push(("STUB_STATE", &state_str));
+
+    let mut sup = SupervisorProc::spawn_with_env(
+        &supervisor_bin(),
+        agent.to_str().unwrap(),
+        tmp.path(),
+        &env,
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url)).await;
+    let out = drain_with_progress(&mut sup).await;
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+    out
+}
+
+fn verification_of(event: &BuildEvent) -> &Verification {
+    match event {
+        BuildEvent::Completed { verification, .. } => {
+            verification.as_ref().expect("a verification was stamped")
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// The happy path, and the ordering claim underneath it.
+///
+/// The gate passes only if the **swept** commit is already HEAD, so a green run
+/// here is proof the suite judged the tree the bundle carries rather than
+/// whatever the agent happened to leave on disk. Everything the build normally
+/// ships still ships.
+#[tokio::test]
+async fn a_declared_suite_runs_against_the_swept_tree_and_its_pass_is_stamped() {
+    let landed = land_verifying(&fixture_agent(), Some(GATE_NEEDS_THE_SWEEP), &[]).await;
+    let v = landed.verification.as_ref().expect("verification stamped");
+    assert_eq!(v.status, VerificationStatus::Passed);
+    assert!(v.is_green());
+    // The gate that ruled is named, always — a field that appears only on
+    // disagreement is one nobody learns to read.
+    assert!(v.detail.contains("gate "), "{}", v.detail);
+    assert!(v.detail.contains("same as main"), "{}", v.detail);
+    // And the build is otherwise exactly the build it was.
+    assert!(landed.files.contains(&"src/built.rs".to_string()));
+    assert!(landed.files.contains(&"src/forgotten.rs".to_string()));
+    assert!(landed.said("verification: running .tasks/verify"));
+}
+
+/// An empty script is the cheapest possible forgery — `sh` on an empty file
+/// exits 0 — and it must never read as a pass.
+#[tokio::test]
+async fn an_empty_declaration_is_undeclared_and_never_a_pass() {
+    let landed = land_verifying(&fixture_agent(), Some(""), &[]).await;
+    let v = landed.verification.as_ref().expect("verification stamped");
+    assert_eq!(v.status, VerificationStatus::Undeclared);
+    assert!(!v.is_green());
+    assert!(v.detail.contains("empty"), "{}", v.detail);
+    // It still ships: a project that declares nothing usable dispatches ungated,
+    // which is exactly the behaviour that shipped before this check existed.
+    assert!(!landed.head_sha.is_empty());
+}
+
+/// A red suite buys one repair round, on the same conversation and the same
+/// worktree — and a build that goes green in it ships as a pass.
+#[tokio::test]
+async fn a_red_suite_gets_one_repair_round_and_ships_when_it_goes_green() {
+    let (terminal, progress) = build_with_gate(
+        &fixture("red-then-green-agent.sh"),
+        GATE_BROKEN_OR_SLOW,
+        &[],
+    )
+    .await;
+    let v = verification_of(&terminal);
+    assert_eq!(v.status, VerificationStatus::Passed, "{}", v.detail);
+    assert!(
+        progress.iter().any(|l| l.contains("one repair round")),
+        "the repair round is announced in the transcript: {progress:?}"
+    );
+    // Read once per ROUND: the repair round's summary is the one that ships, or
+    // the accounting the repair prompt asked for is dropped on the floor.
+    match &terminal {
+        BuildEvent::Completed { summary, .. } => assert!(
+            summary
+                .as_deref()
+                .is_some_and(|s| s.contains("Fixed the failing test")),
+            "the latest summary wins: {summary:?}"
+        ),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// A suite that is still red after its one repair round fails the build — and
+/// packages nothing, which is the whole point: untested-and-broken work never
+/// becomes a pull request for someone to review.
+#[tokio::test]
+async fn a_suite_that_stays_red_fails_the_build_and_packages_nothing() {
+    let (terminal, _progress) = build_with_gate(
+        &fixture("red-then-green-agent.sh"),
+        GATE_BROKEN_OR_SLOW,
+        &[("STUB_NEVER_FIX", "1")],
+    )
+    .await;
+    match terminal {
+        BuildEvent::Failed { reason, class } => {
+            assert!(reason.contains("test suite failed"), "{reason}");
+            assert!(reason.contains("after a repair round"), "{reason}");
+            // A verdict on the work: the agent ran to completion twice and the
+            // project's own suite says the result does not work.
+            assert_eq!(class, FailureClass::Verdict);
+        }
+        other => panic!("a red suite must not package a bundle, got {other:?}"),
+    }
+}
+
+/// **A red verdict, once reached, is not erased by an inconclusive re-run.**
+///
+/// Round one is red. The repair round trades the failure for a suite that never
+/// finishes, which on a *first* round would be an honest `TimedOut` that ships.
+/// Here it must not: the last thing actually known about this work is that it
+/// failed, and shipping on "we do not know" after that is the one direction the
+/// check exists to make impossible. It also closes the incentive gradient —
+/// red is terminal, so a suite that merely hangs must not be an escape.
+#[tokio::test]
+async fn a_red_verdict_is_not_erased_by_an_inconclusive_re_run() {
+    let (terminal, progress) = build_with_gate(
+        &fixture("red-then-green-agent.sh"),
+        GATE_BROKEN_OR_SLOW,
+        &[("STUB_MAKE_SLOW", "1"), ("BUILDER_SUITE_BUDGET_SECS", "3")],
+    )
+    .await;
+    match terminal {
+        BuildEvent::Failed { reason, class } => {
+            assert!(reason.contains("test suite failed"), "{reason}");
+            assert!(reason.contains("did not fix it"), "{reason}");
+            // The observed status stays HONEST — the second run really did time
+            // out, and `detail` is read by humans. What changes is the decision,
+            // not the observation.
+            assert!(reason.contains("timed_out"), "{reason}");
+            assert!(reason.contains("does not overturn a red run"), "{reason}");
+            assert_eq!(class, FailureClass::Verdict);
+        }
+        other => panic!("an inconclusive re-run must not ship a red build, got {other:?}"),
+    }
+    // The killed run is reported rather than inferred from a silence.
+    assert!(
+        progress.iter().any(|l| l.contains("was killed")),
+        "{progress:?}"
+    );
+}
+
+/// A first-round timeout is different, and ships.
+///
+/// A suite that never finished is not evidence about the work — the
+/// implementation may be perfect, and throwing it away because a cold `target/`
+/// compiled slowly is the failure #929 and #884 were filed about. It is never
+/// green, so the batch routes to a human.
+///
+/// This is also the test that found the hang: killing `sh` does not close the
+/// pipes its children inherited, so awaiting the output collector here waits
+/// forever. The gate uses a shell **builtin** loop rather than `sleep`, or the
+/// leaked `sleep` adds its whole duration to every run of this suite.
+#[tokio::test]
+async fn a_first_round_timeout_ships_and_is_never_green() {
+    let landed = land_verifying(
+        &fixture_agent(),
+        Some("#!/bin/sh\nwhile :; do :; done\n"),
+        &[("BUILDER_SUITE_BUDGET_SECS", "3")],
+    )
+    .await;
+    let v = landed.verification.as_ref().expect("verification stamped");
+    assert_eq!(v.status, VerificationStatus::TimedOut);
+    assert!(!v.is_green());
+    assert!(v.detail.contains("killed after 3s"), "{}", v.detail);
+    // It shipped: the bundle is real and the branch grew.
+    assert!(landed.files.contains(&"src/built.rs".to_string()));
+}
+
+/// The forgery this whole change exists to prevent, one level down.
+///
+/// The agent rewrites `.tasks/verify` to `exit 0` and commits it. The build
+/// still fails, because the script is read out of the **base** commit and the
+/// branch's version is never the one that runs.
+#[tokio::test]
+async fn a_branch_that_weakens_its_own_gate_is_still_judged_by_the_base_one() {
+    let (terminal, progress) =
+        build_with_gate(&fixture("gate-editing-agent.sh"), GATE_ALWAYS_RED, &[]).await;
+    match terminal {
+        BuildEvent::Failed { reason, class } => {
+            assert!(reason.contains("test suite failed"), "{reason}");
+            assert_eq!(class, FailureClass::Verdict);
+        }
+        other => panic!("a weakened gate must not let a red build ship, got {other:?}"),
+    }
+    // The gate that ruled is the trunk's, and the branch's edit changed nothing
+    // about it — so there is deliberately NO divergence to report here. The
+    // comparison is base-against-trunk, and on an unstacked build those are the
+    // same commit; the case it exists for is the one below.
+    assert!(
+        progress.iter().any(|l| l.contains("same as main")),
+        "{progress:?}"
+    );
+    assert!(
+        !progress.iter().any(|l| l.contains("declaration_changed")),
+        "an unstacked build has no divergence to report: {progress:?}"
+    );
+}
+
+/// **Stacking punctures the base-commit defence, and the comparison that
+/// notices is against the trunk.**
+///
+/// Build A weakens `.tasks/verify` and opens a pull request. Build B is
+/// dispatched onto A's branch, so the weakened script is *already in B's base
+/// commit*: B's own diff changes nothing, and a base-against-own-diff
+/// comparison sees nothing wrong. This pipeline stacks builds as a matter of
+/// course, so that is not a corner case.
+///
+/// The gate still rules — it is reported, never refused, because changing how a
+/// project is tested is ordinary work — but which script ruled is said out
+/// loud, so a reviewer can see the run was gated by something the trunk does
+/// not have.
+#[tokio::test]
+async fn a_gate_weakened_by_an_earlier_build_in_the_stack_is_reported_against_the_trunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path(), Some(GATE_ALWAYS_RED)).await;
+
+    // Build A's branch: same repo, a gate that passes anything.
+    run_git(&repo, &["checkout", "-q", "-b", "build/earlier"]).await;
+    tokio::fs::write(
+        repo.join(VERIFY_SCRIPT_PATH),
+        "#!/bin/sh
+exit 0
+",
+    )
+    .await
+    .unwrap();
+    run_git(&repo, &["add", "-A"]).await;
+    run_git(&repo, &["commit", "-q", "-m", "Relax the gate"]).await;
+    run_git(&repo, &["checkout", "-q", "main"]).await;
+
+    let repo_url = format!("file://{}", repo.display());
+    let mut sup = SupervisorProc::spawn(
+        &supervisor_bin(),
+        fixture_agent().to_str().unwrap(),
+        tmp.path(),
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start_stacked(repo_url, "build/earlier")).await;
+    let (terminal, progress) = drain_with_progress(&mut sup).await;
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+
+    // The weakened gate really did rule — that is the cost of reporting rather
+    // than refusing, and it is the cost the reviewer chose.
+    let v = verification_of(&terminal);
+    assert_eq!(v.status, VerificationStatus::Passed);
+    // But it is not passed off as the trunk's, and the difference is named on
+    // the field itself rather than only in a log line nobody reads back.
+    assert!(v.detail.contains("DIFFERS from main"), "{}", v.detail);
+    assert!(
+        progress.iter().any(|l| l.contains("declaration_changed")),
+        "the divergence must be reported: {progress:?}"
+    );
+}
+
+/// The trunk comparison is best-effort, and an unmade comparison says so rather
+/// than reading as agreement.
+#[tokio::test]
+async fn an_unreachable_trunk_is_reported_as_an_unmade_comparison() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path(), Some(GATE_NEEDS_THE_SWEEP)).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let mut sup = SupervisorProc::spawn(
+        &supervisor_bin(),
+        fixture_agent().to_str().unwrap(),
+        tmp.path(),
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start_with_trunk(repo_url, Some("no-such-trunk")))
+        .await;
+    let (terminal, _progress) = drain_with_progress(&mut sup).await;
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+
+    let v = verification_of(&terminal);
+    // Still green — an unmade comparison is not a reason to refuse a passing
+    // run — but the gate identity says the comparison was not made.
+    assert_eq!(v.status, VerificationStatus::Passed);
+    assert!(v.detail.contains("gate "), "{}", v.detail);
+    assert!(
+        v.detail.contains("not reachable in this clone"),
+        "an unmade comparison must not read as agreement: {}",
+        v.detail
+    );
+}
+
+/// A run with no budget left to state has nothing to bound a suite with, and
+/// says so — `Unavailable`, never a guess, and never green.
+#[tokio::test]
+async fn a_host_that_states_no_budget_reports_unavailable_rather_than_guessing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path(), Some(GATE_NEEDS_THE_SWEEP)).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let mut sup = SupervisorProc::spawn(
+        &supervisor_bin(),
+        fixture_agent().to_str().unwrap(),
+        tmp.path(),
+    )
+    .await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start_with_budget(repo_url, None)).await;
+    let (terminal, _progress) = drain_with_progress(&mut sup).await;
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+
+    let v = verification_of(&terminal);
+    assert_eq!(v.status, VerificationStatus::Unavailable);
+    assert!(!v.is_green());
+    assert!(v.detail.contains("restart it"), "{}", v.detail);
 }

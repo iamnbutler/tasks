@@ -291,7 +291,22 @@ than filing into the wrong repo. Name it explicitly in a multi-repo client.
   a view retired only by `done` leaves a clock running forever when it is.
 - `GET /builds` (newest first), `GET /builds/{id}` (`{..., spec_ids}`) —
   `branch`, `base_branch`, `base_sha`/`head_sha`, `pr_number`, `status`,
-  `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`.
+  `summary` (the PR body the agent wrote), `files_touched`, `exit_reason`,
+  `verification`.
+  `verification` is `{status, detail}` and is a **check, not a claim**: the
+  Builder supervisor ran the project's own suite (`.tasks/verify`, read out of
+  the build's base commit) inside the VM against the tree the bundle carries.
+  `status` ∈ `passed` \| `undeclared` \| `unavailable` \| `timed_out` — there is
+  deliberately **no failed**, because a red suite fails the build inside the VM
+  and never opens a pull request at all, so a build you can see is never one
+  whose tests were red. Exactly one of those is green; render every other value,
+  and `null`, as "no passing run backs this" rather than as anything neutral.
+  `null` means no run is on record — a build predating the check, or a Builder
+  image not yet rebuilt for it. `detail` is prose for a human (it names the blob
+  SHA of the script that ruled, and whether that script matches the trunk's);
+  **branch on `status` and never on `detail`**. A green run covers the branch
+  against its own base and says nothing about whether it still passes composed
+  with a trunk that has moved since.
   `status` ∈ `queued` \| `running` \| `succeeded` \| `failed` \| **`cancelled`**
   — the last of those is somebody stopping the run, not the build failing, and
   its batch's specs stay `approved` with no attempt charged.

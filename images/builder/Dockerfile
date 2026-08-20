@@ -65,4 +65,17 @@ ENV BUILDER_AGENT_CMD="claude --print --output-format stream-json --verbose --da
 # worktree is the implementation and only an in-VM resume keeps it.
 ENV BUILDER_MAX_RESUMES=2
 
+# The supervisor runs the project's own suite (`.tasks/verify`, read out of the
+# build's BASE commit) after the sweep and before it packages anything, and a
+# red run fails the build inside this VM rather than opening a pull request. It
+# needs no configuration: `make`/`build-essential` come from the base image and
+# cargo-nextest is installed above, which is what `make test-ci` wants.
+#
+# BUILDER_SUITE_BUDGET_SECS is the override and is deliberately NOT set. Unset,
+# the budget is derived from what is left of the run's — remaining minus a 120s
+# packaging reserve, floored at 60s — which is sized to expire before
+# BUILDER_TIMEOUT_SECS does. Set it here only as a hard ceiling for a project
+# whose suite needs one; `0` skips the suite and reports `unavailable`, which is
+# never green.
+
 ENTRYPOINT ["/usr/local/bin/builder-supervisor"]

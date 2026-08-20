@@ -2119,6 +2119,7 @@ fn builder_config(config: &Config, leases: Option<crate::broker::LeaseIssuer>) -
         timeout: config.builder_timeout,
         scratch_root: config.data_dir.join("build-scratch"),
         leases,
+        trunk_branch: config.scout_base_branch.clone(),
     }
 }
 

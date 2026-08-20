@@ -298,7 +298,7 @@ async fn harness(issue: u64, pr_number: u64, pr: Value) -> (Harness, Task, Spec,
         .unwrap();
     store.claim_next_queued_build().await.unwrap().unwrap();
     let build = store
-        .finalize_build_succeeded(&build.id, "headsha", pr_number, None, &[])
+        .finalize_build_succeeded(&build.id, "headsha", pr_number, None, &[], None)
         .await
         .unwrap();
     assert_eq!(
@@ -703,7 +703,7 @@ async fn a_rebuilt_batch_leaves_the_build_it_was_rebuilt_past_alone() {
         .unwrap();
     h.store.claim_next_queued_build().await.unwrap().unwrap();
     h.store
-        .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+        .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[], None)
         .await
         .unwrap();
     {

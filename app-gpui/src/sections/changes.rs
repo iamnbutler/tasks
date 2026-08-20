@@ -15,26 +15,62 @@
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, Context};
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::models::{Build, BuildStatus, TaskState};
+use tasks_client::api::models::{
+    Build, BuildStatus, TaskState, Verification, VerificationStatus,
+};
 
 use crate::components::{status_badge, task_state_color, title_case};
 use crate::time;
 use crate::workspace::Workspace;
 
-/// The Builder's own claim about its work, stated as a trailer in
-/// `SUMMARY.md`: `Verification: PASSED|FAILED|NOT RUN`. A **claim**, not a
-/// check — this repo has no CI, so the build's own test run is the only
-/// evidence a change works, and the tab attributes it as the builder's
-/// statement. Parsed off the summary because that is where the pipeline
-/// puts it (one sentence serving the PR body, the brief, and this tab, no
-/// migration in between).
-pub(crate) fn verification(summary: &str) -> Option<&str> {
-    summary.lines().rev().find_map(|line| {
-        line.trim()
-            .strip_prefix("Verification:")
-            .map(|rest| rest.trim())
-            .filter(|rest| !rest.is_empty())
-    })
+/// How the Changes tab renders a build's verification.
+///
+/// It reads the **structured field** the Builder supervisor stamps on the
+/// build, not a trailer parsed out of `SUMMARY.md`. That parser was a second
+/// one, beside the server's, over prose the graded agent wrote; both are gone.
+/// What is left is a check: the supervisor ran the project's own suite inside
+/// the VM, and a failing suite never opened a pull request at all.
+pub(crate) fn verification_label(
+    verification: Option<&Verification>,
+) -> (String, VerificationTone) {
+    let Some(v) = verification else {
+        return (
+            "not reported — no run on record".into(),
+            VerificationTone::Absent,
+        );
+    };
+    match v.status {
+        VerificationStatus::Passed => (
+            "PASSED — the supervisor ran this project's suite".into(),
+            VerificationTone::Green,
+        ),
+        VerificationStatus::Undeclared => (
+            "none — this project declares no `.tasks/verify`".into(),
+            VerificationTone::Absent,
+        ),
+        VerificationStatus::Unavailable => (
+            "unavailable — the suite could not be run".into(),
+            VerificationTone::Absent,
+        ),
+        VerificationStatus::TimedOut => (
+            "timed out — the suite was killed by its budget".into(),
+            VerificationTone::Absent,
+        ),
+    }
+}
+
+/// How a verification reads at a glance.
+///
+/// **There is no "bad" tone**, for the same structural reason
+/// [`VerificationStatus`] has no `Failed` variant: a red suite fails the build
+/// inside the VM, so this tab can never be asked to render one. Everything that
+/// is not a pass is an absence of evidence, and they all read the same way —
+/// which is the right way, because they all mean the same thing to whoever is
+/// deciding whether to merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationTone {
+    Green,
+    Absent,
 }
 
 impl Workspace {
@@ -86,7 +122,7 @@ impl Workspace {
                 }
                 _ => {
                     "A build appears here while the pipeline is building this task, \
-                     with its branch, summary and the builder's verification claim. \
+                     with its branch, summary and the supervisor's verification. \
                      Build history needs task linkage on builds (a noted follow-up)."
                 }
             };
@@ -128,7 +164,7 @@ impl Workspace {
     }
 
     /// One build's card: identity, status, files, the summary, and the
-    /// verification trailer surfaced as the claim it is.
+    /// verification surfaced as the check it is.
     fn render_build_card(&self, build: Build, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let pr_url = {
@@ -149,7 +185,7 @@ impl Workspace {
         let elapsed = build
             .started_at
             .map(|started| format!("running · {}", time::elapsed(started)));
-        let claim = build.summary.as_deref().and_then(verification);
+        let claim = verification_label(build.verification.as_ref());
 
         let mut card = div()
             .flex()
@@ -207,9 +243,9 @@ impl Workspace {
             );
         }
 
-        // The builder's own claim, attributed as one. `Unreported` (no
-        // trailer) reads as "no run on record" — the direction a mistake
-        // here has to fall.
+        // A check rather than a claim, and `None` reads as "no run on
+        // record" — the direction a mistake here has to fall.
+        let (label, tone) = claim;
         card = card.child(
             div()
                 .flex()
@@ -217,18 +253,14 @@ impl Workspace {
                 .gap(px(6.))
                 .text_xs()
                 .child(div().text_color(theme.fg_muted()).child("Verification:"))
-                .child(match claim {
-                    Some(claim) => div()
-                        .text_color(match claim {
-                            "PASSED" => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
-                            "FAILED" => gpui::hsla(0., 0.75, 0.55, 1.),
-                            _ => theme.fg(),
+                .child(
+                    div()
+                        .text_color(match tone {
+                            VerificationTone::Green => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
+                            VerificationTone::Absent => theme.fg_muted(),
                         })
-                        .child(format!("{claim} (builder's claim)")),
-                    None => div()
-                        .text_color(theme.fg_muted())
-                        .child("not reported — no run on record"),
-                }),
+                        .child(label),
+                ),
         );
 
         if !build.files_touched.is_empty() {
@@ -276,31 +308,59 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_trailer_parses_wherever_it_sits() {
-        assert_eq!(
-            verification("did things\n\nVerification: PASSED\n"),
-            Some("PASSED")
-        );
-        assert_eq!(verification("Verification: NOT RUN"), Some("NOT RUN"));
-        assert_eq!(verification("  Verification:   FAILED  "), Some("FAILED"));
+    fn v(status: VerificationStatus) -> Verification {
+        Verification {
+            status,
+            detail: "make test-ci (gate abc1234)".into(),
+        }
     }
 
-    /// The last trailer wins — a summary quoting an earlier build's line
-    /// must not outrank the build's own statement at the end.
+    /// Exactly one state renders green, and it is the one the supervisor's own
+    /// run produced.
     #[test]
-    fn the_last_trailer_wins() {
-        assert_eq!(
-            verification("Verification: FAILED\nfixed it\nVerification: PASSED"),
-            Some("PASSED")
-        );
+    fn only_a_passing_run_reads_green() {
+        let (label, tone) = verification_label(Some(&v(VerificationStatus::Passed)));
+        assert_eq!(tone, VerificationTone::Green);
+        assert!(label.contains("PASSED"), "{label}");
+        // And it says whose run it was — the whole point of replacing a trailer
+        // the agent wrote with a check the supervisor ran.
+        assert!(label.contains("supervisor"), "{label}");
+
+        for status in [
+            VerificationStatus::Undeclared,
+            VerificationStatus::Unavailable,
+            VerificationStatus::TimedOut,
+        ] {
+            let (label, tone) = verification_label(Some(&v(status)));
+            assert_eq!(tone, VerificationTone::Absent, "{status}: {label}");
+        }
     }
 
-    /// No trailer parses as no claim — never as a default verdict.
+    /// No field parses as no run — never as a default verdict, and never as a
+    /// failure the tab has no way to be handed.
     #[test]
-    fn absence_is_unreported_not_a_verdict() {
-        assert_eq!(verification("shipped some code"), None);
-        assert_eq!(verification("Verification:"), None);
-        assert_eq!(verification("Verification:   "), None);
+    fn absence_is_no_run_on_record_not_a_verdict() {
+        let (label, tone) = verification_label(None);
+        assert_eq!(tone, VerificationTone::Absent);
+        assert!(label.contains("no run on record"), "{label}");
+    }
+
+    /// Each not-green state says which one it is: "declares no suite" and "the
+    /// suite was killed" send a reader to different fixes.
+    #[test]
+    fn the_not_green_states_are_distinguishable() {
+        let labels: Vec<String> = [
+            VerificationStatus::Undeclared,
+            VerificationStatus::Unavailable,
+            VerificationStatus::TimedOut,
+        ]
+        .into_iter()
+        .map(|s| verification_label(Some(&v(s))).0)
+        .collect();
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
     }
 }

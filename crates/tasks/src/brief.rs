@@ -27,13 +27,11 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::builder::{
-    VerificationReport, summary_accounts_for_review_feedback, verification_report,
-};
+use crate::builder::summary_accounts_for_review_feedback;
 use crate::github::GitHubClient;
 use crate::models::{
     Build, BuildId, BuildStatus, Project, ProjectId, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
-    Task, TaskId, TaskState,
+    Task, TaskId, TaskState, Verification, VerificationStatus,
 };
 use crate::store::{Store, StoreError};
 
@@ -307,7 +305,7 @@ impl<'a> Brief<'a> {
         if !waiting.is_empty() {
             lines.push(format!("still awaiting merge: {}", waiting.join(", ")));
         }
-        lines.push(verification_line(build.summary.as_deref()));
+        lines.push(verification_line(build.verification.as_ref()));
         lines.extend(review_feedback_line(&build, world));
         lines.push(verification_surface(&build.files_touched));
         lines.extend(self.landing_facts(&build, world).await);
@@ -855,12 +853,19 @@ impl<'a> Brief<'a> {
 
 // --- pure fact functions ---
 
-/// What the build said about its own test run, attributed as a claim.
+/// Whether a passing run of the project's own test suite backs this batch.
 ///
-/// It *is* a claim — nothing here re-ran anything, and no workflow in this
-/// repository produces a pull-request check and there are no required checks,
-/// so there is no second opinion anywhere in the loop. Saying so on the line is
-/// the difference between evidence and the appearance of evidence.
+/// It is a **check** and no longer a claim: the Builder *supervisor* runs the
+/// suite the project declares at `.tasks/verify`, inside the VM, against the
+/// tree the bundle carries — the agent cannot write the answer, and a red suite
+/// never became a pull request at all. That is why exactly one of the five
+/// states below is green and none of the others is a verdict on the work.
+///
+/// What a green run does **not** say is the half worth stating on the line: it
+/// tested this branch against **its own base**, and the trunk has moved since.
+/// Two branches can each be green against their own base and red composed. Only
+/// a run of the merged result answers that, and nothing in the pipeline makes
+/// one — which is what the landing section sends the reader to do.
 ///
 /// It says "no automated check" rather than "nothing downstream", and the
 /// narrowing is necessary: on a host where the orchestrator has a warm build
@@ -868,30 +873,35 @@ impl<'a> Brief<'a> {
 /// *pipeline* still will not make one for it. Leaving a sentence here that says
 /// the run will not happen, beside a landing section that says go and make one,
 /// is two sources of truth about the same fact.
-fn verification_line(summary: Option<&str>) -> String {
-    match verification_report(summary) {
-        VerificationReport::Passed(detail) => format!(
-            "the build reported its own tests PASSED ({}) — its claim, not an \
-             independent run, and the only evidence here that the change works",
-            or_unspecified(&detail),
+fn verification_line(verification: Option<&Verification>) -> String {
+    let Some(v) = verification else {
+        return "no test run is on record at all: this build predates the supervisor's own \
+                run, or ran in a Builder image that has not been rebuilt for it — unknown \
+                rather than known-skipped, and never a pass"
+            .to_string();
+    };
+    let detail = or_unspecified(&v.detail);
+    match v.status {
+        VerificationStatus::Passed => format!(
+            "the supervisor ran this project's own test suite against the branch and it \
+             PASSED ({detail}) — a check rather than the build's claim about itself, and a \
+             failing suite would never have opened the pull request. It says nothing about \
+             whether the branch still passes composed with a trunk that has moved since its \
+             base"
         ),
-        VerificationReport::Failed(detail) => format!(
-            "the build reported its own tests FAILED ({}) — its claim, not an \
-             independent run, and no automated check re-runs them, so no passing \
-             run backs this batch",
-            or_unspecified(&detail),
+        VerificationStatus::Undeclared => format!(
+            "the project declares no test suite at `.tasks/verify` ({detail}), so nothing ran \
+             and no passing run backs this batch — no automated check will make one"
         ),
-        VerificationReport::NotRun(detail) => format!(
-            "the build reported that it did NOT RUN the tests ({}) — so no run at \
-             all backs this batch, and no automated check will make one",
-            or_unspecified(&detail),
+        VerificationStatus::Unavailable => format!(
+            "the suite could not be run ({detail}), so no passing run backs this batch and no \
+             automated check will make one"
         ),
-        VerificationReport::Unreported => {
-            "the build recorded no verification line, so there is no test run at all on \
-             record: whether anything ran is unknown rather than known-skipped \
-             (builds from before the line was asked for read the same way)"
-                .to_string()
-        }
+        VerificationStatus::TimedOut => format!(
+            "the suite did not finish inside its budget and was killed ({detail}), so no \
+             passing run backs this batch — the suite never reported on the work either way, \
+             which is why the branch shipped rather than failing"
+        ),
     }
 }
 
@@ -903,7 +913,8 @@ fn verification_line(summary: Option<&str>) -> String {
 /// way into the prompt: a build cannot account for an empty section it was
 /// never shown.
 ///
-/// Like [`verification_line`], what it reports is the build's **own claim** —
+/// Unlike [`verification_line`], which is now a check, what this reports is
+/// still the build's **own claim** —
 /// [`summary_accounts_for_review_feedback`] is a presence check and cannot tell
 /// a real accounting from a bare heading. And it is a *fact*, never a veto:
 /// `orchestrator::landing_section` names exactly three carve-outs, all about
@@ -1388,38 +1399,76 @@ mod tests {
         assert!(mixed.contains("Mac"), "{mixed}");
     }
 
-    /// The line is a *claim*, and each of the four states has to read
-    /// differently — "no line" and "did not run" especially, since one is
-    /// compatible with a passing run nobody wrote down and the other is not.
+    fn verified(status: VerificationStatus) -> Verification {
+        Verification {
+            status,
+            detail: "make test-ci (gate abc1234, same as main)".into(),
+        }
+    }
+
+    /// Five states, each reading differently — and only one of them green.
+    ///
+    /// There is deliberately no red state to test: a failing suite fails the
+    /// build inside the VM, so a brief can never be handed one.
     #[test]
-    fn the_verification_line_attributes_the_claim_in_all_four_states() {
-        let passed = verification_line(Some("Verification: PASSED — make test"));
+    fn the_verification_line_reads_differently_in_all_five_states() {
+        let passed = verification_line(Some(&verified(VerificationStatus::Passed)));
         assert!(passed.contains("PASSED"), "{passed}");
-        assert!(passed.contains("make test"), "{passed}");
+        assert!(passed.contains("make test-ci"), "{passed}");
+        // The two halves the reviewer required: it is a check rather than a
+        // claim, AND it is silent about composing with a trunk that moved.
+        assert!(passed.contains("a check rather than"), "{passed}");
+        assert!(passed.contains("trunk that has moved"), "{passed}");
+
+        let undeclared = verification_line(Some(&verified(VerificationStatus::Undeclared)));
         assert!(
-            passed.contains("its claim, not an independent run"),
-            "{passed}"
+            undeclared.contains("declares no test suite"),
+            "{undeclared}"
         );
+        assert!(undeclared.contains("no passing run"), "{undeclared}");
 
-        let failed = verification_line(Some("Verification: FAILED — make test, 2 red"));
-        assert!(failed.contains("FAILED"), "{failed}");
-        assert!(failed.contains("no passing run"), "{failed}");
+        let unavailable = verification_line(Some(&verified(VerificationStatus::Unavailable)));
+        assert!(unavailable.contains("could not be run"), "{unavailable}");
+        assert!(unavailable.contains("no passing run"), "{unavailable}");
 
-        let not_run = verification_line(Some("Verification: NOT RUN — no runner"));
-        assert!(not_run.contains("NOT RUN"), "{not_run}");
-        assert!(not_run.contains("no run at all"), "{not_run}");
+        let timed_out = verification_line(Some(&verified(VerificationStatus::TimedOut)));
+        assert!(timed_out.contains("did not finish"), "{timed_out}");
+        assert!(timed_out.contains("no passing run"), "{timed_out}");
 
-        let silent = verification_line(Some("Just prose."));
-        assert!(silent.contains("no test run at all"), "{silent}");
+        let absent = verification_line(None);
+        assert!(absent.contains("no test run is on record"), "{absent}");
         assert!(
-            silent.contains("unknown rather than known-skipped"),
-            "{silent}"
+            absent.contains("unknown rather than known-skipped"),
+            "{absent}"
         );
-        assert_eq!(
-            silent,
-            verification_line(None),
-            "a build from before the line reads the same"
-        );
+        assert!(absent.contains("never a pass"), "{absent}");
+
+        // No two of them read alike — a reader must be able to tell "declares
+        // nothing" from "was killed" from "no image support" at a glance.
+        let lines = [passed, undeclared, unavailable, timed_out, absent];
+        for (i, a) in lines.iter().enumerate() {
+            for b in lines.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// Exactly one state may describe the batch as backed by a passing run.
+    /// Every other line has to say, in words, that none backs it.
+    #[test]
+    fn only_the_passing_state_claims_a_run_backs_the_batch() {
+        for status in [
+            VerificationStatus::Undeclared,
+            VerificationStatus::Unavailable,
+            VerificationStatus::TimedOut,
+        ] {
+            let line = verification_line(Some(&verified(status)));
+            assert!(
+                line.contains("no passing run backs this batch"),
+                "{status}: {line}"
+            );
+        }
+        assert!(!verification_line(None).contains("PASSED"));
     }
 
     /// #935's other half: the prompt now carries the feedback, and this is the
@@ -1481,6 +1530,7 @@ mod tests {
             agent_finished_at: None,
             completed_at: Some(chrono::Utc::now()),
             directions: None,
+            verification: None,
         }
     }
 
