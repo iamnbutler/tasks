@@ -175,6 +175,19 @@ app-stop:
 # assertion with nothing behind it, one level out. Copied here rather than in
 # `dist-install` because `make app` is a redistribution too the moment anyone
 # hands the bundle over.
+#
+# The AppIcon.icns copy and Info.plist.in's CFBundleIconFile are two halves of
+# one change (#986): either alone leaves the app drawing the generic blank, and
+# macOS warns about neither. One line here covers every bundle — `release-bundle`
+# runs this same target with APP_BUNDLE overridden, so `make dist` and `make
+# release` inherit it, and `codesign` seals whatever is in Resources without
+# being told about it. Do NOT add a second copy aimed at dist/: that is how the
+# signed download comes to differ from the bundle that was tested, which is what
+# the comment on `release-bundle` already refuses.
+#
+# No CI runner executes this recipe — it is check-darwin gated — so nothing
+# would notice it going missing. `crates/tasks/tests/app_icon.rs` is the guard,
+# and it lives in the workspace precisely because this one cannot be run.
 app-install: check-darwin
 	@bundle="$(APP_BUNDLE)"; \
 	if [ "$$bundle" = "$(APP_BUNDLE_DEFAULT)" ]; then \
@@ -189,6 +202,7 @@ app-install: check-darwin
 	sed -e 's/@VERSION@/$(APP_VERSION)/' -e 's/@COMMIT@/$(APP_COMMIT)/' \
 		app-gpui/Info.plist.in > "$$bundle/Contents/Info.plist"; \
 	cp -R app-gpui/third-party "$$bundle/Contents/Resources/third-party"; \
+	cp app-gpui/AppIcon.icns "$$bundle/Contents/Resources/AppIcon.icns"; \
 	echo "installed $$bundle ($(APP_VERSION), $(APP_COMMIT))"
 
 # Build and install, exactly as `make app` always did.
