@@ -1225,10 +1225,10 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 /// The three carve-outs are exhaustive on purpose. "Hand it over when in
 /// doubt" is what the old sentence effectively said, and doubt is unbounded;
 /// "hand it over when GitHub would refuse it, when no test run backs it, or
-/// when nothing here could have checked it" is not. The third exists because
-/// this repository has no workflows and no branch protection, so GitHub's
-/// verdict is structurally incapable of objecting to a change that does not
-/// work — see [`crate::github::Landing`].
+/// when nothing here could have checked it" is not. The third exists because no
+/// workflow in this repository produces a pull-request check and there is no
+/// branch protection, so GitHub's verdict is structurally incapable of
+/// objecting to a change that does not work — see [`crate::github::Landing`].
 ///
 /// A missing row reads as `Off`, the safe direction `authority_section` takes.
 ///

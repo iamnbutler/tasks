@@ -165,12 +165,23 @@ implementation.
   in doubt" is what the old sentence effectively said and doubt is unbounded.
   So there are exactly three carve-outs, named as the whole list: GitHub would
   refuse the merge, the build reported no passing test run of its own, or
-  nothing runnable here could have checked it. The third exists because this
-  repository has **no `.github/workflows` and no branch protection**, so
-  `mergeable_state` can only ever be `clean` or `dirty` and GitHub's verdict is
-  structurally incapable of objecting to a change that does not work —
-  `Landing::Clear::describe()` says so in words, and a test pins that clause
-  and the absence of "ready to merge". Read `mergeable_state` and never
+  nothing runnable here could have checked it. The third exists because **no
+  workflow here produces a pull-request check and there is no branch
+  protection**, so `mergeable_state` can only ever be `clean` or `dirty` and
+  GitHub's verdict is structurally incapable of objecting to a change that does
+  not work — `Landing::Clear::describe()` says so in words, and a test pins that
+  clause and the absence of "ready to merge". That premise used to be "no
+  `.github/workflows`", one `ls` away from checkable, and `pages.yml` (the
+  landing page's deploy, #995) ended it — so it is now **mechanically
+  enforced instead of asserted**: the workflow triggers on `push` and
+  `workflow_dispatch` only, and `no_workflow_produces_a_pull_request_check`
+  (`crates/tasks/tests/site.rs`) fails the suite the moment any workflow grows
+  an `on: pull_request`. Prose was the wrong home for it — the next person to
+  add a trigger would have falsified six doc comments and this bullet with
+  nothing going red, while the pipeline kept merging on a carve-out whose
+  premise had gone. Real pull-request checks are #1015's change, and they come
+  with a rewrite of `Landing`'s reading of `mergeable_state` in the same
+  commit. Read `mergeable_state` and never
   `mergeable` alone: `false` there means a conflict and nothing else, so a red
   PR reads ready. The only evidence that a change works is therefore the
   Builder's own run, which it states as a `Verification: PASSED|FAILED|NOT RUN`
@@ -1082,6 +1093,17 @@ implementation.
   `builder` are Tasks'. A tool a Tasks crate needs goes in the latter two,
   duplicated, rather than once in `agent` — app vocabulary does not enter
   vm-pool's images any more than it enters its code
+- `site/` — the landing page published at `nate.rip/tasks/` (#995): one
+  hand-written `index.html`, one stylesheet, three screenshots. It lives here
+  rather than in `docs/` because a `/docs` Pages source would publish the
+  design docs too, and in this repo rather than its own so the README, CLAUDE.md
+  and the diagram it must stay in step with are one checkout away. **No build
+  step**, and that is more than register: `.gitignore`'s `dist/` and
+  `node_modules/` patterns are *unanchored*, so a generator emitting into
+  `site/dist/` would commit nothing and fail silently. `make site-check` is the
+  whole publish gate (`.github/workflows/pages.yml` runs the same line); the
+  disclaimer-drift half of it is *also* a workspace test, deliberately, because
+  the script only runs at deploy time and this pipeline merges its own PRs
 - `docs/plans/` — implementation plans; `docs/vm-pool.md` — vm-pool spec
 - `spec` for the platform: issue #744 + docs/plans/2026-08-09-v2-resume.md
 
@@ -1154,6 +1176,9 @@ make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;
                                        #   FORCE=1 skips the gate)
 make images-check                      # boot each image, read `--version` back
+make site-check                        # the landing page's publish gate: the
+                                       #   disclaimer matches the README's and
+                                       #   every relative link resolves
 make verify-warm                       # prime the orchestrator's build directory
 make test                              # see Tests below
 ```

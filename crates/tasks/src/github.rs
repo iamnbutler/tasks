@@ -296,11 +296,17 @@ const BLOCKED_BEHIND: &str =
 /// Whether a pull request can be landed *as a merge* — never whether the
 /// change is any good.
 ///
-/// The distinction is load-bearing. This repository has no workflows and no
-/// branch protection, so `blocked` cannot arise in it at all and [`Self::Clear`]
-/// is a statement about git, not about the code. Anything reading this to
-/// decide whether work is safe to ship needs a second source of evidence; see
-/// `builder::verification_report`.
+/// The distinction is load-bearing. No workflow in this repository produces a
+/// pull-request check and there is no branch protection, so `blocked` cannot
+/// arise in it at all and [`Self::Clear`] is a statement about git, not about
+/// the code. The one workflow here — `.github/workflows/pages.yml`, which
+/// publishes the landing page — triggers on `push` and `workflow_dispatch`
+/// only, and a push-triggered workflow reports nothing against a pull request,
+/// so `mergeable_state` can still only be `clean` or `dirty`. That trigger list
+/// is not left to prose: `no_workflow_produces_a_pull_request_check` in
+/// `crates/tasks/tests/site.rs` fails the suite if any workflow grows an
+/// `on: pull_request`. Anything reading this to decide whether work is safe to
+/// ship needs a second source of evidence; see `builder::verification_report`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Landing {
     /// Nothing in the way of the merge itself.
@@ -2251,11 +2257,11 @@ mod tests {
         );
     }
 
-    /// The wording is pinned because it is the load-bearing part. There are no
-    /// workflows and no branch protection in this repository, so `clean` is a
-    /// statement about git and cannot object to a change that does not work —
-    /// a describe() that read as a clearance would be instructing every future
-    /// turn to land unverified work.
+    /// The wording is pinned because it is the load-bearing part. No workflow
+    /// here produces a pull-request check and there is no branch protection, so
+    /// `clean` is a statement about git and cannot object to a change that does
+    /// not work — a describe() that read as a clearance would be instructing
+    /// every future turn to land unverified work.
     #[test]
     fn clear_says_what_it_does_not_mean() {
         let said = Landing::Clear.describe();
