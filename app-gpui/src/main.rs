@@ -76,6 +76,12 @@ fn main() {
         // workspace both reach, so it exists before either.
         server::init(cx);
 
+        // The process's server state, built once and outliving every window.
+        // Before `open_workspace`, which is handed it — and which, being a
+        // bare `fn` for `on_reopen`, reads it back from the global on a
+        // reopen rather than capturing it.
+        state::init(cx);
+
         // Bindings before the bar: gpui reads shortcuts out of the keymap
         // while building the menu, once.
         //
@@ -93,6 +99,13 @@ fn main() {
 
 /// Open the main window, or raise the one that is already open.
 fn open_workspace(cx: &mut App) {
+    // `state::init` has run — `on_reopen` cannot fire before `run`. Reading
+    // it back rather than capturing it is forced by `on_reopen` taking a
+    // plain `fn`; the entity is the same one every window gets, which is what
+    // makes a reopen resume rather than reset.
+    let Some(app_state) = state::global(cx) else {
+        return;
+    };
     // The handle stays structurally valid after its window closes, so a stale
     // one is only detectable by `update` failing.
     if let Some(existing) = cx.try_global::<WorkspaceWindow>().map(|global| global.0) {
@@ -122,7 +135,7 @@ fn open_workspace(cx: &mut App) {
                 ))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Workspace::new(window, cx)),
+            |window, cx| cx.new(|cx| Workspace::new(app_state, window, cx)),
         )
         .unwrap();
     cx.set_global(WorkspaceWindow(handle));

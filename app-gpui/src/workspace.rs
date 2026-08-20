@@ -285,8 +285,10 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let app_state = cx.new(AppState::new);
+    /// `app_state` is passed in rather than built here: it is the process's
+    /// one state (see [`crate::state::init`]), so closing this window no
+    /// longer throws it away and reopening no longer refetches from nothing.
+    pub fn new(app_state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let server_control = ServerControl::global(cx);
         // The menu bar joins three facts from two entities, so both observers
         // re-derive it. `sync` is a no-op unless something actually moved.

@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui::Context;
+use gpui::{App, AppContext, Context, Entity, Global};
 use tasks_client::api::events::Event;
 use tasks_client::api::http::{RejectedBundle, Viewer};
 use tasks_client::api::models::{
@@ -250,6 +250,49 @@ impl Snapshot {
         snapshot.error = error;
         snapshot
     }
+}
+
+/// The one [`AppState`] for the process, as a global.
+///
+/// **The ordinary way to reach it is still the explicit argument** —
+/// [`crate::workspace::Workspace::new`] takes it, so the dependency stays in
+/// the signature. This exists for the callers that cannot be handed one: the
+/// Server window, which is constructed on its own path with no workspace in
+/// reach, and `main`'s `open_workspace`, which is a bare `fn` because
+/// `Application::on_reopen` is registered before `run` and so can capture
+/// nothing built inside it.
+///
+/// It holds the entity **strongly**, and that is what fixes the bug this
+/// replaced: [`AppState`] used to be constructed *inside* `Workspace::new`,
+/// so cmd-W dropped it and reopening built a fresh one — every close of the
+/// main window was a full state reset with a full refetch behind it. A weak
+/// handle here would keep exactly that behaviour, because after the window
+/// closes there is nothing else left holding a strong one: the workspace was
+/// the only owner, and no closure outside `run` can be given the entity to
+/// hold. One process-lifetime singleton is the honest description; there is
+/// no leak for a strong global to hide, because nothing is ever meant to drop
+/// this.
+struct GlobalAppState(Entity<AppState>);
+
+impl Global for GlobalAppState {}
+
+/// Build the process's [`AppState`] and publish it. Call once, from `main`,
+/// before the first window opens — the sync loop starts here, so the first
+/// snapshot is already in flight while the window is being built.
+pub fn init(cx: &mut App) -> Entity<AppState> {
+    let state = cx.new(AppState::new);
+    cx.set_global(GlobalAppState(state.clone()));
+    state
+}
+
+/// The process's [`AppState`], or `None` before [`init`].
+///
+/// `try_global` rather than `global`: a caller reaching for this off the
+/// workspace's path has no business panicking, and returning `None` is what
+/// lets [`crate::autonomy::intercepts`] fall through to "carry on" rather
+/// than swallow a press.
+pub fn global(cx: &App) -> Option<Entity<AppState>> {
+    cx.try_global::<GlobalAppState>().map(|global| global.0.clone())
 }
 
 impl AppState {
