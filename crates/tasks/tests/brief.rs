@@ -23,7 +23,7 @@ use tasks::github::GitHubClient;
 use tasks::models::{
     Actor, Build, Complexity, DecisionInput, GhState, Obligation, ObligationKind, Project,
     ProjectId, ProjectStatus, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry,
-    SpecQueueStatus, Task, TaskId, TaskState,
+    SpecQueueStatus, Task, TaskId, TaskState, Verification, VerificationStatus,
 };
 use tasks::store::Store;
 
@@ -357,6 +357,7 @@ async fn only_builds_that_still_claim_their_files_are_listed() {
             862,
             None,
             &["src/store.rs".into()],
+            None,
         )
         .await
         .unwrap();
@@ -390,6 +391,7 @@ async fn only_builds_that_still_claim_their_files_are_listed() {
             864,
             None,
             &["src/store.rs".into()],
+            None,
         )
         .await
         .unwrap();
@@ -480,7 +482,7 @@ async fn a_stranded_build_brief_spells_out_a_base_that_is_not_the_trunk() {
         .unwrap();
     store.claim_next_queued_build().await.unwrap().unwrap();
     store
-        .finalize_build_succeeded(&build.id, "headsha", 863, None, &[])
+        .finalize_build_succeeded(&build.id, "headsha", 863, None, &[], None)
         .await
         .unwrap();
 
@@ -529,7 +531,7 @@ async fn a_stranded_build_based_on_the_trunk_says_merging_ships_it() {
         .unwrap();
     store.claim_next_queued_build().await.unwrap().unwrap();
     store
-        .finalize_build_succeeded(&build.id, "headsha", 864, None, &[])
+        .finalize_build_succeeded(&build.id, "headsha", 864, None, &[], None)
         .await
         .unwrap();
 
@@ -661,7 +663,9 @@ fn open_pr(mergeable_state: &str) -> Value {
 }
 
 /// A succeeded build on `base`, carrying one spec, with `summary` and
-/// `files_touched` as the Builder left them.
+/// `files_touched` as the Builder left them — and a **passing** supervisor run
+/// behind it, which is the ordinary case now that a failing one never opens a
+/// pull request at all.
 async fn parked_build(
     store: &Store,
     project: &Project,
@@ -671,6 +675,34 @@ async fn parked_build(
     summary: Option<&str>,
     files: &[&str],
 ) -> Build {
+    parked_build_verified(
+        store,
+        project,
+        issue,
+        base,
+        pr_number,
+        summary,
+        files,
+        Some(&Verification {
+            status: VerificationStatus::Passed,
+            detail: "make test-ci (gate abc1234, same as main)".into(),
+        }),
+    )
+    .await
+}
+
+/// [`parked_build`], stating what the supervisor's run said.
+#[allow(clippy::too_many_arguments)]
+async fn parked_build_verified(
+    store: &Store,
+    project: &Project,
+    issue: u64,
+    base: &str,
+    pr_number: u64,
+    summary: Option<&str>,
+    files: &[&str],
+    verification: Option<&Verification>,
+) -> Build {
     let spec = approved_spec(store, project, issue, files).await;
     let build = store
         .create_build(std::slice::from_ref(&spec.id), base, DecisionInput::human())
@@ -679,7 +711,14 @@ async fn parked_build(
     store.claim_next_queued_build().await.unwrap().unwrap();
     let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
     store
-        .finalize_build_succeeded(&build.id, "headsha", pr_number, summary, &files)
+        .finalize_build_succeeded(
+            &build.id,
+            "headsha",
+            pr_number,
+            summary,
+            &files,
+            verification,
+        )
         .await
         .unwrap()
 }
@@ -698,7 +737,7 @@ async fn a_clean_tested_trunk_based_batch_names_all_three_facts_and_spends_no_co
         881,
         "main",
         900,
-        Some("Did the thing.\n\nVerification: PASSED — make test (579 tests)"),
+        Some("Did the thing."),
         &["crates/tasks/src/brief.rs"],
     )
     .await;
@@ -718,10 +757,12 @@ async fn a_clean_tested_trunk_based_batch_names_all_three_facts_and_spends_no_co
         text.contains("says nothing about whether the change works"),
         "a clean verdict must not read as a clearance: {text}"
     );
-    // 2. The build's own run, attributed as a claim.
+    // 2. The supervisor's own run, attributed as the check it is — and naming
+    //    the gate that ruled, which is what tells a reader whether the script
+    //    was the trunk's or one only this branch has.
     assert!(text.contains("PASSED"), "{text}");
-    assert!(text.contains("make test (579 tests)"), "{text}");
-    assert!(text.contains("its claim, not an independent run"), "{text}");
+    assert!(text.contains("gate abc1234, same as main"), "{text}");
+    assert!(text.contains("a check rather than"), "{text}");
     // 3. What could have checked it.
     assert!(text.contains("make test"), "{text}");
     assert!(!text.contains("Mac"), "nothing here needs one: {text}");
@@ -752,7 +793,7 @@ async fn a_refused_merge_says_which_refusal_it_is() {
             882,
             "main",
             901,
-            Some("Verification: PASSED — make test"),
+            Some("Did the thing."),
             &["crates/tasks/src/run.rs"],
         )
         .await;
@@ -783,7 +824,7 @@ async fn a_stacked_pr_reports_its_base_and_asks_the_compare_in_that_order() {
         883,
         "build/underneath",
         902,
-        Some("Verification: PASSED — make test"),
+        Some("Did the thing."),
         &["crates/tasks/src/store.rs"],
     )
     .await;
@@ -819,7 +860,7 @@ async fn a_stacked_pr_whose_base_already_landed_wants_retargeting() {
         884,
         "build/underneath",
         903,
-        Some("Verification: PASSED — make test"),
+        Some("Did the thing."),
         &["crates/tasks/src/store.rs"],
     )
     .await;
@@ -836,14 +877,14 @@ async fn a_stacked_pr_whose_base_already_landed_wants_retargeting() {
     assert!(text.contains("retargeting"), "{text}");
 }
 
-/// The case every batch parked today falls into, and the one a mistake has to
-/// fall towards: GitHub is content, and there is still no evidence the change
-/// works.
+/// Every batch parked before this check existed, and every one from a Builder
+/// image nobody has rebuilt — the case a mistake here has to fall towards:
+/// GitHub is content, and there is still no evidence the change works.
 #[tokio::test]
-async fn a_batch_with_no_verification_line_says_so_next_to_the_clean_verdict() {
+async fn a_batch_with_no_verification_on_record_says_so_next_to_the_clean_verdict() {
     let store = Store::open_in_memory().await.unwrap();
     let project = seed_project(&store).await;
-    let build = parked_build(
+    let build = parked_build_verified(
         &store,
         &project,
         885,
@@ -851,6 +892,7 @@ async fn a_batch_with_no_verification_line_says_so_next_to_the_clean_verdict() {
         904,
         Some("Implemented the spec. Refactored two helpers."),
         &["crates/tasks/src/brief.rs"],
+        None,
     )
     .await;
     let (rest, _fake) = spawn_fake_github(open_pr("clean"), "ahead").await;
@@ -866,8 +908,43 @@ async fn a_batch_with_no_verification_line_says_so_next_to_the_clean_verdict() {
         text.contains("nothing in the way of the merge itself"),
         "{text}"
     );
-    assert!(text.contains("no test run at all"), "{text}");
+    assert!(text.contains("no test run is on record"), "{text}");
     assert!(text.contains("unknown rather than known-skipped"), "{text}");
+}
+
+/// The other direction, and the one the whole change buys: a batch the
+/// supervisor's own run passed says so as a **check**, and still says what that
+/// check did not cover.
+#[tokio::test]
+async fn a_batch_backed_by_a_supervisor_run_is_reported_as_a_check() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+    let build = parked_build(
+        &store,
+        &project,
+        886,
+        "main",
+        905,
+        Some("Implemented the spec."),
+        &["crates/tasks/src/store.rs"],
+    )
+    .await;
+    let (rest, _fake) = spawn_fake_github(open_pr("clean"), "ahead").await;
+    let github = GitHubClient::new("token").with_rest_base_url(rest);
+
+    let text = joined(
+        &Brief::new(&store, Some(&github), "main")
+            .for_stranded_build(&build.id)
+            .await
+            .unwrap(),
+    );
+    assert!(text.contains("PASSED"), "{text}");
+    assert!(text.contains("a check rather than"), "{text}");
+    // Which gate ruled travels with it, so a reader of the brief can tell a run
+    // against the trunk's script from one against a script only this branch has.
+    assert!(text.contains("gate abc1234"), "{text}");
+    // And the limit of what it settles.
+    assert!(text.contains("trunk that has moved"), "{text}");
 }
 
 /// The narrow carve-out, stated narrowly: the app compiles and unit-tests on a
@@ -882,7 +959,7 @@ async fn an_app_only_batch_says_a_mac_is_needed_and_a_tokenless_server_says_so()
         886,
         "main",
         905,
-        Some("Verification: PASSED — make app-test"),
+        Some("Did the app thing."),
         &["app-gpui/src/sections/queue.rs", "app-gpui/src/lib.rs"],
     )
     .await;
@@ -915,7 +992,7 @@ async fn the_pipeline_names_a_parked_batch_its_pr_and_its_issue() {
         887,
         "main",
         906,
-        Some("Verification: PASSED — make test"),
+        Some("Did the thing."),
         &["crates/tasks/src/run.rs"],
     )
     .await;

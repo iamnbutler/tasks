@@ -435,6 +435,7 @@ async fn a_restart_reattaches_to_a_build_and_still_lands_the_branch() {
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(300),
             leases: None,
+            trunk_branch: "main".into(),
             scratch_root: tmp.path().join("scratch"),
         },
     );

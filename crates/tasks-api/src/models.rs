@@ -651,6 +651,100 @@ pub struct Build {
     /// unlike a task, a build is created for one run and never re-aimed.
     #[serde(default)]
     pub directions: Option<Directions>,
+    /// What the project's own test suite said, run by the Builder **supervisor**
+    /// inside the VM against the tree the bundle carries.
+    ///
+    /// `None` means no run is on record: a build that predates the check, or
+    /// one whose supervisor image has not been rebuilt yet. Never green — see
+    /// [`VerificationStatus::is_green`], which is the only way to ask.
+    #[serde(default)]
+    pub verification: Option<Verification>,
+}
+
+/// A build's verification, on the client wire.
+///
+/// The deliberate twin of `tasks_protocol::verify::Verification`, and separate
+/// from it for the reason every type in this crate is: the VM wire decodes
+/// *forgivingly*, because a terminal event that will not parse hangs a run
+/// until its deadline, while clients ship from this repository, so skew here
+/// should be a build error rather than a runtime fallback. `builder::api_verification`
+/// is the seam, and it is where an unrecognised status becomes `None` rather
+/// than a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verification {
+    pub status: VerificationStatus,
+    /// Prose for a human. **Nothing branches on it** — it names the gate that
+    /// ruled and what happened, and that is all.
+    #[serde(default)]
+    pub detail: String,
+}
+
+impl Verification {
+    /// Shorthand for [`VerificationStatus::is_green`].
+    pub fn is_green(&self) -> bool {
+        self.status.is_green()
+    }
+}
+
+/// The states a build's verification can be in.
+///
+/// **There is deliberately no `Failed`**: a red suite fails the build inside
+/// the VM before a bundle is packaged, so "shipped and red" is unrepresentable
+/// rather than merely avoided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// The project's declared suite ran and passed. The only green state.
+    Passed,
+    /// The project declares no suite, or declares an empty one.
+    Undeclared,
+    /// Something below the suite failed: a runner that would not start, an
+    /// unreadable script, an unstated budget, or a status this binary could
+    /// not parse.
+    Unavailable,
+    /// The suite was killed by its budget, or there was not enough budget left
+    /// to start it. The build still ships; the status is honestly not green.
+    TimedOut,
+}
+
+impl VerificationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Undeclared => "undeclared",
+            Self::Unavailable => "unavailable",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    /// Strict, unlike the VM wire's: an unrecognised value is `None` here and
+    /// the caller decides, rather than decaying silently.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "passed" => Some(Self::Passed),
+            "undeclared" => Some(Self::Undeclared),
+            "unavailable" => Some(Self::Unavailable),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+
+    /// Whether a passing run of the project's own suite backs this build.
+    ///
+    /// The only way anything asks, so a variant added later cannot become
+    /// green by omission.
+    pub fn is_green(&self) -> bool {
+        match self {
+            Self::Passed => true,
+            Self::Undeclared | Self::Unavailable | Self::TimedOut => false,
+        }
+    }
+}
+
+impl std::fmt::Display for VerificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

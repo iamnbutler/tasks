@@ -185,6 +185,23 @@ impl Deadline {
         self.budget
     }
 
+    /// How much of this budget is left, right now — `None` once it has run
+    /// out.
+    ///
+    /// Answered off the same [`Expiry::remaining`] the firing decision uses,
+    /// rather than `budget - awake` computed at the call site, so it can never
+    /// promise more time than the host will actually allow: past
+    /// [`WAKE_KILL_FLOOR`] the wall arm is armed and the remainder is the
+    /// *smaller* of the two, and a caller doing its own subtraction would hand
+    /// a VM a budget the deadline is about to cut short.
+    ///
+    /// What reads it is the Builder's dispatch, sizing the in-VM test suite's
+    /// budget to expire before this one does. That ordering is what keeps an
+    /// outer expiry defensible as a `Verdict`.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.reading().remaining()
+    }
+
     /// Resolve when the budget has run out on either armed clock.
     ///
     /// Polls rather than sleeping the whole remainder, because the monotonic

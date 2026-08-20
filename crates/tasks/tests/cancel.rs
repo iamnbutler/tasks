@@ -455,6 +455,7 @@ async fn a_cancelled_build_returns_its_specs_without_a_strike() {
             timeout: Duration::from_secs(600),
             leases: None,
             scratch_root: tmp.path().join("scratch"),
+            trunk_branch: "main".into(),
         },
     );
     let url = format!("file://{}", clone_root.join("test/repo.git").display());

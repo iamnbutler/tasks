@@ -38,6 +38,7 @@ use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient};
 use crate::models::{
     Build, Directions, Project, RunKind, Spec, Task, TranscriptOwner, TranscriptStream,
+    Verification, VerificationStatus,
 };
 use crate::protocol::{
     BuildCommand, BuildEvent, FailureClass, TaskCommand, TaskEvent, TasksProtocol,
@@ -185,6 +186,11 @@ pub struct BuilderConfig {
     /// no broker at all — the integration tests, which build from `file://`
     /// repos.
     pub leases: Option<LeaseIssuer>,
+    /// The project's trunk (`SCOUT_BASE_BRANCH`), handed to the VM so it can
+    /// report whether the `.tasks/verify` that gated this build is the one the
+    /// trunk carries. Not derivable from `build.base_branch`, which for a
+    /// stacked build is another build's branch.
+    pub trunk_branch: String,
 }
 
 pub struct Builder {
@@ -387,6 +393,19 @@ impl Builder {
                     base_branch: build.base_branch.clone(),
                     branch: build.branch.clone(),
                     prompt,
+                    // What is LEFT, off the deadline itself rather than the
+                    // configured budget: the VM sizes its test suite to expire
+                    // before this does, and a suite sized against a number the
+                    // host will not honour is one the outer deadline kills
+                    // mid-run — a `Verdict` charged against work that may be
+                    // fine. `None` once the budget is already spent, which the
+                    // VM reads as "no bound to run a suite under".
+                    budget_secs: deadline.remaining().map(|d| d.as_secs()),
+                    // The trunk, so the VM can say which gate ruled. Not
+                    // `base_branch`: this pipeline stacks builds, so a stacked
+                    // build's base is another build's branch — see
+                    // `builder-supervisor`'s `run_verification`.
+                    trunk_branch: Some(self.config.trunk_branch.clone()),
                 }),
             )
             .await?;
@@ -589,6 +608,7 @@ impl Builder {
                 pr_number,
                 outcome.summary.as_deref(),
                 &outcome.files_touched,
+                outcome.verification.as_ref(),
             )
             .await?)
     }
@@ -694,6 +714,7 @@ impl Builder {
                         bundle_base64,
                         summary,
                         files_touched,
+                        verification,
                     } => {
                         return Ok(BuildOutcome {
                             base_sha,
@@ -701,6 +722,7 @@ impl Builder {
                             bundle_base64,
                             summary,
                             files_touched,
+                            verification: verification.as_ref().map(api_verification),
                         });
                     }
                     BuildEvent::Failed { reason, class } => {
@@ -967,6 +989,33 @@ struct BuildOutcome {
     bundle_base64: String,
     summary: Option<String>,
     files_touched: Vec<String>,
+    /// What the supervisor's own run of the project's suite said. `None` from
+    /// an image that predates the check — never green, and rendered as "no run
+    /// on record".
+    verification: Option<Verification>,
+}
+
+/// Cross the seam between the two verification types.
+///
+/// The VM wire's ([`tasks_protocol::verify`]) decodes *forgivingly*, because a
+/// terminal event that will not parse hangs a run until its deadline; the
+/// client wire's ([`tasks_api::models`]) is strict, because clients ship from
+/// this repository and skew should be a build error. One function so the
+/// mapping is stated once, and an exhaustive `match` so a status added to
+/// either side has to be decided here rather than falling through to a
+/// default — which, on this particular enum, would be a default about whether
+/// work is tested.
+fn api_verification(v: &tasks_protocol::verify::Verification) -> Verification {
+    use tasks_protocol::verify::VerificationStatus as Wire;
+    Verification {
+        status: match v.status {
+            Wire::Passed => VerificationStatus::Passed,
+            Wire::Undeclared => VerificationStatus::Undeclared,
+            Wire::Unavailable => VerificationStatus::Unavailable,
+            Wire::TimedOut => VerificationStatus::TimedOut,
+        },
+        detail: v.detail.clone(),
+    }
 }
 
 async fn git(dir: &std::path::Path, args: &[&str]) -> Result<(), BuilderError> {
@@ -1065,17 +1114,14 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String
          describing the change, suitable as a pull request body. Do not use \
          GitHub closing keywords (`Closes #N`, `Fixes #N`) — the server \
          links the issues itself.\n\
-         5. End `SUMMARY.md` with one line saying whether you actually ran the \
-         tests, in exactly this shape:\n\
-         `Verification: PASSED — <the command you ran>`\n\
-         `Verification: FAILED — <the command, and what failed>`\n\
-         `Verification: NOT RUN — <why not>`\n\
-         Report what actually happened. Nothing re-runs this suite for you \
-         downstream, so this line is the only evidence anyone has that the \
-         change works — claiming a run you did not make is the one thing here \
-         that cannot be caught later, and \"NOT RUN\" costs the batch a look \
-         from a human rather than costing you anything.\n\
-         6. Do NOT push and do NOT open a PR — the server does both.\n",
+         5. Do NOT push and do NOT open a PR — the server does both.\n\n\
+         On step 2: when this project declares a test suite at \
+         `.tasks/verify`, the supervisor runs it itself after you finish, \
+         against the committed tree your branch carries. If it fails you get \
+         one chance to fix it and then the build fails with no pull request, \
+         so getting there first is entirely in your interest. It reads that \
+         script out of the build's BASE commit, so editing it changes nothing \
+         about what runs.\n",
     );
     out
 }
@@ -1161,16 +1207,18 @@ fn render_review_feedback(batch: &[BatchItem]) -> String {
 
 /// The heading a Builder's `SUMMARY.md` accounts for its review feedback under.
 ///
-/// A heading rather than a [`VERIFICATION_PREFIX`]-style trailer because there
-/// is one line per item and the item count is the reviewer's, not ours.
+/// A heading rather than a one-line trailer because there is one line per item
+/// and the item count is the reviewer's, not ours.
 pub const REVIEW_FEEDBACK_HEADING: &str = "Review feedback";
 
 /// Whether a `SUMMARY.md` has a [`REVIEW_FEEDBACK_HEADING`] section at all.
 ///
 /// A **presence check, and nothing more**: it cannot tell a real accounting
-/// from a bare heading, so it is reported as the build's own claim exactly like
-/// [`verification_report`] is. Lenient about the shapes agents write — `##`,
-/// `**…**`, `- …:` — for the same reason that parser is.
+/// from a bare heading, so it is reported as the build's own claim. It is the
+/// last thing here that reads agent prose, and deliberately so — what it
+/// reports is a fact for a reviewer, never a gate on a write. Lenient about the
+/// shapes agents write — `##`, `**…**`, `- …:` — because the alternative is
+/// silently failing to see an accounting that is plainly there.
 ///
 /// What it must not do is read the words appearing inside an ordinary sentence
 /// ("Review feedback was helpful") as an accounting, which is what the
@@ -1220,74 +1268,61 @@ fn render_directions(directions: &Directions) -> String {
     )
 }
 
-/// The marker a Builder's `SUMMARY.md` carries its test-run claim under.
-///
-/// A trailer in the summary, rather than a column or a protocol field, for one
-/// reason worth stating: the summary is *already* stored and *already* the PR
-/// body, so one sentence serves the human reading the PR on GitHub and the
-/// brief reading it back, with no migration, no `BuildEvent` field and no
-/// builder-image rebuild in between. It also degrades correctly on rows that
-/// predate it — they parse as [`VerificationReport::Unreported`].
-pub const VERIFICATION_PREFIX: &str = "Verification:";
-
-/// Detail longer than this is truncated. One line, bounded: this ends up in a
-/// brief, whose whole value is being cheaper to read than the thing it summarizes.
+/// Detail longer than this is rendered truncated. One line, bounded: this ends
+/// up in a pull request body and in a brief, whose whole value is being cheaper
+/// to read than the thing it summarizes.
 const MAX_VERIFICATION_DETAIL: usize = 200;
 
-/// What a build claimed about its own test run.
+/// The sentence appended to a pull request body saying what backs the change.
 ///
-/// A *claim*, never a check — nothing here re-runs anything. The point of
-/// keeping [`Self::Unreported`] separate from [`Self::NotRun`] is that they
-/// mean different things: one build said it skipped the tests, the other said
-/// nothing at all, and only the second is compatible with "the tests passed
-/// and the line was forgotten".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerificationReport {
-    Passed(String),
-    Failed(String),
-    NotRun(String),
-    Unreported,
+/// **Host-authored, generated from the structured field**, and nothing ever
+/// parses it back. That is the whole difference from the trailer it replaces:
+/// the agent wrote that one, the host grepped it, and a gate on prose written
+/// by the graded party is the defect this change exists to remove.
+///
+/// Deleting the parser while leaving the instruction would have been the worst
+/// of the three options — the agent would go on writing `Verification: PASSED`
+/// into `SUMMARY.md`, which **is** the PR body, so a human on GitHub would read
+/// a claim sitting beside a field holding a check, with the prose one in front
+/// of them. So the prompt instruction went with it, and this gives the human
+/// the same convenience from the one source that is now true.
+fn verification_trailer(verification: Option<&Verification>) -> String {
+    let Some(v) = verification else {
+        return "Verification: no run on record — this build predates the supervisor's own test \
+                run, or ran in a Builder image that has not been rebuilt for it."
+            .to_string();
+    };
+    let detail = truncate_detail(&v.detail);
+    match v.status {
+        VerificationStatus::Passed => format!(
+            "Verification: the Builder supervisor ran this project's own test suite against \
+             this branch and it PASSED ({detail}). A check, not the agent's claim about \
+             itself — a failing suite would not have opened this pull request."
+        ),
+        VerificationStatus::Undeclared => format!(
+            "Verification: none. This project declares no test suite at `.tasks/verify`, so \
+             nothing ran and no passing run backs this branch ({detail})."
+        ),
+        VerificationStatus::Unavailable => format!(
+            "Verification: unavailable — the suite could not be run, so no passing run backs \
+             this branch ({detail})."
+        ),
+        VerificationStatus::TimedOut => format!(
+            "Verification: the test suite did not finish inside its budget and was killed, so \
+             no passing run backs this branch ({detail}). The suite never reported on the \
+             work, which is why the branch still shipped."
+        ),
+    }
 }
 
-/// Read the verification trailer out of a `SUMMARY.md`.
-///
-/// Scans every line because agents append trailers, takes the first marker it
-/// recognizes, and is deliberately forgiving about the shape agents actually
-/// produce — bullets, casing, `—`/`-`/`:` between the marker and the detail.
-/// Anything it cannot recognize is [`VerificationReport::Unreported`] and
-/// **never** a pass: the direction a mistake here has to fall is towards a
-/// human looking at it.
-pub fn verification_report(summary: Option<&str>) -> VerificationReport {
-    let Some(summary) = summary else {
-        return VerificationReport::Unreported;
-    };
-    for line in summary.lines() {
-        // Bullets and emphasis around the trailer: `- **Verification:** …`.
-        let line = line.trim().trim_start_matches(['-', '*', '#', ' ']).trim();
-        let Some(rest) = strip_prefix_ci(line, VERIFICATION_PREFIX) else {
-            continue;
-        };
-        // `**Verification:** …` leaves the closing emphasis behind.
-        let rest = rest.trim_start_matches(['*', ' ']).trim();
-        for (marker, build) in [
-            ("PASSED", VerificationReport::Passed as fn(String) -> _),
-            ("FAILED", VerificationReport::Failed as fn(String) -> _),
-            ("NOT RUN", VerificationReport::NotRun as fn(String) -> _),
-            ("NOT_RUN", VerificationReport::NotRun as fn(String) -> _),
-        ] {
-            let Some(detail) = strip_prefix_ci(rest, marker) else {
-                continue;
-            };
-            let detail = detail
-                .trim_start_matches(['—', '–', '-', ':', ' '])
-                .trim()
-                .chars()
-                .take(MAX_VERIFICATION_DETAIL)
-                .collect::<String>();
-            return build(detail);
-        }
+/// A detail, bounded for rendering. Empty reads as "no detail", never as an
+/// empty pair of brackets.
+fn truncate_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return "no detail".to_string();
     }
-    VerificationReport::Unreported
+    detail.chars().take(MAX_VERIFICATION_DETAIL).collect()
 }
 
 /// `strip_prefix`, ASCII-case-insensitively.
@@ -1321,6 +1356,8 @@ fn pr_text(batch: &[BatchItem], outcome: &BuildOutcome) -> (String, String) {
             .collect::<Vec<_>>()
             .join("\n"),
     };
+    body.push_str("\n\n");
+    body.push_str(&verification_trailer(outcome.verification.as_ref()));
     body.push_str("\n\n");
     for item in batch {
         body.push_str(&format!("Implements #{}\n", item.task.gh_issue_number));
@@ -1804,8 +1841,7 @@ mod tests {
     }
 
     /// A presence check, and it has to fail towards "no accounting on record":
-    /// the words appearing inside an ordinary sentence must not read as one,
-    /// exactly as prose about passing is not the verification trailer.
+    /// the words appearing inside an ordinary sentence must not read as one.
     #[test]
     fn the_review_feedback_accounting_survives_the_shapes_agents_write() {
         let accounts = |s: &str| summary_accounts_for_review_feedback(Some(s));
@@ -1827,87 +1863,151 @@ mod tests {
         assert!(!accounts("## Reviewer notes"));
     }
 
-    /// The Builder's own test run is the only evidence this repository can
-    /// produce that a change works — there are no workflows and no required
-    /// checks — so the prompt has to ask for it, and has to ask for it
-    /// *truthfully*. A line that agents learn to write unconditionally is
-    /// worse than no line, because the brief reads it back as evidence.
+    /// The instruction that produced the trailer is **gone**, and its absence
+    /// is the point rather than a side effect.
+    ///
+    /// Deleting the parser while leaving the instruction would have been the
+    /// worst of the three options: the agent would go on writing `Verification:
+    /// PASSED` into `SUMMARY.md`, which *is* the pull request body, so a human
+    /// on GitHub would read a claim sitting beside a field holding a check —
+    /// and the prose one is the one in front of them.
     #[test]
-    fn the_prompt_asks_for_the_verification_line_and_for_the_truth() {
+    fn the_prompt_no_longer_asks_the_agent_to_report_on_its_own_test_run() {
         let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
-        assert!(prompt.contains("Verification: PASSED"), "{prompt}");
-        assert!(prompt.contains("Verification: FAILED"), "{prompt}");
-        assert!(prompt.contains("Verification: NOT RUN"), "{prompt}");
-        assert!(prompt.contains("Report what actually happened"), "{prompt}");
-        assert!(
-            prompt.contains("cannot be caught later"),
-            "the reason the line has to be honest: {prompt}"
-        );
-        // The step it displaced is still there, renumbered.
-        assert!(prompt.contains("6. Do NOT push"), "{prompt}");
+        for forbidden in [
+            "Verification: PASSED",
+            "Verification: FAILED",
+            "Verification: NOT RUN",
+            "the only evidence anyone has",
+            "Nothing re-runs this suite for you",
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "the prompt still asks for the trailer ({forbidden}): {prompt}"
+            );
+        }
+        // The step it occupied is gone, and the one below it renumbered.
+        assert!(prompt.contains("5. Do NOT push"), "{prompt}");
+        assert!(!prompt.contains("6. Do NOT push"), "{prompt}");
     }
 
-    /// The parser meets agents where they write. What it must never do is
-    /// promote something it did not understand into a pass.
+    /// What replaces it: the agent is told a check will run, and told the two
+    /// things it would otherwise waste its one repair round discovering.
     #[test]
-    fn the_verification_trailer_survives_the_shapes_agents_write() {
-        let report = |s: &str| verification_report(Some(s));
+    fn the_prompt_says_the_supervisor_will_run_the_suite_itself() {
+        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
+        assert!(prompt.contains(".tasks/verify"), "{prompt}");
+        assert!(prompt.contains("supervisor runs it itself"), "{prompt}");
+        assert!(prompt.contains("one chance to fix it"), "{prompt}");
+        // The gate is read at the base commit, said outright — an agent that
+        // does not know that spends its round editing the script.
+        assert!(prompt.contains("BASE commit"), "{prompt}");
+    }
 
-        assert_eq!(
-            report("Did the thing.\n\nVerification: PASSED — make test (579 tests)"),
-            VerificationReport::Passed("make test (579 tests)".into())
-        );
-        // Case, bullets and emphasis.
-        assert_eq!(
-            report("- **verification:** passed - cargo test"),
-            VerificationReport::Passed("cargo test".into())
-        );
-        assert_eq!(
-            report("* Verification: FAILED: make test, 2 store tests red"),
-            VerificationReport::Failed("make test, 2 store tests red".into())
-        );
-        assert_eq!(
-            report("Verification: not run — the suite needs a display"),
-            VerificationReport::NotRun("the suite needs a display".into())
-        );
-        assert_eq!(
-            report("Verification: NOT_RUN — no test runner in the image"),
-            VerificationReport::NotRun("no test runner in the image".into())
-        );
-        // The first marker wins; a summary that argues with itself is not a
-        // reason to search for the most favourable line.
-        assert_eq!(
-            report("Verification: FAILED — one test red\nVerification: PASSED — later"),
-            VerificationReport::Failed("one test red".into())
+    /// The seam between the forgiving VM wire and the strict client wire is one
+    /// function, and it must be total in both directions — a status that
+    /// arrived from a VM has to come out the other side as itself, never as a
+    /// default about whether work is tested.
+    #[test]
+    fn the_wire_seam_maps_every_status_to_itself() {
+        use tasks_protocol::verify::VerificationStatus as Wire;
+        for (wire, api) in [
+            (Wire::Passed, VerificationStatus::Passed),
+            (Wire::Undeclared, VerificationStatus::Undeclared),
+            (Wire::Unavailable, VerificationStatus::Unavailable),
+            (Wire::TimedOut, VerificationStatus::TimedOut),
+        ] {
+            let mapped = api_verification(&tasks_protocol::verify::Verification::new(wire, "why"));
+            assert_eq!(mapped.status, api);
+            assert_eq!(mapped.detail, "why");
+            assert_eq!(mapped.status.is_green(), wire.is_green());
+        }
+    }
+
+    /// A status the VM wire could not recognise arrives here already decayed to
+    /// `Unavailable` — which is what makes the seam safe: there is no path from
+    /// an unknown word on the wire to a green build.
+    #[test]
+    fn an_unrecognised_wire_status_cannot_come_out_green() {
+        let forged: tasks_protocol::verify::Verification =
+            serde_json::from_str(r#"{"status":"PASSED","detail":"nice try"}"#).unwrap();
+        let mapped = api_verification(&forged);
+        assert_eq!(mapped.status, VerificationStatus::Unavailable);
+        assert!(!mapped.is_green());
+    }
+
+    /// The trailer is host-authored and generated from the field. Every state
+    /// reads differently, and only one of them says the change is backed by a
+    /// passing run.
+    #[test]
+    fn the_pr_trailer_is_generated_from_the_field_and_only_one_state_is_a_pass() {
+        let of = |status| {
+            verification_trailer(Some(&Verification {
+                status,
+                detail: "make test-ci (gate abc1234, same as main)".into(),
+            }))
+        };
+        let passed = of(VerificationStatus::Passed);
+        assert!(passed.contains("PASSED"), "{passed}");
+        assert!(passed.contains("make test-ci"), "{passed}");
+        // Attributed to the supervisor, and saying what a red one would have
+        // done — which is the sentence that makes it evidence rather than a
+        // claim.
+        assert!(passed.contains("supervisor"), "{passed}");
+        assert!(
+            passed.contains("would not have opened this pull request"),
+            "{passed}"
         );
 
-        // Everything unrecognized, including a build that predates the line.
-        assert_eq!(verification_report(None), VerificationReport::Unreported);
-        assert_eq!(
-            report("Just prose about the change."),
-            VerificationReport::Unreported
-        );
-        assert_eq!(
-            report("Verification: probably fine"),
-            VerificationReport::Unreported
-        );
-        assert_eq!(
-            report("The tests passed."),
-            VerificationReport::Unreported,
-            "prose about passing is not the trailer"
-        );
+        let others = [
+            of(VerificationStatus::Undeclared),
+            of(VerificationStatus::Unavailable),
+            of(VerificationStatus::TimedOut),
+            verification_trailer(None),
+        ];
+        for line in &others {
+            assert!(
+                line.contains("no passing run backs this branch")
+                    || line.contains("no run on record"),
+                "{line}"
+            );
+            assert!(!line.contains("PASSED"), "{line}");
+        }
+        // And none of them reads like any other.
+        for (i, a) in others.iter().enumerate() {
+            for b in others.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// A build from an un-rebuilt image says so, in the pull request body,
+    /// where the human deciding whether to merge will read it.
+    #[test]
+    fn an_absent_field_says_no_run_is_on_record_in_the_pr_body() {
+        let line = verification_trailer(None);
+        assert!(line.contains("no run on record"), "{line}");
+        assert!(line.contains("has not been rebuilt"), "{line}");
     }
 
     #[test]
     fn the_verification_detail_is_one_bounded_line() {
-        let long = format!("Verification: PASSED — {}\nmore prose", "x".repeat(500));
-        match verification_report(Some(&long)) {
-            VerificationReport::Passed(detail) => {
-                assert_eq!(detail.chars().count(), MAX_VERIFICATION_DETAIL);
-                assert!(!detail.contains("more prose"));
-            }
-            other => panic!("expected a pass, got {other:?}"),
-        }
+        let long = verification_trailer(Some(&Verification {
+            status: VerificationStatus::Passed,
+            detail: "x".repeat(500),
+        }));
+        assert!(
+            long.matches('x').count() == MAX_VERIFICATION_DETAIL,
+            "detail must be truncated: {}",
+            long.matches('x').count()
+        );
+        // An empty detail never renders as an empty pair of brackets.
+        let bare = verification_trailer(Some(&Verification {
+            status: VerificationStatus::Undeclared,
+            detail: String::new(),
+        }));
+        assert!(bare.contains("no detail"), "{bare}");
+        assert!(!bare.contains("()"), "{bare}");
     }
 
     #[test]
@@ -1919,6 +2019,10 @@ mod tests {
             bundle_base64: String::new(),
             summary: Some("Did both things.".into()),
             files_touched: vec![],
+            verification: Some(Verification {
+                status: VerificationStatus::Passed,
+                detail: "make test-ci".into(),
+            }),
         };
         let (title, body) = pr_text(&batch, &outcome);
         assert_eq!(title, "Build: #7, #9");
@@ -1926,6 +2030,10 @@ mod tests {
         assert!(body.contains("Implements #7"));
         assert!(body.contains("Implements #9"));
         assert!(!body.contains("Closes"));
+        // The host-authored sentence rides the body, so the human reading the
+        // pull request on GitHub sees what backs it without fetching anything.
+        assert!(body.contains("PASSED"), "{body}");
+        assert!(body.contains("supervisor"), "{body}");
 
         let single = vec![item(7, "First thing", "spec")];
         let no_summary = BuildOutcome {
@@ -1972,6 +2080,7 @@ mod tests {
             bundle_base64: String::new(),
             summary: Some("Closes #763. Adds golden fixtures.".into()),
             files_touched: vec![],
+            verification: None,
         };
         let (_, body) = pr_text(&batch, &outcome);
         assert!(!body.contains("Closes"));

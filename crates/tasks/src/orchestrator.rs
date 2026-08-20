@@ -1224,7 +1224,7 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 ///
 /// The three carve-outs are exhaustive on purpose. "Hand it over when in
 /// doubt" is what the old sentence effectively said, and doubt is unbounded;
-/// "hand it over when GitHub would refuse it, when no test run backs it, or
+/// "hand it over when GitHub would refuse it, when no passing run backs it, or
 /// when nothing here could have checked it" is not. The third exists because
 /// this repository has no workflows and no branch protection, so GitHub's
 /// verdict is structurally incapable of objecting to a change that does not
@@ -1232,19 +1232,37 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 ///
 /// A missing row reads as `Off`, the safe direction `authority_section` takes.
 ///
-/// `can_verify` splits the `Live` arm because carve-out (b) used to assert
-/// "nothing re-runs its tests for you" — true when the agent had nowhere warm
-/// to build, and false on a host where it does. Leaving it in place beside a
-/// [`verification_section`] that hands over a build directory would be the fix
-/// going inert: the agent would have somewhere to run the suite and a standing
-/// instruction saying the run will not happen. Both are computed from the same
-/// `can_verify` for exactly that reason.
+/// # Carve-out (b) asks whether a passing run *backs* the batch
 ///
-/// It widens `land_builds` autonomy, deliberately: the charter's own principle
-/// is that what sends a batch back to a human is unverifiability, not risk, and
-/// the orchestrator's own run is *stronger* evidence than the Builder's trailer
-/// — a check rather than a claim. (c) is untouched, and handing over stays
-/// available whenever a run genuinely could not be produced.
+/// It used to say "reported", which was right while the only evidence was a
+/// `Verification:` trailer the Builder agent wrote into its own summary. The
+/// supervisor now runs the project's declared suite itself and a red one never
+/// opens a pull request, so under `Live` (b) can only ever mean a run that was
+/// **never obtained** — undeclared, unavailable, or killed by its budget.
+/// Every arm is worded to ask that question rather than the old one.
+///
+/// # What a green run does not settle
+///
+/// It tested the branch against **its own base**. The trunk moves under a queue
+/// — branches sit in it while other pull requests land — and two branches each
+/// green against their own base can be red composed. No supervisor run can see
+/// that, because the thing it would have to test does not exist until merge
+/// time. So a green run does not end the reader's own: it removes the "is this
+/// tested at all" question and leaves the "does it still compose" one, which is
+/// precisely what the `can_verify` arm sends the agent to answer.
+///
+/// `can_verify` splits the `Live` arm for that reason — and it is a narrower
+/// reason than the one that first split it. That one was "the orchestrator's
+/// own run is stronger evidence than the Builder's trailer, a check rather than
+/// a claim", and it is now false as stated: both are checks. What survives is a
+/// different fact — branch versus composition — and leaving the old wording
+/// beside a [`verification_section`] that hands over a build directory would
+/// tell the agent to re-run a suite that has already run, instead of running
+/// the one that has not. Both are computed from the same `can_verify` so they
+/// cannot disagree about what this host can do.
+///
+/// (c) is untouched: a green suite still says nothing about whether a pixel
+/// landed.
 fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
     let level = charter
         .iter()
@@ -1258,27 +1276,41 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              The brief above has already asked the three questions that could \
              stop you, and they are the whole list: (a) GitHub would refuse the \
              merge — say which reason and stop; (b) no passing run backs it AND \
-             you could not make one — but you can: check the pull request out \
-             and run the suite yourself before you consider handing it over, \
-             since your own run is stronger evidence than the build's claim \
-             about itself, and hand it to the human only when a run genuinely \
-             could not be produced; (c) nothing runnable here could have checked \
-             it — the app-gpui rendering case. Say which of the three it is \
-             rather than defaulting to caution, and if it is none of them, merge \
-             it."
+             you could not make one — and under this charter (b) can only mean a \
+             run that was never obtained, since a failing suite fails the build \
+             inside the VM and never becomes a pull request at all, so check the \
+             branch out and run the suite yourself before you consider handing \
+             it over; (c) nothing runnable here could have checked it — the \
+             app-gpui rendering case. Say which of the three it is rather than \
+             defaulting to caution, and if it is none of them, merge it.\n\n\
+             A batch whose suite passed is not thereby finished with you. That \
+             run tested the branch against its OWN base, and the trunk has moved \
+             since — pull requests land while a queue drains. Two branches can \
+             each be green against their own base and red composed, and nothing \
+             upstream of you can see that, because the merged result does not \
+             exist until you make it. So when several are waiting, or when one \
+             has sat behind others that landed, check them out together onto \
+             current main and run the suite on the composition. That run is the \
+             one nobody else can make."
         }
         CharterLevel::Live => {
             "Landing it is YOURS, and waiting is not the default: merge it this \
              turn with POST /pull-requests/{number}/merge, and say that you did. \
              The brief above has already asked the three questions that could \
              stop you, and they are the whole list: (a) GitHub would refuse the \
-             merge — say which reason and stop; (b) the build reported no \
-             passing test run of its own, or a failing one — hand it to the \
-             human, since nothing re-runs its tests for you and this repository \
-             requires no checks of its own; (c) nothing runnable here could have \
-             checked it — the app-gpui rendering case. Say which of the three it \
-             is rather than defaulting to caution, and if it is none of them, \
-             merge it."
+             merge — say which reason and stop; (b) no passing run of the \
+             project's own test suite backs it — which here can only mean a run \
+             that was never obtained, since a failing suite fails the build \
+             inside the VM and never becomes a pull request; hand it to the \
+             human, because nothing on this host can make the run for you and \
+             this repository requires no checks of its own; (c) nothing runnable \
+             here could have checked it — the app-gpui rendering case. Say which \
+             of the three it is rather than defaulting to caution, and if it is \
+             none of them, merge it.\n\n\
+             Note what a passing run does not settle: it tested the branch \
+             against its own base, not against a trunk that has moved since. \
+             Nothing here can run the composition, so say so when you merge \
+             several at once."
         }
         CharterLevel::Shadow => {
             "Landing it is yours to decide and not to do: call POST \
@@ -1286,15 +1318,20 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              records the judgment, applies nothing, and answers `shadowed: true` \
              — and then say what you decided and why. Judge it on the same three \
              questions the brief answers: whether GitHub would refuse the merge, \
-             whether the build reported a passing test run of its own, and \
-             whether anything runnable here could have checked it."
+             whether a passing run of the project's own test suite backs it, and \
+             whether anything runnable here could have checked it. That run \
+             tested the branch against its own base and not against a trunk that \
+             has moved since, so say whether the composition is the open \
+             question."
         }
         CharterLevel::Off => {
             "Landing it is not yours. Report what it is waiting on, and say \
              which of the three questions the brief answers would have decided \
-             it: whether GitHub would refuse the merge, whether the build \
-             reported a passing test run of its own, and whether anything \
-             runnable here could have checked it."
+             it: whether GitHub would refuse the merge, whether a passing run of \
+             the project's own test suite backs it, and whether anything \
+             runnable here could have checked it. A passing run covers the \
+             branch against its own base and not the composition with a trunk \
+             that has moved."
         }
     }
 }
@@ -1336,7 +1373,11 @@ fn verification_section(target_dir: Option<&Path>, turn: Duration) -> String {
     let turn_secs = turn.as_secs();
     format!(
         "You can run this repository's tests, and a merge decision should rest \
-         on that rather than on a typecheck. CARGO_TARGET_DIR is already set \
+         on that rather than on a typecheck. The run worth making here is the \
+         one nobody upstream can: each Builder already ran this project's suite \
+         against its own branch, so what is unknown is whether those branches \
+         still pass COMPOSED with a trunk that moved under them while they \
+         queued. CARGO_TARGET_DIR is already set \
          for you to {dir} — a shared, long-lived build directory that stays \
          warm between turns. Do not override it, do not `cargo clean` it, and \
          do not delete it: its warmth is the whole reason the suite is \
@@ -2497,44 +2538,112 @@ mod tests {
         );
     }
 
+    fn landing_charter(level: CharterLevel) -> Vec<CharterEntry> {
+        vec![CharterEntry {
+            capability: crate::models::Capability::LandBuilds,
+            level,
+            daily_limit: None,
+            updated_at: chrono::Utc::now(),
+        }]
+    }
+
     /// Adding the build directory without changing this section would leave the
     /// whole fix inert: somewhere warm to build, beside a standing instruction
     /// saying nothing re-runs the tests for you.
+    ///
+    /// The *reason* has narrowed since — both runs are checks now — so what a
+    /// verifying host is sent to do is the one run nobody else can make: the
+    /// branches composed onto a trunk that moved under them.
     #[test]
     fn a_host_that_can_run_the_suite_is_told_to_run_it_before_handing_over() {
-        let charter = |level| {
-            vec![CharterEntry {
-                capability: crate::models::Capability::LandBuilds,
-                level,
-                daily_limit: None,
-                updated_at: chrono::Utc::now(),
-            }]
-        };
-        let live = charter(CharterLevel::Live);
-
-        let cannot = landing_section(&live, false);
-        assert!(
-            cannot.contains("nothing re-runs its tests for you"),
-            "{cannot}"
-        );
+        let live = landing_charter(CharterLevel::Live);
 
         let can = landing_section(&live, true);
         assert!(
             !can.contains("nothing re-runs its tests for you"),
             "the claim is false on a host that can verify: {can}"
         );
-        assert!(can.contains("check the pull request out"), "{can}");
+        assert!(can.contains("check the branch out"), "{can}");
         assert!(can.contains("run the suite yourself"), "{can}");
+        // What is worth running there, stated as the thing upstream cannot do.
+        assert!(can.contains("run the suite on the composition"), "{can}");
         // The other two carve-outs are untouched, and handing over stays
         // available when a run genuinely could not be produced.
         assert!(can.contains("GitHub would refuse the merge"), "{can}");
         assert!(can.contains("app-gpui"), "{can}");
-        assert!(can.contains("could not be produced"), "{can}");
 
         // Shadow and Off do not vary with it.
         for level in [CharterLevel::Shadow, CharterLevel::Off] {
-            let c = charter(level);
+            let c = landing_charter(level);
             assert_eq!(landing_section(&c, true), landing_section(&c, false));
+        }
+    }
+
+    /// Carve-out (b) asks whether a passing run **backs** the batch, never
+    /// whether the build *reported* one.
+    ///
+    /// "Reported" was right while the only evidence was a trailer the Builder
+    /// agent wrote into its own summary. The supervisor runs the suite itself
+    /// now, so the word would send the agent looking for a claim that no longer
+    /// exists — and would quietly reintroduce the idea that a build's own
+    /// statement about itself is the evidence.
+    #[test]
+    fn no_landing_arm_describes_verification_as_something_the_build_reported() {
+        for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
+            for can_verify in [true, false] {
+                let section = landing_section(&landing_charter(level), can_verify);
+                for forbidden in [
+                    "the build reported",
+                    "reported a passing test run",
+                    "reported no passing test run",
+                    "the build's claim",
+                ] {
+                    assert!(
+                        !section.contains(forbidden),
+                        "{level:?}/{can_verify}: still says {forbidden:?}: {section}"
+                    );
+                }
+                assert!(
+                    section.contains("backs it") || section.contains("backs it,"),
+                    "{level:?}/{can_verify}: {section}"
+                );
+            }
+        }
+    }
+
+    /// The half of the change that is not about wording: a green run covers the
+    /// branch against **its own base**, and every arm has to say so, or the
+    /// next reader takes `Passed` for "nothing further to run" and merges a
+    /// composition nobody tested.
+    #[test]
+    fn every_landing_arm_says_a_passing_run_does_not_cover_the_composition() {
+        for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
+            for can_verify in [true, false] {
+                let section = landing_section(&landing_charter(level), can_verify);
+                assert!(
+                    section.contains("its own base") || section.contains("its OWN base"),
+                    "{level:?}/{can_verify}: {section}"
+                );
+                assert!(
+                    section.contains("moved") || section.contains("composition"),
+                    "{level:?}/{can_verify}: {section}"
+                );
+            }
+        }
+    }
+
+    /// The two `Live` arms say outright that (b) can only mean a run that was
+    /// never obtained — a *failing* one never became a pull request, so an
+    /// agent looking for one is looking for something that cannot exist.
+    #[test]
+    fn the_live_arms_say_a_failing_suite_never_became_a_pull_request() {
+        for can_verify in [true, false] {
+            let section = landing_section(&landing_charter(CharterLevel::Live), can_verify);
+            assert!(
+                section.contains("never became a pull request")
+                    || section.contains("never becomes a pull request"),
+                "{can_verify}: {section}"
+            );
         }
     }
 

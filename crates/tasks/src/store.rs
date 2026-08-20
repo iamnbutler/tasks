@@ -23,7 +23,8 @@ use crate::models::{
     OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId,
     ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
     SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream,
+    Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream, Verification,
+    VerificationStatus,
 };
 use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
@@ -72,7 +73,7 @@ macro_rules! build_columns {
     () => {
         "id, project_id, vm_id, branch, base_branch, base_sha, head_sha, pr_number, status, \
          summary, files_touched, exit_reason, created_at, started_at, agent_finished_at, \
-         completed_at, directions, directions_author"
+         completed_at, directions, directions_author, verification_status, verification_detail"
     };
 }
 
@@ -2805,6 +2806,10 @@ impl Store {
             agent_finished_at: None,
             completed_at: None,
             directions: directions.cloned(),
+            // A build that has not run has no run behind it. The row's two
+            // columns start NULL and only `finalize_build_succeeded` writes
+            // them.
+            verification: None,
         };
         let branch = format!("build/{}", build.id);
         sqlx::query(
@@ -3144,13 +3149,15 @@ impl Store {
         pr_number: u64,
         summary: Option<&str>,
         files_touched: &[String],
+        verification: Option<&Verification>,
     ) -> Result<Build, StoreError> {
         let now = Utc::now();
         let mut tx = self.begin_write().await?;
 
         sqlx::query(
             "UPDATE builds SET status = ?, head_sha = ?, pr_number = ?, summary = ?, \
-             files_touched = ?, completed_at = ? WHERE id = ?",
+             files_touched = ?, completed_at = ?, verification_status = ?, \
+             verification_detail = ? WHERE id = ?",
         )
         .bind(BuildStatus::Succeeded.as_str())
         .bind(head_sha)
@@ -3158,6 +3165,11 @@ impl Store {
         .bind(summary)
         .bind(serde_json::to_string(files_touched)?)
         .bind(now.to_rfc3339())
+        // Two columns and not one JSON blob, on the `directions` precedent: the
+        // status is branched on and the detail is only ever rendered, so a
+        // reader that wants the decision never has to parse the prose.
+        .bind(verification.map(|v| v.status.as_str()))
+        .bind(verification.map(|v| v.detail.as_str()))
         .bind(id.as_str())
         .execute(&mut *tx)
         .await?;
@@ -5363,6 +5375,30 @@ fn build_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Build, StoreError> {
             row.try_get::<Option<String>, _>("directions_author")?
                 .as_deref(),
         ),
+        verification: verification_from_columns(
+            row.try_get::<Option<String>, _>("verification_status")?
+                .as_deref(),
+            row.try_get::<Option<String>, _>("verification_detail")?,
+        ),
+    })
+}
+
+/// A build's verification, out of its two columns.
+///
+/// An unrecognised status reads as `None` — "no run on record" — and **never**
+/// as a guess. This is the strict half of the seam: the VM wire decays an
+/// unknown status forgivingly because a terminal event that will not decode
+/// hangs a run, but by the time a value is in this column it has already been
+/// through that, so anything unrecognisable here is a column somebody wrote by
+/// hand or a schema that moved, and the honest reading of either is that there
+/// is no run behind it.
+///
+/// A status with no detail is still a status: `detail` is prose and nothing
+/// branches on it, so its absence is not a reason to drop the fact.
+fn verification_from_columns(status: Option<&str>, detail: Option<String>) -> Option<Verification> {
+    Some(Verification {
+        status: VerificationStatus::from_str(status?)?,
+        detail: detail.unwrap_or_default(),
     })
 }
 
@@ -7644,7 +7680,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap();
         store
-            .finalize_build_succeeded(&build.id, "headsha", 863, None, &[])
+            .finalize_build_succeeded(&build.id, "headsha", 863, None, &[], None)
             .await
             .unwrap();
 
@@ -9967,11 +10003,24 @@ mod tests {
                 77,
                 Some("Did the thing."),
                 &["src/lib.rs".to_string()],
+                Some(&Verification {
+                    status: VerificationStatus::Passed,
+                    detail: ".tasks/verify passed (gate abc1234, same as main)".into(),
+                }),
             )
             .await
             .unwrap();
         assert_eq!(done.status, BuildStatus::Succeeded);
         assert_eq!(done.pr_number, Some(77));
+        // The two columns survive the round trip, and the status is the thing a
+        // reader branches on rather than the prose beside it.
+        let stored = done.verification.as_ref().expect("verification persisted");
+        assert_eq!(stored.status, VerificationStatus::Passed);
+        assert!(stored.is_green());
+        assert!(stored.detail.contains("gate abc1234"));
+        // And re-read from the row rather than from the returned struct.
+        let refetched = store.get_build(&build.id).await.unwrap().unwrap();
+        assert_eq!(refetched.verification, done.verification);
         assert_eq!(done.head_sha.as_deref(), Some("headsha123"));
 
         // Spec drained, task concluded, and neither can be re-consumed.
@@ -10049,7 +10098,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
         store
-            .finalize_build_succeeded(&build.id, "headsha", 91, None, &[])
+            .finalize_build_succeeded(&build.id, "headsha", 91, None, &[], None)
             .await
             .unwrap();
 
@@ -10112,7 +10161,7 @@ mod tests {
                 .unwrap();
             store.claim_next_queued_build().await.unwrap().unwrap();
             store
-                .finalize_build_succeeded(&build.id, "headsha", 100 + issue, None, &[])
+                .finalize_build_succeeded(&build.id, "headsha", 100 + issue, None, &[], None)
                 .await
                 .unwrap();
             // What `finalize_build_succeeded` used to write.
@@ -10201,7 +10250,14 @@ mod tests {
                 .unwrap();
             store.claim_next_queued_build().await.unwrap().unwrap();
             store
-                .finalize_build_succeeded(&build.id, "headsha", 50 + attempt as u64, None, &[])
+                .finalize_build_succeeded(
+                    &build.id,
+                    "headsha",
+                    50 + attempt as u64,
+                    None,
+                    &[],
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -10617,7 +10673,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
         store
-            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[])
+            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[], None)
             .await
             .unwrap();
         store.unwind_unmerged_build(&dead.id).await.unwrap();
@@ -10633,7 +10689,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
         store
-            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[], None)
             .await
             .unwrap();
         assert_eq!(
@@ -10688,7 +10744,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
         store
-            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[])
+            .finalize_build_succeeded(&dead.id, "headsha", 946, None, &[], None)
             .await
             .unwrap();
         store.unwind_unmerged_build(&dead.id).await.unwrap();
@@ -10712,7 +10768,7 @@ mod tests {
             .unwrap();
         store.claim_next_queued_build().await.unwrap().unwrap();
         store
-            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[])
+            .finalize_build_succeeded(&live.id, "headsha2", 952, None, &[], None)
             .await
             .unwrap();
 

@@ -221,6 +221,7 @@ async fn harness_with_env_and_vms(
             vm_config: VmConfig::default(),
             timeout: Duration::from_secs(60),
             leases: None,
+            trunk_branch: "main".into(),
             scratch_root: scratch_root.clone(),
         },
     );
@@ -1040,6 +1041,7 @@ async fn a_vm_pool_that_goes_away_mid_build_costs_the_batch_no_attempt() {
                 vm_config: VmConfig::default(),
                 timeout: Duration::from_secs(60),
                 leases: None,
+                trunk_branch: "main".into(),
                 scratch_root: h.scratch_root.clone(),
             },
         );
