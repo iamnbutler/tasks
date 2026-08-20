@@ -5,6 +5,17 @@
   sed, substituting @VERSION@ and @COMMIT@. The bundle identifier and the
   deployment target carry over from the retired Swift target, so installing
   replaces the old app in place.
+
+  CFBundleIconFile takes a BASE NAME: macOS appends `.icns` itself, so
+  `AppIcon.icns` here resolves to `AppIcon.icns.icns` and draws the generic
+  blank. There is deliberately no CFBundleIconName — that key names an entry in
+  a compiled asset catalog (Assets.car) and this bundle has none, so it would
+  point at nothing.
+
+  This key and `app-install`'s `cp app-gpui/AppIcon.icns` are two halves of one
+  change: either alone leaves the app showing the blank, and macOS does not
+  warn about an icon that resolves to nothing. `crates/tasks/tests/app_icon.rs`
+  is what holds the two together.
 -->
 <plist version="1.0">
 <dict>
@@ -12,6 +23,8 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>Tasks</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.iamnbutler.tasks</string>
 	<key>CFBundleInfoDictionaryVersion</key>
