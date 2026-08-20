@@ -1175,6 +1175,7 @@ mod tests {
             // Not a hold: the build directory's size is never a reason the
             // pipeline is idle, which is what this fixture is about.
             verify_dir: None,
+            orchestrator_lane: None,
         }
     }
 

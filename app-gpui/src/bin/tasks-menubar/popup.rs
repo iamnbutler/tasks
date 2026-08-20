@@ -494,7 +494,31 @@ impl Popup {
             .child(mode.as_str().to_uppercase())
             .on_click(move |_, _, cx| {
                 server.update(cx, |server, cx| {
-                    server.set_mode(machines::toggled_mode(mode), cx)
+                    let next = machines::toggled_mode(mode);
+                    // The **third** play button (#993). A status-item panel is
+                    // not a window and cannot host the sheet, so this one is
+                    // refused with a stated reason rather than routed
+                    // somewhere — the reason being on the same info line the
+                    // section already renders `mode_error` on.
+                    //
+                    // Refused rather than "open the Server window with the
+                    // sheet up" for a reason specific to this surface: the
+                    // menubar can point at other machines
+                    // (`TASKS_MENUBAR_MACHINES`), and the acknowledgement is a
+                    // record in *this* host's data dir. It says nothing about
+                    // the remote server whose charter would actually govern
+                    // the run, so a sheet raised here would generate its list
+                    // from the right charter and file its acknowledgement
+                    // against the wrong install. Acknowledging where the
+                    // pipeline is is the honest place.
+                    if !server.set_mode_gated(next, cx) {
+                        server.mode_error = Some(
+                            "Open Tasks and start the pipeline there once — this machine \
+                             has not been told what play does yet."
+                                .into(),
+                        );
+                        cx.notify();
+                    }
                 });
             })
     }

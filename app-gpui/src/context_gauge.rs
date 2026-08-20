@@ -235,6 +235,7 @@ mod tests {
             cc_session_id: Some("s".into()),
             workdir: None,
             checked_out: false,
+            lane: Default::default(),
             context_tokens: context,
             tick_tokens: Some(1_634_166),
             model_id: Some("claude-opus-5[1m]".into()),
