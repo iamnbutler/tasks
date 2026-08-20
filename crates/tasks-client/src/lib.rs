@@ -32,6 +32,7 @@ use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
     OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ScoutNotes, Session, SessionId,
     Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    WorkerId,
 };
 use tasks_api::version::VersionInfo;
 use thiserror::Error;
@@ -773,6 +774,11 @@ impl Client {
     /// The same tail for a build.
     pub fn stream_build_transcript(&self, id: &BuildId, since: i64) -> TranscriptTail {
         TranscriptTail::new(self.clone(), TranscriptOwner::build(id), since)
+    }
+
+    /// The same tail for a worker run (#1053).
+    pub fn stream_worker_transcript(&self, id: &WorkerId, since: i64) -> TranscriptTail {
+        TranscriptTail::new(self.clone(), TranscriptOwner::worker(id), since)
     }
 
     /// The in-flight orchestrator tick (deltas, tool labels, done).

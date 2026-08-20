@@ -1442,7 +1442,8 @@ fn write_route(action: DecisionAction, task: &Task) -> Option<(String, Value)> {
         | DecisionAction::CancelRun
         | DecisionAction::SettleDecision
         | DecisionAction::EnrollAgent
-        | DecisionAction::RevokeAgent => None,
+        | DecisionAction::RevokeAgent
+        | DecisionAction::DispatchWorker => None,
     }
 }
 

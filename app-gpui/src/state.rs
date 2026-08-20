@@ -596,6 +596,9 @@ impl AppState {
                         TranscriptOwner::Build { build_id } => {
                             client.stream_build_transcript(build_id, 1)
                         }
+                        TranscriptOwner::Worker { worker_id } => {
+                            client.stream_worker_transcript(worker_id, 1)
+                        }
                     };
                     for item in tail {
                         if tx.unbounded_send(item).is_err() {

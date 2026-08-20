@@ -56,6 +56,7 @@ id_newtype!(TaskId, "task");
 id_newtype!(SessionId, "sess");
 id_newtype!(SpecId, "spec");
 id_newtype!(BuildId, "build");
+id_newtype!(WorkerId, "work");
 
 /// How much of the pipeline still runs for one repo — the honest per-repo
 /// counterpart to the global [`Mode`].
@@ -337,14 +338,16 @@ pub struct TranscriptLine {
     pub line: String,
 }
 
-/// Which run produced a transcript line. Two variants rather than one opaque
-/// id because they are two resources behind two routes — a reader holding a
-/// line should not have to guess which one to fetch more from.
+/// Which run produced a transcript line. One variant per owning resource
+/// rather than one opaque id because they are separate resources behind
+/// separate routes — a reader holding a line should not have to guess which
+/// one to fetch more from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptOwner {
     Session { session_id: SessionId },
     Build { build_id: BuildId },
+    Worker { worker_id: WorkerId },
 }
 
 impl TranscriptOwner {
@@ -360,11 +363,18 @@ impl TranscriptOwner {
         }
     }
 
+    pub fn worker(id: &WorkerId) -> Self {
+        TranscriptOwner::Worker {
+            worker_id: id.clone(),
+        }
+    }
+
     /// The owning row's id, whichever side of the arc is set.
     pub fn id(&self) -> &str {
         match self {
             TranscriptOwner::Session { session_id } => session_id.as_str(),
             TranscriptOwner::Build { build_id } => build_id.as_str(),
+            TranscriptOwner::Worker { worker_id } => worker_id.as_str(),
         }
     }
 }
@@ -797,10 +807,11 @@ impl BuildStatus {
     }
 }
 
-/// Which kind of run something is about — a Scout session or a Builder run.
+/// Which kind of run something is about — a Scout session, a Builder run, or
+/// a host worker run.
 ///
 /// The discriminant that lets one `cancellations` table and one cancel path
-/// serve both dispatchers. Deliberately not folded into [`TranscriptOwner`]:
+/// serve every dispatcher. Deliberately not folded into [`TranscriptOwner`]:
 /// that one carries the id and exists to address a transcript, this one is the
 /// bare kind and travels beside an id that is already in hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -808,6 +819,7 @@ impl BuildStatus {
 pub enum RunKind {
     Session,
     Build,
+    Worker,
 }
 
 impl RunKind {
@@ -815,6 +827,7 @@ impl RunKind {
         match self {
             RunKind::Session => "session",
             RunKind::Build => "build",
+            RunKind::Worker => "worker",
         }
     }
 
@@ -822,6 +835,7 @@ impl RunKind {
         match s {
             "session" => Some(RunKind::Session),
             "build" => Some(RunKind::Build),
+            "worker" => Some(RunKind::Worker),
             _ => None,
         }
     }
@@ -832,11 +846,98 @@ impl RunKind {
         match self {
             RunKind::Session => "scout",
             RunKind::Build => "build",
+            RunKind::Worker => "worker",
         }
     }
 }
 
 impl fmt::Display for RunKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A worker run: labor the orchestrator moved out of its own conversation
+/// lane (#1053). A fresh, disposable headless Claude Code session the server
+/// spawns **on the host** — full host capabilities (the checkout, the warm
+/// build directory), no `--resume`, no context carried between jobs.
+///
+/// A worker is a voice, not an authority: its result text comes back into the
+/// orchestrator conversation as a server-written `[worker <job>]` turn, and
+/// its default command carries no `curl` at all — a local process with no
+/// actor header would be attributed as the *human*, whom the charter never
+/// gates, so handing a worker the API would make dispatching one a
+/// privilege-escalation primitive. GitHub and pipeline writes stay where the
+/// server can attribute them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worker {
+    pub id: WorkerId,
+    /// Short label naming the job, chosen at dispatch. It heads the report
+    /// turn (`[worker <job>]`), so it is what the words are attributed to.
+    pub job: String,
+    /// The job itself, free text. Same trust domain as the orchestrator that
+    /// wrote it.
+    pub prompt: String,
+    pub status: WorkerStatus,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// How the run ended, in words — the only thing that later tells a
+    /// deliberate stop from a crash from a budget that ran out.
+    pub exit_reason: Option<String>,
+    /// The result text the run returned, when it completed. The bounded copy
+    /// of this is what lands in the conversation; this is the full text.
+    pub report: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Queued,
+    Running,
+    Succeeded,
+    /// The run ended without a report the orchestrator can act on: a non-zero
+    /// exit, a timeout, or a host that went away. Never a strike anywhere — a
+    /// failed worker is information, and whether to redispatch is the
+    /// orchestrator's call on reading the report turn.
+    Failed,
+    /// Stopped on purpose, by an accountable actor, while queued or running.
+    Cancelled,
+}
+
+impl WorkerStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerStatus::Queued => "queued",
+            WorkerStatus::Running => "running",
+            WorkerStatus::Succeeded => "succeeded",
+            WorkerStatus::Failed => "failed",
+            WorkerStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(WorkerStatus::Queued),
+            "running" => Some(WorkerStatus::Running),
+            "succeeded" => Some(WorkerStatus::Succeeded),
+            "failed" => Some(WorkerStatus::Failed),
+            "cancelled" => Some(WorkerStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether the run has reached a state nothing will move it out of.
+    /// The predicate `POST /workers/{id}/cancel` answers `concluded` on.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            WorkerStatus::Succeeded | WorkerStatus::Failed | WorkerStatus::Cancelled
+        )
+    }
+}
+
+impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -1314,6 +1415,15 @@ decision_actions! {
     /// that was wrong, and the reason `enroll_agents` can be trusted with
     /// `live`.
     RevokeAgent => "revoke_agent", Some(Capability::EnrollAgents);
+    /// A worker run was dispatched: labor (a suite run, a composition check,
+    /// an investigation) moved onto the host worker lane instead of being run
+    /// inside the orchestrator's own turn.
+    ///
+    /// Store-only — `applied` by construction, like `enroll_agent`: the
+    /// dispatch commits in the same transaction family as the row it creates
+    /// and reaches GitHub never. What a worker *returns* is a report turn in
+    /// the conversation, not a gated write.
+    DispatchWorker => "dispatch_worker", Some(Capability::DispatchWorkers);
 }
 
 /// What became of the effect a decision authorized.
@@ -1422,16 +1532,28 @@ pub enum Capability {
     /// capability covers for the same reason `reopen_work` lives under
     /// `retire_work`: an act and its undo belong to one switch.
     EnrollAgents,
+    /// Dispatch a worker run: a fresh headless agent the server spawns on the
+    /// host to do labor (run a suite, verify a composition, investigate) and
+    /// report back into the conversation as a `[worker <job>]` turn.
+    ///
+    /// What makes this safe to ship `live`: a worker conveys labor, not
+    /// authority. Its result is input the orchestrator weighs; its default
+    /// command has no route to the pipeline API (no `curl`) and no GitHub
+    /// credential, so every gated write still happens where the server can
+    /// attribute it. The cost of a bad dispatch is host CPU time, bounded by
+    /// `WORKER_TIMEOUT_SECS` and stoppable under `cancel_runs`.
+    DispatchWorkers,
 }
 
 impl Capability {
     /// Every capability, in the order the charter is meant to be flipped:
     /// additive and trivially reversible first, irreversible-ish last.
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::CaptureWork,
         Capability::CommentOnWork,
         Capability::RetireWork,
         Capability::QueueTasks,
+        Capability::DispatchWorkers,
         Capability::DispatchBuilds,
         Capability::CancelRuns,
         Capability::AutoReviewSpecs,
@@ -1452,6 +1574,7 @@ impl Capability {
             Capability::CurateWork => "curate_work",
             Capability::CancelRuns => "cancel_runs",
             Capability::EnrollAgents => "enroll_agents",
+            Capability::DispatchWorkers => "dispatch_workers",
         }
     }
 
@@ -1467,6 +1590,7 @@ impl Capability {
             "curate_work" => Some(Capability::CurateWork),
             "cancel_runs" => Some(Capability::CancelRuns),
             "enroll_agents" => Some(Capability::EnrollAgents),
+            "dispatch_workers" => Some(Capability::DispatchWorkers),
             _ => None,
         }
     }
@@ -1486,6 +1610,10 @@ impl Capability {
             Capability::EnrollAgents => {
                 "enroll an external agent: mint a short-lived code that lets it \
                  message you (POST /agents), or revoke one"
+            }
+            Capability::DispatchWorkers => {
+                "dispatch a worker: a fresh host agent that runs a job you \
+                 write (POST /workers) and reports back as a [worker] turn"
             }
         }
     }

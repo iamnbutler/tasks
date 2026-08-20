@@ -24,7 +24,7 @@ use crate::models::{
     ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
     SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
     Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream, Verification,
-    VerificationStatus,
+    VerificationStatus, Worker, WorkerId, WorkerStatus,
 };
 use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
@@ -1777,7 +1777,7 @@ impl Store {
         if lines.is_empty() {
             return Ok(Vec::new());
         }
-        let (session_id, build_id) = owner_columns(owner);
+        let (session_id, build_id, worker_id) = owner_columns(owner);
         let now = Utc::now();
         let mut tx = self.begin_write().await?;
 
@@ -1787,6 +1787,9 @@ impl Store {
             }
             TranscriptOwner::Build { .. } => {
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE build_id = ?"
+            }
+            TranscriptOwner::Worker { .. } => {
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_lines WHERE worker_id = ?"
             }
         })
         .bind(owner.id().to_string())
@@ -1804,11 +1807,13 @@ impl Store {
             // tail and a catch-up read see identical bytes.
             let line = crate::redact::redact_line(line);
             sqlx::query(
-                "INSERT INTO transcript_lines (session_id, build_id, seq, timestamp, stream, line) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO transcript_lines \
+                 (session_id, build_id, worker_id, seq, timestamp, stream, line) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session_id.clone())
             .bind(build_id.clone())
+            .bind(worker_id.clone())
             .bind(seq)
             .bind(now.to_rfc3339())
             .bind(stream.as_str())
@@ -1842,12 +1847,19 @@ impl Store {
     ) -> Result<Vec<TranscriptLine>, StoreError> {
         let rows = sqlx::query(match owner {
             TranscriptOwner::Session { .. } => {
-                "SELECT session_id, build_id, seq, timestamp, stream, line FROM transcript_lines \
+                "SELECT session_id, build_id, worker_id, seq, timestamp, stream, line \
+                 FROM transcript_lines \
                  WHERE session_id = ? AND seq >= ? ORDER BY seq LIMIT ?"
             }
             TranscriptOwner::Build { .. } => {
-                "SELECT session_id, build_id, seq, timestamp, stream, line FROM transcript_lines \
+                "SELECT session_id, build_id, worker_id, seq, timestamp, stream, line \
+                 FROM transcript_lines \
                  WHERE build_id = ? AND seq >= ? ORDER BY seq LIMIT ?"
+            }
+            TranscriptOwner::Worker { .. } => {
+                "SELECT session_id, build_id, worker_id, seq, timestamp, stream, line \
+                 FROM transcript_lines \
+                 WHERE worker_id = ? AND seq >= ? ORDER BY seq LIMIT ?"
             }
         })
         .bind(owner.id().to_string())
@@ -3718,6 +3730,233 @@ impl Store {
         Ok(returned)
     }
 
+    // --- workers (#1053) ---
+
+    /// Record a worker dispatch. The row lands `queued`; the worker lane
+    /// claims it in order.
+    ///
+    /// Validation lives here rather than in the handler, on
+    /// `require_rationale`'s backstop argument: a caller that never went
+    /// through a handler still cannot write a job label that cannot head a
+    /// report turn. The label is single-line because it is spliced into
+    /// `[worker <job>]` — a newline there would let a job name forge a second
+    /// heading.
+    pub async fn create_worker(&self, job: &str, prompt: &str) -> Result<Worker, StoreError> {
+        let job = job.trim();
+        if job.is_empty() {
+            return Err(StoreError::Invalid("a worker needs a job label".into()));
+        }
+        if job.len() > MAX_WORKER_JOB_BYTES {
+            return Err(StoreError::Invalid(format!(
+                "worker job label is {} bytes; the limit is {MAX_WORKER_JOB_BYTES}",
+                job.len()
+            )));
+        }
+        if job.contains(['\n', '\r', '[', ']']) {
+            return Err(StoreError::Invalid(
+                "a worker job label is one line, without brackets — it heads the \
+                 [worker <job>] report turn"
+                    .into(),
+            ));
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(StoreError::Invalid("a worker needs a prompt".into()));
+        }
+        if prompt.len() > MAX_WORKER_PROMPT_BYTES {
+            // A 400 and not a truncation: an instruction cut off halfway is a
+            // different instruction — the `parse_directions` rule.
+            return Err(StoreError::Invalid(format!(
+                "worker prompt is {} bytes; the limit is {MAX_WORKER_PROMPT_BYTES}",
+                prompt.len()
+            )));
+        }
+        let worker = Worker {
+            id: WorkerId::new(),
+            job: job.to_string(),
+            prompt: prompt.to_string(),
+            status: WorkerStatus::Queued,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            exit_reason: None,
+            report: None,
+        };
+        sqlx::query(
+            "INSERT INTO workers (id, job, prompt, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(worker.id.as_str())
+        .bind(&worker.job)
+        .bind(&worker.prompt)
+        .bind(worker.status.as_str())
+        .bind(worker.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(worker)
+    }
+
+    pub async fn worker(&self, id: &WorkerId) -> Result<Option<Worker>, StoreError> {
+        sqlx::query(
+            "SELECT id, job, prompt, status, created_at, started_at, completed_at, \
+             exit_reason, report FROM workers WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .map(worker_from_row)
+        .transpose()
+    }
+
+    /// Workers, newest first.
+    pub async fn list_workers(&self, limit: i64) -> Result<Vec<Worker>, StoreError> {
+        sqlx::query(
+            "SELECT id, job, prompt, status, created_at, started_at, completed_at, \
+             exit_reason, report FROM workers ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(worker_from_row)
+        .collect()
+    }
+
+    /// Claim the oldest queued worker, or `None` while one is running.
+    ///
+    /// The lane is serial for the same reason the build lane is — and for one
+    /// more of its own: the warm build directory
+    /// (`ORCHESTRATOR_TARGET_DIR`) keeps exactly one job's artifacts hot, so
+    /// two workers building at once would fight over the very thing that
+    /// makes a worker's suite run affordable. The check lives inside the
+    /// claim's transaction so two racing callers cannot both claim
+    /// (`claim_next_queued_build`'s shape).
+    pub async fn claim_next_queued_worker(&self) -> Result<Option<Worker>, StoreError> {
+        let now = Utc::now();
+        let mut tx = self.begin_write().await?;
+
+        let running = sqlx::query("SELECT 1 FROM workers WHERE status = ? LIMIT 1")
+            .bind(WorkerStatus::Running.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if running.is_some() {
+            return Ok(None);
+        }
+
+        let Some(row) = sqlx::query(
+            "SELECT id, job, prompt, status, created_at, started_at, completed_at, \
+             exit_reason, report FROM workers WHERE status = ? ORDER BY rowid LIMIT 1",
+        )
+        .bind(WorkerStatus::Queued.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let mut worker = worker_from_row(row)?;
+
+        sqlx::query("UPDATE workers SET status = ?, started_at = ? WHERE id = ?")
+            .bind(WorkerStatus::Running.as_str())
+            .bind(now.to_rfc3339())
+            .bind(worker.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        worker.status = WorkerStatus::Running;
+        worker.started_at = Some(now);
+        Ok(Some(worker))
+    }
+
+    /// Conclude a worker row. `status` must be terminal — a caller trying to
+    /// "finish" a worker back to `queued` is a bug, not a transition.
+    pub async fn finish_worker(
+        &self,
+        id: &WorkerId,
+        status: WorkerStatus,
+        exit_reason: Option<&str>,
+        report: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if !status.is_terminal() {
+            return Err(StoreError::Invalid(format!(
+                "finish_worker with non-terminal status {status}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE workers SET status = ?, completed_at = ?, exit_reason = ?, report = ? \
+             WHERE id = ?",
+        )
+        .bind(status.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(exit_reason)
+        .bind(report)
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Apply a cancel to a worker that is still `queued` — nothing is
+    /// following it, so nobody would ever read the request. Conditional on
+    /// the status inside the store, so losing the race against the worker
+    /// lane leaves the running worker's own cancel path to conclude it —
+    /// `cancel_queued_build`'s shape exactly.
+    pub async fn cancel_queued_worker(
+        &self,
+        id: &WorkerId,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE workers SET status = ?, exit_reason = ?, completed_at = ? \
+             WHERE id = ? AND status = ?",
+        )
+        .bind(WorkerStatus::Cancelled.as_str())
+        .bind(reason)
+        .bind(Utc::now().to_rfc3339())
+        .bind(id.as_str())
+        .bind(WorkerStatus::Queued.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Write off workers a dead process left behind: every `queued` or
+    /// `running` row goes to `failed` with `reason`, and the rows are
+    /// returned so the caller can report each one into the conversation —
+    /// a worker is a local child, so unlike a scout or a build there is
+    /// nothing to reattach to (the orchestrator-turn rule, one lane over).
+    pub async fn reconcile_orphaned_workers(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<Worker>, StoreError> {
+        let mut tx = self.begin_write().await?;
+        let rows = sqlx::query(
+            "SELECT id, job, prompt, status, created_at, started_at, completed_at, \
+             exit_reason, report FROM workers WHERE status IN (?, ?) ORDER BY rowid",
+        )
+        .bind(WorkerStatus::Queued.as_str())
+        .bind(WorkerStatus::Running.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let orphans: Vec<Worker> = rows
+            .into_iter()
+            .map(worker_from_row)
+            .collect::<Result<_, _>>()?;
+        let now = Utc::now();
+        for worker in &orphans {
+            sqlx::query(
+                "UPDATE workers SET status = ?, completed_at = ?, exit_reason = ? WHERE id = ?",
+            )
+            .bind(WorkerStatus::Failed.as_str())
+            .bind(now.to_rfc3339())
+            .bind(reason)
+            .bind(worker.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(orphans)
+    }
+
     // --- orchestrator ---
 
     /// Append one conversation turn and emit [`EventPayload::OrchestratorMessage`].
@@ -5556,31 +5795,36 @@ fn session_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Session, StoreError>
     })
 }
 
-/// The two owner columns for a binding, exactly one of them `Some`.
-fn owner_columns(owner: &TranscriptOwner) -> (Option<String>, Option<String>) {
+/// The three owner columns for a binding, exactly one of them `Some`.
+fn owner_columns(owner: &TranscriptOwner) -> (Option<String>, Option<String>, Option<String>) {
     match owner {
-        TranscriptOwner::Session { session_id } => (Some(session_id.to_string()), None),
-        TranscriptOwner::Build { build_id } => (None, Some(build_id.to_string())),
+        TranscriptOwner::Session { session_id } => (Some(session_id.to_string()), None, None),
+        TranscriptOwner::Build { build_id } => (None, Some(build_id.to_string()), None),
+        TranscriptOwner::Worker { worker_id } => (None, None, Some(worker_id.to_string())),
     }
 }
 
 fn transcript_line_from_row(row: sqlx::sqlite::SqliteRow) -> Result<TranscriptLine, StoreError> {
     let stream_raw: String = row.try_get("stream")?;
-    // The arc is a CHECK constraint, so neither/both is a corrupt row rather
-    // than a case with a sensible default. Say so instead of guessing.
+    // The arc is a CHECK constraint, so none-or-several is a corrupt row
+    // rather than a case with a sensible default. Say so instead of guessing.
     let owner = match (
         row.try_get::<Option<String>, _>("session_id")?,
         row.try_get::<Option<String>, _>("build_id")?,
+        row.try_get::<Option<String>, _>("worker_id")?,
     ) {
-        (Some(session_id), None) => TranscriptOwner::Session {
+        (Some(session_id), None, None) => TranscriptOwner::Session {
             session_id: SessionId::from_raw(session_id),
         },
-        (None, Some(build_id)) => TranscriptOwner::Build {
+        (None, Some(build_id), None) => TranscriptOwner::Build {
             build_id: BuildId::from_raw(build_id),
+        },
+        (None, None, Some(worker_id)) => TranscriptOwner::Worker {
+            worker_id: WorkerId::from_raw(worker_id),
         },
         _ => {
             return Err(StoreError::Invalid(
-                "transcript line owns neither or both of session_id / build_id".into(),
+                "transcript line owns none or several of session_id / build_id / worker_id".into(),
             ));
         }
     };
@@ -5624,6 +5868,38 @@ fn cancel_request_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CancelRequest
         rationale: row.try_get("rationale")?,
         decision_seq: row.try_get("decision_seq")?,
         requested_at: parse_ts(&row.try_get::<String, _>("requested_at")?, "requested_at")?,
+    })
+}
+
+/// Ceiling on a worker's job label. Generous for a heading, refused past it.
+const MAX_WORKER_JOB_BYTES: usize = 80;
+
+/// Ceiling on a worker's prompt. The orchestrator writes these by hand, so a
+/// prompt near this size is almost certainly a paste gone wrong; refused
+/// rather than truncated, because an instruction cut off halfway is a
+/// different instruction.
+const MAX_WORKER_PROMPT_BYTES: usize = 64 * 1024;
+
+fn worker_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Worker, StoreError> {
+    let status_raw: String = row.try_get("status")?;
+    let opt_ts = |col: &'static str| -> Result<Option<DateTime<Utc>>, StoreError> {
+        row.try_get::<Option<String>, _>(col)?
+            .map(|s| parse_ts(&s, col))
+            .transpose()
+    };
+    Ok(Worker {
+        id: WorkerId::from_raw(row.try_get::<String, _>("id")?),
+        job: row.try_get("job")?,
+        prompt: row.try_get("prompt")?,
+        status: WorkerStatus::from_str(&status_raw).ok_or(StoreError::BadEnum {
+            column: "status",
+            value: status_raw,
+        })?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+        started_at: opt_ts("started_at")?,
+        completed_at: opt_ts("completed_at")?,
+        exit_reason: row.try_get("exit_reason")?,
+        report: row.try_get("report")?,
     })
 }
 

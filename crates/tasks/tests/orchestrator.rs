@@ -53,6 +53,7 @@ fn orchestrator(store: Arc<Store>, stub: &Path, tmp: &Path) -> Orchestrator {
         OrchestratorConfig {
             command: stub.display().to_string(),
             timeout: Duration::from_secs(30),
+            worker_timeout: Duration::from_secs(300),
             workdir: tmp.join("orch-workdir"),
             workdir_is_checkout: false,
             target_dir: None,
@@ -622,6 +623,7 @@ async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expan
         OrchestratorConfig {
             command: stub.display().to_string(),
             timeout: Duration::from_secs(30),
+            worker_timeout: Duration::from_secs(300),
             workdir: workdir.clone(),
             workdir_is_checkout: false,
             target_dir: None,
@@ -1701,6 +1703,7 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
     let base = OrchestratorConfig {
         command: stub.display().to_string(),
         timeout: Duration::from_secs(900),
+        worker_timeout: Duration::from_secs(3600),
         workdir: tmp.path().join("orch-workdir"),
         workdir_is_checkout: true,
         target_dir: Some(target_dir.clone()),
