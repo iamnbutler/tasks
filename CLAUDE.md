@@ -1022,9 +1022,58 @@ implementation.
   aftermath: `rejected` is terminal and there is no endpoint that returns a task
   from it, so the two tasks that died that night are still there. Whether
   `rejected` should be reversible, and by whom, is its own decision.
+- **The substrate under all of it gets a hold too, and the probe is the tool
+  rather than the refusal.** On 2026-08-19 the container runtime was not
+  running — `apiserver is not running and not registered with launchd`, so it
+  had not survived a reboot — and dispatch resumed anyway: in one play window
+  **3 builds failed** on `allocate failed: runtime error: transport closed
+  before Ready` and **12 tasks were charged one of their three dispatch
+  attempts** and left stranded (#1017). vm-pool itself was healthy and current;
+  it accepted every allocate and only then discovered it could not start a
+  container. At twelve a window that is three windows from rejecting the whole
+  queue, and the asymmetry the GitHub hold rests on applies unchanged: a false
+  hold costs a tick of latency, a false dispatch costs one of three attempts on
+  work that did nothing wrong. `pool_health` is the closest existing shape and
+  the **wrong subject** — it asks whether vm-pool has a *slot*, and a pool with
+  every slot free answers cheerfully while nothing can be started at all. So
+  `runtime_health::RuntimeHealth` is the sixth standing hold, and the decision
+  worth writing down is that it is **not** a widening of #930's strike waiver.
+  #930 waives `Capacity` alone and keeps `Runtime` charged, on the argument
+  that "a reference that does not resolve refuses identically forever" — right
+  about `Image`, and beside the point here, because with the probe in place the
+  failing allocate **never happens**. Today's outage would have cost *zero*
+  attempts rather than twelve, which no strike waiver could deliver: a waived
+  strike still spends an allocation, a pool slot and a teardown per task,
+  forever. `FailureClass::for_service_error` is therefore untouched. **The
+  evidence is `container system status` and deliberately not the refused
+  allocation** the dispatchers already collect: a refusal-driven record's
+  natural clearing signal is a *successful allocation*, which is the one thing a
+  hold prevents — the same circle that keeps `pool_health` on a `status` round
+  trip. Asking the tool has two consequences and the second is the prize: it
+  needs **no protocol change and no vm-pool restart** (a field on `pool_status`
+  was the other honest design and is inert until the pool reporting it is
+  restarted, which during an outage a *reboot* caused is exactly when nobody
+  has restarted anything), and it observes the fault **before the first
+  allocate**, so an outage costs a log line rather than a strike — a record
+  written from refusals can only ever be one task late. It reuses
+  `doctor::probe_within`, the same one-implementation-with-a-parameter move as
+  the broker's. The three rules again, and the first is doing real work:
+  **absence of evidence never holds** — a host with no `container` on `PATH` is
+  not a broken host, since vm-pool can be built on `SupervisorRuntime`, the test
+  harnesses are, and a Linux checkout has no apple/container at all, so
+  `Probe::Missing` touches nothing; a probe that **timed out** touches nothing
+  either, because it is not an answer and `doctor` reads the same outcome as a
+  `Skip`. **Only a zero exit clears one**, and **a hold nobody refreshes
+  expires**. It is ordered **last** among the six, because it is the most
+  expensive question asked — a subprocess rather than a socket round trip — so
+  everything cheaper answers first. The other half of #1017, the 12 tasks
+  stranded in `scouting` because `Scout::dispatch` claims before it allocates,
+  is #967's unwind and already landed; the two compose exactly as that issue
+  warned they must, since without a hold the fix that returns tasks to `Queued`
+  is a retry loop at `DISPATCH_TICK`.
 - **The scout dispatcher asks *what is next* and *may I start it* in one call,
   because a call site is not pinnable by a test of its predicate.** `top_up`
-  reads the five dispatch holds twice — once before its loop for cost, and once
+  reads the six dispatch holds twice — once before its loop for cost, and once
   **per scout**, since each iteration starts a VM and a pause landing mid-pass
   must stop the next one rather than merely the next pass (#948). That
   per-scout read was correct and invisible: deleting it left the whole suite

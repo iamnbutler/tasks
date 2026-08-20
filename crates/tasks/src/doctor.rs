@@ -306,7 +306,7 @@ impl fmt::Display for Report {
 /// that hung is a `Skip` — we did not learn the answer, and saying we did
 /// would be the one thing a diagnostic must not do.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Probe {
+pub enum Probe {
     /// It ran. `ok` is the exit status; `text` is the first useful line.
     Ran { ok: bool, text: String },
     /// There is no such executable on `PATH`.
@@ -320,6 +320,11 @@ pub(crate) enum Probe {
 impl Probe {
     fn succeeded(&self) -> bool {
         matches!(self, Probe::Ran { ok: true, .. })
+    }
+
+    /// The first useful line, or the failure rendered — prose for a reader.
+    pub fn describe(&self) -> &str {
+        self.text()
     }
 
     fn text(&self) -> &str {
@@ -356,7 +361,14 @@ async fn probe(program: &str, args: &[&str]) -> Probe {
     probe_within(program, args, PROBE_TIMEOUT).await
 }
 
-async fn probe_within(program: &str, args: &[&str], budget: Duration) -> Probe {
+/// Run `program args…`, bounded by the caller's patience, and keep only the
+/// first line.
+///
+/// `pub` because [`crate::runtime_health`] asks the same question of the same
+/// tool on the dispatch path, with a tighter budget — one implementation with
+/// a parameter, for the reason `doctor` reads `ImageFreshness` rather than
+/// judging freshness a second time.
+pub async fn probe_within(program: &str, args: &[&str], budget: Duration) -> Probe {
     let run = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -1226,7 +1238,7 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
     });
 
     // Each hold already names its own discharge, so they are rendered rather
-    // than summarized. Absence of all four is the ordinary case.
+    // than summarized. Absence of all five is the ordinary case.
     let mut holds = Vec::new();
     if let Some(github) = &status.github {
         holds.push(format!(
@@ -1246,6 +1258,12 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
             broker.address, broker.since, broker.error
         ));
     }
+    if let Some(runtime) = &status.runtime {
+        holds.push(format!(
+            "container runtime down since {}: {}",
+            runtime.since, runtime.error
+        ));
+    }
     section.push(match holds.is_empty() {
         true => Check::ok("dispatch holds", "none"),
         false => Check::warn(
@@ -1253,8 +1271,10 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
             holds.join(" | "),
             "each hold clears on its own terms: a GitHub hold on the next successful \
              poll, an update hold on `make restart` / `make images`, a pool hold on the \
-             next VM handed back, a broker hold on the next probe that gets a 401 (the \
-             `broker reachable` check above is the same question, asked here directly)",
+             next VM handed back, a broker hold on the next probe that gets a 401, a \
+             runtime hold on `container system start` (the `broker reachable` and \
+             `container services` checks above are the same two questions, asked here \
+             directly)",
         ),
     });
     section

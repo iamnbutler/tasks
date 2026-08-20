@@ -551,6 +551,32 @@ pub struct ServerStatus {
     /// reload-skew reason as the fields above.
     #[serde(default)]
     pub broker: Option<BrokerHold>,
+    /// Set for as long as scout and build dispatch is being held because this
+    /// host's container runtime is not running. `#[serde(default)]` for the
+    /// same reload-skew reason as the fields above.
+    #[serde(default)]
+    pub runtime: Option<RuntimeHold>,
+}
+
+/// Why the pipeline is idle when the container runtime is not running.
+///
+/// Nothing here can start a VM, so work dispatched into it fails at the
+/// allocate and is charged an attempt for it — 3 builds and 12 tasks in one
+/// play window on 2026-08-19, after a reboot left apple/container's apiserver
+/// unregistered with launchd (#1017). Holding costs nothing, and the discharge
+/// is one command: `container system start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHold {
+    /// The first failed probe in this run — "down since", which later probes
+    /// do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent failed probe.
+    pub last_seen: DateTime<Utc>,
+    /// How many probes have failed since `since`.
+    pub probes: u32,
+    /// What `container system status` said — the one thing that distinguishes
+    /// a stopped service from a broken install.
+    pub error: String,
 }
 
 /// Why the pipeline is idle when the credential broker is not answering.

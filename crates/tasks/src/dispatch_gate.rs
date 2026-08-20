@@ -1,7 +1,7 @@
 //! What the scout dispatcher may start, and whether it may start it — asked
 //! together, so the second question cannot be dropped from the first (#973).
 //!
-//! [`top_up`](crate::run::top_up) reads the five standing dispatch holds twice:
+//! [`top_up`](crate::run::top_up) reads the six standing dispatch holds twice:
 //! once before its loop, for cost, and once **per scout**, because each
 //! iteration starts a VM and a pause landing mid-pass must stop the next one
 //! rather than merely the next pass (#948). That per-scout read is correct and
@@ -42,7 +42,7 @@ use crate::store::{Store, StoreError};
 ///
 /// The fields are private and there is exactly one constructor — inside
 /// [`next_scout`], after the hold read — so holding one of these **is** the
-/// evidence that the five holds were re-read since the queue was scanned. That
+/// evidence that the six holds were re-read since the queue was scanned. That
 /// is the whole mechanism: the caller cannot assemble one, and cannot reach the
 /// pair any other way, because [`next_dispatchable`] does not leave this module.
 pub struct Cleared {
@@ -92,12 +92,14 @@ pub enum NextScout {
 /// and that window reopens. It is also the last thing before the caller's
 /// `spawn`, with nothing awaited in between — which is what makes it a
 /// per-dispatch read rather than a per-pass one.
+#[expect(clippy::too_many_arguments, reason = "one argument per standing hold")]
 pub async fn next_scout(
     store: &Store,
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
     broker_health: &crate::broker_health::BrokerHealth,
+    runtime_health: &crate::runtime_health::RuntimeHealth,
     handle: &ClientHandle<TasksProtocol>,
     skip: &HashSet<TaskId>,
 ) -> Result<NextScout, StoreError> {
@@ -111,16 +113,26 @@ pub async fn next_scout(
     // `a_hold_that_lands_after_the_pass_began_stops_the_next_scout` kills;
     // hoisting it above the scan is the one
     // `the_holds_are_read_after_the_scan_not_before_it` kills.
-    if dispatch_held(store, health, updates, pool_health, broker_health, handle).await? {
+    if dispatch_held(
+        store,
+        health,
+        updates,
+        pool_health,
+        broker_health,
+        runtime_health,
+        handle,
+    )
+    .await?
+    {
         return Ok(NextScout::Held);
     }
 
     Ok(NextScout::Start(Cleared { task, project }))
 }
 
-/// Whether new scouts must wait: the five standing reasons, asked together.
+/// Whether new scouts must wait: the six standing reasons, asked together.
 ///
-/// One function rather than five inline checks so a sixth reason cannot be
+/// One function rather than six inline checks so a seventh reason cannot be
 /// added at one call site and forgotten at another — [`crate::run::top_up`]
 /// asks once before its loop (for cost), [`next_scout`] once per dispatch (for
 /// freshness), and [`crate::run::build_loop`] once per tick ahead of its claim.
@@ -129,8 +141,9 @@ pub async fn next_scout(
 ///
 /// Silent by design, like the checks it replaces: a pause is the human's own
 /// act, the GitHub edge is announced by the poller, the update edge by the
-/// watch, and the pool and broker edges by [`announce_pool`] and
-/// [`announce_broker`], and `/status` answers for whoever asks later. A 500 ms loop that logged its refusals is what trains a
+/// watch, and the pool, broker and runtime edges by [`announce_pool`],
+/// [`announce_broker`] and [`announce_runtime`], and `/status` answers for
+/// whoever asks later. A 500 ms loop that logged its refusals is what trains a
 /// reader to ignore them.
 ///
 /// The serial build lane ([`crate::run::build_loop`]) calls this too, since
@@ -142,13 +155,15 @@ pub async fn next_scout(
 /// argument does not cover is the one this function exists for: with two
 /// implementations, a *fifth* reason reaches scouts and not builds unless
 /// somebody remembers both. There is now one — and the fifth reason arrived
-/// (#1006), reaching both without either call site being touched.
+/// (#1006), then the sixth (#1017), each reaching both without either call
+/// site being touched.
 pub async fn dispatch_held(
     store: &Store,
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
     broker_health: &crate::broker_health::BrokerHealth,
+    runtime_health: &crate::runtime_health::RuntimeHealth,
     handle: &ClientHandle<TasksProtocol>,
 ) -> Result<bool, StoreError> {
     if store.get_mode().await? != Mode::Play {
@@ -187,6 +202,15 @@ pub async fn dispatch_held(
     // against the broker and not against github.com. Dispatching into that is
     // not a delay, it is a `rejected` task in under a minute (#1006).
     if broker_hold(broker_health, store).await {
+        return Ok(true);
+    }
+
+    // And the substrate under all of it. vm-pool can be healthy, current and
+    // holding every slot free while no container can be started at all — it
+    // accepts the allocate and only then discovers it (#1017). Last because it
+    // is the most expensive question here: a subprocess rather than a socket
+    // round trip, so everything cheaper answers first.
+    if runtime_hold(runtime_health, store).await {
         return Ok(true);
     }
 
@@ -313,6 +337,65 @@ async fn announce_broker(store: &Store, transition: crate::broker_health::Transi
         .await
     {
         warn!(error = %e, "could not record the broker hold on the feed");
+    }
+}
+
+/// Refresh the runtime record if a probe is due, then read the hold.
+///
+/// The probe is `container system status` and deliberately **not** the refused
+/// allocation the dispatchers already collect: a refusal-driven record's
+/// natural clearing signal is a successful allocation, which is the one thing
+/// a hold prevents — the same circle [`pool_hold`] avoids. Asking the tool
+/// directly also catches the fault *before* the first allocate, so an outage
+/// costs a log line rather than a strike.
+///
+/// Private, for the reason [`pool_hold`] and [`broker_hold`] are.
+async fn runtime_hold(
+    runtime_health: &crate::runtime_health::RuntimeHealth,
+    store: &Store,
+) -> bool {
+    if runtime_health.probe_due(chrono::Utc::now()) {
+        let probe = runtime_health.probe().await;
+        let transition = runtime_health.observe(&probe, chrono::Utc::now());
+        announce_runtime(store, transition).await;
+    }
+    runtime_health.hold(chrono::Utc::now()).is_some()
+}
+
+/// Say once, per edge, that the container runtime stopped or started — in the
+/// log and on the event feed.
+///
+/// Driven by the [`Transition`](crate::runtime_health::Transition) taken under
+/// the probe claim, never by the `hold` predicate, for the reason
+/// [`announce_pool`] states.
+async fn announce_runtime(store: &Store, transition: crate::runtime_health::Transition) {
+    use crate::runtime_health::Transition;
+    let message = match transition {
+        Transition::Unchanged => return,
+        Transition::Stopped(run) => {
+            let message = run.describe();
+            warn!("{message}");
+            message
+        }
+        Transition::Started(run) => {
+            let message = format!(
+                "the container runtime is running again (it was down for {}s, {} \
+                 probe(s)); dispatch resumes",
+                (run.last - run.since).num_seconds(),
+                run.probes
+            );
+            tracing::info!("{message}");
+            message
+        }
+    };
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: DISPATCHER.into(),
+            message,
+        })
+        .await
+    {
+        warn!(error = %e, "could not record the container runtime hold on the feed");
     }
 }
 
@@ -498,6 +581,7 @@ mod tests {
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
         let broker = crate::broker_health::BrokerHealth::unprobed();
+        let runtime = crate::runtime_health::RuntimeHealth::unprobed();
         let handle = client.handle();
 
         let project = project();
@@ -519,6 +603,7 @@ mod tests {
             &updates,
             &pool_health,
             &broker,
+            &runtime,
             &handle,
             &skip,
         )
@@ -541,6 +626,7 @@ mod tests {
                     &updates,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -564,6 +650,7 @@ mod tests {
                     &updates,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -586,6 +673,7 @@ mod tests {
                     &updates,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -617,6 +705,7 @@ mod tests {
                     &updates,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -640,6 +729,7 @@ mod tests {
                     &released,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -658,6 +748,7 @@ mod tests {
             &released,
             &pool_health,
             &broker,
+            &runtime,
             &handle,
             &skip,
         )
@@ -686,6 +777,7 @@ mod tests {
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
         let broker = crate::broker_health::BrokerHealth::unprobed();
+        let runtime = crate::runtime_health::RuntimeHealth::unprobed();
         let handle = client.handle();
 
         // Every hold live at once, so no single one of them can be the reason
@@ -702,9 +794,17 @@ mod tests {
         .await;
         pool_health.observe(&full(), Utc::now());
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            dispatch_held(
+                &store,
+                &health,
+                &updates,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "the four holds really are in force"
         );
 
@@ -722,6 +822,7 @@ mod tests {
                     &updates,
                     &pool_health,
                     &broker,
+                    &runtime,
                     &handle,
                     &skip
                 )
@@ -751,29 +852,54 @@ mod tests {
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
         let broker = crate::broker_health::BrokerHealth::unprobed();
+        let runtime = crate::runtime_health::RuntimeHealth::unprobed();
         let handle = client.handle();
 
         store.set_mode(Mode::Play).await.unwrap();
         assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            !dispatch_held(
+                &store,
+                &health,
+                &updates,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "playing, GitHub answering, nothing pending: dispatch is free"
         );
 
         for mode in [Mode::Pause, Mode::Stop] {
             store.set_mode(mode).await.unwrap();
             assert!(
-                dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                    .await
-                    .unwrap(),
+                dispatch_held(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &runtime,
+                    &handle,
+                )
+                .await
+                .unwrap(),
                 "{mode:?} must be seen by the very next read"
             );
             store.set_mode(Mode::Play).await.unwrap();
             assert!(
-                !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                    .await
-                    .unwrap(),
+                !dispatch_held(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &runtime,
+                    &handle,
+                )
+                .await
+                .unwrap(),
                 "and so must the play that follows it"
             );
         }
@@ -781,16 +907,32 @@ mod tests {
         let now = Utc::now();
         health.observe(&unavailable(), now);
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            dispatch_held(
+                &store,
+                &health,
+                &updates,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "an outage that started mid-pass holds the next dispatch"
         );
         health.observe(&Ok::<(), GhError>(()), now);
         assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            !dispatch_held(
+                &store,
+                &health,
+                &updates,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "and a success releases it just as promptly"
         );
 
@@ -805,16 +947,32 @@ mod tests {
         )
         .await;
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            dispatch_held(
+                &store,
+                &health,
+                &updates,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "a stale image observed since boot holds new scouts"
         );
         let off = crate::updates::UpdateWatch::at_boot(false);
         assert!(
-            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            !dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "TASKS_UPDATE_HOLD=off keeps the report and drops the gate"
         );
 
@@ -822,16 +980,32 @@ mod tests {
         // next read sees.
         pool_health.observe(&full(), Utc::now());
         assert!(
-            dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "a full pool holds new scouts (#967)"
         );
         pool_health.observe(&has_room(), Utc::now());
         assert!(
-            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            !dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "and a slot coming back releases it"
         );
 
@@ -844,17 +1018,77 @@ mod tests {
             Utc::now(),
         );
         assert!(
-            dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "a broker that is not answering holds new scouts (#1006)"
         );
         broker.observe(&crate::doctor::BrokerProbe::DemandedLease, Utc::now());
         assert!(
-            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
-                .await
-                .unwrap(),
+            !dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
             "and a 401 — which is what a healthy broker answers — releases it"
+        );
+
+        // And the substrate under all of it — the sixth reason (#1017).
+        runtime.observe(
+            &crate::doctor::Probe::Ran {
+                ok: false,
+                text: "apiserver is not running and not registered with launchd".into(),
+            },
+            Utc::now(),
+        );
+        assert!(
+            dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
+            "a container runtime that is not running holds new scouts (#1017)"
+        );
+        runtime.observe(
+            &crate::doctor::Probe::Ran {
+                ok: true,
+                text: "apiserver is running".into(),
+            },
+            Utc::now(),
+        );
+        assert!(
+            !dispatch_held(
+                &store,
+                &health,
+                &off,
+                &pool_health,
+                &broker,
+                &runtime,
+                &handle,
+            )
+            .await
+            .unwrap(),
+            "and a zero exit releases it"
         );
     }
 

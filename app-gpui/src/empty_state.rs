@@ -92,7 +92,7 @@ impl Reachability {
     }
 }
 
-/// Which of the four dispatch holds this is.
+/// Which of the five dispatch holds this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind {
     /// An upgrade is half-applied — `make restart` / `make images`.
@@ -101,6 +101,8 @@ pub enum HoldKind {
     Pool,
     /// The credential broker is not answering.
     Broker,
+    /// This host's container runtime is not running.
+    Runtime,
     /// GitHub is not answering.
     GitHub,
 }
@@ -115,14 +117,15 @@ pub struct Hold {
     ///
     /// `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate, so a
     /// non-binding hold must never be *the reason* nothing is starting — it
-    /// is still said, as a note. The other three have no such switch.
+    /// is still said, as a note. The other four have no such switch.
     pub binding: bool,
 }
 
-/// The four holds, in the order of who can discharge them: the operator's
-/// own two commands first, then a pool that clears when a VM comes back, then
-/// the broker — which is the operator's again, since it is this server's own
-/// listener — and then GitHub, which nobody here can hurry.
+/// The five holds, in the order of who can discharge them: the operator's own
+/// commands first — `make restart` / `make images`, then `container system
+/// start` — then a pool that clears when a VM comes back, then the broker
+/// (this server's own listener), and last GitHub, which nobody here can
+/// hurry.
 pub fn observe(status: Option<&ServerStatus>) -> Vec<Hold> {
     let Some(status) = status else {
         return Vec::new();
@@ -147,6 +150,17 @@ pub fn observe(status: Option<&ServerStatus>) -> Vec<Hold> {
                 )
             },
             binding: update.enforced,
+        });
+    }
+    if let Some(runtime) = &status.runtime {
+        holds.push(Hold {
+            kind: HoldKind::Runtime,
+            sentence: format!(
+                "The container runtime is not running ({}), so nothing here can \
+                 start a VM at all. Run `container system start`.",
+                runtime.error
+            ),
+            binding: true,
         });
     }
     if let Some(pool) = &status.pool {
@@ -708,6 +722,9 @@ mod tests {
                 HoldKind::Broker => {
                     "the credential broker is not answering; it clears on the next 401.".into()
                 }
+                HoldKind::Runtime => {
+                    "the container runtime is not running: run `container system start`.".into()
+                }
                 HoldKind::GitHub => "GitHub is not answering; it clears on the next poll.".into(),
             },
             binding,
@@ -953,15 +970,20 @@ mod tests {
     fn every_hold_sentence_names_its_own_discharge() {
         let status = status_with_every_hold(true);
         let holds = observe(Some(&status));
-        assert_eq!(holds.len(), 4);
+        assert_eq!(holds.len(), 5);
         assert!(holds[0].sentence.contains("make restart"));
-        assert!(holds[1].sentence.contains("VM_POOL_MAX_VMS"));
-        assert!(holds[2].sentence.contains("clears on the first probe"));
-        assert!(holds[3].sentence.contains("clears on the first poll"));
+        assert!(holds[1].sentence.contains("container system start"));
+        assert!(holds[2].sentence.contains("VM_POOL_MAX_VMS"));
+        assert!(holds[3].sentence.contains("clears on the first probe"));
+        assert!(holds[4].sentence.contains("clears on the first poll"));
         // The broker hold names its address, because that is the thing the
         // reader checks — and because it is deliberately the advertised one
         // and not loopback (#1006).
-        assert!(holds[2].sentence.contains("192.168.64.1:4801"));
+        assert!(holds[3].sentence.contains("192.168.64.1:4801"));
+        // And the runtime hold quotes what `container system status` said: a
+        // stopped service and a broken install read identically once
+        // summarised (#1017).
+        assert!(holds[1].sentence.contains("not registered with launchd"));
     }
 
     #[test]
@@ -975,6 +997,7 @@ mod tests {
             kinds,
             vec![
                 HoldKind::Update,
+                HoldKind::Runtime,
                 HoldKind::Pool,
                 HoldKind::Broker,
                 HoldKind::GitHub
@@ -988,7 +1011,7 @@ mod tests {
         let holds = observe(Some(&status));
         assert!(!holds[0].binding);
         assert!(holds[0].sentence.contains("TASKS_UPDATE_HOLD"));
-        assert!(holds[1].binding && holds[2].binding && holds[3].binding);
+        assert!(holds[1..].iter().all(|hold| hold.binding));
     }
 
     /// Nothing observed is not a clean bill of health — but it is also not a
@@ -1000,7 +1023,9 @@ mod tests {
     }
 
     fn status_with_every_hold(enforced: bool) -> ServerStatus {
-        use tasks_client::api::http::{BrokerHold, GitHubHold, InFlight, PoolHold, UpdatePending};
+        use tasks_client::api::http::{
+            BrokerHold, GitHubHold, InFlight, PoolHold, RuntimeHold, UpdatePending,
+        };
         ServerStatus {
             pid: 1,
             started_at: Utc::now(),
@@ -1023,6 +1048,12 @@ mod tests {
                 last_seen: Utc::now(),
                 observations: 4,
                 total: 6,
+            }),
+            runtime: Some(RuntimeHold {
+                since: Utc::now(),
+                last_seen: Utc::now(),
+                probes: 2,
+                error: "apiserver is not running and not registered with launchd".into(),
             }),
             broker: Some(BrokerHold {
                 since: Utc::now(),

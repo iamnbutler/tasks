@@ -44,6 +44,9 @@ pub mod reattach;
 pub mod redact;
 pub mod reload;
 pub mod run;
+/// Whether this host can start a container at all, and whether dispatch
+/// should wait for it — the fifth standing hold (#1017).
+pub mod runtime_health;
 pub mod scout;
 /// Sealed at-rest storage for the two upstream keys, and the live handle the
 /// server reads them through (#971).

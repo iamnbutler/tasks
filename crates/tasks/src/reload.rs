@@ -1367,6 +1367,7 @@ pub fn render_status(
             out.push_str(&render_update_pending(status));
             out.push_str(&render_pool_hold(status, now));
             out.push_str(&render_broker_hold(status, now));
+            out.push_str(&render_runtime_hold(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -1463,6 +1464,28 @@ pub fn render_broker_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
          dispatch waits for it; every clone inside a VM is redeemed there, so work \
          started now would die at the clone\n         {}\n",
         hold.address,
+        humanize(now - hold.since),
+        hold.probes,
+        humanize(now - hold.last_seen),
+        hold.error
+    )
+}
+
+/// Why the pipeline is idle, when the reason is that this host's container
+/// runtime is not running.
+///
+/// Silent with no hold, like the three above it. It quotes what `container
+/// system status` said rather than summarising it, because a stopped service
+/// and a broken install read identically once summarised — and it names the
+/// discharge, which is one command (#1017).
+pub fn render_runtime_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(hold) = &status.runtime else {
+        return String::new();
+    };
+    format!(
+        "runtime  the container runtime has been down for {} ({} probe(s), last {} ago) \
+         — nothing here can start a VM, so scout and build dispatch waits; run \
+         `container system start`\n         {}\n",
         humanize(now - hold.since),
         hold.probes,
         humanize(now - hold.last_seen),
@@ -1628,6 +1651,7 @@ mod tests {
             update: None,
             pool: None,
             broker: None,
+            runtime: None,
         }
     }
 

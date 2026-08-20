@@ -883,6 +883,11 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         config.broker.advertise_host.clone(),
         config.broker.port,
     ));
+    // And the fifth: the substrate under all of it. vm-pool can be healthy,
+    // current and holding every slot free while this host cannot start a
+    // container at all — it accepts the allocate and only then finds out
+    // (#1017).
+    let runtime_health = Arc::new(crate::runtime_health::RuntimeHealth::new());
 
     let poll = tokio::spawn(poll_loop(
         store.clone(),
@@ -898,6 +903,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         updates.clone(),
         pool_health.clone(),
         broker_health.clone(),
+        runtime_health.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
@@ -908,6 +914,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         updates.clone(),
         pool_health.clone(),
         broker_health.clone(),
+        runtime_health.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -960,6 +967,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             updates: Some(updates.clone()),
             pool_health: Some(pool_health.clone()),
             broker_health: Some(broker_health.clone()),
+            runtime_health: Some(runtime_health.clone()),
             viewer: Default::default(),
         },
         async move {
@@ -2162,6 +2170,7 @@ pub async fn dispatch_loop(
     updates: Arc<crate::updates::UpdateWatch>,
     pool_health: Arc<crate::pool_health::PoolHealth>,
     broker_health: Arc<crate::broker_health::BrokerHealth>,
+    runtime_health: Arc<crate::runtime_health::RuntimeHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -2205,6 +2214,7 @@ pub async fn dispatch_loop(
             &updates,
             &pool_health,
             &broker_health,
+            &runtime_health,
             client,
             &mut shutdown,
         )
@@ -2646,6 +2656,7 @@ async fn dispatch_connected(
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
     broker_health: &crate::broker_health::BrokerHealth,
+    runtime_health: &crate::runtime_health::RuntimeHealth,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -2674,6 +2685,7 @@ async fn dispatch_connected(
                 updates,
                 pool_health,
                 broker_health,
+                runtime_health,
                 &handle,
                 &scout,
                 &mut in_flight,
@@ -2729,6 +2741,7 @@ async fn top_up(
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
     broker_health: &crate::broker_health::BrokerHealth,
+    runtime_health: &crate::runtime_health::RuntimeHealth,
     handle: &ClientHandle<TasksProtocol>,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
@@ -2737,8 +2750,16 @@ async fn top_up(
     // Cheap pre-check, and only that: the per-dispatch read inside
     // `next_scout` is the one that decides. A held dispatcher must not walk the
     // whole task table every `DISPATCH_TICK` to reach the same answer.
-    if dispatch_gate::dispatch_held(store, health, updates, pool_health, broker_health, handle)
-        .await?
+    if dispatch_gate::dispatch_held(
+        store,
+        health,
+        updates,
+        pool_health,
+        broker_health,
+        runtime_health,
+        handle,
+    )
+    .await?
     {
         return Ok(());
     }
@@ -2756,6 +2777,7 @@ async fn top_up(
             updates,
             pool_health,
             broker_health,
+            runtime_health,
             handle,
             in_flight_ids,
         )
@@ -3250,6 +3272,7 @@ pub async fn build_loop(
     updates: Arc<crate::updates::UpdateWatch>,
     pool_health: Arc<crate::pool_health::PoolHealth>,
     broker_health: Arc<crate::broker_health::BrokerHealth>,
+    runtime_health: Arc<crate::runtime_health::RuntimeHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
@@ -3325,6 +3348,7 @@ pub async fn build_loop(
                     &updates,
                     &pool_health,
                     &broker_health,
+                    &runtime_health,
                     &handle,
                 )
                 .await

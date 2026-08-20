@@ -190,6 +190,9 @@ pub struct Services {
     /// Absent for the same reason as `pool_health`, and written the same way —
     /// only ever by a gate, from a probe it claimed.
     pub broker_health: Option<Arc<crate::broker_health::BrokerHealth>>,
+    /// The container-runtime record the two dispatchers write and read.
+    /// Absent on the same terms as the two above it.
+    pub runtime_health: Option<Arc<crate::runtime_health::RuntimeHealth>>,
     /// Who the server's own GitHub credential is, remembered for a while.
     ///
     /// **The only non-`Option` field here**, and deliberately: every other
@@ -246,6 +249,12 @@ impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
 impl FromRef<AppState> for Option<Arc<crate::broker_health::BrokerHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.broker_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::runtime_health::RuntimeHealth>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.runtime_health.clone()
     }
 }
 
@@ -3505,6 +3514,7 @@ async fn get_status(
     State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
     State(pool_health): State<Option<Arc<crate::pool_health::PoolHealth>>>,
     State(broker_health): State<Option<Arc<crate::broker_health::BrokerHealth>>>,
+    State(runtime_health): State<Option<Arc<crate::runtime_health::RuntimeHealth>>>,
 ) -> ApiResult<Json<ServerStatus>> {
     // Through the same watch the dispatchers consult, so `/status` cannot
     // claim a hold they are not honouring.
@@ -3548,6 +3558,11 @@ async fn get_status(
         // address, and a hung broker would hang `/status` with it. `reload`
         // uses this route as its liveness probe.
         broker: broker_health
+            .and_then(|health| health.hold(Utc::now()))
+            .map(|run| run.to_hold()),
+        // The fifth, and emphatically not probed here either: that probe is a
+        // subprocess.
+        runtime: runtime_health
             .and_then(|health| health.hold(Utc::now()))
             .map(|run| run.to_hold()),
     }))

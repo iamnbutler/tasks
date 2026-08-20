@@ -33,6 +33,7 @@ use tasks::models::{
 };
 use tasks::pool_health::PoolHealth;
 use tasks::run::{self, Config, GitHubWatch, InFlight};
+use tasks::runtime_health::RuntimeHealth;
 use tasks::store::Store;
 use tasks::updates::UpdateWatch;
 
@@ -64,6 +65,15 @@ fn test_pool_health() -> Arc<PoolHealth> {
 /// The hold itself is covered in `tasks::broker_health`'s own tests.
 fn test_broker_health() -> Arc<BrokerHealth> {
     Arc::new(BrokerHealth::unprobed())
+}
+
+/// A container-runtime record that never probes, for the same reason — and
+/// here it is stronger still: that probe reads a real tool on the machine
+/// running the suite, so a developer whose container services happen to be
+/// stopped would otherwise watch every dispatch test fail for a reason none of
+/// them is about, while CI never reproduced it.
+fn test_runtime_health() -> Arc<RuntimeHealth> {
+    Arc::new(RuntimeHealth::unprobed())
 }
 
 // --- GitHub poll loop ---
@@ -312,6 +322,7 @@ async fn a_github_hold_starts_no_scout_and_charges_nothing() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -389,6 +400,7 @@ async fn a_broker_hold_starts_no_scout_and_charges_nothing() {
         test_update_watch(),
         test_pool_health(),
         broker.clone(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -408,6 +420,93 @@ async fn a_broker_hold_starts_no_scout_and_charges_nothing() {
     // A 401 is what a healthy broker answers an unauthenticated request, and
     // it is the only thing that clears the hold.
     broker.observe(&tasks::doctor::BrokerProbe::DemandedLease, Utc::now());
+    let s = store.clone();
+    wait_until(Duration::from_secs(60), || {
+        let s = s.clone();
+        async move { s.list_specs().await.unwrap().len() == 1 }
+    })
+    .await;
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("dispatch loop exits on shutdown")
+        .unwrap();
+
+    assert_eq!(dispatch_order(&store).await, vec![task.id.clone()]);
+    assert_eq!(
+        store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_attempts,
+        0
+    );
+}
+
+/// One layer further down again: vm-pool is healthy and current, every slot is
+/// free, and this host cannot start a container at all — which is what
+/// happened on 2026-08-19, when a reboot left apple/container's apiserver
+/// unregistered with launchd. The pool accepted every allocate and only then
+/// found out, so one play window failed 3 builds and charged 12 tasks one of
+/// their three dispatch attempts (#1017).
+///
+/// The probe is `container system status`, deliberately not the refused
+/// allocation: a refusal-driven record's clearing signal would be a successful
+/// allocation, which is the one thing a hold prevents — and asking the tool
+/// directly catches the fault *before* the first allocate, so the outage costs
+/// no attempt at all rather than one.
+#[tokio::test]
+async fn a_stopped_container_runtime_starts_no_scout_and_charges_nothing() {
+    let (_tmp, store, config, _service) = dispatch_harness(1).await;
+    let project = insert_project(&store).await;
+    let task = insert_task(&store, &project, 1, "waits for the runtime").await;
+    store.set_mode(Mode::Play).await.unwrap();
+
+    let runtime = Arc::new(RuntimeHealth::unprobed());
+    runtime.observe(
+        &tasks::doctor::Probe::Ran {
+            ok: false,
+            text: "apiserver is not running and not registered with launchd".into(),
+        },
+        Utc::now(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(run::dispatch_loop(
+        store.clone(),
+        config,
+        InFlight::default(),
+        Arc::new(GitHubHealth::default()),
+        test_update_watch(),
+        test_pool_health(),
+        test_broker_health(),
+        runtime.clone(),
+        shutdown_rx,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "a held dispatcher starts nothing"
+    );
+    let held = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(held.state, TaskState::Queued, "and moves nothing");
+    assert_eq!(
+        held.dispatch_attempts, 0,
+        "holding costs the task no attempt — twelve of them were charged one \
+         each for this, in a single window"
+    );
+
+    // A zero exit is the only thing that clears it.
+    runtime.observe(
+        &tasks::doctor::Probe::Ran {
+            ok: true,
+            text: "apiserver is running".into(),
+        },
+        Utc::now(),
+    );
     let s = store.clone();
     wait_until(Duration::from_secs(60), || {
         let s = s.clone();
@@ -464,6 +563,7 @@ async fn a_github_hold_never_claims_a_build() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -536,6 +636,7 @@ async fn a_full_pool_holds_scout_dispatch_and_releases_it_when_a_slot_returns() 
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -652,6 +753,7 @@ async fn a_full_pool_never_claims_a_build() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -1353,6 +1455,7 @@ async fn dispatch_loop_survives_a_missing_vm_pool() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -1560,6 +1663,7 @@ async fn dispatch_loop_follows_queue_order_and_skips_closed_issues() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -1620,6 +1724,7 @@ async fn pause_blocks_new_dispatches() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -1716,6 +1821,7 @@ async fn an_agent_that_concluded_with_nothing_still_burns_its_three() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1801,6 +1907,7 @@ async fn an_infrastructure_death_never_rejects_the_task() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -1885,6 +1992,7 @@ async fn a_restart_resumes_the_persisted_attempt_count() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
     wait_for_state(&store, &task.id, TaskState::Rejected).await;
@@ -1959,6 +2067,7 @@ async fn startup_reconciles_orphaned_work_before_dispatch() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -2011,6 +2120,7 @@ async fn a_hung_scout_times_out_and_frees_its_slot() {
         test_update_watch(),
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 
@@ -2140,6 +2250,7 @@ async fn an_update_hold_starts_no_scout_and_observing_the_rebuilt_image_releases
         updates,
         test_pool_health(),
         test_broker_health(),
+        test_runtime_health(),
         shutdown_rx,
     ));
 

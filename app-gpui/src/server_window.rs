@@ -250,6 +250,10 @@ impl ServerWindow {
             .as_ref()
             .and_then(broker_hold_line)
             .map(|line| self.fact("Broker", line, cx));
+        let runtime = status
+            .as_ref()
+            .and_then(runtime_hold_line)
+            .map(|line| self.fact("Runtime", line, cx));
 
         div()
             .flex()
@@ -261,6 +265,7 @@ impl ServerWindow {
             .children(update)
             .children(pool)
             .children(broker)
+            .children(runtime)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -906,6 +911,25 @@ fn broker_hold_line(status: &ServerStatus) -> Option<String> {
     ))
 }
 
+/// Why new work is waiting, when the reason is that this host's container
+/// runtime is not running. Same contract again.
+///
+/// It quotes what `container system status` said rather than summarising it —
+/// a stopped service and a broken install read identically once summarised —
+/// and names the discharge, which is one command (#1017).
+fn runtime_hold_line(status: &ServerStatus) -> Option<String> {
+    let hold = status.runtime.as_ref()?;
+    Some(format!(
+        "The container runtime has been down for {} ({} probe(s), last {} ago) — nothing \
+         here can start a VM, so scout and build dispatch waits. Run `container system \
+         start`. {}",
+        time::since(hold.since),
+        hold.probes,
+        time::since(hold.last_seen),
+        hold.error
+    ))
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -956,6 +980,7 @@ mod tests {
             update: None,
             pool: None,
             broker: None,
+            runtime: None,
         }
     }
 
