@@ -33,7 +33,23 @@ implementation.
   build returned its turn expecting to be woken (#962), which the orchestrator's
   own prompt has warned about for a while and the agents that most need it were
   never told — and asks for verification **in proportion to what was changed**,
-  which is where the incentive to background came from.
+  which is where the incentive to background came from. It also **names the
+  clock**: an agent knew its budget as a number only if the prompt happened to
+  carry one, so the two rational-looking mistakes available to it were to wait
+  for a result nothing will collect and to start what cannot finish — a Scout
+  ran `cargo clippy` with four minutes left against a command another run had
+  measured at forty (#982). The minutes are rendered from the budget the run
+  was *given* and never from the configured constant, because a reattached
+  run's budget is the remainder and a prompt naming the hour would be lying to
+  it. And a run that stops on its own terms says so in its own
+  `exit_reason`: `unspent_budget_clause` appends one clause when half the
+  budget or more is left, so `SPEC.md not found` at eighteen minutes stops
+  reading identically to the same sentence at the deadline. Half, and
+  deliberately *not* `WAIVED_BUDGET_SHARE` — that quarter answers whether a run
+  was given its budget, this half answers whether it chose to stop, and one
+  number serving two questions is #944. It changes no decision:
+  `FailureClass` is stamped off a field and never off reason text, and this
+  clause is addressed to a human.
   A human may also skip the Scout outright — `POST /tasks/{id}/build-now`
   writes a spec by hand for a task whose issue body already is one, and its
   `specs.session_id IS NULL` is the tell. It changes nothing below: the spec is

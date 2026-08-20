@@ -337,7 +337,7 @@ impl Builder {
 
         let batch = self.load_batch(build).await?;
         let project = self.project(build).await?;
-        let prompt = render_prompt(&batch, build.directions.as_ref());
+        let prompt = render_prompt(&batch, build.directions.as_ref(), self.config.timeout);
 
         // What this build authenticates with: a lease minted against this
         // build id, read-only, repo-bound, expiring at the budget plus slack
@@ -1078,7 +1078,7 @@ async fn git_stdout(dir: &std::path::Path, args: &[&str]) -> Result<String, Buil
 ///
 /// Anything else that ever wants to reach a Builder still has to make its
 /// argument here, and the answer should still be no.
-fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String {
+fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>, budget: Duration) -> String {
     let n = batch.len();
     let mut out = format!(
         "You are a Builder in the Double Diamond architecture.\n\n\
@@ -1104,7 +1104,7 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String
     if let Some(directions) = directions {
         out.push_str(&render_directions(directions));
     }
-    out.push_str(
+    out.push_str(&format!(
         "## Your job\n\n\
          1. Implement every spec above, in order, as one coherent change in \
          the cloned repo (cwd). You are on the right branch already.\n\
@@ -1115,12 +1115,16 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String
          GitHub closing keywords (`Closes #N`, `Fixes #N`) — the server \
          links the issues itself.\n\
          5. Do NOT push and do NOT open a PR — the server does both.\n\n\
-         **You get one turn, and it ends abruptly.** There is no later: when \
-         you end your turn, the run is over. A backgrounded command buys you \
-         nothing — its child is killed with the turn — so anything whose \
-         result you need must be awaited inline, however long it takes. A poll \
-         loop over a file another process will write can only report to a turn \
-         that has already ended.\n\n\
+         **You have {budget_mins} minutes, once.** That is the whole run — \
+         the clone before you started, this turn, the supervisor's own test \
+         run and the packaging after it — measured on the wall clock from \
+         dispatch. There is no later: when you end your turn the run is over. \
+         A backgrounded command buys you nothing — its child is killed with \
+         the turn — so anything whose result you need must be awaited inline, \
+         and a poll loop over a file another process will write can only \
+         report to a turn that has already ended. Nor should you start what \
+         cannot finish: a cold build in a large workspace can run forty \
+         minutes, so weigh what a command will cost against what is left.\n\n\
          On step 2: when this project declares a test suite at \
          `.tasks/verify`, the supervisor runs it itself after you finish, \
          against the committed tree your branch carries. If it fails you get \
@@ -1128,7 +1132,8 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String
          so getting there first is entirely in your interest. It reads that \
          script out of the build's BASE commit, so editing it changes nothing \
          about what runs.\n",
-    );
+        budget_mins = budget.as_secs() / 60,
+    ));
     out
 }
 
@@ -1474,12 +1479,17 @@ mod tests {
     #[test]
     fn the_build_prompt_says_a_backgrounded_command_dies_with_the_turn() {
         let batch = vec![item(7, "First thing", "do it")];
-        let prompt = render_prompt(&batch, None);
+        let prompt = render_prompt(&batch, None, Duration::from_secs(3600));
         assert!(
             prompt.contains("backgrounded command buys you nothing"),
             "{prompt}"
         );
         assert!(prompt.contains("awaited inline"), "{prompt}");
+        // #982: and the clock itself, rendered from the budget this run was
+        // given rather than from a constant.
+        assert!(prompt.contains("You have 60 minutes, once"), "{prompt}");
+        let short = render_prompt(&batch, None, Duration::from_secs(15 * 60));
+        assert!(short.contains("You have 15 minutes, once"), "{short}");
     }
 
     #[test]
@@ -1706,7 +1716,7 @@ mod tests {
             item(7, "First thing", "## Spec: first\ndo it"),
             item(9, "Second thing", "## Spec: second\ndo that"),
         ];
-        let prompt = render_prompt(&batch, None);
+        let prompt = render_prompt(&batch, None, Duration::from_secs(3600));
 
         let first = prompt.find("## Spec 1 of 2: First thing (#7)").unwrap();
         let second = prompt.find("## Spec 2 of 2: Second thing (#9)").unwrap();
@@ -1732,7 +1742,7 @@ mod tests {
             "keep the migration reversible",
             crate::models::Actor::Orchestrator,
         );
-        let prompt = render_prompt(&batch, Some(&directions));
+        let prompt = render_prompt(&batch, Some(&directions), Duration::from_secs(3600));
 
         let spec = prompt.find("## Spec 1 of 1").unwrap();
         let section = prompt
@@ -1755,6 +1765,7 @@ mod tests {
         let human = render_prompt(
             &batch,
             Some(&Directions::new("x", crate::models::Actor::Human)),
+            Duration::from_secs(3600),
         );
         assert!(human.contains("The human running this pipeline"), "{human}");
     }
@@ -1767,7 +1778,7 @@ mod tests {
     fn a_hand_authored_spec_is_not_described_as_explored() {
         let mut hand = item(7, "A thing", "## Spec: first");
         hand.spec.session_id = None;
-        let prompt = render_prompt(&[hand], None);
+        let prompt = render_prompt(&[hand], None, Duration::from_secs(3600));
         assert!(
             prompt.contains("A human wrote this spec by hand"),
             "{prompt}"
@@ -1778,7 +1789,11 @@ mod tests {
             "nothing may claim this one was explored: {prompt}"
         );
 
-        let scouted = render_prompt(&[item(9, "Another", "## Spec: second")], None);
+        let scouted = render_prompt(
+            &[item(9, "Another", "## Spec: second")],
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(scouted.contains("throwaway branch"), "{scouted}");
         assert!(scouted.contains("trust its pitfalls"), "{scouted}");
     }
@@ -1789,7 +1804,11 @@ mod tests {
     fn provenance_is_per_spec_not_per_prompt() {
         let mut hand = item(7, "Hand", "## Spec: hand");
         hand.spec.session_id = None;
-        let prompt = render_prompt(&[hand, item(9, "Scouted", "## Spec: scouted")], None);
+        let prompt = render_prompt(
+            &[hand, item(9, "Scouted", "## Spec: scouted")],
+            None,
+            Duration::from_secs(3600),
+        );
         let hand_at = prompt.find("## Spec 1 of 2").unwrap();
         let scouted_at = prompt.find("## Spec 2 of 2").unwrap();
         let unexplored = prompt.find("A human wrote this spec by hand").unwrap();
@@ -1817,7 +1836,7 @@ mod tests {
             item(9, "Second thing", "## Spec: second\ndo that"),
         ];
         let directions = Directions::new("keep it one commit", crate::models::Actor::Human);
-        let prompt = render_prompt(&batch, Some(&directions));
+        let prompt = render_prompt(&batch, Some(&directions), Duration::from_secs(3600));
 
         let spec_two = prompt.find("## Spec 2 of 2: Second thing (#9)").unwrap();
         let section = prompt.find("## Review feedback on these specs").unwrap();
@@ -1856,10 +1875,18 @@ mod tests {
     /// all, and blank text counts as nobody.
     #[test]
     fn a_batch_approved_without_feedback_grows_no_review_section() {
-        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
+        let prompt = render_prompt(
+            &[item(7, "A thing", "spec")],
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(!prompt.contains("Review feedback"), "{prompt}");
 
-        let blank = render_prompt(&[reviewed(7, "A thing", "spec", Some("   \n  "))], None);
+        let blank = render_prompt(
+            &[reviewed(7, "A thing", "spec", Some("   \n  "))],
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(!blank.contains("Review feedback"), "{blank}");
     }
 
@@ -1896,7 +1923,11 @@ mod tests {
     /// and the prose one is the one in front of them.
     #[test]
     fn the_prompt_no_longer_asks_the_agent_to_report_on_its_own_test_run() {
-        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
+        let prompt = render_prompt(
+            &[item(7, "A thing", "spec")],
+            None,
+            Duration::from_secs(3600),
+        );
         for forbidden in [
             "Verification: PASSED",
             "Verification: FAILED",
@@ -1918,7 +1949,11 @@ mod tests {
     /// things it would otherwise waste its one repair round discovering.
     #[test]
     fn the_prompt_says_the_supervisor_will_run_the_suite_itself() {
-        let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
+        let prompt = render_prompt(
+            &[item(7, "A thing", "spec")],
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(prompt.contains(".tasks/verify"), "{prompt}");
         assert!(prompt.contains("supervisor runs it itself"), "{prompt}");
         assert!(prompt.contains("one chance to fix it"), "{prompt}");

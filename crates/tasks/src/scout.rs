@@ -363,6 +363,7 @@ impl Scout {
             prior.as_ref(),
             salvage.as_ref(),
             task.scout_directions.as_ref(),
+            self.config.timeout,
         );
 
         // What this run authenticates with. A lease rather than the raw keys:
@@ -785,6 +786,7 @@ impl Scout {
                 files_touched,
                 class,
             }) => {
+                let reason = format!("{reason}{}", unspent_budget_clause(deadline));
                 self.finalize_stopped_early(
                     session_id,
                     task,
@@ -811,7 +813,17 @@ impl Scout {
                 Err(ScoutError::Cancelled(request))
             }
             Err(e) => {
-                let reason = format!("{e}");
+                // #982: the clause goes only on a supervisor verdict. A
+                // `Timeout` has no unspent budget by construction and its
+                // string is pinned by the integration tests, and a `Suspended`
+                // run's unspent budget is already what its own sentence is
+                // about.
+                let reason = match &e {
+                    ScoutError::ScoutFailed { .. } => {
+                        format!("{e}{}", unspent_budget_clause(deadline))
+                    }
+                    _ => format!("{e}"),
+                };
                 // The deadline and a dead stream never reach the supervisor's
                 // own reporting — the VM is destroyed where it stands. The
                 // last checkpoint is all there is, and it is worth the same
@@ -1448,6 +1460,37 @@ async fn drain_scout_events(
     }
 }
 
+/// A clause naming a budget the run did not spend, when most of it is left.
+///
+/// #982: a Scout that wrote the fix, confirmed it and then ended its turn at
+/// 18 minutes of a 60-minute budget is recorded as `SPEC.md not found at …` —
+/// the same sentence a run killed at the deadline gets. They are different
+/// events. One is an agent that explored and could not conclude, which is a
+/// verdict; the other is an agent that believed it would be resumed, which is
+/// a fact about this harness. A human reading `sessions.exit_reason` cannot
+/// tell them apart, and this is the one place that can say so cheaply.
+///
+/// It changes **no decision**: `FailureClass` is stamped off a field and never
+/// off reason text, which is the rule this codebase follows everywhere. This
+/// is addressed to a human.
+///
+/// Half, and deliberately not `WAIVED_BUDGET_SHARE` (a quarter): that constant
+/// answers whether a run was *given* its budget, this one answers whether it
+/// chose to stop, and one number serving two questions is #944 exactly.
+fn unspent_budget_clause(deadline: &Deadline) -> String {
+    let Some(remaining) = deadline.remaining() else {
+        return String::new();
+    };
+    if remaining * 2 < deadline.budget() {
+        return String::new();
+    }
+    format!(
+        " — the run ended on its own terms with {} of its {} budget unspent, so this was \
+         not the deadline",
+        crate::deadline::human(remaining),
+        crate::deadline::human(deadline.budget()),
+    )
+}
 /// Build the scout prompt, splicing in the previous attempt when the task has
 /// one. The section sits between the issue body and the instructions so the
 /// model reads issue → what went wrong last time → what to do.
@@ -1456,6 +1499,7 @@ fn render_prompt(
     prior: Option<&ReviewedSpec>,
     salvage: Option<&ScoutNotes>,
     directions: Option<&Directions>,
+    budget: Duration,
 ) -> String {
     let previous = prior.map(render_previous_attempt).unwrap_or_default();
     let field_notes = salvage.map(render_field_notes).unwrap_or_default();
@@ -1490,14 +1534,22 @@ fn render_prompt(
          that is what `NOTES.md` is for.\n\
          5. Do NOT create a PR or push anywhere.\n\n\
          ## Two things about this run that are not true of an ordinary session\n\n\
-         **You get one turn, and it ends abruptly.** There is no later: when \
-         you end your turn, the run is over, and if the budget runs out the \
+         **You have {budget_mins} minutes, once.** That is the whole run — \
+         the clone before you started, this turn, and the packaging after it \
+         — measured on the wall clock from dispatch. There is no later: when \
+         you end your turn the run is over, and when the budget runs out the \
          machine is destroyed where it stands. Nothing you have not already \
-         sent out survives that. So a backgrounded command buys you nothing — \
-         its child is killed with the turn — and anything whose result you \
-         need must be awaited inline, however long it takes. If you find \
-         yourself writing a poll loop over a file another process will write, \
-         stop: it can only report to a turn that has already ended.\n\n\
+         sent out survives that. Two things follow, and they are the two \
+         mistakes available to an agent that cannot see its own clock. A \
+         backgrounded command buys you nothing — its child is killed with the \
+         turn — so anything whose result you need must be awaited inline, \
+         however long it takes; if you find yourself writing a poll loop over \
+         a file another process will write, stop, because it can only report \
+         to a turn that has already ended. And do not start something that \
+         cannot finish: a cold build in a large workspace can run forty \
+         minutes, so before you launch one, ask what it will cost against \
+         what is left, and spend the remainder writing down what you know \
+         instead if the answer is that it will not fit.\n\n\
          **Draft the spec early, in `NOTES.md`.** Once you have a shape in \
          mind and before you finish implementing, write a complete first draft \
          of the spec — the whole structure below, filled in as best you can — \
@@ -1532,6 +1584,7 @@ fn render_prompt(
         previous = previous,
         field_notes = field_notes,
         directions = directions,
+        budget_mins = budget.as_secs() / 60,
     )
 }
 
@@ -1932,7 +1985,7 @@ mod tests {
     /// and promoting one stays a human act.
     #[test]
     fn the_prompt_asks_for_the_spec_to_be_drafted_where_it_will_survive() {
-        let prompt = render_prompt(&task_fixture(), None, None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
         assert!(
             prompt.contains("Draft the spec early, in `NOTES.md`"),
             "{prompt}"
@@ -1951,7 +2004,7 @@ mod tests {
     /// never told.
     #[test]
     fn the_prompt_says_a_backgrounded_command_dies_with_the_turn() {
-        let prompt = render_prompt(&task_fixture(), None, None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
         assert!(
             prompt.contains("backgrounded command buys you nothing"),
             "{prompt}"
@@ -1965,9 +2018,55 @@ mod tests {
         );
     }
 
+    /// #982 (1): an agent that cannot see its clock makes the two scheduling
+    /// mistakes available to it — waiting for a result that will never be
+    /// collected, and starting something that cannot finish. The budget is a
+    /// number the host has and the agent did not.
+    #[test]
+    fn the_prompt_tells_the_agent_how_long_it_has() {
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
+        assert!(prompt.contains("You have 60 minutes, once"), "{prompt}");
+        assert!(prompt.contains("do not start something that"), "{prompt}");
+    }
+
+    /// The clause is rendered from the budget it was given, not from a
+    /// constant — a reattached run's budget is the remainder, and a prompt
+    /// naming the configured hour would be lying to it.
+    #[test]
+    fn the_clock_the_prompt_names_is_the_one_the_run_was_given() {
+        let prompt = render_prompt(
+            &task_fixture(),
+            None,
+            None,
+            None,
+            Duration::from_secs(15 * 60),
+        );
+        assert!(prompt.contains("You have 15 minutes, once"), "{prompt}");
+    }
+
+    /// #982 (4): `SPEC.md not found` at 18 minutes of a 60-minute budget and
+    /// the same sentence at the deadline are different events and read
+    /// identically. Nothing decides on this text — `FailureClass` is stamped
+    /// off a field — so it costs nothing and it stops a human misreading the
+    /// ledger.
+    #[tokio::test]
+    async fn a_run_that_stopped_with_most_of_its_budget_left_says_so() {
+        let deadline = Deadline::starting_now(Duration::from_secs(3600));
+        let clause = unspent_budget_clause(&deadline);
+        assert!(clause.contains("was not the deadline"), "{clause}");
+        assert!(clause.contains("unspent"), "{clause}");
+
+        // And silent once most of the budget is gone: a run that used its
+        // hour and produced nothing is a verdict, and saying `not the
+        // deadline` there would be the same misreading in the other
+        // direction.
+        let nearly_done = Deadline::starting_now(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(unspent_budget_clause(&nearly_done), "");
+    }
     #[test]
     fn a_fresh_prompt_has_no_previous_attempt_section() {
-        let prompt = render_prompt(&task_fixture(), None, None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
         assert!(!prompt.contains("Previous attempt"));
         // The body must still run straight into the instructions.
         assert!(prompt.contains("The issue body.\n\n## Your job"));
@@ -1980,7 +2079,13 @@ mod tests {
     fn directions_sit_last_before_the_job_and_name_their_author() {
         let directions = Directions::new("start from the poller, not the API", Actor::Human);
         let notes = salvaged("half an idea", Some("the VM went away"));
-        let prompt = render_prompt(&task_fixture(), None, Some(&notes), Some(&directions));
+        let prompt = render_prompt(
+            &task_fixture(),
+            None,
+            Some(&notes),
+            Some(&directions),
+            Duration::from_secs(3600),
+        );
 
         let field = prompt.find("## Field notes from an interrupted").unwrap();
         let section = prompt.find("## Directions for this exploration").unwrap();
@@ -2008,6 +2113,7 @@ mod tests {
             None,
             None,
             Some(&Directions::new("x", Actor::Orchestrator)),
+            Duration::from_secs(3600),
         );
         assert!(
             orchestrated.contains("The orchestrator agent"),
@@ -2026,6 +2132,7 @@ mod tests {
             None,
             None,
             Some(&Directions::new("do the thing", Actor::Human)),
+            Duration::from_secs(3600),
         );
         assert!(
             !prompt.contains("Nothing below has been verified"),
@@ -2044,7 +2151,13 @@ mod tests {
             "## Spec: old\n\nSection 3 is thin.",
             Some("Flesh out section 3."),
         );
-        let prompt = render_prompt(&task_fixture(), Some(&prior), None, None);
+        let prompt = render_prompt(
+            &task_fixture(),
+            Some(&prior),
+            None,
+            None,
+            Duration::from_secs(3600),
+        );
 
         let attempt = prompt.find("## Previous attempt").expect("section present");
         let verdict = prompt.find("needs_revision").expect("verdict present");
@@ -2078,6 +2191,7 @@ mod tests {
                 Some(&reviewed("spec body", empty)),
                 None,
                 None,
+                Duration::from_secs(3600),
             );
             assert!(prompt.contains("## Previous attempt"));
             assert!(prompt.contains("no written feedback"));
@@ -2094,6 +2208,7 @@ mod tests {
             Some(&reviewed(nested, Some("f"))),
             None,
             None,
+            Duration::from_secs(3600),
         );
         assert!(prompt.contains("````markdown"));
         assert_eq!(fence_for("no fences"), "```");
@@ -2117,7 +2232,7 @@ mod tests {
     /// skeleton spec is what reaches a reviewer looking finished.
     #[test]
     fn the_prompt_asks_for_notes_and_forbids_a_placeholder_spec() {
-        let prompt = render_prompt(&task_fixture(), None, None, None);
+        let prompt = render_prompt(&task_fixture(), None, None, None, Duration::from_secs(3600));
         assert!(prompt.contains("Keep `NOTES.md`"));
         assert!(prompt.contains("`SPEC.md` is not a checkpoint"));
         assert!(prompt.contains("A half-written spec is worse than no spec"));
@@ -2131,7 +2246,13 @@ mod tests {
             "# Notes\n\nThe parser lives in src/parse.rs.",
             Some("scout timed out after 3600s"),
         );
-        let prompt = render_prompt(&task_fixture(), None, Some(&notes), None);
+        let prompt = render_prompt(
+            &task_fixture(),
+            None,
+            Some(&notes),
+            None,
+            Duration::from_secs(3600),
+        );
 
         let section = prompt
             .find("## Field notes from an interrupted attempt")
@@ -2147,7 +2268,13 @@ mod tests {
 
         // A checkpoint salvaged mid-run has no reason yet; the section still
         // renders rather than printing "None".
-        let no_reason = render_prompt(&task_fixture(), None, Some(&salvaged("x", None)), None);
+        let no_reason = render_prompt(
+            &task_fixture(),
+            None,
+            Some(&salvaged("x", None)),
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(no_reason.contains("cut short before it could say why"));
         assert!(!no_reason.contains("None)"));
     }
@@ -2158,7 +2285,13 @@ mod tests {
     #[test]
     fn quoted_notes_survive_their_own_fences() {
         let notes = salvaged("```rust\nfn x() {}\n```", None);
-        let prompt = render_prompt(&task_fixture(), None, Some(&notes), None);
+        let prompt = render_prompt(
+            &task_fixture(),
+            None,
+            Some(&notes),
+            None,
+            Duration::from_secs(3600),
+        );
         assert!(prompt.contains("````markdown"));
     }
 
@@ -2187,7 +2320,13 @@ mod tests {
     fn a_prompt_can_carry_both_a_review_and_field_notes() {
         let prior = reviewed("## Spec: old", Some("Say more."));
         let notes = salvaged("a later, interrupted look", None);
-        let prompt = render_prompt(&task_fixture(), Some(&prior), Some(&notes), None);
+        let prompt = render_prompt(
+            &task_fixture(),
+            Some(&prior),
+            Some(&notes),
+            None,
+            Duration::from_secs(3600),
+        );
 
         let previous = prompt.find("## Previous attempt").unwrap();
         let field = prompt.find("## Field notes").unwrap();
