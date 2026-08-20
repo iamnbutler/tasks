@@ -222,6 +222,11 @@ impl Workspace {
                 .map(|run| (run.op, run.started_at))
         };
 
+        // The pipeline's one sentence, read before the app-state borrow: it
+        // joins `AppState` and `ServerControl`, and it is what an empty tree
+        // says about itself.
+        let explanation = self.explanation(cx);
+
         // Owned projections first — the rows need `cx` for listeners after
         // the state borrow ends.
         let (tree, feedback, banner, queue_notice) = {
@@ -370,6 +375,15 @@ impl Workspace {
                             .text_color(theme.fg())
                             .child(notice)
                     }))
+                    // A rail that *has* rows and is not moving says why, in
+                    // one standing line. Mutually exclusive with the empty
+                    // tree's block below, and only because both read a
+                    // repo-scoped pipeline: every standing situation needs
+                    // something queued, and within a filter an empty tree
+                    // means nothing is.
+                    .when(!tree.is_empty() && explanation.is_standing(), |el| {
+                        el.child(self.render_explanation(&explanation, "rail-standing", true, cx))
+                    })
                     // The tree — the queue itself, drag to rank.
                     .child(
                         div()
@@ -381,16 +395,12 @@ impl Workspace {
                             .overflow_y_scroll()
                             .map(|el| {
                                 if tree.is_empty() {
-                                    el.child(
-                                        div()
-                                            .px(px(16.))
-                                            .py(px(6.))
-                                            .text_xs()
-                                            .text_color(text_muted)
-                                            .child(
-                                                "Nothing picked up — queue work from All Tasks.",
-                                            ),
-                                    )
+                                    el.child(self.render_explanation(
+                                        &explanation,
+                                        "rail-empty",
+                                        false,
+                                        cx,
+                                    ))
                                 } else {
                                     el.children(
                                         tree.into_iter().map(|row| self.render_tree_row(row, cx)),

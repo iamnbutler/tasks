@@ -82,6 +82,12 @@ impl Workspace {
             .collect();
         let empty = rows.is_empty() && state.loaded;
         let show_done = self.show_done;
+        // `state` is not read past here, so the diagnosis — which reads both
+        // entities and then wants `cx` mutably for its button — is free to
+        // take over.
+        let explanation = self
+            .explanation(cx)
+            .without(crate::empty_state::Action::OpenAllTasks);
 
         div()
             .flex()
@@ -96,20 +102,26 @@ impl Workspace {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .py(px(4.))
-                    .when(empty, |el| {
+                    .when(empty && done_count > 0, |el| {
                         el.child(
                             div()
                                 .p(px(16.))
                                 .text_sm()
                                 .text_color(theme.fg_muted())
                                 // Everything there is, is archived — say so,
-                                // rather than claiming there is nothing.
-                                .child(if done_count > 0 {
-                                    "Nothing open — every task here is done."
-                                } else {
-                                    "No tasks yet — the poller fills this from open GitHub issues."
-                                }),
+                                // rather than claiming there is nothing. This
+                                // stays the catalog's own sentence and is
+                                // deliberately *not* routed through the
+                                // diagnosis: a view filter hiding rows that
+                                // exist is not a pipeline state, and the
+                                // footer toggle below is what fixes it.
+                                .child("Nothing open — every task here is done."),
                         )
+                    })
+                    // Every other empty catalog is the pipeline talking, with
+                    // "Open All Tasks" dropped — this *is* All Tasks.
+                    .when(empty && done_count == 0, |el| {
+                        el.child(self.render_explanation(&explanation, "empty-catalog", false, cx))
                     })
                     .children(rows.into_iter().map(
                         |(id, number, title, task_state, updated, repo)| {
