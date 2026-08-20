@@ -210,6 +210,32 @@ pub fn compare(a: &str, b: &str) -> Option<Ordering> {
     Some(Ordering::Equal)
 }
 
+/// The largest version strictly below `version` under [`compare`], or `None`
+/// when there is none (`0.0.0`) or it does not parse.
+///
+/// This exists for tests that need "a build older than the one running", and
+/// it lives here rather than in each of them because the answer depends on how
+/// [`compare`] reads a version, which is a fact of this module.
+///
+/// The literal it replaces was `"0.1.1"`, and CI is what caught it: a stamp is
+/// `0.1.<commit count>`, `actions/checkout` clones one commit deep by default,
+/// so a CI build stamps itself `0.1.1` and every test asserting `"0.1.1"` is
+/// stale asserted that this build is older than itself. The workflow now
+/// fetches full history — the stamp has to be real for its own sake — but a
+/// test whose meaning depends on clone depth is a trap either way.
+pub fn one_below(version: &str) -> Option<String> {
+    let mut parts = parse(version)?;
+    let index = parts.iter().rposition(|&part| part > 0)?;
+    parts[index] -= 1;
+    Some(
+        parts
+            .iter()
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 fn parse(version: &str) -> Option<Vec<u64>> {
     let core = version.trim().split('-').next()?.trim();
     if core.is_empty() {
@@ -230,6 +256,23 @@ mod tests {
             commit: "abc1234".into(),
             min_client_version: min.into(),
         }
+    }
+
+    /// Whatever `one_below` returns must actually compare `Less` — including
+    /// at the shallow-clone stamp `0.1.1`, which is the case that put it here.
+    #[test]
+    fn one_below_is_strictly_below_and_bottoms_out() {
+        for version in ["0.1.163", "0.1.1", "0.1.0", "1.0.0", "0.1.163-dirty"] {
+            let below = one_below(version).expect("something is below it");
+            assert_eq!(
+                compare(&below, version),
+                Some(Ordering::Less),
+                "{below} vs {version}"
+            );
+        }
+        // Nothing is below the floor, and nothing is below what will not parse.
+        assert_eq!(one_below("0.0.0"), None);
+        assert_eq!(one_below("nightly"), None);
     }
 
     /// The bug this comparison exists to not have: `"0.1.9" > "0.1.100"` as

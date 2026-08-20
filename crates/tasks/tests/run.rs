@@ -2234,7 +2234,10 @@ async fn an_update_hold_starts_no_scout_and_observing_the_rebuilt_image_releases
             "agent:v1",
             tasks_api::version::ImageRole::Scout,
             Some(&SupervisorBuild {
-                version: "0.1.1".into(),
+                // Never a literal: a one-commit-deep clone stamps `0.1.1`,
+                // which is this build on CI. See `version::one_below`.
+                version: tasks_api::version::one_below(tasks::version::VERSION)
+                    .expect("this build is not the oldest possible one"),
                 commit: "0000000".into(),
             }),
             "sess_before",

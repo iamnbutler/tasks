@@ -255,6 +255,16 @@ mod tests {
     use crate::protocol::SupervisorBuild;
     use tasks_api::version::ImageRole;
 
+    /// A version strictly older than this server's stamp.
+    ///
+    /// Never a literal. `0.1.<commit count>` on a one-commit-deep clone is
+    /// `0.1.1`, so the literal that stood here asserted this build is older
+    /// than itself — green everywhere with git history and red on CI.
+    fn older_build() -> String {
+        tasks_api::version::one_below(crate::version::VERSION)
+            .expect("this build is not the oldest possible one")
+    }
+
     #[test]
     fn a_binary_built_after_boot_is_pending_and_one_from_before_is_not() {
         let boot = SystemTime::now();
@@ -281,7 +291,7 @@ mod tests {
                 "agent:v1",
                 ImageRole::Scout,
                 Some(&SupervisorBuild {
-                    version: "0.1.1".into(),
+                    version: older_build(),
                     commit: "0000000".into(),
                 }),
                 "sess_test",
@@ -327,7 +337,7 @@ mod tests {
                 "agent:v1",
                 ImageRole::Scout,
                 Some(&SupervisorBuild {
-                    version: "0.1.1".into(),
+                    version: older_build(),
                     commit: "0000000".into(),
                 }),
                 "sess_old",
@@ -377,7 +387,7 @@ mod tests {
                 "agent:v1",
                 ImageRole::Scout,
                 Some(&SupervisorBuild {
-                    version: "0.1.1".into(),
+                    version: older_build(),
                     commit: "0000000".into(),
                 }),
                 "sess_stale",

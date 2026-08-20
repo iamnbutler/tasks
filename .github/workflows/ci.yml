@@ -51,7 +51,15 @@ jobs:
     name: fmt, clippy, suite
     runs-on: ubuntu-latest
     steps:
+      # Full history, not the default depth-1. `build-stamp` derives every
+      # binary's identity from `git rev-list --count HEAD`, so a shallow clone
+      # stamps this build `0.1.1` — a number that collides with a real early
+      # build and makes every `ImageFreshness` comparison meaningless. The
+      # first CI run found it, by failing three `UpdateWatch` tests that
+      # asserted `0.1.1` was stale.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
