@@ -26,7 +26,7 @@ use tasks_api::http::{
     BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse, CancelRunRequest,
     CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
     ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
-    ServerStatus, SetCharter, SetMode, SetProjectStatus,
+    ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -638,6 +638,20 @@ impl Client {
     /// liveness probe for a swap.
     pub fn status(&self) -> Result<ServerStatus> {
         self.get_json("/status", &[])
+    }
+
+    // --- viewer ---
+
+    /// Who the server's own GitHub credential is — the identity whose branches
+    /// get pushed and whose issues get closed.
+    ///
+    /// Always a 200 on a server that has the route: the three
+    /// [`Viewer`] states are answers, not failures, so a fresh machine with no
+    /// token is `Unauthenticated` rather than an error. A server *older* than
+    /// the route answers 404, which is an ordinary [`ClientError`] here — see
+    /// the app's read of it for why that is deliberately not bannered.
+    pub fn viewer(&self) -> Result<Viewer> {
+        self.get_json("/viewer", &[])
     }
 
     // --- mode ---

@@ -165,12 +165,23 @@ implementation.
   in doubt" is what the old sentence effectively said and doubt is unbounded.
   So there are exactly three carve-outs, named as the whole list: GitHub would
   refuse the merge, the build reported no passing test run of its own, or
-  nothing runnable here could have checked it. The third exists because this
-  repository has **no `.github/workflows` and no branch protection**, so
-  `mergeable_state` can only ever be `clean` or `dirty` and GitHub's verdict is
-  structurally incapable of objecting to a change that does not work —
-  `Landing::Clear::describe()` says so in words, and a test pins that clause
-  and the absence of "ready to merge". Read `mergeable_state` and never
+  nothing runnable here could have checked it. The third exists because **no
+  workflow here produces a pull-request check and there is no branch
+  protection**, so `mergeable_state` can only ever be `clean` or `dirty` and
+  GitHub's verdict is structurally incapable of objecting to a change that does
+  not work — `Landing::Clear::describe()` says so in words, and a test pins that
+  clause and the absence of "ready to merge". That premise used to be "no
+  `.github/workflows`", one `ls` away from checkable, and `pages.yml` (the
+  landing page's deploy, #995) ended it — so it is now **mechanically
+  enforced instead of asserted**: the workflow triggers on `push` and
+  `workflow_dispatch` only, and `no_workflow_produces_a_pull_request_check`
+  (`crates/tasks/tests/site.rs`) fails the suite the moment any workflow grows
+  an `on: pull_request`. Prose was the wrong home for it — the next person to
+  add a trigger would have falsified six doc comments and this bullet with
+  nothing going red, while the pipeline kept merging on a carve-out whose
+  premise had gone. Real pull-request checks are #1015's change, and they come
+  with a rewrite of `Landing`'s reading of `mergeable_state` in the same
+  commit. Read `mergeable_state` and never
   `mergeable` alone: `false` there means a conflict and nothing else, so a red
   PR reads ready. The only evidence that a change works is therefore a run of
   the project's own suite, and the bullet below is how that run is now
@@ -366,9 +377,10 @@ implementation.
   already holds the duplicate, and a failed migration is a boot failure in a
   process that has already taken the port.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
-  prompt.** Nine independently switchable capabilities (`capture_work`,
+  prompt.** Ten independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,
-  `dispatch_builds`, `cancel_runs`, `auto_review_specs`, `land_builds`), each
+  `dispatch_builds`, `cancel_runs`, `auto_review_specs`, `land_builds`,
+  `enroll_agents`), each
   `off` | `shadow` | `live`, human-writable only. The system prompt's
   authority section is *generated* from those rows every turn and the server
   enforces the same rows on the endpoints — one statement of authority, and
@@ -376,7 +388,7 @@ implementation.
   two edits, not one: the enum variant alone grants nothing, because
   `Store::charter_entry` reads a missing row as `off` — the migration's
   `INSERT` is what makes it real, and without it the refusal looks like a bug
-  in `authorize`. **All nine ship `live`
+  in `authorize`. **All ten ship `live`
   and uncapped** — the charter is a kill switch, not a promotion ladder, and
   the point of the system is that work moves without being asked. What makes
   that safe is the `decisions` ledger under every write: audit and recourse
@@ -399,6 +411,40 @@ implementation.
   cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
   from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
   a demotion to human.
+- **An external agent gets a voice by enrollment, and a failed claim is
+  refused, never demoted to the human.** The orchestrator conversation has
+  three speakers, and headers decide which one a `POST /orchestrator/messages`
+  is: no `X-Tasks-Agent` is the human (never gated, as ever), a *valid* code
+  in it is that agent — the turn lands as `ChatRole::Event` under a
+  server-written `[agent <name>]` heading, beside `[pipeline]` and
+  unmistakable from both — and an invalid, expired or revoked one is a 403
+  with the message **discarded**, the `X-Tasks-Actor` rule again, because
+  quietly becoming the human is the one direction attribution must never
+  fail. The code is the device-code flow one level up from the broker lease
+  and holds its custody: `POST /agents` mints 256 random bits returned
+  exactly once, `agent_enrollments` keeps only the SHA-256, and the row —
+  never deleted, it is the audit trail for turns already spoken — carries the
+  name, the expiry (default 4h, bounds refused rather than clamped: a
+  credential silently granted a different lifetime is a different grant) and
+  `revoked_at`. The **name is chosen by the minter, never the agent**, is
+  validated in the store (`require_rationale`'s backstop argument), and can
+  never be another speaker — reserved words refused, one active enrollment
+  per name — because the name is what the words are attributed to. What an
+  enrollment conveys is a **voice, not authority**: an agent turn is input
+  the orchestrator is prompted to read as a peer's unverified leads, never a
+  gated write, which is why `enroll_agents` (the tenth capability) can ship
+  `live` — the convenient flow is asking the orchestrator in chat for a code,
+  and its mints and revokes are ledgered with a required rationale
+  (`enroll_agent` / `revoke_agent`, both store-only, `applied` by
+  construction). The prompt tells the orchestrator to relay a minted code to
+  the human verbatim and nowhere else — a persisted transcript holding a
+  short-lived message code is the accepted cost of having no other channel to
+  the human, bounded by the TTL and by what the code can do. The coverage
+  claim, stated exactly: enrollment does not authenticate the human — any
+  local process can still omit the header and speak as the human, and the
+  loopback bind plus who runs on the machine remain that boundary. What it
+  buys is the cooperative case: an honest label the orchestrator can weigh,
+  and a bounded, revocable credential instead of ambient human standing.
 - **A bind address is not access control against a browser, so the API refuses
   the two shapes only a browser sends.** The other half of the attribution
   rule: a request with no `X-Tasks-Actor` is read as the human's, and the human
@@ -439,13 +485,18 @@ implementation.
   src>`/`<iframe>`, so `<img src="http://127.0.0.1:4800/…">` passes both rules.
   That residual is bounded to routes whose responses the attacker cannot read
   (this API sends no CORS headers) and whose only effect is server-side, and
-  today exactly one route is not nil: **`GET /decisions/{seq}/reconcile`**,
-  which spends the server's own GitHub credential outbound. It is **accepted**
+  today exactly two routes are not nil, and both spend the server's own GitHub
+  credential outbound. **`GET /decisions/{seq}/reconcile`** is **accepted**
   rather than moved to `POST` — idempotent, locally mutating nothing, answering
   only for a `pending` decision, and named as a `GET` by the obligation loop
   and the orchestrator's own `curl` — so what it costs is one GitHub read per
   pending decision, a rate-limit lever and not the `build-now` hole; closing it
-  wants `Sec-Fetch-Site`, which is its own decision. There is **no knob**, and
+  wants `Sec-Fetch-Site`, which is its own decision. **`GET /viewer`** is the
+  second, and it is the cheaper of the two *because of the cache it needed
+  anyway*: the app asks on every SSE event, so the answer is held for 30
+  minutes (5 on a failure), which bounds a forced read to one GitHub call per
+  failure TTL however hard the page hammers it. The same `Sec-Fetch-Site`
+  decision covers both. There is **no knob**, and
   the argument is no longer the one that fits on a line: a disable switch whose
   only user bypasses the fix was the whole reason until a *legitimate*
   deployment shape turned out to be refused. Through an SSH `-L` tunnel the
@@ -1166,6 +1217,17 @@ implementation.
   `builder` are Tasks'. A tool a Tasks crate needs goes in the latter two,
   duplicated, rather than once in `agent` — app vocabulary does not enter
   vm-pool's images any more than it enters its code
+- `site/` — the landing page published at `nate.rip/tasks/` (#995): one
+  hand-written `index.html`, one stylesheet, three screenshots. It lives here
+  rather than in `docs/` because a `/docs` Pages source would publish the
+  design docs too, and in this repo rather than its own so the README, CLAUDE.md
+  and the diagram it must stay in step with are one checkout away. **No build
+  step**, and that is more than register: `.gitignore`'s `dist/` and
+  `node_modules/` patterns are *unanchored*, so a generator emitting into
+  `site/dist/` would commit nothing and fail silently. `make site-check` is the
+  whole publish gate (`.github/workflows/pages.yml` runs the same line); the
+  disclaimer-drift half of it is *also* a workspace test, deliberately, because
+  the script only runs at deploy time and this pipeline merges its own PRs
 - `docs/plans/` — implementation plans; `docs/vm-pool.md` — vm-pool spec
 - `spec` for the platform: issue #744 + docs/plans/2026-08-09-v2-resume.md
 
@@ -1238,6 +1300,9 @@ make images                            # rebuild the Scout/Builder VM images
                                        #   (gated on `tasks drain --check`;
                                        #   FORCE=1 skips the gate)
 make images-check                      # boot each image, read `--version` back
+make site-check                        # the landing page's publish gate: the
+                                       #   disclaimer matches the README's and
+                                       #   every relative link resolves
 make verify-warm                       # prime the orchestrator's build directory
 sh .tasks/verify                       # what a Builder VM runs before it packages
                                        #   anything — a red run fails the build

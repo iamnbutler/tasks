@@ -17,8 +17,8 @@ use crate::events::{Event, EventPayload};
 use crate::github::GhIssue;
 use crate::migrations::MIGRATOR;
 use crate::models::{
-    Actor, Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel, ChatRole,
-    CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput,
+    Actor, AgentEnrollment, Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel,
+    ChatRole, CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput,
     DecisionState, Directions, GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent,
     OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId,
     ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
@@ -107,6 +107,19 @@ pub enum ActorClaim {
     /// A claim was made and it failed. Refuse it.
     Unrecognized,
 }
+
+/// The header an enrolled external agent presents its code in
+/// (`POST /orchestrator/messages`). A present-but-invalid code is a refusal,
+/// never a demotion to the human — the [`ACTOR_HEADER`] rule.
+pub const AGENT_HEADER: &str = "X-Tasks-Agent";
+
+/// Enrollment lifetime when the mint does not name one: a working session,
+/// not a standing credential.
+pub const AGENT_TTL_DEFAULT_SECS: i64 = 4 * 3600;
+/// Bounds on a requested enrollment lifetime. Outside them is a refusal, not
+/// a clamp.
+pub const AGENT_TTL_FLOOR_SECS: i64 = 60;
+pub const AGENT_TTL_CAP_SECS: i64 = 24 * 3600;
 
 /// Conversation page size when a client does not ask for one.
 pub const MESSAGE_PAGE_DEFAULT: i64 = 200;
@@ -3901,6 +3914,143 @@ impl Store {
         }
     }
 
+    // --- agent enrollments ---
+
+    /// Mint an enrollment: a named, short-lived code an external agent
+    /// presents (`X-Tasks-Agent`) to speak in the orchestrator conversation
+    /// under its own name. Returns the code exactly once; the row keeps only
+    /// its hash.
+    ///
+    /// The name is validated here rather than only at the HTTP edge, for the
+    /// `require_rationale` reason: the store is the backstop for callers that
+    /// never went through a handler. It is chosen by the *minter*, never the
+    /// agent, because it is what the words get attributed to — which is also
+    /// why anything that could read as another speaker is refused, and why an
+    /// out-of-range TTL is a 400-shaped error rather than a clamp: a
+    /// credential silently granted a different lifetime is a different grant.
+    pub async fn enroll_agent(
+        &self,
+        name: &str,
+        minted_by: Actor,
+        ttl_secs: Option<i64>,
+    ) -> Result<(AgentEnrollment, String), StoreError> {
+        let name = name.trim();
+        validate_agent_name(name)?;
+        let ttl = ttl_secs.unwrap_or(AGENT_TTL_DEFAULT_SECS);
+        if !(AGENT_TTL_FLOOR_SECS..=AGENT_TTL_CAP_SECS).contains(&ttl) {
+            return Err(StoreError::Invalid(format!(
+                "ttl_secs must be between {AGENT_TTL_FLOOR_SECS} and {AGENT_TTL_CAP_SECS} \
+                 (asked for {ttl})"
+            )));
+        }
+        let now = Utc::now();
+        // One active code per name: two agents answering to one name is
+        // exactly the attribution mush this table exists to prevent. Refused
+        // rather than silently rotated, so replacing a live agent's code is a
+        // deliberate two-step a reader can find in the ledger.
+        let clash = sqlx::query(
+            "SELECT id FROM agent_enrollments              WHERE lower(name) = lower(?) AND revoked_at IS NULL AND expires_at > ?",
+        )
+        .bind(name)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = clash {
+            let id: i64 = row.try_get("id")?;
+            return Err(StoreError::Invalid(format!(
+                "an active enrollment already holds the name \"{name}\" — revoke it first \
+                 (POST /agents/{id}/revoke) or pick another name"
+            )));
+        }
+        let (code, hash) = crate::broker::mint_agent_code();
+        let expires_at = now + chrono::Duration::seconds(ttl);
+        let result = sqlx::query(
+            "INSERT INTO agent_enrollments (name, token_hash, minted_by, created_at, expires_at)              VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(&hash)
+        .bind(minted_by.as_str())
+        .bind(now.to_rfc3339())
+        .bind(expires_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok((
+            AgentEnrollment {
+                id: result.last_insert_rowid(),
+                name: name.to_string(),
+                minted_by,
+                created_at: now,
+                expires_at,
+                revoked_at: None,
+                last_used_at: None,
+            },
+            code,
+        ))
+    }
+
+    /// The enrollment a presented code names, in *any* state — the caller
+    /// distinguishes revoked and expired, because "expired, ask for a new
+    /// code" and "no such code" are different refusals and only one of them
+    /// has a fix the agent can be told.
+    pub async fn agent_by_code(&self, code: &str) -> Result<Option<AgentEnrollment>, StoreError> {
+        let hash = crate::broker::token_hash(code.trim());
+        let row = sqlx::query(
+            "SELECT id, name, minted_by, created_at, expires_at, revoked_at, last_used_at              FROM agent_enrollments WHERE token_hash = ?",
+        )
+        .bind(&hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(agent_enrollment_row).transpose()
+    }
+
+    /// Stamp a successful use, so `GET /agents` can say which enrollments
+    /// are actually speaking. Best-effort bookkeeping — a failure here must
+    /// not fail the message it records.
+    pub async fn touch_agent(&self, id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE agent_enrollments SET last_used_at = ? WHERE id = ?")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// End an enrollment before its expiry. Idempotent on an already-revoked
+    /// row — the first `revoked_at` is the historical fact and keeps it.
+    pub async fn revoke_agent(&self, id: i64) -> Result<AgentEnrollment, StoreError> {
+        sqlx::query(
+            "UPDATE agent_enrollments SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let row = sqlx::query(
+            "SELECT id, name, minted_by, created_at, expires_at, revoked_at, last_used_at              FROM agent_enrollments WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("no enrollment {id}")))?;
+        agent_enrollment_row(row)
+    }
+
+    /// Enrollments, newest first, bounded. Expired and revoked rows are
+    /// included — they are the audit trail for turns already spoken under
+    /// their names — and the reader tells them apart by the timestamps.
+    pub async fn list_agent_enrollments(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AgentEnrollment>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, name, minted_by, created_at, expires_at, revoked_at, last_used_at              FROM agent_enrollments ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(agent_enrollment_row).collect()
+    }
+
     // --- obligations ---
 
     /// Everything the pipeline is owed right now, oldest first.
@@ -5632,6 +5782,74 @@ fn orchestrator_message_row(
     })
 }
 
+fn agent_enrollment_row(row: sqlx::sqlite::SqliteRow) -> Result<AgentEnrollment, StoreError> {
+    let minted_by_raw: String = row.try_get("minted_by")?;
+    Ok(AgentEnrollment {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        minted_by: Actor::from_str(&minted_by_raw).ok_or(StoreError::BadEnum {
+            column: "minted_by",
+            value: minted_by_raw,
+        })?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+        expires_at: parse_ts(&row.try_get::<String, _>("expires_at")?, "expires_at")?,
+        revoked_at: row
+            .try_get::<Option<String>, _>("revoked_at")?
+            .as_deref()
+            .map(|t| parse_ts(t, "revoked_at"))
+            .transpose()?,
+        last_used_at: row
+            .try_get::<Option<String>, _>("last_used_at")?
+            .as_deref()
+            .map(|t| parse_ts(t, "last_used_at"))
+            .transpose()?,
+    })
+}
+
+/// Names an enrollment may carry. Lowercase kebab, bounded, and never a word
+/// that already means another speaker — the name is rendered into the
+/// conversation as attribution, so "orchestrator" or "human" here would be
+/// impersonation with a valid credential. Refused rather than normalized: a
+/// name silently rewritten is a different name than the one the minter chose.
+fn validate_agent_name(name: &str) -> Result<(), StoreError> {
+    const RESERVED: &[&str] = &[
+        "human",
+        "user",
+        "orchestrator",
+        "pipeline",
+        "system",
+        "assistant",
+        "event",
+        "agent",
+        "server",
+        "tasks",
+    ];
+    if name.is_empty() {
+        return Err(StoreError::Invalid("name is empty".into()));
+    }
+    if name.chars().count() > 40 {
+        return Err(StoreError::Invalid(
+            "name is over 40 characters".to_string(),
+        ));
+    }
+    let well_formed = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !well_formed {
+        return Err(StoreError::Invalid(format!(
+            "name \"{name}\" must be lowercase letters, digits and inner hyphens"
+        )));
+    }
+    if RESERVED.contains(&name) {
+        return Err(StoreError::Invalid(format!(
+            "\"{name}\" already names another speaker — pick a name for the agent itself"
+        )));
+    }
+    Ok(())
+}
+
 fn charter_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CharterEntry, StoreError> {
     let capability_raw: String = row.try_get("capability")?;
     let level_raw: String = row.try_get("level")?;
@@ -5783,6 +6001,36 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         assert_eq!(store.get_mode().await.unwrap(), Mode::Pause);
         assert!(store.list_projects().await.unwrap().is_empty());
+    }
+
+    /// The lapsed-code refusal is decided off `expires_at`, and the row
+    /// survives its own expiry — the audit trail for turns already spoken.
+    /// Expiry is rewound with raw SQL here because nothing public moves a
+    /// clock, deliberately.
+    #[tokio::test]
+    async fn an_expired_enrollment_is_past_its_window_and_its_name_is_free() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (row, code) = store
+            .enroll_agent("lapsed", Actor::Human, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_enrollments SET expires_at = ? WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+            .bind(row.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // The lookup still answers — the *caller* refuses on the timestamps,
+        // so it has to see them.
+        let found = store.agent_by_code(&code).await.unwrap().unwrap();
+        assert!(found.expires_at <= Utc::now());
+
+        // And expiry releases the name without a revoke.
+        store
+            .enroll_agent("lapsed", Actor::Human, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -31,10 +31,11 @@ use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
-    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, SettleDecisionRequest, ShadowAck,
+    EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse, ErrorResponse, GitHubHold,
+    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
+    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, RevokeAgentRequest, ScoutRequest,
+    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus,
+    SettleDecisionRequest, ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -42,15 +43,15 @@ use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
 use crate::github_health::GitHubHealth;
 use crate::models::{
-    Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
-    Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions, GhState, Mode,
-    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind,
-    ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId, TranscriptLine, TranscriptOwner,
+    Actor, AgentEnrollment, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole,
+    CloseReason, Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions,
+    GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus,
+    RunKind, ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
-    ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
-    require_rationale,
+    ACTOR_HEADER, AGENT_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store,
+    StoreError, require_rationale,
 };
 
 /// How many events `/events` returns when the caller doesn't ask for a count.
@@ -185,6 +186,14 @@ pub struct Services {
     /// written by a gate, so a router with no dispatchers behind it would have
     /// nothing to report even if it held one.
     pub pool_health: Option<Arc<crate::pool_health::PoolHealth>>,
+    /// Who the server's own GitHub credential is, remembered for a while.
+    ///
+    /// **The only non-`Option` field here**, and deliberately: every other
+    /// service's absence has a distinct answer (a 503, no hold), and this
+    /// one's does not — a router with no GitHub client answers
+    /// `Unauthenticated`, which is the same thing an empty cache in front of
+    /// no client would answer. There is nothing for an `Option` to say.
+    pub viewer: Arc<crate::viewer::ViewerCache>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -227,6 +236,12 @@ impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
 impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.pool_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<crate::viewer::ViewerCache> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.viewer.clone()
     }
 }
 
@@ -320,6 +335,8 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/messages",
             get(list_orchestrator_messages).post(send_orchestrator_message),
         )
+        .route("/agents", get(list_agents).post(enroll_agent))
+        .route("/agents/{id}/revoke", post(revoke_agent))
         .route("/orchestrator/stream", get(stream_orchestrator))
         .route("/orchestrator/session", get(get_orchestrator_session))
         .route(
@@ -330,6 +347,7 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/session/release",
             post(release_orchestrator_session),
         )
+        .route("/viewer", get(get_viewer))
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
@@ -2611,7 +2629,9 @@ async fn look_up_artifact(
         | DecisionAction::AuthorSpec
         | DecisionAction::QueueTask
         | DecisionAction::CancelRun
-        | DecisionAction::SettleDecision => (
+        | DecisionAction::SettleDecision
+        | DecisionAction::EnrollAgent
+        | DecisionAction::RevokeAgent => (
             "unknown",
             serde_json::Value::Null,
             "this action never reaches another system, so it has no artifact to find —              a pending row here is a bug, not a window"
@@ -3068,18 +3088,205 @@ struct MessagesQuery {
 
 /// 202: the message is queued; the orchestrator loop answers it. Watch
 /// `orchestrator_message` events (or poll) for the reply.
+///
+/// Who is speaking is decided by headers, and the decision is three-way. No
+/// [`AGENT_HEADER`] is the human — the default every unattributed request
+/// gets, and the human is never gated. A header carrying a *valid* enrollment
+/// code is that agent: the turn lands as [`ChatRole::Event`] under a
+/// server-written `[agent <name>]` heading, so the orchestrator (and the
+/// transcript's reader) can see it is neither the human nor the pipeline. A
+/// header that does not verify — unknown, expired, revoked — is a 403 and the
+/// message is *discarded*: demoting a failed claim to "the human" is the one
+/// direction this must never fail, the same rule [`ACTOR_HEADER`] follows.
+/// The refusals name their fix, because the retrying party is an agent that
+/// can only act on what the error says.
 async fn send_orchestrator_message(
     State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SendMessage>,
 ) -> ApiResult<(StatusCode, Json<OrchestratorMessage>)> {
     let content = body.content.trim();
     if content.is_empty() {
         return Err(ApiError::BadRequest("message is empty".into()));
     }
+    let Some(code) = headers.get(AGENT_HEADER).and_then(|v| v.to_str().ok()) else {
+        let message = store
+            .append_orchestrator_message(ChatRole::User, content)
+            .await?;
+        return Ok((StatusCode::ACCEPTED, Json(message)));
+    };
+    let enrollment = store.agent_by_code(code).await?.ok_or_else(|| {
+        ApiError::Forbidden(format!(
+            "{AGENT_HEADER} did not verify — the message was not delivered. A failed \
+             claim is refused rather than read as the human; ask the human for an \
+             enrollment code (POST /agents) and send it exactly as issued."
+        ))
+    })?;
+    if let Some(revoked_at) = enrollment.revoked_at {
+        return Err(ApiError::Forbidden(format!(
+            "the enrollment for \"{}\" was revoked at {revoked_at} — the message was \
+             not delivered. Ask the human for a new code if you should still have a \
+             voice here.",
+            enrollment.name
+        )));
+    }
+    if enrollment.expires_at <= chrono::Utc::now() {
+        return Err(ApiError::Forbidden(format!(
+            "the enrollment for \"{}\" expired at {} — the message was not delivered. \
+             Ask the human for a new code (POST /agents).",
+            enrollment.name, enrollment.expires_at
+        )));
+    }
+    // The heading is written here, server-side, so it can never be claimed —
+    // same as `[pipeline]`. Everything after the first line is the agent's
+    // own text, and the prompt says to read it that way.
+    let attributed = format!(
+        "[agent {}] Message from an enrolled external agent — not the human, \
+         not the pipeline:\n{content}",
+        enrollment.name
+    );
     let message = store
-        .append_orchestrator_message(ChatRole::User, content)
+        .append_orchestrator_message(ChatRole::Event, &attributed)
         .await?;
+    if let Err(e) = store.touch_agent(enrollment.id).await {
+        warn!(error = %e, agent = %enrollment.name, "could not stamp agent last_used_at");
+    }
     Ok((StatusCode::ACCEPTED, Json(message)))
+}
+
+// --- agent enrollments ---
+
+/// Mint an enrollment code (the device-code flow): the human — or the
+/// orchestrator, under `enroll_agents` — names an external agent and gets a
+/// short-lived code to hand it. The code appears in this response and never
+/// again; the server keeps a hash.
+///
+/// The ledger row is written after the mint rather than inside it, the
+/// `queue_task` shape: minting is trivially reversible (revoke), so the row
+/// is audit, not authorization. What `authorize` puts *ahead* of the mint is
+/// the part that must refuse first — the charter level and the rationale.
+async fn enroll_agent(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<EnrollAgentRequest>,
+) -> ApiResult<Response> {
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::EnrollAgents,
+        DecisionAction::EnrollAgent,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "agent",
+                body.name.trim(),
+                DecisionAction::EnrollAgent,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no code was minted"));
+    }
+    let (enrollment, code) = store.enroll_agent(&body.name, actor, body.ttl_secs).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "agent",
+                &enrollment.id.to_string(),
+                DecisionAction::EnrollAgent,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: "agents".into(),
+            message: format!(
+                "agent \"{}\" enrolled by {} until {}",
+                enrollment.name,
+                actor.as_str(),
+                enrollment.expires_at.format("%Y-%m-%d %H:%M UTC"),
+            ),
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(EnrollAgentResponse { enrollment, code }),
+    )
+        .into_response())
+}
+
+/// Enrollments, newest first — who can speak, who spoke, and what has lapsed.
+async fn list_agents(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<AgentEnrollment>>> {
+    Ok(Json(store.list_agent_enrollments(100).await?))
+}
+
+/// End an enrollment early — the recourse for a mint that was wrong, under
+/// the same capability that minted it.
+async fn revoke_agent(
+    State(store): State<Arc<Store>>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<RevokeAgentRequest>>,
+) -> ApiResult<Response> {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::EnrollAgents,
+        DecisionAction::RevokeAgent,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "agent",
+                &id.to_string(),
+                DecisionAction::RevokeAgent,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the enrollment was not revoked"));
+    }
+    let enrollment = store.revoke_agent(id).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "agent",
+                &id.to_string(),
+                DecisionAction::RevokeAgent,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: "agents".into(),
+            message: format!(
+                "agent \"{}\" enrollment revoked by {}",
+                enrollment.name,
+                actor.as_str()
+            ),
+        })
+        .await?;
+    Ok(Json(enrollment).into_response())
 }
 
 /// The conversation, always bounded.
@@ -3168,6 +3375,36 @@ async fn stream_orchestrator(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+}
+
+// --- viewer ---
+
+/// `GET /viewer` — who the server's own GitHub credential is.
+///
+/// **Its own route rather than a `/status` field.** `/status` is `reload`'s
+/// liveness probe for a swap and is polled by `tasks status` and the Server
+/// window, and its own `pool` field already carries the rule that a status
+/// request must not make a round trip to another daemon. A GitHub call there
+/// would be the same mistake with a longer tail.
+///
+/// **Always a 200.** All three answers are states this route reports, not
+/// failures of it: a fresh machine with no token is the *common* case, and a
+/// 503 there would put a red banner on an app that is working correctly.
+///
+/// Not charter-gated and it writes no `decisions` row — it is a read that
+/// changes nothing upstream.
+///
+/// It is the second route that spends the server's GitHub credential outbound
+/// on a `GET`, so it joins `GET /decisions/{seq}/reconcile` in
+/// [`crate::loopback`]'s stated residual — a cross-site `<img src>` carries no
+/// `Origin` and a loopback `Host`, so it passes the guard. What bounds it is
+/// the cache this route needed anyway: a forced read costs at most one GitHub
+/// call per failure TTL however often it is triggered.
+async fn get_viewer(
+    State(cache): State<Arc<crate::viewer::ViewerCache>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+) -> Json<Viewer> {
+    Json(cache.get(github.as_ref()).await)
 }
 
 // --- mode ---
@@ -4733,6 +4970,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// A router with no GitHub client answers, rather than failing: "nobody
+    /// has sealed a token into this server yet" is the ordinary state of a
+    /// fresh machine, and a 503 there would put a red banner on an app that is
+    /// working correctly.
+    #[tokio::test]
+    async fn viewer_answers_unauthenticated_without_a_credential() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let base = spawn(store).await;
+        let resp = reqwest::get(format!("{base}/viewer")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<Viewer>().await.unwrap(),
+            Viewer::Unauthenticated
+        );
+    }
+
+    /// The cache is proved by taking GitHub away between the two reads: the
+    /// second one is answered from memory, so an app refreshing on every SSE
+    /// event costs one GitHub call per `SUCCESS_TTL` rather than one per event.
+    #[tokio::test]
+    async fn viewer_is_cached_across_reads() {
+        let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gh_url = format!("http://{}/graphql", gh_listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let gh = axum::Router::new().route(
+            "/graphql",
+            post(|| async {
+                Json(json!({"data": {"viewer": {
+                    "login": "octocat",
+                    "avatarUrl": "https://avatars.example/u/9",
+                    "url": "https://github.example/octocat",
+                }}}))
+            }),
+        );
+        let served = tokio::spawn(async move {
+            axum::serve(gh_listener, gh)
+                .with_graceful_shutdown(async {
+                    stopped.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router_with_services(
+            store,
+            Services {
+                github: Some(Arc::new(GitHubClient::with_base_url("token", gh_url))),
+                ..Default::default()
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let read = async || {
+            reqwest::get(format!("{base}/viewer"))
+                .await
+                .unwrap()
+                .json::<Viewer>()
+                .await
+                .unwrap()
+        };
+        let first = read().await;
+        assert_eq!(
+            first,
+            Viewer::Known {
+                login: "octocat".into(),
+                avatar_url: "https://avatars.example/u/9".into(),
+                profile_url: "https://github.example/octocat".into(),
+            }
+        );
+
+        // GitHub goes away entirely; the held answer must survive it.
+        stop.send(()).ok();
+        served.await.unwrap();
+        assert_eq!(read().await, first);
     }
 
     /// `/status` is the answer for whoever arrives *after* the edge was

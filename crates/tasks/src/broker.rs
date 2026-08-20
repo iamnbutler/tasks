@@ -227,10 +227,21 @@ impl Lease {
 /// humans reading a leak: it names what leaked (a tasks lease, dead minutes
 /// later) rather than leaving a bare blob to be treated as a key.
 fn mint_token() -> (String, String) {
+    mint_with_prefix("tl")
+}
+
+/// Mint an agent enrollment code and its storable hash (`Store::enroll_agent`).
+/// Same custody as a lease — 256 random bits, hash at rest — with its own
+/// prefix so a leak names itself: a short-lived message code, not a key.
+pub fn mint_agent_code() -> (String, String) {
+    mint_with_prefix("ta")
+}
+
+fn mint_with_prefix(prefix: &str) -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = format!(
-        "tl-{}",
+        "{prefix}-{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     );
     let hash = token_hash(&token);

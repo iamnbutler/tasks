@@ -42,6 +42,7 @@ use crate::components::{
     markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::context_gauge::{self, Band, Gauge};
+use crate::empty_state::{self, Action as EmptyStateAction, Explanation, Reachability};
 use crate::feed::{self, FeedKey, FeedRowKind};
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
@@ -53,6 +54,7 @@ use crate::projects::ProjectFilter;
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
+use crate::server_window;
 use crate::state::AppState;
 use crate::time;
 
@@ -61,12 +63,6 @@ pub(crate) const FONT: &str = "Menlo";
 /// Reading-width cap for conversation content — long markdown replies
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
-
-/// The signed-in human, hardcoded until device-flow login exists: the chat
-/// chip's avatar and where clicking it goes. One place on purpose — login
-/// replaces these two constants and nothing else.
-const GITHUB_PROFILE_URL: &str = "https://github.com/iamnbutler";
-const GITHUB_AVATAR_URL: &str = "https://avatars.githubusercontent.com/u/1714999?v=4";
 
 /// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
 /// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
@@ -251,10 +247,17 @@ pub struct Workspace {
     /// repo's tasks below. `true` shows the repo level — entered by the
     /// header's ‹ chevron, left by choosing a repo.
     pub(crate) rail_shows_repos: bool,
-    /// The chat chip's avatar, fetched once off the main thread. `None`
-    /// until it lands (or forever, offline) — the chip renders a quiet
-    /// placeholder circle rather than blocking on it.
+    /// The chat chip's avatar, fetched off the main thread. `None` until it
+    /// lands (or forever, offline, or on a server with no identity to give) —
+    /// the chip renders a quiet placeholder circle rather than blocking on it.
     avatar: Option<std::sync::Arc<gpui::Image>>,
+    /// Which URL [`Self::avatar`] was fetched for, so [`Self::sync_avatar`] is
+    /// idempotent per URL. The observer fires on every notify, and without
+    /// this it would spawn a fetch thread per event.
+    ///
+    /// Also what makes a *changed* URL — a server whose token was rotated to
+    /// another account — clear the stale face rather than keep it.
+    avatar_source: Option<String>,
     /// The rail header's ⋮ menu — the chrome that lost its titlebar slot
     /// (refresh, the Server window). A popover for the same leak reason as
     /// the switcher.
@@ -289,6 +292,7 @@ impl Workspace {
         // re-derive it. `sync` is a no-op unless something actually moved.
         cx.observe(&app_state, |this: &mut Self, _, cx| {
             this.sync_menus(cx);
+            this.sync_avatar(cx);
             cx.notify();
         })
         .detach();
@@ -326,6 +330,16 @@ impl Workspace {
                             || this.server_control.read(cx).busy();
                         if live || ticks.is_multiple_of(30) {
                             cx.notify();
+                        }
+                        // The three dispatch holds live on `GET /status`, and
+                        // until #992 only the Server window ever read it — so
+                        // the main window could not say why the pipeline was
+                        // idle. Same cadence as that window, and `refresh`
+                        // coalesces on its own `probing` flag, so two pollers
+                        // are one request.
+                        if ticks.is_multiple_of(server_window::POLL.as_secs()) {
+                            this.server_control
+                                .update(cx, |control, cx| control.refresh(cx));
                         }
                     })
                     .is_ok();
@@ -506,42 +520,6 @@ impl Workspace {
         let feed_list = ListState::new(0, ListAlignment::Top, px(2048.));
         feed_list.set_follow_mode(FollowMode::Tail);
 
-        // The avatar, once, off the main thread. A miss is a permanent
-        // placeholder, not a retry loop — this is chrome, not data.
-        {
-            let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
-            std::thread::Builder::new()
-                .name("tasks-avatar-fetch".into())
-                .spawn(move || {
-                    let Ok(response) = ureq::get(GITHUB_AVATAR_URL).call() else {
-                        return;
-                    };
-                    let mut bytes = Vec::new();
-                    use std::io::Read as _;
-                    if response.into_reader().read_to_end(&mut bytes).is_err() {
-                        return;
-                    }
-                    // GitHub serves avatars as PNG or JPEG depending on the
-                    // upload; sniff rather than trust the URL.
-                    let format = match bytes.first() {
-                        Some(0xFF) => gpui::ImageFormat::Jpeg,
-                        _ => gpui::ImageFormat::Png,
-                    };
-                    tx.send(gpui::Image::from_bytes(format, bytes)).ok();
-                })
-                .expect("spawn avatar-fetch thread");
-            cx.spawn(async move |this, cx| {
-                if let Ok(image) = rx.await {
-                    this.update(cx, |this: &mut Workspace, cx| {
-                        this.avatar = Some(std::sync::Arc::new(image));
-                        cx.notify();
-                    })
-                    .ok();
-                }
-            })
-            .detach();
-        }
-
         Self {
             focus_handle,
             nav: NavHistory::default(),
@@ -578,6 +556,7 @@ impl Workspace {
             project_filter: ProjectFilter::All,
             rail_shows_repos: false,
             avatar: None,
+            avatar_source: None,
             rail_overflow,
             context_popover,
             repo_input,
@@ -668,6 +647,76 @@ impl Workspace {
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.app_state
             .update(cx, |state, cx| state.set_mode(mode, cx));
+    }
+
+    /// Fetch the chat chip's avatar when the server's answer names a URL this
+    /// has not already fetched.
+    ///
+    /// Runs from the `app_state` observer rather than at construction: the URL
+    /// is no longer a constant, so at construction there is nothing to fetch.
+    /// The observer fires on **every** notify, which is why this is idempotent
+    /// per URL — without the [`Self::avatar_source`] comparison it would spawn
+    /// a fetch thread per event, including on every event of a server with no
+    /// identity to give.
+    ///
+    /// A changed URL — a token rotated to another account — clears the stale
+    /// face before the new one lands, so the chip never shows one account
+    /// while linking to another. That branch is reachable because a settled
+    /// identity is re-asked on an interval; see
+    /// [`crate::identity::should_ask_for_viewer`].
+    ///
+    /// A miss is a permanent placeholder for that URL, not a retry loop —
+    /// this is chrome, not data. `gpui::img` is only ever handed a *decoded*
+    /// image, so a URL that 404s or a dead network falls through to the
+    /// placeholder circle rather than rendering empty.
+    fn sync_avatar(&mut self, cx: &mut Context<Self>) {
+        let url = crate::identity::avatar_url(self.app_state.read(cx).viewer.as_ref());
+        if url == self.avatar_source {
+            return;
+        }
+        // Clear first: whatever is on screen belongs to the previous answer.
+        self.avatar = None;
+        self.avatar_source = url.clone();
+        let Some(url) = url else {
+            return;
+        };
+
+        let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
+        let fetch_url = url.clone();
+        std::thread::Builder::new()
+            .name("tasks-avatar-fetch".into())
+            .spawn(move || {
+                let Ok(response) = ureq::get(&fetch_url).call() else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                use std::io::Read as _;
+                if response.into_reader().read_to_end(&mut bytes).is_err() {
+                    return;
+                }
+                // GitHub serves avatars as PNG or JPEG depending on the
+                // upload; sniff rather than trust the URL.
+                let format = match bytes.first() {
+                    Some(0xFF) => gpui::ImageFormat::Jpeg,
+                    _ => gpui::ImageFormat::Png,
+                };
+                tx.send(gpui::Image::from_bytes(format, bytes)).ok();
+            })
+            .expect("spawn avatar-fetch thread");
+        cx.spawn(async move |this, cx| {
+            if let Ok(image) = rx.await {
+                this.update(cx, |this: &mut Workspace, cx| {
+                    // Another answer may have landed while this was in
+                    // flight; only the current URL's bytes may be shown.
+                    if this.avatar_source.as_deref() == Some(url.as_str()) {
+                        this.avatar = Some(std::sync::Arc::new(image));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Rebuild the menu bar from the facts it depends on, which live in three
@@ -1476,9 +1525,15 @@ impl Workspace {
     /// The chip at the chat's top-right, per the design: the mic (voice mode
     /// with the orchestrator, later — shipped disabled so the slot exists),
     /// a divider, and the signed-in human's avatar, which opens their GitHub
-    /// profile until device-flow login gives it more to do.
+    /// profile.
+    ///
+    /// Who that is comes from `GET /viewer` — the server's own credential —
+    /// and is **inert in every state but the one with a real identity behind
+    /// it**: no pointer, no click, and the placeholder keeps its footprint so
+    /// nothing reflows. See [`crate::identity`] for the four states.
     fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let identity = crate::identity::chip_identity(self.app_state.read(cx).viewer.as_ref());
         let mic = std::sync::Arc::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Svg,
             MIC_SVG.to_vec(),
@@ -1489,8 +1544,8 @@ impl Workspace {
                 .size(px(22.))
                 .rounded_full()
                 .into_any_element(),
-            // Offline, or not landed yet: a quiet placeholder, same
-            // footprint, still a working link.
+            // No identity, offline, or not landed yet: a quiet placeholder,
+            // same footprint.
             None => div()
                 .size(px(22.))
                 .rounded_full()
@@ -1528,10 +1583,14 @@ impl Workspace {
                 div()
                     .id("github-profile")
                     .flex_none()
-                    .cursor_pointer()
-                    .tooltip(tooltip("iamnbutler on GitHub"))
-                    .on_click(|_event, _window, cx| {
-                        cx.open_url(GITHUB_PROFILE_URL);
+                    .tooltip(tooltip(identity.tooltip))
+                    // No identity ⇒ no cursor and no click. A chip that looks
+                    // clickable and opens nothing (or somebody else's
+                    // profile) is what #987 was.
+                    .when_some(identity.profile_url, |this, url| {
+                        this.cursor_pointer().on_click(move |_event, _window, cx| {
+                            cx.open_url(&url);
+                        })
                     })
                     .child(avatar),
             )
@@ -2287,8 +2346,25 @@ impl Workspace {
     }
 
     /// What an empty conversation says about itself.
-    fn render_chat_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// With nothing reachable the invitation below is a lie — there is
+    /// nothing to talk to — so the diagnosis takes the pane instead. Only the
+    /// three connection states can appear here, which is why this asks
+    /// `explain_reachability` rather than walking the lists.
+    fn render_chat_empty_state(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
+        let reachability = self.reachability(cx);
+        if reachability != Reachability::Up {
+            let explanation = empty_state::explain_reachability(reachability);
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(self.render_explanation(&explanation, "empty-chat", false, cx))
+                .into_any_element();
+        }
         div()
             .flex_1()
             .flex()
@@ -2314,6 +2390,7 @@ impl Workspace {
                          tasks and specs, and file issues. Press ⌘↩ to send.",
                     ),
             )
+            .into_any_element()
     }
 
     // --- the Agent Feed ---
@@ -2628,6 +2705,178 @@ impl Workspace {
         }
     }
 
+    // --- why a pane is empty (#992) ---
+    //
+    // The join: the lists, the mode and the connection come from `AppState`,
+    // the three dispatch holds from `ServerControl`'s `/status`. Everything
+    // decidable lives in `crate::empty_state`, which is gpui-free and unit
+    // tested; what is left here is where the sentence hangs and what it looks
+    // like, which is `make app` on a Mac.
+
+    /// How much of the server this window can currently see.
+    pub(crate) fn reachability(&self, cx: &App) -> Reachability {
+        let state = self.app_state.read(cx);
+        Reachability::read(
+            state.build_warning.is_some(),
+            state.connected,
+            state.error.is_some(),
+        )
+    }
+
+    /// This window's pipeline, counted once.
+    ///
+    /// Scoped by [`Self::project_filter`] for the tasks and deliberately not
+    /// for the projects — see [`empty_state::Pipeline::count`]. The scoping is
+    /// also what keeps the rail's two placements mutually exclusive: within a
+    /// filter, an empty tree means nothing queued, and every standing
+    /// situation needs something queued.
+    pub(crate) fn pipeline(&self, cx: &App) -> empty_state::Pipeline {
+        let reachability = self.reachability(cx);
+        let holds = empty_state::observe(self.server_control.read(cx).status.as_ref());
+        let state = self.app_state.read(cx);
+        empty_state::Pipeline::count(
+            reachability,
+            &state.projects,
+            &state.tasks,
+            &state.spec_queue,
+            &self.project_filter,
+            state.mode,
+            holds,
+        )
+    }
+
+    /// The one thing this window has to say about an empty pane.
+    pub(crate) fn explanation(&self, cx: &App) -> Explanation {
+        empty_state::explain(&self.pipeline(cx))
+    }
+
+    /// Render one diagnosis.
+    ///
+    /// `id` is per **placement** and required rather than derived: a server
+    /// that is not answering empties the rail, the catalog and the chat at
+    /// once, and gpui keys interactive elements by id — one constant here
+    /// would put three identically-keyed buttons in one window.
+    ///
+    /// `compact` is the standing line above a rail that has rows: a chip
+    /// under the section header rather than a block where a list would have
+    /// been.
+    pub(crate) fn render_explanation(
+        &self,
+        explanation: &Explanation,
+        id: &'static str,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let block = div()
+            .flex()
+            .flex_col()
+            .gap(px(if compact { 4. } else { 8. }))
+            .when(compact, |el| {
+                el.mx(px(6.))
+                    .mb(px(4.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(5.))
+                    .bg(theme.surface_secondary())
+            })
+            .when(!compact, |el| el.items_center().p(px(16.)))
+            .child(
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center().text_sm())
+                    .when(compact, |el| el.text_xs())
+                    .text_color(theme.fg())
+                    .child(explanation.headline),
+            )
+            .child(
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center())
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(explanation.detail.clone()),
+            );
+
+        let block = match explanation.action {
+            None => block,
+            Some(action) => block
+                .child(
+                    div()
+                        .id(id)
+                        .flex_none()
+                        .mt(px(2.))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(theme.border_secondary())
+                        .text_xs()
+                        .text_color(theme.fg())
+                        .cursor_pointer()
+                        .hover({
+                            let hover_bg = theme.surface_tertiary();
+                            move |el| el.bg(hover_bg)
+                        })
+                        // The caution is the disclaimer module's words, never
+                        // a second wording of our own: this is a fourth
+                        // surface for a control the About window, the Server
+                        // window and the title bar already caution, and it is
+                        // the one a new reader meets first (#984).
+                        .when(action.starts_the_pipeline(), |el| {
+                            el.tooltip(tooltip(crate::disclaimer::PLAY_TOOLTIP))
+                        })
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.run_empty_state_action(action, window, cx);
+                        }))
+                        .child(action.label()),
+                )
+                // Said in full and not only on hover, for the same reason the
+                // Server window says it in full: the reader with the least
+                // context must not be the one who has to find the tooltip.
+                .when(action.starts_the_pipeline(), |el| {
+                    el.child(
+                        div()
+                            .when(!compact, |el| el.max_w(px(420.)).text_center())
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child(crate::disclaimer::PIPELINE_CAUTION),
+                    )
+                }),
+        };
+
+        // Holds that are true but are not the headline. Said, never pressed.
+        block
+            .children(explanation.notes.iter().map(|note| {
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center())
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(note.clone())
+            }))
+            .into_any_element()
+    }
+
+    /// Every empty-state button goes through the action the menus already
+    /// dispatch, so there is no second path to starting the server and the
+    /// Server window's confirmation stays the only confirmation.
+    fn run_empty_state_action(
+        &mut self,
+        action: EmptyStateAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            // One action for both: `tasks reload` with no live pid already
+            // *is* a start, which is why the command palette renames the one
+            // item rather than offering two.
+            EmptyStateAction::StartServer | EmptyStateAction::RestartServer => {
+                window.dispatch_action(Box::new(menus::RestartServer), cx);
+            }
+            EmptyStateAction::AddRepo => self.open_repo_window(cx),
+            EmptyStateAction::OpenAllTasks => self.navigate(MiddleView::AllTasks, cx),
+            EmptyStateAction::Play => self.set_mode(Mode::Play, cx),
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let loaded = self.app_state.read(cx).loaded;
@@ -2650,13 +2899,11 @@ impl Workspace {
             );
 
         if !loaded {
-            return pane.child(
-                div()
-                    .p(px(16.))
-                    .text_sm()
-                    .text_color(theme.fg_muted())
-                    .child("Connecting to the tasks server…"),
-            );
+            // No snapshot yet, so the lists behind the full walk have never
+            // been filled — only the connection is knowable, and
+            // `explain_reachability` is what refuses to guess past it.
+            let explanation = empty_state::explain_reachability(self.reachability(cx));
+            return pane.child(self.render_explanation(&explanation, "empty-center", false, cx));
         }
 
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),

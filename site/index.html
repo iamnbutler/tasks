@@ -3,162 +3,230 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tasks — an autonomous software pipeline with a human in the loop</title>
-<meta name="description" content="Tasks turns a GitHub issue tracker into shipped pull requests by orchestrating coding agents — you review, it works.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9 6 L15 16 L9 26 L3 16 Z' fill='none' stroke='%23a89984' stroke-width='2'/%3E%3Cpath d='M23 6 L29 16 L23 26 L17 16 Z' fill='%23a89984'/%3E%3C/svg%3E">
-<style>
-  :root {
-    --paper: #fbf1c7;
-    --ink: #3c3836;
-    --muted: #7c6f64;
-    --link: #076678;
-    --danger: #9d0006;
-    --rule: #d5c4a1;
-    --code-bg: #ebdbb2;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --paper: #282828;
-      --ink: #ebdbb2;
-      --muted: #a89984;
-      --link: #83a598;
-      --danger: #fb4934;
-      --rule: #504945;
-      --code-bg: #3c3836;
-    }
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body {
-    background: var(--paper);
-    color: var(--ink);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    font-size: 0.9375rem;
-    line-height: 1.55;
-  }
-  main {
-    max-width: 40rem;
-    margin: 0 auto;
-    padding: 2.5rem 1.25rem 1.5rem;
-  }
-  a { color: var(--link); text-decoration: underline; text-underline-offset: 2px; }
-  a:hover { text-decoration-thickness: 2px; }
-
-  h1 {
-    font-size: 1.625rem;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    line-height: 1.15;
-    margin-bottom: 0.5rem;
-  }
-  .lede { font-size: 1rem; }
-  .meta {
-    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.75rem;
-    color: var(--muted);
-    margin-top: 0.75rem;
-  }
-  .meta a { color: var(--muted); }
-
-  h2 {
-    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--muted);
-    border-top: 1px solid var(--rule);
-    padding-top: 0.8rem;
-    margin: 1.8rem 0 0.6rem;
-  }
-  p + p { margin-top: 0.7rem; }
-  strong { font-weight: 700; }
-
-  code {
-    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.875em;
-    background: var(--code-bg);
-    padding: 0.1em 0.35em;
-    border-radius: 3px;
-  }
-
-  .warning {
-    border-left: 3px solid var(--danger);
-    padding-left: 0.9rem;
-    margin-top: 0.6rem;
-  }
-  .warning-head { border-top: none; color: var(--danger); }
-
-  footer {
-    border-top: 1px solid var(--rule);
-    margin-top: 2rem;
-    padding: 0.8rem 0;
-    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.75rem;
-    color: var(--muted);
-  }
-  footer a { color: var(--muted); }
-
-  .banner {
-    background: var(--code-bg);
-    border-bottom: 1px solid var(--rule);
-    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.75rem;
-    text-align: center;
-    padding: 0.5rem 1.25rem;
-  }
-  .soon { color: var(--muted); }
-</style>
+<title>Tasks</title>
+<meta name="description" content="Tasks is a program that runs coding agents against your GitHub issue tracker. It runs on your own Mac, on repositories you point it at, with your own API key.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Tasks">
+<meta property="og:description" content="A program that runs coding agents against your GitHub issue tracker. It runs on your own Mac, on repositories you point it at, with your own API key.">
+<meta property="og:url" content="https://nate.rip/tasks/">
+<meta property="og:image" content="https://nate.rip/tasks/img/workspace.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Tasks">
+<meta name="twitter:description" content="A program that runs coding agents against your GitHub issue tracker. It runs on your own Mac, on repositories you point it at, with your own API key.">
+<meta name="twitter:image" content="https://nate.rip/tasks/img/workspace.png">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="banner">Tasks isn't quite ready yet — follow the
-<a href="https://github.com/iamnbutler/tasks/issues/999">road to release</a>.</div>
 <main>
 
-<header>
-  <h1>Tasks</h1>
-  <p class="lede">An autonomous software pipeline with a human in the loop.
-  Tasks turns a GitHub issue tracker into shipped pull requests by
-  orchestrating coding agents — you review, it works.</p>
-  <p class="meta">alpha &nbsp;·&nbsp; macOS &nbsp;·&nbsp; Rust &nbsp;·&nbsp; MIT
-  &nbsp;·&nbsp; <a href="https://github.com/iamnbutler/tasks">GitHub</a></p>
-</header>
+<h1>Tasks</h1>
 
-<h2>Download</h2>
-<p><a>Download</a> &nbsp;|&nbsp; <a>Client only</a> &nbsp;|&nbsp;
-<a>Server only</a> &nbsp;<span class="soon">(coming soon)</span></p>
+<p>Tasks is a program that runs coding agents against your GitHub issue
+tracker. It reads your open issues; for each one you queue, it sends an agent
+to explore the codebase and write a spec, waits for you to approve that spec,
+sends a second agent to implement it, opens a pull request, and closes the
+issue once the work is actually on <code>main</code>. It runs on your own Mac,
+on repositories you point it at, with your own API key.</p>
 
-<h2 class="warning-head">Warning</h2>
-<div class="warning">
-  <p>Running Tasks is risky. It runs autonomous agents, without permission
-  prompts, holding credentials that spend your Anthropic API budget and push
-  to your GitHub repositories. Research how it works before you run it, and
-  pay attention while it runs.</p>
-</div>
+<!--
+  The block below is the README's `## Read this first`, verbatim.
 
-<h2>Scouting</h2>
-<p>Scouts run in parallel, each in a throwaway VM. A Scout explores the
-codebase and writes a spec — a text document saying what to build and how.
-The spec is the deliverable; the Scout's code is discarded.</p>
+  Its words are #984's and belong to `README.md`. Both copies sit between
+  `disclaimer:start` / `disclaimer:end` markers, and two independent checks
+  compare them after normalisation: `disclaimer_on_the_page_matches_the_readme`
+  in `crates/tasks/tests/site.rs` (before a merge) and `site/check.sh` (before
+  a deploy). Edit the README, then re-run both.
+-->
+<section class="disclaimer">
+<!-- disclaimer:start -->
+<h2>Read this first</h2>
 
-<h2>Building</h2>
-<p>Approved specs go to a Builder, one build at a time. A Builder starts from
-a fresh branch and the spec alone — never Scout code — implements it, and
-opens a pull request. The issue closes only once the work reaches trunk:
-<code>done</code> means <em>shipped</em>.</p>
+<p>Tasks runs coding agents against your repositories with nobody in the loop
+between a decision and the act. Before you point it at anything, know what it
+does.</p>
 
-<h2>Orchestration</h2>
-<p>Between the two sits a review, by you or by the orchestrator — an agent
-that reads everything owed a decision and acts: queueing work, reviewing
-specs, dispatching and landing builds. What it may do is a nine-capability
-charter you control, and every act lands in a decisions ledger with its
-rationale, open to audit.</p>
+<ul>
+<li><strong>The agents run unattended, with permission checks off.</strong> Scouts and
+Builders are Claude Code processes started with
+<code>--dangerously-skip-permissions</code> (<code>images/scout/Dockerfile</code>,
+<code>images/builder/Dockerfile</code>): inside their VM they run whatever commands
+they decide to run, and nothing asks you first. The VM is the boundary, and
+it is a real one — each is ephemeral, and the credentials a run is given
+reach Anthropic and read the one repository it was dispatched for. Agents
+cannot push.</li>
+<li><strong>The server can.</strong> On an agent's say-so, under its own GitHub credential,
+while you are not watching, it pushes branches, opens pull requests, merges
+them, comments on issues and closes them. All nine capabilities in the
+orchestrator's charter ship <code>live</code> and uncapped
+(<code>crates/tasks/migrations/0016_charter_live.sql</code>) — no daily limit, no
+pre-approval gate, nothing that stops at the tenth merge of the day. The
+charter is a kill switch, not a promotion ladder, and the append-only
+decisions ledger is something you read afterwards. Any one capability can be
+switched off on its own, which is how you keep the pipeline and merge by
+hand:
+
+<pre><code>curl -X POST localhost:4800/charter/land_builds \
+     -H 'content-type: application/json' -d '{"level":"off"}'</code></pre></li>
+
+<li><strong>The local API has no authentication.</strong> Anything running on your machine
+that can reach port 4800 can drive the pipeline — start a Scout, start a
+Builder, merge a pull request — and it is recorded as you, because a caller
+that does not identify itself is read as the human and the human is never
+gated. Web pages are refused (<code>crates/tasks/src/loopback.rs</code>), but that
+guard is about pages, not about processes.</li>
+<li><strong>The orchestrator is not in a VM.</strong> It is a Claude Code agent in an
+ordinary child process on the machine running the server, and what it may
+do is whatever <code>ORCHESTRATOR_CMD</code> allows. The default is <code>curl</code> and nothing
+else; pointing <code>ORCHESTRATOR_WORKDIR</code> at a checkout and adding
+<code>--dangerously-skip-permissions</code>, which <code>CLAUDE.md</code> describes as a
+supported way to run it, makes it a full developer agent on your host.</li>
+</ul>
+
+<p>The server boots paused, so nothing moves until you say so. Point it at a
+repository you would not mind rewriting — a fork, a scratch repo, something
+where a bad pull request costs you a click. This is software one person wrote
+to run on his own machine, published in case it is useful to you: there is no
+warranty, nobody is on call, and if it breaks something of yours, fixing it is
+your job. The <code>LICENSE</code> says the same thing in the legal register.</p>
+<!-- disclaimer:end -->
+</section>
+
+<h2>How it works</h2>
+
+<p>The architecture is a double diamond: explore widely, decide once, build
+narrowly, ship.</p>
+
+<pre class="diagram">GitHub issues ──▶ backlog ──▶ queue ──▶ SCOUT ──▶ spec ──▶ review ──▶ BUILDER ──▶ PR ──▶ merged ──▶ done
+                                     (parallel)          (human or            (serial)
+                                                        orchestrator)</pre>
+
+<ul>
+<li><strong>Scouts</strong> run in parallel, each in its own ephemeral VM. A Scout explores
+the codebase and writes a <strong>spec</strong> — a text document saying what to build and
+how. The spec is the deliverable; the Scout's code is thrown away.</li>
+<li>Specs land in a <strong>review queue</strong>. You approve, request revision, or reject.
+Nothing is built from a spec nobody ruled on.</li>
+<li><strong>Builders</strong> run serially, one at a time. A Builder is given approved specs
+and never Scout code — the information barrier is deliberate, and it is why a
+Builder can batch several specs onto one branch. It implements them on a fresh
+branch and opens a pull request carrying its own test verdict.</li>
+<li>A <strong>merge watcher</strong> confirms the work actually reached the trunk, rather than
+trusting GitHub's <code>merged</code> flag, which only means a branch took the commit.
+The issue closes when the work is really on <code>main</code>, so <code>done</code> means shipped.</li>
+</ul>
+
+<p>Beside the pipeline sits an <strong>orchestrator</strong>: a Claude Code agent that wakes
+on a tick, reads a brief of everything owed a decision, and acts — queueing
+tasks, reviewing specs, dispatching builds, commenting upstream, landing pull
+requests. What it may do is a <strong>charter</strong> of nine independently switchable
+capabilities, each <code>off</code>, <code>shadow</code> or <code>live</code>, writable only by you and
+enforced by the server rather than by its prompt. Every act it takes lands in
+an append-only decisions ledger with the rationale it gave, which is what you
+read afterwards and what you reverse.</p>
+
+<h2>What it looks like</h2>
+
+<figure>
+<img src="img/workspace.png" width="2560" height="1600"
+     alt="The Tasks workspace: a rail of queued tasks on the left, a tabbed task view in the middle showing the task overview, and the orchestrator chat on the right.">
+<figcaption>The workspace. Queued tasks on the left, the selected task in the
+middle, the orchestrator's chat always open on the right.</figcaption>
+</figure>
+
+<figure>
+<img src="img/agent-feed.png" width="2560" height="1600"
+     alt="The live agent feed for a running Scout, showing the agent's tool calls and output streaming in as it explores the codebase.">
+<figcaption>A Scout running. The feed is the agent's own output, streamed out
+of the VM while it works.</figcaption>
+</figure>
+
+<figure>
+<img src="img/spec-review.png" width="2560" height="1600"
+     alt="A spec in the review queue, showing the summary, implementation approach and discovered pitfalls, with approve and request-revision controls.">
+<figcaption>A spec awaiting review. This is the decision the whole pipeline is
+built around; everything before it is exploration and everything after it is
+implementation.</figcaption>
+</figure>
+
+<h2>Before you start</h2>
+
+<ul>
+<li><strong>A Mac with Apple silicon.</strong> The VMs are
+<a href="https://github.com/apple/container">apple/container</a>'s, so this half is
+macOS only.</li>
+<li><strong>apple/container installed and its services started.</strong> <code>container system
+start</code> — having the CLI is not the same fact as having the runtime running,
+and only the second one starts a VM.</li>
+<li><strong>An Anthropic API key.</strong> Every agent run is metered to you. A pipeline left
+running is not cheap: a Scout and a Builder each get a budget measured in
+model-hours, and the orchestrator wakes on a tick whether or not anything
+happened.</li>
+<li><strong>A GitHub token that can push.</strong> The server pushes branches, opens pull
+requests and closes issues under it. Agents never hold it.</li>
+<li><strong>Rust, edition 2024</strong>, plus the Linux cross toolchain the VM images are
+built with (<code>rustup target add aarch64-unknown-linux-gnu</code> and a matching
+linker). Until there is a release, you build all of it yourself — the server,
+the app and the container images.</li>
+<li><strong>About 22 GB of RAM free</strong> at the default VM sizes: two Scouts at 6144 MB
+each, one Builder at 8192 MB, plus the container runtime's own builder. Fewer
+concurrent Scouts is the knob if you have less.</li>
+</ul>
+
+<h2>Getting it</h2>
+
+<p>There is no release yet. When there is one it will be a signed and
+notarized Mac app with the server inside it, published at
+<a href="https://github.com/iamnbutler/tasks/releases">the repository's releases
+page</a>. Until then there is nothing to download and the way to run it is to
+build it.</p>
+
+<pre><code>git clone https://github.com/iamnbutler/tasks
+cd tasks
+cargo build -p tasks
+export PATH="$PWD/target/debug:$PATH"
+
+tasks secrets init                     # sealed credential store
+tasks secrets set anthropic-api-key    # value on stdin
+tasks secrets set github-token
+cp .env.example .env
+cargo run -p tasks -- add-project owner/repo
+make images                            # the Scout and Builder VM images
+
+tasks vm-pool                          # terminal 1: the VM pool
+make serve                             # terminal 2: the server
+tasks doctor                           # terminal 3: is this machine ready?</code></pre>
+
+<p>The full sequence, with what each line is for and what goes wrong without
+it, is in the
+<a href="https://github.com/iamnbutler/tasks#running-it">README</a>.
+<code>make images</code> has no progress bar and takes a while; the long silences are
+cross-compiles.</p>
+
+<p>The server boots paused, and ingested issues land in a backlog that is never
+dispatched from. Pointing Tasks at a repository with ten thousand open issues
+gives you ten thousand backlog rows and zero agent runs — work moves only for
+the tasks you queue, once you put the pipeline in play. That is not a rate
+limit you can raise; it is the shape of the thing.</p>
+
+<h2>Reading</h2>
+
+<ul>
+<li><a href="https://github.com/iamnbutler/tasks">The repository</a> — the whole
+program, MIT licensed.</li>
+<li><a href="https://github.com/iamnbutler/tasks/blob/main/CLAUDE.md">CLAUDE.md</a> —
+worth reading on its own even if you never run this. It is the design rules
+written as arguments: every load-bearing decision with the failure that
+forced it, including the ones that were wrong first.</li>
+<li><a href="https://github.com/iamnbutler/tasks/issues">The issues</a> — this is
+also the pipeline's own input, so the tracker is what it is being built
+from.</li>
+<li><a href="https://github.com/iamnbutler/tasks/tree/main/docs/plans">docs/plans/</a>
+— the longer design documents.</li>
+</ul>
 
 <footer>
-  <p>MIT &nbsp;·&nbsp;
-  <a href="https://github.com/iamnbutler/tasks">source</a> &nbsp;·&nbsp;
-  <a href="https://github.com/iamnbutler/tasks/issues">issues</a> &nbsp;·&nbsp;
-  <a href="https://github.com/iamnbutler/tasks/blob/main/CLAUDE.md">design rules</a></p>
+<p>Alpha. It runs on one person's laptop. Built by
+<a href="https://nate.rip">Nate Butler</a>, largely by the pipeline itself.</p>
 </footer>
 
 </main>
