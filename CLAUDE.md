@@ -531,6 +531,51 @@ implementation.
   Safe with no leader election only because the pool refuses an occupied
   socket. Boot mode stays the quiet default; `tasks service install
   --default-mode play` is the explicit, crash-restart-inclusive opt-in.
+- **What never leaves this machine may be unsigned; what is downloaded is
+  signed, notarized and stapled — and the chain refuses rather than
+  degrades.** `make app` and `make dist` stay unsigned, and that is not an
+  oversight to fix later: they install to `$HOME/Applications` on the machine
+  that built them, where Gatekeeper has nothing to assess. A download does,
+  and it arrives carrying `com.apple.quarantine`. So there is a second chain
+  (`make release`, staged in `dist/`, full reasoning in
+  `docs/plans/2026-08-19-signing-and-notarization.md`) and **every target in it
+  errors on a missing credential rather than emitting an unsigned artifact**,
+  because the failure worth preventing is the quiet one: the `.dmg` that built
+  fine and reached a link unsigned, which nobody discovers until a stranger
+  double-clicks it. Four things hold its shape. **Sign inside-out and never
+  `--deep`** — `--deep` re-signs nested code with the *outer* bundle's
+  arguments, and the documented failure is a signature that verifies locally
+  and comes back Invalid from the notary service minutes later; the standalone
+  CLI is then a **copy of the signed seed** rather than a second signing act,
+  so the binary in the release and the one at `Contents/Helpers/tasks` are byte
+  identical. **`stapler` is the gate, not `notarytool --wait`**, since a ticket
+  exists only for an Accepted submission — and `dmg` refuses unless the bundle
+  already validates, which is what stops the silent version of the ordering
+  mistake, a DMG built before notarization that looks identical and ships an
+  app whose first launch needs Apple reachable. **The release bundle is
+  assembled by the same two recipes as the dev bundle**, with `APP_BUNDLE`
+  overridden on the sub-make command line (a command-line variable beats the
+  `:=` and propagates), so the thing that is downloaded cannot quietly differ
+  from the thing that was tested; `app-install`'s two guards — the unset-`HOME`
+  refusal and the "Tasks is running" note — are gated on *one* comparison
+  against the default path, since neither has anything to say about an absolute
+  override. And **a bare Mach-O cannot be stapled**, so the CLI archive is
+  notarized-but-not-stapled and Gatekeeper fetches its ticket online; that is
+  acceptable **for a reason specific to this system rather than in general** —
+  nothing here works offline, so a machine that cannot reach Apple cannot run
+  what it just unzipped either. The stapleable alternative is a `.pkg`, which
+  needs a *Developer ID Installer* certificate, a different class from the
+  Application one; deferred and named. One measured fact is a **checklist gate
+  and not a pitfall**: `std::fs::copy` on macOS clones extended attributes, so
+  a downloaded, quarantined bundle installs a `~/.tasks/bin/tasks` that carries
+  `com.apple.quarantine` and makes launchd's exec a Gatekeeper assessment —
+  confirmed on a Mac, not suspected — and that is the one-button install on a
+  fresh machine, the path with nobody at a terminal. `install_binary` is
+  deliberately **unchanged** here, because a fix wants a real signed artifact
+  to test against; when it is made it clears the attribute *after* verifying
+  the copy's own signature, never before. Finally, `dist/` is this chain's
+  staging directory and `make dist` does not write there — `release-clean`
+  empties only the former.
 - **Agent engine is Claude Code / the Agent SDK — never a home-rolled agentic
   loop.** The server consumes Claude Code's typed output (stream-json, hooks,
   MCP tools, structured outputs); it does not reimplement the loop.
@@ -1161,6 +1206,18 @@ tasks secrets set github-token         # seal a key (value on stdin, never argv)
 make dist                              # Tasks.app with a release `tasks` seed
                                        #   at Contents/Helpers/tasks; first
                                        #   launch installs the service from it
+                                       #   — installs to ~/Applications, NOT
+                                       #   to dist/
+make release SIGN_IDENTITY='Developer ID Application: … (TEAM)'
+                                       # the download: signed, notarized,
+                                       #   stapled .app + .dmg + CLI zip,
+                                       #   staged in dist/. Refuses without an
+                                       #   identity rather than shipping
+                                       #   unsigned; macOS + Apple Developer
+                                       #   enrollment only
+make release-clean                     # rm -rf dist/ — the release staging
+                                       #   directory only, never what `make
+                                       #   dist` installed
 tasks service install                  # THIS binary -> ~/.tasks/bin, one
                                        #   LaunchAgent (login + crash restart);
                                        #   idempotent, and also the upgrade

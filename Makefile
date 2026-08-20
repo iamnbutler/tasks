@@ -31,6 +31,8 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         check-nextest test-bins test test-ci test-cargo app run \
         check-darwin app-build app-stop app-install \
         server-release dist-install dist \
+        check-signing check-notary release-bundle sign notarize dmg \
+        notarize-dmg verify-release check-clean-tree release release-clean \
         app-check app-stubs app-test \
         server serve restart status stop drain resume check-quiesced \
         migration verify-warm site-check
@@ -74,7 +76,18 @@ APP_COMMIT := $(BUILD_COMMIT)
 # both expand to the empty string there, and `"$HOME/Applications/Tasks.app"`
 # then reads `/Applications/Tasks.app` — someone else's install, aimed at by an
 # `rm -rf`. Measured, not assumed. The guard in `app-install` is what closes it.
-APP_BUNDLE := $$HOME/Applications/Tasks.app
+#
+# Named twice on purpose: `APP_BUNDLE` is what every recipe uses and what a
+# command-line override replaces, and `APP_BUNDLE_DEFAULT` is what `app-install`
+# compares against to ask "am I installing to the operator's own app?". The two
+# guards that only make sense for that install — the HOME check and the "Tasks
+# is running" note — key off that one comparison rather than off two conditions
+# that could drift. `release-bundle` overrides `APP_BUNDLE` with an absolute
+# path under `dist/`, where neither guard has anything to say: an absolute
+# override cannot collapse to `/Applications/Tasks.app`, and the operator's
+# running app is not the bundle being written.
+APP_BUNDLE_DEFAULT := $$HOME/Applications/Tasks.app
+APP_BUNDLE := $(APP_BUNDLE_DEFAULT)
 
 # The macOS guard, named once. It used to sit in the recipe that both built
 # and installed; those are separate targets now, so copying it would be two
@@ -139,11 +152,13 @@ app-stop:
 # `dist-install` because `make app` is a redistribution too the moment anyone
 # hands the bundle over.
 app-install: check-darwin
-	@[ -n "$$HOME" ] || { echo "HOME is unset; refusing to install to $(APP_BUNDLE)"; exit 1; }
-	@pgrep -x Tasks >/dev/null 2>&1 && \
-		echo "note: Tasks is running; it will keep running from the deleted bundle until you quit it (make run stops it first)" \
-		|| true
 	@bundle="$(APP_BUNDLE)"; \
+	if [ "$$bundle" = "$(APP_BUNDLE_DEFAULT)" ]; then \
+		[ -n "$$HOME" ] || { echo "HOME is unset; refusing to install to $$bundle"; exit 1; }; \
+		if pgrep -x Tasks >/dev/null 2>&1; then \
+			echo "note: Tasks is running; it will keep running from the deleted bundle until you quit it (make run stops it first)"; \
+		fi; \
+	fi; \
 	rm -rf "$$bundle"; \
 	mkdir -p "$$bundle/Contents/MacOS" "$$bundle/Contents/Resources"; \
 	cp app-gpui/target/release/tasks-gpui "$$bundle/Contents/MacOS/Tasks"; \
@@ -173,7 +188,8 @@ app:
 # directory entry — a cp "beside" the app binary silently overwrites it and
 # every claim about the bundle stays green while the app is gone. Measured,
 # not assumed: the first dist build did exactly that. Helpers is a standard
-# nested-code location, so codesigning (phase 2) needs no exception for it.
+# nested-code location, so the signing chain below needs no exception for it
+# (docs/plans/2026-08-19-signing-and-notarization.md — phase 2 is now here).
 #
 # `make app` stays the dev bundle — no embedded server, no release-build tax
 # on the inner loop. The app treats the two identically except that a bundle
@@ -204,6 +220,251 @@ dist:
 	@$(MAKE) --no-print-directory server-release
 	@$(MAKE) --no-print-directory app-install
 	@$(MAKE) --no-print-directory dist-install
+
+# ---------------------------------------------------------------------------
+# The release chain: a signed, notarized, stapled download.
+#
+# `make app` and `make dist` stay unsigned and unchanged. They never leave the
+# machine that built them, which is exactly why they are fine and a download is
+# not — Gatekeeper refuses an unsigned, un-notarized bundle that arrived with a
+# quarantine attribute, and the failure lands on someone with no terminal in
+# front of them.
+#
+# Every target here REFUSES rather than degrades. No signing identity is an
+# error and never an unsigned artifact, because the failure worth preventing is
+# the quiet one: the `.dmg` that built fine and reached a download link
+# unsigned. The checklist, the pitfalls and the reasons live in
+# docs/plans/2026-08-19-signing-and-notarization.md.
+#
+# Nothing in this block can run anywhere but macOS: codesign, xcrun, security,
+# hdiutil, ditto and spctl are all macOS-only.
+#
+# Note the collision worth knowing about before you type either: `make dist`
+# does NOT write to `dist/` — it installs to $(APP_BUNDLE_DEFAULT). `dist/` is
+# this block's staging directory and `release-clean` empties only that.
+DIST_DIR := $(abspath dist)
+RELEASE_BUNDLE := $(DIST_DIR)/Tasks.app
+DMG := $(DIST_DIR)/Tasks-$(BUILD_VERSION).dmg
+CLI_ZIP := $(DIST_DIR)/tasks-$(BUILD_VERSION)-macos-arm64.zip
+
+# Empty on purpose: there is no default that could be right, and a wrong
+# default would sign with somebody else's certificate or fall through to an
+# unsigned artifact. Pass it on the command line or export it.
+SIGN_IDENTITY ?=
+NOTARY_PROFILE ?= tasks-notary
+
+# Split from check-notary because the two fail for different reasons and only
+# `sign` and `dmg` need an identity — a notarization retry should not demand
+# one, and a signing run should not demand App Store Connect credentials.
+#
+# It must be a *Developer ID Application* identity: the notary service rejects
+# an Apple Development one by name, minutes later, which is exactly the slow
+# way to learn it.
+check-signing: check-darwin
+	@[ -n "$(SIGN_IDENTITY)" ] || { \
+		echo "SIGN_IDENTITY is unset; refusing to produce an unsigned release artifact."; \
+		echo "  make release SIGN_IDENTITY=\"Developer ID Application: Your Name (TEAMID)\""; \
+		echo "  security find-identity -v -p codesigning   # lists what this machine has"; \
+		exit 1; }
+	@security find-identity -v -p codesigning 2>/dev/null | grep -qF "$(SIGN_IDENTITY)" || { \
+		echo "no codesigning identity matching \"$(SIGN_IDENTITY)\" in this keychain."; \
+		echo "  security find-identity -v -p codesigning   # lists what this machine has"; \
+		echo "It must be a 'Developer ID Application' identity — the notary service"; \
+		echo "rejects an 'Apple Development' one by name."; \
+		exit 1; }
+	@echo "signing identity: $(SIGN_IDENTITY)"
+
+# A liveness probe, not a presence check: `xcrun --find` only proves the tool
+# is installed, and the credential is the half that is actually missing on a
+# fresh machine. `history` is the cheapest call that needs one.
+#
+# The app-specific password never appears here, in argv, in `.env` or in the
+# repo — `notarytool store-credentials` puts it in the keychain and everything
+# downstream names the profile. Same rule the credential-custody work applies
+# to every runtime secret; this one is a build-host secret and gets it anyway.
+check-notary: check-darwin
+	@xcrun --find notarytool >/dev/null 2>&1 || { \
+		echo "no notarytool; install Xcode (or the Command Line Tools) and run:"; \
+		echo "  sudo xcode-select --switch /Applications/Xcode.app"; \
+		exit 1; }
+	@xcrun notarytool history --keychain-profile "$(NOTARY_PROFILE)" >/dev/null 2>&1 || { \
+		echo "notarytool cannot use keychain profile \"$(NOTARY_PROFILE)\"; store it once:"; \
+		echo "  xcrun notarytool store-credentials \"$(NOTARY_PROFILE)\" \\"; \
+		echo "    --apple-id <apple-id> --team-id <TEAMID> --password <app-specific-password>"; \
+		echo "(the password is generated at appleid.apple.com and lives only in the keychain)"; \
+		exit 1; }
+	@echo "notary profile: $(NOTARY_PROFILE)"
+
+# The release bundle is assembled by the SAME two recipes as the dev bundle,
+# with APP_BUNDLE overridden on the sub-make command line — a command-line
+# variable beats the `:=` above and propagates to sub-makes, so nothing else
+# needs to change. A second copy of app-install/dist-install aimed at dist/ is
+# how the two bundles would come to differ in a way nobody noticed until a
+# download behaved unlike the thing that was tested.
+#
+# app-gpui is not a workspace member and has its own target/, so the app binary
+# and the server binary come from two different build directories; this target
+# is what drives both.
+release-bundle: check-darwin
+	@$(MAKE) --no-print-directory app-build
+	@$(MAKE) --no-print-directory server-release
+	@$(MAKE) --no-print-directory app-install APP_BUNDLE=$(RELEASE_BUNDLE)
+	@$(MAKE) --no-print-directory dist-install APP_BUNDLE=$(RELEASE_BUNDLE)
+
+# Sign inside-out, and NEVER --deep. `--deep` re-signs nested code with the
+# outer bundle's arguments; the documented failure is a signature that verifies
+# locally and comes back Invalid from the notary service minutes later.
+#
+# --force because Rust binaries arrive ad-hoc signed (the linker does it on
+# Apple Silicon), so codesign would otherwise fail on an already-signed binary
+# rather than doing nothing.
+#
+# The standalone CLI is a *copy of the signed seed*, not a second signing act,
+# so the binary in the release and the binary inside the app are byte
+# identical. A Mach-O signature lives in the file, so it survives the copy —
+# and survives `tasks service install`'s copy to ~/.tasks/bin/tasks too.
+#
+# The three local checks at the end are the whole reason this target verifies
+# anything: a genuine signing defect comes back from the notary service as
+# Invalid, but a submission can also sit In Progress for hours, and telling
+# those apart after the fact is expensive. Locally the answer takes a second.
+#
+# No entitlements file, deliberately. Hardened runtime needs no exception for a
+# Metal app that spawns child processes and speaks HTTP, and an entitlements
+# plist that grants nothing is a file that accretes grants. Add one only when a
+# real hardened-runtime failure names the exception it needs — and never
+# `--options` without `runtime` to make a crash go away.
+sign: check-darwin check-signing
+	@[ -d "$(RELEASE_BUNDLE)" ] || { \
+		echo "no bundle at $(RELEASE_BUNDLE); run make release-bundle"; exit 1; }
+	@[ -f "$(RELEASE_BUNDLE)/Contents/Helpers/tasks" ] || { \
+		echo "no seed binary at $(RELEASE_BUNDLE)/Contents/Helpers/tasks; run make release-bundle"; exit 1; }
+	codesign --force --options runtime --timestamp \
+		--sign "$(SIGN_IDENTITY)" "$(RELEASE_BUNDLE)/Contents/Helpers/tasks"
+	codesign --force --options runtime --timestamp \
+		--sign "$(SIGN_IDENTITY)" "$(RELEASE_BUNDLE)"
+	cp "$(RELEASE_BUNDLE)/Contents/Helpers/tasks" "$(DIST_DIR)/tasks"
+	codesign --verify --strict --verbose=2 "$(RELEASE_BUNDLE)"
+	codesign --verify --strict --verbose=2 "$(DIST_DIR)/tasks"
+	@for target in "$(RELEASE_BUNDLE)" "$(DIST_DIR)/tasks"; do \
+		if codesign -d --entitlements :- "$$target" 2>/dev/null | grep -q 'get-task-allow'; then \
+			echo "$$target carries get-task-allow: a debug entitlement the notary service rejects"; \
+			exit 1; \
+		fi; \
+		codesign -d -vv "$$target" 2>&1 | grep -q 'flags=.*runtime' || { \
+			echo "$$target is not signed with the hardened runtime (--options runtime)"; \
+			exit 1; }; \
+	done
+	@echo "signed $(RELEASE_BUNDLE) and $(DIST_DIR)/tasks (hardened runtime, timestamped)"
+
+# ONE submission carrying both artifacts, so the app and the standalone CLI
+# cannot end up notarized against different signatures.
+#
+# `stapler` is the gate, not `--wait`: a ticket exists only for an Accepted
+# submission, so a staple that succeeds is the proof, and a staple that fails
+# is where a rejection stops the chain.
+#
+# A bare Mach-O CANNOT be stapled — Apple staples bundles, disk images and flat
+# installer packages only, and against a raw executable stapler fails looking
+# for Contents/CodeResources. That is printed rather than left in a doc,
+# because whoever runs this is the person who will otherwise try it.
+notarize: check-darwin check-notary
+	@[ -d "$(RELEASE_BUNDLE)" ] || { echo "no bundle at $(RELEASE_BUNDLE); run make sign"; exit 1; }
+	@[ -f "$(DIST_DIR)/tasks" ] || { echo "no signed CLI at $(DIST_DIR)/tasks; run make sign"; exit 1; }
+	rm -rf "$(DIST_DIR)/submission" "$(DIST_DIR)/submission.zip"
+	mkdir -p "$(DIST_DIR)/submission"
+	ditto "$(RELEASE_BUNDLE)" "$(DIST_DIR)/submission/Tasks.app"
+	ditto "$(DIST_DIR)/tasks" "$(DIST_DIR)/submission/tasks"
+	ditto -c -k --keepParent "$(DIST_DIR)/submission" "$(DIST_DIR)/submission.zip"
+	xcrun notarytool submit "$(DIST_DIR)/submission.zip" \
+		--keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(RELEASE_BUNDLE)"
+	ditto -c -k "$(DIST_DIR)/tasks" "$(CLI_ZIP)"
+	@echo "stapled $(RELEASE_BUNDLE); wrote $(CLI_ZIP)"
+	@echo "note: $(CLI_ZIP) is notarized but NOT stapled — a bare Mach-O cannot be."
+	@echo "      Gatekeeper fetches its ticket online at first launch of a quarantined copy."
+
+# Refuses unless the bundle is already stapled. That precondition is what stops
+# the silent version of the ordering mistake: a DMG built before notarization
+# looks identical and ships an app whose first launch needs Apple reachable.
+#
+# The /Applications symlink is not decoration — it makes the drag the obvious
+# gesture, and dragging out of the image is what clears App Translocation (a
+# quarantined app launched from the mounted image runs from a randomized
+# read-only path).
+#
+# The image is signed WITHOUT --options runtime: a disk image is not executable
+# code, and hardened runtime is a property of a running process.
+dmg: check-darwin check-signing
+	@xcrun stapler validate "$(RELEASE_BUNDLE)" >/dev/null 2>&1 || { \
+		echo "$(RELEASE_BUNDLE) is not stapled; run make notarize first."; \
+		echo "A DMG built before notarization looks identical and ships an app whose"; \
+		echo "first launch needs Apple reachable."; \
+		exit 1; }
+	rm -rf "$(DIST_DIR)/dmg" "$(DMG)"
+	mkdir -p "$(DIST_DIR)/dmg"
+	ditto "$(RELEASE_BUNDLE)" "$(DIST_DIR)/dmg/Tasks.app"
+	ln -s /Applications "$(DIST_DIR)/dmg/Applications"
+	hdiutil create -format UDZO -volname "Tasks" -srcfolder "$(DIST_DIR)/dmg" -ov "$(DMG)"
+	codesign --force --timestamp --sign "$(SIGN_IDENTITY)" "$(DMG)"
+	@echo "wrote $(DMG)"
+
+notarize-dmg: check-darwin check-notary
+	@[ -f "$(DMG)" ] || { echo "no image at $(DMG); run make dmg"; exit 1; }
+	xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(DMG)"
+	@echo "stapled $(DMG)"
+
+# spctl is the one that answers the question actually being asked — what
+# Gatekeeper will do — rather than "is this signature well formed". Both are
+# here because they fail differently and only one of them is about Apple's
+# verdict.
+verify-release: check-darwin
+	codesign --verify --strict --verbose=2 "$(RELEASE_BUNDLE)"
+	codesign --verify --strict --verbose=2 "$(RELEASE_BUNDLE)/Contents/Helpers/tasks"
+	xcrun stapler validate "$(RELEASE_BUNDLE)"
+	xcrun stapler validate "$(DMG)"
+	spctl -a -t exec -vv "$(RELEASE_BUNDLE)"
+	spctl -a -t open --context context:primary-signature -vv "$(DMG)"
+	@echo "verified $(RELEASE_BUNDLE) and $(DMG)"
+
+# A release names a commit — #997 tags them v0.1.<commit count>, the same
+# number BUILD_VERSION already carries — so a dirty tree makes the tag a lie.
+# FORCE=1 overrides, matching the `make images` convention.
+check-clean-tree:
+	@if [ -n "$(FORCE)" ]; then \
+		echo "FORCE=$(FORCE): releasing a dirty tree; $(BUILD_VERSION) will not name what shipped"; \
+	else \
+		git diff --quiet && git diff --cached --quiet || { \
+			echo "uncommitted changes; a release names a commit and this tree is not one."; \
+			echo "  git status        # then commit, stash, or FORCE=1 make release"; \
+			exit 1; }; \
+	fi
+
+# The whole chain. Both credential checks and the tree check run FIRST, so a
+# missing credential costs a message rather than a six-minute build.
+#
+# Sub-makes rather than prerequisites, as everywhere else in this file: `make
+# -j` gives prerequisites no ordering at all, and every property of this
+# sequence is an ordering.
+release:
+	@$(MAKE) --no-print-directory check-signing
+	@$(MAKE) --no-print-directory check-notary
+	@$(MAKE) --no-print-directory check-clean-tree
+	@$(MAKE) --no-print-directory release-bundle
+	@$(MAKE) --no-print-directory sign
+	@$(MAKE) --no-print-directory notarize
+	@$(MAKE) --no-print-directory dmg
+	@$(MAKE) --no-print-directory notarize-dmg
+	@$(MAKE) --no-print-directory verify-release
+
+# No check-darwin: removing a directory works everywhere, and a clean that
+# refuses to run on the wrong OS is a clean nobody can use to tidy up after a
+# failed experiment. It empties `dist/` only — `make dist` writes to
+# $(APP_BUNDLE_DEFAULT) and is untouched by this.
+release-clean:
+	rm -rf $(DIST_DIR)
+# ---------------------------------------------------------------------------
 
 # Build, stop, install, launch — in that order, and each step is where it is
 # for a reason:
