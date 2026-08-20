@@ -488,8 +488,18 @@ async fn a_transport_death_costs_the_batch_no_build_attempt() {
             .await
             .unwrap_err();
 
-        // The symptom is still the symptom — the class is what the host reads.
-        assert!(format!("{err}").contains("no commits"), "{err}");
+        // Since #1008 the reason names the cause rather than the symptom — a
+        // non-zero exit fails the build before the `tip == base` check it used
+        // to be reported by. The class is what the host reads either way, and
+        // that is what this test is about.
+        assert!(
+            format!("{err}").contains("exited 1 rather than concluding"),
+            "{err}"
+        );
+        assert!(
+            format!("{err}").contains("connection to the API failed"),
+            "a transport death still names itself: {err}"
+        );
         assert_eq!(
             err.failure_class(),
             tasks::protocol::FailureClass::Transport,
@@ -563,7 +573,11 @@ async fn a_silent_build_failure_leaves_a_readable_transcript() {
         )
         .await
         .unwrap_err();
-    assert!(format!("{err}").contains("no commits"), "{err}");
+    // #1008: the agent exited 3, which is now the failure by itself.
+    assert!(
+        format!("{err}").contains("exited 3 rather than concluding"),
+        "{err}"
+    );
 
     // The build row is final and says only that it failed …
     let after = h.store.get_build(&build.id).await.unwrap().unwrap();

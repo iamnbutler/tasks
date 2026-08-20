@@ -304,6 +304,38 @@ implementation.
   `verification: None`, which renders as "no run on record", is never green, and
   routes everything to a human; that is `#[serde(default)]` doing its job, and
   the degradation is safe by construction rather than by luck.
+- **A build is a success only if the agent said so and accounted for it —
+  commits alone are not a deliverable.** The supervisor emitted the agent's
+  exit code as `ImplementationFinished` and then ignored it, and the only
+  artifact check downstream is `tip != base`, which a half-finished batch
+  passes trivially because the sweep commits whatever is on disk. So a build
+  whose agent exited 1 on `blocking_limit` carrying four specs was recorded
+  `succeeded`, opened a pull request and parked four tasks in
+  `awaiting_merge` — two of the four never implemented, and `builds.summary`
+  zero bytes (#1008). Merging is the dangerous act there: `watch_merges` closes
+  **every** task in the batch as completed with the merge commit as evidence,
+  and no pass revisits `done`. Two rules now stand between that and GitHub, and
+  they are separate because they fail differently. **A non-zero exit fails the
+  build**, after the resume loop (so a run picked back up reports the last
+  attempt's code) and *before* the sweep, because the exit is the cause and "no
+  commits" is at best a symptom of it — reached through `run.failure_class()`,
+  so a dropped connection is still `Transport`, charges no strike and returns
+  the specs to `approved`. This is the Scout's rule one crate over (`a clean
+  exit is a spec, whatever the file looks like; only a messy exit is read
+  sceptically`), and the difference is what there is to be sceptical *about*: a
+  Scout has `SPEC.md` to inspect, a Builder's deliverable is a branch nothing
+  in the VM can judge, so there is no partial-credit reading and the honest
+  answer is to fail. It costs a rebuild, which is the cheap half of the trade.
+  **A missing `SUMMARY.md` fails the build** too, and that is not a style rule:
+  the summary *is* the pull request body and carries the `## Review feedback`
+  accounting, so without one `pr_text` falls back to a list of spec titles
+  under one `Implements #NNN` per task — a claim about work, written by the
+  pipeline rather than by the party that did it, in front of the human who has
+  to rule on it. The fallback stays in `pr_text` because builds recorded before
+  this still have to render; what changed is that no new build can reach it.
+  The hardest case is the one a test pins: commits **plus** a summary plus a
+  non-zero exit is still a failure, because nothing in the VM can tell a branch
+  that finished from one that stopped.
 - **The orchestrator can now produce the run it used to only ask for, and what
   made that possible was a warm build directory, not a bigger budget.** Carve-out
   (b) above rested on "nothing re-runs its tests for you", and that was true for

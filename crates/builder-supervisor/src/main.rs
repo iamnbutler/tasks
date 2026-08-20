@@ -18,8 +18,12 @@
 //!      `BUILDER_MAX_RESUMES`) if its API connection drops mid-response — the
 //!      worktree survives with the conversation, which is the whole point for
 //!      a Builder. See [`tasks_protocol::agent_run`]
-//!   6. Reads `SUMMARY.md` (optional PR prose), then removes both artifacts
-//!      from the worktree
+//!      A **non-zero exit fails the build here**: the agent's own exit used to
+//!      be reported and then ignored, and the only artifact check below is
+//!      `tip != base`, which a half-finished batch passes trivially (#1008)
+//!   6. Reads `SUMMARY.md` — the PR body, and **required**: an agent that
+//!      concluded and wrote nothing down has not finished — then removes both
+//!      artifacts from the worktree
 //!   7. [`reconcile_checkout`]s the build branch with wherever the agent
 //!      actually finished — HEAD is only the branch while it stays
 //!      symbolically attached to it, and a rebase or a `git checkout <sha>`
@@ -355,6 +359,39 @@ async fn run_build(
     )
     .await;
 
+    // #1008: the agent's own exit was reported here and then ignored, and the
+    // only artifact check downstream is `tip != base` — which a half-finished
+    // batch passes trivially, because a sweep commits whatever is on disk. So
+    // a build whose agent died carrying four specs was recorded `succeeded`,
+    // opened a pull request, and parked four tasks in `awaiting_merge` with two
+    // of the four never implemented and no `SUMMARY.md` at all. Merging is the
+    // dangerous act there: `watch_merges` closes **every** task in the batch as
+    // completed, and no pass revisits `done`.
+    //
+    // This is the scout's rule, one crate over: a clean exit is taken at its
+    // word, and only a messy exit is read sceptically. The difference is what
+    // there is to be sceptical *about* — a Scout has `SPEC.md` to inspect,
+    // while a Builder's deliverable is a branch nothing here can judge, so
+    // there is no partial-credit reading available and the honest answer is to
+    // fail. It costs a rebuild, which is the cheap half of the trade: this
+    // reaches `run.failure_class()`, so a dropped connection is `Transport` and
+    // charges no strike, and the specs go back to `approved`.
+    //
+    // Note the placement — after the resume loop, so an agent that lost its
+    // connection and was picked back up reports the *last* attempt's code, and
+    // before the sweep, because the exit is the cause and "no commits" is at
+    // best a symptom of it.
+    if run.outcome.exit_code != 0 {
+        fail!(
+            class: run.failure_class(),
+            "the agent exited {} rather than concluding, so whatever is on the branch is \
+             what it had got to rather than what it finished{}{}",
+            run.outcome.exit_code,
+            run.outcome.failure_context(),
+            run.failure_context()
+        );
+    }
+
     // Steps 6-10, once per round. A red suite buys exactly one repair round,
     // and the round's commits have to travel this same path — which is why
     // this is a loop and not a straight line.
@@ -476,6 +513,32 @@ async fn run_build(
         }
     };
 
+    // #1008's other half. `SUMMARY.md` is not decoration: it *is* the pull
+    // request body, and it carries the `## Review feedback` accounting the
+    // reviewer reads without fetching anything. With it absent the body falls
+    // back to a generated list of spec titles under one `Implements #NNN` line
+    // per task — a claim about the work, written by the pipeline rather than by
+    // the party that did it, which is the shape this codebase refuses
+    // everywhere else. A batch cannot be reviewed without the deliverable's own
+    // account of itself, so an agent that concluded cleanly and wrote nothing
+    // down has not finished.
+    //
+    // A `Verdict` unconditionally, and it does not need `run.failure_class()`:
+    // every ending that is not a clean exit has failed above, so reaching here
+    // means the agent said it was done.
+    //
+    // After the loop, so a repair round gets its chance to write one; the
+    // `pr_text` fallback stays where it is, because builds recorded before this
+    // still have to render.
+    let Some(summary) = summary else {
+        fail!(
+            class: FailureClass::Verdict,
+            "the agent exited cleanly but wrote no SUMMARY.md, so there is no account of \
+             what the branch does — and the pull request body would be a list of spec \
+             titles the pipeline wrote on its behalf"
+        );
+    };
+
     // Thin bundle with base_sha as its prerequisite, carrying the branch ref
     // the server will fetch by name — and the head is read back out of it.
     let (bundle_base64, head_sha) =
@@ -517,7 +580,7 @@ async fn run_build(
             base_sha,
             head_sha,
             bundle_base64,
-            summary,
+            summary: Some(summary),
             files_touched,
             verification: Some(verification),
         },

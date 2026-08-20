@@ -599,6 +599,73 @@ async fn an_empty_branch_is_a_failure() {
     sup.close().await;
 }
 
+/// #1008: a build recorded `succeeded` after its agent exited 1 on
+/// `blocking_limit`, opened a pull request and parked four tasks in
+/// `awaiting_merge` — two of the four never implemented. The branch had
+/// commits, which is the only artifact check there was, and a sweep commits
+/// whatever is on disk.
+///
+/// This is the hardest version of the rule on purpose: the agent got real work
+/// committed *and* wrote a summary. Nothing in this VM can tell a branch that
+/// finished from one that stopped, so the exit code is the only fact available
+/// and it has to be believed.
+#[tokio::test]
+async fn an_agent_that_dies_after_committing_real_work_still_fails_the_build() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let agent = fixture("finished-then-died-agent.sh");
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url)).await;
+
+    match drain(&mut sup).await {
+        BuildEvent::Failed { reason, class } => {
+            assert!(
+                reason.contains("exited 1 rather than concluding"),
+                "reason: {reason}"
+            );
+            // Not a transport ending, so it is charged — the waiver is decided
+            // by how the agent died, never by the fact that it died.
+            assert_eq!(class, FailureClass::Verdict, "reason: {reason}");
+        }
+        other => panic!("commits plus a summary must not rescue a dead agent: {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
+/// The other half of #1008. `SUMMARY.md` is the pull request body; without one
+/// the body falls back to a list of spec titles under `Implements #NNN` — a
+/// claim about the work written by the pipeline rather than by the party that
+/// did it. An agent that concluded and wrote nothing down has not finished.
+#[tokio::test]
+async fn a_clean_exit_that_wrote_no_summary_is_not_a_success() {
+    let binary = supervisor_bin();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_fixture_repo(tmp.path()).await;
+    let repo_url = format!("file://{}", repo.display());
+
+    let agent = fixture("no-summary-agent.sh");
+    let mut sup = SupervisorProc::spawn(&binary, agent.to_str().unwrap(), tmp.path()).await;
+    assert!(matches!(sup.recv().await, VmEvent::Ready));
+    sup.send(start(repo_url)).await;
+
+    match drain(&mut sup).await {
+        BuildEvent::Failed { reason, class } => {
+            assert!(reason.contains("no SUMMARY.md"), "reason: {reason}");
+            assert_eq!(class, FailureClass::Verdict, "reason: {reason}");
+        }
+        other => panic!("a batch cannot be reviewed without its own account: {other:?}"),
+    }
+
+    sup.send(VmCommand::Shutdown).await;
+    sup.close().await;
+}
+
 /// The OOM shape: the agent is killed by a signal, commits nothing, and until
 /// #825 lands the failure reason is the only place a build's postmortem can
 /// live. So the reason must name the signal, and the exit code must be
@@ -636,7 +703,14 @@ async fn a_signal_killed_agent_reports_137_and_names_the_signal() {
     };
 
     assert_eq!(exit_code, Some(137), "SIGKILL should surface as 128 + 9");
-    assert!(reason.contains("no commits"), "reason: {reason}");
+    // The cause, not the symptom: since #1008 a non-zero exit fails the build
+    // outright, so this never reaches the `tip == base` check it used to be
+    // reported by — which is the right way round, because "no commits" is what
+    // a killed agent produces rather than what went wrong with it.
+    assert!(
+        reason.contains("exited 137 rather than concluding"),
+        "reason: {reason}"
+    );
     assert!(
         reason.contains("killed by signal 9 (SIGKILL)"),
         "reason did not name the signal: {reason}"
