@@ -1,0 +1,155 @@
+/* One column, system fonts, 1px borders, no shadows. Light and dark from
+   `prefers-color-scheme` and nothing else — there is no theme switcher and
+   no JavaScript on this page to build one with. */
+
+:root {
+  --paper: #ffffff;
+  --ink: #1a1a1a;
+  --muted: #5c5c5c;
+  --rule: #d8d8d8;
+  --code-bg: #f4f4f4;
+  --danger: #8a1a1a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #16181a;
+    --ink: #e6e4e1;
+    --muted: #9a9895;
+    --rule: #34383c;
+    --code-bg: #202325;
+    --danger: #e08a84;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 1rem;
+  line-height: 1.55;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 3rem 2rem 2rem;
+}
+
+a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+
+h1 {
+  font-size: 1.75rem;
+  line-height: 1.2;
+  margin: 0 0 1.25rem;
+}
+
+h2 {
+  font-size: 1rem;
+  font-weight: 700;
+  margin: 2.75rem 0 0.75rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--rule);
+}
+
+p { margin: 0 0 1rem; }
+
+ul { margin: 0 0 1rem; padding-left: 1.25rem; }
+li { margin-bottom: 0.6rem; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+               monospace;
+  font-size: 0.875em;
+  background: var(--code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 2px;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  padding: 0.9rem 1rem;
+  margin: 0 0 1rem;
+  /* `pre`, not `pre-wrap`: the architecture diagram below is 108 columns and
+     a wrapped arrow is a different diagram. Scroll it instead. */
+  white-space: pre;
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+.diagram {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+               monospace;
+  font-size: 0.75rem;
+}
+
+/* The disclaimer is the second thing on the page and is meant to be read,
+   so it gets a border and its own spacing — not the treatment an aside or a
+   footnote would get. */
+.disclaimer {
+  border: 1px solid var(--danger);
+  padding: 1.25rem 1.5rem 0.5rem;
+  margin: 0 0 1.5rem;
+}
+
+.disclaimer h2 {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+  color: var(--danger);
+  font-size: 1.0625rem;
+}
+
+.disclaimer pre { background: var(--paper); }
+
+figure { margin: 0 0 2rem; }
+
+figure img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--rule);
+}
+
+figcaption {
+  margin-top: 0.5rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+/* Screenshots may exceed the measure once there is room for them.
+
+   `width: min(52rem, calc(100vw - 4rem))` with `margin-left: 50%` and a
+   `translateX(-50%)` — deliberately *not* a negative margin computed off the
+   40rem measure, which overflows: `box-sizing: border-box` makes the content
+   box 37.5rem, not 40, so the arithmetic that looks right is 2.5rem wrong. */
+@media (min-width: 56rem) {
+  figure {
+    width: min(52rem, calc(100vw - 4rem));
+    margin-left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+footer {
+  border-top: 1px solid var(--rule);
+  margin-top: 2.75rem;
+  padding-top: 1rem;
+  font-size: 0.875rem;
+  color: var(--muted);
+}

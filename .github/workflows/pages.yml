@@ -1,0 +1,70 @@
+# Publishes site/ to GitHub Pages, which serves it at nate.rip/tasks/.
+#
+# There is no build step — site/ is the artifact — so `site/check.sh` is the
+# whole gate: it is what stops a broken link or a drifted disclaimer from
+# being deployed.
+#
+# THE TRIGGERS ARE `push` AND `workflow_dispatch`, NEVER `pull_request`.
+#
+# This is the first workflow in this repository and the constraint is not
+# stylistic. The pipeline that maintains this repo merges its own pull
+# requests, and `land_builds` is allowed to do that because GitHub here is
+# structurally incapable of objecting to a change that does not work: with no
+# workflows and no branch protection, `mergeable_state` can only be `clean` or
+# `dirty`, so `Landing::Clear` is a statement about git and never about the
+# code (`crates/tasks/src/github.rs`). A `pull_request` trigger would create a
+# real check, make `blocked` reachable, and let a red pull request read as
+# ready — quietly invalidating the carve-out and six doc comments with it.
+#
+# Adding one is #1015's change, not a line to slip in here: it has to rewrite
+# `Landing`'s reading of `mergeable_state` in the same commit. Until then
+# `no_workflow_produces_a_pull_request_check` in `crates/tasks/tests/site.rs`
+# fails the suite if this block grows one.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      # The disclaimer on the page is a copy of the README's and `check.sh`
+      # compares them, so a README edit can break this deploy.
+      - 'README.md'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in flight: the previous page keeps serving until a
+# new one lands, and a half-replaced site is the one state worse than a stale
+# one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # `bash site/check.sh`, not `./site/check.sh` — the executable bit is
+      # not something to depend on surviving a checkout.
+      - name: Check the site
+        run: bash site/check.sh
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
