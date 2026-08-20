@@ -217,26 +217,38 @@ implementation.
   back to a human is **unverifiability, not risk**, because "hand it over when
   in doubt" is what the old sentence effectively said and doubt is unbounded.
   So there are exactly three carve-outs, named as the whole list: GitHub would
-  refuse the merge, the build reported no passing test run of its own, or
-  nothing runnable here could have checked it. The third exists because **no
-  workflow here produces a pull-request check and there is no branch
-  protection**, so `mergeable_state` can only ever be `clean` or `dirty` and
-  GitHub's verdict is structurally incapable of objecting to a change that does
-  not work — `Landing::Clear::describe()` says so in words, and a test pins that
-  clause and the absence of "ready to merge". That premise used to be "no
-  `.github/workflows`", one `ls` away from checkable, and `pages.yml` (the
-  landing page's deploy, #995) ended it — so it is now **mechanically
-  enforced instead of asserted**: the workflow triggers on `push` and
-  `workflow_dispatch` only, and `no_workflow_produces_a_pull_request_check`
-  (`crates/tasks/tests/site.rs`) fails the suite the moment any workflow grows
-  an `on: pull_request`. Prose was the wrong home for it — the next person to
-  add a trigger would have falsified six doc comments and this bullet with
-  nothing going red, while the pipeline kept merging on a carve-out whose
-  premise had gone. Real pull-request checks are #1015's change, and they come
-  with a rewrite of `Landing`'s reading of `mergeable_state` in the same
-  commit. Read `mergeable_state` and never
-  `mergeable` alone: `false` there means a conflict and nothing else, so a red
-  PR reads ready. The only evidence that a change works is therefore a run of
+  refuse the merge **or reports a check that has not gone green**, the build
+  reported no passing test run of its own, or nothing runnable here could have
+  checked it. The first carve-out is where #1015 landed, and it is worth being
+  precise about what moved. It used to be refusal alone, because **no workflow
+  here produced a pull-request check**, so `mergeable_state` could only ever be
+  `clean` or `dirty` and GitHub's verdict was structurally incapable of
+  objecting to a change that does not work. `.github/workflows/ci.yml` now runs
+  `cargo fmt`, clippy and the whole suite **on every push** — and a Builder
+  branch is a push, so its check runs attach to the commit the pull request
+  points at. Three consequences and none is "GitHub is the gate now". The
+  checks are **not required** (there is no branch protection), so `blocked`
+  stays unreachable, a red branch reads `unstable`, and the merge endpoint
+  still takes it — which is why the widening had to happen in the *prompt*
+  rather than being left to GitHub. `unstable` does **not** distinguish a check
+  that failed from one that has not finished, and GitHub will not say which, so
+  `Landing::Unstable::describe()` says both possibilities out loud instead of
+  filing it under non-required noise, which is what it said before CI existed
+  and would now read as permission to merge red work. And `Landing::Clear` now
+  carries evidence rather than being a statement about git — what it still does
+  not settle is the composition, which is the sentence the test pins, alongside
+  the unchanged absence of "ready to merge". The mechanical enforcement moved
+  with the premise: `no_workflow_produces_a_pull_request_check` is gone, and
+  `ci_runs_the_suite_on_every_push` (`crates/tasks/tests/site.rs`) replaces it,
+  failing the suite if CI stops existing or grows a `branches:`/`paths:` filter
+  — the quiet falsification, because an unfiltered-out branch that nothing ran
+  on reads `clean` for having no checks rather than for passing them, which
+  fails *upward*. Beside it `no_workflow_runs_fork_code_with_our_secrets`
+  refuses `pull_request_target` in any workflow, permanently. Prose was the
+  wrong home for any of this — the next person to add a filter would have
+  falsified six doc comments and this bullet with nothing going red. Read
+  `mergeable_state` and never `mergeable` alone: `false` there means a conflict
+  and nothing else, so a red PR reads ready. The only evidence that a change works is therefore a run of
   the project's own suite, and the bullet below is how that run is now
   obtained — by the Builder **supervisor**, as a check, where this bullet used
   to describe a `Verification:` trailer the Builder *agent* wrote into

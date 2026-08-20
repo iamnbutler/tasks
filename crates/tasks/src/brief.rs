@@ -1016,12 +1016,20 @@ fn recorded_base_verdict(base: &str, trunk: &str) -> String {
     )
 }
 
-/// It says "no automated check" rather than "nothing downstream", and the
-/// narrowing is necessary: on a host where the orchestrator has a warm build
-/// directory, the *reader* of this brief can go and make a run, even though the
-/// *pipeline* still will not make one for it. Leaving a sentence here that says
-/// the run will not happen, beside a landing section that says go and make one,
-/// is two sources of truth about the same fact.
+/// What it may say about a *missing* run narrowed twice, for the same reason
+/// both times: every sentence here that predicted what would not happen
+/// elsewhere was a second source of truth about somebody else's fact.
+///
+/// First it said "nothing downstream", which was false on a host where the
+/// orchestrator has a warm build directory — the *reader* of this brief can go
+/// and make a run even though the *pipeline* will not make one for it, and the
+/// landing section says exactly that. Then "no automated check will make one",
+/// which #1015 falsified for this repository (CI runs the suite on every push,
+/// and a Builder branch is a push) and which this function could never have
+/// known for any other, since what CI a project runs is not a fact the pipeline
+/// holds. So it now reports only what it does know — the pipeline made no
+/// passing run — and hands the check question to the landing line, which reads
+/// it off `mergeable_state` rather than predicting it.
 fn verification_line(verification: Option<&Verification>) -> String {
     let Some(v) = verification else {
         return "no test run is on record at all: this build predates the supervisor's own \
@@ -1040,11 +1048,14 @@ fn verification_line(verification: Option<&Verification>) -> String {
         ),
         VerificationStatus::Undeclared => format!(
             "the project declares no test suite at `.tasks/verify` ({detail}), so nothing ran \
-             and no passing run backs this batch — no automated check will make one"
+             in the VM and no passing run from the pipeline backs this batch — whether the \
+             repository's own CI has anything to say about the branch is the landing line's \
+             business, not this one"
         ),
         VerificationStatus::Unavailable => format!(
-            "the suite could not be run ({detail}), so no passing run backs this batch and no \
-             automated check will make one"
+            "the suite could not be run ({detail}), so no passing run from the pipeline backs \
+             this batch — whether the repository's own CI has anything to say about the branch \
+             is the landing line's business, not this one"
         ),
         VerificationStatus::TimedOut => format!(
             "the suite did not finish inside its budget and was killed ({detail}), so no \
@@ -1604,6 +1615,13 @@ mod tests {
 
     /// Exactly one state may describe the batch as backed by a passing run.
     /// Every other line has to say, in words, that none backs it.
+    ///
+    /// The claim is now qualified — "no passing run *from the pipeline*" —
+    /// because #1015 made a second run possible that this function cannot see:
+    /// CI runs on every push, and what a *given* project runs is not a fact the
+    /// pipeline holds for any repository, this one included. So the qualifier
+    /// is checked rather than tolerated. Dropping it would put a sentence here
+    /// that the landing line, which reads `mergeable_state`, can contradict.
     #[test]
     fn only_the_passing_state_claims_a_run_backs_the_batch() {
         for status in [
@@ -1613,8 +1631,26 @@ mod tests {
         ] {
             let line = verification_line(Some(&verified(status)));
             assert!(
-                line.contains("no passing run backs this batch"),
+                line.contains("no passing run from the pipeline backs this batch")
+                    || line.contains("no passing run backs this batch"),
                 "{status}: {line}"
+            );
+        }
+        // Neither of the two arms that were qualified may go back to
+        // predicting what will happen elsewhere.
+        for status in [
+            VerificationStatus::Undeclared,
+            VerificationStatus::Unavailable,
+        ] {
+            let line = verification_line(Some(&verified(status)));
+            assert!(
+                line.contains("no passing run from the pipeline"),
+                "{status}: {line}"
+            );
+            assert!(
+                !line.contains("automated check will make one"),
+                "CI makes that false, and it was never knowable for another \
+                 repository: {line}"
             );
         }
         assert!(!verification_line(None).contains("PASSED"));

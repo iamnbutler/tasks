@@ -1,0 +1,95 @@
+# fmt, clippy and the whole suite, on every push (#1015).
+#
+# THE PUSH TRIGGER CARRIES NO `branches:` AND NO `paths:` FILTER, DELIBERATELY.
+#
+# This pipeline pushes Builder branches into this repository and merges its own
+# pull requests, and as of #1015 the merge brief cites GitHub's verdict on the
+# head commit as evidence. A filter that skipped a branch — or a path — would
+# leave a pull request reading `clean` because nothing ran, which is the one
+# way `clean` can lie. `ci_runs_the_suite_on_every_push` in
+# `crates/tasks/tests/site.rs` fails the suite if either filter appears here.
+#
+# These checks are NOT required: there is no branch protection on this
+# repository, so GitHub will still take a merge over a red check. What they
+# changed is what `mergeable_state` can say — `unstable` is now reachable and
+# means a check failed *or* has not finished, which GitHub does not
+# distinguish. Making them required changes who can land and is a separate
+# decision, taken deliberately, later.
+#
+# `pull_request` is not here because `push` already covers every branch in this
+# repository and would double every run. `pull_request_target` must never be
+# here at all: it runs fork code with this repository's secrets.
+#
+# `make site-check` is deliberately NOT a step. It fails today for a reason no
+# agent can fix — the three screenshots need a Mac — so it would paint every
+# commit red and train the verdict out of use, which is the whole value here.
+# Its disclaimer-drift half is a workspace test and so already runs under `make
+# test-ci`; the link half is pages.yml's own gate, where a failure holds the
+# deploy and leaves the previous page serving.
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+# One run per ref. A superseded push has nothing to say — but see pages.yml,
+# where cancelling is the wrong call because a half-replaced site is worse than
+# a stale one. Nothing is published here.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: fmt, clippy, suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Two target directories: the workspace's, and app-gpui's own — it is
+      # deliberately not a workspace member, and a cold gpui build is minutes.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            app-gpui -> app-gpui/target
+
+      - uses: taiki-e/install-action@nextest
+
+      # app-gpui's five. The Makefile falls back to stub `.so`s where these are
+      # absent, and that fallback exists for hosts that cannot install
+      # packages — exercising it here would test the stubs rather than the app.
+      # `images/{scout,builder}/Dockerfile` install the same five.
+      - name: Install app-gpui's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `make test-ci`, not `cargo nextest` by hand: it prebuilds the
+      # supervisor binaries and exports TASKS_TEST_BIN_DIR (tests exec binaries
+      # and must never build them), runs the `ci` profile — no fail-fast,
+      # retries, a quieter slow threshold — and then runs the doctests, which
+      # nextest skips silently and with no count in its summary.
+      - run: make test-ci
+
+      # Compile and test the app. Neither needs a display or a Mac; what they
+      # cannot say is that a pixel landed anywhere, which stays `make app` on a
+      # Mac.
+      - run: make app-check
+      - run: make app-test

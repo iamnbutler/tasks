@@ -4,22 +4,21 @@
 # whole gate: it is what stops a broken link or a drifted disclaimer from
 # being deployed.
 #
-# THE TRIGGERS ARE `push` AND `workflow_dispatch`, NEVER `pull_request`.
+# THE TRIGGERS ARE `push` AND `workflow_dispatch`, NEVER `pull_request`, and
+# never `pull_request_target`.
 #
-# This is the first workflow in this repository and the constraint is not
-# stylistic. The pipeline that maintains this repo merges its own pull
-# requests, and `land_builds` is allowed to do that because GitHub here is
-# structurally incapable of objecting to a change that does not work: with no
-# workflows and no branch protection, `mergeable_state` can only be `clean` or
-# `dirty`, so `Landing::Clear` is a statement about git and never about the
-# code (`crates/tasks/src/github.rs`). A `pull_request` trigger would create a
-# real check, make `blocked` reachable, and let a red pull request read as
-# ready — quietly invalidating the carve-out and six doc comments with it.
+# `push` is deliberate rather than incidental: a Builder branch is pushed into
+# this repository, so a push-triggered workflow attaches its check runs to the
+# commit a pull request points at, which is exactly how `.github/workflows/
+# ci.yml` became the merge brief's evidence in #1015. This one is filtered to
+# `site/**`, so on most branches it simply does not run — an absent check is
+# not a passing one, and `Landing` reads `mergeable_state`, which only ever
+# reports the checks that exist.
 #
-# Adding one is #1015's change, not a line to slip in here: it has to rewrite
-# `Landing`'s reading of `mergeable_state` in the same commit. Until then
-# `no_workflow_produces_a_pull_request_check` in `crates/tasks/tests/site.rs`
-# fails the suite if this block grows one.
+# `pull_request_target` is refused outright and permanently: it would run fork
+# code with this repository's secrets and its `GITHUB_TOKEN` write scope.
+# `no_workflow_runs_fork_code_with_our_secrets` in `crates/tasks/tests/site.rs`
+# fails the suite if any workflow here grows one.
 
 name: Pages
 

@@ -772,8 +772,13 @@ async fn a_clean_tested_trunk_based_batch_names_all_three_facts_and_spends_no_co
         "{text}"
     );
     assert!(
-        text.contains("says nothing about whether the change works"),
-        "a clean verdict must not read as a clearance: {text}"
+        text.contains("every check it knows about has passed"),
+        "#1015: `clean` now carries CI's verdict and the brief has to cite it: {text}"
+    );
+    assert!(
+        text.contains("composed with a trunk that has moved"),
+        "a clean verdict must not read as a clearance — what it still does not \
+         cover is the composition: {text}"
     );
     // 2. The supervisor's own run, attributed as the check it is — and naming
     //    the gate that ruled, which is what tells a reader whether the script

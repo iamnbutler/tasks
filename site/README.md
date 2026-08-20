@@ -65,17 +65,16 @@ publish is human-gated anyway, and both acts happen in one sitting.
 `site/**` or `README.md`, and on `workflow_dispatch`. It runs
 `bash site/check.sh`, then uploads `site/` and deploys it.
 
-**The workflow has no `pull_request` trigger and must never grow one.** It is
-the first workflow in this repository, and the claim it must not break is that
-GitHub here is structurally incapable of objecting to a change that does not
-work — which is what lets `land_builds` merge on the Builder's own test run.
-A push-triggered workflow produces no pull-request check, so `mergeable_state`
-stays `clean` or `dirty` and `Landing::Clear` keeps meaning what it says. The
-reason is written out in the workflow file, and
-`no_workflow_produces_a_pull_request_check` in `crates/tasks/tests/site.rs`
-fails the suite if anyone adds one. Real pull-request checks are #1015's
-change, and they come with a rewrite of `Landing`'s reading of
-`mergeable_state` in the same commit.
+**The workflow has no `pull_request` trigger and needs none.** A Builder branch
+is pushed into this repository, so a `push` trigger already attaches its check
+runs to the commit a pull request points at — which is how
+`.github/workflows/ci.yml` became evidence the orchestrator's merge brief cites
+(#1015). What this one must never grow is `pull_request_target`, which would run
+fork code with this repository's secrets;
+`no_workflow_runs_fork_code_with_our_secrets` in `crates/tasks/tests/site.rs`
+fails the suite if any workflow does. Note that this workflow is filtered to
+`site/**`, so it does not run on most branches at all — an absent check is not
+a passing one, and `Landing` reports only the checks that exist.
 
 Pushing a file under `.github/workflows/` needs `workflow` scope on the
 token doing the pushing (classic PAT: the `workflow` checkbox; fine-grained:

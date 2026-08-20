@@ -1,19 +1,25 @@
 //! Guards for `site/` — the landing page published at `nate.rip/tasks/`
 //! (#995) — and for the claim that publishing it does not disturb.
 //!
-//! Two assertions, and they protect two different things.
+//! Three assertions, and they protect three different things.
 //!
-//! The first is the load-bearing one. Six doc comments and a CLAUDE.md bullet
-//! rest on GitHub being *structurally incapable* of objecting to a change
-//! that does not work, which is what lets `land_builds` merge on the
-//! Builder's own test run. Until this change that claim was "this repository
-//! has no `.github/workflows`", and its truth was one `ls` away. It is now
-//! "no workflow here produces a pull-request check", which is a property of
-//! the `on:` block of every workflow file that will ever exist here — a
-//! mechanically checkable fact that, left to prose, nothing would check.
-//! Adding `on: pull_request` to any workflow makes all seven sites false
-//! silently, while the pipeline goes on merging on a carve-out whose premise
-//! has quietly gone. So it is checked here instead.
+//! The first two are the load-bearing ones, and they are the *inverse* of the
+//! single assertion that stood here before #1015. Seven doc sites and a
+//! CLAUDE.md bullet used to rest on GitHub being *structurally incapable* of
+//! objecting to a change that does not work — first as "this repository has no
+//! `.github/workflows`" (one `ls` away from checkable), then as "no workflow
+//! here produces a pull-request check" (a property of every `on:` block). CI
+//! is now here, so that premise is gone and its opposite is what has to hold:
+//! **the suite runs on every commit pushed to this repository**, which is what
+//! lets those same sites say `clean` now carries evidence. The way that claim
+//! goes quietly false is no longer a `pull_request` trigger appearing — it is a
+//! `branches:` or `paths:` filter appearing on CI's push trigger, after which
+//! a Builder branch reads `clean` because nothing ever ran on it. That is the
+//! one way `clean` can lie, so it is checked here.
+//!
+//! The second is narrower and is about secrets rather than evidence:
+//! `pull_request_target` runs fork code with this repository's own token, and
+//! nothing here has any use for it.
 //!
 //! The second is that the disclaimer on the published page still says what
 //! the README says. `site/check.sh` makes the same comparison, and the
@@ -27,19 +33,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Every doc site that rests on the no-pull-request-check claim. Named in the
-/// failure message so whoever trips this a year from now can find them
+/// Every doc site that rests on CI running against every commit here. Named in
+/// the failure message so whoever trips this a year from now can find them
 /// without grepping for a sentence that no longer says what they searched.
 const DOC_SITES: &[&str] = &[
     "crates/tasks/src/github.rs (the `Landing` enum doc)",
     "crates/tasks/src/github.rs (the doc on `clear_says_what_it_does_not_mean`)",
     "crates/tasks/src/brief.rs (the doc on `verification_line`)",
-    "crates/tasks/src/builder.rs (the doc on \
-     `the_prompt_asks_for_the_verification_line_and_for_the_truth`)",
     "crates/tasks/src/orchestrator.rs (the doc on `landing_section`)",
     "CLAUDE.md (the landing bullet: \"An open PR is chased like every other stage\")",
-    "site/README.md (why this repository's first workflow was safe to add)",
+    "site/README.md (\"Deploying\" — why pages.yml is not the workflow that matters)",
+    ".github/workflows/ci.yml (the header comment)",
 ];
+
+/// The workflow that has to keep running on everything.
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
 fn repo_root() -> PathBuf {
     // `crates/tasks` -> the repository root.
@@ -139,35 +147,76 @@ fn relative(path: &Path) -> String {
         .to_string()
 }
 
-/// The premise under every autonomous merge in this pipeline.
+/// The premise under every autonomous merge in this pipeline, since #1015
+/// inverted it: **the suite runs against every commit pushed here.**
+///
+/// Before CI, the sites in [`DOC_SITES`] said GitHub could not object to a
+/// change that does not work, and the way that went false was a `pull_request`
+/// trigger appearing. Now they say GitHub's verdict on the head commit is
+/// evidence a merge may cite, and the way *that* goes false is quieter: a
+/// `branches:` or `paths:` filter on CI's push trigger, after which a Builder
+/// branch reads `clean` because nothing ever ran on it. Nothing goes red. The
+/// pull request looks better, not worse.
+///
+/// So this asserts the trigger's *shape*, not merely its presence: `push`,
+/// with no filter under it.
 #[test]
-fn no_workflow_produces_a_pull_request_check() {
+fn ci_runs_the_suite_on_every_push() {
+    let path = repo_root().join(CI_WORKFLOW);
+    let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "reading {path}: {error}\n\n\
+             {CI_WORKFLOW} is what makes GitHub's verdict on a commit worth citing, and \
+             these sites say it exists:\n\n  {sites}\n\n\
+             If CI is genuinely going away, rewrite `Landing`'s reading of `mergeable_state` \
+             in the same commit that deletes it. Do not delete this test.",
+            path = path.display(),
+            sites = DOC_SITES.join("\n  "),
+        )
+    });
+    let block = triggers(&source).unwrap_or_else(|| {
+        panic!("{CI_WORKFLOW} has no top-level `on:` block, so it can never run")
+    });
+    assert!(
+        block.contains("push"),
+        "{CI_WORKFLOW} does not trigger on `push`.\n\nThe `on:` block read was:\n{block}"
+    );
+    for filter in ["branches:", "branches-ignore:", "paths:", "paths-ignore:"] {
+        assert!(
+            !block.contains(filter),
+            "{CI_WORKFLOW}'s triggers carry a `{filter}` filter.\n\n\
+             A filtered push trigger means some commits are never checked, and this pipeline \
+             merges its own pull requests citing GitHub's verdict on the head commit — so an \
+             unchecked branch reads `clean` because nothing ran, which is the one way `clean` \
+             can lie. It fails upward: the pull request looks better, and nothing goes red.\n\n\
+             These sites say every commit here is checked:\n\n  {sites}\n\n\
+             The `on:` block read was:\n{block}",
+            sites = DOC_SITES.join("\n  "),
+        );
+    }
+}
+
+/// `pull_request_target` runs the *base* branch's workflow with this
+/// repository's own secrets, against code from a fork. Nothing here needs it,
+/// and this repository's token can push branches and merge pull requests.
+///
+/// Unrelated to the evidence question above — kept as its own assertion so a
+/// change to one cannot quietly relax the other.
+#[test]
+fn no_workflow_runs_fork_code_with_our_secrets() {
     for path in workflow_files() {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
         let Some(block) = triggers(&source) else {
             continue;
         };
-        for trigger in ["pull_request_target", "pull_request"] {
-            assert!(
-                !block.contains(trigger),
-                "{} has an `on: {trigger}` trigger.\n\n\
-                 That makes GitHub report a pull-request check, and this pipeline merges its \
-                 own pull requests on a carve-out that assumes GitHub is structurally \
-                 incapable of objecting to a change that does not work — `mergeable_state` \
-                 can only be `clean` or `dirty` here, so `Landing::Clear` is a statement \
-                 about git and nothing else. With a real check in play `blocked` becomes \
-                 reachable, a red check can read as ready, and every one of these becomes \
-                 false without anything going red:\n\n  {}\n\n\
-                 If pull-request checks are genuinely arriving, that is #1015's change: \
-                 repair those sites and rewrite `Landing`'s reading of `mergeable_state` \
-                 in the same commit as the trigger. Do not delete this test to land a \
-                 workflow.\n\n\
-                 The `on:` block read was:\n{block}",
-                relative(&path),
-                DOC_SITES.join("\n  "),
-            );
-        }
+        assert!(
+            !block.contains("pull_request_target"),
+            "{} has an `on: pull_request_target` trigger, which runs fork code with this \
+             repository's secrets — including a token that can push branches and merge \
+             pull requests.\n\nThe `on:` block read was:\n{block}",
+            relative(&path),
+        );
     }
 }
 

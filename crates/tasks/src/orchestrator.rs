@@ -1324,10 +1324,28 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 /// The three carve-outs are exhaustive on purpose. "Hand it over when in
 /// doubt" is what the old sentence effectively said, and doubt is unbounded;
 /// "hand it over when GitHub would refuse it, when no passing run backs it, or
-/// when nothing here could have checked it" is not. The third exists because no
-/// workflow in this repository produces a pull-request check and there is no
-/// branch protection, so GitHub's verdict is structurally incapable of
-/// objecting to a change that does not work — see [`crate::github::Landing`].
+/// when nothing here could have checked it" is not.
+///
+/// # What #1015 moved, and what it did not
+///
+/// (a) used to be exactly "GitHub would refuse the merge", because no workflow
+/// here produced a pull-request check and there is no branch protection, so
+/// GitHub's verdict was structurally incapable of objecting to a change that
+/// does not work. CI now runs fmt, clippy and the whole suite on every push,
+/// and a Builder branch is a push, so its check runs attach to the commit the
+/// pull request points at. That does not make GitHub the gate — the checks are
+/// **not required**, so a red one leaves `mergeable_state` at `unstable` and
+/// the merge endpoint still takes it. What changes is that GitHub now holds
+/// evidence the agent must not step over, and `unstable` does not say whether
+/// the check failed or is merely unfinished. So (a) widens to cover both
+/// refusal and an unresolved check, rather than a fourth carve-out being added
+/// beside the three: it is still the same question — what does GitHub say about
+/// this merge — and the count is what keeps "when in doubt" from creeping back.
+/// See [`crate::github::Landing`].
+///
+/// (b) and (c) are untouched. A CI run is another run against the branch's own
+/// base, so it settles nothing (b) did not already settle and nothing about the
+/// composition; and it renders no pixels.
 ///
 /// A missing row reads as `Off`, the safe direction `authority_section` takes.
 ///
@@ -1374,7 +1392,12 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              turn with POST /pull-requests/{number}/merge, and say that you did. \
              The brief above has already asked the three questions that could \
              stop you, and they are the whole list: (a) GitHub would refuse the \
-             merge — say which reason and stop; (b) no passing run backs it AND \
+             merge, or reports a check on the head commit that has not gone \
+             green — CI runs this project's suite on every push, `unstable` \
+             means a check FAILED or has not finished and GitHub will not say \
+             which, and nothing will refuse the merge for you, so find out \
+             which it is and stop unless it is green; (b) no passing run backs \
+             it AND \
              you could not make one — and under this charter (b) can only mean a \
              run that was never obtained, since a failing suite fails the build \
              inside the VM and never becomes a pull request at all, so check the \
@@ -1397,12 +1420,17 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              turn with POST /pull-requests/{number}/merge, and say that you did. \
              The brief above has already asked the three questions that could \
              stop you, and they are the whole list: (a) GitHub would refuse the \
-             merge — say which reason and stop; (b) no passing run of the \
+             merge, or reports a check on the head commit that has not gone \
+             green — CI runs this project's suite on every push, `unstable` \
+             means a check FAILED or has not finished and GitHub will not say \
+             which, and the checks are not required so nothing will refuse the \
+             merge for you; find out which it is and stop unless it is green; \
+             (b) no passing run of the \
              project's own test suite backs it — which here can only mean a run \
              that was never obtained, since a failing suite fails the build \
              inside the VM and never becomes a pull request; hand it to the \
-             human, because nothing on this host can make the run for you and \
-             this repository requires no checks of its own; (c) nothing runnable \
+             human, because nothing on this host can make the run for you; \
+             (c) nothing runnable \
              here could have checked it — the app-gpui rendering case. Say which \
              of the three it is rather than defaulting to caution, and if it is \
              none of them, merge it.\n\n\
@@ -1416,8 +1444,9 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              /pull-requests/{number}/merge as you otherwise would — the server \
              records the judgment, applies nothing, and answers `shadowed: true` \
              — and then say what you decided and why. Judge it on the same three \
-             questions the brief answers: whether GitHub would refuse the merge, \
-             whether a passing run of the project's own test suite backs it, and \
+             questions the brief answers: whether GitHub would refuse the merge \
+             or reports a check that has not gone green, whether a passing run \
+             of the project's own test suite backs it, and \
              whether anything runnable here could have checked it. That run \
              tested the branch against its own base and not against a trunk that \
              has moved since, so say whether the composition is the open \
@@ -1426,7 +1455,8 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
         CharterLevel::Off => {
             "Landing it is not yours. Report what it is waiting on, and say \
              which of the three questions the brief answers would have decided \
-             it: whether GitHub would refuse the merge, whether a passing run of \
+             it: whether GitHub would refuse the merge or reports a check that \
+             has not gone green, whether a passing run of \
              the project's own test suite backs it, and whether anything \
              runnable here could have checked it. A passing run covers the \
              branch against its own base and not the composition with a trunk \
@@ -2997,6 +3027,48 @@ mod tests {
                     section.contains("moved") || section.contains("composition"),
                     "{level:?}/{can_verify}: {section}"
                 );
+            }
+        }
+    }
+
+    /// #1015 widened carve-out (a), and the widening is the half that can be
+    /// lost silently.
+    ///
+    /// Before CI, "GitHub would refuse the merge" was the whole of what GitHub
+    /// could contribute, because nothing here produced a pull-request check.
+    /// Now a red suite reads `unstable` — which GitHub will still merge, since
+    /// the checks are not required — so an arm that asks only about refusal
+    /// tells the agent to merge red work and reports no carve-out for it. Every
+    /// arm has to name the check question, and the two `Live` arms have to say
+    /// that `unstable` does not distinguish failed from unfinished, or the
+    /// agent reads it as noise and merges through it.
+    #[test]
+    fn every_landing_arm_asks_what_ci_said_and_not_only_whether_github_would_refuse() {
+        for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
+            for can_verify in [true, false] {
+                let section = landing_section(&landing_charter(level), can_verify);
+                assert!(
+                    section.contains("check"),
+                    "{level:?}/{can_verify}: (a) is refusal-only: {section}"
+                );
+                if level == CharterLevel::Live {
+                    assert!(
+                        section.contains("unstable"),
+                        "{level:?}/{can_verify}: {section}"
+                    );
+                    assert!(
+                        section.contains("FAILED"),
+                        "{level:?}/{can_verify}: {section}"
+                    );
+                    assert!(
+                        section.contains("has not finished"),
+                        "{level:?}/{can_verify}: {section}"
+                    );
+                    assert!(
+                        section.contains("nothing will refuse the merge for you"),
+                        "{level:?}/{can_verify}: {section}"
+                    );
+                }
             }
         }
     }

@@ -299,17 +299,34 @@ const BLOCKED_BEHIND: &str =
 /// Whether a pull request can be landed *as a merge* — never whether the
 /// change is any good.
 ///
-/// The distinction is load-bearing. No workflow in this repository produces a
-/// pull-request check and there is no branch protection, so `blocked` cannot
-/// arise in it at all and [`Self::Clear`] is a statement about git, not about
-/// the code. The one workflow here — `.github/workflows/pages.yml`, which
-/// publishes the landing page — triggers on `push` and `workflow_dispatch`
-/// only, and a push-triggered workflow reports nothing against a pull request,
-/// so `mergeable_state` can still only be `clean` or `dirty`. That trigger list
-/// is not left to prose: `no_workflow_produces_a_pull_request_check` in
-/// `crates/tasks/tests/site.rs` fails the suite if any workflow grows an
-/// `on: pull_request`. Anything reading this to decide whether work is safe to
-/// ship needs a second source of evidence; see `builder::verification_report`.
+/// The distinction is load-bearing and #1015 moved where it falls.
+/// `.github/workflows/ci.yml` now runs `cargo fmt`, clippy and the whole suite
+/// on **every push**, and a Builder branch is pushed into this repository, so
+/// its check runs attach to the head commit a pull request points at. Three
+/// consequences, and none of them is the obvious one.
+///
+/// [`Self::Clear`] now carries evidence: `clean` requires every check GitHub
+/// knows about to have *passed*, so on this repository it says the branch
+/// builds, is formatted, is clippy-clean and its tests pass. What it still does
+/// not say is that the change works composed with a trunk that has moved since
+/// — no run against a branch can, and that is what the merge brief's own
+/// carve-outs are about.
+///
+/// [`Self::Unstable`] becomes reachable, and it is the dangerous one, because
+/// GitHub does not distinguish "a check failed" from "a check has not finished
+/// yet" — both read `unstable`. Merging on it without finding out which is the
+/// new way to ship a red branch, so [`Landing::describe`] says so rather than
+/// dismissing it as non-required noise.
+///
+/// [`Self::Blocked`]`(BLOCKED_REQUIRED)` stays unreachable here: the checks are
+/// **not required**, because there is no branch protection on this repository,
+/// so GitHub will still take a merge over a red one. The arm stays for the day
+/// that changes, which is a separate decision about who may land.
+///
+/// The premise is not left to prose. `ci_runs_the_suite_on_every_push` in
+/// `crates/tasks/tests/site.rs` fails the suite if CI stops existing or grows a
+/// `branches:`/`paths:` filter — the quiet failure, since an unchecked branch
+/// reads `clean` because nothing ran rather than because something passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Landing {
     /// Nothing in the way of the merge itself.
@@ -336,15 +353,17 @@ impl Landing {
     pub fn describe(&self) -> String {
         match self {
             Landing::Clear => "GitHub reports nothing in the way of the merge itself — no \
-                 conflict with the base, and no check it is waiting on. That says \
-                 nothing about whether the change works; no check here is capable \
-                 of objecting to that."
+                 conflict with the base, and every check it knows about has passed, \
+                 which here is fmt, clippy and the whole suite against this branch. \
+                 That says nothing about whether the branch still passes composed \
+                 with a trunk that has moved since its base."
                 .to_string(),
-            Landing::Unstable => {
-                "GitHub would take the merge, with a non-required check failing or \
-                 still running. That says nothing about whether the change works."
-                    .to_string()
-            }
+            Landing::Unstable => "GitHub would take the merge, and a check on the head commit is \
+                 either FAILING or has not finished — GitHub reports both as the \
+                 same state and does not say which. Here a check is this project's \
+                 own fmt, clippy and test suite, so find out which one it is before \
+                 merging; nothing will refuse the merge for you."
+                .to_string(),
             Landing::Blocked(reason) => format!(
                 "GitHub would refuse this merge: {reason}. A merge call now would \
                  be refused, so that has to be cleared first."
@@ -2354,16 +2373,21 @@ mod tests {
         );
     }
 
-    /// The wording is pinned because it is the load-bearing part. No workflow
-    /// here produces a pull-request check and there is no branch protection, so
-    /// `clean` is a statement about git and cannot object to a change that does
-    /// not work — a describe() that read as a clearance would be instructing
-    /// every future turn to land unverified work.
+    /// The wording is pinned because it is the load-bearing part, and #1015
+    /// moved what it has to say without moving how much it may claim.
+    ///
+    /// `clean` now means CI passed on the head commit, so the old sentence
+    /// ("no check here is capable of objecting") is false and had to go. What
+    /// replaces it is the narrower true one — this run covered the branch
+    /// against its own base and not the composition — because a `describe()`
+    /// that read as a clearance would be instructing every future turn to land
+    /// on evidence it does not have. The forbidden list is unchanged: the
+    /// failure mode is a reader upgrading "nothing in the way" into "ready".
     #[test]
     fn clear_says_what_it_does_not_mean() {
         let said = Landing::Clear.describe();
         assert!(
-            said.contains("says nothing about whether the change works"),
+            said.contains("composed with a trunk that has moved"),
             "{said}"
         );
         for forbidden in ["good to merge", "ready to merge", "safe"] {
@@ -2373,6 +2397,23 @@ mod tests {
         let blocked = Landing::Blocked(BLOCKED_REQUIRED).describe();
         assert!(blocked.contains(BLOCKED_REQUIRED), "{blocked}");
         assert!(blocked.contains("would be refused"), "{blocked}");
+    }
+
+    /// The half of #1015 that is easiest to get wrong. `unstable` conflates a
+    /// check that FAILED with one that has not finished, GitHub will not say
+    /// which, and nothing refuses the merge — so a sentence that filed it under
+    /// non-required noise (which is what it said before CI existed) is an
+    /// instruction to merge red work.
+    #[test]
+    fn unstable_says_a_check_may_be_red_and_that_nothing_will_stop_you() {
+        let said = Landing::Unstable.describe();
+        assert!(said.contains("FAILING"), "{said}");
+        assert!(said.contains("has not finished"), "{said}");
+        assert!(said.contains("nothing will refuse the merge"), "{said}");
+        assert!(
+            !said.contains("says nothing about whether the change works"),
+            "the pre-CI dismissal is exactly what must not survive: {said}"
+        );
     }
 
     fn rest(status: u16, message: &str) -> GhError {
