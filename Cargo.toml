@@ -105,3 +105,16 @@ build-stamp = { path = "crates/build-stamp" }
 tasks-protocol = { path = "crates/tasks-protocol" }
 tasks-api = { path = "crates/tasks-api" }
 tasks = { path = "crates/tasks" }
+
+# Dev and test builds keep file:line backtraces and drop the rest of the
+# debug info: full debuginfo doubled the target directory (6.5 GB -> 3.4 GB
+# measured on a cold workspace) and cost ~12% of a cold build, and nothing
+# here attaches a debugger to a dev build as a matter of course — backtraces,
+# the thing the tests and `RUST_BACKTRACE=1` actually read, keep their file
+# and line. It also shrinks what the linker holds in memory, which is the
+# resource the SCOUT/BUILDER_BUILD_JOBS derivation exists to protect in
+# memory-capped VMs. `test` inherits `dev`; `release` (what `make dist` and
+# the land path ship) is untouched. Set CARGO_PROFILE_DEV_DEBUG=2 for the
+# one-off session that wants a real debugger.
+[profile.dev]
+debug = "line-tables-only"

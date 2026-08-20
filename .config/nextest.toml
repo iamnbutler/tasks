@@ -21,9 +21,25 @@ leak-timeout = { period = "1s", result = "pass" }
 # Name the slow tests at the end of every run.
 final-status-level = "slow"
 
+# The suite is sleep-bound, not CPU-bound — these tests spawn real servers and
+# real child processes and then wait on timeouts, polls and drains — so
+# nextest's default of one thread per core leaves the host mostly idle. 16
+# took the run from ~91s to ~45s on the 10-core dev host, measured twice, all
+# green with no retries and the slowest test at 18s against the 60s kill
+# threshold. An absolute number rather than a multiplier because nextest has
+# no multiplier syntax; `ci` below pins itself back to `num-cpus` for the
+# 4-CPU builder VMs.
+test-threads = 16
+
 [profile.ci]
 # CI wants the whole picture from one run, and tolerance for the flakiness
 # that comes with spawning real processes.
 fail-fast = false
 retries = 2
 slow-timeout = { period = "15s", terminate-after = 4 }
+
+# Profiles inherit from `default`, and this is the one inherited value that
+# must not flow through: `.tasks/verify` runs `make test-ci` inside a 4-CPU
+# Builder VM, where 16 threads of real processes would starve the slow tail
+# toward the kill threshold. `num-cpus` is nextest's own default, restated.
+test-threads = "num-cpus"
