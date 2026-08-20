@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::brief::Brief;
-use crate::deadline::{self, Deadline, Expiry};
+use crate::deadline::{self, Deadline, Expiry, command_budget};
 use crate::events::{Event, EventPayload};
 use crate::models::{
     Actor, BuildStatus, Capability, CharterEntry, CharterLevel, ContextBreakdown, Obligation,
@@ -1334,25 +1334,6 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
              that has moved."
         }
     }
-}
-
-/// Floor under [`command_budget`], so a very short turn still allows a command
-/// long enough to be worth running.
-const MIN_COMMAND_BUDGET: Duration = Duration::from_secs(60);
-
-/// How long one command may run inside a turn of `turn`.
-///
-/// Half, and the half is the statable guarantee: whatever a command spent, at
-/// least that much turn is left to report it in. The failure this comes from
-/// was a 600s turn against Claude Code's own 600s per-command ceiling, where a
-/// single command could consume the entire turn and leave nothing to report
-/// with — observed as an agent "killed before writing output".
-///
-/// Derived rather than configured. A second knob is a second thing to get
-/// wrong, and the invariant that matters is a relationship between the two
-/// numbers, not either number alone. The floor never exceeds the turn itself.
-pub fn command_budget(turn: Duration) -> Duration {
-    (turn / 2).max(MIN_COMMAND_BUDGET.min(turn))
 }
 
 /// How the agent verifies a change, or empty when it cannot.

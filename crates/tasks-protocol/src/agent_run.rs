@@ -34,6 +34,26 @@
 //! conversation *and* the worktree — and for a Builder that difference is the
 //! implementation itself.
 //!
+//! # Three policies, one mechanism
+//!
+//! Re-invoking the agent on the conversation it already has is now the answer
+//! to three different questions, and they must not be netted together:
+//!
+//! - **`{SCOUT,BUILDER}_MAX_RESUMES`** (this module's [`decide`]) — how often a
+//!   *dropped API connection* may be picked back up.
+//! - **the Builder's repair round** (`builder-supervisor`, one round,
+//!   hardcoded) — how often the agent may be told *its own tests are red*.
+//! - **`{SCOUT,BUILDER}_MAX_CONTINUATIONS`** ([`decide_continuation`]) — how
+//!   often the agent may be told *its turn was the whole run and it produced
+//!   nothing* (#962).
+//!
+//! Separate counters, because netting any two lets one exhaust the other: a run
+//! that spent both resumes on dropped connections still gets its repair round
+//! and still gets its continuation. What they share is the re-invocation
+//! itself — [`resume_argv`] for the argv and [`command_selects_session`] for
+//! the guard — so a third hand-written version of either cannot come to
+//! disagree with the other two.
+//!
 //! # The guards are the load-bearing part
 //!
 //! The failures you must not retry look superficially like the one you must.
@@ -48,6 +68,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::AgentRole;
+use crate::budget::{RunBudget, command_budget};
 use crate::vm_memory::AgentOutcome;
 
 /// Resumes allowed per run when `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES`
@@ -460,6 +482,334 @@ pub fn command_selects_session(argv: &[String]) -> Option<String> {
     session_selecting_flag(argv)
 }
 
+/// Continuations allowed per run when `SCOUT_MAX_CONTINUATIONS` /
+/// `BUILDER_MAX_CONTINUATIONS` is unset.
+///
+/// **One**, and one is a decision rather than a starting point. The message a
+/// continuation carries is "there is no later, and you have produced nothing" —
+/// a third telling of that is not a longer leash, it is a mechanism for wearing
+/// an agent down until it invents something, and what it would invent is the
+/// half-explored spec that reaches a reviewer looking finished.
+pub const DEFAULT_MAX_CONTINUATIONS: u32 = 1;
+
+/// Whether the run left anything behind that the supervisor can report.
+///
+/// Deliberately the *weakest* reading each supervisor can make — "is there
+/// anything at all", never "is it any good". Asking whether the work was fully
+/// done would fire a continuation on every ordinary run, and a supervisor that
+/// cannot read its own repository answers [`Deliverable::Produced`], so an
+/// unreadable state declines a continuation rather than spending one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deliverable {
+    /// Something is on disk: a spec, or commits. Nothing to continue about.
+    Produced,
+    /// Nothing is. This is the state [`decide_continuation`] exists for.
+    Nothing,
+}
+
+/// Why a run that produced nothing was not handed back to its agent.
+///
+/// One named reason per guard, on [`NoResume`]'s rule: a continuation that did
+/// not happen has to be as readable as one that did — and here it is more than
+/// readability, because the terminal reason these compose into is what a human
+/// reads when deciding whether three attempts were fair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoContinuation {
+    /// `*_MAX_CONTINUATIONS=0`: continuing is switched off.
+    Disabled,
+    /// The continuation budget is spent. With the default of one, this is what
+    /// a second empty ending says.
+    BudgetExhausted { used: u32, max: u32 },
+    /// The run has something to show, so there is nothing to tell it about.
+    DeliverableProduced,
+    /// The agent did not end its own turn — its connection dropped, the VM is
+    /// going away, or it never streamed anything to classify. A continuation
+    /// says "you ended your turn and your background children are already
+    /// dead"; in front of an agent whose turn was ended *for* it that message
+    /// is simply false, and the whole mechanism rests on it being true.
+    NotAConclusion { ending: &'static str },
+    /// The kernel OOM-killed something during the run. Same argument as
+    /// [`Self::NotAConclusion`] and it is the argument rather than #828 that
+    /// settles it: the agent did not park and did not choose to stop, so the
+    /// message would describe something that did not happen, to an agent that
+    /// did not do it. The recovery this gives up — an agent writing down what
+    /// it knew without rebuilding anything — has a home already, and it is
+    /// `NOTES.md`, which survives without a continuation.
+    MemoryKill,
+    /// The agent never announced a session id, so there is no conversation to
+    /// hand anything back to.
+    NoSessionId,
+    /// The operator's command already chooses its own conversation.
+    CommandSelectsSession { flag: String },
+    /// The host stated no run budget, so there is no way to know whether a
+    /// continuation could have been acted on — and claiming the agent was told
+    /// when it may have had seconds is the one thing this guard exists to
+    /// prevent.
+    BudgetUnstated,
+    /// There is budget left, and not enough of it.
+    TooLittle { remaining_secs: u64, needed_secs: u64 },
+}
+
+impl NoContinuation {
+    /// One clause for a log line or a terminal reason.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Disabled => "continuing is disabled (max continuations is 0)".to_string(),
+            Self::BudgetExhausted { used, max } => {
+                format!("the continuation budget is spent ({used} of {max} used)")
+            }
+            Self::DeliverableProduced => "the run produced something to report".to_string(),
+            Self::NotAConclusion { ending } => format!(
+                "the agent did not end its own turn ({ending}), so it was never asked to \
+                 continue one"
+            ),
+            Self::MemoryKill => {
+                "the kernel OOM-killed a process during the run, so the agent did not choose to \
+                 stop and telling it that it had would be false"
+                    .to_string()
+            }
+            Self::NoSessionId => {
+                "the agent's output never carried a session id, so there is no conversation to \
+                 continue"
+                    .to_string()
+            }
+            Self::CommandSelectsSession { flag } => {
+                format!("the configured agent command already selects a session ({flag})")
+            }
+            Self::BudgetUnstated => {
+                "the host did not say how much run budget was left, so there was no way to know \
+                 whether a further attempt could be acted on (the server predates this field — \
+                 restart it)"
+                    .to_string()
+            }
+            Self::TooLittle {
+                remaining_secs,
+                needed_secs,
+            } => format!(
+                "only {remaining_secs}s of run budget remained, less than the {needed_secs}s one \
+                 command may run for, so a further attempt could not have been acted on"
+            ),
+        }
+    }
+}
+
+/// A run that has just ended, and everything the continuation decision reads
+/// about it.
+///
+/// A struct rather than eight positional arguments, because the two counters
+/// and the two budgets are easy to transpose and a transposed pair here is a
+/// wrong fact under an attempt cap.
+#[derive(Debug, Clone, Copy)]
+pub struct Continuation<'a> {
+    /// The stream the last attempt produced.
+    pub watcher: &'a ResultWatcher,
+    /// The last attempt's exit status and memory accounting.
+    pub outcome: &'a AgentOutcome,
+    /// The operator's configured command, program first.
+    pub argv: &'a [String],
+    /// Whose deliverable is missing — it decides two nouns in the prompt.
+    pub role: AgentRole,
+    /// Whether anything was produced.
+    pub deliverable: Deliverable,
+    /// What is left of the run, as the host stated it and this VM has spent it.
+    pub budget: RunBudget,
+    /// Continuations this run has already spent.
+    pub used: u32,
+    /// [`DEFAULT_MAX_CONTINUATIONS`], or the configured override.
+    pub max: u32,
+}
+
+/// Whether to hand a run that produced nothing back to its own agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationDecision {
+    /// Re-invoke the agent with this argv and this prompt. `attempt` counts
+    /// continuations, so the first one is 1.
+    Continue {
+        argv: Vec<String>,
+        prompt: String,
+        attempt: u32,
+    },
+    /// Let the run end, for this reason.
+    Stop(NoContinuation),
+}
+
+/// Decide whether to tell an agent that produced nothing that there is no
+/// later.
+///
+/// This is the answer to #962, where a Scout finished its implementation, put a
+/// cold 750-crate build behind three `until [ -f /tmp/test.log ]` waiters, said
+/// it would pick the result up when the tests reported, and ended its turn 490s
+/// into a 3600s budget. Under `claude --print` the turn ending *is* the run
+/// ending: the children were killed a moment later, the supervisor collected a
+/// `SPEC.md` that was never written, and the task was charged a dispatch
+/// attempt for a verdict nothing had reached.
+///
+/// # It is a second policy over one mechanism, never a second mechanism
+///
+/// [`decide`] answers "the connection dropped, pick it back up"; the Builder's
+/// repair round answers "your own tests are red, fix them"; this answers "your
+/// turn was the whole run and you produced nothing". Three questions, three
+/// counters — netting any two would let one exhaust the other. What they share
+/// is the re-invocation underneath: [`resume_argv`] builds the argv and
+/// [`command_selects_session`] is the guard, asked here rather than restated,
+/// which is what keeps the three from disagreeing about `--resume=<id>`.
+///
+/// # Why this is not a fourth `FailureClass`
+///
+/// An agent that parked on a background command and an agent that explored
+/// honestly and concluded it could not conclude write the *same* terminal
+/// record (`terminal_reason: completed`) and leave the same empty directory.
+/// They are not distinguishable by inspection, and separating them on how much
+/// of the budget was spent is exactly the inference this codebase refuses
+/// everywhere else. So the ambiguity is removed rather than classified: what
+/// comes back is a verdict either way — a spec, or an agent that was told
+/// plainly and still produced nothing.
+///
+/// # The budget guard is what keeps that claim true
+///
+/// [`AgentRun::continuations`] puts "it was told" into the terminal reason, and
+/// that only holds when the agent had time to answer. A run parking at 3400s of
+/// 3600 would otherwise spend a continuation the agent could not act on and
+/// record it as a telling — the ledger asserting something untrue, in the
+/// direction that charges a strike. So the threshold is [`command_budget`], the
+/// same half-the-run arithmetic the harness enforces per command: a further
+/// attempt that cannot run one command cannot verify anything. It errs toward
+/// declining, deliberately — declining costs one run's recovery, while
+/// recording a telling that never happened puts a wrong fact under an attempt
+/// cap that rejects a task at three.
+pub fn decide_continuation(c: &Continuation<'_>) -> ContinuationDecision {
+    if c.max == 0 {
+        return ContinuationDecision::Stop(NoContinuation::Disabled);
+    }
+    if c.used >= c.max {
+        return ContinuationDecision::Stop(NoContinuation::BudgetExhausted {
+            used: c.used,
+            max: c.max,
+        });
+    }
+    if c.deliverable == Deliverable::Produced {
+        return ContinuationDecision::Stop(NoContinuation::DeliverableProduced);
+    }
+    match c.watcher.ending() {
+        AgentEnding::Concluded { .. } => {}
+        AgentEnding::Silent => {
+            return ContinuationDecision::Stop(NoContinuation::NotAConclusion {
+                ending: "it produced no stream-json to classify",
+            });
+        }
+        AgentEnding::NoResult => {
+            return ContinuationDecision::Stop(NoContinuation::NotAConclusion {
+                ending: "it wrote no terminal record, so it was killed from outside",
+            });
+        }
+        AgentEnding::Transport { .. } => {
+            return ContinuationDecision::Stop(NoContinuation::NotAConclusion {
+                ending: "its API connection dropped",
+            });
+        }
+    }
+    if c.outcome.verdict.is_some() {
+        return ContinuationDecision::Stop(NoContinuation::MemoryKill);
+    }
+    let Some(session_id) = c.watcher.session_id() else {
+        return ContinuationDecision::Stop(NoContinuation::NoSessionId);
+    };
+    if let Some(flag) = command_selects_session(c.argv) {
+        return ContinuationDecision::Stop(NoContinuation::CommandSelectsSession { flag });
+    }
+    // Last, and last on purpose: every reason above is a fact about the run,
+    // and reporting "there was no time" about a run that had produced its
+    // deliverable anyway would be noise in the one place a human is deciding
+    // whether a strike was earned.
+    let (Some(total), Some(remaining)) = (c.budget.total(), c.budget.remaining()) else {
+        return ContinuationDecision::Stop(NoContinuation::BudgetUnstated);
+    };
+    let needed = command_budget(total);
+    if remaining < needed {
+        return ContinuationDecision::Stop(NoContinuation::TooLittle {
+            remaining_secs: remaining.as_secs(),
+            needed_secs: needed.as_secs(),
+        });
+    }
+
+    ContinuationDecision::Continue {
+        argv: resume_argv(c.argv, session_id),
+        prompt: continuation_prompt(c.role),
+        attempt: c.used + 1,
+    }
+}
+
+/// What the continued agent reads on stdin.
+///
+/// Like [`RESUME_PROMPT`] it does **not** restate the task: the task is above
+/// this in the conversation the `--resume` reattaches to, and re-sending it is
+/// how a re-invocation silently becomes a restart.
+///
+/// Three things it must say, and each is load-bearing.
+///
+/// That the turn ending *is* the run ending, in as many words — because under
+/// `claude --print` it is, and an agent that has just backgrounded a build has
+/// demonstrably not been told.
+///
+/// That the background children are already dead. Not "will be": the previous
+/// turn ended, so they were killed before this message was written, and an
+/// agent told they *would* die may reasonably go back to waiting for one.
+///
+/// That "I cannot" is available, in as many words, and where to write it.
+/// Without that the only exit is to produce something, which for a Scout is the
+/// half-explored spec that reaches a reviewer looking finished — the exact
+/// failure the `SPEC.md`/`NOTES.md` split exists to prevent.
+pub fn continuation_prompt(role: AgentRole) -> String {
+    let deliverable = role.deliverable();
+    let shortfall = role.shortfall_artifact();
+    let finish = match role {
+        AgentRole::Scout => {
+            "If you have concluded, write `SPEC.md` now. If you have not, do the smallest \
+             remaining thing that would let you conclude — run it in the foreground, watch it \
+             finish, and then write the spec."
+        }
+        AgentRole::Builder => {
+            "If the implementation is done, commit it now. If it is not, finish the smallest \
+             coherent piece of it, run what verifies that piece in the foreground, watch it \
+             finish, and commit."
+        }
+    };
+    format!(
+        "STOP. Your turn ended and this run produced nothing.\n\n\
+         Read this carefully, because it is probably not what you assumed.\n\n\
+         **Your turn ending is this run ending.** You are running under `claude --print`: there \
+         is no later turn, nothing polls for you, and no one is going to read a file you have \
+         not written yet. The supervisor looked for {deliverable} and found none.\n\n\
+         **Anything you put in the background is already dead.** Not \"will be killed\" — the \
+         moment your last turn ended, every child process you had started was killed. A build \
+         you backgrounded is not still building. A test run you were waiting on will never \
+         report. A file it was going to write will never appear. If you ended your turn \
+         intending to collect a result, that result does not exist and cannot be collected.\n\n\
+         You have EXACTLY ONE more attempt. Use it in the foreground: run the command, wait for \
+         it, read its output. One command may run for a long time here — far longer than the \
+         default you may be used to — and the run budget is what bounds you, not the command \
+         timeout.\n\n\
+         Everything you already wrote is still on disk, in the same working directory, \
+         unchanged. Do not start over and do not repeat work you have already done. \
+         {finish}\n\n\
+         **If you cannot conclude, say that instead — it is a real answer and an honest one is \
+         worth more than an invented one.** Write what you actually know into `{shortfall}`: \
+         what you established, what you ruled out, where you got to, and what you would do \
+         next. That is read by whoever picks this up, and it is worth far more than something \
+         made to look finished. Do not manufacture a conclusion you have not reached."
+    )
+}
+
+/// Read a `*_MAX_CONTINUATIONS` variable, falling back to
+/// [`DEFAULT_MAX_CONTINUATIONS`] when it is unset or unparseable. `0` disables
+/// continuing.
+pub fn max_continuations_from_env(var: &str) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_CONTINUATIONS)
+}
+
 /// A whole agent run — every attempt of it — and how it ended.
 ///
 /// The reported exit code is the *last* attempt's, not the death's, so a run
@@ -487,6 +837,17 @@ pub struct AgentRun {
     /// watcher. `None` is an agent that never streamed a session id, and the
     /// only honest response to it is not to resume.
     pub session_id: Option<String>,
+    /// How many times the agent was told its turn was the whole run and handed
+    /// the conversation back. `0` on an ordinary run.
+    ///
+    /// This is what makes a strike legible as earned: an empty run that was
+    /// told plainly and still produced nothing is a verdict, where the same
+    /// empty run untold is #962.
+    pub continuations: u32,
+    /// Why the run was not continued. Meaningful only when the agent ended its
+    /// own turn — on a transport death "not continued: its API connection
+    /// dropped" is noise beside [`Self::no_resume`], which already said it.
+    pub no_continuation: Option<NoContinuation>,
 }
 
 impl AgentRun {
@@ -499,6 +860,8 @@ impl AgentRun {
             resumes: 0,
             no_resume: None,
             session_id: None,
+            continuations: 0,
+            no_continuation: None,
         }
     }
 
@@ -541,8 +904,42 @@ impl AgentRun {
         {
             out.push_str(&format!(" — not resumed: {}", reason.describe()));
         }
+        out.push_str(&self.continuation_context());
         out.push_str(&self.outcome.failure_context());
         out
+    }
+
+    /// The clause that says whether this run was handed back to its agent, and
+    /// on what terms.
+    ///
+    /// Three states, deliberately kept apart, because a human deciding whether
+    /// three attempts were fair needs them apart: **told** (and still produced
+    /// nothing — that is a verdict), **not told for want of time** (the
+    /// continuation could not have been acted on, so nothing was claimed of the
+    /// agent), and **not told for some other reason** (which names itself).
+    ///
+    /// Two silences. A run that ended in anything but a conclusion of the
+    /// agent's own says nothing here, because [`Self::no_resume`] has already
+    /// described that ending and repeating it under a second heading reads as
+    /// two findings. And a run that produced its deliverable says nothing,
+    /// because "the run produced something to report" is not a fact about a
+    /// failure.
+    fn continuation_context(&self) -> String {
+        if self.continuations > 0 {
+            return format!(
+                " — told {} time(s) that its turn was the whole run and given a further \
+                 attempt, and still produced nothing",
+                self.continuations
+            );
+        }
+        if self.ending.is_transport() {
+            return String::new();
+        }
+        match &self.no_continuation {
+            None | Some(NoContinuation::DeliverableProduced) => String::new(),
+            Some(NoContinuation::NotAConclusion { .. }) => String::new(),
+            Some(reason) => format!(" — not continued: {}", reason.describe()),
+        }
     }
 }
 
@@ -558,6 +955,8 @@ pub fn max_resumes_from_env(var: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn argv(cmd: &str) -> Vec<String> {
@@ -804,14 +1203,15 @@ mod tests {
     #[test]
     fn a_transport_failure_names_itself_in_the_terminal_reason() {
         let run = AgentRun {
-            outcome: AgentOutcome::default(),
-            ending: AgentEnding::Transport {
-                terminal_reason: "api_error".into(),
-                api_error_status: Some("529".into()),
-            },
             resumes: 2,
             no_resume: Some(NoResume::BudgetExhausted { used: 2, max: 2 }),
-            session_id: None,
+            ..AgentRun::single(
+                AgentOutcome::default(),
+                AgentEnding::Transport {
+                    terminal_reason: "api_error".into(),
+                    api_error_status: Some("529".into()),
+                },
+            )
         };
         let context = run.failure_context();
         assert!(
@@ -830,15 +1230,15 @@ mod tests {
     #[test]
     fn a_healthy_run_adds_nothing_to_the_reason() {
         let run = AgentRun {
-            outcome: AgentOutcome::default(),
-            ending: AgentEnding::Concluded {
-                terminal_reason: "completed".into(),
-            },
-            resumes: 0,
             no_resume: Some(NoResume::Concluded {
                 terminal_reason: "completed".into(),
             }),
-            session_id: None,
+            ..AgentRun::single(
+                AgentOutcome::default(),
+                AgentEnding::Concluded {
+                    terminal_reason: "completed".into(),
+                },
+            )
         };
         assert_eq!(run.failure_context(), "");
         assert_eq!(AgentRun::default().failure_context(), "");
@@ -891,13 +1291,13 @@ mod tests {
         // The *final* ending decides: a run resumed twice that then concluded
         // badly is a verdict, whatever killed the earlier attempts.
         let resumed_then_concluded = AgentRun {
-            outcome: AgentOutcome::default(),
-            ending: AgentEnding::Concluded {
-                terminal_reason: "completed".into(),
-            },
             resumes: 2,
-            no_resume: None,
-            session_id: None,
+            ..AgentRun::single(
+                AgentOutcome::default(),
+                AgentEnding::Concluded {
+                    terminal_reason: "completed".into(),
+                },
+            )
         };
         assert_eq!(
             resumed_then_concluded.failure_class(),
@@ -919,6 +1319,383 @@ mod tests {
         assert_eq!(
             run.failure_context(),
             " — agent killed by signal 9 (SIGKILL)"
+        );
+    }
+
+    // ---- continuations (#962) -------------------------------------------
+
+    /// A run that ended cleanly, produced nothing, and has most of an hour
+    /// left — the #962 shape, where every guard is satisfied.
+    fn parked() -> (ResultWatcher, AgentOutcome) {
+        (watch(&[INIT, CLEAN_RESULT]), AgentOutcome::default())
+    }
+
+    fn continuation<'a>(
+        watcher: &'a ResultWatcher,
+        outcome: &'a AgentOutcome,
+        argv: &'a [String],
+    ) -> Continuation<'a> {
+        Continuation {
+            watcher,
+            outcome,
+            argv,
+            role: AgentRole::Scout,
+            deliverable: Deliverable::Nothing,
+            budget: RunBudget::starting_now(Some(3600)),
+            used: 0,
+            max: DEFAULT_MAX_CONTINUATIONS,
+        }
+    }
+
+    /// The failure the whole mechanism is for: a clean ending, an empty
+    /// directory, and 3110s of the budget still unspent.
+    #[test]
+    fn an_empty_clean_ending_with_budget_left_is_continued_once() {
+        let (w, o) = parked();
+        let argv = base_argv();
+        let ContinuationDecision::Continue {
+            argv: next,
+            prompt,
+            attempt,
+        } = decide_continuation(&continuation(&w, &o, &argv))
+        else {
+            panic!("the #962 shape must be continued");
+        };
+        assert_eq!(attempt, 1);
+        assert_eq!(
+            next.last().map(String::as_str),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(next[next.len() - 2], "--resume");
+        assert!(prompt.contains("already dead"));
+
+        // And exactly once: the second empty ending finds the budget spent.
+        let spent = Continuation {
+            used: 1,
+            ..continuation(&w, &o, &argv)
+        };
+        assert_eq!(
+            decide_continuation(&spent),
+            ContinuationDecision::Stop(NoContinuation::BudgetExhausted { used: 1, max: 1 })
+        );
+    }
+
+    /// Every gate names itself, so a continuation that did not happen is as
+    /// readable as one that did — and so a reader can tell which guard fired.
+    #[test]
+    fn each_continuation_guard_stops_with_its_own_reason() {
+        let (w, o) = parked();
+        let argv = base_argv();
+        let base = continuation(&w, &o, &argv);
+
+        let cases: Vec<(Continuation<'_>, NoContinuation)> = vec![
+            (Continuation { max: 0, ..base }, NoContinuation::Disabled),
+            (
+                Continuation {
+                    used: 3,
+                    max: 1,
+                    ..base
+                },
+                NoContinuation::BudgetExhausted { used: 3, max: 1 },
+            ),
+            (
+                Continuation {
+                    deliverable: Deliverable::Produced,
+                    ..base
+                },
+                NoContinuation::DeliverableProduced,
+            ),
+            (
+                Continuation {
+                    budget: RunBudget::starting_now(None),
+                    ..base
+                },
+                NoContinuation::BudgetUnstated,
+            ),
+        ];
+        for (case, expected) in cases {
+            assert_eq!(
+                decide_continuation(&case),
+                ContinuationDecision::Stop(expected)
+            );
+        }
+
+        // An ending that is not the agent's own, three ways. Each says which.
+        let silent = watch(&["not json at all"]);
+        let ContinuationDecision::Stop(NoContinuation::NotAConclusion { ending }) =
+            decide_continuation(&Continuation {
+                watcher: &silent,
+                ..base
+            })
+        else {
+            panic!("a silent agent is not a conclusion");
+        };
+        assert!(ending.contains("stream-json"), "{ending}");
+
+        let no_result = watch(&[INIT]);
+        let ContinuationDecision::Stop(NoContinuation::NotAConclusion { ending }) =
+            decide_continuation(&Continuation {
+                watcher: &no_result,
+                ..base
+            })
+        else {
+            panic!("a missing terminal record is not a conclusion");
+        };
+        assert!(ending.contains("killed from outside"), "{ending}");
+
+        let dropped = watch(&[INIT, API_ERROR_RESULT]);
+        let ContinuationDecision::Stop(NoContinuation::NotAConclusion { ending }) =
+            decide_continuation(&Continuation {
+                watcher: &dropped,
+                ..base
+            })
+        else {
+            panic!("a transport death is decide()'s question, never this one");
+        };
+        assert!(ending.contains("connection dropped"), "{ending}");
+
+        // The kernel stopped it, so it did not choose to stop, so it must not
+        // be told that it did.
+        let oomed = AgentOutcome {
+            verdict: Some("the kernel OOM-killed a process".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_continuation(&Continuation {
+                outcome: &oomed,
+                ..base
+            }),
+            ContinuationDecision::Stop(NoContinuation::MemoryKill)
+        );
+
+        // No conversation to continue.
+        let anonymous = watch(&[
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"subtype":"success","terminal_reason":"completed","api_error_status":null,"type":"result"}"#,
+        ]);
+        assert_eq!(
+            decide_continuation(&Continuation {
+                watcher: &anonymous,
+                ..base
+            }),
+            ContinuationDecision::Stop(NoContinuation::NoSessionId)
+        );
+
+        // The operator already chose one.
+        let operators: Vec<String> = "claude --print --resume abc"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            decide_continuation(&Continuation {
+                argv: &operators,
+                ..base
+            }),
+            ContinuationDecision::Stop(NoContinuation::CommandSelectsSession {
+                flag: "--resume".into()
+            })
+        );
+    }
+
+    /// A continuation started with no budget left is not a telling, and the
+    /// terminal reason must not record it as one.
+    ///
+    /// The threshold is [`command_budget`] — half the run, floor 60s — because
+    /// a further attempt that cannot run one command cannot verify anything.
+    #[test]
+    fn a_continuation_needs_enough_budget_left_to_be_acted_on() {
+        let (w, o) = parked();
+        let argv = base_argv();
+        let base = continuation(&w, &o, &argv);
+
+        // An hour's budget with ten minutes left: half the run is 1800s, so a
+        // further attempt could not run one command.
+        let starved = Continuation {
+            budget: RunBudget::anchored(Instant::now() - Duration::from_secs(3000), Some(3600)),
+            ..base
+        };
+        let ContinuationDecision::Stop(NoContinuation::TooLittle {
+            remaining_secs,
+            needed_secs,
+        }) = decide_continuation(&starved)
+        else {
+            panic!("600s of an hour is not enough to be told anything about");
+        };
+        assert_eq!(needed_secs, 1800);
+        assert!((595..=600).contains(&remaining_secs), "{remaining_secs}");
+
+        // The #962 run parked at 490s of 3600 — 3110s left, comfortably over.
+        let roomy = Continuation {
+            budget: RunBudget::anchored(Instant::now() - Duration::from_secs(490), Some(3600)),
+            ..base
+        };
+        assert!(matches!(
+            decide_continuation(&roomy),
+            ContinuationDecision::Continue { .. }
+        ));
+
+        // A host that stated nothing is its own answer, never a guess.
+        assert_eq!(
+            decide_continuation(&Continuation {
+                budget: RunBudget::starting_now(None),
+                ..base
+            }),
+            ContinuationDecision::Stop(NoContinuation::BudgetUnstated)
+        );
+
+        // The budget guard is asked LAST: a run that produced its deliverable
+        // with no time left reports the deliverable, not the clock, because
+        // "there was no time" is noise where nothing was owed.
+        assert_eq!(
+            decide_continuation(&Continuation {
+                deliverable: Deliverable::Produced,
+                budget: RunBudget::starting_now(Some(0)),
+                ..base
+            }),
+            ContinuationDecision::Stop(NoContinuation::DeliverableProduced)
+        );
+    }
+
+    /// A resume and a continuation name the same conversation the same way,
+    /// which is the whole reason [`resume_argv`] is shared rather than copied.
+    #[test]
+    fn a_resume_and_a_continuation_name_the_same_conversation_the_same_way() {
+        let argv = base_argv();
+        let dropped = watch(&[INIT, API_ERROR_RESULT]);
+        let ResumeDecision::Resume {
+            argv: resumed_argv, ..
+        } = decide(&dropped, &AgentOutcome::default(), &argv, 0, 2)
+        else {
+            panic!("a dropped connection resumes");
+        };
+
+        let (w, o) = parked();
+        let ContinuationDecision::Continue {
+            argv: continued_argv,
+            ..
+        } = decide_continuation(&continuation(&w, &o, &argv))
+        else {
+            panic!("the #962 shape continues");
+        };
+
+        assert_eq!(resumed_argv, continued_argv);
+    }
+
+    /// The prompt has to be *true* about the thing it is telling the agent, and
+    /// it has to leave "I cannot" available with somewhere to write it.
+    #[test]
+    fn the_continuation_prompt_is_true_and_leaves_an_honest_exit() {
+        for role in [AgentRole::Scout, AgentRole::Builder] {
+            let p = continuation_prompt(role);
+            assert!(
+                p.contains("already dead"),
+                "the children are dead now, not later: {p}"
+            );
+            assert!(
+                p.contains("the moment your last turn ended"),
+                "past tense, not future — an agent told its children *would* die \
+                 may reasonably go back to waiting for one: {p}"
+            );
+            assert!(p.contains("EXACTLY ONE more attempt"), "{p}");
+            assert!(p.contains("If you cannot conclude"), "{p}");
+            assert!(p.contains(role.shortfall_artifact()), "{p}");
+            assert!(
+                p.contains("Do not start over"),
+                "a continuation is not a restart: {p}"
+            );
+        }
+        assert!(continuation_prompt(AgentRole::Scout).contains("NOTES.md"));
+        assert!(continuation_prompt(AgentRole::Builder).contains("SUMMARY.md"));
+    }
+
+    /// Told, not-told-for-want-of-time, and not-told-for-another-reason are
+    /// three different sentences, because a human deciding whether three
+    /// attempts were fair has to tell them apart.
+    #[test]
+    fn the_terminal_reason_keeps_the_three_continuation_states_apart() {
+        let concluded = || AgentEnding::Concluded {
+            terminal_reason: "completed".into(),
+        };
+
+        let told = AgentRun {
+            continuations: 1,
+            ..AgentRun::single(AgentOutcome::default(), concluded())
+        };
+        assert!(
+            told.failure_context()
+                .contains("told 1 time(s) that its turn was the whole run"),
+            "{}",
+            told.failure_context()
+        );
+
+        let starved = AgentRun {
+            no_continuation: Some(NoContinuation::TooLittle {
+                remaining_secs: 600,
+                needed_secs: 1800,
+            }),
+            ..AgentRun::single(AgentOutcome::default(), concluded())
+        };
+        let text = starved.failure_context();
+        assert!(text.contains("not continued: only 600s"), "{text}");
+        assert!(!text.contains("told"), "{text}");
+
+        let never = AgentRun {
+            no_continuation: Some(NoContinuation::Disabled),
+            ..AgentRun::single(AgentOutcome::default(), concluded())
+        };
+        assert!(
+            never.failure_context().contains("continuing is disabled"),
+            "{}",
+            never.failure_context()
+        );
+
+        // Two silences. A transport death already said why it ended, so it does
+        // not also report that it was not continued...
+        let dropped = AgentRun {
+            no_continuation: Some(NoContinuation::NotAConclusion {
+                ending: "its API connection dropped",
+            }),
+            ..AgentRun::single(
+                AgentOutcome::default(),
+                AgentEnding::Transport {
+                    terminal_reason: "api_error".into(),
+                    api_error_status: Some("529".into()),
+                },
+            )
+        };
+        assert!(!dropped.failure_context().contains("not continued"));
+
+        // ...and neither does a run that had something to report.
+        let produced = AgentRun {
+            no_continuation: Some(NoContinuation::DeliverableProduced),
+            ..AgentRun::single(AgentOutcome::default(), concluded())
+        };
+        assert_eq!(produced.failure_context(), "");
+    }
+
+    /// The env knob, and the direction a typo falls in.
+    #[test]
+    fn the_continuation_budget_defaults_to_one() {
+        assert_eq!(DEFAULT_MAX_CONTINUATIONS, 1);
+        // SAFETY: single-threaded test process, and the var is read once here.
+        unsafe {
+            std::env::set_var("TASKS_TEST_MAX_CONTINUATIONS", "0");
+        }
+        assert_eq!(max_continuations_from_env("TASKS_TEST_MAX_CONTINUATIONS"), 0);
+        unsafe {
+            std::env::set_var("TASKS_TEST_MAX_CONTINUATIONS", "not a number");
+        }
+        assert_eq!(
+            max_continuations_from_env("TASKS_TEST_MAX_CONTINUATIONS"),
+            DEFAULT_MAX_CONTINUATIONS,
+            "an unparseable value falls back to the default rather than to zero"
+        );
+        unsafe {
+            std::env::remove_var("TASKS_TEST_MAX_CONTINUATIONS");
+        }
+        assert_eq!(
+            max_continuations_from_env("TASKS_TEST_MAX_CONTINUATIONS"),
+            DEFAULT_MAX_CONTINUATIONS
         );
     }
 }

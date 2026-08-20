@@ -19,9 +19,53 @@ use serde::{Deserialize, Deserializer, Serialize};
 use vm_pool_protocol::{AppProtocol, ServiceErrorKind};
 
 pub mod agent_run;
+pub mod budget;
 pub mod redact;
 pub mod verify;
 pub mod vm_memory;
+
+/// Which of the two agents a run belongs to.
+///
+/// Not a wire type — the wire already tags a role on [`TaskCommand`] and
+/// [`TaskEvent`], and this is deliberately not that. It exists because two
+/// things the server and the supervisors both render — the harness section of
+/// an agent's prompt, and [`crate::agent_run::continuation_prompt`] — differ by
+/// exactly one noun (the artifact the agent is asked to produce), and a shared
+/// sentence with a role-shaped hole in it is one statement rather than two that
+/// can drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// Explores, and concludes by writing `SPEC.md` — with `NOTES.md` as the
+    /// honest fallback when it cannot.
+    Scout,
+    /// Implements, and concludes by committing — with `SUMMARY.md` as where it
+    /// says what it could not do.
+    Builder,
+}
+
+impl AgentRole {
+    /// What this agent is asked to produce, as the prompt names it.
+    pub fn deliverable(&self) -> &'static str {
+        match self {
+            Self::Scout => "a finished `SPEC.md`",
+            Self::Builder => "committed work on this branch",
+        }
+    }
+
+    /// Where this agent writes down what it could *not* do.
+    ///
+    /// Every prompt that tells an agent it has one attempt left has to name
+    /// this in the same breath, or the only exit it leaves is to produce
+    /// something — which for a Scout is the half-explored spec that reaches a
+    /// reviewer looking finished, the exact failure the `SPEC.md`/`NOTES.md`
+    /// split exists to prevent.
+    pub fn shortfall_artifact(&self) -> &'static str {
+        match self {
+            Self::Scout => "NOTES.md",
+            Self::Builder => "SUMMARY.md",
+        }
+    }
+}
 
 /// Whether a terminal failure is a verdict on the *work*, or something that
 /// happened *to* the run.
@@ -230,6 +274,19 @@ pub enum ScoutCommand {
         /// The prompt Claude Code sees. Includes the issue body and spec
         /// template instructions, rendered host-side.
         prompt: String,
+        /// Seconds of this run's budget still unspent when the command was
+        /// sent, so the VM can tell whether a further attempt at the agent
+        /// could be acted on at all (see
+        /// [`crate::agent_run::decide_continuation`]) — the Builder's field of
+        /// the same name, for the same reason one level along.
+        ///
+        /// `#[serde(default)]` in the direction that actually happens: a
+        /// supervisor image rebuilt ahead of the server it talks to sees no
+        /// field, and `None` declines a continuation rather than guessing at
+        /// how much time it would have had. A telling the agent could not act
+        /// on is a wrong fact under an attempt cap.
+        #[serde(default)]
+        budget_secs: Option<u64>,
     },
 }
 

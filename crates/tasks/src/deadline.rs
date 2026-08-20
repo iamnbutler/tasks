@@ -399,6 +399,22 @@ pub async fn bounded<T>(deadline: &Deadline, work: impl Future<Output = T>) -> R
     }
 }
 
+/// How long one command may run inside a run of this budget, and the floor
+/// under it.
+///
+/// Re-exported rather than defined here, and the indirection is the point.
+/// There are four callers of one relationship now: the orchestrator's turn,
+/// a Scout's run and a Builder's — which set it on the child as
+/// `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` and quote it in the prompt —
+/// and the supervisors *inside* the VMs, which ask the same arithmetic whether
+/// a further attempt at the agent could run one command at all
+/// (`tasks_protocol::agent_run::decide_continuation`). The fourth is on the
+/// other side of a crate boundary, so the definition lives in
+/// `tasks-protocol` where both sides can reach it; run budgets live here, so
+/// this is where a server-side caller reads it from. A second copy of the
+/// arithmetic would be a second thing to get wrong.
+pub use tasks_protocol::budget::{MIN_COMMAND_BUDGET, command_budget};
+
 /// A duration as a human reads one: `8h13m`, `1h`, `38m`, `45s`.
 pub fn human(d: Duration) -> String {
     let secs = d.as_secs();

@@ -63,6 +63,7 @@ use vm_pool_protocol::{VmConfig, VmId};
 use crate::brief::Brief;
 use crate::builder::{Builder, BuilderConfig, BuilderError};
 use crate::bundles::RejectedBundles;
+use crate::deadline::command_budget;
 use crate::dispatch_gate;
 use crate::events::EventPayload;
 use crate::github::{GhError, GitHubClient, IntakeFilter, PrState};
@@ -100,7 +101,7 @@ const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-js
 /// Fifteen minutes rather than ten because a turn that verifies a composition
 /// may have to pay for one cold build, and Claude Code's own per-command
 /// ceiling has to fit *below* the turn (see
-/// [`orchestrator::command_budget`](crate::orchestrator::command_budget)) — at
+/// [`command_budget`](crate::deadline::command_budget)) — at
 /// 600s against a 600s ceiling a single command could consume the whole turn
 /// and leave nothing to report in. Bounded above by `OBLIGATION_REMINDER`, so
 /// a turn can never outlast the interval at which the pipeline re-states what
@@ -366,6 +367,22 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let clone_url_base =
             env_string("GITHUB_CLONE_URL_BASE").unwrap_or_else(|| DEFAULT_CLONE_URL_BASE.into());
+        // Hoisted above the literal because each is read TWICE below: once as
+        // the run budget, and once — through `agent_vm_config` — as the
+        // per-command budget derived from it. Read in place, the two could
+        // drift the moment somebody edited one of the `parse_env` calls, and
+        // the whole point of deriving the command budget is that it is a
+        // relationship between the two numbers rather than a second knob.
+        let scout_timeout = Duration::from_secs(parse_env(
+            "SCOUT_TIMEOUT_SECS",
+            "a number of seconds",
+            DEFAULT_SCOUT_TIMEOUT_SECS,
+        )?);
+        let builder_timeout = Duration::from_secs(parse_env(
+            "BUILDER_TIMEOUT_SECS",
+            "a number of seconds",
+            DEFAULT_BUILDER_TIMEOUT_SECS,
+        )?);
         Ok(Self {
             data_dir,
             port: parse_env("TASKS_SERVER_PORT", "a port number", DEFAULT_PORT)?,
@@ -382,11 +399,7 @@ impl Config {
             )?
             .max(1),
             scout_image: env_string("SCOUT_IMAGE").unwrap_or_else(|| DEFAULT_SCOUT_IMAGE.into()),
-            scout_timeout: Duration::from_secs(parse_env(
-                "SCOUT_TIMEOUT_SECS",
-                "a number of seconds",
-                DEFAULT_SCOUT_TIMEOUT_SECS,
-            )?),
+            scout_timeout,
             vm_pool_socket: env_string("VM_POOL_SOCKET")
                 .unwrap_or_else(|| DEFAULT_VM_POOL_SOCKET.into())
                 .into(),
@@ -404,15 +417,11 @@ impl Config {
             intake: IntakeFilter::from_label(env_string("TASKS_INTAKE_LABEL")),
             clone_url_base,
             scout_base_branch: env_string("SCOUT_BASE_BRANCH").unwrap_or_else(|| "main".into()),
-            vm_config: agent_vm_config(SCOUT_VM)?,
-            builder_vm_config: agent_vm_config(BUILDER_VM)?,
+            vm_config: agent_vm_config(SCOUT_VM, scout_timeout)?,
+            builder_vm_config: agent_vm_config(BUILDER_VM, builder_timeout)?,
             builder_image: env_string("BUILDER_IMAGE")
                 .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.into()),
-            builder_timeout: Duration::from_secs(parse_env(
-                "BUILDER_TIMEOUT_SECS",
-                "a number of seconds",
-                DEFAULT_BUILDER_TIMEOUT_SECS,
-            )?),
+            builder_timeout,
             github_rest_api_url: env_string("GITHUB_REST_API_URL"),
             orchestrator_cmd: env_string("ORCHESTRATOR_CMD")
                 .unwrap_or_else(|| DEFAULT_ORCHESTRATOR_CMD.into()),
@@ -570,8 +579,8 @@ fn build_jobs(cpus: u32, memory_mb: u32) -> u32 {
     (for_jobs / BUILD_JOB_MEMORY_MB).clamp(1, cpus.max(1))
 }
 
-/// Build one role's VM shape: cpus, memory, and the derived
-/// `CARGO_BUILD_JOBS`.
+/// Build one role's VM shape: cpus, memory, the derived `CARGO_BUILD_JOBS`,
+/// and the per-command budget the agent inside it runs under.
 ///
 /// **No credentials.** The shape is resolved once at startup; what a run
 /// authenticates with is minted per dispatch — a lease from
@@ -582,7 +591,27 @@ fn build_jobs(cpus: u32, memory_mb: u32) -> u32 {
 /// The images pin `CARGO_BUILD_JOBS=1` as a floor for hand-started
 /// containers; this env entry overrides it, so the server's arithmetic always
 /// wins for a VM the server allocated.
-fn agent_vm_config(role: VmRole) -> Result<VmConfig, ConfigError> {
+///
+/// # The command budget, and why it rides here rather than in a Dockerfile
+///
+/// Until #962 these VMs set no bash timeout at all, so the agent ran under
+/// Claude Code's 120s default with a 600s ceiling — and a cold 750-crate build
+/// fits in neither, which is what made backgrounding the only move available to
+/// the Scout that lost its run. `budget` is the run budget for this role, and
+/// [`command_budget`] is the same half-the-run arithmetic the orchestrator's
+/// own turn uses.
+///
+/// **Both** variables, because Claude Code computes its ceiling as
+/// `max(BASH_MAX_TIMEOUT_MS, effective default)`: setting only the max leaves
+/// un-annotated commands — nearly all of them — at 120s.
+///
+/// It rides [`VmConfig::env`] rather than an image's `ENV` for two reasons. The
+/// images are rebuilt by hand, so a value in a Dockerfile reaches nothing until
+/// somebody deploys it. And the number tracks `SCOUT_TIMEOUT_SECS` /
+/// `BUILDER_TIMEOUT_SECS`, which an image cannot know — the same budget is what
+/// [`crate::agent_prompt::harness_section`] quotes to the agent, so the prompt
+/// and the harness cannot disagree.
+fn agent_vm_config(role: VmRole, budget: Duration) -> Result<VmConfig, ConfigError> {
     let cpus: u32 = parse_env(role.cpus_var, "a positive integer", role.default_cpus)?.max(1);
     let memory_mb: u32 = parse_env(role.memory_var, "a size in MB", role.default_memory_mb)?;
     let jobs: u32 = parse_env(
@@ -592,10 +621,15 @@ fn agent_vm_config(role: VmRole) -> Result<VmConfig, ConfigError> {
     )?
     .max(1);
 
+    let command_ms = command_budget(budget).as_millis().to_string();
     Ok(VmConfig {
         cpus: Some(cpus),
         memory_mb: Some(memory_mb),
-        env: vec![("CARGO_BUILD_JOBS".into(), jobs.to_string())],
+        env: vec![
+            ("CARGO_BUILD_JOBS".into(), jobs.to_string()),
+            ("BASH_DEFAULT_TIMEOUT_MS".into(), command_ms.clone()),
+            ("BASH_MAX_TIMEOUT_MS".into(), command_ms),
+        ],
         ..VmConfig::default()
     })
 }

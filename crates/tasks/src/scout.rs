@@ -1451,11 +1451,18 @@ async fn drain_scout_events(
 /// Build the scout prompt, splicing in the previous attempt when the task has
 /// one. The section sits between the issue body and the instructions so the
 /// model reads issue → what went wrong last time → what to do.
+///
+/// `budget` is this run's, and it is the *same* value
+/// [`crate::run::agent_vm_config`] derives the VM's per-command ceiling from —
+/// so the seconds the harness section quotes are the seconds the harness will
+/// enforce. Anything a prompt claims about its environment is generated from
+/// it.
 fn render_prompt(
     task: &Task,
     prior: Option<&ReviewedSpec>,
     salvage: Option<&ScoutNotes>,
     directions: Option<&Directions>,
+    budget: Duration,
 ) -> String {
     let previous = prior.map(render_previous_attempt).unwrap_or_default();
     let field_notes = salvage.map(render_field_notes).unwrap_or_default();
@@ -1465,6 +1472,11 @@ fn render_prompt(
     // always-present empty heading is exactly what teaches an agent to skim
     // past the one that matters.
     let directions = directions.map(render_directions).unwrap_or_default();
+    // Last, after `## Your job` and the template: the slot before `## Your
+    // job` belongs to the directions above, and last is where the failure it
+    // describes actually happens — an agent parks on a background command at
+    // the end of a long run, not the start of one.
+    let harness = harness_section(AgentRole::Scout, budget);
     format!(
         "You are a Scout in the Double Diamond architecture.\n\n\
          ## Issue: {title} (#{num})\n\n\
@@ -1479,7 +1491,10 @@ fn render_prompt(
          It is read back every 30 seconds and is the only thing that survives \
          if this run is cut short, so write it as you learn rather than at the \
          end.\n\
-         3. Run the project's tests / lint / typecheck — get them green.\n\
+         3. Run the project's tests / lint / typecheck — get them green. \
+         Run them in the FOREGROUND and wait for them: see \
+         `## How this run works` at the end of this prompt for how long you \
+         have and what happens to anything you background.\n\
          4. Write `SPEC.md` in the repo root with the structure below, and \
          only once you have actually concluded. **`SPEC.md` is not a \
          checkpoint.** A half-written spec is worse than no spec, because it \
@@ -1501,13 +1516,15 @@ fn render_prompt(
          Simple | Medium | Complex\n\n\
          ### Notes\n\
          Anything the Builder should know.\n\
-         ```\n",
+         ```\n\n\
+         {harness}",
         title = task.title,
         num = task.gh_issue_number,
         body = task.body,
         previous = previous,
         field_notes = field_notes,
         directions = directions,
+        harness = harness,
     )
 }
 
