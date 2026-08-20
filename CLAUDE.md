@@ -1739,6 +1739,10 @@ cargo run -p tasks -- add-project owner/repo
 tasks secrets init                     # create the sealed credential store
 tasks secrets set github-token         # seal a key (value on stdin, never argv);
                                        #   a running server picks it up live
+tasks auth login                       # or skip minting a PAT: GitHub device
+                                       #   flow — shows a code to enter at
+                                       #   github.com/login/device and seals
+                                       #   the token as github-token (#1002)
 make dist                              # Tasks.app with a release `tasks` seed
                                        #   at Contents/Helpers/tasks; first
                                        #   launch installs the service from it
@@ -2251,6 +2255,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_VM_POOL_AUTOSPAWN` | derived | whether a failed vm-pool connect spawns the pool from the serving binary, detached, logging to `<data dir>/vm-pool.log` (`on`/`off`; anything else refuses to boot). Unset, the default is derived from where the binary lives: `on` for an installed binary (no workspace above `current_exe()` — a `make dist` bundle), `off` for a checkout artifact, whose developer restarts the pool deliberately. Safe because the pool refuses an occupied socket, so racing spawns resolve to one daemon. See *The daemon is the product* above |
 | `GITHUB_TOKEN` | — | **fallback** for `tasks secrets set github-token`, warned at startup — the sealed store is where production keys live. Needed (either way) for polling; the broker spends it for clones and the land push |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
+| `GITHUB_OAUTH_URL` | `https://github.com` | where `tasks auth login` speaks the device flow. The OAuth endpoints live on github.com rather than the API host, so `GITHUB_API_URL` is deliberately not reused — override for tests only |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix, and where the broker forwards git traffic. A non-http(s) base (a `file://` mirror) cannot be proxied and clones direct — see the credential-custody rule |
 | `TASKS_BROKER_PORT` | 4801 | credential broker listener — where VMs redeem run leases. A second listener on purpose; the API stays loopback-only |
 | `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |

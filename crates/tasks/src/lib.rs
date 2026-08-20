@@ -4,6 +4,8 @@
 //! `models` and `events`) so native clients can share them without depending
 //! on the server stack.
 
+/// GitHub sign-in by the OAuth device flow — `tasks auth login` (#1002).
+pub mod auth;
 pub mod brief;
 /// Short-lived credential leases and the proxy that redeems them, so VMs
 /// operate on credit and never hold a raw key (#971).
