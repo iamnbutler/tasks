@@ -9,6 +9,7 @@ mod feed;
 mod identity;
 mod issue_composer;
 mod menus;
+mod modal;
 mod nav;
 mod palette;
 mod projects;
@@ -65,6 +66,12 @@ fn main() {
         // depth tie on registration order, later wins. Swap these two lines
         // and ↑/↓ silently go back to moving the text cursor.
         palette::bind_keys(cx);
+
+        // Same tie, same reason: the modal layer's escape is bound in
+        // `"Modal > Input"` so it out-ranks gpuikit's blur-on-escape inside a
+        // modal's own field. Registered before `bind_input_keys` and escape
+        // stops closing modals you have typed into.
+        modal::bind_keys(cx);
 
         // Every key equivalent in the app, from the one table that also builds
         // the menu bar. Before `menus::set` below: gpui reads shortcuts out of
