@@ -937,16 +937,63 @@ impl Store {
         Ok(())
     }
 
-    /// Pick a backlog task up into the scout queue, appending it at the end of
-    /// the ranked order. The only door from `Backlog` into the pipeline.
+    /// Pick a task up into the scout queue, appending it at the end of the
+    /// ranked order. The only door into the pipeline.
+    ///
+    /// Two states can walk through it, and the second is the whole of #1028.
+    ///
+    /// `Backlog` is the ordinary one. `Rejected` is admitted **only while the
+    /// GitHub issue is still open**, because `Rejected` names two unrelated
+    /// outcomes: a *verdict* (someone decided not to do this — the issue is
+    /// closed, and terminal is correct), and *attrition* (three scouts failed
+    /// to produce a spec — the issue is still open, the work is still wanted,
+    /// and terminal is a lie). `list_active_tasks` already keeps the second
+    /// kind visible and says why: it is the "close the issue or re-queue?"
+    /// decision surface. Until now that surface offered a decision with one
+    /// arm missing — nothing, for anyone, could re-queue a rejected task, so
+    /// the only route back was to close the issue and file a new one, losing
+    /// its number, comments, labels and history for work whose only sin was
+    /// that the infrastructure failed three times.
+    ///
+    /// The open/closed split is what keeps this from being an undo button on
+    /// human judgment. A verdict-rejected task is refused here; reopening its
+    /// issue is the deliberate act that makes it eligible again, and the
+    /// poller carries that in on its own.
+    ///
+    /// **Clearing `dispatch_attempts` is mandatory, not a courtesy.**
+    /// `dispatch_gate` skips any task at or past `MAX_DISPATCH_ATTEMPTS`, so a
+    /// task returned to the queue still carrying 3 of 3 would sit there
+    /// visible and never dispatch — which is a worse state than the one this
+    /// fixes, because it looks like it is waiting its turn. A task coming back
+    /// from `Backlog` keeps its count untouched: it never spent one.
     ///
     /// Emits the `TaskStateChanged` event itself so every caller gets the same
     /// audit trail. Returns the updated task.
     pub async fn queue_task(&self, id: &TaskId) -> Result<Task, StoreError> {
         let mut tx = self.begin_write().await?;
         let task = self
-            .require_task_state(&mut tx, id, TaskState::Backlog)
-            .await?;
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {id}")))?;
+        let returning = match task.state {
+            TaskState::Backlog => false,
+            TaskState::Rejected if task.gh_state == GhState::Open => true,
+            TaskState::Rejected => {
+                return Err(StoreError::Invalid(format!(
+                    "task {id} was rejected and its issue is closed, so the rejection was a \
+                     verdict rather than a run of failures — reopen the issue to make it \
+                     eligible again"
+                )));
+            }
+            other => {
+                return Err(StoreError::Invalid(format!(
+                    "task {id} is {}, expected {} or {} with an open issue",
+                    other.as_str(),
+                    TaskState::Backlog.as_str(),
+                    TaskState::Rejected.as_str(),
+                )));
+            }
+        };
         let next_rank: i64 =
             sqlx::query("SELECT COALESCE(MAX(manual_rank), 0) + 1 AS r FROM tasks")
                 .fetch_one(&mut *tx)
@@ -959,6 +1006,12 @@ impl Store {
             .bind(id.as_str())
             .execute(&mut *tx)
             .await?;
+        if returning {
+            sqlx::query("UPDATE tasks SET dispatch_attempts = 0 WHERE id = ?")
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
 
         self.append_event(EventPayload::TaskStateChanged {
@@ -9713,6 +9766,133 @@ mod tests {
         got.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         wanted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(got, wanted);
+    }
+
+    /// #1028: `Rejected` names two unrelated outcomes, and only one of them is
+    /// terminal in any honest sense. A task that burned three scout attempts
+    /// without a verdict has an issue that is *still open* — the work is still
+    /// wanted, and before this it could not be returned to the queue by anyone:
+    /// not the app, not the orchestrator, not the human. `list_active_tasks`
+    /// kept the row on screen as the "close the issue or re-queue?" decision
+    /// surface while only one of those two arms existed.
+    #[tokio::test]
+    async fn a_task_rejected_by_attrition_can_be_returned_to_the_queue() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        // Exactly the shape #982 and #996 were in: three attempts, no spec,
+        // issue never closed because nothing closed it.
+        let mut task = sample_task(&project.id);
+        task.state = TaskState::Rejected;
+        task.gh_state = GhState::Open;
+        task.dispatch_attempts = crate::run::MAX_DISPATCH_ATTEMPTS;
+        store.insert_task(&task).await.unwrap();
+
+        let queued = store.queue_task(&task.id).await.unwrap();
+        assert_eq!(queued.state, TaskState::Queued);
+        assert!(
+            queued.manual_rank.is_some(),
+            "it takes a place in the order"
+        );
+
+        // The half that is not a courtesy: `dispatch_gate` skips anything at or
+        // past the cap, so a task returned still carrying 3 of 3 would sit in
+        // the queue looking like it was waiting its turn and never dispatch —
+        // worse than the stranding this fixes, because it is invisible.
+        assert_eq!(
+            queued.dispatch_attempts, 0,
+            "a task returned at the cap is skipped forever by the dispatcher"
+        );
+
+        let payloads: Vec<EventPayload> = store
+            .all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.payload)
+            .collect();
+        assert!(payloads.contains(&EventPayload::TaskStateChanged {
+            task_id: task.id.clone(),
+            from: TaskState::Rejected,
+            to: TaskState::Queued,
+        }));
+    }
+
+    /// The other kind of rejection, and the line that keeps this from being an
+    /// undo button on human judgment: a closed issue means somebody decided
+    /// not to do this. Reopening the issue is the deliberate act that makes it
+    /// eligible again, and the poller carries that in on its own.
+    #[tokio::test]
+    async fn a_task_rejected_by_verdict_stays_rejected_while_its_issue_is_closed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut task = sample_task(&project.id);
+        task.state = TaskState::Rejected;
+        task.gh_state = GhState::Closed;
+        task.dispatch_attempts = 0;
+        store.insert_task(&task).await.unwrap();
+
+        let err = store.queue_task(&task.id).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("verdict"), "{message}");
+        assert!(message.contains("reopen the issue"), "{message}");
+        assert_eq!(
+            store.get_task(&task.id).await.unwrap().unwrap().state,
+            TaskState::Rejected,
+            "a refusal is a no-op"
+        );
+    }
+
+    /// A task coming back from `Backlog` never spent an attempt, so its count
+    /// is left alone — the clearing is for the return path and nothing else.
+    #[tokio::test]
+    async fn queueing_from_the_backlog_leaves_the_attempt_count_alone() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        let mut task = sample_task(&project.id);
+        task.state = TaskState::Backlog;
+        task.dispatch_attempts = 2;
+        store.insert_task(&task).await.unwrap();
+
+        let queued = store.queue_task(&task.id).await.unwrap();
+        assert_eq!(queued.state, TaskState::Queued);
+        assert_eq!(queued.dispatch_attempts, 2);
+    }
+
+    /// Every other state is still refused, and the message names what would
+    /// have been accepted rather than only what was rejected.
+    #[tokio::test]
+    async fn queueing_work_already_in_flight_is_still_refused() {
+        let store = Store::open_in_memory().await.unwrap();
+        let project = sample_project();
+        store.insert_project(&project).await.unwrap();
+
+        for (n, state) in [
+            TaskState::Queued,
+            TaskState::Scouting,
+            TaskState::InReview,
+            TaskState::ReadyToBuild,
+            TaskState::Building,
+            TaskState::AwaitingMerge,
+            TaskState::Done,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut task = sample_task(&project.id);
+            // One issue number each: `(project_id, gh_issue_number)` is unique.
+            task.gh_issue_number = 500 + n as u64;
+            task.state = state;
+            store.insert_task(&task).await.unwrap();
+            let message = store.queue_task(&task.id).await.unwrap_err().to_string();
+            assert!(message.contains(state.as_str()), "{state:?}: {message}");
+            assert!(message.contains("backlog"), "{state:?}: {message}");
+        }
     }
 
     #[tokio::test]
