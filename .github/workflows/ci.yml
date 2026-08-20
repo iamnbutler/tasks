@@ -26,6 +26,16 @@
 # Its disclaimer-drift half is a workspace test and so already runs under `make
 # test-ci`; the link half is pages.yml's own gate, where a failure holds the
 # deploy and leaves the previous page serving.
+#
+# THREE JOBS, NOT ONE, so the wall clock is the slowest of them rather than
+# the sum — the suite and app-gpui's cold build are each minutes, and neither
+# needs the other's artifacts. The split changes nothing about the evidence:
+# `mergeable_state` aggregates every check on the commit, so one red job reads
+# exactly as the one red step did; it just arrives sooner. Each job restores
+# only the cache it uses (rust-cache keys per job by default, which is wanted:
+# clippy's check artifacts and the suite's test builds are different sets, and
+# a shared key would have each run restoring the other's), and this repository
+# is public, so parallel runners cost nothing.
 name: CI
 
 on:
@@ -47,16 +57,19 @@ permissions:
   contents: read
 
 jobs:
-  workspace:
-    name: fmt, clippy, suite
+  lint:
+    name: fmt, clippy
     runs-on: ubuntu-latest
     steps:
-      # Full history, not the default depth-1. `build-stamp` derives every
-      # binary's identity from `git rev-list --count HEAD`, so a shallow clone
-      # stamps this build `0.1.1` — a number that collides with a real early
-      # build and makes every `ImageFreshness` comparison meaningless. The
-      # first CI run found it, by failing three `UpdateWatch` tests that
-      # asserted `0.1.1` was stale.
+      # Full history, not the default depth-1, in EVERY job. `build-stamp`
+      # derives every binary's identity from `git rev-list --count HEAD`, so a
+      # shallow clone stamps this build `0.1.1` — a number that collides with
+      # a real early build and makes every `ImageFreshness` comparison
+      # meaningless. The first CI run found it, by failing three `UpdateWatch`
+      # tests that asserted `0.1.1` was stale. Only the suite asserts on the
+      # number today, but the stamp compiles into everything (clippy builds
+      # build.rs too), so the depth is uniform rather than rediscovered
+      # per job the next time a test reads it.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -65,15 +78,52 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # Two target directories: the workspace's, and app-gpui's own — it is
-      # deliberately not a workspace member, and a cold gpui build is minutes.
       - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  suite:
+    name: suite
+    runs-on: ubuntu-latest
+    steps:
+      # Full history for the build stamp — the comment on `lint`'s checkout is
+      # the reason, and this is the job whose tests assert on the number.
+      - uses: actions/checkout@v4
         with:
-          workspaces: |
-            . -> target
-            app-gpui -> app-gpui/target
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - uses: taiki-e/install-action@nextest
+
+      # `make test-ci`, not `cargo nextest` by hand: it prebuilds the
+      # supervisor binaries and exports TASKS_TEST_BIN_DIR (tests exec binaries
+      # and must never build them), runs the `ci` profile — no fail-fast,
+      # retries, a quieter slow threshold — and then runs the doctests, which
+      # nextest skips silently and with no count in its summary.
+      - run: make test-ci
+
+  app:
+    name: app-gpui
+    runs-on: ubuntu-latest
+    steps:
+      # Full history for the build stamp — the comment on `lint`'s checkout is
+      # the reason; app-gpui stamps its About window from the same crate.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # app-gpui is deliberately not a workspace member and has its own target
+      # directory; this job caches only that one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-gpui -> app-gpui/target
 
       # app-gpui's five. The Makefile falls back to stub `.so`s where these are
       # absent, and that fallback exists for hosts that cannot install
@@ -84,17 +134,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libfontconfig-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev
-
-      - run: cargo fmt --all -- --check
-
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # `make test-ci`, not `cargo nextest` by hand: it prebuilds the
-      # supervisor binaries and exports TASKS_TEST_BIN_DIR (tests exec binaries
-      # and must never build them), runs the `ci` profile — no fail-fast,
-      # retries, a quieter slow threshold — and then runs the doctests, which
-      # nextest skips silently and with no count in its summary.
-      - run: make test-ci
 
       # Compile and test the app. Neither needs a display or a Mac; what they
       # cannot say is that a pixel landed anywhere, which stays `make app` on a
