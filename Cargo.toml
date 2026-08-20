@@ -34,6 +34,10 @@ license = "MIT"
 repository = "https://github.com/iamnbutler/tasks"
 
 [workspace.dependencies]
+# One call: `kill(-pgid, sig)`, so a turn's whole process group can be swept
+# (#1064). `kill_on_drop` takes the agent alone and its bash children survive
+# holding the pipes we read.
+libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

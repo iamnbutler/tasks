@@ -1,0 +1,12 @@
+-- A human's standing hold on the orchestrator's turn lane (#1064).
+--
+-- Durable on purpose, and deliberately not the mode's shape:
+-- `TASKS_DEFAULT_MODE` overwrites the stored mode at every boot precisely
+-- because dispatch should come back quiet, whereas a lane hold is a standing
+-- decision about the judge — and a restart that silently resumed turns would
+-- leave a control that looks applied and is not.
+--
+-- The hold *is* the column's presence. The instant is "held since", which
+-- re-holding does not move, and it is decoration for a banner that ages it:
+-- an unreadable timestamp can never become "not held".
+ALTER TABLE orchestrator ADD COLUMN held_at TEXT;

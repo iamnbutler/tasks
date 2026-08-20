@@ -7,7 +7,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Build, BuildId, Mode, ProjectId, RunKind, SecretName, SpecId, TaskId};
+use crate::models::{
+    Build, BuildId, Mode, OrchestratorLane, ProjectId, RunKind, SecretName, SpecId, TaskId,
+};
 use crate::version::ImageIdentity;
 
 /// Body of `POST /projects`.
@@ -623,6 +625,16 @@ pub struct ServerStatus {
     /// happened yet.
     #[serde(default)]
     pub verify_dir: Option<VerifyDirUsage>,
+    /// Why the orchestrator's turn lane is quiet — **present only when it is
+    /// not open** (#1064).
+    ///
+    /// The hold shape and deliberately not the `verify_dir` shape: a held lane
+    /// is an exception a reader must not miss, and a standing "lane open" row
+    /// is one a reader learns to skip. `#[serde(default)]` for the same
+    /// reload-skew reason as the fields above — `reload` reads `/status` off
+    /// the *older* server before it swaps.
+    #[serde(default)]
+    pub orchestrator_lane: Option<OrchestratorLane>,
 }
 
 /// Why the pipeline is idle when the container runtime is not running.
@@ -1267,4 +1279,43 @@ mod tests {
             "20260815030411_build_transcripts"
         );
     }
+}
+
+/// Body of `POST /orchestrator/interrupt`, `/hold` and `/release` (#1064).
+///
+/// The rationale is **optional**, unlike a `decisions` rationale. Nothing here
+/// is charter-gated — these three decide whether the judge convenes at all,
+/// which is the `build-now` category — so there is no ledger row to leave
+/// unreviewable. It is addressed to whoever reads the feed later, and a human
+/// stopping a turn in a hurry should not have to compose a sentence first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneControlRequest {
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Answer to `POST /orchestrator/interrupt`.
+///
+/// A request that finds **no turn in flight is a 200 saying so**, never a 4xx:
+/// the caller's question is whether the lane is quiet, and it is. The request
+/// is not stored either — see `orchestrator::TurnControl` — so it cannot leak
+/// forward into a turn nobody asked to stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptResponse {
+    /// Whether there was a turn to end.
+    pub interrupted: bool,
+    /// What happened, in the reader's terms — including that an interrupt
+    /// alone re-answers the same input on the next tick, which is *why*
+    /// quieting the lane is two acts.
+    pub detail: String,
+    /// The lane as it stands after the request, so a caller that wanted the
+    /// lane quiet can see in one answer that it is not.
+    pub lane: OrchestratorLane,
+}
+
+/// Answer to `POST /orchestrator/hold` and `POST /orchestrator/release`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneResponse {
+    pub lane: OrchestratorLane,
+    pub detail: String,
 }

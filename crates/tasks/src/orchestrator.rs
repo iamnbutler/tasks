@@ -41,11 +41,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -85,6 +86,17 @@ pub enum OrchestratorError {
     /// the feed and the ledger start disagreeing about the same night.
     #[error("agent abandoned: {0}")]
     Suspended(Expiry),
+    /// A human ended this turn in flight (`POST /orchestrator/interrupt`).
+    ///
+    /// The **one** error that does not become an assistant turn. Every other
+    /// path deliberately writes itself into the chat, because persisting a
+    /// reply settles the tick condition so the loop cannot retry a poison
+    /// prompt forever — and settling the tick condition is exactly what an
+    /// interrupt must not do. The input the interrupt exists to preserve is
+    /// preserved by *not* advancing the watermark, which happens only in
+    /// `append_orchestrator_reply`, which this path never reaches.
+    #[error("the turn was interrupted{}", .0.by_line())]
+    Interrupted(Interruption),
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +181,166 @@ pub struct Orchestrator {
     config: OrchestratorConfig,
 }
 
+/// `source` on the event-log breadcrumbs about the orchestrator's own
+/// lifecycle.
+///
+/// One constant with [`crate::run`] and `maintain_verify_dir`, which were two
+/// spellings of the same string until this became the third reader.
+pub const NOTE_SOURCE: &str = "orchestrator";
+
+/// Who ended a turn, and why — the audit shape a `cancellations` row would
+/// have carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interruption {
+    /// Who asked. Always the human today: the three lane controls are
+    /// human-only, on the `build-now` precedent.
+    pub actor: String,
+    /// Optional, unlike a `decisions` rationale — nothing here is
+    /// charter-gated, so there is no ledger row to leave unreviewable.
+    pub rationale: Option<String>,
+}
+
+impl Interruption {
+    /// The trailing clause of the error's own sentence.
+    pub fn by_line(&self) -> String {
+        match &self.rationale {
+            Some(reason) if !reason.trim().is_empty() => {
+                format!(" by {}: {}", self.actor, reason.trim())
+            }
+            _ => format!(" by {}", self.actor),
+        }
+    }
+}
+
+/// The live handle on the turn in flight: one slot, taken while a turn runs
+/// and empty otherwise (#1064).
+///
+/// **An in-process signal, not a `cancellations` row — decided, with the
+/// reason.** [`crate::cancel`]'s row exists for a premise that is false here:
+/// *the process taking the request need not be the one following the run*. A
+/// scout or a build lives in a VM and may be picked back up by
+/// `resume_in_flight` in a later process; an orchestrator turn is a local child
+/// of this one server, dies with it, and can never be reattached — the process
+/// taking the request **is** the process running the turn. (Workers are local
+/// children too and *do* use a row; the difference is that a worker has a
+/// durable id. A turn has none, `cancellations` is keyed `(run_kind, run_id)`,
+/// and the only id available is the singleton's — so a request landing a moment
+/// late would sit on record and stop a *later* turn nobody asked to stop.) What
+/// the row would have bought, an audit shape, is kept as an
+/// `EventPayload::Note` carrying the actor and the rationale.
+///
+/// The slot is the whole concurrency argument, and it must not be replaced by
+/// an `AtomicBool` plus a stored request: a request that arrives with nothing
+/// running finds **no slot**, is answered honestly, and is never stored — which
+/// is what makes "a request cannot leak into the next turn" structural rather
+/// than careful. [`TurnGuard`] clears the slot on every exit path including a
+/// panic.
+#[derive(Default)]
+pub struct TurnControl {
+    slot: Mutex<Option<watch::Sender<Option<Interruption>>>>,
+}
+
+impl TurnControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the slot for the turn about to run, handing back the receiver the
+    /// turn selects on and a guard that frees the slot however the turn ends.
+    ///
+    /// Armed around the whole of `run_agent` rather than per invocation: a
+    /// turn whose resume fails invokes twice, and a window between them
+    /// answering "no turn in flight" would be a lie.
+    fn arm(self: &Arc<Self>) -> (watch::Receiver<Option<Interruption>>, TurnGuard) {
+        let (tx, rx) = watch::channel(None);
+        *self.slot.lock().expect("turn control slot") = Some(tx);
+        (
+            rx,
+            TurnGuard {
+                control: self.clone(),
+            },
+        )
+    }
+
+    /// End the turn in flight, if there is one. `false` means there was
+    /// nothing to end — a 200 saying so, never a 4xx, and nothing recorded.
+    pub fn interrupt(&self, interruption: Interruption) -> bool {
+        let slot = self.slot.lock().expect("turn control slot");
+        match slot.as_ref() {
+            Some(tx) => tx.send(Some(interruption)).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Whether a turn is in flight right now.
+    pub fn in_flight(&self) -> bool {
+        self.slot.lock().expect("turn control slot").is_some()
+    }
+
+    fn disarm(&self) {
+        *self.slot.lock().expect("turn control slot") = None;
+    }
+}
+
+/// Frees the slot when the turn ends — return, error, or panic.
+struct TurnGuard {
+    control: Arc<TurnControl>,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.control.disarm();
+    }
+}
+
+/// SIGTERM then SIGKILL a whole process group, best effort.
+///
+/// `kill_on_drop` takes the agent alone, and its bash children survive holding
+/// the pipes we are reading — `run_script`'s hazard one surface over, and the
+/// same answer. The child is spawned with `.process_group(0)`, so signalling
+/// `-pgid` reaches the agent *and* whatever `cargo` it left behind.
+///
+/// Best-effort by design: every failure here is `ESRCH` (already gone) or a
+/// permission error a retry cannot fix, and an interrupt that errored *after*
+/// freeing the lane would be worse than the hang it replaced.
+///
+/// Public and taking a bare pgid so a second caller can use it — the worker
+/// lane has the same `kill_on_drop`-takes-the-child-only hazard, filed
+/// separately and deliberately not fixed here.
+pub fn signal_group(pgid: u32, signal: i32) {
+    // Negative pid: the group. A pgid of 0 or 1 would mean "every process we
+    // may signal", which is never what a caller means.
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: `kill` with a negative pid is a plain libc call with no memory
+    // contract; the worst an unknown pgid does is return ESRCH, which is
+    // exactly the case this ignores.
+    unsafe {
+        libc::kill(-(pgid as i32), signal);
+    }
+}
+
+/// The sweep both the interrupt and the timeout path run: ask the group to
+/// stop, then make sure.
+///
+/// The **timeout path gets the same sweep**, so a turn killed at its deadline
+/// cannot leave a `cargo` behind holding the warm build directory — that
+/// directory reached 51 GB unattended once already.
+///
+/// Liveness between the two signals is re-derived with
+/// [`crate::pidfile::pid_alive`] — `ps -o state=`, where an empty row or a
+/// leading `Z` is dead. A killed grandchild is a **zombie, not an absence**:
+/// its parent is dead and nothing here reaps it, so `kill(pid, 0)` reports
+/// every corpse as alive. That is the pidfile rule, and it is the one
+/// implementation of it: this server runs on macOS, which has no `/proc`.
+pub fn sweep_group(pgid: u32) {
+    signal_group(pgid, libc::SIGTERM);
+    if crate::pidfile::pid_alive(pgid) {
+        signal_group(pgid, libc::SIGKILL);
+    }
+}
+
 impl Orchestrator {
     pub fn new(store: Arc<Store>, config: OrchestratorConfig) -> Self {
         Self { store, config }
@@ -178,7 +350,7 @@ impl Orchestrator {
     /// a reply was produced. One reply covers every unanswered turn — they
     /// are joined into one prompt, which is also what makes the tick
     /// idempotent.
-    pub async fn tick(&self) -> Result<bool, OrchestratorError> {
+    pub async fn tick(&self, control: &Arc<TurnControl>) -> Result<bool, OrchestratorError> {
         let pending = self.store.unanswered_orchestrator_messages().await?;
         if pending.is_empty() {
             return Ok(false);
@@ -204,7 +376,12 @@ impl Orchestrator {
         if let Err(e) = self.store.begin_orchestrator_turn().await {
             warn!(error = %e, "could not mark the orchestrator turn as in flight");
         }
-        let (reply, session_id) = match self.run_agent(&prompt).await {
+        // Armed around the whole of `run_agent` — resume and the fresh-session
+        // retry behind it — so there is no window between two invocations in
+        // which an interrupt would be told there is no turn in flight. The
+        // guard frees the slot on every exit path below, panic included.
+        let (interrupt, _guard) = control.arm();
+        let (reply, session_id) = match self.run_agent(&prompt, interrupt).await {
             Ok(turn) => {
                 info!(
                     session = %turn.session_id,
@@ -213,6 +390,19 @@ impl Orchestrator {
                     "orchestrator turn complete"
                 );
                 (turn.text, Some(turn.session_id))
+            }
+            // The one error that is not written into the chat. Persisting a
+            // reply is what settles the tick condition, and settling it is
+            // exactly what an interrupt must not do: the input stays
+            // unanswered and the next tick puts the same prompt back. Adding a
+            // `return` through `append_orchestrator_reply` here "to record
+            // what happened" would silently eat the input the interrupt exists
+            // to preserve.
+            Err(OrchestratorError::Interrupted(interruption)) => {
+                return self
+                    .conclude_interrupted(interruption)
+                    .await
+                    .map(|()| false);
             }
             Err(e) => {
                 // The error becomes the assistant turn: the chat must never
@@ -244,6 +434,54 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Wind up an interrupted turn: clear the in-flight marker, put the
+    /// accounting on the feed, and tell live subscribers the in-flight view is
+    /// over.
+    ///
+    /// The Note is written **here, by the turn, and not by the route**. The
+    /// select in `invoke` is `biased` with the work first
+    /// ([`crate::cancel::bounded`]'s rule — an outcome already in hand is
+    /// never discarded for a request that arrived in the same poll), so a note
+    /// written at the request would sometimes claim a stop that never
+    /// happened.
+    ///
+    /// `answered_through` is deliberately untouched: it moves only in
+    /// `append_orchestrator_reply`, which this path never reaches, so the
+    /// input survives and the next tick re-answers it. That an interrupt alone
+    /// re-answers the same input is correct, and is *why* quieting the lane is
+    /// two acts.
+    async fn conclude_interrupted(
+        &self,
+        interruption: Interruption,
+    ) -> Result<(), OrchestratorError> {
+        if let Err(e) = self.store.end_orchestrator_turn().await {
+            warn!(error = %e, "could not clear the orchestrator turn marker");
+        }
+        let detail = match interruption.rationale.as_deref().map(str::trim) {
+            Some(reason) if !reason.is_empty() => format!(
+                "The orchestrator turn was interrupted by {}: {reason}. The input it was \
+                 answering is unchanged, so the next tick takes it up again — hold the lane \
+                 (POST /orchestrator/hold) to stop turns starting.",
+                interruption.actor
+            ),
+            _ => format!(
+                "The orchestrator turn was interrupted by {}. The input it was answering is \
+                 unchanged, so the next tick takes it up again — hold the lane \
+                 (POST /orchestrator/hold) to stop turns starting.",
+                interruption.actor
+            ),
+        };
+        self.store
+            .append_event(EventPayload::Note {
+                source: NOTE_SOURCE.into(),
+                message: detail,
+            })
+            .await?;
+        self.store
+            .publish_orchestrator_feed(OrchestratorFeedEvent::Done);
+        Ok(())
+    }
+
     /// Run one headless Claude Code turn against the persistent session,
     /// creating the session on first use and healing a lost one by starting
     /// over with a fresh id.
@@ -257,7 +495,11 @@ impl Orchestrator {
     /// The standing prompt rides along on every turn — resume included — so
     /// prompt updates reach a long-lived session without resetting it, and a
     /// fresh session is re-armed with its instructions on turn one.
-    async fn run_agent(&self, prompt: &str) -> Result<Turn, OrchestratorError> {
+    async fn run_agent(
+        &self,
+        prompt: &str,
+        interrupt: watch::Receiver<Option<Interruption>>,
+    ) -> Result<Turn, OrchestratorError> {
         // Re-read every turn: the charter is the one statement of what the
         // orchestrator may do, and it reaches a long-lived session only
         // through the prompt. A human flipping a capability takes effect on
@@ -265,11 +507,12 @@ impl Orchestrator {
         let charter = self.store.charter().await?;
         let system = system_prompt(&self.config, &charter);
         match self.store.orchestrator_cc_session().await? {
-            None => self.start_session(&system, prompt, None).await,
+            None => self.start_session(&system, prompt, None, interrupt).await,
             Some(session) => match self
                 .invoke(
                     &["--resume", &session, "--append-system-prompt", &system],
                     prompt,
+                    interrupt.clone(),
                 )
                 .await
             {
@@ -292,7 +535,8 @@ impl Orchestrator {
                     self.store
                         .end_orchestrator_session(&session, SessionEndReason::ResumeFailed)
                         .await?;
-                    self.start_session(&system, prompt, Some(&session)).await
+                    self.start_session(&system, prompt, Some(&session), interrupt)
+                        .await
                 }
                 Err(e) => Err(e),
             },
@@ -307,12 +551,14 @@ impl Orchestrator {
         system: &str,
         prompt: &str,
         replacing: Option<&str>,
+        interrupt: watch::Receiver<Option<Interruption>>,
     ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
         let (text, usage) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
+                interrupt,
             )
             .await?;
         self.store
@@ -341,6 +587,7 @@ impl Orchestrator {
         &self,
         extra_args: &[&str],
         prompt: &str,
+        mut interrupt: watch::Receiver<Option<Interruption>>,
     ) -> Result<(String, TurnUsage), OrchestratorError> {
         let mut parts = split_command(&self.config.command).into_iter();
         let prog = parts.next().unwrap_or_else(|| "claude".to_string());
@@ -388,7 +635,15 @@ impl Orchestrator {
             )
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
+            // It takes the agent **alone**, though: the bash children it left
+            // behind survive holding the pipes we are reading, which is why
+            // the child gets a process group of its own below and both the
+            // interrupt and the timeout path sweep it.
             .kill_on_drop(true)
+            // Its own process group, so one signal reaches the agent and
+            // whatever `cargo` it started. Set before the spawn because the
+            // pgid is the child's pid, which is what `sweep_group` is given.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -412,6 +667,13 @@ impl Orchestrator {
         }
 
         let mut child = cmd.spawn().map_err(OrchestratorError::Spawn)?;
+        // Read **before** the child is moved into the read future below —
+        // afterwards there is no handle left to ask, and the sweep needs the
+        // pgid on exactly the paths where the future is being dropped. The
+        // process group is the child's own pid, because of `.process_group(0)`
+        // above. `None` means the child has already been reaped, which leaves
+        // nothing to sweep and no group to name.
+        let pgid = child.id().unwrap_or(0);
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -487,18 +749,52 @@ impl Orchestrator {
         // Two clocks, for the reason the dispatchers use them: a lid closed
         // mid-turn is not a turn that spent 900 seconds thinking.
         let deadline = Deadline::starting_now(self.config.timeout);
-        let (status, result_text, raw, usage) =
-            deadline::bounded(&deadline, read)
-                .await
-                .map_err(|expiry| {
-                    if expiry.starved_by_suspend() {
-                        OrchestratorError::Suspended(expiry)
-                    } else {
-                        OrchestratorError::Timeout {
-                            secs: self.config.timeout.as_secs(),
-                        }
-                    }
-                })??;
+        // `Box::pin`, not `tokio::pin!`: the interrupt arm below needs a *real*
+        // drop to take the child with it, and dropping the `Pin<&mut F>` that
+        // `tokio::pin!` yields drops nothing at all — the child would outlive
+        // the decision to kill it. clippy's `drop_non_drop` catches that one;
+        // do not silence it.
+        let mut read = Box::pin(deadline::bounded(&deadline, read));
+        let outcome = tokio::select! {
+            // Biased, with the work first: an outcome already in hand is never
+            // discarded for a request that arrived in the same poll
+            // (`cancel::bounded`'s rule). It is also what lets the Note be
+            // written by the turn rather than by the route — a note written at
+            // the request would sometimes claim a stop that never happened.
+            biased;
+            outcome = &mut read => Some(outcome),
+            _ = interrupt.changed() => None,
+        };
+        let Some(outcome) = outcome else {
+            let interruption = interrupt.borrow().clone().unwrap_or(Interruption {
+                actor: "a human".into(),
+                rationale: None,
+            });
+            // Order matters. Ask the group to stop first, then drop the read
+            // future — which takes `claude` itself via `kill_on_drop` — then
+            // make sure with SIGKILL.
+            signal_group(pgid, libc::SIGTERM);
+            drop(read);
+            // `abort()` rather than awaiting an EOF that will never come: the
+            // pipe is held by children we have just signalled, and a reader
+            // parked on it would hang the interrupt it is part of.
+            stderr_task.abort();
+            sweep_group(pgid);
+            return Err(OrchestratorError::Interrupted(interruption));
+        };
+        let (status, result_text, raw, usage) = outcome.map_err(|expiry| {
+            // The same sweep as the interrupt path: a turn killed at its
+            // deadline must not leave a `cargo` behind holding the warm
+            // build directory.
+            sweep_group(pgid);
+            if expiry.starved_by_suspend() {
+                OrchestratorError::Suspended(expiry)
+            } else {
+                OrchestratorError::Timeout {
+                    secs: self.config.timeout.as_secs(),
+                }
+            }
+        })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();

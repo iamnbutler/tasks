@@ -1684,6 +1684,7 @@ pub fn render_status(
             out.push_str(&render_broker_hold(status, now));
             out.push_str(&render_runtime_hold(status, now));
             out.push_str(&render_verify_dir(status, now));
+            out.push_str(&render_orchestrator_lane(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -1845,6 +1846,31 @@ pub fn render_runtime_hold(status: &ServerStatus, now: DateTime<Utc>) -> String 
 /// A reclaim is reported for the rest of the boot, and the wholesale tier names
 /// its cost, because "the next verification is cold" is what sends the next
 /// batch to a human and nothing else would say why.
+/// Why the orchestrator's turn lane is quiet, when it is (#1064).
+///
+/// **Silent when the lane is open**, on the holds' rule and not the verify
+/// directory's: a standing "lane open" row is one a reader learns to skip, and
+/// this one has to land the one time it appears.
+///
+/// It prints **both** reasons when both hold and names each one's discharge. A
+/// reader told only about the checkout releases it, finds the lane still
+/// quiet, and stops trusting the control — which is the failure the struct
+/// (rather than an enum) exists to prevent, carried through to the surface
+/// that reports it.
+pub fn render_orchestrator_lane(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(lane) = &status.orchestrator_lane else {
+        return String::new();
+    };
+    let Some(why) = lane.describe() else {
+        return String::new();
+    };
+    let since = match lane.held_at {
+        Some(at) => format!(" (held {} ago)", humanize(now - at)),
+        None => String::new(),
+    };
+    format!("orch     no turn will start: {why}{since}\n")
+}
+
 pub fn render_verify_dir(status: &ServerStatus, now: DateTime<Utc>) -> String {
     let Some(usage) = &status.verify_dir else {
         return String::new();
@@ -2049,6 +2075,7 @@ mod tests {
             broker: None,
             runtime: None,
             verify_dir: None,
+            orchestrator_lane: None,
         }
     }
 

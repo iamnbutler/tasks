@@ -20,11 +20,11 @@ use crate::models::{
     Actor, AgentEnrollment, Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel,
     ChatRole, CloseReason, Complexity, ContextBreakdown, Decision, DecisionAction, DecisionInput,
     DecisionState, Directions, GhState, Mode, Obligation, ObligationKind, OrchestratorFeedEvent,
-    OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project, ProjectId,
-    ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason, SessionId,
-    SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream, Verification,
-    VerificationStatus, Worker, WorkerId, WorkerStatus,
+    OrchestratorLane, OrchestratorMessage, OrchestratorSession, OrchestratorSessionInfo, Project,
+    ProjectId, ProjectStatus, ReviewedSpec, RunKind, ScoutNotes, Session, SessionEndReason,
+    SessionId, SessionStatus, SessionUsage, Spec, SpecId, SpecQueueEntry, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine, TranscriptOwner, TranscriptStream,
+    Verification, VerificationStatus, Worker, WorkerId, WorkerStatus,
 };
 use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
@@ -5292,11 +5292,15 @@ impl Store {
     /// the session checked out for interactive use.
     pub async fn orchestrator_session_info(&self) -> Result<OrchestratorSessionInfo, StoreError> {
         let row = sqlx::query(
-            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, s.last_context_tokens,                     s.last_tick_tokens, s.last_input_tokens, s.last_cache_read_tokens,                     s.last_cache_creation_tokens, s.model_id, s.context_window,                     s.compactions, s.last_compacted_at              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
+            "SELECT o.cc_session_id, o.workdir, o.checked_out_at, o.held_at, s.last_context_tokens,                     s.last_tick_tokens, s.last_input_tokens, s.last_cache_read_tokens,                     s.last_cache_creation_tokens, s.model_id, s.context_window,                     s.compactions, s.last_compacted_at              FROM orchestrator o              LEFT JOIN orchestrator_sessions s ON s.cc_session_id = o.cc_session_id              WHERE o.id = 1",
         )
         .fetch_one(&self.pool)
         .await?;
         let checked_out_at: Option<String> = row.try_get("checked_out_at")?;
+        // The hold *is* the column's presence, and the instant is parsed
+        // leniently beside it: it is decoration for a banner that ages the
+        // hold, so a timestamp this cannot read must never become "not held".
+        let held_at: Option<String> = row.try_get("held_at")?;
         let last_compacted_at: Option<String> = row.try_get("last_compacted_at")?;
         // All three or none: they are written from one `Option` and only mean
         // anything as a set, since what makes them useful is that they sum to
@@ -5313,12 +5317,23 @@ impl Store {
             }),
             _ => None,
         };
-        Ok(OrchestratorSessionInfo {
-            cc_session_id: row.try_get("cc_session_id")?,
-            workdir: row.try_get("workdir")?,
+        let lane = OrchestratorLane {
+            held: held_at.is_some(),
+            held_at: held_at
+                .as_deref()
+                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                .map(|ts| ts.with_timezone(&Utc)),
             checked_out: checked_out_at
                 .as_deref()
                 .is_some_and(checkout_heartbeat_fresh),
+        };
+        Ok(OrchestratorSessionInfo {
+            cc_session_id: row.try_get("cc_session_id")?,
+            workdir: row.try_get("workdir")?,
+            // Filled from the same read as `lane`, so the two cannot disagree
+            // about the same instant.
+            checked_out: lane.checked_out,
+            lane,
             context_tokens: row.try_get("last_context_tokens")?,
             tick_tokens: row.try_get("last_tick_tokens")?,
             model_id: row.try_get("model_id")?,
@@ -5355,8 +5370,47 @@ impl Store {
     }
 
     /// Whether a human currently has the orchestrator session checked out.
+    ///
+    /// **Rewired onto [`Self::orchestrator_lane`]** rather than left as a
+    /// second hand-written query — that is how two readers come to disagree,
+    /// and this question now has two of them ([`crate::run::orchestrator_loop`]
+    /// gates the tick on the whole lane, while the verify-directory reclaim
+    /// beside it keys on the checkout alone).
     pub async fn orchestrator_checked_out(&self) -> Result<bool, StoreError> {
-        Ok(self.orchestrator_session_info().await?.checked_out)
+        Ok(self.orchestrator_lane().await?.checked_out)
+    }
+
+    /// Both reasons a headless turn may not start, in one read (#1064).
+    ///
+    /// The one read behind the loop's gate and every surface that reports why
+    /// the lane is quiet, so they cannot drift into two notions of "quiet"
+    /// while both meanings stay distinct and both render.
+    pub async fn orchestrator_lane(&self) -> Result<OrchestratorLane, StoreError> {
+        Ok(self.orchestrator_session_info().await?.lane)
+    }
+
+    /// Hold the turn lane: no new headless turn starts until it is released.
+    ///
+    /// Idempotent, and re-holding **does not move "held since"** — that is
+    /// when the lane went quiet, not when somebody last said so. It says
+    /// nothing about a turn already in flight; interrupting one is
+    /// [`crate::orchestrator::TurnControl`]'s job, and that they are two acts
+    /// is the point rather than an omission.
+    pub async fn orchestrator_hold(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET held_at = ? WHERE id = 1 AND held_at IS NULL")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Release the hold. Unconditional: releasing a lane nobody held is a
+    /// no-op, which is the only honest answer to "make sure turns can start".
+    pub async fn orchestrator_release_hold(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE orchestrator SET held_at = NULL WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // --- in-flight work ---
